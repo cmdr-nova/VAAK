@@ -158,13 +158,8 @@ fn render_actions_core(ctx:&FediActionContext,direct:Option<&str>,_show_open:boo
         let label = if ctx.bookmarked { "Bookmark folders" } else { "Bookmark" };
         html.push_str(&format!("<form method=\"post\" action=\"{action_base}\" style=\"display:inline\">{}{}{}{}<button class=\"icon-btn{}\" type=\"submit\" title=\"{label}\" aria-label=\"{label}\" data-bm-picker=\"{}\"><i class=\"ph{} ph-bookmark-simple\" aria-hidden=\"true\"></i></button></form>", hidden("action", if ctx.bookmarked { "unbookmark_status" } else { "bookmark_status" }), hidden("return_view", &ctx.return_view), hidden("status_id", sid), hidden("object_id", uri), if ctx.bookmarked { " on" } else { "" }, u8::from(ctx.bookmarked), if ctx.bookmarked { "-fill" } else { "" }));
     }
-    // The PHP generic status painter keeps navigation for AT/non-HTTPS
-    // objects in a separate GET-only menu before the moderation controls.
-    // Direct/profile presentation has its own explicit navigation policy.
-    if direct.is_none() && !uri.is_empty() && !uri.starts_with("https://") {
-        html.push_str(&read_only_overflow_mode(uri,&ctx.return_view,&ctx.remote_url,true));
-    }
-    html.push_str(&render_moderation(ctx));
+    let protocol_open = if direct.is_none() { Some(_show_open) } else { None };
+    html.push_str(&render_moderation_with_protocol_navigation(ctx, &ctx.return_view, protocol_open));
     html.push_str("</div>");
     Ok(html)
 }
@@ -185,6 +180,10 @@ fn moderation_form(ctx: &FediActionContext, action: &str, field: &str, value: &s
 pub(crate) fn render_moderation(ctx: &FediActionContext) -> String {render_moderation_with_from(ctx,&ctx.return_view)}
 
 pub(crate) fn render_moderation_with_from(ctx: &FediActionContext,return_from:&str) -> String {
+    render_moderation_with_protocol_navigation(ctx, return_from, None)
+}
+
+pub(crate) fn render_moderation_with_protocol_navigation(ctx: &FediActionContext,return_from:&str,protocol_open:Option<bool>) -> String {
     let link_from=if return_from.is_empty(){&ctx.return_view}else{return_from};
     let actor = ctx.actor_id.trim_end_matches('/');
     let state = &ctx.moderation;
@@ -196,6 +195,12 @@ pub(crate) fn render_moderation_with_from(ctx: &FediActionContext,return_from:&s
     if state.is_local || state.is_wafrn { menu.push_str(&format!("<a class=\"menu-action\" href=\"?view=ask&amp;target_actor={}&amp;from={}\">Ask</a>", query(actor), query(link_from))); }
     if ctx.object_id.starts_with("https://") {
         menu.push_str(&format!("<a class=\"menu-action\" href=\"{}\">Open</a><a class=\"menu-action\" href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\">{}</a>", esc(&status_href(&ctx.object_id, &ctx.return_view)), esc(if ctx.remote_url.starts_with("https://"){&ctx.remote_url}else{&ctx.object_id}), if ctx.object_id.to_lowercase().contains("bsky.app") { "Open on Bluesky" } else { "Remote" }));
+    }
+    if !ctx.object_id.is_empty() && !ctx.object_id.starts_with("https://") {
+        if let Some(show_open) = protocol_open {
+            if show_open { menu.push_str(&format!("<a class=\"menu-action\" href=\"{}\">Open</a>", esc(&status_href(&ctx.object_id, &ctx.return_view)))); }
+            if ctx.remote_url.starts_with("https://") || ctx.remote_url.starts_with("http://") { menu.push_str(&format!("<a class=\"menu-action\" href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\">Remote</a>", esc(&ctx.remote_url))); }
+        }
     }
     if actor.starts_with("https://") {
         if state.is_local_admin {
@@ -251,6 +256,30 @@ mod tests {
     use super::*;
     fn context() -> FediActionContext {
         FediActionContext { owner_id: 1, status_id: "123".into(), object_id: "https://remote.test/users/alice/statuses/123".into(), actor_id: "https://remote.test/users/alice".into(), remote_url: "https://remote.test/@alice/123".into(), return_view: "bookmarks".into(), reply_mentions: vec!["alice@remote.test".into()], spoiler: "".into(), sensitive: false, favourited: false, bookmarked: false, boosted: false, counts: Counts { favourites: 3, reblogs: 2, ..Default::default() }, csrf: "fixture-csrf-token".into(), moderation: ModerationContext::default() }
+    }
+    #[test]
+    fn protocol_navigation_shares_one_moderation_menu() {
+        let mut ctx = context();
+        ctx.object_id = "at://did:plc:fixture/app.bsky.feed.post/example".into();
+        ctx.actor_id = "https://bsky.app/profile/dame.is".into();
+        ctx.remote_url = "https://bsky.app/profile/dame.is/post/example".into();
+        for view in ["home", "status"] {
+            ctx.return_view = view.into();
+            for show_open in [true, false] {
+                let html = render_moderation_with_protocol_navigation(&ctx, view, Some(show_open));
+                assert_eq!(html.matches("<details class=\"post-action-menu\">").count(), 1);
+                assert_eq!(html.contains(">Open</a>"), show_open);
+                assert!(html.contains(">Remote</a>"));
+                for action in ["user_block_add", "mute_remote", "deprioritize_remote"] {
+                    assert!(html.contains(&format!("name=\"action\" value=\"{action}\"")));
+                }
+                assert!(html.contains("name=\"csrf\" value=\"fixture-csrf-token\""));
+            }
+        }
+        ctx.remote_url = "javascript:alert(1)".into();
+        assert!(!render_moderation_with_protocol_navigation(&ctx, "home", Some(true)).contains("javascript:"));
+        ctx.moderation.is_self = true;
+        assert!(render_moderation_with_protocol_navigation(&ctx, "home", Some(true)).is_empty());
     }
     #[test]
     fn owner_and_view_are_bound_before_action_paint() {

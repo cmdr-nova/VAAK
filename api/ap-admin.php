@@ -16584,7 +16584,7 @@ function admin_post_navigation_menu_html(string $openHref, string $remoteHref = 
         $menu .= '<a class="menu-action" href="' . h($openHref) . '"'
             . ($externalOpen ? ' target="_blank" rel="noopener noreferrer"' : '') . '>' . h($openLabel) . '</a>';
     }
-    if ($remoteHref !== '') {
+    if (str_starts_with($remoteHref, 'https://') || str_starts_with($remoteHref, 'http://')) {
         $menu .= '<a class="menu-action" href="' . h($remoteHref) . '" target="_blank" rel="noopener noreferrer">Remote</a>';
     }
     return $menu !== '' ? '<details class="post-action-menu">'
@@ -16593,7 +16593,7 @@ function admin_post_navigation_menu_html(string $openHref, string $remoteHref = 
 }
 
 /** Permission-aware actor actions used by posts, profiles, and DMs. */
-function block_quick_actions(?string $actorId, ?string $host, string $returnView, int $ownerUserId = 0, bool $isAdmin = false, string $returnFrom = '', string $objectId = '', mixed $objectUrlHint = null): string
+function block_quick_actions(?string $actorId, ?string $host, string $returnView, int $ownerUserId = 0, bool $isAdmin = false, string $returnFrom = '', string $objectId = '', mixed $objectUrlHint = null, ?bool $protocolShowOpen = null): string
 {
     if (!empty($GLOBALS['vaak_guest_profile'])) {
         return '';
@@ -16674,6 +16674,16 @@ function block_quick_actions(?string $actorId, ?string $host, string $returnView
         $isBskyObject = str_contains(strtolower($objectId), 'bsky.app');
         $menu .= '<a class="menu-action" href="' . h(admin_remote_object_href($objectId, $objectUrlHint)) . '" target="_blank" rel="noopener noreferrer">'
             . ($isBskyObject ? 'Open on Bluesky' : 'Remote') . '</a>';
+    }
+    // Protocol objects keep navigation in this same permission-aware menu.
+    if ($objectId !== '' && !str_starts_with($objectId, 'https://') && $protocolShowOpen !== null) {
+        if ($protocolShowOpen) {
+            $menu .= '<a class="menu-action" href="' . h(admin_status_href($objectId, $returnView)) . '">Open</a>';
+        }
+        $remoteHref = admin_remote_object_href($objectId, $objectUrlHint);
+        if (str_starts_with($remoteHref, 'https://') || str_starts_with($remoteHref, 'http://')) {
+            $menu .= '<a class="menu-action" href="' . h($remoteHref) . '" target="_blank" rel="noopener noreferrer">Remote</a>';
+        }
     }
     // Personal mute/block first — available to every signed-in user, including admins.
     // Don't offer personal actions for the signed-in actor itself.
@@ -18741,10 +18751,9 @@ function admin_render_masto_status_card(
                 </form>
               <?php endif; ?>
               <?php
-                $statusQuickActions = block_quick_actions($actorRef, short_host($actorRef), $returnView, admin_owner_user_id(), !empty($GLOBALS['vaak_is_admin']), $returnView, $uri, $st['url'] ?? null);
-                // AT objects and own protocol profiles have no object navigation in
-                // the moderation menu. Keep their former links in a GET-only menu.
-                if ($uri !== '' && ($statusQuickActions === '' || !str_starts_with($uri, 'https://'))) {
+                $statusQuickActions = block_quick_actions($actorRef, short_host($actorRef), $returnView, admin_owner_user_id(), !empty($GLOBALS['vaak_is_admin']), $returnView, $uri, $st['url'] ?? null, $showOpen);
+                // Own actors have no moderation menu; retain their GET navigation.
+                if ($uri !== '' && $statusQuickActions === '') {
                     echo admin_post_navigation_menu_html($showOpen ? admin_status_href($uri, $returnView) : '', admin_remote_object_href($uri, $st['url'] ?? null));
                 }
                 echo $statusQuickActions;
@@ -19375,9 +19384,6 @@ function admin_render_boost_card(array $rb, array $followingIds, string $returnV
               echo admin_tweet_content_wrap($boostInner);
             ?>
             <div class="tweet-actions">
-              <?php if ($objectId !== '' && (!empty($GLOBALS['vaak_guest_profile']) || (function_exists('vaak_is_own_url') && vaak_is_own_url($objectId)))): ?>
-                <?= admin_post_navigation_menu_html(admin_status_href($objectId, $returnView), admin_remote_object_href($objectId)) ?>
-              <?php endif; ?>
               <?php if ($statusId !== '' && $objectId !== ''): ?>
                 <form method="post" action="?view=<?= h($returnView) ?>" style="display:inline">
                   <input type="hidden" name="action" value="unreblog_status">
@@ -19403,7 +19409,13 @@ function admin_render_boost_card(array $rb, array $followingIds, string $returnV
                   <button class="icon-btn<?= $bm ? ' on' : '' ?>" type="submit" title="<?= $bm ? 'Bookmark folders' : 'Bookmark' ?>" aria-label="<?= $bm ? 'Bookmark folders' : 'Bookmark' ?>" data-bm-picker="<?= $bm ? '1' : '0' ?>"><i class="ph<?= $bm ? '-fill' : '' ?> ph-bookmark-simple" aria-hidden="true"></i></button>
                 </form>
               <?php endif; ?>
-              <?= block_quick_actions($targetActor, short_host($targetActor), $returnView, admin_owner_user_id(), !empty($GLOBALS['vaak_is_admin']), $returnView, $objectId) ?>
+              <?php
+                $boostQuickActions = block_quick_actions($targetActor, short_host($targetActor), $returnView, admin_owner_user_id(), !empty($GLOBALS['vaak_is_admin']), $returnView, $objectId);
+                if ($boostQuickActions === '' && $objectId !== '' && (!empty($GLOBALS['vaak_guest_profile']) || (function_exists('vaak_is_own_url') && vaak_is_own_url($objectId)))) {
+                    echo admin_post_navigation_menu_html(admin_status_href($objectId, $returnView), admin_remote_object_href($objectId));
+                }
+                echo $boostQuickActions;
+              ?>
             </div>
           </article>
     <?php
@@ -20861,6 +20873,260 @@ if ($isPartial && $view === 'status' && (string) ($_GET['shell'] ?? '') === '1')
     if (function_exists('ap_auth_session_write_close')) ap_auth_session_write_close();
 }
 
+/** Strict public Bluesky thread discovery, rendered into existing incremental shells. */
+function admin_bsky_thread_fragment(string $object, string $part, string $from, array $followingIds): ?string
+{
+    $owner = admin_owner_user_id();
+    $level = ob_get_level();
+    $galleryBudget = $GLOBALS['admin_bsky_gallery_repair_budget'] ?? null;
+    $GLOBALS['admin_bsky_gallery_repair_budget'] = 0;
+    try {
+        ap_bsky_posts_migrate();ap_bsky_crossposts_migrate();ap_bsky_post_links_migrate();
+        $policy = admin_bsky_thread_policy_snapshot($owner);
+        $at = admin_bsky_thread_target_uri($object);
+        if (!is_string($at) || !preg_match('~^at://did:[^/\s]+/app\.bsky\.feed\.post/[A-Za-z0-9]+$~D', $at)) return null;
+        $focus = admin_bsky_thread_focus_item($at, $owner, $part === 'focus');
+        if (!is_array($focus) || ($focus['post']['uri'] ?? '') !== $at
+            || !admin_bsky_thread_focus_allowed($focus, $owner)
+            || $policy !== admin_bsky_thread_policy_snapshot($owner)) return null;
+        $rootTwin = admin_bsky_thread_local_twin($at);
+        $rootTwins = $rootTwin !== null ? [$rootTwin] : [];
+        $rootSource = admin_bsky_thread_source_snapshot([$at], $rootTwins);
+        $source = ap_normalize_from_bsky_post($focus);
+        if (!is_array($source) || !admin_direct_status_allowed($source, $owner)) return null;
+        // Policy receipts are private request-local SQL rows, never supplied by AppView.
+        $wantAncestors = in_array($part, ['1', 'ancestors', 'both'], true);
+        $wantReplies = in_array($part, ['replies', 'descendants', 'both'], true);
+        $tree = null;
+        if ($wantAncestors || $wantReplies) {
+            $got = ap_bsky_xrpc(AP_BSKY_PUBLIC_API, 'app.bsky.feed.getPostThread', 'GET',
+                ['uri'=>$at, 'depth'=>$wantReplies ? '4' : '0', 'parentHeight'=>$wantAncestors ? '12' : '0'], null, null, 4);
+            $tree = is_array($got['json']['thread'] ?? null) ? $got['json']['thread'] : null;
+            if (empty($got['ok']) || !is_array($tree) || !admin_bsky_thread_node_valid($tree) || ($tree['post']['uri'] ?? '') !== $at
+                || !admin_bsky_thread_focus_allowed(['post'=>$tree['post']], $owner)) return null;
+        }
+        if ($rootSource !== admin_bsky_thread_source_snapshot([$at], $rootTwins)) return null;
+        $posts = $part === 'focus' ? [$focus['post']] : admin_bsky_thread_posts($tree ?? [], $at, $wantAncestors, $wantReplies);
+        $seen = [$at=>true];$cards = [];$selectedUris=[$at];$selectedTwins=$rootTwins;
+        foreach ($posts as $post) {
+            $uri = (string) ($post['uri'] ?? '');
+            if ($uri === '' || (isset($seen[$uri]) && $part !== 'focus')) continue;
+            $seen[$uri] = true;
+            if (!admin_bsky_thread_post_valid($post) || !($part === 'focus' ? admin_bsky_thread_focus_allowed(['post'=>$post], $owner) : admin_library_bsky_item_allowed(['post'=>$post], $owner, 0, true))) continue;
+            // Index the genuine record before inspecting its current local association.
+            if ($part !== 'focus') ap_bsky_post_upsert_from_feed_item(['post'=>$post], $owner > 0 ? $owner : null);
+            $twin = admin_bsky_thread_local_twin($uri);
+            $card = null;
+            if (is_string($twin) && $twin !== '') {
+                if (isset($seen[$twin])) continue;
+                $seen[$twin] = true;$selectedTwins[]=$twin;
+                $row = ap_masto_status_by_note_id($twin);
+                // A missing/private local twin must never revive its bridged copy.
+                if (!is_array($row)) continue;
+                $card = ap_masto_status_from_row($row, true, true);
+            } else {
+                $card = ap_normalize_from_bsky_post(['post'=>$post]);
+            }
+            if (!is_array($card) || !admin_direct_status_allowed($card, $owner)
+                || ($part !== 'focus' && ap_visibility_status_hidden($card, $owner))) continue;
+            $selectedUris[]=$uri;$cards[] = ['post'=>$post, 'card'=>$card];
+        }
+        $sources = admin_bsky_thread_source_snapshot(array_values(array_unique($selectedUris)), $selectedTwins);
+        ob_start();
+        foreach ($cards as $entry) admin_render_direct_status_card($entry['card'], $followingIds, $from, $part === 'focus', $part !== 'focus');
+        $html = (string) ob_get_clean();
+        // Never publish a buffered fragment after settings/account withdrawal.
+        if ($owner !== admin_owner_user_id() || $sources !== admin_bsky_thread_source_snapshot(array_values(array_unique($selectedUris)), $selectedTwins)
+            || $policy !== admin_bsky_thread_policy_snapshot($owner)
+            || !admin_bsky_thread_focus_allowed($focus, $owner)
+            || !admin_direct_status_allowed($source, $owner)) return null;
+        foreach ($cards as $entry) {
+            if (!($part === 'focus' ? admin_bsky_thread_focus_allowed(['post'=>$entry['post']], $owner) : admin_library_bsky_item_allowed(['post'=>$entry['post']], $owner, 0, true))
+                || !admin_direct_status_allowed($entry['card'], $owner)
+                || ($part !== 'focus' && ap_visibility_status_hidden($entry['card'], $owner))) return null;
+        }
+        return $html;
+    } catch (Throwable $e) {
+        while (ob_get_level() > $level) ob_end_clean();
+        return null;
+    } finally {
+        if ($galleryBudget === null) unset($GLOBALS['admin_bsky_gallery_repair_budget']);
+        else $GLOBALS['admin_bsky_gallery_repair_budget'] = $galleryBudget;
+    }
+}
+
+/** Validate a public PostView before its first cache write; repair only the focus. */
+function admin_bsky_thread_focus_item(string $at, int $owner, bool $repairFocus): ?array
+{
+    $cached=ap_bsky_post_item_by_uri($at);
+    if(is_array($cached) && (($cached['post']['uri']??'')!==$at
+        || !is_array($cached['post']??null) || !admin_bsky_thread_post_valid($cached['post'])))return null;
+    $forceRepair=$GLOBALS['vaak_bsky_force_media_repair']??null;
+    try {
+        if($repairFocus)$GLOBALS['vaak_bsky_force_media_repair']=true;
+        $thin=is_array($cached) && $repairFocus && function_exists('ap_bsky_post_embed_media_thin')
+            && ap_bsky_post_embed_media_thin($cached['post']);
+    } finally {
+        if($forceRepair===null)unset($GLOBALS['vaak_bsky_force_media_repair']);
+        else $GLOBALS['vaak_bsky_force_media_repair']=$forceRepair;
+    }
+    if(is_array($cached) && !$thin)return $cached;
+    $got=ap_bsky_xrpc(AP_BSKY_PUBLIC_API,'app.bsky.feed.getPosts','GET',['uris'=>$at],null,null,$thin?6:4);
+    if(empty($got['ok'])||!is_array($got['json']??null)){
+        if($thin&&function_exists('ap_bsky_post_preview_warm_enqueue'))ap_bsky_post_preview_warm_enqueue($at,$owner);
+        return $thin?$cached:null;
+    }
+    $posts=$got['json']['posts']??null;
+    if(!is_array($posts)||count($posts)!==1||!is_array($posts[0]??null)
+        || ($posts[0]['uri']??'')!==$at || !admin_bsky_thread_post_valid($posts[0]))return null;
+    $live=$posts[0];
+    if($thin){
+        // Preserve cached text/identity; refresh the original labels and ready media.
+        $post=$cached['post'];
+        $labels=ap_bsky_compact_label_list($live['labels']??null);if($labels!==[])$post['labels']=$labels;
+        if(is_array($live['record']['embed']??null))$post['record']['embed']=$live['record']['embed'];
+        $self=ap_bsky_compact_label_list($live['record']['labels']??($live['record']['selfLabels']??null));
+        if($self!==[])$post['record']['labels']=['$type'=>'com.atproto.label.defs#selfLabels','values'=>$self];
+        if(!is_array($live['embed']??null)){
+            try { ap_bsky_post_upsert_from_feed_item(['post'=>array_merge($post,[
+                'labels'=>$live['labels']??($post['labels']??[]),'record'=>$post['record']??($live['record']??[])])],$owner>0?$owner:null); } catch(Throwable $e) {}
+            return ['post'=>$post];
+        }
+        $embed=ap_bsky_post_embed_compact($live['embed']);
+        if(!is_array($embed))return ['post'=>$post];
+        $post['embed']=$embed;
+        // Successful media repair persists the validated LIVE snapshot, as PHP did.
+        try { ap_bsky_post_upsert_from_feed_item(['post'=>$live],$owner>0?$owner:null); } catch(Throwable $e) {}
+        return ['post'=>$post];
+    }
+    ap_bsky_post_upsert_from_feed_item(['post'=>$live],$owner>0?$owner:null);
+    return ['post'=>$live];
+}
+
+/** Resolve only the requested identity, never a same-rkey cache fallback. */
+function admin_bsky_thread_target_uri(string $object): ?string
+{
+    $object=trim($object);if(str_starts_with($object,'bsky:'))$object=substr($object,5);
+    if(preg_match('~^at://did:[^/\s]+/app\.bsky\.feed\.post/[A-Za-z0-9]+$~D',$object))return $object;
+    if(!preg_match('~^https://bsky\.app/profile/([^/?#]+)/post/([A-Za-z0-9]+)$~D',$object,$m))return null;
+    $actor=rawurldecode($m[1]);$rkey=$m[2];
+    if(str_starts_with($actor,'did:'))$did=$actor;
+    else{
+        $q=ap_db()->prepare('SELECT bsky_uri FROM bsky_posts WHERE lower(author_handle)=lower(?) AND bsky_uri LIKE ? LIMIT 2');
+        $q->execute([$actor,'%/app.bsky.feed.post/'.$rkey]);$matches=$q->fetchAll(PDO::FETCH_COLUMN);
+        if(count($matches)===1)return preg_match('~^at://did:[^/\s]+/app\.bsky\.feed\.post/[A-Za-z0-9]+$~D',$matches[0])?$matches[0]:null;
+        $r=ap_bsky_xrpc(AP_BSKY_PUBLIC_API,'com.atproto.identity.resolveHandle','GET',['handle'=>$actor],null,null,4);
+        $did=!empty($r['ok'])?($r['json']['did']??null):null;
+    }
+    return is_string($did)&&preg_match('~^did:[^/\s]+$~D',$did)?'at://'.$did.'/app.bsky.feed.post/'.$rkey:null;
+}
+
+function admin_bsky_thread_post_valid(array $post): bool
+{
+    return is_string($post['uri']??null) && is_array($post['author']??null)
+        && preg_match('~^at://(did:[^/\s]+)/app\.bsky\.feed\.post/[A-Za-z0-9]+$~D',$post['uri'],$m)
+        && is_string($post['author']['did']??null) && ($post['author']['did']??'')===$m[1]
+        && is_array($post['record']??null) && is_string($post['record']['text']??null)
+        && is_string($post['record']['createdAt']??null);
+}
+
+/** Explicit focus retains root mute/word behavior; nested material stays strict. */
+function admin_bsky_thread_focus_allowed(array $item, int $owner): bool
+{
+    $post=$item['post']??null;if(!is_array($post)||!admin_bsky_thread_post_valid($post))return false;
+    if(!empty($post['viewer']['blockedBy'])||!empty($post['author']['viewer']['blockedBy']))return false;
+    foreach(array_filter([$post['author']['did'], 'https://bsky.app/profile/'.$post['author']['did'],
+        !empty($post['author']['handle'])?'https://bsky.app/profile/'.$post['author']['handle']:'']) as $actor){
+        if(!function_exists('ap_actor_is_content_blocked')||ap_actor_is_content_blocked($actor,null,$owner))return false;
+    }
+    $q=ap_db()->prepare('SELECT 1 FROM bsky_hide_dids WHERE owner_user_id=? AND did=? LIMIT 1');$q->execute([$owner,$post['author']['did']]);
+    if($q->fetchColumn())return false;
+    $twin=admin_bsky_thread_local_twin($post['uri']);
+    if($twin!==null){
+        $row=ap_masto_status_by_note_id($twin);
+        if(!is_array($row)||!admin_direct_status_allowed(ap_masto_status_from_row($row,true,false),$owner))return false;
+    }
+    $status=ap_normalize_from_bsky_post($item);
+    if(!is_array($status)||!admin_direct_status_allowed($status,$owner)||admin_direct_status_content_blocked($status))return false;
+    if(is_array($post['embed']??null)&&!admin_library_bsky_item_allowed($post['embed'],$owner,0,true))return false;
+    if(is_array($post['record']['embed']??null)&&!admin_library_bsky_item_allowed($post['record']['embed'],$owner,0,true))return false;
+    return true;
+}
+
+/** Public AppView union: only a real ThreadViewPost can carry renderable material. */
+function admin_bsky_thread_node_valid(array $node): bool
+{
+    return ($node['$type']??null)==='app.bsky.feed.defs#threadViewPost'
+        && is_array($node['post']??null) && admin_bsky_thread_post_valid($node['post']);
+}
+
+/** Read current indexed associations without request-static memo or PDS repair. */
+function admin_bsky_thread_local_twin(string $uri): ?string
+{
+    $q=ap_db()->prepare('SELECT note_id FROM bsky_crossposts WHERE bsky_uri=? LIMIT 1');$q->execute([$uri]);
+    $id=$q->fetchColumn();if(is_string($id)&&$id!=='')return $id;
+    $q=ap_db()->prepare('SELECT fediverse_id,ap_object_id FROM bsky_post_links WHERE bsky_uri=? LIMIT 1');$q->execute([$uri]);
+    $row=$q->fetch(PDO::FETCH_ASSOC);if(!is_array($row))return null;
+    $id=rtrim((string)($row['fediverse_id']??$row['ap_object_id']??''),'/');
+    return $id!==''&&str_contains($id,'/notes/')?$id:null;
+}
+
+/** Complete raw rows for only this request's selected source/mapping/twins. */
+function admin_bsky_thread_source_snapshot(array $uris, array $twins): array
+{
+    $out=[];
+    foreach(['bsky_posts'=>['bsky_uri',$uris], 'bsky_crossposts'=>['bsky_uri',$uris], 'bsky_post_links'=>['bsky_uri',$uris],
+        'masto_statuses'=>['note_id',$twins], 'outbox_notes'=>['id',$twins]] as $table=>$scope){
+        [$column,$keys]=$scope;if(!$keys){$out[$table]=[];continue;}
+        $q=ap_db()->prepare('SELECT * FROM '.$table.' WHERE '.$column.' IN ('.implode(',',array_fill(0,count($keys),'?')).')');$q->execute($keys);
+        $rows=$q->fetchAll(PDO::FETCH_ASSOC);usort($rows,static fn($a,$b)=>strcmp(serialize($a),serialize($b)));$out[$table]=$rows;
+    }
+    return $out;
+}
+
+function admin_bsky_thread_policy_snapshot(int $owner): array
+{
+    $rows = [];
+    foreach (['ap_users'=>'id', 'bsky_sessions'=>'owner_user_id', 'bsky_hide_dids'=>'owner_user_id',
+        'ap_user_blocks'=>'owner_user_id', 'ap_mutes'=>'owner_user_id', 'ap_muted_words'=>'owner_user_id'] as $table=>$column) {
+        $q=ap_db()->prepare('SELECT * FROM '.$table.' WHERE '.$column.' = ?');$q->execute([$owner]);
+        $values=$q->fetchAll(PDO::FETCH_ASSOC);usort($values,static fn($a,$b)=>strcmp(serialize($a),serialize($b)));$rows[$table]=$values;
+    }
+    $q=ap_db()->prepare('SELECT p.* FROM actor_profile p JOIN ap_users u ON u.actor_key=p.actor_key WHERE u.id=?');$q->execute([$owner]);$rows['profile']=$q->fetchAll(PDO::FETCH_ASSOC);
+    if($owner>0 && (count($rows['ap_users'])!==1 || !empty($rows['ap_users'][0]['disabled_at'])
+        || (session_status()===PHP_SESSION_ACTIVE && (int)($_SESSION['vaak_user_id']??0)!==$owner)))throw new RuntimeException('thread owner withdrawn');
+    $rows['server']=ap_db()->query('SELECT * FROM ap_blocks')->fetchAll(PDO::FETCH_ASSOC);
+    usort($rows['server'],static fn($a,$b)=>strcmp(serialize($a),serialize($b)));
+    return $rows;
+}
+
+/** Original AppView order, oldest ancestor first; depth/node/cycle bounded. */
+function admin_bsky_thread_posts(array $tree, string $focus, bool $ancestors, bool $replies): array
+{
+    $out=[];$seen=[$focus=>true];
+    $valid=static function(array $node): ?array {
+        if(!admin_bsky_thread_node_valid($node))return null;
+        $post=$node['post']??null;
+        return is_array($post)&&admin_bsky_thread_post_valid($post)?$post:null;
+    };
+    if($ancestors){$parents=[];$node=$tree;
+        for($depth=0;$depth<12;$depth++){
+            $previous=$node['post']??[];$node=$node['parent']??null;if(!is_array($node))break;
+            $post=$valid($node);if($post===null||isset($seen[$post['uri']]) || ($previous['record']['reply']['parent']['uri']??'')!==$post['uri'])break;
+            $seen[$post['uri']]=true;$parents[]=$post;
+        }$out=array_reverse($parents);
+    }
+    $examined=0;
+    $walk=static function(array $node,int $depth,string $parent) use(&$walk,&$out,&$seen,&$examined,$valid):void{
+        if($depth>4||count($out)>=40||$examined++>=80)return;
+        $post=$valid($node);if($post===null||isset($seen[$post['uri']]) || ($post['record']['reply']['parent']['uri']??'')!==$parent)return;
+        $seen[$post['uri']]=true;$out[]=$post;
+        foreach(is_array($node['replies']??null)?$node['replies']:[] as $child){if(count($out)>=40||$examined>=80)break;if(is_array($child))$walk($child,$depth+1,$post['uri']);}
+    };
+    if($replies)foreach(is_array($tree['replies']??null)?$tree['replies']:[] as $child){if(count($out)>=40||$examined>=80)break;if(is_array($child))$walk($child,1,$focus);}
+    return $out;
+}
+
 // AJAX fragment: Status Open — ancestors and/or replies (Mastodon-style progressive load)
 if ($isPartial && $view === 'status' && isset($_GET['thread'])) {
     $stObject = trim((string) ($_GET['object'] ?? ''));
@@ -20876,6 +21142,13 @@ if ($isPartial && $view === 'status' && isset($_GET['thread'])) {
     }
     header('Content-Type: text/html; charset=utf-8');
     header('Cache-Control: no-store');
+    if (admin_object_is_bluesky_post($stObject)) {
+        require_once __DIR__.'/ap-bsky.php';
+        require_once __DIR__.'/ap-masto-entities.php';
+        $html=admin_bsky_thread_fragment($stObject,$threadPart,$stFrom,$followingIds);
+        if($html===null){http_response_code(404);exit;}
+        echo $html;exit;
+    }
     if ($stObject === '' || !str_starts_with($stObject, 'https://')) {
         echo '<div class="meta">Missing post URL.</div>';
         exit;
@@ -22880,9 +23153,9 @@ function admin_library_render_context_allowed(array $status, int $ownerUserId, a
  * Walk PostView/RecordView, repost authors and nested quotes before either painter.
  * Labels remain under the existing sensitive/CW renderer and saved unblur setting.
  */
-function admin_library_bsky_item_allowed(array $item, int $ownerUserId, int $depth = 0): bool
+function admin_library_bsky_item_allowed(array $item, int $ownerUserId, int $depth = 0, bool $allowGuest = false): bool
 {
-    if ($ownerUserId < 1 || $depth > 16 || !function_exists('ap_visibility_actor_hidden')
+    if (($ownerUserId < 1 && !$allowGuest) || $depth > 16 || !function_exists('ap_visibility_actor_hidden')
         || !function_exists('ap_muted_words_match')) {
         return false;
     }
@@ -22910,7 +23183,7 @@ function admin_library_bsky_item_allowed(array $item, int $ownerUserId, int $dep
             || !empty($item['author']['viewer']['blockedBy'])) return false;
         if (ap_muted_words_match($ownerUserId, (string) ($item['text'] ?? ''), '') !== null) return false;
         foreach ($item as $value) {
-            if (is_array($value) && !admin_library_bsky_item_allowed($value, $ownerUserId, $depth + 1)) return false;
+            if (is_array($value) && !admin_library_bsky_item_allowed($value, $ownerUserId, $depth + 1, $allowGuest)) return false;
         }
         return true;
     } catch (Throwable $e) {
@@ -28778,7 +29051,6 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
             <?php
               $isOut = ($m['direction'] ?? '') === 'out';
               $msgHtml = admin_dm_html($m['content'] ?? null, $m);
-              $msgObj = (string) ($m['object_id'] ?? '');
               $dmReplyContext = admin_dm_reply_context_html((string) ($m['in_reply_to'] ?? ''), 'dms');
             ?>
             <article class="tweet"<?= $dmIndex === count($thread) - 1 ? ' id="dm-message-last"' : '' ?>>
@@ -28799,11 +29071,6 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
                     echo admin_media_row_html($dMedia);
                 }
               ?>
-              <div class="tweet-actions">
-                <?php if ($msgObj !== '' && str_starts_with($msgObj, 'https://')): ?>
-                  <a href="<?= h($msgObj) ?>" target="_blank" rel="noopener noreferrer" class="meta">Open remote</a>
-                <?php endif; ?>
-              </div>
             </article>
           <?php endforeach; ?>
           </div>
@@ -32377,18 +32644,13 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
           // Ask answers: prefer local ap_asks via ap_normalize_status / vaak_ask
           // on the local masto row. Mentions still carry Wafrn remote Ask fields.
           $stAskStatus = null;
-          $stBskyItem = null;
+          $stBskyFocusHtml = null;
           $isSyntheticBite = str_contains($stObject, '/bites-received/');
           if ($stObject !== '' && (str_starts_with($stObject, 'bsky:') || str_starts_with($stObject, 'at://'))) {
               if (str_starts_with($stObject, 'bsky:')) {
                   $stObject = substr($stObject, 5);
               }
-              if (str_starts_with($stObject, 'at://') && function_exists('ap_bsky_https_url_from_at_uri')) {
-                  $https = ap_bsky_https_url_from_at_uri($stObject, null);
-                  if (is_string($https) && str_starts_with($https, 'https://')) {
-                      $stObject = $https;
-                  }
-              }
+
           }
           $stIsBskyObject = $stObject !== '' && function_exists('admin_object_is_bluesky_post')
               && admin_object_is_bluesky_post($stObject);
@@ -32397,13 +32659,13 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
                   // Status focus: allow a small sync AppView repair so NSFW/thin
                   // media paints behind a CW instead of waiting on warm.
                   $GLOBALS['admin_bsky_gallery_repair_budget'] = 2;
-                  $stBskyItem = ap_bsky_feed_item_from_any_url($stObject, admin_owner_user_id(), true);
+                  $stBskyFocusHtml = admin_bsky_thread_fragment($stObject, 'focus', $stFrom, $followingIds);
               } catch (Throwable $e) {
                   error_log('[ap-admin] status bsky hydrate: ' . $e->getMessage());
-                  $stBskyItem = null;
+                  $stBskyFocusHtml = null;
               }
           }
-          if ($stObject !== '' && str_starts_with($stObject, 'https://') && !is_array($stBskyItem)) {
+          if ($stObject !== '' && str_starts_with($stObject, 'https://') && !$stIsBskyObject) {
               // Strip like/reblog/bite interaction fragments so Open hits the real Note.
               if (function_exists('ap_masto_mention_target_object_id')) {
                   $stObject = ap_masto_mention_target_object_id($stObject);
@@ -32618,45 +32880,20 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
               to unblock.
             </div>
           </div>
-        <?php elseif (is_array($stBskyItem)): ?>
-          <?php
-            $stBskyCtx = in_array($stFrom, ['mentions', 'home', 'feed', 'local'], true) ? 'home' : 'bluesky';
-            $stBskyParentLocal = null;
-            $stBskyParentItem = null;
-            $stBskyParentPrev = function_exists('ap_bsky_reply_parent_preview')
-                ? ap_bsky_reply_parent_preview($stBskyItem)
-                : null;
-            $stBskyParentUri = is_array($stBskyParentPrev) ? trim((string) ($stBskyParentPrev['uri'] ?? '')) : '';
-            $stBskyParentUrl = is_array($stBskyParentPrev) ? rtrim((string) ($stBskyParentPrev['url'] ?? ''), '/') : '';
-            if ($stBskyParentUri !== '' && function_exists('ap_bsky_local_note_id_for_at_uri')) {
-                $stBskyTwin = ap_bsky_local_note_id_for_at_uri($stBskyParentUri, admin_owner_user_id());
-                if (is_string($stBskyTwin) && str_starts_with($stBskyTwin, 'https://')
-                    && function_exists('ap_masto_status_by_note_id')) {
-                    $stBskyTwinRow = ap_masto_status_by_note_id($stBskyTwin);
-                    if (is_array($stBskyTwinRow) && function_exists('ap_masto_status_from_row')) {
-                        $stBskyParentLocal = ap_masto_status_from_row($stBskyTwinRow, true, true);
-                    }
-                }
-            }
-            if ($stBskyParentLocal === null && ($stBskyParentUrl !== '' || $stBskyParentUri !== '')
-                && function_exists('ap_bsky_feed_item_from_any_url')) {
-                $stBskyParentItem = ap_bsky_feed_item_from_any_url(
-                    $stBskyParentUrl !== '' ? $stBskyParentUrl : $stBskyParentUri,
-                    admin_owner_user_id(),
-                    true
-                );
-            }
-          ?>
-          <?php if (is_array($stBskyParentLocal)): ?>
-            <div class="meta" style="margin:0 0 .5rem">Your post</div>
-            <?php admin_render_masto_status_card($stBskyParentLocal, $followingIds, $stFrom, false, true); ?>
-          <?php elseif (is_array($stBskyParentItem)): ?>
-            <div class="meta" style="margin:0 0 .5rem">Parent post</div>
-            <?php admin_render_bsky_feed_item($stBskyParentItem, 'following', $stBskyCtx); ?>
-          <?php endif; ?>
-          <div id="status-focus">
-            <?php admin_render_bsky_feed_item($stBskyItem, 'following', $stBskyCtx); ?>
+        <?php elseif ($stIsBskyObject): ?>
+          <?php if ($stBskyFocusHtml === null): ?>
+            <div class="empty">This post is unavailable or hidden.</div>
+          <?php else: ?>
+          <div id="status-thread-ancestors" data-object="<?= h($stObject) ?>" data-from="<?= h($stFrom) ?>" data-need-more="1">
+            <div class="meta status-thread-loading" style="margin-bottom:.5rem">Loading earlier posts…</div>
           </div>
+          <div id="status-focus">
+            <?= $stBskyFocusHtml ?>
+          </div>
+          <div id="status-thread-descendants" data-object="<?= h($stObject) ?>" data-from="<?= h($stFrom) ?>" data-need-more="1" data-seen-count="0">
+            <div class="meta status-thread-loading" style="margin-top:1rem">Loading replies…</div>
+          </div>
+          <?php endif; ?>
         <?php elseif (!is_array($stEvent) && !is_array($stLocalStatus)): ?>
           <?php if (!empty($isSyntheticBite) || str_contains($stObject, '/bites-received/')): ?>
             <div class="empty">No associated post — this was an account bite, not a post bite.</div>

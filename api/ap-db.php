@@ -1995,6 +1995,9 @@ CREATE TABLE mentions (
     activity_type TEXT,
     spoiler_text TEXT NOT NULL DEFAULT '',
     sensitive INTEGER NOT NULL DEFAULT 0,
+    ask_actor TEXT NOT NULL DEFAULT '',
+    ask_question TEXT NOT NULL DEFAULT '',
+    ask_answer TEXT NOT NULL DEFAULT '',
     UNIQUE(owner_user_id, object_id)
 );
 CREATE INDEX IF NOT EXISTS idx_mentions_created ON mentions(created_at);
@@ -2003,10 +2006,12 @@ SQL);
         $db->prepare(
             'INSERT OR IGNORE INTO mentions
              (owner_user_id, owner_actor_id, created_at, activity_id, object_id, actor_id, type, content,
-              in_reply_to, deleted_at, media_urls, activity_type, spoiler_text, sensitive)
+              in_reply_to, deleted_at, media_urls, activity_type, spoiler_text, sensitive,
+              ask_actor, ask_question, ask_answer)
              SELECT ?, ?, created_at, activity_id, object_id, actor_id, type, content,
                     in_reply_to, deleted_at, media_urls, activity_type,
-                    COALESCE(spoiler_text, \'\'), COALESCE(sensitive, 0)
+                    COALESCE(spoiler_text, \'\'), COALESCE(sensitive, 0),
+                    COALESCE(ask_actor, \'\'), COALESCE(ask_question, \'\'), COALESCE(ask_answer, \'\')
              FROM mentions_legacy_f'
         )->execute([$cmdrUserId, $cmdrActorId]);
         $db->exec('DROP TABLE mentions_legacy_f');

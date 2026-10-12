@@ -234,8 +234,8 @@ pub(crate) fn normalized_actions(status:&Value,facts:&CardFacts,show_open:bool)-
     html.push_str(&button("repost",post,facts,b,&object,view,!b.repost_record.is_empty(),n(post,"repostCount").max(n(status,"reblogs_count")),false,false));
     html.push_str(&button("like",post,facts,b,&object,view,liked,n(post,"likeCount").max(n(status,"favourites_count")),false,false));
     html.push_str(&button("bookmark",post,facts,b,&object,view,bookmarked,0,false,false));
-    let moderation=super::actions::render_moderation(&FediActionContext{owner_id:facts.owner_id,status_id:s(status,"id").into(),object_id:uri.into(),actor_id:actor.into(),remote_url:s(status,"url").into(),return_view:view.clone(),reply_mentions:mentions,spoiler:s(status,"spoiler_text").into(),sensitive:yes(status,"sensitive"),favourited:liked,bookmarked,boosted:false,counts:Counts::default(),csrf:facts.csrf.clone(),moderation:facts.moderation.clone()});
-    if moderation.is_empty()||!uri.starts_with("https://"){html.push_str(&super::actions::read_only_overflow_mode(uri,view,&super::card::remote_object_href(uri,status.get("url"))?,show_open));}
+    let moderation=super::actions::render_moderation_with_protocol_navigation(&FediActionContext{owner_id:facts.owner_id,status_id:s(status,"id").into(),object_id:uri.into(),actor_id:actor.into(),remote_url:if uri.starts_with("https://"){s(status,"url").into()}else{super::card::remote_object_href(uri,status.get("url"))?},return_view:view.clone(),reply_mentions:mentions,spoiler:s(status,"spoiler_text").into(),sensitive:yes(status,"sensitive"),favourited:liked,bookmarked,boosted:false,counts:Counts::default(),csrf:facts.csrf.clone(),moderation:facts.moderation.clone()}, view, Some(show_open));
+    if moderation.is_empty(){html.push_str(&super::actions::read_only_overflow_mode(uri,view,&super::card::remote_object_href(uri,status.get("url"))?,show_open));}
     // PHP report-object transport only admits HTTP object targets, never AT URIs.
     html.push_str(&moderation.replace(&format!("&amp;report_object={}",query(uri)),""));
     html.push_str("</div>");Ok(html)
