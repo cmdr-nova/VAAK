@@ -971,7 +971,7 @@ $vaakAdminOnlyActions = [
         'block_add', 'block_actor', 'block_domain', 'unblock',
         'relay_add', 'relay_enable', 'relay_disable', 'relay_remove',
         'report_dismiss', 'report_ignore', 'report_reopen', 'report_note',
-        'invite_create', 'registration_approve', 'registration_reject',
+        'invite_create', 'registration_approve', 'registration_reject', 'registration_open', 'registration_close',
         'user_ban', 'user_unban',
         'policies_save_privacy', 'policies_save_conduct', 'policies_save_rules',
         'downrank_term_add', 'downrank_term_delete', 'downrank_signal_clear', 'downrank_term_preview',
@@ -4260,12 +4260,23 @@ $vaakAdminOnlyActions = [
                 $error = $res['error'] ?? 'Could not save notice.';
             }
         }
+    } elseif ($action === 'registration_open' || $action === 'registration_close') {
+        $view = 'approvals';
+        $res = ap_registration_set_accepting($action === 'registration_open', $csrfToken);
+        if (!empty($res['ok'])) $notice = $res['accepting'] ? (ap_registration_approvals_enabled() ? 'Registration reopened. Applications still require approval.' : 'Registration reopened. Invites are required.') : 'Registration closed. Pending applications remain reviewable.';
+        else $error = (string) ($res['error'] ?? 'Could not change registration.');
     } elseif ($action === 'registration_approve' || $action === 'registration_reject') {
         $view = 'approvals';
         $res = ap_registration_decide((int) ($_POST['application_id'] ?? 0),
             $action === 'registration_approve' ? 'approved' : 'rejected', $csrfToken);
         if (!empty($res['ok'])) $notice = !empty($res['provisioning_failed']) ? 'Account approved; provisioning needs operator attention.' : (!empty($res['already_decided']) ? 'Application already decided.' : 'Application decided.');
         else $error = (string) ($res['error'] ?? 'Could not decide application.');
+        if (!empty($res['ok']) && isset($res['approval_email'])) $notice .= match ($res['approval_email']) {
+            'sent' => ' Approval email sent.',
+            'no_email' => ' No email address supplied.',
+            'not_provisioned' => ' Approval email skipped until provisioning is complete.',
+            default => ' Approval email could not be sent; account approval is saved.',
+        };
     } elseif ($action === 'invite_create') {
         $view = 'invites';
         if (!$vaakIsAdmin) {
@@ -29719,10 +29730,14 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
       <?php elseif ($view === 'approvals'): ?>
         <?php if (!ap_registration_current_admin(ap_db())): ?>
           <div class="empty">Admin only.</div>
-        <?php elseif (($adminNativeBody = ap_admin_native_read_body('approvals', max(0,(int)($_GET['approval_offset']??0)))) !== null): ?>
-          <?= $adminNativeBody ?>
+        <?php /* Retain PHP Approvals until native body includes registration controls. */ ?>
         <?php else: ?>
-          <p class="meta"><?= ap_registration_approvals_enabled() ? 'Applications require approval before an account is created.' : 'Registration applications are closed. Invite registration continues as usual.' ?></p>
+          <?php $registrationAccepting = ap_registration_accepting(); ?>
+          <p class="meta" role="status"><?= $registrationAccepting ? 'Registration open.' : 'Registration closed.' ?> <?= ap_registration_approvals_enabled() ? 'Applications require approval before an account is created.' : 'Public applications are disabled; invites are required when registration is open.' ?> Pending applications remain reviewable.</p>
+          <form method="post" action="?view=approvals">
+            <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
+            <button class="btn" name="action" value="<?= $registrationAccepting ? 'registration_close' : 'registration_open' ?>"><?= $registrationAccepting ? 'Close registration' : 'Reopen registration' ?></button>
+          </form>
           <?php $applicationOffset = max(0, (int) ($_GET['approval_offset'] ?? 0)); $applicationRows = ap_registration_applications_list($applicationOffset); ?>
           <?php if ($applicationRows === []): ?><div class="empty">No applications.</div><?php endif; ?>
           <?php foreach ($applicationRows as $application): ?>

@@ -2,8 +2,9 @@
 declare(strict_types=1);
 
 /** Reuse the existing Clearance/Brevo sender without storing SMTP secrets in Vaak. */
-function ap_mail_send(string $to, string $subject, string $text, string $html): bool
+function ap_mail_send(string $to, string $subject, string $text, string $html, ?float $totalTimeout = null): bool
 {
+    $deadline = $totalTimeout === null ? null : hrtime(true) / 1e9 + max(0.01, min(20.0, $totalTimeout));
     if (!filter_var($to, FILTER_VALIDATE_EMAIL)) {
         return false;
     }
@@ -23,15 +24,26 @@ function ap_mail_send(string $to, string $subject, string $text, string $html): 
     $from = (string) ($cfg['smtp_from_email'] ?? 'clearance@mkultra.monster');
     $fromName = (string) ($cfg['smtp_from_name'] ?? 'Vaak');
     $messageId = sprintf('<%s.%s@mkultra.monster>', bin2hex(random_bytes(8)), gmdate('YmdHis'));
-    $fp = @stream_socket_client("tcp://{$host}:{$port}", $errno, $errstr, 20, STREAM_CLIENT_CONNECT);
+    $remaining = static function () use ($deadline): float {
+        $seconds = $deadline === null ? 20.0 : $deadline - hrtime(true) / 1e9;
+        if ($seconds <= 0) throw new RuntimeException('SMTP deadline exceeded');
+        return min(20.0, $seconds);
+    };
+    $fp = null;
+    try {
+    $fp = @stream_socket_client("tcp://{$host}:{$port}", $errno, $errstr, $remaining(), STREAM_CLIENT_CONNECT);
     if (!$fp) {
-        error_log('[ap-mail] SMTP connect failed: ' . $errstr);
+        error_log($deadline === null ? '[ap-mail] SMTP connect failed: ' . $errstr : '[ap-mail] Approval SMTP connection failed.');
         return false;
     }
-    stream_set_timeout($fp, 20);
-    $read = static function () use ($fp): string {
+    $setTimeout = static function () use ($fp, $remaining): void {
+        $seconds = $remaining();
+        stream_set_timeout($fp, (int)$seconds, max(1, (int)(($seconds - (int)$seconds) * 1000000)));
+    };
+    $read = static function () use ($fp, $setTimeout): string {
         $out = '';
         while (!feof($fp)) {
+            $setTimeout();
             $line = fgets($fp, 515);
             if ($line === false) break;
             $out .= $line;
@@ -43,10 +55,19 @@ function ap_mail_send(string $to, string $subject, string $text, string $html): 
         $resp = $read();
         if (!str_starts_with($resp, $prefix)) throw new RuntimeException(trim($resp));
     };
-    $write = static function (string $line) use ($fp): void { fwrite($fp, $line . "\r\n"); };
-    try {
+    $writeBytes = static function (string $bytes) use ($fp, $setTimeout): void {
+        $offset = 0;
+        while ($offset < strlen($bytes)) {
+            $setTimeout();
+            $written = fwrite($fp, substr($bytes, $offset));
+            if ($written === false || $written === 0) throw new RuntimeException('SMTP write failed');
+            $offset += $written;
+        }
+    };
+    $write = static function (string $line) use ($writeBytes): void { $writeBytes($line . "\r\n"); };
         $expect('220'); $write('EHLO mkultra.monster'); $expect('250');
         $write('STARTTLS'); $expect('220');
+        $setTimeout();
         if (!stream_socket_enable_crypto($fp, true, STREAM_CRYPTO_METHOD_TLS_CLIENT)) throw new RuntimeException('TLS failed');
         $write('EHLO mkultra.monster'); $expect('250'); $write('AUTH LOGIN'); $expect('334');
         $write(base64_encode((string) $cfg['smtp_user'])); $expect('334'); $write(base64_encode((string) $cfg['smtp_pass'])); $expect('235');
@@ -72,10 +93,15 @@ function ap_mail_send(string $to, string $subject, string $text, string $html): 
             . $html . "\r\n"
             . '--' . $boundary . "--\r\n";
         $body = preg_replace('/^\./m', '..', $body) ?? $body;
-        fwrite($fp, $body . "\r\n.\r\n"); $expect('250'); $write('QUIT'); fclose($fp);
-        error_log('[ap-mail] sent to=' . $to . ' subject=' . $subject . ' id=' . $messageId);
+        $writeBytes($body . "\r\n.\r\n"); $expect('250');
+        // DATA acceptance is delivery success; QUIT cannot reverse that receipt.
+        if ($deadline === null) $write('QUIT');
+        fclose($fp);
+        error_log($deadline === null ? '[ap-mail] sent to=' . $to . ' subject=' . $subject . ' id=' . $messageId : '[ap-mail] Approval email sent.');
         return true;
     } catch (Throwable $e) {
-        fclose($fp); error_log('[ap-mail] ' . $e->getMessage()); return false;
+        if (is_resource($fp)) fclose($fp);
+        error_log($deadline === null ? '[ap-mail] ' . $e->getMessage() : '[ap-mail] Approval email unavailable.');
+        return false;
     }
 }

@@ -372,13 +372,15 @@ if ($isAuthPost) {
         }
     } elseif ($postAction === 'register' || $mode === 'register') {
         $application = ap_registration_approvals_enabled();
-        $res = $application && !ap_registration_rate_admit()
+        $res = !ap_registration_accepting()
+            ? ['ok'=>false,'error'=>'Registration is closed.']
+            : ($application && !ap_registration_rate_admit()
             ? ['ok'=>false,'error'=>'Too many application attempts. Try again in 15 minutes.']
             : ($application
             ? ap_registration_submit((string) ($_POST['username'] ?? ''), (string) ($_POST['password'] ?? ''),
                 (string) ($_POST['email'] ?? ''), (string) ($_POST['csrf'] ?? ''), (string) ($_POST['invite'] ?? ''))
             : ap_auth_register((string) ($_POST['invite'] ?? ''), (string) ($_POST['username'] ?? ''),
-                (string) ($_POST['password'] ?? ''), (string) ($_POST['email'] ?? '')));
+                (string) ($_POST['password'] ?? ''), (string) ($_POST['email'] ?? ''))));
         if (!empty($res['ok']) && empty($res['pending'])) {
             header('Location: /vaak/?view=home', true, 302);
             exit;
@@ -724,9 +726,12 @@ ASCII;
       </form>
       <p class="switch"><a href="/vaak/?mode=login">Back to login</a></p>
     <?php elseif ($mode === 'register'): ?>
+      <?php $registrationAccepting = ap_registration_accepting(); ?>
+      <?php if (!$registrationAccepting): ?><p class="hint" id="registration-closed" role="status">Registration closed. Existing accounts can still log in.</p><?php endif; ?>
       <form method="post" action="/vaak/?mode=register" autocomplete="on">
         <input type="hidden" name="csrf" value="<?= $csrf ?>">
         <input type="hidden" name="action" value="register">
+        <fieldset <?= $registrationAccepting ? '' : 'disabled aria-describedby="registration-closed"' ?> style="border:0;padding:0;margin:0;min-width:0;<?= $registrationAccepting ? '' : 'opacity:.5' ?>">
         <label for="username">Username</label>
         <input id="username" name="username" required autocomplete="username" pattern="[A-Za-z][A-Za-z0-9_]{1,29}"
                placeholder="your_name"
@@ -742,6 +747,7 @@ ASCII;
                value="<?= htmlspecialchars((string) ($_POST['invite'] ?? $_GET['invite'] ?? ''), ENT_QUOTES, 'UTF-8') ?>">
         <?php if (ap_registration_approvals_enabled()): ?><p class="hint">Every application needs administrator approval. Paid Clearance supporters may enter a reward code for a Supporter badge, using the email they paid with. A code is not required.</p><?php endif; ?>
         <button type="submit"><?= ap_registration_approvals_enabled() ? 'Apply for an account' : 'Create account' ?></button>
+        </fieldset>
       </form>
       <p class="switch">Have an account? <a href="/vaak/?mode=login">Log in</a></p>
     <?php else: ?>
@@ -765,7 +771,7 @@ ASCII;
                placeholder="••••••••••">
         <button type="submit">Log in</button>
       </form>
-      <p class="switch"><?= ap_registration_approvals_enabled() ? 'Applications are open.' : 'Have an invite?' ?> <a href="/vaak/?mode=register">Register</a><br><a href="/vaak/?mode=forgot">Forgot password?</a></p>
+      <p class="switch"><?= !ap_registration_accepting() ? 'Registration closed.' : (ap_registration_approvals_enabled() ? 'Applications are open.' : 'Have an invite?') ?> <a href="/vaak/?mode=register">Register</a><br><a href="/vaak/?mode=forgot">Forgot password?</a></p>
     <?php endif; ?>
 
     <div class="landing-mascot-mobile" aria-hidden="true"><img src="/api/assets/mascot/vaak-landing.webp" alt=""></div>

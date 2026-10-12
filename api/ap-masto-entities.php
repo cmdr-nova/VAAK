@@ -1721,10 +1721,11 @@ function ap_masto_instance_v1(): array
     if (!function_exists('ap_registration_approvals_enabled')) {
         require_once __DIR__ . '/ap-registration-approvals.php';
     }
-    $applicationsOpen = ap_registration_approvals_enabled();
-    $description = $applicationsOpen
+    $registrationAccepting = ap_registration_accepting();
+    $applicationsOpen = ap_registration_approvals_enabled() && $registrationAccepting;
+    $description = !$registrationAccepting ? 'ActivityPub / Mastodon-compatible instance (NovaLandia). Registration is closed.' : ($applicationsOpen
         ? 'ActivityPub / Mastodon-compatible instance (NovaLandia). Account applications require administrator approval.'
-        : 'Invite-only ActivityPub / Mastodon-compatible instance (NovaLandia).';
+        : 'Invite-only ActivityPub / Mastodon-compatible instance (NovaLandia).');
     // Admin contact stays cmdr_nova regardless of any request session/token.
     $contactUser = null;
     try {
@@ -1762,8 +1763,8 @@ function ap_masto_instance_v1(): array
         'thumbnail' => $account['avatar'],
         'languages' => ['en'],
         'registrations' => $applicationsOpen,
-        'approval_required' => $applicationsOpen,
-        'invites_enabled' => !$applicationsOpen,
+        'approval_required' => ap_registration_approvals_enabled(),
+        'invites_enabled' => $registrationAccepting && !ap_registration_approvals_enabled(),
         'configuration' => [
             'statuses' => [
                 'max_characters' => 2000,
