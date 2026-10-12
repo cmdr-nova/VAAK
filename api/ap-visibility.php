@@ -109,7 +109,7 @@ function ap_visibility_filter_statuses(array $statuses, int $ownerUserId): array
 }
 
 /** Apply moderation to the whole card, including nested boosts and quotes. */
-function ap_visibility_status_hidden(array $status, int $ownerUserId, int $depth = 0): bool
+function ap_visibility_status_hidden(array $status, int $ownerUserId, int $depth = 0, bool $ordinaryRoot = false): bool
 {
     if ($depth > 16) {
         return true;
@@ -122,7 +122,8 @@ function ap_visibility_status_hidden(array $status, int $ownerUserId, int $depth
     }
     if (function_exists('ap_muted_words_match') && ap_muted_words_match(
         $ownerUserId, (string) ($status['content'] ?? ''), (string) ($status['spoiler_text'] ?? '')
-    ) !== null) {
+    ) !== null && !($ordinaryRoot && $depth === 0
+        && ap_ordinary_note_owned((string)($status['uri']??''), $ownerUserId, (string)($status['account']['uri']??'')))) {
         return true;
     }
     foreach (['reblog', 'quote', 'vaak_quote_preview'] as $field) {

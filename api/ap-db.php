@@ -2708,9 +2708,10 @@ function ap_profile_badge_catalog(bool $includeAdmin = true): array
 }
 
 /** @return list<string> */
-function ap_profile_normalize_badges(mixed $badges, bool $allowAdmin = true): array
+function ap_profile_normalize_badges(mixed $badges, bool $allowAdmin = true, bool $includeReserved = true): array
 {
     $allowed = ap_profile_badge_catalog($allowAdmin);
+    if (!$includeReserved) unset($allowed['admin'], $allowed['supporter']);
     if (is_string($badges)) {
         $decoded = json_decode($badges, true);
         $badges = is_array($decoded) ? $decoded : [];
@@ -2718,14 +2719,16 @@ function ap_profile_normalize_badges(mixed $badges, bool $allowAdmin = true): ar
     if (!is_array($badges)) {
         return [];
     }
-    $earned = count(array_filter($badges, fn($b) => is_string($b) && trim($b) === 'supporter')) > 0;
+    $earned = $includeReserved && count(array_filter($badges, fn($b) => is_string($b) && trim($b) === 'supporter')) > 0;
+    $admin = $includeReserved && $allowAdmin && count(array_filter($badges, fn($b) => is_string($b) && trim($b) === 'admin')) > 0;
     $out = $earned ? ['supporter'] : [];
+    if ($admin) $out[] = 'admin';
     foreach ($badges as $badge) {
         $key = is_string($badge) ? trim($badge) : '';
         if ($key !== '' && isset($allowed[$key]) && !in_array($key, $out, true)) {
             $out[] = $key;
         }
-        if (count($out) >= (in_array('supporter', $out, true) ? 7 : 6)) {
+        if (count($out) >= 6 + (int)$earned + (int)$admin) {
             break;
         }
     }
@@ -2772,8 +2775,14 @@ function ap_profile_supporter_awarded(string $actorKey): bool
 }
 function ap_profile_authorized_badges(mixed $badges,string $actorKey): array
 {
-    $out=ap_profile_normalize_badges($badges);
-    $out=array_slice(array_values(array_diff($out,['supporter'])),0,6);
+    // Reserved badges come from current account authority, never stored flair.
+    // Filter before the six-slot limit so forged keys cannot displace real flair.
+    $out=ap_profile_normalize_badges($badges, false, false);
+    try {
+        $st=ap_db()->prepare('SELECT 1 FROM ap_users WHERE actor_key=? AND is_admin<>0 AND disabled_at IS NULL LIMIT 1');
+        $st->execute([$actorKey]);
+        if ($st->fetchColumn()) array_unshift($out,'admin');
+    } catch (Throwable $e) { /* Missing account authority fails closed. */ }
     if (ap_profile_supporter_awarded($actorKey)) array_unshift($out,'supporter');
     return $out;
 }
@@ -2791,6 +2800,7 @@ $cached['profile_badges']=ap_profile_authorized_badges($cached['profile_badges']
     $row = $stmt->fetch();
     $d = ap_profile_defaults($actorKey);
     if (!$row) {
+        $d['profile_badges'] = ap_profile_authorized_badges($d['profile_badges'] ?? [], $actorKey);
         if (function_exists('ap_redis_json_set')) ap_redis_json_set($profileCacheKey, $d, 60);
         return $d;
     }
@@ -3118,11 +3128,9 @@ function ap_profile_save_unlocked(array $fields, string $actorKey = 'cmdr_nova')
         ? (string) $fields['reply_policy'] : (string) ($existingProfile['reply_policy'] ?? 'anyone');
     $quotePolicy = in_array((string) ($fields['quote_policy'] ?? ''), ['anyone', 'followers', 'nobody'], true)
         ? (string) $fields['quote_policy'] : (string) ($existingProfile['quote_policy'] ?? 'anyone');
-    $profileBadges = array_key_exists('profile_badges', $fields)
-        ? ap_profile_normalize_badges($fields['profile_badges'], $actorKey === 'cmdr_nova')
-        : ap_profile_normalize_badges($existingProfile['profile_badges'] ?? [], $actorKey === 'cmdr_nova');
-    $profileBadges = array_values(array_diff($profileBadges, ['supporter']));
-    if (in_array('supporter',ap_profile_normalize_badges($existingProfile['profile_badges'] ?? []),true) && ap_profile_supporter_awarded($actorKey)) array_unshift($profileBadges, 'supporter');
+    $profileBadges = ap_profile_authorized_badges(
+        array_key_exists('profile_badges', $fields) ? $fields['profile_badges'] : ($existingProfile['profile_badges'] ?? []), $actorKey
+    );
     $hideProfileReplies = array_key_exists('hide_profile_replies', $fields)
         ? (!empty($fields['hide_profile_replies']) ? 1 : 0)
         : (!empty($existingProfile['hide_profile_replies']) ? 1 : 0);
@@ -16312,4 +16320,50 @@ function ap_remote_media_expired(int $unusedDays = 7, int $limit = 200): array
 function ap_remote_media_delete_row(int $id): void
 {
     ap_db()->prepare('DELETE FROM remote_media_cache WHERE id = ?')->execute([$id]);
+}
+
+
+/** Ordinary local roots only. Discovery and the generic matcher stay strict. */
+function ap_ordinary_note_owned(string $uri, int $ownerUserId, ?string $expectedActor = null): bool
+{
+    $uri = rtrim(trim($uri), '/');
+    if ($ownerUserId < 1 || $uri === '') return false;
+    // Request-local memoization is deliberately avoided: account state may change.
+    $st = ap_db()->prepare("SELECT rtrim(u.actor_id,'/') FROM outbox_notes o JOIN ap_users u
+        ON u.id = ? AND u.disabled_at IS NULL WHERE rtrim(o.id,'/') = ?
+        AND rtrim(u.actor_id,'/') <> ''
+        AND substr(o.id,1,length(rtrim(u.actor_id,'/') || '/notes/')) = rtrim(u.actor_id,'/') || '/notes/' LIMIT 1");
+    $st->execute([$ownerUserId, $uri]);
+    $actor=$st->fetchColumn();
+    return $actor !== false && ($expectedActor === null || rtrim(trim($expectedActor),'/') === $actor);
+}
+
+/** Explicit ordinary surface entry point; generic policy stays strict by default. */
+function ap_ordinary_ask_questions_muted(array $status, int $ownerUserId, int $depth = 0): bool
+{
+    if ($depth > 16) return true;
+    $ask=is_array($status['vaak_ask']??null)?$status['vaak_ask']:[];
+    if (ap_muted_words_match($ownerUserId,(string)($ask['question']??$ask['ask_question']??'')) !== null) return true;
+    foreach (['reblog','quote','vaak_quote_preview'] as $field) {
+        $child=$status[$field]??null;
+        if (!is_array($child)) continue;
+        $child=is_array($child['quoted_status']??null)?$child['quoted_status']:(is_array($child['status']??null)?$child['status']:$child);
+        if (ap_ordinary_ask_questions_muted($child,$ownerUserId,$depth+1)) return true;
+    }
+    return false;
+}
+
+function ap_visibility_ordinary_status_hidden(array $status, int $ownerUserId): bool
+{
+    return ap_ordinary_ask_questions_muted($status, $ownerUserId) || ap_visibility_status_hidden($status, $ownerUserId, 0, true);
+}
+
+/** Only original outbox bodies can be exempted; boosts and event summaries remain strict. */
+function ap_ordinary_outbox_matches_muted_words(array $row, array $extraTexts, int $ownerUserId): bool
+{
+    if (ap_muted_words_match($ownerUserId,(string)($row['object_summary']??''),(string)($row['reblog_content']??'')) !== null) return true;
+    if (!ap_row_matches_muted_words($row,'outbox',$extraTexts,$ownerUserId)) return false;
+    if (!ap_ordinary_note_owned((string)($row['id']??''),$ownerUserId)) return true;
+    // Flattened foreign text is never covered by the root grant.
+    return ap_muted_words_match($ownerUserId,(string)($row['object_summary']??''),(string)($row['reblog_content']??'')) !== null;
 }

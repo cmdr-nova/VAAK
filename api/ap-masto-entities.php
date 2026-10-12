@@ -64,6 +64,7 @@ function ap_masto_session_account_id(): string
  */
 function ap_masto_session_actor_id(): string
 {
+    if (!empty($GLOBALS['vaak_trend_selected_mapper_cache_only'])) return '';
     // Prefer OAuth/token-bound globals first so poll/etc. never leak across users
     // when ap_request_actor still points at a different inbox actor.
     $g = rtrim((string) ($GLOBALS['vaak_actor_id'] ?? ''), '/');
@@ -481,6 +482,7 @@ function ap_masto_disambiguate_mod_id(
 /** Fill favourited/bookmarked/reblogged from local masto_* tables (status id + object URL). */
 function ap_masto_apply_interaction_flags(array $status): array
 {
+    if (!empty($GLOBALS['vaak_trend_selected_mapper_cache_only'])) return ap_masto_trend_status_world_metadata($status);
     $id = (string) ($status['id'] ?? '');
     $objectId = (string) ($status['uri'] ?? $status['url'] ?? '');
     if ($id !== '' || $objectId !== '') {
@@ -4451,8 +4453,9 @@ function ap_masto_status_from_mention(array $row): array
             // Prefer cache. Request path may AppView a few misses; list-warm (M4)
             // stays cache-only and enqueues thin-media so the worker tick stays cheap.
             static $bskyNotifMediaFetchBudget = 3;
-            $listWarm = function_exists('ap_masto_notifications_list_warm_mode')
-                && ap_masto_notifications_list_warm_mode();
+            $listWarm = !empty($GLOBALS['vaak_trend_selected_mapper_cache_only'])
+                || (function_exists('ap_masto_notifications_list_warm_mode')
+                    && ap_masto_notifications_list_warm_mode());
             $allowFetch = !$listWarm && $bskyNotifMediaFetchBudget > 0;
             if ($allowFetch) {
                 $bskyNotifMediaFetchBudget--;
@@ -7632,13 +7635,13 @@ function ap_masto_status_from_event(array $row, ?string $profileBoostActor = nul
     $evHost = isset($row['host']) ? (string) $row['host'] : null;
     $allowHidden = !empty($row['_allow_hidden_actor']);
     if ($actorId === '' || (!$allowHidden && (function_exists('ap_row_is_hidden')
-        ? ap_row_is_hidden($actorId, $evHost, ap_db_masto_owner_user_id())
+        ? ap_row_is_hidden($actorId, $evHost, !empty($GLOBALS['vaak_trend_selected_mapper_cache_only']) ? 0 : ap_db_masto_owner_user_id())
         : ap_row_is_blocked($actorId, $evHost)))) {
         return null;
     }
     // Skip session actor's own outbound copies (shown via local statuses / outbox cards).
     // Other local instance accounts must remain resolvable for fav/boost/etc.
-    $sessionActor = function_exists('ap_local_actor_id') ? rtrim(ap_local_actor_id(), '/') : '';
+    $sessionActor = empty($GLOBALS['vaak_trend_selected_mapper_cache_only']) && function_exists('ap_local_actor_id') ? rtrim(ap_local_actor_id(), '/') : '';
     if ($sessionActor !== '' && rtrim($actorId, '/') === $sessionActor) {
         // Only the validated local profile Boosts caller may display its own
         // ledger entry. This changes presentation, never the inner audience.
@@ -10178,6 +10181,16 @@ function ap_masto_search_hashtags(string $q, int $limit): array
     $currentRows=ap_search_local_indexing_rows();
     if ($currentRows===null) return [];
     $counts = [];
+    // Only matching hashtag-bearing rows can contribute to the final corpus.
+    // This is a text prefilter, never an admission cache: every contributor
+    // still passes the unchanged current source, audience and actor checks.
+    $contributes = static function (string $text) use ($qLower): bool {
+        if (!preg_match_all('/#([\p{L}\p{N}_]{1,100})/u', $text, $matches)) return false;
+        foreach ($matches[1] as $tag) {
+            if ($qLower === '' || str_contains(mb_strtolower($tag), $qLower)) return true;
+        }
+        return false;
+    };
 
     $ingest = static function (string $text) use (&$counts): void {
         if ($text === '') {
@@ -10199,8 +10212,10 @@ function ap_masto_search_hashtags(string $q, int $limit): array
         foreach (ap_db()->query(
             "SELECT id,content,visibility FROM outbox_notes ORDER BY published DESC LIMIT 400"
         )->fetchAll() as $row) {
+            $text = (string) ($row['content'] ?? '');
+            if (!$contributes($text)) continue;
             if (!ap_search_tag_row_allowed($row, 'outbox', ap_db_masto_owner_user_id(), $currentRows)) continue;
-            $ingest((string) ($row['content'] ?? ''));
+            $ingest($text);
         }
     } catch (Throwable $e) {
         // ignore
@@ -10209,8 +10224,10 @@ function ap_masto_search_hashtags(string $q, int $limit): array
         foreach (ap_db()->query(
             "SELECT id,object_id,actor_id,visibility,type,action_taken,summary FROM events WHERE summary IS NOT NULL AND summary != '' ORDER BY id DESC LIMIT 600"
         )->fetchAll() as $row) {
+            $text = html_entity_decode((string) ($row['summary'] ?? ''), ENT_QUOTES | ENT_HTML5, 'UTF-8');
+            if (!$contributes($text)) continue;
             if (!ap_search_tag_row_allowed($row, 'event', ap_db_masto_owner_user_id(), $currentRows)) continue;
-            $ingest(html_entity_decode((string) ($row['summary'] ?? ''), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+            $ingest($text);
         }
     } catch (Throwable $e) {
         // ignore
@@ -10219,8 +10236,10 @@ function ap_masto_search_hashtags(string $q, int $limit): array
         foreach (ap_db()->query(
             "SELECT id,object_id,actor_id,deleted_at,content FROM mentions WHERE deleted_at IS NULL AND content IS NOT NULL ORDER BY id DESC LIMIT 300"
         )->fetchAll() as $row) {
+            $text = (string) ($row['content'] ?? '');
+            if (!$contributes($text)) continue;
             if (!ap_search_tag_row_allowed($row, 'mention', ap_db_masto_owner_user_id(), $currentRows)) continue;
-            $ingest((string) ($row['content'] ?? ''));
+            $ingest($text);
         }
     } catch (Throwable $e) {
         // ignore
@@ -10479,10 +10498,15 @@ function ap_masto_trend_item_hidden(array $item, int $ownerUserId, array $actors
     }
     if (function_exists('ap_muted_words_match')) {
         $texts = [];
-        foreach (['name', 'title', 'url', 'content', 'description'] as $key) {
+        foreach (['name', 'title', 'url', 'content', 'spoiler_text', 'description'] as $key) {
             if (isset($item[$key]) && is_string($item[$key])) {
                 $texts[] = $item[$key];
             }
+        }
+        // Tags paint a literal hash, while their URL encodes it. Honor both
+        // the bare phrase and a muted literal hashtag without decoding URLs.
+        if (isset($item['name']) && is_string($item['name']) && is_array($item['history'] ?? null)) {
+            $texts[] = '#' . ltrim($item['name'], '#');
         }
         if (is_array($item['account'] ?? null)) {
             $texts[] = (string) ($item['account']['display_name'] ?? '');
@@ -10515,7 +10539,7 @@ function ap_masto_trends_cache_info(string $kind): array
     return [
         // v2 invalidates pre-Bluesky trend files after the schema/input mix
         // changes, while preserving stale-while-revalidate behavior.
-        'path' => rtrim($dir, '/') . '/mkultra-ap-trends-v2-' . $kind . '.json',
+        'path' => rtrim($dir, '/') . '/mkultra-ap-trends-' . (in_array($kind,['tags','links','statuses'],true) ? 'v3-' : 'v2-') . $kind . '.json',
         'ttl' => AP_MASTO_TRENDS_CACHE_TTL,
     ];
 }
@@ -10528,16 +10552,24 @@ function ap_masto_trends_cache_info(string $kind): array
  */
 
 
-function ap_masto_trends_cache_read(string $kind, int $minItems = 1, bool $allowStale = false): ?array
+function ap_masto_trends_cache_read(string $kind, int $minItems = 1, bool $allowStale = false, int $ownerUserId = 0): ?array
 {
     $info = ap_masto_trends_cache_info($kind);
-    $redisKey = 'vaak:trends:v2:' . preg_replace('/[^a-z]/', '', strtolower($kind));
+    $redisKey = 'vaak:trends:' . (in_array($kind,['tags','links','statuses'],true) ? 'v3:' : 'v2:') . preg_replace('/[^a-z]/', '', strtolower($kind));
     $redisPayload = function_exists('ap_redis_json_get') ? ap_redis_json_get($redisKey) : null;
     if (is_array($redisPayload) && isset($redisPayload['items']) && is_array($redisPayload['items'])) {
         $cachedAt = (int) ($redisPayload['cached_at'] ?? time());
         $age = max(0, time() - $cachedAt);
         $stale = $age >= (int) $info['ttl'];
-        if ((!$stale || $allowStale) && count($redisPayload['items']) >= $minItems) {
+        if ((!$stale || $allowStale) && (in_array($kind,['tags','links','statuses'],true) || count($redisPayload['items']) >= $minItems)) {
+            if (in_array($kind,['tags','links'],true)) {
+                if (($redisPayload['source_policy_version'] ?? 0) !== 3 || !is_array($redisPayload['sources'] ?? null)) return null;
+                return ['items' => ($kind==='tags'?ap_masto_trend_tags_recount($redisPayload['sources'],$ownerUserId):ap_masto_trend_links_recount($redisPayload['sources'],$ownerUserId)), 'age' => $age, 'stale' => $stale];
+            }
+            if ($kind === 'statuses') {
+                if (($redisPayload['status_source_version'] ?? 0) !== 3) return null;
+                return ['items'=>ap_masto_trend_status_public_items(ap_masto_trend_status_world_items($redisPayload['items'])), 'age'=>$age, 'stale'=>$stale];
+            }
             return ['items' => $redisPayload['items'], 'age' => $age, 'stale' => $stale];
         }
     }
@@ -10563,6 +10595,14 @@ function ap_masto_trends_cache_read(string $kind, int $minItems = 1, bool $allow
     if (!is_array($decoded) || !isset($decoded['items']) || !is_array($decoded['items'])) {
         return null;
     }
+    if (in_array($kind,['tags','links'],true)) {
+        if (($decoded['source_policy_version'] ?? 0) !== 3 || !is_array($decoded['sources'] ?? null)) return null;
+        return ['items' => ($kind==='tags'?ap_masto_trend_tags_recount($decoded['sources'],$ownerUserId):ap_masto_trend_links_recount($decoded['sources'],$ownerUserId)), 'age' => $age, 'stale' => $stale];
+    }
+    if ($kind === 'statuses') {
+        if (($decoded['status_source_version'] ?? 0) !== 3) return null;
+        return ['items'=>ap_masto_trend_status_public_items(ap_masto_trend_status_world_items($decoded['items'])), 'age'=>$age, 'stale'=>$stale];
+    }
     if (count($decoded['items']) < $minItems) {
         return null;
     }
@@ -10576,9 +10616,9 @@ function ap_masto_trends_cache_read(string $kind, int $minItems = 1, bool $allow
 /**
  * @return list<array<string,mixed>>|null
  */
-function ap_masto_trends_cache_get(string $kind, int $minItems = 1): ?array
+function ap_masto_trends_cache_get(string $kind, int $minItems = 1, int $ownerUserId = 0): ?array
 {
-    $row = ap_masto_trends_cache_read($kind, $minItems, false);
+    $row = ap_masto_trends_cache_read($kind, $minItems, false, $ownerUserId);
     return is_array($row) ? $row['items'] : null;
 }
 
@@ -10624,17 +10664,22 @@ function ap_masto_trends_schedule_refresh(): void
 /**
  * @param list<array<string,mixed>> $items
  */
-function ap_masto_trends_cache_set(string $kind, array $items): void
+function ap_masto_trends_cache_set(string $kind, array $items, ?array $sources = null): void
 {
     $info = ap_masto_trends_cache_info($kind);
-    $redisKey = 'vaak:trends:v2:' . preg_replace('/[^a-z]/', '', strtolower($kind));
-    if (function_exists('ap_redis_json_set')) {
-        ap_redis_json_set($redisKey, ['cached_at' => time(), 'items' => array_values($items)], max(60, (int) $info['ttl'] * 2));
+    $redisKey = 'vaak:trends:' . (in_array($kind,['tags','links','statuses'],true) ? 'v3:' : 'v2:') . preg_replace('/[^a-z]/', '', strtolower($kind));
+    $envelope = ['cached_at' => time(), 'items' => array_values($items)];
+    if ($kind === 'statuses') $envelope['status_source_version'] = 3;
+    if (in_array($kind,['tags','links'],true)) {
+        if ($sources === null) return;
+        $envelope['source_policy_version'] = 3;
+        $envelope['sources'] = array_values($sources);
     }
-    $payload = json_encode([
-        'checked_at' => gmdate('c'),
-        'items' => array_values($items),
-    ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+    if (function_exists('ap_redis_json_set')) {
+        ap_redis_json_set($redisKey, $envelope, max(60, (int) $info['ttl'] * 2));
+    }
+    $envelope['checked_at'] = gmdate('c');
+    $payload = json_encode($envelope, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
     if (!is_string($payload)) {
         return;
     }
@@ -10659,14 +10704,606 @@ function ap_masto_trends_cache_mtime(string $kind): int
  *
  * @return list<array<string,mixed>> Mastodon Tag entities with history
  */
-function ap_masto_trends_tags(int $limit = 10): array
+function ap_masto_trend_suppression_map(int $ownerUserId): array
 {
-    $limit = max(1, min(30, $limit));
-    $cached = ap_masto_trends_cache_get('tags', 1);
-    if (is_array($cached) && count($cached) >= $limit) {
-        return array_slice($cached, 0, $limit);
+    if ($ownerUserId < 1) return [];
+    try {
+        $st = ap_db()->prepare('SELECT actor_id, score, categories_json, suppressed_until FROM ap_home_suppression WHERE owner_user_id = ?');
+        $st->execute([$ownerUserId]);
+        $out = [];
+        foreach ($st->fetchAll() ?: [] as $row) {
+            $actor = rtrim((string) ($row['actor_id'] ?? ''), '/');
+            if ($actor === '') continue;
+            $cats = json_decode((string) ($row['categories_json'] ?? '[]'), true);
+            $out[$actor] = [
+                'score' => max(0, (int) ($row['score'] ?? 0)),
+                'until' => strtotime((string) ($row['suppressed_until'] ?? '')) ?: 0,
+                'categories' => is_array($cats) ? array_values(array_filter(array_map('strval', $cats))) : [],
+            ];
+        }
+        return $out;
+    } catch (Throwable $e) {
+        return [];
     }
+}
 
+function ap_masto_trend_actor_refs(string $actor): array
+{
+    $actor = ap_search_canonical_actor($actor);
+    $out = [];
+    foreach (ap_actor_moderation_aliases($actor) as $alias) {
+        foreach (ap_moderation_syntactic_refs((string) $alias) as $ref) {
+            $ref = rtrim((string) $ref, '/');
+            if ($ref !== '' && !ctype_digit($ref)) $out[$ref] = true;
+        }
+    }
+    return array_keys($out);
+}
+
+function ap_masto_trend_downrank_ref_set(int $ownerUserId): array
+{
+    if ($ownerUserId < 1) {
+        return [];
+    }
+    $set = [];
+    $now = time();
+    $preference = ap_db()->prepare('SELECT COALESCE(p.downranking_enabled, 1) FROM ap_users u LEFT JOIN actor_profile p ON p.actor_key = u.actor_key WHERE u.id = ?');
+    $preference->execute([$ownerUserId]);
+    $temporaryEnabled = (bool) $preference->fetchColumn();
+    foreach ($temporaryEnabled ? ap_masto_trend_suppression_map($ownerUserId) : [] as $actor => $row) {
+        if ((int) ($row['until'] ?? 0) <= $now) {
+            continue;
+        }
+        $refs = ap_masto_trend_actor_refs((string) $actor);
+        foreach ($refs as $ref) {
+            $ref = strtolower(rtrim((string) $ref, '/'));
+            if ($ref !== '' && !ctype_digit($ref)) {
+                $set[$ref] = true;
+            }
+        }
+    }
+    // Read the current manual choices directly; never inherit a cached HTML decision.
+    $st = ap_db()->prepare('SELECT actor_id FROM ap_deprioritized_actors WHERE owner_user_id = ?');
+    $st->execute([$ownerUserId]);
+    foreach ($st->fetchAll() ?: [] as $row) {
+        foreach (ap_masto_trend_actor_refs((string) ($row['actor_id'] ?? '')) as $ref) {
+            $ref = rtrim((string) $ref, '/');
+            if ($ref !== '' && !ctype_digit($ref)) $set['manual:' . $ref] = true;
+        }
+    }
+    return $set;
+}
+
+function ap_masto_trend_status_is_downranked(array $item, array $refs): bool
+{
+    if ($refs === []) {
+        return false;
+    }
+    $raw = function_exists('ap_masto_trend_item_actors') ? ap_masto_trend_item_actors($item) : [];
+    $pull = static function ($account) use (&$raw): void {
+        if (!is_array($account)) {
+            return;
+        }
+        foreach (['uri', 'url', 'id'] as $key) {
+            $raw[] = (string) ($account[$key] ?? '');
+        }
+    };
+    $pull($item['account'] ?? null);
+    foreach (['reblog', 'quote'] as $nest) {
+        if (!is_array($item[$nest] ?? null)) {
+            continue;
+        }
+        $pull($item[$nest]['account'] ?? null);
+        $raw[] = (string) ($item[$nest]['author_did'] ?? '');
+    }
+    $raw[] = (string) ($item['author_did'] ?? '');
+    foreach ($raw as $actor) {
+        $actor = trim((string) $actor);
+        if ($actor === '' || ctype_digit(rtrim($actor, '/'))) {
+            continue;
+        }
+        $candidates = ap_masto_trend_actor_refs($actor);
+        foreach ($candidates as $ref) {
+            if (isset($refs['manual:' . rtrim((string) $ref, '/')])) return true;
+            $ref = strtolower(rtrim((string) $ref, '/'));
+            if ($ref !== '' && isset($refs[$ref])) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+function ap_masto_trend_tree_hidden(array $item, int $ownerUserId, int $depth = 0, ?array $downrankRefs = null): bool
+{
+    $downrankRefs ??= ap_masto_trend_downrank_ref_set($ownerUserId);
+    if ($depth > 16 || ap_masto_trend_item_hidden($item, $ownerUserId, [], false)
+        || ap_masto_trend_status_is_downranked($item, $downrankRefs)
+        || (function_exists('ap_search_status_hidden') && ap_search_status_hidden($item, $ownerUserId))) return true;
+    foreach (['quote', 'reblog', 'quoted_status', 'status', 'vaak_quote_preview'] as $nest) {
+        if (is_array($item[$nest] ?? null) && ap_masto_trend_tree_hidden($item[$nest], $ownerUserId, $depth + 1, $downrankRefs)) return true;
+    }
+    $policy=ap_masto_trend_tag_policy_snapshot($ownerUserId);
+    if ($policy===null) return true;
+    $uri=(string)($item['uri']??'');
+    $ask=function_exists('ap_ask_answer_for_note')?ap_ask_answer_for_note($uri):null;
+    if (ap_masto_trend_tag_words_hidden($policy['words'],(string)($item['content']??''),(string)($item['spoiler_text']??''),(string)($ask['question']??$item['vaak_ask']['question']??''))) return true;
+    return false;
+}
+
+function ap_masto_trends_filter_for_owner(array $items, int $ownerUserId, int $limit): array
+{
+    if ($ownerUserId < 1) return array_slice($items, 0, $limit);
+    $user = ap_auth_user_by_id($ownerUserId);
+    if (!is_array($user) || (int) ($user['id'] ?? 0) !== $ownerUserId || !empty($user['disabled_at'])) return [];
+    $downrankRefs = ap_masto_trend_downrank_ref_set($ownerUserId);
+    $out = [];
+    foreach ($items as $item) {
+        if (!is_array($item) || ap_masto_trend_tree_hidden($item, $ownerUserId, 0, $downrankRefs)) continue;
+        $out[] = ap_masto_trend_status_owner_metadata($item,$ownerUserId);
+        if (count($out) >= $limit) break;
+    }
+    return $out;
+}
+
+function ap_masto_trend_tag_source_window(): array
+{
+    $since = gmdate('c', (int) (floor(time() / 86400) * 86400) - 6 * 86400);
+    $sources = [];
+    $queries = [
+        'event' => ["SELECT id FROM events WHERE created_at >= ? AND summary IS NOT NULL AND summary != '' ORDER BY id DESC LIMIT 2500", 'id'],
+        'bsky' => ["SELECT bsky_uri FROM bsky_posts WHERE published_at >= ? AND text IS NOT NULL AND text <> '' ORDER BY indexed_at DESC LIMIT 3000", 'bsky_uri'],
+        'mention' => ["SELECT id FROM mentions WHERE deleted_at IS NULL AND created_at >= ? AND content IS NOT NULL ORDER BY id DESC LIMIT 800", 'id'],
+        'outbox' => ["SELECT id FROM outbox_notes WHERE published >= ? ORDER BY published DESC LIMIT 400", 'id'],
+    ];
+    foreach ($queries as $source => [$sql, $key]) {
+        try {
+            $st = ap_db()->prepare($sql); $st->execute([$since]);
+            foreach ($st->fetchAll() ?: [] as $row) $sources[] = ['source' => $source, 'id' => (string) $row[$key]];
+        } catch (Throwable $e) {
+            // Optional unavailable sources fail closed to no contribution.
+        }
+    }
+    return $sources;
+}
+
+function ap_masto_trend_tag_current_rows(array $sources): array
+{
+    if (count($sources) > 6700) return [];
+    $defs = [
+        'event' => ['events', 'id', 'id,object_id,actor_id,visibility,type,action_taken,summary,spoiler_text,created_at'],
+        'mention' => ['mentions', 'id', 'id,object_id,actor_id,visibility,deleted_at,content,spoiler_text,created_at'],
+        'outbox' => ['outbox_notes', 'id', 'id,visibility,content,raw_create_json,published'],
+        'bsky' => ['bsky_posts', 'bsky_uri', 'bsky_uri,text,published_at,author_did'],
+    ];
+    $ids = []; $rows = []; $seen = []; $counts = [];
+    $caps = ['event' => 2500, 'bsky' => 3000, 'mention' => 800, 'outbox' => 400];
+    foreach ($sources as $entry) {
+        if (!is_array($entry) || !isset($defs[$entry['source'] ?? '']) || !is_string($entry['id'] ?? null) || $entry['id'] === '') return [];
+        $identity = $entry['source'] . ':' . $entry['id'];
+        if (isset($seen[$identity]) || ($counts[$entry['source']] ?? 0) >= $caps[$entry['source']]) return [];
+        $seen[$identity] = true; $counts[$entry['source']] = ($counts[$entry['source']] ?? 0) + 1;
+        $ids[$entry['source']][] = $entry['id'];
+    }
+    foreach ($ids as $source => $selected) {
+        [$table, $key, $columns] = $defs[$source];
+        foreach (array_chunk(array_values(array_unique($selected)), 200) as $batch) {
+            try {
+                $st = ap_db()->prepare("SELECT {$columns} FROM {$table} WHERE {$key} IN (" . implode(',', array_fill(0, count($batch), '?')) . ')');
+                $st->execute($batch);
+                foreach ($st->fetchAll() ?: [] as $row) $rows[$source][(string) $row[$key]] = $row;
+            } catch (Throwable $e) { /* Failed current reads contribute nothing. */ }
+        }
+    }
+    $out = [];
+    foreach ($sources as $entry) {
+        $row = $rows[$entry['source']][$entry['id']] ?? null;
+        if (is_array($row)) $out[] = ['source' => $entry['source'], 'row' => $row];
+    }
+    return $out;
+}
+
+function ap_masto_trend_status_fingerprint(array $row): string
+{
+    unset($row['latest']);ksort($row);
+    return hash('sha256',json_encode($row,JSON_UNESCAPED_SLASHES|JSON_UNESCAPED_UNICODE));
+}
+
+function ap_masto_trend_status_current(array $items): ?array
+{
+    $entries=[];$ids=[];$origins=[];
+    foreach($items as $item){$origin=$item['_vaak_trend_source']['announcer']??null;if(is_array($origin)&&isset($origin['id']))$origins[(string)$origin['id']]=['source'=>'event','id'=>(string)$origin['id']];}
+    $nestedEntries=[];
+    $walk=static function(array $node,int $depth=0) use (&$walk,&$nestedEntries,&$ids):void {
+        if($depth>16)return;
+        $uri=rtrim((string)($node['uri']??''),'/');
+        if(str_starts_with($uri,'at://'))$ids[]=$uri;
+        if($uri!=='')$nestedEntries[$uri]=['source'=>'event','row'=>['object_id'=>$uri]];
+        foreach(['quote','reblog','quoted_status','status','vaak_quote_preview'] as $key)if(is_array($node[$key]??null))$walk($node[$key],$depth+1);
+    };
+    foreach($items as $item) {
+        $walk($item);
+        $proof=$item['_vaak_trend_source']??null;
+        if(!is_array($proof)||!is_array($proof['row']??null))continue;
+        $entries[]=['source'=>$proof['source'],'row'=>$proof['row']];
+        if($proof['source']==='bsky')$ids[]=(string)($proof['row']['bsky_uri']??'');
+    }
+    $canonical=ap_masto_trend_status_canonical_rows(array_merge($entries,array_values($nestedEntries)));
+    $policy=ap_masto_trend_tag_policy_snapshot(0);
+    if($canonical===null||$policy===null)return null;
+    try {
+        $currentRows=ap_search_local_indexing_rows();if($currentRows===null)return null;$bsky=[];
+        foreach(array_chunk(array_values(array_unique($ids)),200) as $batch) {
+            $q=ap_db()->prepare('SELECT * FROM bsky_posts WHERE bsky_uri IN ('.implode(',',array_fill(0,count($batch),'?')).')');$q->execute($batch);
+            foreach($q->fetchAll()?:[] as $row)$bsky[(string)$row['bsky_uri']]=$row;
+        }
+        $fallback=[];$fallbackUris=[];foreach($entries as $entry){$uri=rtrim((string)($entry['row']['object_id']??''),'/');if($uri!==''&&!isset($canonical['events'][$uri])&&isset($canonical['mentions'][$uri]))$fallbackUris[$uri]=true;}
+        foreach(array_chunk(array_keys($fallbackUris),200) as $batch){$marks=implode(',',array_fill(0,count($batch),'?'));$q=ap_db()->prepare("SELECT * FROM (SELECT events.*,ROW_NUMBER() OVER(PARTITION BY object_id ORDER BY id DESC) AS latest FROM events WHERE object_id IN ($marks) AND type='Announce' AND ((summary IS NOT NULL AND summary!='') OR (media_urls IS NOT NULL AND media_urls!='' AND media_urls!='[]'))) selected_announcer WHERE latest=1");$q->execute($batch);foreach($q->fetchAll()?:[] as $row)$fallback[rtrim((string)$row['object_id'],'/')]=$row;}
+        $originRows=[];foreach(ap_masto_trend_tag_current_rows(array_values($origins)) as $entry)$originRows[(string)$entry['row']['id']]=$entry['row'];foreach($fallback as $row)$originRows[(string)$row['id']]=$row;
+        return ['canonical'=>$canonical,'policy'=>$policy,'index'=>$currentRows,'bsky'=>$bsky,'announcers'=>$originRows,'fallback_announces'=>$fallback];
+    }catch(Throwable $e){return null;}
+}
+
+function ap_masto_trend_status_world_items(array $items, ?array $facts = null): array
+{
+    $facts??=ap_masto_trend_status_current($items);if($facts===null)return [];
+    $out=[];
+    foreach($items as $item) {
+        $proof=$item['_vaak_trend_source']??null;
+        if(!is_array($proof)||!is_array($proof['row']??null))continue;
+        $row=$proof['row'];$source=$proof['source']??'';$uri=rtrim((string)($item['uri']??''),'/');
+        $announcer=$proof['announcer']??null;
+        if(is_array($announcer)){
+            $origin=$facts['announcers'][(string)($announcer['id']??'')]??null;
+            if(!is_array($origin))continue;
+            $originCanonical=ap_masto_trend_tag_source_actor($origin,'event',$facts['index'],$facts['canonical']);
+            $originActor=ap_search_canonical_actor((string)($origin['actor_id']??''));
+            if($originCanonical===null||$originActor===''||!ap_search_indexing_allowed($originActor,0,$facts['index'])||ap_masto_trend_tag_actor_hidden($originActor,$facts['policy'],0))continue;
+            $item['trend_actors']=array_values(array_unique(array_merge($item['trend_actors']??[],[$originActor])));
+        }
+        if($source==='bsky') {
+            $current=$facts['bsky'][$row['bsky_uri']??'']??null;
+            if(!is_array($current))continue;
+            $actor=(string)($current['author_did']??'');
+        }else {
+            $actor=ap_masto_trend_tag_source_actor($row,$source,$facts['index'],$facts['canonical']);
+            $current=$facts['canonical']['events'][$uri]??$facts['canonical']['mentions'][$uri]??null;
+            if($actor===null||!is_array($current))continue;
+            $local=$facts['canonical']['outbox'][$uri]??null;
+            if(is_array($local)&&ap_muted_words_normalize_haystack((string)($local['content']??''))!==ap_muted_words_normalize_haystack((string)($current['summary']??$current['content']??'')))continue;
+        }
+        if($actor===''||ap_masto_trend_tag_actor_hidden($actor,$facts['policy'],0))continue;
+        if(ap_masto_trend_status_fingerprint($current)!==ap_masto_trend_status_fingerprint($row)) {
+            $freshSource=$source==='bsky'?'bsky':(isset($facts['canonical']['events'][$uri])?'event':'mention');
+            $fresh=ap_masto_trend_status_map_current($current,$freshSource);if(!is_array($fresh))continue;
+            if(is_array($fresh['reblog']??null))$fresh=$fresh['reblog'];
+            foreach(['reblogs_count','favourites_count','replies_count'] as $key)$fresh[$key]=max((int)($fresh[$key]??0),(int)($item[$key]??0));
+            $fresh['_vaak_trend_source']=['source'=>$freshSource,'row'=>$current];if(is_array($announcer))$fresh['_vaak_trend_source']['announcer']=$announcer;
+            // This freshly painted actual row, not the older body, owns the proof.
+            $repainted=ap_masto_trend_status_world_items([$fresh]);
+            if($repainted!==[])$out[]=$repainted[0];
+            continue;
+        }
+        if (!ap_masto_trend_status_nested_current($item,$facts)) continue;
+        $out[]=$item;
+    }
+    return $out;
+}
+
+function ap_masto_trend_status_nested_current(array &$item,array $facts,int $depth=0,bool $child=false): bool
+{
+    if($depth>16)return false;
+    $uri=rtrim((string)($item['uri']??''),'/');
+    if($child&&$uri!=='') {
+        $row=$facts['bsky'][$uri]??$facts['canonical']['events'][$uri]??$facts['canonical']['mentions'][$uri]??null;
+        if(!is_array($row))return false;
+        $source=isset($facts['bsky'][$uri])?'bsky':(isset($facts['canonical']['events'][$uri])?'event':'mention');
+        $actor=ap_masto_trend_tag_source_actor($row,$source,$facts['index'],$facts['canonical']);
+        if($actor===null||ap_masto_trend_tag_actor_hidden($actor,$facts['policy'],0))return false;
+        $fresh=ap_masto_trend_status_map_current($row,$source);
+        if(!is_array($fresh))return false;
+        if(is_array($fresh['reblog']??null))$fresh=$fresh['reblog'];
+        $changed=false;
+        foreach(['content','spoiler_text','media_attachments','poll'] as $key)
+            if(($fresh[$key]??null)!==($item[$key]??null))$changed=true;
+        $freshActor=(string)($fresh['account']['uri']??$fresh['account']['url']??'');
+        $paintedActor=(string)($item['account']['uri']??$item['account']['url']??'');
+        if($freshActor!==$paintedActor||($fresh['vaak_ask']['question']??null)!==($item['vaak_ask']['question']??null))$changed=true;
+        if($changed){$item=$fresh;$freshFacts=ap_masto_trend_status_current([$fresh]);if($freshFacts===null)return false;$facts=$freshFacts;}
+
+    }
+    foreach(['quote','reblog','quoted_status','status','vaak_quote_preview'] as $key)
+        if(is_array($item[$key]??null)&&!ap_masto_trend_status_nested_current($item[$key],$facts,$depth+1,true))return false;
+    return true;
+}
+
+function ap_masto_trend_status_map_current(array $row,string $source): ?array
+{
+    if($source==='bsky') {
+        $raw=json_decode((string)($row['raw_json']??''),true);
+        if(!is_array($raw))return null;
+        $mapped=ap_masto_bsky_trend_status(is_array($raw['post']??null)?$raw['post']:$raw);
+        return is_array($mapped)?ap_masto_trend_status_world_metadata($mapped):null;
+    }
+    $had=array_key_exists('vaak_trend_selected_mapper_cache_only',$GLOBALS);$prior=$GLOBALS['vaak_trend_selected_mapper_cache_only']??null;
+    $GLOBALS['vaak_trend_selected_mapper_cache_only']=true;
+    try {$mapped=$source==='mention'?ap_masto_status_from_mention($row):ap_masto_status_from_event($row);return is_array($mapped)?ap_masto_trend_status_world_metadata($mapped):null;}
+    finally {if($had)$GLOBALS['vaak_trend_selected_mapper_cache_only']=$prior;else unset($GLOBALS['vaak_trend_selected_mapper_cache_only']);}
+}
+
+function ap_masto_trend_status_candidate_batch(array $entries,array $skipUris = []): iterable
+{
+    $proofItems=[];
+    foreach($entries as $entry) {
+        $row=$entry['row'];$source=$entry['source'];
+        if($source==='event'&&($row['type']??'')==='Announce')$entry['announcer']=$row;
+        $proofItems[]=['uri'=>$source==='bsky'?($row['bsky_uri']??''):($row['object_id']??''),'_vaak_trend_source'=>$entry];
+    }
+    $facts=ap_masto_trend_status_current($proofItems);if($facts===null)return [];
+    $items=[];
+    foreach($entries as $entry) {
+        $source=$entry['source'];$row=$entry['row'];$uri=rtrim((string)($source==='bsky'?($row['bsky_uri']??''):($row['object_id']??'')),'/');
+        if($source==='bsky')$row=$facts['bsky'][$uri]??null;
+        else {
+            $row=$facts['canonical']['events'][$uri]??$facts['canonical']['mentions'][$uri]??null;
+            $source=isset($facts['canonical']['events'][$uri])?'event':'mention';
+        }
+        if(!is_array($row)||isset($skipUris[$uri]))continue;
+        $actor=ap_masto_trend_tag_source_actor($row,$source,$facts['index'],$facts['canonical']);
+        if($actor===null||ap_masto_trend_tag_actor_hidden($actor,$facts['policy'],0))continue;
+        $status=ap_masto_trend_status_map_current($row,$source);if(!is_array($status))continue;
+        if(is_array($status['reblog']??null))$status=$status['reblog'];
+        $status['_vaak_trend_source']=['source'=>$source,'row'=>$row];
+        if($entry['source']==='event'&&($entry['row']['type']??'')==='Announce')$status['_vaak_trend_source']['announcer']=$entry['row'];
+        elseif($entry['source']==='event'&&isset($facts['fallback_announces'][$uri]))$status['_vaak_trend_source']['announcer']=$facts['fallback_announces'][$uri];
+        $nested=false;foreach(['quote','reblog','vaak_quote_preview'] as $key)if(is_array($status[$key]??null))$nested=true;
+        // Ordinary roots share the cohort snapshot; only actual selected nested
+        // containers need a fresh bounded child projection before yielding.
+        $admitted=ap_masto_trend_status_world_items([$status],$nested?null:$facts);
+        if($admitted!==[])yield $admitted[0];
+    }
+}
+
+function ap_masto_trend_status_world_metadata(array $item): array
+{
+    foreach(['favourited','reblogged','bookmarked','muted'] as $key)if(array_key_exists($key,$item))$item[$key]=false;
+    if(is_array($item['poll']??null)){$item['poll']['voted']=false;$item['poll']['own_votes']=null;}
+    if(is_array($item['bsky_post']??null)) {
+        $strip=static function(array $node) use (&$strip):array {unset($node['viewer']);foreach($node as &$value)if(is_array($value))$value=$strip($value);unset($value);return $node;};
+        $item['bsky_post']=$strip($item['bsky_post']);
+    }
+    foreach(['quote','reblog','quoted_status','status','vaak_quote_preview'] as $key)if(is_array($item[$key]??null))$item[$key]=ap_masto_trend_status_world_metadata($item[$key]);
+    return $item;
+}
+
+function ap_masto_trend_status_owner_metadata(array $item,int $ownerUserId,int $depth=0): array
+{
+    if($depth>16||$ownerUserId<1)return ap_masto_trend_status_world_metadata($item);
+    $memoHad=array_key_exists('ap_masto_flag_memo',$GLOBALS);$memoPrior=$GLOBALS['ap_masto_flag_memo']??null;unset($GLOBALS['ap_masto_flag_memo']);
+    try {
+    $id=(string)($item['id']??'');$uri=(string)($item['uri']??$item['url']??'');
+    if($id!==''||$uri!=='') {
+        $item['favourited']=ap_masto_status_is_favourited($id,$ownerUserId,$uri!==''?$uri:null);
+        $item['bookmarked']=ap_masto_status_is_bookmarked($id,$ownerUserId,$uri!==''?$uri:null);
+        $item['reblogged']=$id!==''&&ap_masto_status_is_reblogged($id,$ownerUserId);
+        if(is_array($item['poll']??null)) {
+            $item['poll']['voted']=false;$item['poll']['own_votes']=null;
+            try {
+                $q=ap_db()->prepare('SELECT voters_json FROM masto_polls WHERE note_id=?');$q->execute([$uri]);$voters=json_decode((string)$q->fetchColumn(),true);
+                $actor=ap_db_owner_actor_id_for_user_id($ownerUserId);
+                if($actor!==''&&is_array($voters)&&(in_array($actor,$voters,true)||in_array($actor.'/', $voters,true))){$item['poll']['voted']=true;$item['poll']['own_votes']=[];}
+            }catch(Throwable $e){/* Same unavailable-poll fallback as ordinary PHP cards. */}
+        }
+        if(is_array($item['bsky_post']??null)&&str_starts_with($uri,'at://')) {
+            $q=ap_db()->prepare('SELECT raw_json FROM bsky_posts WHERE bsky_uri=?');$q->execute([$uri]);$raw=json_decode((string)$q->fetchColumn(),true);$post=is_array($raw['post']??null)?$raw['post']:$raw;
+            $viewer=is_array($post['viewer']??null)?array_intersect_key($post['viewer'],array_flip(['like','repost'])):[];
+            $item['bsky_post']['viewer']=ap_bsky_viewer_for_owner($viewer,$ownerUserId,$uri);
+        }
+    }
+    foreach(['quote','reblog','quoted_status','status','vaak_quote_preview'] as $key)if(is_array($item[$key]??null))$item[$key]=ap_masto_trend_status_owner_metadata($item[$key],$ownerUserId,$depth+1);
+    return $item;
+    } finally {if($memoHad)$GLOBALS['ap_masto_flag_memo']=$memoPrior;else unset($GLOBALS['ap_masto_flag_memo']);}
+}
+
+function ap_masto_trend_status_public_items(array $items): array
+{
+    foreach($items as &$item)unset($item['_vaak_trend_source']);unset($item);return $items;
+}
+
+function ap_masto_trend_status_canonical_rows(array $entries): ?array
+{
+    $uris=[];
+    foreach ($entries as $entry) {
+        if ($entry['source']==='bsky') continue;
+        $row=$entry['row'];
+        $uri=rtrim((string)($entry['source']==='outbox'?($row['id']??''):($row['object_id']??'')),'/');
+        if ($uri!=='') $uris[$uri]=true;
+    }
+    $out=['events'=>[],'mentions'=>[],'outbox'=>[]];
+    try {
+        foreach (array_chunk(array_keys($uris),200) as $batch) {
+            $refs=[];foreach($batch as $uri){$refs[]=$uri;$refs[]=$uri.'/';}
+            $marks=implode(',',array_fill(0,count($refs),'?'));
+            $sql="SELECT * FROM (SELECT e.*,
+                ROW_NUMBER() OVER(PARTITION BY rtrim(object_id,'/') ORDER BY id DESC) AS latest
+                FROM events e WHERE object_id IN ($marks)
+                AND (type IN ('Create','Update','Delete','Tombstone') OR (type IN ('Quote','QuotePost')
+                AND NOT EXISTS(SELECT 1 FROM events n WHERE n.object_id IN (rtrim(e.object_id,'/'),rtrim(e.object_id,'/')||'/') AND n.type IN ('Create','Update'))))) current_source WHERE latest=1";
+            $st=ap_db()->prepare($sql);$st->execute($refs);
+            foreach($st->fetchAll()?:[] as $row)$out['events'][rtrim((string)$row['object_id'],'/')]=$row;
+            $st=ap_db()->prepare("SELECT * FROM (SELECT mentions.*,
+                ROW_NUMBER() OVER(PARTITION BY rtrim(object_id,'/') ORDER BY id DESC) AS latest
+                FROM mentions WHERE object_id IN ($marks)) current_source WHERE latest=1");$st->execute($refs);
+            foreach($st->fetchAll()?:[] as $row)$out['mentions'][rtrim((string)$row['object_id'],'/')]=$row;
+            $st=ap_db()->prepare("SELECT * FROM outbox_notes WHERE id IN ($marks)");$st->execute($refs);
+            foreach($st->fetchAll()?:[] as $row)$out['outbox'][rtrim((string)$row['id'],'/')]=$row;
+        }
+        return $out;
+    } catch(Throwable $e) { return null; }
+}
+
+function ap_masto_trend_tag_canonical_rows(array $entries): ?array
+{
+    $uris=[];
+    foreach ($entries as $entry) {
+        if ($entry['source']==='bsky') continue;
+        $row=$entry['row'];
+        $uri=rtrim((string)($entry['source']==='outbox'?($row['id']??''):($row['object_id']??'')),'/');
+        if ($uri!=='') $uris[$uri]=true;
+    }
+    $out=['events'=>[],'mentions'=>[],'outbox'=>[]];
+    try {
+        foreach (array_chunk(array_keys($uris),200) as $batch) {
+            $refs=[];foreach($batch as $uri){$refs[]=$uri;$refs[]=$uri.'/';}
+            $marks=implode(',',array_fill(0,count($refs),'?'));
+            $sql="SELECT * FROM (SELECT object_id,actor_id,visibility,type,action_taken,summary,spoiler_text,
+                ROW_NUMBER() OVER(PARTITION BY rtrim(object_id,'/') ORDER BY id DESC) AS latest
+                FROM events e WHERE object_id IN ($marks)
+                AND (type IN ('Create','Update','Delete','Tombstone') OR (type IN ('Quote','QuotePost')
+                AND NOT EXISTS(SELECT 1 FROM events n WHERE n.object_id IN (rtrim(e.object_id,'/'),rtrim(e.object_id,'/')||'/') AND n.type IN ('Create','Update'))))) current_source WHERE latest=1";
+            $st=ap_db()->prepare($sql);$st->execute($refs);
+            foreach($st->fetchAll()?:[] as $row)$out['events'][rtrim((string)$row['object_id'],'/')]=$row;
+            $st=ap_db()->prepare("SELECT * FROM (SELECT object_id,actor_id,visibility,deleted_at,content,spoiler_text,
+                ROW_NUMBER() OVER(PARTITION BY rtrim(object_id,'/') ORDER BY id DESC) AS latest
+                FROM mentions WHERE object_id IN ($marks)) current_source WHERE latest=1");$st->execute($refs);
+            foreach($st->fetchAll()?:[] as $row)$out['mentions'][rtrim((string)$row['object_id'],'/')]=$row;
+            $st=ap_db()->prepare("SELECT id,visibility,content,raw_create_json FROM outbox_notes WHERE id IN ($marks)");$st->execute($refs);
+            foreach($st->fetchAll()?:[] as $row)$out['outbox'][rtrim((string)$row['id'],'/')]=$row;
+        }
+        return $out;
+    } catch(Throwable $e) { return null; }
+}
+
+function ap_masto_trend_tag_source_actor(array $row, string $source, array $currentRows, array $canonical): ?string
+{
+    if ($source==='bsky') return trim((string)($row['author_did']??''))?:null;
+    if (strtolower((string)($row['visibility']??''))!=='public'
+        || !empty($row['deleted_at']) || ($row['action_taken']??'')==='deleted') return null;
+    $uri=rtrim((string)($source==='outbox'?($row['id']??''):($row['object_id']??'')),'/');
+    if ($uri==='') return null;
+    $local=$canonical['outbox'][$uri]??null;
+    if ($source==='outbox' || preg_match('#^https://mkultra\.monster/users/[^/]+/notes/#',$uri)) {
+        if(!is_array($local)) return null;
+        $latest=$local;$actor=explode('/notes/',$uri,2)[0];
+    } else {
+        $latest=$canonical['events'][$uri]??$canonical['mentions'][$uri]??null;
+        $actor=ap_search_canonical_actor((string)($latest['actor_id']??''));
+        if(is_array($latest)&&(($latest['action_taken']??'')==='deleted'||in_array($latest['type']??'',['Delete','Tombstone'],true)))return null;
+        // A durable local twin overrides the remote source audience too.
+        if(is_array($local)) $latest=$local;
+    }
+    if(!is_array($latest)||strtolower((string)($latest['visibility']??''))!=='public'
+        || !empty($latest['deleted_at']) || ($latest['action_taken']??'')==='deleted'
+        || in_array($latest['type']??'',['Delete','Tombstone'],true)) return null;
+    return $actor!==''&&ap_search_indexing_allowed($actor,0,$currentRows)?$actor:null;
+}
+
+function ap_masto_trend_tag_policy_snapshot(int $ownerUserId): ?array
+{
+    try {
+        $out=['server'=>[],'personal'=>[],'words'=>[]];
+        $out['server']=ap_db()->query('SELECT scope,value,kind FROM ap_blocks')->fetchAll()?:[];
+        if($ownerUserId>0) {
+            $st=ap_db()->prepare('SELECT scope,value FROM ap_user_blocks WHERE owner_user_id=?');$st->execute([$ownerUserId]);$out['personal']=$st->fetchAll()?:[];
+            $st=ap_db()->prepare('SELECT actor_id FROM ap_mutes WHERE owner_user_id=?');$st->execute([$ownerUserId]);
+            foreach($st->fetchAll()?:[] as $row)$out['personal'][]=['scope'=>'actor','value'=>$row['actor_id']];
+            $st=ap_db()->prepare('SELECT phrase FROM ap_muted_words WHERE owner_user_id=?');$st->execute([$ownerUserId]);
+            foreach($st->fetchAll()?:[] as $row){$phrase=mb_strtolower(trim((string)$row['phrase']),'UTF-8');if($phrase!=='')$out['words'][]=$phrase;}
+        }
+        foreach(['server','personal'] as $scope) foreach($out[$scope] as &$row) {
+            if(($row['scope']??'')==='actor') {
+                $value=rtrim((string)($row['value']??''),'/');
+                $row['refs']=array_values(array_unique(array_merge(ap_actor_moderation_aliases($value),ap_moderation_syntactic_refs($value))));
+            }
+        }
+        unset($row);
+        $out['rules']=[];
+        foreach(['server','personal'] as $scope) {
+            $rules=['actors'=>[],'muted_actors'=>[],'domains'=>[]];
+            foreach($out[$scope] as $row) {
+                if(($row['scope']??'')==='domain') {
+                    $domain=strtolower((string)($row['value']??''));if($domain!=='')$rules['domains'][$domain]=true;
+                } elseif(($row['scope']??'')==='actor') {
+                    $field=$scope==='server'&&($row['kind']??'')==='mute'?'muted_actors':'actors';
+                    foreach($row['refs']??[] as $ref){$ref=rtrim((string)$ref,'/');if($field==='muted_actors')$ref=strtolower($ref);if($ref!=='')$rules[$field][$ref]=true;}
+                }
+            }
+            $out['rules'][$scope]=$rules;
+        }
+        return $out;
+    } catch(Throwable $e) { return null; }
+}
+
+function ap_masto_trend_tag_words_hidden(array $phrases,string ...$texts): bool
+{
+    $hay=[];foreach($texts as $text){$n=ap_muted_words_normalize_haystack($text);if($n!=='')$hay[]=$n;}
+    $hay=implode(' ',$hay);
+    foreach($phrases as $phrase)if($phrase!==''&&mb_strpos($hay,$phrase,0,'UTF-8')!==false)return true;
+    return false;
+}
+
+function ap_masto_trend_tag_actor_hidden(string $actor,array $policy,int $ownerUserId): bool
+{
+    $refs=[];foreach(ap_search_actor_ref_list($actor) as $ref)$refs=array_merge($refs,ap_moderation_syntactic_refs($ref));
+    if($refs===[])return false;
+    $muteRefs=$refs;
+    if(preg_match('~/(?:ap/)?(did:plc:[a-z0-9]+)~i',$actor,$m))$muteRefs=array_merge($muteRefs,ap_moderation_syntactic_refs($m[1]));
+    // The existing actor helper checks each syntactic alias, including DID's
+    // bsky.app profile host; a bare DID's empty host alone is insufficient.
+    $hosts=[];foreach($refs as $ref){$host=parse_url($ref,PHP_URL_HOST);if(is_string($host)&&$host!=='')$hosts[strtolower($host)]=true;}
+    foreach(['server','personal'] as $scope) {
+        if($scope==='personal'&&($ownerUserId<1||ap_search_refs_are_self($refs,'',$ownerUserId)))continue;
+        $rules=$policy['rules'][$scope];
+        foreach(array_keys($hosts) as $host) {
+            $parts=explode('.',$host);
+            for($i=0;$i<count($parts);$i++)if(isset($rules['domains'][implode('.',array_slice($parts,$i))]))return true;
+        }
+        foreach($refs as $ref)if(isset($rules['actors'][rtrim($ref,'/')]))return true;
+        if($scope==='server')foreach($muteRefs as $ref)if(isset($rules['muted_actors'][strtolower(rtrim($ref,'/'))]))return true;
+    }
+    return false;
+}
+
+function ap_masto_trend_source_downrank_ref_set(int $ownerUserId): ?array
+{
+    if ($ownerUserId < 1) {
+        return [];
+    }
+    try {
+    $set = [];
+    $now = time();
+    $preference = ap_db()->prepare('SELECT COALESCE(p.downranking_enabled, 1) FROM ap_users u LEFT JOIN actor_profile p ON p.actor_key = u.actor_key WHERE u.id = ?');
+    $preference->execute([$ownerUserId]);
+    $temporaryEnabled = (bool) $preference->fetchColumn();
+    $temporary=[];
+    if($temporaryEnabled){$query=ap_db()->prepare('SELECT actor_id,suppressed_until FROM ap_home_suppression WHERE owner_user_id=?');$query->execute([$ownerUserId]);foreach($query->fetchAll()?:[] as $item)$temporary[(string)$item['actor_id']]=['until'=>strtotime((string)$item['suppressed_until'])?:0];}
+    foreach ($temporary as $actor => $row) {
+        if ((int) ($row['until'] ?? 0) <= $now) {
+            continue;
+        }
+        $refs = ap_masto_trend_actor_refs((string) $actor);
+        foreach ($refs as $ref) {
+            $ref = strtolower(rtrim((string) $ref, '/'));
+            if ($ref !== '' && !ctype_digit($ref)) {
+                $set[$ref] = true;
+            }
+        }
+    }
+    // Read the current manual choices directly; never inherit a cached HTML decision.
+    $st = ap_db()->prepare('SELECT actor_id FROM ap_deprioritized_actors WHERE owner_user_id = ?');
+    $st->execute([$ownerUserId]);
+    foreach ($st->fetchAll() ?: [] as $row) {
+        foreach (ap_masto_trend_actor_refs((string) ($row['actor_id'] ?? '')) as $ref) {
+            $ref = rtrim((string) $ref, '/');
+            if ($ref !== '' && !ctype_digit($ref)) $set['manual:' . $ref] = true;
+        }
+    }
+    return $set;
+    }catch(Throwable $e){return null;}
+}
+
+function ap_masto_trend_tags_recount(array $sources, int $ownerUserId = 0): array
+{
     // dayIndex 0 = today … 6 = 6 days ago
     $dayStart = (int) (floor(time() / 86400) * 86400);
     /** @var array<string,array{uses:list<int>,accounts:list<array<string,bool>>}> $stats */
@@ -10707,70 +11344,46 @@ function ap_masto_trends_tags(int $limit = 10): array
         }
     };
 
-    try {
-        $since = gmdate('c', $dayStart - (6 * 86400));
-        $st = ap_db()->prepare(
-            "SELECT summary, created_at, actor_id FROM events
-             WHERE created_at >= ? AND summary IS NOT NULL AND summary != ''
-             ORDER BY id DESC LIMIT 2500"
-        );
-        $st->execute([$since]);
-        foreach ($st->fetchAll() as $row) {
-            $text = html_entity_decode((string) ($row['summary'] ?? ''), ENT_QUOTES | ENT_HTML5, 'UTF-8');
-            $ts = strtotime((string) ($row['created_at'] ?? '')) ?: 0;
-            $ingest($text, $ts, rtrim((string) ($row['actor_id'] ?? ''), '/'));
+    $viewer = $ownerUserId > 0 ? ap_auth_user_by_id($ownerUserId) : null;
+    if ($ownerUserId > 0 && (!is_array($viewer) || (int) ($viewer['id'] ?? 0) !== $ownerUserId || !empty($viewer['disabled_at']))) return [];
+    $currentRows = ap_search_local_indexing_rows();
+    if ($currentRows === null) return [];
+    $downrankRefs = $ownerUserId > 0 ? ap_masto_trend_source_downrank_ref_set($ownerUserId) : [];
+    if($downrankRefs===null)return [];
+    $entries=ap_masto_trend_tag_current_rows($sources);
+    $canonical=ap_masto_trend_tag_canonical_rows($entries);
+    if($canonical===null) return [];
+    $policy=ap_masto_trend_tag_policy_snapshot($ownerUserId);
+    if($policy===null)return [];
+    foreach ($entries as $entry) {
+        $row = $entry['row']; $source = $entry['source'];
+        if ($source === 'outbox') {
+            $raw = json_decode((string) ($row['raw_create_json'] ?? ''), true);
+            $row['spoiler_text'] = is_array($raw) && is_array($raw['object'] ?? null) ? (string) ($raw['object']['summary'] ?? '') : '';
         }
-    } catch (Throwable $e) {
-        // ignore
-    }
-    // Bluesky posts are already indexed by the feed workers. Read only that
-    // local cache here; never make AppView requests while rebuilding trends.
-    try {
-        if (function_exists('ap_bsky_posts_migrate')) {
-            ap_bsky_posts_migrate();
+        $text = (string) ($row[$source === 'event' ? 'summary' : ($source === 'bsky' ? 'text' : 'content')] ?? '');
+        if ($source === 'event') $text = html_entity_decode($text, ENT_QUOTES | ENT_HTML5, 'UTF-8');
+        if ($source === 'outbox') $text = strip_tags($text);
+        // Text-only prefilter does not authorize any contributing source.
+        if (!preg_match('/#[\p{L}\p{N}_]{2,100}/u', $text)) continue;
+        // Personal word matching stays strict even for an own contribution.
+        if ($ownerUserId > 0 && ap_masto_trend_tag_words_hidden($policy['words'],$text,(string)($row['spoiler_text']??''))) continue;
+        $actor = ap_masto_trend_tag_source_actor($row, $source, $currentRows, $canonical);
+        if ($actor === null) continue;
+        $uri=rtrim((string)($source==='outbox'?($row['id']??''):($row['object_id']??'')),'/');
+        $current=$canonical['outbox'][$uri]??$canonical['events'][$uri]??$canonical['mentions'][$uri]??null;
+        if($ownerUserId>0&&is_array($current)) {
+            $raw=json_decode((string)($current['raw_create_json']??''),true);
+            $cw=(string)($current['spoiler_text']??(is_array($raw)?($raw['object']['summary']??''):''));
+            if(ap_masto_trend_tag_words_hidden($policy['words'],(string)($current['summary']??$current['content']??''),$cw))continue;
         }
-        $st = ap_db()->prepare(
-            'SELECT text, published_at, author_did FROM bsky_posts
-             WHERE published_at >= ? AND text IS NOT NULL AND text <> \'\'
-             ORDER BY indexed_at DESC LIMIT 3000'
-        );
-        $st->execute([gmdate('c', $dayStart - (6 * 86400))]);
-        foreach ($st->fetchAll() ?: [] as $row) {
-            $ts = strtotime((string) ($row['published_at'] ?? '')) ?: 0;
-            $ingest((string) ($row['text'] ?? ''), $ts, (string) ($row['author_did'] ?? ''));
-        }
-    } catch (Throwable $e) {
-        // Bluesky indexing is optional and must never break Fediverse trends.
-    }
-    try {
-        $since = gmdate('c', $dayStart - (6 * 86400));
-        $st = ap_db()->prepare(
-            "SELECT content, created_at, actor_id FROM mentions
-             WHERE deleted_at IS NULL AND created_at >= ? AND content IS NOT NULL
-             ORDER BY id DESC LIMIT 800"
-        );
-        $st->execute([$since]);
-        foreach ($st->fetchAll() as $row) {
-            $ts = strtotime((string) ($row['created_at'] ?? '')) ?: 0;
-            $ingest((string) ($row['content'] ?? ''), $ts, rtrim((string) ($row['actor_id'] ?? ''), '/'));
-        }
-    } catch (Throwable $e) {
-        // ignore
-    }
-    try {
-        $since = gmdate('c', $dayStart - (6 * 86400));
-        $st = ap_db()->prepare(
-            "SELECT content, published FROM outbox_notes
-             WHERE published >= ?
-             ORDER BY published DESC LIMIT 400"
-        );
-        $st->execute([$since]);
-        foreach ($st->fetchAll() as $row) {
-            $ts = strtotime((string) ($row['published'] ?? '')) ?: 0;
-            $ingest(strip_tags((string) ($row['content'] ?? '')), $ts, 'https://mkultra.monster/users/cmdr_nova');
-        }
-    } catch (Throwable $e) {
-        // ignore
+        $sourceActor=$source==='outbox'?$actor:(string)($row['actor_id']??$row['author_did']??$actor);
+        // World moderation remains strict even for the viewer's own contribution.
+        if(ap_masto_trend_tag_actor_hidden($actor,$policy,$ownerUserId)||ap_masto_trend_tag_actor_hidden($sourceActor,$policy,$ownerUserId))continue;
+        $contributor = ['account' => ['uri' => $actor], 'trend_actors' => [$actor,$sourceActor]];
+        if ($ownerUserId > 0 && ap_masto_trend_status_is_downranked($contributor, $downrankRefs)) continue;
+        $ts = strtotime((string) ($row[$source === 'outbox' ? 'published' : ($source === 'bsky' ? 'published_at' : 'created_at')] ?? '')) ?: 0;
+        $ingest($text,$ts,ap_search_canonical_actor($sourceActor));
     }
 
     // Score: today/yesterday dominate so the sidebar moves through the week
@@ -10806,7 +11419,7 @@ function ap_masto_trends_tags(int $limit = 10): array
                 'accounts' => (string) count($s['accounts'][$i]),
             ];
         }
-        $tagEntity = ap_masto_tag_entity((string) $name, $history);
+        $tagEntity = ap_masto_tag_entity((string) $name, $history, $ownerUserId);
         $contributors = [];
         foreach ($s['accounts'] as $dayAccounts) {
             foreach (array_keys($dayAccounts) as $actor) {
@@ -10819,8 +11432,237 @@ function ap_masto_trends_tags(int $limit = 10): array
             break;
         }
     }
-    ap_masto_trends_cache_set('tags', $out);
-    return array_slice($out, 0, $limit);
+    if ($ownerUserId > 0) {
+        $current = ap_auth_user_by_id($ownerUserId);
+        if (!is_array($current) || !empty($current['disabled_at']) || (int) ($current['id'] ?? 0) !== $ownerUserId || ($current['actor_id'] ?? '') !== ($viewer['actor_id'] ?? '')) return [];
+    }
+    return $out;
+
+}
+
+function ap_masto_trend_link_source_window(): array
+{
+    $since = gmdate('c', (int) (floor(time() / 86400) * 86400) - 6 * 86400);
+    $sources = [];
+    $queries = [
+        'event' => ["SELECT id FROM events WHERE created_at >= ? AND summary IS NOT NULL AND summary != '' AND type IN ('Create','Announce') ORDER BY id DESC LIMIT 3000", 'id'],
+        'bsky' => ["SELECT bsky_uri FROM bsky_posts WHERE published_at >= ? AND text IS NOT NULL AND text <> '' ORDER BY indexed_at DESC LIMIT 3000", 'bsky_uri'],
+        'mention' => ["SELECT id FROM mentions WHERE deleted_at IS NULL AND created_at >= ? AND content IS NOT NULL ORDER BY id DESC LIMIT 800", 'id'],
+        'outbox' => ["SELECT id FROM outbox_notes WHERE published >= ? ORDER BY published DESC LIMIT 400", 'id'],
+    ];
+    foreach ($queries as $source => [$sql, $key]) {
+        try {
+            $st = ap_db()->prepare($sql); $st->execute([$since]);
+            foreach ($st->fetchAll() ?: [] as $row) $sources[] = ['source' => $source, 'id' => (string) $row[$key]];
+        } catch (Throwable $e) {
+            // Optional unavailable sources fail closed to no contribution.
+        }
+    }
+    return $sources;
+}
+
+function ap_masto_trend_link_current_rows(array $sources): array
+{
+    if (count($sources) > 7200) return [];
+    $defs = [
+        'event' => ['events', 'id', 'id,object_id,actor_id,visibility,type,action_taken,summary,spoiler_text,created_at'],
+        'mention' => ['mentions', 'id', 'id,object_id,actor_id,visibility,deleted_at,content,spoiler_text,created_at'],
+        'outbox' => ['outbox_notes', 'id', 'id,visibility,content,raw_create_json,published'],
+        'bsky' => ['bsky_posts', 'bsky_uri', 'bsky_uri,text,published_at,author_did'],
+    ];
+    $ids = []; $rows = []; $seen = []; $counts = [];
+    $caps = ['event' => 3000, 'bsky' => 3000, 'mention' => 800, 'outbox' => 400];
+    foreach ($sources as $entry) {
+        if (!is_array($entry) || !isset($defs[$entry['source'] ?? '']) || !is_string($entry['id'] ?? null) || $entry['id'] === '') return [];
+        $identity = $entry['source'] . ':' . $entry['id'];
+        if (isset($seen[$identity]) || ($counts[$entry['source']] ?? 0) >= $caps[$entry['source']]) return [];
+        $seen[$identity] = true; $counts[$entry['source']] = ($counts[$entry['source']] ?? 0) + 1;
+        $ids[$entry['source']][] = $entry['id'];
+    }
+    foreach ($ids as $source => $selected) {
+        [$table, $key, $columns] = $defs[$source];
+        foreach (array_chunk(array_values(array_unique($selected)), 200) as $batch) {
+            try {
+                $st = ap_db()->prepare("SELECT {$columns} FROM {$table} WHERE {$key} IN (" . implode(',', array_fill(0, count($batch), '?')) . ')');
+                $st->execute($batch);
+                foreach ($st->fetchAll() ?: [] as $row) $rows[$source][(string) $row[$key]] = $row;
+            } catch (Throwable $e) { /* Failed current reads contribute nothing. */ }
+        }
+    }
+    $out = [];
+    foreach ($sources as $entry) {
+        $row = $rows[$entry['source']][$entry['id']] ?? null;
+        if (is_array($row)) $out[] = ['source' => $entry['source'], 'row' => $row];
+    }
+    return $out;
+}
+
+function ap_masto_trend_links_recount(array $sources,int $ownerUserId=0,bool $allowMetadataFetch=false): array
+{
+    $dayStart = (int) (floor(time() / 86400) * 86400);
+    /** @var array<string,array{uses:list<int>,accounts:list<array<string,bool>>}> $stats */
+    $stats = [];
+
+    $ingest = static function (string $text, int $ts, string $accountKey) use (&$stats, $dayStart): void {
+        if ($text === '' || $ts <= 0 || !function_exists('ap_link_preview_extract_all_urls')) {
+            return;
+        }
+        $dayIdx = (int) floor(($dayStart - (int) (floor($ts / 86400) * 86400)) / 86400);
+        if ($dayIdx < 0 || $dayIdx > 6) {
+            return;
+        }
+        $urls = ap_link_preview_extract_all_urls($text, true);
+        if (!$urls) {
+            return;
+        }
+        $seenInPost = [];
+        foreach ($urls as $url) {
+            // Skip fediverse status/profile URLs — News wants articles/media sites
+            $host = strtolower((string) (parse_url($url, PHP_URL_HOST) ?: ''));
+            $path = strtolower((string) (parse_url($url, PHP_URL_PATH) ?: ''));
+            if ($host === '' || str_ends_with($host, 'mkultra.monster')) {
+                continue;
+            }
+            if (
+                str_contains($path, '/users/')
+                || str_contains($path, '/@')
+                || str_contains($path, '/statuses/')
+                || str_contains($path, '/notes/')
+                || str_contains($path, '/objects/')
+                || str_contains($path, '/activities/')
+                || str_contains($path, '/tags/')
+                || str_contains($host, 'brid.gy')
+            ) {
+                continue;
+            }
+            if (isset($seenInPost[$url])) {
+                continue;
+            }
+            $seenInPost[$url] = true;
+            if (!isset($stats[$url])) {
+                $stats[$url] = [
+                    'uses' => [0, 0, 0, 0, 0, 0, 0],
+                    'accounts' => [[], [], [], [], [], [], []],
+                ];
+            }
+            $stats[$url]['uses'][$dayIdx]++;
+            if ($accountKey !== '') {
+                $stats[$url]['accounts'][$dayIdx][$accountKey] = true;
+            }
+        }
+    };
+
+    $viewer = $ownerUserId > 0 ? ap_auth_user_by_id($ownerUserId) : null;
+    if ($ownerUserId > 0 && (!is_array($viewer) || (int) ($viewer['id'] ?? 0) !== $ownerUserId || !empty($viewer['disabled_at']))) return [];
+    $currentRows = ap_search_local_indexing_rows();
+    if ($currentRows === null) return [];
+    $downrankRefs = $ownerUserId > 0 ? ap_masto_trend_source_downrank_ref_set($ownerUserId) : [];
+    if($downrankRefs===null)return [];
+    if($downrankRefs===null)return [];
+    $entries=ap_masto_trend_link_current_rows($sources);
+    $canonical=ap_masto_trend_tag_canonical_rows($entries);
+    if($canonical===null) return [];
+    $policy=ap_masto_trend_tag_policy_snapshot($ownerUserId);
+    if($policy===null)return [];
+    foreach ($entries as $entry) {
+        $row = $entry['row']; $source = $entry['source'];
+        if ($source === 'outbox') {
+            $raw = json_decode((string) ($row['raw_create_json'] ?? ''), true);
+            $row['spoiler_text'] = is_array($raw) && is_array($raw['object'] ?? null) ? (string) ($raw['object']['summary'] ?? '') : '';
+        }
+        $text = (string) ($row[$source === 'event' ? 'summary' : ($source === 'bsky' ? 'text' : 'content')] ?? '');
+        if ($source === 'event') $text = html_entity_decode($text, ENT_QUOTES | ENT_HTML5, 'UTF-8');
+        if ($source === 'outbox') $text = strip_tags($text);
+        // Text-only prefilter does not authorize any contributing source.
+        if(!str_contains(strtolower($text),'https://'))continue;
+        // Personal word matching stays strict even for an own contribution.
+        if ($ownerUserId > 0 && ap_masto_trend_tag_words_hidden($policy['words'],$text,(string)($row['spoiler_text']??''))) continue;
+        $actor = ap_masto_trend_tag_source_actor($row, $source, $currentRows, $canonical);
+        if ($actor === null) continue;
+        $uri=rtrim((string)($source==='outbox'?($row['id']??''):($row['object_id']??'')),'/');
+        $current=$canonical['outbox'][$uri]??$canonical['events'][$uri]??$canonical['mentions'][$uri]??null;
+        if($ownerUserId>0&&is_array($current)) {
+            $raw=json_decode((string)($current['raw_create_json']??''),true);
+            $cw=(string)($current['spoiler_text']??(is_array($raw)?($raw['object']['summary']??''):''));
+            if(ap_masto_trend_tag_words_hidden($policy['words'],(string)($current['summary']??$current['content']??''),$cw))continue;
+        }
+        $sourceActor=$source==='outbox'?$actor:(string)($row['actor_id']??$row['author_did']??$actor);
+        // World moderation remains strict even for the viewer's own contribution.
+        if(ap_masto_trend_tag_actor_hidden($actor,$policy,$ownerUserId)||ap_masto_trend_tag_actor_hidden($sourceActor,$policy,$ownerUserId))continue;
+        $contributor = ['account' => ['uri' => $actor], 'trend_actors' => [$actor,$sourceActor]];
+        if ($ownerUserId > 0 && ap_masto_trend_status_is_downranked($contributor, $downrankRefs)) continue;
+        $ts = strtotime((string) ($row[$source === 'outbox' ? 'published' : ($source === 'bsky' ? 'published_at' : 'created_at')] ?? '')) ?: 0;
+        $ingest($text,$ts,ap_search_canonical_actor($sourceActor));
+    }
+
+    $scored = [];
+    foreach ($stats as $url => $s) {
+        $totalUses = array_sum($s['uses']);
+        if ($totalUses < 2) {
+            continue;
+        }
+        $score = 0.0;
+        $weights = [20, 8, 3, 1.5, 1, 0.5, 0.25];
+        for ($i = 0; $i < 7; $i++) {
+            $uses = (int) $s['uses'][$i];
+            $accts = count($s['accounts'][$i]);
+            $score += $weights[$i] * ($uses + (0.5 * $accts));
+        }
+        if ((int) $s['uses'][0] > 0) {
+            $score *= 1.35;
+        }
+        $scored[$url] = $score;
+    }
+    arsort($scored, SORT_NUMERIC);
+
+    $out = [];
+    // Deferred ajax trends + 15m cache: warm titles for the sidebar (5) plus a few more.
+    $fetchBudget = 8;
+    foreach ($scored as $url => $score) {
+        $s = $stats[$url];
+        $history = [];
+        for ($i = 0; $i < 7; $i++) {
+            $history[] = [
+                'day' => (string) ($dayStart - ($i * 86400)),
+                'uses' => (string) (int) $s['uses'][$i],
+                'accounts' => (string) count($s['accounts'][$i]),
+            ];
+        }
+        $cached = function_exists('ap_link_preview_cache_get') ? ap_link_preview_cache_get((string) $url) : null;
+        $hasOkTitle = is_array($cached)
+            && ($cached['status'] ?? '') === 'ok'
+            && trim((string) ($cached['title'] ?? '')) !== '';
+        // Retry when missing or previously failed (fail rows used to block refetch).
+        $allowFetch = $allowMetadataFetch && $fetchBudget > 0 && !$hasOkTitle;
+        if ($allowFetch) {
+            $fetchBudget--;
+        }
+        $linkEntity = ap_masto_trends_link_entity((string) $url, $history, $allowFetch);
+        $contributors = [];
+        foreach ($s['accounts'] as $dayAccounts) {
+            foreach (array_keys($dayAccounts) as $actor) {
+                $contributors[] = $actor;
+            }
+        }
+        $linkEntity['trend_actors'] = array_values(array_unique($contributors));
+        $out[] = $linkEntity;
+        if (count($out) >= 20) {
+            break;
+        }
+    }
+    if($ownerUserId>0){$current=ap_auth_user_by_id($ownerUserId);if(!is_array($current)||!empty($current['disabled_at'])||(int)($current['id']??0)!==$ownerUserId||($current['actor_id']??'')!==($viewer['actor_id']??''))return [];}
+    return $out;
+}
+
+function ap_masto_trends_tags(int $limit = 10, int $ownerUserId = 0): array
+{
+    $limit = max(1, min(30, $limit));
+    $cached = ap_masto_trends_cache_get('tags', 1, $ownerUserId);
+    if (is_array($cached)) return array_slice($cached, 0, $limit);
+    $sources = ap_masto_trend_tag_source_window();
+    $items = ap_masto_trend_tags_recount($sources);
+    ap_masto_trends_cache_set('tags', $items, $sources);
+    return array_slice($ownerUserId > 0 ? ap_masto_trend_tags_recount($sources, $ownerUserId) : $items, 0, $limit);
 }
 
 /**
@@ -10896,189 +11738,17 @@ function ap_masto_trends_link_entity(string $url, array $history, bool $allowFet
  *
  * @return list<array<string,mixed>> Mastodon Trends::Link entities
  */
-function ap_masto_trends_links(int $limit = 10): array
+function ap_masto_trends_links(int $limit=10,int $ownerUserId=0): array
 {
-    $limit = max(1, min(20, $limit));
-    $cached = ap_masto_trends_cache_get('links', 1);
-    if (is_array($cached) && count($cached) >= $limit) {
-        return array_slice($cached, 0, $limit);
-    }
-
-    $dayStart = (int) (floor(time() / 86400) * 86400);
-    /** @var array<string,array{uses:list<int>,accounts:list<array<string,bool>>}> $stats */
-    $stats = [];
-
-    $ingest = static function (string $text, int $ts, string $accountKey) use (&$stats, $dayStart): void {
-        if ($text === '' || $ts <= 0 || !function_exists('ap_link_preview_extract_all_urls')) {
-            return;
-        }
-        $dayIdx = (int) floor(($dayStart - (int) (floor($ts / 86400) * 86400)) / 86400);
-        if ($dayIdx < 0 || $dayIdx > 6) {
-            return;
-        }
-        $urls = ap_link_preview_extract_all_urls($text, true);
-        if (!$urls) {
-            return;
-        }
-        $seenInPost = [];
-        foreach ($urls as $url) {
-            // Skip fediverse status/profile URLs — News wants articles/media sites
-            $host = strtolower((string) (parse_url($url, PHP_URL_HOST) ?: ''));
-            $path = strtolower((string) (parse_url($url, PHP_URL_PATH) ?: ''));
-            if ($host === '' || str_ends_with($host, 'mkultra.monster')) {
-                continue;
-            }
-            if (
-                str_contains($path, '/users/')
-                || str_contains($path, '/@')
-                || str_contains($path, '/statuses/')
-                || str_contains($path, '/notes/')
-                || str_contains($path, '/objects/')
-                || str_contains($path, '/activities/')
-                || str_contains($path, '/tags/')
-                || str_contains($host, 'brid.gy')
-            ) {
-                continue;
-            }
-            if (isset($seenInPost[$url])) {
-                continue;
-            }
-            $seenInPost[$url] = true;
-            if (!isset($stats[$url])) {
-                $stats[$url] = [
-                    'uses' => [0, 0, 0, 0, 0, 0, 0],
-                    'accounts' => [[], [], [], [], [], [], []],
-                ];
-            }
-            $stats[$url]['uses'][$dayIdx]++;
-            if ($accountKey !== '') {
-                $stats[$url]['accounts'][$dayIdx][$accountKey] = true;
-            }
-        }
-    };
-
-    try {
-        $since = gmdate('c', $dayStart - (6 * 86400));
-        $st = ap_db()->prepare(
-            "SELECT summary, created_at, actor_id FROM events
-             WHERE created_at >= ? AND summary IS NOT NULL AND summary != ''
-               AND type IN ('Create', 'Announce')
-             ORDER BY id DESC LIMIT 3000"
-        );
-        $st->execute([$since]);
-        foreach ($st->fetchAll() as $row) {
-            $text = html_entity_decode((string) ($row['summary'] ?? ''), ENT_QUOTES | ENT_HTML5, 'UTF-8');
-            $ts = strtotime((string) ($row['created_at'] ?? '')) ?: 0;
-            $ingest($text, $ts, rtrim((string) ($row['actor_id'] ?? ''), '/'));
-        }
-    } catch (Throwable $e) {
-        // ignore
-    }
-    try {
-        $since = gmdate('c', $dayStart - (6 * 86400));
-        $st = ap_db()->prepare(
-            "SELECT content, created_at, actor_id FROM mentions
-             WHERE deleted_at IS NULL AND created_at >= ? AND content IS NOT NULL
-             ORDER BY id DESC LIMIT 800"
-        );
-        $st->execute([$since]);
-        foreach ($st->fetchAll() as $row) {
-            $ts = strtotime((string) ($row['created_at'] ?? '')) ?: 0;
-            $ingest((string) ($row['content'] ?? ''), $ts, rtrim((string) ($row['actor_id'] ?? ''), '/'));
-        }
-    } catch (Throwable $e) {
-        // ignore
-    }
-    try {
-        $since = gmdate('c', $dayStart - (6 * 86400));
-        $st = ap_db()->prepare(
-            "SELECT content, published FROM outbox_notes
-             WHERE published >= ?
-             ORDER BY published DESC LIMIT 400"
-        );
-        $st->execute([$since]);
-        foreach ($st->fetchAll() as $row) {
-            $ts = strtotime((string) ($row['published'] ?? '')) ?: 0;
-            $ingest(strip_tags((string) ($row['content'] ?? '')), $ts, 'https://mkultra.monster/users/cmdr_nova');
-        }
-    } catch (Throwable $e) {
-        // ignore
-    }
-    try {
-        if (function_exists('ap_bsky_posts_migrate')) {
-            ap_bsky_posts_migrate();
-        }
-        $st = ap_db()->prepare(
-            'SELECT text, published_at, author_did FROM bsky_posts
-             WHERE published_at >= ? AND text IS NOT NULL AND text <> \'\'
-             ORDER BY indexed_at DESC LIMIT 3000'
-        );
-        $st->execute([gmdate('c', $dayStart - (6 * 86400))]);
-        foreach ($st->fetchAll() ?: [] as $row) {
-            $ts = strtotime((string) ($row['published_at'] ?? '')) ?: 0;
-            $ingest((string) ($row['text'] ?? ''), $ts, (string) ($row['author_did'] ?? ''));
-        }
-    } catch (Throwable $e) {
-        // Bluesky indexing is optional.
-    }
-
-    $scored = [];
-    foreach ($stats as $url => $s) {
-        $totalUses = array_sum($s['uses']);
-        if ($totalUses < 2) {
-            continue;
-        }
-        $score = 0.0;
-        $weights = [20, 8, 3, 1.5, 1, 0.5, 0.25];
-        for ($i = 0; $i < 7; $i++) {
-            $uses = (int) $s['uses'][$i];
-            $accts = count($s['accounts'][$i]);
-            $score += $weights[$i] * ($uses + (0.5 * $accts));
-        }
-        if ((int) $s['uses'][0] > 0) {
-            $score *= 1.35;
-        }
-        $scored[$url] = $score;
-    }
-    arsort($scored, SORT_NUMERIC);
-
-    $out = [];
-    // Deferred ajax trends + 15m cache: warm titles for the sidebar (5) plus a few more.
-    $fetchBudget = 8;
-    foreach ($scored as $url => $score) {
-        $s = $stats[$url];
-        $history = [];
-        for ($i = 0; $i < 7; $i++) {
-            $history[] = [
-                'day' => (string) ($dayStart - ($i * 86400)),
-                'uses' => (string) (int) $s['uses'][$i],
-                'accounts' => (string) count($s['accounts'][$i]),
-            ];
-        }
-        $cached = function_exists('ap_link_preview_cache_get') ? ap_link_preview_cache_get((string) $url) : null;
-        $hasOkTitle = is_array($cached)
-            && ($cached['status'] ?? '') === 'ok'
-            && trim((string) ($cached['title'] ?? '')) !== '';
-        // Retry when missing or previously failed (fail rows used to block refetch).
-        $allowFetch = $fetchBudget > 0 && !$hasOkTitle;
-        if ($allowFetch) {
-            $fetchBudget--;
-        }
-        $linkEntity = ap_masto_trends_link_entity((string) $url, $history, $allowFetch);
-        $contributors = [];
-        foreach ($s['accounts'] as $dayAccounts) {
-            foreach (array_keys($dayAccounts) as $actor) {
-                $contributors[] = $actor;
-            }
-        }
-        $linkEntity['trend_actors'] = array_values(array_unique($contributors));
-        $out[] = $linkEntity;
-        if (count($out) >= 20) {
-            break;
-        }
-    }
-    ap_masto_trends_cache_set('links', $out);
-    return array_slice($out, 0, $limit);
+    $limit=max(1,min(20,$limit));
+    $cached=ap_masto_trends_cache_get('links',1,$ownerUserId);
+    if(is_array($cached))return array_slice($cached,0,$limit);
+    $sources=ap_masto_trend_link_source_window();
+    $items=ap_masto_trend_links_recount($sources,0,true);
+    // Metadata IO can outlive current source/audience/moderation facts.
+    $items=ap_masto_trend_links_recount($sources,0,false);
+    ap_masto_trends_cache_set('links',$items,$sources);
+    return array_slice($ownerUserId>0?ap_masto_trend_links_recount($sources,$ownerUserId):$items,0,$limit);
 }
 
 /**
@@ -11448,7 +12118,7 @@ function ap_masto_trends_statuses(int $limit = 10): array
 {
     $limit = max(1, min(20, $limit));
     $cached = ap_masto_trends_cache_get('statuses', 1);
-    if (is_array($cached) && count($cached) >= $limit) {
+    if (is_array($cached)) {
         return array_slice($cached, 0, $limit);
     }
 
@@ -11530,7 +12200,8 @@ function ap_masto_trends_statuses(int $limit = 10): array
     $seenIds = [];
     /** @var array<string,int> $perAcct */
     $perAcct = [];
-    $takeStatus = static function (array $status) use (&$out, &$seenIds, &$perAcct): bool {
+    $takeStatus = static function (array $status, array $row, string $source = 'event') use (&$out, &$seenIds, &$perAcct): bool {
+        // candidate_batch already admitted this exact current painted source.
         $sid = (string) ($status['id'] ?? '');
         if ($sid === '' || isset($seenIds[$sid])) {
             return false;
@@ -11552,63 +12223,17 @@ function ap_masto_trends_statuses(int $limit = 10): array
 
     // Leave room so cached Bluesky posts can appear in Explore (~30%).
     $fediCap = 14;
-    foreach ($scored as $oid => $_score) {
-        if (count($out) >= $fediCap) {
-            break;
+    foreach (array_chunk(array_keys($scored),32) as $oids) {
+        if (count($out) >= $fediCap) break;
+        $entries=[];foreach($oids as $oid)$entries[]=['source'=>'event','row'=>['object_id'=>$oid]];
+        foreach(ap_masto_trend_status_candidate_batch($entries,array_fill_keys(array_column($out,'uri'),true)) as $status) {
+            if(count($out)>=$fediCap)break;
+            $oid=rtrim((string)($status['uri']??''),'/');$a=$agg[$oid]??null;if(!is_array($a))continue;
+            $status['reblogs_count']=max((int)($status['reblogs_count']??0),(int)$a['announces']);
+            $status['favourites_count']=max((int)($status['favourites_count']??0),(int)$a['likes']);
+            $status['replies_count']=max((int)($status['replies_count']??0),(int)$a['replies']);
+            $takeStatus($status,$status['_vaak_trend_source']['row']);
         }
-        $row = null;
-        try {
-            // Prefer a Create with text; then Create with media; then Announce
-            $st = ap_db()->prepare(
-                "SELECT * FROM events
-                 WHERE object_id = ? AND type = 'Create'
-                   AND summary IS NOT NULL AND summary != ''
-                 ORDER BY id DESC LIMIT 1"
-            );
-            $st->execute([$oid]);
-            $row = $st->fetch();
-            if (!is_array($row)) {
-                $st = ap_db()->prepare(
-                    "SELECT * FROM events
-                     WHERE object_id = ? AND type = 'Create'
-                       AND media_urls IS NOT NULL AND media_urls != '' AND media_urls != '[]'
-                     ORDER BY id DESC LIMIT 1"
-                );
-                $st->execute([$oid]);
-                $row = $st->fetch();
-            }
-            if (!is_array($row)) {
-                $st = ap_db()->prepare(
-                    "SELECT * FROM events
-                     WHERE object_id = ? AND type = 'Announce'
-                       AND (
-                         (summary IS NOT NULL AND summary != '')
-                         OR (media_urls IS NOT NULL AND media_urls != '' AND media_urls != '[]')
-                       )
-                     ORDER BY id DESC LIMIT 1"
-                );
-                $st->execute([$oid]);
-                $row = $st->fetch();
-            }
-        } catch (Throwable $e) {
-            $row = null;
-        }
-        if (!is_array($row)) {
-            continue;
-        }
-        $status = ap_masto_status_from_event($row);
-        if ($status === null) {
-            continue;
-        }
-        // Trends should show the underlying post, not the boost wrapper
-        if (!empty($status['reblog']) && is_array($status['reblog'])) {
-            $status = $status['reblog'];
-        }
-        $a = $agg[$oid];
-        $status['reblogs_count'] = max((int) ($status['reblogs_count'] ?? 0), (int) $a['announces']);
-        $status['favourites_count'] = max((int) ($status['favourites_count'] ?? 0), (int) $a['likes']);
-        $status['replies_count'] = max((int) ($status['replies_count'] ?? 0), (int) $a['replies']);
-        $takeStatus($status);
     }
 
     // Fill with recent original Creates if engagement set is thin
@@ -11623,15 +12248,13 @@ function ap_masto_trends_statuses(int $limit = 10): array
                  ORDER BY id DESC LIMIT 120"
             );
             $st->execute([$since]);
-            foreach ($st->fetchAll() as $row) {
-                if (count($out) >= max($limit, 10)) {
-                    break;
+            foreach(array_chunk($st->fetchAll()?:[],32) as $batch) {
+                if(count($out)>=max($limit,10))break;
+                $entries=[];foreach($batch as $row)$entries[]=['source'=>'event','row'=>$row];
+                foreach(ap_masto_trend_status_candidate_batch($entries,array_fill_keys(array_column($out,'uri'),true)) as $status) {
+                    if(count($out)>=max($limit,10))break;
+                    $takeStatus($status,$status['_vaak_trend_source']['row']);
                 }
-                $status = ap_masto_status_from_event($row);
-                if ($status === null) {
-                    continue;
-                }
-                $takeStatus($status);
             }
         } catch (Throwable $e) {
             // ignore
@@ -11645,7 +12268,7 @@ function ap_masto_trends_statuses(int $limit = 10): array
             ap_bsky_posts_migrate();
         }
         $st = ap_db()->prepare(
-            'SELECT raw_json FROM bsky_posts
+            'SELECT * FROM bsky_posts
              WHERE published_at >= ? AND raw_json IS NOT NULL AND raw_json <> \'\'
              ORDER BY (COALESCE(like_count, 0) + COALESCE(repost_count, 0) * 2 + COALESCE(reply_count, 0) * 2 + COALESCE(quote_count, 0) * 2) DESC,
                       indexed_at DESC LIMIT 120'
@@ -11653,25 +12276,12 @@ function ap_masto_trends_statuses(int $limit = 10): array
         $st->execute([$since]);
         $bskyAdded = 0;
         $bskyCap = 6;
-        foreach ($st->fetchAll() ?: [] as $row) {
-            if ($bskyAdded >= $bskyCap || count($out) >= 20) {
-                break;
-            }
-            $raw = json_decode((string) ($row['raw_json'] ?? ''), true);
-            if (!is_array($raw)) {
-                continue;
-            }
-            // raw_json may be PostView or FeedViewPost({post: ...}).
-            $post = is_array($raw['post'] ?? null) ? $raw['post'] : $raw;
-            if (!function_exists('ap_masto_bsky_trend_status')) {
-                continue;
-            }
-            $status = ap_masto_bsky_trend_status($post);
-            if ($status === null) {
-                continue;
-            }
-            if ($takeStatus($status)) {
-                $bskyAdded++;
+        foreach(array_chunk($st->fetchAll()?:[],32) as $batch) {
+            if($bskyAdded>=$bskyCap||count($out)>=20)break;
+            $entries=[];foreach($batch as $row)$entries[]=['source'=>'bsky','row'=>$row];
+            foreach(ap_masto_trend_status_candidate_batch($entries,array_fill_keys(array_column($out,'uri'),true)) as $status) {
+                if($bskyAdded>=$bskyCap||count($out)>=20)break;
+                if($takeStatus($status,$status['_vaak_trend_source']['row'],'bsky'))$bskyAdded++;
             }
         }
     } catch (Throwable $e) {
@@ -11703,7 +12313,7 @@ function ap_masto_trends_statuses(int $limit = 10): array
     $out = $mixed;
 
     ap_masto_trends_cache_set('statuses', array_slice($out, 0, 20));
-    return array_slice($out, 0, $limit);
+    return ap_masto_trend_status_public_items(array_slice($out, 0, $limit));
 }
 
 /* -------------------------------------------------------------------------- */

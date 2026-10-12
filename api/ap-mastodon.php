@@ -955,6 +955,19 @@ function ap_masto_oauth_revoke(): void
     exit;
 }
 
+function ap_masto_trends_viewer_user_id(): int
+{
+    $auth = $_SERVER['HTTP_AUTHORIZATION'] ?? $_SERVER['REDIRECT_HTTP_AUTHORIZATION'] ?? '';
+    if (!is_string($auth) || trim($auth) === '') return 0;
+    $token = ap_oauth_token_lookup($auth);
+    if (!is_array($token) || str_starts_with((string) ($token['scopes'] ?? ''), 'app:')) return 0;
+    // Never use the legacy NULL-token/default-operator fallback for a public route.
+    $id = (int) ($token['user_id'] ?? 0);
+    if ($id < 1) return 0;
+    $user = ap_auth_user_by_id($id);
+    return is_array($user) && empty($user['disabled_at']) ? (int) $user['id'] : 0;
+}
+
 function ap_masto_api(string $method, string $path): void
 {
     // Public-ish stubs that Ice Cubes hits before/without caring much
@@ -1146,7 +1159,9 @@ function ap_masto_api(string $method, string $path): void
     if ($method === 'GET' && ($path === '/api/v1/trends/tags' || $path === '/api/v1/trends')) {
         $limit = isset($_GET['limit']) ? (int) $_GET['limit'] : 10;
         $limit = max(1, min(30, $limit));
-        ap_masto_json(ap_masto_trends_tags($limit));
+        $owner = ap_masto_trends_viewer_user_id();
+        $items = ap_masto_trends_tags($owner > 0 ? 30 : $limit, $owner);
+        ap_masto_json(ap_masto_trends_filter_for_owner($items, $owner, $limit));
         return;
     }
 
@@ -1154,7 +1169,8 @@ function ap_masto_api(string $method, string $path): void
     if ($method === 'GET' && $path === '/api/v1/trends/links') {
         $limit = isset($_GET['limit']) ? (int) $_GET['limit'] : 10;
         $limit = max(1, min(20, $limit));
-        ap_masto_json(ap_masto_trends_links($limit));
+        $owner=ap_masto_trends_viewer_user_id();
+        ap_masto_json(ap_masto_trends_links($limit,$owner));
         return;
     }
 
@@ -1162,7 +1178,9 @@ function ap_masto_api(string $method, string $path): void
     if ($method === 'GET' && $path === '/api/v1/trends/statuses') {
         $limit = isset($_GET['limit']) ? (int) $_GET['limit'] : 10;
         $limit = max(1, min(20, $limit));
-        ap_masto_json(ap_masto_trends_statuses($limit));
+        $owner = ap_masto_trends_viewer_user_id();
+        $items = ap_masto_trends_statuses($owner > 0 ? 20 : $limit);
+        ap_masto_json(ap_masto_trends_filter_for_owner($items, $owner, $limit));
         return;
     }
 

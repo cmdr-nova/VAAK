@@ -260,7 +260,7 @@ async fn load_viewer_actor(db: &Client, owner_id: i64) -> Result<String> {
     let row = db
         .query_opt(
             "SELECT COALESCE(NULLIF(trim(actor_id), ''), ''), COALESCE(username, '')
-             FROM ap_users WHERE id = $1 LIMIT 1",
+             FROM ap_users WHERE id = $1::bigint LIMIT 1",
             &[&owner_id],
         )
         .await
@@ -803,9 +803,11 @@ pub async fn profile_html_fill(
     }
     // Apply after quote and self-thread hydration, including off-page parents.
     let source_count = statuses.len();
-    let hidden = crate::hidden::load_hidden_sets(&db, viewer_owner_id).await?;
+    let mut hidden = crate::hidden::load_hidden_sets(&db, viewer_owner_id).await?;
     crate::audience::filter_statuses(&db, viewer_owner_id, crate::audience::Surface::Profile, &mut statuses).await?;
-    statuses.retain(|st| !crate::hidden::status_hidden_on_profile(st, &hidden));
+    let selected:Vec<String> = statuses.iter().filter_map(|status|status.get("uri").and_then(Value::as_str).map(str::to_owned)).collect();
+    crate::hidden::load_ordinary_owned_notes(&db, viewer_owner_id, &selected, &mut hidden).await?;
+    statuses.retain(|st| !crate::hidden::ordinary_status_hidden_on_profile(st, &hidden));
     crate::audience::filter_parents(&db, viewer_owner_id, crate::audience::Surface::Profile, &mut extra_parents).await?;
     let units = plan_feed_paint_units(&statuses, &extra_parents);
     let paint = |st: &Value, from: &str, viewer: &str| paint_lean_feed_card_opts(st, from, viewer);

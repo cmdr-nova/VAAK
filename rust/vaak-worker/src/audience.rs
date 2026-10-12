@@ -261,12 +261,16 @@ pub async fn filter_parents(db: &Client, owner: i64, surface: Surface, parents: 
     if parents.is_empty() { return Ok(()); }
     let keys: Vec<String> = parents.keys().cloned().collect();
     let mut values: Vec<Value> = keys.iter().filter_map(|k| parents.remove(k)).collect();
-    let hidden = crate::hidden::load_hidden_sets(db, owner).await?;
+    let mut hidden = crate::hidden::load_hidden_sets(db, owner).await?;
+    let selected:Vec<String> = values.iter().filter_map(|status|status.get("uri").and_then(Value::as_str).map(str::to_owned)).collect();
+    crate::hidden::load_ordinary_owned_notes(db, owner, &selected, &mut hidden).await?;
     filter_statuses(db, owner, surface, &mut values).await?;
     let moderation = crate::hidden::load_viewer_moderation(db, owner).await?;
     crate::notif_embed::stamp_viewer_moderation(&mut values, &moderation);
+    let selected:Vec<String> = values.iter().filter_map(|status|status.get("uri").and_then(Value::as_str).map(str::to_owned)).collect();
+    crate::hidden::load_ordinary_owned_notes(db, owner, &selected, &mut hidden).await?;
     for st in values {
-        if !(if surface == Surface::Profile { crate::hidden::status_hidden_on_profile(&st, &hidden) } else { crate::hidden::status_hidden(&st, &hidden) }) {
+        if !(if surface == Surface::Profile { crate::hidden::ordinary_status_hidden_on_profile(&st, &hidden) } else { crate::hidden::ordinary_status_hidden(&st, &hidden) }) {
             let id = key(st.get("uri").and_then(Value::as_str).unwrap_or(""));
             if let Some(k) = keys.iter().find(|k| key(k) == id) { parents.insert(k.clone(), st); }
         }

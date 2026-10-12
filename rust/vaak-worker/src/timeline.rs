@@ -309,8 +309,10 @@ pub async fn view_hydrate(
             crate::recommendations::filter_statuses(&moderation_db, owner_user_id, &mut report.items).await?;
         }
         crate::home_hydrate_ranked::refresh_local_accounts(&moderation_db, &mut report.items).await?;
-        let hidden = crate::hidden::load_hidden_sets(&moderation_db, owner_user_id).await?;
-        report.items.retain(|status| !crate::hidden::status_hidden(status, &hidden));
+        let mut hidden = crate::hidden::load_hidden_sets(&moderation_db, owner_user_id).await?;
+        let selected:Vec<String> = report.items.iter().filter_map(|status|status.get("uri").and_then(serde_json::Value::as_str).map(str::to_owned)).collect();
+        crate::hidden::load_ordinary_owned_notes(&moderation_db, owner_user_id, &selected, &mut hidden).await?;
+        report.items.retain(|status| !crate::hidden::ordinary_status_hidden(status, &hidden));
         report.filtered = report.items.len() != before;
         report.n = report.items.len();
         let _ = crate::interaction_flags::apply_to_statuses_with_cfg(
@@ -328,7 +330,9 @@ pub async fn view_hydrate(
         )
         .await;
         crate::audience::filter_statuses(&moderation_db, owner_user_id, crate::audience::Surface::timeline(view), &mut report.items).await?;
-        report.items.retain(|status| !crate::hidden::status_hidden(status, &hidden));
+        let selected:Vec<String> = report.items.iter().filter_map(|status|status.get("uri").and_then(serde_json::Value::as_str).map(str::to_owned)).collect();
+        crate::hidden::load_ordinary_owned_notes(&moderation_db, owner_user_id, &selected, &mut hidden).await?;
+        report.items.retain(|status| !crate::hidden::ordinary_status_hidden(status, &hidden));
         report.filtered = report.items.len() != before;
         report.n = report.items.len();
     }
