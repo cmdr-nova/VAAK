@@ -153,7 +153,7 @@ pub async fn fetch_newer_home(
                ORDER BY indexed_at DESC
                LIMIT 25
              ) p ON true
-             WHERE g.owner_user_id = $1
+             WHERE g.owner_user_id = $1::bigint
                AND g.kind = 'follow'
              ORDER BY p.indexed_at DESC
              LIMIT $3",
@@ -161,8 +161,13 @@ pub async fn fetch_newer_home(
         )
         .await
         .context("newer bsky")?;
+    let bsky_uris: Vec<String> = bsky_rows.iter().map(|row| row.get(0)).collect();
+    let mirrors = crate::home_bsky_mirrors::flags(&db, &bsky_uris).await?;
+    let own_did = crate::home_bsky_mirrors::own_did(&db, owner_user_id).await?;
     for row in &bsky_rows {
         let uri: String = row.get(0);
+        if mirrors.get(&uri).map(|flag| flag.mirror || flag.note_id.is_some()).unwrap_or(false)
+            || own_did.as_ref().map(|did| uri.starts_with(&format!("at://{did}/"))).unwrap_or(false) { continue; }
         let indexed: String = row.try_get::<_, String>(1).unwrap_or_default();
         let sort = parse_ts(&indexed).unwrap_or(0);
         if sort <= since_ts {

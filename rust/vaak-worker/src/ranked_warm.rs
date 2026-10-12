@@ -862,12 +862,10 @@ async fn load_own_did(db: &Client, owner: i64) -> Result<Option<String>> {
     }
     let row = db
         .query_opt(
-            "SELECT did FROM bsky_sessions WHERE owner_user_id = $1 LIMIT 1",
+            "SELECT did FROM bsky_sessions WHERE owner_user_id = $1::bigint LIMIT 1",
             &[&owner],
         )
-        .await
-        .ok()
-        .flatten();
+        .await?;
     Ok(row.and_then(|r| {
         r.try_get::<_, Option<String>>(0)
             .ok()
@@ -2842,6 +2840,9 @@ pub async fn warm_home_native(cfg: &Config, owner_user_id: i64) -> Result<String
             }
         }
     }
+    let uris: Vec<String> = bsky.iter().map(|row| row.uri.clone()).collect();
+    let mirrors = crate::home_bsky_mirrors::flags(&db, &uris).await?;
+    bsky.retain(|row| !mirrors.get(&row.uri).map(|flag| flag.mirror || flag.note_id.is_some()).unwrap_or(false));
     // Algorithm-off leaves both maps empty, so this keeps indexed_at order.
     stamp_bsky_sort(&mut bsky, &actor_weights, &tag_weights);
     collapse_repeated_external_posts(&mut bsky);
