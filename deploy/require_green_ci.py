@@ -3,6 +3,11 @@
 
 Check runs whose job name belongs to this deploy workflow are ignored, so
 the workflow can require some other CI run without counting itself.
+
+A release commit pushed with GITHUB_TOKEN has no check runs: GitHub does
+not start workflows for that token. Waiting cannot succeed. Callers gate
+that commit with deploy/release_commit.py (parent CI, version-only diff)
+instead of polling here.
 """
 
 from __future__ import annotations
@@ -44,6 +49,19 @@ def evaluate(check_runs: list[dict]) -> str:
     return "ok"
 
 
+def should_wait(state: str, check_run_count: int) -> bool:
+    """Whether polling again could observe a new result.
+
+    Zero check runs stay empty. A push made with GITHUB_TOKEN does not
+    start workflows, so a wait on that commit hangs until the timeout.
+    """
+    if state in {"ok", "fail"}:
+        return False
+    if state == "absent" and check_run_count == 0:
+        return False
+    return state in {"pending", "absent"}
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Require a green CI result for a commit")
     parser.add_argument("--sha", required=True)
@@ -68,7 +86,16 @@ def main(argv: list[str] | None = None) -> int:
         if state == "fail":
             print(f"ci_error: checks failed for {args.sha}", file=sys.stderr)
             return 1
-        if not args.wait or time.time() >= deadline:
+        if len(runs) == 0:
+            print(
+                f"ci_error: no check runs for {args.sha}. "
+                "A commit pushed with GITHUB_TOKEN does not start GitHub Actions, "
+                "so waiting cannot succeed. Require CI on the parent commit and "
+                "confirm this commit only changes version files.",
+                file=sys.stderr,
+            )
+            return 1
+        if not args.wait or not should_wait(state, len(runs)) or time.time() >= deadline:
             print(f"ci_error: CI is {state} for {args.sha}", file=sys.stderr)
             return 1
         time.sleep(args.interval_seconds)

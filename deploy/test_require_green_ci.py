@@ -3,13 +3,16 @@
 
 from __future__ import annotations
 
+import io
 import sys
 import unittest
+from contextlib import redirect_stderr
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from require_green_ci import evaluate
+from require_green_ci import evaluate, main, should_wait
 
 
 def run(name: str, status: str = "completed", conclusion: str = "success") -> dict:
@@ -33,6 +36,21 @@ class EvaluateCiTest(unittest.TestCase):
             evaluate([run("php"), run("docs", conclusion="skipped")]),
             "ok",
         )
+
+    def test_zero_check_runs_are_not_worth_waiting_for(self) -> None:
+        self.assertFalse(should_wait("absent", 0))
+        self.assertTrue(should_wait("absent", 2))
+        self.assertTrue(should_wait("pending", 1))
+        self.assertFalse(should_wait("ok", 1))
+        self.assertFalse(should_wait("fail", 1))
+
+    @patch("require_green_ci.fetch_check_runs", return_value=[])
+    @patch("require_green_ci.time.sleep")
+    def test_main_does_not_poll_a_commit_with_no_checks(self, sleep, _fetch) -> None:
+        with redirect_stderr(io.StringIO()):
+            rc = main(["--sha", "ab" * 20, "--wait", "--timeout-seconds", "1500"])
+        self.assertEqual(rc, 1)
+        sleep.assert_not_called()
 
 
 if __name__ == "__main__":

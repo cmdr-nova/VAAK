@@ -1,12 +1,12 @@
 # Deploying VAAK
 
-Production deploys run from GitHub Actions. The workflow is [`.github/workflows/deploy-production.yml`](../.github/workflows/deploy-production.yml). It is manual (`workflow_dispatch` on `main`). It deploys only a commit that is already on `main` and has a green CI check. The activate job waits on the GitHub Environment named `production` and runs on a self-hosted runner on the production host. GitHub-hosted runners cannot SSH to the server, so this workflow does not use SSH.
+Production deploys run from GitHub Actions. The workflow is [`.github/workflows/deploy-production.yml`](../.github/workflows/deploy-production.yml). It is manual (`workflow_dispatch` on `main`). It deploys a commit that is already on `main` and has a green CI check, or a version-only release commit whose parent has that check. The activate job waits on the GitHub Environment named `production` and runs on a self-hosted runner on the production host. GitHub-hosted runners cannot SSH to the server, so this workflow does not use SSH.
 
 Nothing in this workflow publishes the Jekyll blog. `NovaLandia/update_site.sh` stays the blog publisher. It `rsync -avz --delete`s the site root with `--exclude '/api/'` and `--exclude '/vaak/'` (trailing slash, so those rules match directories only; a second rsync uses `api/` and `vaak/`). This deploy never writes the site root, `clearance/`, `/img/profile`, or `update_site.sh`.
 
 `/srv/mkultra/html/api` and `/srv/mkultra/html/vaak` stay **real directories**. rsync without `-L` treats a symlink as a non-directory, so if those paths were symlinks the blog publish would delete them. This deploy does not depend on a change to `update_site.sh`. The safest companion change, in the owner's NovaLandia copy of that script, is to drop the trailing slash (`--exclude '/api'` and `--exclude '/vaak'`, and the same for the second rsync). Do that when convenient. Do not treat it as a requirement for this deploy.
 
-The live version in this checkout is **alpha 0.8.45** (`api/ap-version.php`, dated 2026-10-13). **0.8.35** is an older note at `docs/RELEASE-0.8.35.md`, not the constant the app reads.
+The counter in this checkout is **alpha 0.8.46** (`api/ap-version.php`, dated 2026-10-13). That release commit is on `main` and was not activated. **0.8.35** is an older note at `docs/RELEASE-0.8.35.md`, not the constant the app reads.
 
 The production host is the documented machine (bots, Bluesky feeds, the Jekyll site, and VAAK). Web roots are `/srv/mkultra/html/api` and `/srv/mkultra/html/vaak`. The worker path is `/usr/local/bin/vaak-worker`. The app env file is `/etc/mkultra/vaak.env`. PHP-FPM is `php8.3-fpm.service`. The host is Ubuntu 24.04.4 LTS, x86_64, glibc 2.39. The workflow still builds the binary inside `debian:bookworm-slim` (glibc 2.36), which that host can run.
 
@@ -37,7 +37,21 @@ The bump updates only the live surfaces:
 
 Choose `version_bump=none` when that commit already contains the counter you want to ship. The workflow then does not make another commit.
 
-After a successful activate, the workflow pushes an annotated tag `v<version>` and opens a GitHub Release whose notes are that release file. The tag is created only after the health check passes. If the version commit was pushed and a later step fails, re-run the workflow with `version_bump=none` and the version commit's SHA. Do not increment again until that commit has actually gone live, or the counter will skip a number that never deployed.
+GitHub does not run CI on a commit this workflow pushes with its own token. The deploy does not wait for checks on that commit. The guard job has already required a green check on the parent. Before activation, the new commit must have that parent and a diff that only touches the version files above. `deploy/release_commit.py` checks the file list and that the bytes match what `deploy/bump_version.py` would write.
+
+If `main` is already that release commit, or later commits did not change the app, `version_bump=increment` does not take the next number while the server's live version is still lower. It ships the counter already in the tree. The live number is read from `/srv/mkultra/html/api/ap-version.php` on the production host. An equal or newer server stops the run instead of inventing the next number. `version_bump=none` still deploys the commit you named, including a redeploy of the version that is already live.
+
+### Shipping 0.8.46
+
+`828be543b3b53bf3ef81a1b05e2bbda9f24e2eb8` is already "Release VAAK alpha 0.8.46" and was not activated. Merge the workflow fix, wait until the checks on that merge are green, then run **Deploy production** from `main`:
+
+- `action`: deploy
+- `sha`: leave empty
+- `version_bump`: increment
+
+Leave `sha` empty so the run uses the new tip of `main`. Do not paste `828be54` after the merge; `main` will have moved, and the workflow only deploys the current tip. The app files are still 0.8.46. If the server is on an older counter, the run activates 0.8.46 and does not commit 0.8.47. `version_bump=none` ships that same tree even when 0.8.46 is already live.
+
+After a successful activate, the workflow pushes an annotated tag `v<version>` and opens a GitHub Release whose notes are that release file. The tag is created only after the health check passes. If a later step fails after the version commit is already on `main`, run the workflow again with `sha` empty. Do not increment again until that counter has actually gone live.
 
 NodeInfo `software.version` stays `1.0.0`, and the Mastodon instance `version` stays `4.5.0 (compatible; vaak)`. Those strings are client-compatibility markers, not this counter.
 
@@ -47,10 +61,10 @@ NodeInfo `software.version` stays `1.0.0`, and the Mastodon instance `version` s
 2. Install the self-hosted runner (below) with labels `self-hosted` and `vaak-prod`, running as `vaak-deploy`, registered on this repository only.
 3. Actions → Deploy production → Run workflow, from `main`.
    - `action=deploy`
-   - `sha` empty for current `main`, or a full SHA that is already on `main`
+   - `sha` empty for the current tip of `main`. A full SHA has to be that same tip.
    - `version_bump=increment` (default) or `none`
-4. The guard job checks CI. The build job compiles `vaak-worker` on a GitHub-hosted runner and uploads the binary. Approve the `production` environment prompt. The self-hosted job then bumps (when asked), pushes that commit to `main`, waits until CI on the new commit is green, and activates the release locally.
-5. The guard job's summary shows the commit and the version it intends to ship. CI for this repository must report at least one successful check on that commit other than the jobs in this workflow. A pending or failed check blocks the deploy. A commit with no other checks is refused.
+4. The guard job checks CI on the source commit. The build job compiles `vaak-worker` from that CI-green commit and uploads the binary. Approve the `production` environment prompt. The self-hosted job then either publishes a version commit (parent already green, diff limited to the version files, no CI wait) or, when that version is already on `main` and the server is still older, ships it as-is. It then activates the release locally.
+5. The guard job's summary shows the commit and the version it intends to ship. CI must report at least one successful check on the source commit other than the jobs in this workflow. A pending or failed check blocks the deploy. A normal commit with no other checks is refused. A version-only release commit is accepted when its parent has that green CI.
 
 `main` has to allow `github-actions[bot]` to push the version commit and the tag. If branch protection blocks that, add a bypass for the bot or the deploy stops before it activates.
 
@@ -217,7 +231,7 @@ Restarted only when that unit is installed **and** the diff says so:
 
 Production runs those two template instances. There is no `ap-bsky-jetstream.service`. Their `ExecStart` reads `api/deploy/ap-bsky-jetstream.py` through the real `html/api` directory, so a Jetstream diff restarts both installed instances. Oneshot timers pick up the new PHP on their next run because they exec the path in the real directory. Rollback compares the two release trees and restarts an optional unit when that tree diff includes its files.
 
-The worker binary is built in CI (`cargo build --release --locked -p vaak-worker` inside `debian:bookworm-slim`) and is not compiled on the server. The version commit does not rebuild it. That commit only changes the version surfaces, and the binary uploaded from the parent commit is the one that ships.
+The worker binary is built in CI (`cargo build --release --locked -p vaak-worker` inside `debian:bookworm-slim`) and is not compiled on the server. The version commit does not rebuild it. The build job compiles the CI-green commit, which is the parent when the tip is only the version bump. That binary is the one that ships.
 
 ## Roll back
 
@@ -254,6 +268,7 @@ These are not deploys of the VAAK app and this workflow does not replace them:
 ```bash
 python3 deploy/test_bump_version.py
 python3 deploy/test_require_green_ci.py
+python3 deploy/test_release_commit.py
 python3 deploy/test_restart_plan.py
 python3 deploy/bump_version.py --check
 bash deploy/assemble-release.sh --self-test
