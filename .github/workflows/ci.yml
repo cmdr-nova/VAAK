@@ -1,0 +1,132 @@
+# Basic CI for the PHP API and the Rust workspace.
+#
+# Jobs:
+#   php             — php -l across api/, plus scripts that run with no services
+#   rust            — cargo build, clippy, and cargo test (including vaak-types
+#                     fixture_roundtrip). Many Rust tests shell out to
+#                     api/bin/php-policy-test, so this job installs PHP too.
+#   php-rust-parity — slot only. It does not run. Replace `if: false` and the
+#                     placeholder step when a harness exists. Intended shape:
+#
+#                     php-rust-parity:
+#                       needs: [php, rust]
+#                       runs-on: ubuntu-latest
+#                       steps:
+#                         - checkout
+#                         - PHP 8.3 (mbstring, pdo_sqlite, curl) and stable Rust
+#                         - Replay shared fixtures through both sides and diff:
+#                             * api/fixtures/normalize/<case>/{input,expected}.json
+#                               PHP: ap_normalize_* (today via
+#                               api/bin/normalize-fixture-smoke.php, which still
+#                               opens Postgres — pure cases need a DB-free mode
+#                               or a fixture database before this can be gated)
+#                               Rust: project the same input and compare the
+#                               expected.json subset. vaak-types already
+#                               deserializes expected.json in
+#                               rust/vaak-types/tests/fixture_roundtrip.rs;
+#                               that is a freeze-contract check, not a producer diff.
+#                             * rust/vaak-worker/fixtures/phyrian/opensim-normalization.json
+#                               already fed to PHP phyrian-parity-smoke.php and
+#                               Rust normalize_opensim_player
+#                             * api/fixtures/settings/profile-fields.json and
+#                               api/fixtures/recommendations/interactions.json
+#                             * JSON oracles emitted by api/bin/*-reference.php
+#                               via php-policy-test, which several Rust tests
+#                               already diff in-process
+#                         - Later, optional: boot vaak-worker on 127.0.0.1 and
+#                           replay recorded bridge requests. Do not point this
+#                           at production.
+#
+# Not in this workflow (no service, or already red on current main):
+#   - Postgres. Migrations under api/migrations and ops/migrations are incremental
+#     and are not a bootable schema. normalize-fixture-smoke.php defaults to
+#     peer database "novalandia" through ap-db.php.
+#   - Live worker client smokes (*-client-smoke.php, search-parity-smoke.php,
+#     admin-safety-smoke.php, downrank-parity-smoke.php) require an explicit
+#     loopback Rust URL and/or an isolated database URL.
+#   - search-direct-undo-smoke.php's PostgreSQL INTEGER/BIGINT copy runs only
+#     when LIBRARY_FIXTURE_SOCKET is set. CI runs the SQLite path.
+#   - PHP scripts that fail on current main are omitted so this workflow stays
+#     a signal for new breakage. They are listed in the pull request.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  php:
+    name: PHP syntax and standalone tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install PHP 8.3
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.3"
+          extensions: mbstring, pdo_sqlite, sqlite3, curl
+          coverage: none
+      - name: Syntax lint api/
+        run: .github/scripts/php-lint.sh
+      - name: Standalone tests
+        run: .github/scripts/php-standalone-tests.sh
+
+  rust:
+    name: Rust build, clippy, and tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install PHP 8.3
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.3"
+          extensions: mbstring, pdo_sqlite, sqlite3, curl
+          coverage: none
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - name: Build
+        working-directory: rust
+        run: cargo build --workspace --locked --all-targets
+      # Do not pass `-D warnings`. Current main already fails that bar
+      # (hundreds of clippy and rustc warnings, mostly in vaak-worker).
+      # Clippy still fails this job on hard errors.
+      - name: Clippy
+        working-directory: rust
+        run: cargo clippy --workspace --locked --all-targets
+      # actual_canonical_entity_helpers reads /tmp/vaak-profile-entity-helper-reference.json,
+      # a machine-local oracle that is not in the repo and is not #[ignore].
+      # Every other non-ignored test runs.
+      - name: Test
+        working-directory: rust
+        run: cargo test --workspace --locked -- --skip profile_materialize::entities::tests::actual_canonical_entity_helpers
+
+  php-rust-parity:
+    name: PHP vs Rust parity
+    needs: [php, rust]
+    # Enable by deleting this condition and replacing the step below.
+    if: ${{ false }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Parity harness is not implemented
+        run: |
+          echo "This job is a slot. It fails closed if enabled before a harness exists."
+          exit 1
