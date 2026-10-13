@@ -11,15 +11,26 @@ foreach ($fixtureCandidates as $candidate) {
     if (is_file($candidate)) { $fixturePath = $candidate; break; }
 }
 $fixture = is_file($fixturePath) ? json_decode((string) file_get_contents($fixturePath), true) : null;
-$canonical = [
-    'name', 'summary', 'attachment_json', 'icon_url', 'image_url',
-    'manually_approves', 'discoverable', 'indexable', 'collection_consent',
-    'vanity_verified', 'auto_follow_back', 'anti_ai_marker',
-    'auto_unblur_sensitive', 'auto_delete_posts_7d', 'automated',
-    'reply_policy', 'quote_policy', 'forum_signature', 'profile_badges',
-    'hide_profile_replies', 'hide_profile_boosts', 'algorithm_enabled',
-    'downranking_enabled', 'asks_enabled', 'webmentions_enabled', 'updated_at',
-];
+
+/** PHP settings projection contract. Required by the parity harness; the smoke below is unchanged. */
+function vaak_settings_parity_canonical_fields(): array
+{
+    return [
+        'name', 'summary', 'attachment_json', 'icon_url', 'image_url',
+        'manually_approves', 'discoverable', 'indexable', 'collection_consent',
+        'vanity_verified', 'auto_follow_back', 'anti_ai_marker',
+        'auto_unblur_sensitive', 'auto_delete_posts_7d', 'automated',
+        'reply_policy', 'quote_policy', 'forum_signature', 'profile_badges',
+        'hide_profile_replies', 'hide_profile_boosts', 'algorithm_enabled',
+        'downranking_enabled', 'asks_enabled', 'webmentions_enabled', 'updated_at',
+    ];
+}
+
+if (realpath((string) ($_SERVER['SCRIPT_FILENAME'] ?? '')) !== __FILE__) {
+    return;
+}
+
+$canonical = vaak_settings_parity_canonical_fields();
 if (!is_array($fixture) || ($fixture['fields'] ?? null) !== $canonical) {
     fwrite(STDERR, "settings-parity: canonical field contract mismatch\n");
     exit(1);

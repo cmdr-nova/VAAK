@@ -5,37 +5,17 @@
 #   rust            — cargo build, clippy, and cargo test (including vaak-types
 #                     fixture_roundtrip). Many Rust tests shell out to
 #                     api/bin/php-policy-test, so this job installs PHP too.
-#   php-rust-parity — slot only. It does not run. Replace `if: false` and the
-#                     placeholder step when a harness exists. Intended shape:
+#   php-rust-parity — replay fixtures through both sides
+#                     (`.github/scripts/php-rust-parity.py`, catalog in
+#                     `parity/catalog.json`). Rust is the source of truth.
+#                     Divergent output is reported (job summary + artifact) and
+#                     does not fail the job. The job fails when the harness
+#                     breaks or a Rust producer errors. No Postgres and no
+#                     live worker. See parity/README.md to add a case.
 #
-#                     php-rust-parity:
-#                       needs: [php, rust]
-#                       runs-on: ubuntu-latest
-#                       steps:
-#                         - checkout
-#                         - PHP 8.3 (mbstring, pdo_sqlite, curl) and stable Rust
-#                         - Replay shared fixtures through both sides and diff:
-#                             * api/fixtures/normalize/<case>/{input,expected}.json
-#                               PHP: ap_normalize_* (today via
-#                               api/bin/normalize-fixture-smoke.php, which still
-#                               opens Postgres — pure cases need a DB-free mode
-#                               or a fixture database before this can be gated)
-#                               Rust: project the same input and compare the
-#                               expected.json subset. vaak-types already
-#                               deserializes expected.json in
-#                               rust/vaak-types/tests/fixture_roundtrip.rs;
-#                               that is a freeze-contract check, not a producer diff.
-#                             * rust/vaak-worker/fixtures/phyrian/opensim-normalization.json
-#                               already fed to PHP phyrian-parity-smoke.php and
-#                               Rust normalize_opensim_player
-#                             * api/fixtures/settings/profile-fields.json and
-#                               api/fixtures/recommendations/interactions.json
-#                             * JSON oracles emitted by api/bin/*-reference.php
-#                               via php-policy-test, which several Rust tests
-#                               already diff in-process
-#                         - Later, optional: boot vaak-worker on 127.0.0.1 and
-#                           replay recorded bridge requests. Do not point this
-#                           at production.
+#                     ActivityPub normalize fixtures under api/fixtures/normalize
+#                     are not replayed here: normalize-fixture-smoke.php opens
+#                     Postgres, and vaak-types only round-trips expected.json.
 #
 # Not in this workflow (no service, or already red on current main):
 #   - Postgres. Migrations under api/migrations and ops/migrations are incremental
@@ -121,12 +101,31 @@ jobs:
   php-rust-parity:
     name: PHP vs Rust parity
     needs: [php, rust]
-    # Enable by deleting this condition and replacing the step below.
-    if: ${{ false }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - name: Parity harness is not implemented
-        run: |
-          echo "This job is a slot. It fails closed if enabled before a harness exists."
-          exit 1
+      - uses: actions/checkout@v4
+      - name: Install PHP 8.3
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.3"
+          extensions: mbstring, pdo_sqlite, sqlite3, curl
+          coverage: none
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - name: Replay fixtures and report divergences
+        env:
+          PARITY_REPORT_DIR: parity-report
+          TZ: UTC
+        run: python3 .github/scripts/php-rust-parity.py
+      - name: Upload parity report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: php-rust-parity-report
+          path: parity-report/
+          if-no-files-found: warn

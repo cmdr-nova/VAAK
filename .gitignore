@@ -26,3 +26,7 @@ __pycache__/
 
 # Local agent instructions stay on the work machine and are never published.
 /AGENTS.md
+
+# Parity harness reports (CI uploads these as artifacts).
+/parity/out/
+/parity-report/

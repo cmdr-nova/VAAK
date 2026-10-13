@@ -1,0 +1,383 @@
+{
+  "cases": [
+    {
+      "id": "remote-public-library",
+      "note": "Remote public post, guest, Library surface. Both allow.",
+      "mode": "audience_allowed",
+      "surface": "library",
+      "owner": 0,
+      "viewer": "",
+      "following": [],
+      "status": {"uri": "https://remote.test/posts/1", "visibility": "public", "account": {"uri": "https://remote.test/users/carol"}},
+      "records": {},
+      "db": {}
+    },
+    {
+      "id": "remote-unlisted-library",
+      "note": "Unlisted is readable as a direct Library reference.",
+      "mode": "audience_allowed",
+      "surface": "library",
+      "owner": 0,
+      "viewer": "",
+      "following": [],
+      "status": {"uri": "https://remote.test/posts/1", "visibility": "unlisted", "account": {"uri": "https://remote.test/users/carol"}},
+      "records": {},
+      "db": {}
+    },
+    {
+      "id": "remote-private-guest-library",
+      "note": "Guest cannot read a private remote post.",
+      "mode": "audience_allowed",
+      "surface": "library",
+      "owner": 0,
+      "viewer": "",
+      "following": [],
+      "status": {"uri": "https://remote.test/posts/1", "visibility": "private", "account": {"uri": "https://remote.test/users/carol"}},
+      "records": {},
+      "db": {}
+    },
+    {
+      "id": "remote-public-discovery",
+      "note": "Public discovery allows a public root.",
+      "mode": "public_status",
+      "surface": "local",
+      "owner": 0,
+      "viewer": "",
+      "following": [],
+      "status": {"uri": "https://remote.test/posts/1", "visibility": "public", "account": {"uri": "https://remote.test/users/carol"}},
+      "records": {},
+      "db": {}
+    },
+    {
+      "id": "remote-unlisted-discovery",
+      "note": "Public discovery rejects an unlisted root. Rust Local/Profile/Federated do the same.",
+      "mode": "public_status",
+      "surface": "profile",
+      "owner": 0,
+      "viewer": "",
+      "following": [],
+      "status": {"uri": "https://remote.test/posts/1", "visibility": "unlisted", "account": {"uri": "https://remote.test/users/carol"}},
+      "records": {},
+      "db": {}
+    },
+    {
+      "id": "remote-unlisted-federated",
+      "note": "Federated timeline is also public-only at the root.",
+      "mode": "public_status",
+      "surface": "federated",
+      "owner": 0,
+      "viewer": "",
+      "following": [],
+      "status": {"uri": "https://remote.test/posts/1", "visibility": "unlisted", "account": {"uri": "https://remote.test/users/carol"}},
+      "records": {},
+      "db": {}
+    },
+    {
+      "id": "nested-unlisted-quote-discovery",
+      "note": "A public post may embed an unlisted quote.",
+      "mode": "public_status",
+      "surface": "local",
+      "owner": 0,
+      "viewer": "",
+      "following": [],
+      "status": {
+        "uri": "https://remote.test/posts/1",
+        "visibility": "public",
+        "account": {"uri": "https://remote.test/users/carol"},
+        "quote": {"quoted_status": {"uri": "https://remote.test/posts/q", "visibility": "unlisted", "account": {"uri": "https://remote.test/users/carol"}}}
+      },
+      "records": {},
+      "db": {}
+    },
+    {
+      "id": "nested-private-quote-guest-discovery",
+      "note": "A public post must not smuggle a private quote to a guest.",
+      "mode": "public_status",
+      "surface": "local",
+      "owner": 0,
+      "viewer": "",
+      "following": [],
+      "status": {
+        "uri": "https://remote.test/posts/1",
+        "visibility": "public",
+        "account": {"uri": "https://remote.test/users/carol"},
+        "quote": {"quoted_status": {"uri": "https://remote.test/posts/q", "visibility": "private", "account": {"uri": "https://remote.test/users/carol"}}}
+      },
+      "records": {},
+      "db": {}
+    },
+    {
+      "id": "nested-private-quote-author-discovery",
+      "note": "Discovery vs author grant. PHP public_status ignores the viewer. Rust Local still grants the quote author on a nested private post.",
+      "mode": "public_status",
+      "surface": "local",
+      "owner": 3,
+      "viewer": "https://remote.test/users/carol",
+      "following": [],
+      "status": {
+        "uri": "https://remote.test/posts/1",
+        "visibility": "public",
+        "account": {"uri": "https://remote.test/users/bob"},
+        "quote": {"quoted_status": {"uri": "https://remote.test/posts/q", "visibility": "private", "account": {"uri": "https://remote.test/users/carol"}}}
+      },
+      "records": {},
+      "db": {"users": [[3, "https://remote.test/users/carol"]]}
+    },
+    {
+      "id": "nested-private-quote-author-library",
+      "note": "The same author grant is allowed on a Library/direct recheck.",
+      "mode": "audience_allowed",
+      "surface": "library",
+      "owner": 3,
+      "viewer": "https://remote.test/users/carol",
+      "following": [],
+      "status": {
+        "uri": "https://remote.test/posts/1",
+        "visibility": "public",
+        "account": {"uri": "https://remote.test/users/bob"},
+        "quote": {"quoted_status": {"uri": "https://remote.test/posts/q", "visibility": "private", "account": {"uri": "https://remote.test/users/carol"}}}
+      },
+      "records": {},
+      "db": {"users": [[3, "https://remote.test/users/carol"]]}
+    },
+    {
+      "id": "reblog-private-discovery",
+      "note": "A public boost of a private post is not public discovery.",
+      "mode": "public_status",
+      "surface": "local",
+      "owner": 0,
+      "viewer": "",
+      "following": [],
+      "status": {
+        "uri": "https://remote.test/posts/boost",
+        "visibility": "public",
+        "account": {"uri": "https://remote.test/users/bob"},
+        "reblog": {"uri": "https://remote.test/posts/1", "visibility": "private", "account": {"uri": "https://remote.test/users/carol"}}
+      },
+      "records": {},
+      "db": {}
+    },
+    {
+      "id": "local-missing-note",
+      "note": "A local note with no durable row fails closed.",
+      "mode": "audience_allowed",
+      "surface": "library",
+      "owner": 2,
+      "viewer": "https://mkultra.monster/users/bob",
+      "following": [],
+      "status": {"uri": "https://mkultra.monster/users/alice/notes/1", "visibility": "public", "account": {"uri": "https://mkultra.monster/users/alice"}},
+      "records": {},
+      "db": {"users": [[2, "https://mkultra.monster/users/bob"]]}
+    },
+    {
+      "id": "local-private-author-library",
+      "note": "The author can read their private note from Library.",
+      "mode": "audience_allowed",
+      "surface": "library",
+      "owner": 1,
+      "viewer": "https://mkultra.monster/users/alice",
+      "following": [],
+      "status": {"uri": "https://mkultra.monster/users/alice/notes/1", "visibility": "public", "account": {"uri": "https://mkultra.monster/users/alice"}},
+      "records": {
+        "https://mkultra.monster/users/alice/notes/1": {
+          "visibility": "private",
+          "author": "https://mkultra.monster/users/alice",
+          "recipients": [],
+          "denied": false
+        }
+      },
+      "db": {
+        "users": [[1, "https://mkultra.monster/users/alice"]],
+        "outbox": [["https://mkultra.monster/users/alice/notes/1", "private", "[]", "[]"]]
+      }
+    },
+    {
+      "id": "local-private-author-profile",
+      "note": "Profile/Local/Federated roots are public-only in Rust, including for the author. PHP's durable recheck still allows the author.",
+      "mode": "audience_allowed",
+      "surface": "profile",
+      "owner": 1,
+      "viewer": "https://mkultra.monster/users/alice",
+      "following": [],
+      "status": {"uri": "https://mkultra.monster/users/alice/notes/1", "visibility": "public", "account": {"uri": "https://mkultra.monster/users/alice"}},
+      "records": {
+        "https://mkultra.monster/users/alice/notes/1": {
+          "visibility": "private",
+          "author": "https://mkultra.monster/users/alice",
+          "recipients": [],
+          "denied": false
+        }
+      },
+      "db": {
+        "users": [[1, "https://mkultra.monster/users/alice"]],
+        "outbox": [["https://mkultra.monster/users/alice/notes/1", "private", "[]", "[]"]]
+      }
+    },
+    {
+      "id": "local-direct-recipient",
+      "note": "An explicit recipient can read a direct note.",
+      "mode": "audience_allowed",
+      "surface": "direct",
+      "owner": 2,
+      "viewer": "https://mkultra.monster/users/bob",
+      "following": [],
+      "status": {"uri": "https://mkultra.monster/users/alice/notes/1", "visibility": "public", "account": {"uri": "https://mkultra.monster/users/alice"}},
+      "records": {
+        "https://mkultra.monster/users/alice/notes/1": {
+          "visibility": "direct",
+          "author": "https://mkultra.monster/users/alice",
+          "recipients": ["https://mkultra.monster/users/bob"],
+          "denied": false
+        }
+      },
+      "db": {
+        "users": [[2, "https://mkultra.monster/users/bob"]],
+        "outbox": [["https://mkultra.monster/users/alice/notes/1", "direct", "[\"https://mkultra.monster/users/bob\"]", "[]"]]
+      }
+    },
+    {
+      "id": "remote-follower",
+      "note": "An accepted remote follow grants private.",
+      "mode": "audience_allowed",
+      "surface": "library",
+      "owner": 2,
+      "viewer": "https://mkultra.monster/users/bob",
+      "following": ["https://remote.test/users/carol"],
+      "status": {"uri": "https://remote.test/posts/1", "visibility": "private", "account": {"uri": "https://remote.test/users/carol"}},
+      "records": {},
+      "db": {
+        "users": [[2, "https://mkultra.monster/users/bob"]],
+        "following": [["https://mkultra.monster/users/bob", "https://remote.test/users/carol"]]
+      }
+    },
+    {
+      "id": "remote-not-following",
+      "note": "Private without a follow or recipient is denied.",
+      "mode": "audience_allowed",
+      "surface": "search",
+      "owner": 2,
+      "viewer": "https://mkultra.monster/users/bob",
+      "following": [],
+      "status": {"uri": "https://remote.test/posts/1", "visibility": "private", "account": {"uri": "https://remote.test/users/carol"}},
+      "records": {},
+      "db": {"users": [[2, "https://mkultra.monster/users/bob"]]}
+    },
+    {
+      "id": "local-private-follower",
+      "note": "An accepted local follower can read a private note.",
+      "mode": "audience_allowed",
+      "surface": "home",
+      "owner": 2,
+      "viewer": "https://mkultra.monster/users/bob",
+      "following": ["https://mkultra.monster/users/alice"],
+      "status": {"uri": "https://mkultra.monster/users/alice/notes/1", "visibility": "public", "account": {"uri": "https://mkultra.monster/users/alice"}},
+      "records": {
+        "https://mkultra.monster/users/alice/notes/1": {
+          "visibility": "private",
+          "author": "https://mkultra.monster/users/alice",
+          "recipients": [],
+          "denied": false
+        }
+      },
+      "db": {
+        "users": [[2, "https://mkultra.monster/users/bob"]],
+        "outbox": [["https://mkultra.monster/users/alice/notes/1", "private", "[]", "[]"]],
+        "followers": [["https://mkultra.monster/users/alice", "https://mkultra.monster/users/bob"]]
+      }
+    },
+    {
+      "id": "mention-grant",
+      "note": "A delivered mention is an explicit recipient. The Rust record lists the viewer the way audience_records would after the mention lookup.",
+      "mode": "audience_allowed",
+      "surface": "library",
+      "owner": 2,
+      "viewer": "https://mkultra.monster/users/bob",
+      "following": [],
+      "status": {"uri": "https://remote.test/posts/1", "visibility": "direct", "account": {"uri": "https://remote.test/users/carol"}},
+      "records": {
+        "https://remote.test/posts/1": {
+          "visibility": "direct",
+          "author": "https://remote.test/users/carol",
+          "recipients": ["https://mkultra.monster/users/bob"],
+          "denied": false
+        }
+      },
+      "db": {
+        "users": [[2, "https://mkultra.monster/users/bob"]],
+        "mentions": [[2, "https://remote.test/posts/1", "Create"]]
+      }
+    },
+    {
+      "id": "local-visibility-local-author",
+      "note": "Logged-in viewers can read local-visibility posts from local authors.",
+      "mode": "audience_allowed",
+      "surface": "home",
+      "owner": 2,
+      "viewer": "https://mkultra.monster/users/bob",
+      "following": [],
+      "status": {"uri": "https://remote.test/posts/local", "visibility": "local", "account": {"uri": "https://mkultra.monster/users/alice"}},
+      "records": {},
+      "db": {"users": [[2, "https://mkultra.monster/users/bob"]]}
+    },
+    {
+      "id": "local-visibility-remote-author",
+      "note": "local visibility does not cover a remote author.",
+      "mode": "audience_allowed",
+      "surface": "home",
+      "owner": 2,
+      "viewer": "https://mkultra.monster/users/bob",
+      "following": [],
+      "status": {"uri": "https://remote.test/posts/1", "visibility": "local", "account": {"uri": "https://remote.test/users/carol"}},
+      "records": {},
+      "db": {"users": [[2, "https://mkultra.monster/users/bob"]]}
+    },
+    {
+      "id": "stale-public-card-private-outbox",
+      "note": "A stale public card loses to the current private outbox row.",
+      "mode": "audience_allowed",
+      "surface": "library",
+      "owner": 0,
+      "viewer": "",
+      "following": [],
+      "status": {"uri": "https://mkultra.monster/users/alice/notes/1", "visibility": "public", "account": {"uri": "https://mkultra.monster/users/alice"}},
+      "records": {
+        "https://mkultra.monster/users/alice/notes/1": {
+          "visibility": "private",
+          "author": "https://mkultra.monster/users/alice",
+          "recipients": [],
+          "denied": false
+        }
+      },
+      "db": {
+        "outbox": [["https://mkultra.monster/users/alice/notes/1", "private", "[]", "[]"]]
+      }
+    },
+    {
+      "id": "search-unlisted",
+      "note": "Search reuses direct-reference audiences, so unlisted stays readable.",
+      "mode": "audience_allowed",
+      "surface": "search",
+      "owner": 0,
+      "viewer": "",
+      "following": [],
+      "status": {"uri": "https://remote.test/posts/1", "visibility": "unlisted", "account": {"uri": "https://remote.test/users/carol"}},
+      "records": {},
+      "db": {}
+    },
+    {
+      "id": "followers-only",
+      "note": "followers_only follows the same follower grant as private.",
+      "mode": "audience_allowed",
+      "surface": "library",
+      "owner": 2,
+      "viewer": "https://mkultra.monster/users/bob",
+      "following": ["https://remote.test/users/carol"],
+      "status": {"uri": "https://remote.test/posts/1", "visibility": "followers_only", "account": {"uri": "https://remote.test/users/carol"}},
+      "records": {},
+      "db": {
+        "users": [[2, "https://mkultra.monster/users/bob"]],
+        "following": [["https://mkultra.monster/users/bob", "https://remote.test/users/carol"]]
+      }
+    }
+  ]
+}
