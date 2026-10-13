@@ -60,6 +60,13 @@ pub(crate) fn sanitized_profile_url(raw:&str)->Option<String>{
  if !icon.starts_with("https://")||icon.len()>800||host.is_empty()||authority.contains('@')||icon.bytes().any(|b|b<32||b==127)||matches!(host.as_str(),"localhost"|"127.0.0.1"|"::1"|"[::1]")||private||port_bad{None}else{Some(icon.into())}
 }
 pub(crate) fn local_avatar(raw:&str)->String{sanitized_profile_url(raw).unwrap_or_else(||"https://mkultra.monster/img/avatar/local-default.webp".into())}
+
+/// Label, flat cache key, and whether a placeholder username would warm.
+/// Same helpers the profile identity unit test compares to PHP.
+pub(crate) fn parity_identity(actor: &str, row: Option<&Value>) -> Value {
+    let warm = row.is_none_or(|r| placeholder(&field(r, "username")));
+    json!({"label": label(actor, row), "flat_key": flat_key(actor), "warm": warm})
+}
 pub(crate) fn label(actor:&str,row:Option<&Value>)->Value{
  let(mut host,path)=host_path(actor);let seg=path.rsplit('/').next().filter(|v|!v.is_empty()&&*v!="0").unwrap_or("user");
  let mut username=normalize(seg).unwrap_or_else(||"user".into());let mut display=username.clone();

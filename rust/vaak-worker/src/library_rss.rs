@@ -10,6 +10,10 @@ fn width(character:char)->usize{
     let point=character as u32;
     ranges.iter().find(|range|point>=range[0]&&point<=range[1]).map(|range|range[2] as usize).unwrap_or(1)
 }
+pub(crate) fn parity_width_sum(text: &str) -> usize { text.chars().map(width).sum() }
+pub(crate) fn parity_trim_width(text: &str, max: usize) -> String { trim_width(text, max) }
+pub(crate) fn parity_clean_summary(text: &str) -> String { clean_summary(text) }
+
 pub(super) fn trim_width(text:&str,max:usize)->String{
     if text.chars().map(width).sum::<usize>()<=max{return text.into();}
     let mut out=String::new();let mut used=0;
@@ -22,7 +26,7 @@ fn clean_summary(text:&str)->String{
     let text=regex::Regex::new(r"(?i)\s*\[link\]\s*\[comments\]\s*$").unwrap().replace(&text,"");
     let text=text.trim();if text.to_lowercase().starts_with("submitted by")||text.to_lowercase().starts_with("[link]"){String::new()}else{text.into()}
 }
-pub(super) fn clean_feed_title(text:&str)->String{
+pub(crate) fn clean_feed_title(text:&str)->String{
     let title=super::card::php_trim(&crate::html_entities::decode(text)).to_owned();if title.is_empty(){return "RSS".into();}
     let cleaned=regex::Regex::new(r"(?i)[\s\-–—|:]*\b(?:articles?|rss|atom|feeds?|blog)\s*$").unwrap().replace(&title,"");
     let cleaned=cleaned.trim_matches(|ch:char|" \t\n\r\0\u{b}\\-–—|:".contains(ch));if cleaned.is_empty(){title}else{cleaned.into()}
@@ -37,7 +41,7 @@ fn image_url(text:&str)->String{
         image=image.replace("?&","?");image=regex::Regex::new("&&+").unwrap().replace_all(&image,"&").into_owned();return image.trim_end_matches(['?','&']).into();
     }image
 }
-pub(super) fn normalize(row:&Value,owner:i64)->Result<Value>{
+pub(crate) fn normalize(row:&Value,owner:i64)->Result<Value>{
     if owner<1||n(row,"owner_user_id")!=owner||n(row,"id")<1||n(row,"feed_id")<1{bail!("RSS source requires a fresh current-owner subscription row");}
     let id=n(row,"id");let feed=n(row,"feed_id");let sid=format!("rss:{id}");let title=super::card::php_trim(s(row,"title"));let summary=clean_summary(s(row,"summary_text"));let url=s(row,"url").trim();let image=image_url(s(row,"image_url"));let feed_title=clean_feed_title(s(row,"feed_title"));
     let host=reqwest::Url::parse(url).ok().and_then(|url|url.host_str().map(str::to_owned)).unwrap_or_default();

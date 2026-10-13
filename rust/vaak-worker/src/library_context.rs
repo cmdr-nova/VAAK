@@ -408,7 +408,11 @@ async fn admit_for_render_impl(db:&Client,session:&TrustedSession,statuses:Vec<V
         }
     }
     let incoming_sids=bound.iter().map(incoming_ap_boost_sid).collect::<Vec<_>>();
-    let hydrated = super::source::hydrate(db, bound).await?;
+    let hydrated = if session.return_view()=="bookmarks" {
+        super::source::hydrate_bookmarks(db, bound).await?
+    } else {
+        super::source::hydrate(db, bound).await?
+    };
     if hydrated.len()!=incoming_sids.len()||hydrated.iter().zip(&incoming_sids).any(|(status,incoming)|incoming.is_some()&&incoming_ap_boost_sid(status)!=*incoming){
         anyhow::bail!("PHP fallback: hydration changed the incoming Library boost SID");
     }

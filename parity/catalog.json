@@ -1,0 +1,63 @@
+{
+  "version": 1,
+  "policy": "rust-wins",
+  "fail_on_divergence": false,
+  "drop_keys": ["rendered_at", "csrf", "function_sha256", "generated_at", "fetched_at", "nonce"],
+  "cases": [
+    {
+      "id": "search-render",
+      "area": "Search rendering",
+      "summary": "Search account, hashtag, and summary painters. Inputs are the offline capture in api/bin/search-render-reference-capture.php (hashtag, account, and summary kinds).",
+      "php": {"script": "parity/php/search-render.php", "args": []}
+    },
+    {
+      "id": "search-query",
+      "area": "Search rendering",
+      "summary": "Search text and tag query normalization from api/bin/search-query-reference.php.",
+      "php": {"script": "parity/php/search-query.php", "args": []}
+    },
+    {
+      "id": "library-components",
+      "area": "Library",
+      "summary": "Library card pieces from api/bin/migration-library-component-capture.php: reply CW, content warnings, relative time, media, account refs, reply meta, asks, link previews, quotes, RSS titles/summaries/statuses, Unicode width, URL aliases, emoji, reply handles, and compact counts.",
+      "php": {"script": "parity/php/library-components.php", "args": []}
+    },
+    {
+      "id": "profile-identity",
+      "area": "Profiles",
+      "summary": "Remote actor labels, flat cache keys, warm predicates, and local avatar sanitizing from api/bin/profile-identity-components-reference.php.",
+      "php": {"script": "parity/php/profile-identity.php", "args": []}
+    },
+    {
+      "id": "profile-markdown",
+      "area": "Profiles",
+      "summary": "Profile markdown and profile-field HTML from api/bin/profile-secondary-components-reference.php.",
+      "php": {"script": "parity/php/profile-markdown.php", "args": []}
+    },
+    {
+      "id": "settings-profile-fields",
+      "rust_producer": "settings-fields",
+      "area": "Profiles",
+      "summary": "Settings profile field contract. PHP list is vaak_settings_parity_canonical_fields(); the declared fixture is api/fixtures/settings/profile-fields.json. Rust compares CANONICAL_FIELDS and rust/vaak-worker/fixtures/settings/profile-fields.json.",
+      "php": {"script": "parity/php/settings-fields.php", "args": []}
+    },
+    {
+      "id": "audience",
+      "area": "Privacy and audience",
+      "summary": "Public discovery (ap_visibility_public_status vs Rust Local/Profile/Federated) and durable recheck (ap_visibility_status_audience_allowed on in-memory SQLite vs Rust Home/Library/Search/Direct). Fixture: parity/fixtures/audience.json. Rust records are the durable map; they are not a second SQL engine.",
+      "php": {"script": "parity/php/audience.php", "args": ["parity/fixtures/audience.json"]}
+    },
+    {
+      "id": "phyrian-opensim",
+      "area": "Phyrian",
+      "summary": "OpenSim player normalization. Shared fixture rust/vaak-worker/fixtures/phyrian/opensim-normalization.json, replayed through both producers rather than compared only to expected.json.",
+      "php": {"script": "parity/php/phyrian-opensim.php", "args": ["rust/vaak-worker/fixtures/phyrian/opensim-normalization.json"]}
+    },
+    {
+      "id": "phyrian-bridge",
+      "area": "Phyrian",
+      "summary": "OpenSim bridge envelope and response decoder, including the numeric ok:1 case. Fixture: parity/fixtures/phyrian-bridge.json.",
+      "php": {"script": "parity/php/phyrian-bridge.php", "args": ["parity/fixtures/phyrian-bridge.json"]}
+    }
+  ]
+}

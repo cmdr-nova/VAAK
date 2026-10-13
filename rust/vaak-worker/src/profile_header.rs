@@ -236,6 +236,9 @@ pub(crate) fn fields_html(fields:&[Value])->String{
   rows.push_str(&format!("<div class=\"remote-profile-field\"><span class=\"meta\" style=\"display:block;font-size:.75rem;margin:0 0 .15rem\">{}{} </span><div style=\"overflow:hidden;text-overflow:ellipsis;white-space:nowrap\">{value}</div></div>",h(name),if verified.is_empty(){String::new()}else{format!(" <span class=\"field-verified\" title=\"Verified via rel=me · {}\" aria-label=\"Verified\">✓</span>",h(verified))}));
  }if rows.is_empty(){String::new()}else{format!("<div class=\"remote-profile-fields\" aria-label=\"Profile fields\">{rows}</div>")}
 }
+pub(crate) fn parity_markdown(raw: &str) -> String { secondary::markdown(raw) }
+pub(crate) fn parity_field_html(raw: &str) -> String { field_html(raw) }
+
 fn field_html(input:&str)->String{
  // PHP strip_tags tracks attribute quotes; an unterminated quoted tag consumes the remaining input.
  let mut complete=input.len();let bytes=input.as_bytes();let mut pos=0;while pos<bytes.len(){if bytes[pos]!=b'<'{pos+=1;continue}let begin=pos;pos+=1;let mut quote=None;while pos<bytes.len(){let c=bytes[pos];if let Some(q)=quote{if c==q{quote=None}}else if c==b'\''||c==b'"'{quote=Some(c)}else if c==b'>'{break}pos+=1;}if pos==bytes.len(){complete=begin;break}pos+=1;}

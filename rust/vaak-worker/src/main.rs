@@ -72,8 +72,10 @@ mod direct_render;
 mod search_bridge;
 mod search_components;
 mod cleanup;
+mod parity_replay;
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -270,16 +272,32 @@ enum Command {
         #[arg(long, default_value_t = false)]
         execute: bool,
     },
+    /// Replay one fixture producer and print JSON. Harness-only: no server,
+    /// database, or Redis. Existing commands are unchanged.
+    ParityReplay {
+        /// Producer name registered in `parity/catalog.json`.
+        #[arg(long)]
+        producer: String,
+        /// JSON envelope `{ "cases": [{ "id", "input" }] }`.
+        #[arg(long)]
+        input: PathBuf,
+    },
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let cli = Cli::parse();
+    if let Command::ParityReplay { producer, input } = &cli.cmd {
+        // Stay offline. Do not load worker config or open Postgres/Redis.
+        parity_replay::run(producer, input)?;
+        return Ok(());
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
         .with_target(false)
         .init();
 
-    let cli = Cli::parse();
     let cfg = config::Config::load()?;
     tracing::info!(env = ?config::env_snapshot(), "vaak-worker starting");
 
@@ -513,6 +531,9 @@ async fn main() -> Result<()> {
                 Ok(report) => println!("{report}"),
                 Err(message) => anyhow::bail!(message),
             }
+        }
+        Command::ParityReplay { .. } => {
+            unreachable!("parity replay returns before config load");
         }
     }
     Ok(())
