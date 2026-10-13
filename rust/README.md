@@ -1,6 +1,6 @@
 # VAAK Rust workers (shadow + live cutover)
 
-Planned release: [**alpha 0.8.45 · 2026-10-13**](../docs/RELEASE-0.8.45.md). Production currently runs 0.8.44; deployment is pending. The verified 40-card handler took 0.718 seconds, but the complete native bridge request took 0.834 seconds versus PHP’s 0.262 seconds, so native Search remains OFF. Search batches bind current source, follow, moderation and owner-action facts before rendering. PHP remains the collector and write owner; the release retains existing activation settings and whole-batch fallback.
+Deployed release: [**alpha 0.8.45 · 2026-10-13**](../docs/RELEASE-0.8.45.md). Native Search rendering is enabled after separate user authorization and verified activation. The local 40-card handler took 0.718 seconds, but the complete native bridge request took 0.834 seconds versus PHP’s0.262 seconds; further optimization remains open. Search batches bind current source, follow, moderation and owner-action facts before rendering. PHP remains the collector and write owner; whole-batch fallback remains, and Library/profile/provider conversion and full-app parity are incomplete.
 
 | Command | Mode | Role |
 |---|---|---|

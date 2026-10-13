@@ -4,9 +4,9 @@
   <img src="docs/assets/vaak-readme-mascot.png" alt="VAAK mascot" width="480">
 </p>
 
-**Planned release:** alpha **0.8.45** · 2026-10-13
+**Current release:** alpha **0.8.45** · 2026-10-13
 
-Latest deployed release: [0.8.44 notes](docs/RELEASE-0.8.44.md). Planned [0.8.45](docs/RELEASE-0.8.45.md) repairs ActivityPub pin delivery and featured collections, aligns worker Ask profile navigation, and removes redundant Search reads while retaining admission and fallback. Verification passed, but the complete native bridge request remains slower than PHP; native Search stays OFF. Deployment is pending. Broader Rust, Library, profile and provider parity remains open.
+Deployed [0.8.45](docs/RELEASE-0.8.45.md) repairs ActivityPub pin delivery and featured collections, aligns worker Ask profile navigation, and removes redundant Search reads. Native Search rendering is enabled following separate user authorization and verified activation; PHP remains the collector and write owner, with whole-batch fallback. The local 40-card handler took 0.718s, but the complete native bridge request took 0.834s versus PHP’s0.262s. Further speed work and broader Rust, Library, profile and provider parity remain open.
 
 VAAK (pronounced “vaak”) is a multi-user social web client for the Fediverse, with an optional Bluesky / AT Protocol connection. One interface for reading, posting, following, moderating, and carrying a conversation across both networks.
 
@@ -98,6 +98,6 @@ This repository is the public source mirror. Live accounts and profiles belong t
 
 ## Status
 
-Active alpha. **0.8.45** is the pending version in `api/ap-version.php`; production currently runs 0.8.44. Federation and Bluesky behavior vary by remote software. Performance work favors warm caches, bounded queues, and safe fallbacks over making a remote API a hard dependency for every screen.
+Active alpha. **0.8.45** is the deployed version in `api/ap-version.php`. Federation and Bluesky behavior vary by remote software. Performance work favors warm caches, bounded queues, and safe fallbacks over making a remote API a hard dependency for every screen.
 
 Version labels in the app come from `api/ap-version.php` (channel, semver, date).
