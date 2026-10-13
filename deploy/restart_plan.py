@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Decide which optional production units a deploy should restart.
 
-ap-bsky-jetstream restarts when the diff touches the Jetstream program or its
-unit files. vaak-worker-shadow restarts when the diff touches the Rust worker
-that the unit executes. PHP-only deploys restart neither.
+ap-bsky-jetstream@0 and ap-bsky-jetstream@1 restart when the diff touches
+the Jetstream program or its unit files. There is no ap-bsky-jetstream.service.
+vaak-worker-shadow restarts when the diff touches the Rust worker that the
+unit executes. PHP-only deploys restart neither.
 """
 
 from __future__ import annotations
