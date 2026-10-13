@@ -1,0 +1,45 @@
+[
+  {
+    "id": "envelope",
+    "kind": "envelope",
+    "action": "vaak_player_pull",
+    "body": {"avatar_uuid": "abc"},
+    "secret": "fixture-secret"
+  },
+  {
+    "id": "ok",
+    "kind": "decode",
+    "http": 200,
+    "raw": "{\"ok\":true,\"player\":{\"resonance\":94}}"
+  },
+  {
+    "id": "already",
+    "kind": "decode",
+    "http": 200,
+    "raw": "{\"ok\":false,\"error\":\"Already checked in today\"}"
+  },
+  {
+    "id": "upstream",
+    "kind": "decode",
+    "http": 502,
+    "raw": "{\"message\":\"upstream unavailable\"}"
+  },
+  {
+    "id": "empty",
+    "kind": "decode",
+    "http": 200,
+    "raw": ""
+  },
+  {
+    "id": "bad-json",
+    "kind": "decode",
+    "http": 200,
+    "raw": "not-json"
+  },
+  {
+    "id": "ok-numeric",
+    "kind": "decode",
+    "http": 200,
+    "raw": "{\"ok\":1,\"player\":{\"resonance\":1}}"
+  }
+]

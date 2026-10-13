@@ -51,6 +51,42 @@ fn hashtag(tag:&Value)->String {
  out.push_str("</div></article>");out
 }
 
+/// Harness entry. Presentation only: account facts are the ones the PHP
+/// painter already resolved. This does not admit or fetch anything.
+pub(crate) fn parity_render(kind: &str, input: &Value, facts: Option<&Value>) -> Result<String, String> {
+    match kind {
+        "hashtag" => Ok(hashtag(input)),
+        "summary" => {
+            let counts = input.get("counts").and_then(Value::as_array).ok_or("summary counts")?;
+            let more = input.get("more").and_then(Value::as_array).ok_or("summary more")?;
+            if counts.len() != 3 || more.len() != 3 {
+                return Err("summary counts/more must have length 3".into());
+            }
+            let mut count_arr = [0usize; 3];
+            let mut more_arr = [false; 3];
+            for i in 0..3 {
+                count_arr[i] = counts[i].as_u64().ok_or("summary count")? as usize;
+                more_arr[i] = more[i].as_bool().ok_or("summary more flag")?;
+            }
+            Ok(summary(text(input, "q"), count_arr, more_arr))
+        }
+        "account" => {
+            let facts = facts.ok_or("account facts")?;
+            let emoji = facts.get("emoji_map").and_then(Value::as_object).map(|map| {
+                map.iter().filter_map(|(key, value)| value.as_str().map(|s| (key.clone(), s.to_string()))).collect()
+            }).unwrap_or_default();
+            Ok(account(input, &AccountFacts {
+                is_me: facts.get("is_me").and_then(Value::as_bool).ok_or("is_me")?,
+                following: facts.get("following").and_then(Value::as_bool).ok_or("following")?,
+                profile_href: text(facts, "profile_href").into(),
+                open_label: text(facts, "open_label").into(),
+                emoji,
+            }))
+        }
+        other => Err(format!("unsupported search render kind {other}")),
+    }
+}
+
 fn summary(q:&str,counts:[usize;3],more:[bool;3])->String {
  fn label(n:usize,more:bool,one:&str,many:&str)->String {format!("{n}{} {}",if more{"+"}else{""},if n==1&&!more{one}else{many})}
  format!("<div class=\"meta search-results-meta\" style=\"margin-bottom:.75rem\">Results for <b>{}</b> — {} · {} · {}</div>",esc(q),label(counts[0],more[0],"account","accounts"),label(counts[1],more[1],"tag","tags"),label(counts[2],more[2],"post","posts"))
