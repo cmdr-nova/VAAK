@@ -6,98 +6,68 @@
 
 **Current release:** alpha **0.8.45** · 2026-10-13
 
-Deployed [0.8.45](docs/RELEASE-0.8.45.md) repairs ActivityPub pin delivery and featured collections, aligns worker Ask profile navigation, and removes redundant Search reads. Native Search rendering is enabled following separate user authorization and verified activation; PHP remains the collector and write owner, with whole-batch fallback. The local 40-card handler took 0.718s, but the complete native bridge request took 0.834s versus PHP’s0.262s. Further speed work and broader Rust, Library, profile and provider parity remain open.
+Notes: [0.8.45](docs/RELEASE-0.8.45.md).
 
-VAAK (pronounced “vaak”) is a multi-user social web client for the Fediverse, with an optional Bluesky / AT Protocol connection. One interface for reading, posting, following, moderating, and carrying a conversation across both networks.
+Hi, I'm Nova. VAAK is the social server I built so I could stay on the Fediverse and still have the rest of the internet I actually use in the same window.
 
-It is **alpha** software: surfaces and behavior can still change between releases. The app for this project is [https://mkultra.monster/vaak/](https://mkultra.monster/vaak/). `vaak.monster` redirects there. Account addresses stay `@name@mkultra.monster`.
+It's pronounced "vaak". The live copy is [https://mkultra.monster/vaak/](https://mkultra.monster/vaak/). `vaak.monster` redirects there. Addresses stay `@name@mkultra.monster`. This repository is the public source. The accounts and the posts belong to the host that runs them.
+
+<p>
+  <a href="https://mkultra.monster/vaak/users/cmdr_nova"><img src="docs/assets/cmdr-nova-avatar.webp" width="28" height="28" alt="cmdr_nova on VAAK"></a>
+  <a href="https://mkultra.monster/vaak/users/cmdr_nova"><strong>cmdr_nova</strong> on VAAK</a>
+</p>
 
 ## What it is
 
-A browser app and a Mastodon-compatible API that speak **ActivityPub**, and that can link an account to **Bluesky** with an app password. Timelines, notifications, search, profiles, DMs, Asks, and moderation apply across both sides where the feature exists. Reads are cache-first so a page does not wait on a remote server.
+An ActivityPub server. PHP runs the app, PostgreSQL holds the durable data, and a Mastodon-compatible API lets clients such as Ice Cubes and Tusky log in and post. Connect a Bluesky app password and the same Home, search, profiles, favourites, and bookmarks pick up that network too. A cross-post carries a dual-publish marker so the two copies stay linked.
 
-This repository is the public source mirror. Live accounts and profiles belong to the host that runs it.
+There's a Rust and Axum backend in progress. It already paints Home, Local, Federated, profile, and notification cards on the paths that have caught up. PHP still writes, and it still draws bookmarks, favourites, and the surfaces that are waiting their turn. The worker map, queues, and environment variables are in [rust/README.md](rust/README.md).
 
-## Highlights
+It is **alpha**. Screens move between releases. If something feels half-finished, it is, and I'm in the middle of it on purpose.
 
-### Timelines
+## What you can do with it
 
-- **Home**, **Local**, and **Federated**, with those scopes kept distinct
-- Home draws from followed Fediverse accounts, followed Bluesky accounts, followed hashtags, RSS subscriptions, and a bounded set of recommendations
-- Turning recommendations off keeps followed sources and moderation in place
-- Personal and server mutes and blocks apply on Home, Local, Federated, notifications, search, and trending
-- Infinite scroll, plus a New posts control on Home
+Home mixes people you follow on the Fediverse, people you follow on Bluesky, hashtags you follow, RSS subscriptions, and a small set of recommendations you can turn off. Local and the Federated feed stay their own timelines. Your blocks and mutes, and the server's, apply on Home, Local, Federated, notifications, search, and Trending before a card is shown. The feed scrolls, and Home has a New posts control when something lands above you.
 
-### Posting
+You can reply, boost, quote-boost, favourite, and run a poll. Polls stay on the Fediverse side. Content warnings, emoji, and sensitive-media marks are there, along with images, animated GIFs, video, audio, and link previews. A YouTube link can play in the post. The audience is public, silent public, local only, or followers-only. Drafts and a queue live under You, for the post you are still writing and the one you want later.
 
-- Replies, boosts, quote boosts, favourites, and polls
-- Content warnings, emoji, and sensitive-media marks
-- Images, animated GIFs, video, and audio, plus link previews (YouTube can play in the post)
-- Audience: public, silent public, local only, or followers-only
-- Drafts and a queue
-- Long-form blog posts next to short posts
+Asks are the Wafrn kind: a question you send to a profile that advertises them, and an answer that comes back as a post. Outbound Asks are always from the signed-in account.
 
-### Profiles and people
+Trending sits beside the timeline: tags, posts, and links, with the same hides as everything else.
 
-- Canonical profiles at `/vaak/users/{name}`, including a logged-out guest view
-- ActivityPub actor documents stay at `https://mkultra.monster/users/{name}`
-- Tabs for posts, replies, boosts, media, Asks, pins, featured accounts, and blog
-- Followers and following for both networks, plus lists, collections, and followed hashtags
-- Notifications, Wafrn-compatible Asks, and direct messages
-- Bookmarks with folders, and favourites split between Fediverse and Bluesky
-- **Pluraldawn:** when an avatar already carries a member list, and a post uses exactly one of those indicators at the start or end of a paragraph, signed-in readers see that member’s name and picture. The account address, the stored post, and Mastodon-API clients stay on the account. VAAK does not build the avatar or store its own member list.
+Library is the shelf. Favourites, bookmarks with folders, followers and following on both networks, followed hashtags, collections, and lists.
 
-### Bluesky
+The blog composer is for the long one. You write Markdown, with buttons for bold, italic, headings, lists, and links, save a draft, and publish. The full post lives on your profile's Blog tab. The timeline gets the title as a content warning and a short excerpt, so the essay stays on the blog.
 
-- Optional per-account connection with an app password
-- The same Home, search, profiles, favourites, and bookmarks — not a separate Bluesky app
-- Cross-posting when connected, with dedupe markers so the two copies are not counted twice
+Profiles are at `/vaak/users/{name}`, including a view for people who are logged out. The ActivityPub actor document stays at `https://mkultra.monster/users/{name}`. Tabs cover posts, replies, boosts, media, Asks, pins, featured accounts, and the blog.
 
-### RSS
+There are notifications, direct messages, two-factor authentication, and an account switcher. Import and export covers follows, mutes, blocks, bookmarks, lists, and followed hashtags. RSS lives under You and mixes into Home. An item that is only video is skipped. Notices, a local Discuss board, and the Phyrian Strains hub sit alongside the usual account stuff.
 
-- Subscriptions under You → RSS, mixed into Home
-- An item that is only video is skipped
+**Pluraldawn:** when an avatar already carries a member list, and a post uses exactly one of those indicators at the start or end of a paragraph, signed-in readers see that member's name and picture. The account address, the stored post, and Mastodon API clients stay on the account. VAAK reads the list out of the picture. It leaves the avatar, and the member list, as they were published.
 
-### Account
+Federation is the usual set: actors, inbox and outbox, WebFinger, NodeInfo, HTTP signatures, and webmentions. Registration stays closed until it is opened. When it is open, an invite is required, or an approval when that gate is on.
 
-- Profile settings, color accents, muted words, and personal blocks and mutes
-- Two-factor authentication and an account switcher
-- Import and export for follows, mutes, blocks, bookmarks, lists, and followed hashtags
-- Notices, a local Discuss board, and the Phyrian Strains hub
+Moderation is reports, mod lists, server blocks, and domain blocks. A hide is applied before the card is shown.
 
-### Clients and federation
+## Why I made it
 
-- ActivityPub actors, inbox/outbox, WebFinger, NodeInfo, and HTTP signatures
-- Mastodon-compatible API for clients such as Ice Cubes
-- Webmentions
-- Invite-only registration
+I run [mkultra.monster](https://mkultra.monster), and I wanted a server I could live in. One Home for the Fediverse and for Bluesky. Asks the way Wafrn does them. A Library for the posts I meant to come back to. A blog that publishes next to the short posts. Trending that still respects a block. A Mastodon API, because the apps people already like should keep working. VAAK is that project, still rough in the corners I'm moving.
 
-### Moderation
+## Running and deploying
 
-- Reports, moderation lists, server blocks, and domain blocks
-- Hides are applied before a card is shown
+The app I actually use is the link above. If you want to see how a copy is wired:
 
-## Design notes
+- Worker build, environment, and the commands that stay up: [rust/README.md](rust/README.md)
+- systemd units and backup scripts: [deploy/](deploy/)
+- Backups and the integrity check: [docs/vaak-integrity-policy.md](docs/vaak-integrity-policy.md)
+- This release: [docs/RELEASE-0.8.45.md](docs/RELEASE-0.8.45.md)
 
-- **PostgreSQL** holds durable state (accounts, posts, queues, moderation)
-- **Redis** accelerates caches and wake-ups; the app still works if Redis is down
-- Remote AppView / PDS work is pushed to workers so page loads enqueue and return quickly
+PostgreSQL is the database (`AP_DB_DSN` as a `pgsql:` DSN). SQLite is available when `AP_ALLOW_SQLITE=1` is set, for local work. Redis is a cache and a queue. If Redis is down, the app still serves. It just has more to do on the way.
 
-### Current runtime model
-
-- PostgreSQL is the only durable application database. Redis is a cache and queue layer, never the source of truth.
-- Rust/Axum paints Home, Local, Federated, profile, and notification cards where parity is in place. PHP paints bookmarks, favourites, and the remaining surfaces, and it remains the write owner.
-- Home ranking uses freshness, follows, favourites, boosts, replies, bookmarks, and moderation signals. Personal and server blocks and mutes are applied before rendering.
-- A small explainable ML ranker runs in **shadow mode** only. It compares an ordering with the production heuristic and does not choose what people see. See `rust/vaak-worker/src/ml_ranker.rs`.
-
-### Background ingestion
-
-- Bluesky ingestion uses shared Jetstream hydration and cached profile and media resolution.
-- Timeline workers warm ranked caches and newer-post polling without blocking the page request.
-- ActivityPub delivery, Asks, Bluesky mirroring, media queues, and moderation stay on bounded queues, with PHP still able to serve a surface the worker does not own.
+A small explainable ranker can train beside the live Home ordering and compare the two. People see the production heuristic. The comparison lives in [`rust/vaak-worker/src/ml_ranker.rs`](rust/vaak-worker/src/ml_ranker.rs).
 
 ## Status
 
-Active alpha. **0.8.45** is the deployed version in `api/ap-version.php`. Federation and Bluesky behavior vary by remote software. Performance work favors warm caches, bounded queues, and safe fallbacks over making a remote API a hard dependency for every screen.
+Active alpha. **0.8.45** is the deployed version in `api/ap-version.php`.
 
-Version labels in the app come from `api/ap-version.php` (channel, semver, date).
+The label in the app comes from that file: channel, number, and date. The counter steps the last component, and `0.8.99` rolls to `0.9.00`. Federation and Bluesky still depend on the other server. I would rather keep a cache warm and a queue bounded than make a page wait on somebody else's API.
