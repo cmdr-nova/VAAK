@@ -1,0 +1,25 @@
+# Extends the gitleaks default ruleset. Entries below are reviewed false
+# positives from a full-history scan with gitleaks 8.28.0.
+#
+# Do not add paths here. In this gitleaks version a path allowlist skips the
+# whole file, which would hide a real secret committed beside a false positive.
+# Match the captured secret text only.
+title = "VAAK"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Log filename in a parity-evidence archive list (sapi-NNNNN.log)."
+regexTarget = "secret"
+regexes = ['''^sapi-\d+\.log$''']
+
+[[allowlists]]
+description = "SQL ON CONFLICT fragment. generic-api-key treats the keyword inside actor_key as the start of an assignment and captures the next column update."
+regexTarget = "secret"
+regexes = ['''^actor_id=excluded\.actor_id$''']
+
+[[allowlists]]
+description = "Browser localStorage key names for a notification-chime dedupe flag. Not credentials. Present only in historical revisions of api/ap-admin.php."
+regexTarget = "secret"
+regexes = ['''^vaak-notif-chime-v\d+$''']
