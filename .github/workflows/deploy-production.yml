@@ -48,8 +48,11 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       sha: ${{ steps.resolve.outputs.sha }}
+      source_sha: ${{ steps.resolve.outputs.source_sha }}
       version: ${{ steps.resolve.outputs.version }}
       next_version: ${{ steps.resolve.outputs.next_version }}
+      reuse: ${{ steps.resolve.outputs.reuse }}
+      kind: ${{ steps.resolve.outputs.kind }}
     steps:
       - name: Fetch main
         uses: actions/checkout@v4
@@ -77,26 +80,35 @@ jobs:
           fi
           python3 deploy/test_bump_version.py
           python3 deploy/test_require_green_ci.py
+          python3 deploy/test_release_commit.py
           python3 deploy/test_restart_plan.py
-          python3 deploy/require_green_ci.py --sha "${SHA}"
-          git checkout --detach "${SHA}"
-          python3 deploy/bump_version.py --check
-          CURRENT="$(python3 deploy/bump_version.py --print-current)"
-          NEXT="$(python3 deploy/bump_version.py --print-next)"
-          if [[ "${VERSION_BUMP}" == "none" ]]; then
-            SHIP="${CURRENT}"
-          else
-            SHIP="${NEXT}"
+          # Plan writes sha, source_sha, version, next_version, reuse, and kind.
+          # source_sha is the commit whose CI must be green. A version-only
+          # release commit uses its parent: GitHub never starts workflows for
+          # the GITHUB_TOKEN push that created it.
+          PLAN="$(python3 deploy/release_commit.py plan --sha "${SHA}" --version-bump "${VERSION_BUMP}" --github-output "${GITHUB_OUTPUT}")"
+          printf '%s\n' "${PLAN}"
+          eval "${PLAN}"
+          python3 deploy/require_green_ci.py --sha "${source_sha}"
+          if [[ "${kind}" == "version-only" ]]; then
+            python3 deploy/release_commit.py verify --sha "${sha}" --parent "${source_sha}"
           fi
-          {
-            echo "sha=${SHA}"
-            echo "version=${CURRENT}"
-            echo "next_version=${SHIP}"
-          } >> "${GITHUB_OUTPUT}"
+          git checkout --detach "${sha}"
+          python3 deploy/bump_version.py --check
           {
             echo "### VAAK deploy"
-            echo "Commit \`${SHA}\` is on main and CI is green."
-            echo "Live counter \`${CURRENT}\`. This run ships \`${SHIP}\` (\`${VERSION_BUMP}\`)."
+            echo "Commit \`${sha}\` is on main."
+            if [[ "${kind}" == "version-only" ]]; then
+              echo "That commit only bumps the version. CI was required on its parent \`${source_sha}\`, which is green. This run does not wait for checks on the version commit."
+            elif [[ "${kind}" == "reuse-tree" ]]; then
+              echo "CI on \`${source_sha}\` is green. The app matches the release already in the tree, so this run does not bump the counter again."
+            else
+              echo "CI on \`${source_sha}\` is green."
+            fi
+            echo "Counter in that commit: \`${version}\`. This run ships \`${next_version}\` (\`${VERSION_BUMP}\`)."
+            if [[ "${reuse}" == "true" && "${VERSION_BUMP}" == "increment" ]]; then
+              echo "The activate job reads the live version on the server and continues only when that number is still lower."
+            fi
           } >> "${GITHUB_STEP_SUMMARY}"
 
   vaak-deploy-build:
@@ -109,7 +121,7 @@ jobs:
       - name: Check out the CI-green commit
         uses: actions/checkout@v4
         with:
-          ref: ${{ needs.vaak-deploy-guard.outputs.sha }}
+          ref: ${{ needs.vaak-deploy-guard.outputs.source_sha }}
           persist-credentials: false
 
       - name: Build the worker on Debian bookworm
@@ -153,7 +165,7 @@ jobs:
           [[ "${REPOSITORY}" == "cmdr-nova/VAAK" ]]
           [[ "${REF}" == "refs/heads/main" ]]
 
-      - name: Check out the CI-green commit
+      - name: Check out the commit to ship
         uses: actions/checkout@v4
         with:
           ref: ${{ needs.vaak-deploy-guard.outputs.sha }}
@@ -163,36 +175,75 @@ jobs:
       - name: Publish the version commit
         id: version
         env:
-          GUARD_SHA: ${{ needs.vaak-deploy-guard.outputs.sha }}
+          DEPLOY_SHA: ${{ needs.vaak-deploy-guard.outputs.sha }}
+          SOURCE_SHA: ${{ needs.vaak-deploy-guard.outputs.source_sha }}
+          KIND: ${{ needs.vaak-deploy-guard.outputs.kind }}
+          REUSE: ${{ needs.vaak-deploy-guard.outputs.reuse }}
           VERSION_BUMP: ${{ inputs.version_bump }}
           GH_TOKEN: ${{ github.token }}
           GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           git fetch origin main
-          [[ "$(git rev-parse origin/main)" == "${GUARD_SHA}" ]] || {
+          [[ "$(git rev-parse origin/main)" == "${DEPLOY_SHA}" ]] || {
             echo "main moved after the CI check; run the deploy again" >&2
             exit 1
           }
-          git checkout --detach "${GUARD_SHA}"
-          if [[ "${VERSION_BUMP}" == "increment" ]]; then
+          [[ "${REUSE}" == "true" || "${REUSE}" == "false" ]]
+          [[ "${KIND}" == "version-only" || "${KIND}" == "reuse-tree" || "${KIND}" == "ci-required" ]]
+          git checkout --detach "${DEPLOY_SHA}"
+          python3 deploy/release_commit.py plan \
+            --sha "${DEPLOY_SHA}" \
+            --version-bump "${VERSION_BUMP}" \
+            --expect-kind "${KIND}" \
+            --expect-reuse "${REUSE}" \
+            --expect-source "${SOURCE_SHA}"
+          if [[ "${REUSE}" == "true" ]]; then
+            # Already the release, or the same app as that release. Do not
+            # create another version commit and do not wait for CI on a
+            # GITHUB_TOKEN push. CI was required on SOURCE_SHA.
+            if [[ "${KIND}" == "version-only" ]]; then
+              python3 deploy/release_commit.py verify --sha "${DEPLOY_SHA}" --parent "${SOURCE_SHA}"
+            fi
+            python3 deploy/require_green_ci.py --sha "${SOURCE_SHA}"
+            VERSION="$(python3 deploy/bump_version.py --print-current)"
+            if [[ "${VERSION_BUMP}" == "increment" ]]; then
+              HTML_API="${VAAK_HTML_API:-/srv/mkultra/html/api}"
+              PHP="${VAAK_PHP:-/usr/bin/php}"
+              LIVE="$("${PHP}" -r 'require $argv[1]; echo VAAK_VERSION;' "${HTML_API}/ap-version.php")"
+              python3 deploy/release_commit.py live-is-older --live "${LIVE}" --version "${VERSION}"
+            fi
+            SHA="${DEPLOY_SHA}"
+            echo "shipping ${VERSION} at ${SHA} without a new commit (${KIND})"
+          elif [[ "${VERSION_BUMP}" == "increment" ]]; then
+            python3 deploy/require_green_ci.py --sha "${SOURCE_SHA}"
             DATE="$(date -u +%F)"
-            VERSION="$(python3 deploy/bump_version.py --increment --date "${DATE}" --commit "${GUARD_SHA}")"
+            VERSION="$(python3 deploy/bump_version.py --increment --date "${DATE}" --commit "${SOURCE_SHA}")"
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             git add api/ap-version.php README.md rust/README.md "docs/RELEASE-${VERSION}.md"
             git diff --cached --quiet && { echo "version bump produced no changes" >&2; exit 1; }
             git commit -m "Release VAAK alpha ${VERSION}"
+            NEW="$(git rev-parse HEAD)"
+            python3 deploy/release_commit.py verify --sha "${NEW}" --parent "${SOURCE_SHA}"
             git push origin "HEAD:refs/heads/main"
-            SHA="$(git rev-parse HEAD)"
-            python3 deploy/require_green_ci.py --sha "${SHA}" --wait --timeout-seconds 1500
+            git fetch origin main
+            [[ "$(git rev-parse origin/main)" == "${NEW}" ]]
+            python3 deploy/release_commit.py verify --sha "${NEW}" --parent "${SOURCE_SHA}"
+            SHA="${NEW}"
+            echo "pushed ${VERSION} at ${SHA}; parent ${SOURCE_SHA} is the CI-green commit"
           else
+            python3 deploy/require_green_ci.py --sha "${SOURCE_SHA}"
             VERSION="$(python3 deploy/bump_version.py --print-current)"
-            SHA="${GUARD_SHA}"
+            SHA="${DEPLOY_SHA}"
+            echo "shipping ${VERSION} at ${SHA} with version_bump=none"
           fi
           [[ "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]{2}$ ]]
-          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
-          echo "sha=${SHA}" >> "${GITHUB_OUTPUT}"
+          [[ "${SHA}" =~ ^[0-9a-f]{40}$ ]]
+          {
+            echo "version=${VERSION}"
+            echo "sha=${SHA}"
+          } >> "${GITHUB_OUTPUT}"
 
       - name: Download the worker binary
         uses: actions/download-artifact@v4

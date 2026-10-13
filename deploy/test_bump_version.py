@@ -11,7 +11,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from bump_version import VersionError, apply_version, check, next_version, read_version
+from bump_version import VersionError, apply_version, check, next_version, read_version, version_less
 
 
 class NextVersionTest(unittest.TestCase):
@@ -32,6 +32,13 @@ class NextVersionTest(unittest.TestCase):
         for bad in ("0.8.5", "0.8.100", "0.08.01", "0.8", "v0.8.45", "0.8.45 ", "10.8.45a"):
             with self.assertRaises(VersionError):
                 next_version(bad)
+
+    def test_orders_the_counter_across_rollover(self) -> None:
+        self.assertTrue(version_less("0.8.45", "0.8.46"))
+        self.assertTrue(version_less("0.8.99", "0.9.00"))
+        self.assertTrue(version_less("0.9.99", "0.10.00"))
+        self.assertFalse(version_less("0.8.46", "0.8.46"))
+        self.assertFalse(version_less("0.8.46", "0.8.45"))
 
 
 class ApplyVersionTest(unittest.TestCase):

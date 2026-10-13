@@ -73,8 +73,8 @@ def _parts(current: str) -> tuple[int, int, int]:
     return int(match.group(1)), int(match.group(2)), int(match.group(3))
 
 
-def read_version(root: Path) -> tuple[str, str, str]:
-    text = (root / "api" / "ap-version.php").read_text(encoding="utf-8")
+def parse_version_file(text: str) -> tuple[str, str, str]:
+    """Return version, channel, and date from the text of api/ap-version.php."""
     version = _one(PHP_VERSION_RE, text, "VAAK_VERSION")
     channel = _one(PHP_CHANNEL_RE, text, "VAAK_CHANNEL")
     date = _one(PHP_DATE_RE, text, "VAAK_VERSION_DATE")
@@ -84,6 +84,16 @@ def read_version(root: Path) -> tuple[str, str, str]:
     if channel == "":
         raise VersionError("VAAK_CHANNEL is empty")
     return version, channel, date
+
+
+def read_version(root: Path) -> tuple[str, str, str]:
+    text = (root / "api" / "ap-version.php").read_text(encoding="utf-8")
+    return parse_version_file(text)
+
+
+def version_less(left: str, right: str) -> bool:
+    """True when left is an earlier counter value than right."""
+    return _parts(left) < _parts(right)
 
 
 def _one(pattern: re.Pattern[str], text: str, label: str) -> str:
