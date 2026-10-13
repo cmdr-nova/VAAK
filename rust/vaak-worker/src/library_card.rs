@@ -126,6 +126,19 @@ pub(crate) fn profile_href(actor: &str, view: &str) -> String {
         if view.is_empty()||view=="home"{format!("/vaak/users/{}",query(key))}else{format!("/vaak/users/{}?from={}", query(key), query(view))}
     } else { format!("/vaak/?view=remote_profile&actor={}&from={}", query(actor), query(view)) }
 }
+// Ask labels use admin_profile_app_href(actor, "home"). Keep its strict
+// local-key predicate and PHP http_build_query (RFC 1738) remote encoding
+// separate from the other painters' existing RFC 3986 links.
+fn ask_profile_href(actor: &str) -> String {
+    let actor = php_trim(actor).trim_end_matches('/');
+    if let Some(key) = actor.strip_prefix("https://mkultra.monster/users/")
+        .filter(|key| !key.is_empty() && key.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')) {
+        profile_href(&format!("https://mkultra.monster/users/{}", key.to_ascii_lowercase()), "home")
+    } else {
+        let actor = query(actor).replace("%20", "+").replace('~', "%7E");
+        format!("/vaak/?view=remote_profile&actor={actor}&from=home")
+    }
+}
 fn status_href(uri: &str, view: &str) -> String {
     let translated=uri.strip_prefix("at://").and_then(|rest| rest.split_once("/app.bsky.feed.post/"))
         .map(|(did,key)|format!("https://bsky.app/profile/{did}/post/{key}"));
@@ -417,7 +430,7 @@ pub(crate) fn ask_html(row: &Value) -> Result<String> {
     let mut label=esc(display);
     if !handle.is_empty() && !display.eq_ignore_ascii_case(handle){label.push_str(&format!(" <span class=\"ask-handle\" style=\"font-weight:500;opacity:.85\">{}</span>",esc(handle)));}
     label.push_str(" asked");
-    let label=if actor.starts_with("https://"){format!("<a class=\"ask-label\" href=\"{}\" style=\"display:inline-block;font-weight:700;margin-bottom:.4rem;color:var(--primary, #ff70c7);text-decoration:none\">{label}</a>",esc(actor))}else{format!("<div class=\"ask-label\" style=\"font-weight:700;margin-bottom:.4rem;color:var(--primary, #ff70c7)\">{label}</div>")};
+    let label=if actor.starts_with("https://"){format!("<a class=\"ask-label\" href=\"{}\" style=\"display:inline-block;font-weight:700;margin-bottom:.4rem;color:var(--primary, #ff70c7);text-decoration:none\">{label}</a>",esc(&ask_profile_href(actor)))}else{format!("<div class=\"ask-label\" style=\"font-weight:700;margin-bottom:.4rem;color:var(--primary, #ff70c7)\">{label}</div>")};
     let avatar=string(row,"asker_avatar");
     let avatar=if avatar.starts_with("https://") && (!row.get("show_avatar").is_some()||boolean(row,"show_avatar")){format!("<img class=\"ask-avatar\" src=\"{}\" alt=\"\" width=\"32\" height=\"32\" loading=\"lazy\" referrerpolicy=\"no-referrer\" style=\"border-radius:50%;object-fit:cover;flex:0 0 auto\">",esc(avatar))}else{String::new()};
     let mut html=format!("<div class=\"ask-container\" style=\"display:flex;gap:.65rem;align-items:flex-start;margin:.35rem 0 .65rem;padding:.7rem .8rem;border:1px solid var(--primary, #ff70c7);border-radius:8px;background:var(--primary-dim, rgba(255,112,199,.12))\">{avatar}<div class=\"ask-body\" style=\"min-width:0;flex:1 1 auto\">{label}<blockquote class=\"ask-text\" style=\"margin:0;padding:.15rem 0 .15rem .75rem;border-left:3px solid var(--primary, #ff70c7);white-space:pre-wrap\">{}</blockquote>",esc(question).replace('\n',"<br />\n"));

@@ -12,7 +12,6 @@ pub(crate) async fn resolve_cached_current(db:&Client,dns:&dyn crate::direct_pre
 }
 
 pub(crate) async fn resolve(db:&Client,dns:&dyn crate::direct_preview::PreviewDns,status:&Value,original_content:Option<&str>,facts:&super::card::CardFacts,budget:&mut i64,fetch:&crate::profile_preview_fetch::PreviewFetchContext,grant:&dyn crate::profile_quote_warm::CurrentQuoteGrant)->Result<Option<Value>>{
- grant.require_current().await?;
  let st=if text(status,"content").is_empty(){status.get("reblog").filter(|value|value.is_object()).unwrap_or(status)}else{status};
  let note=if text(st,"uri").is_empty(){text(st,"url")}else{text(st,"uri")};
  if st.get("media_attachments").and_then(Value::as_array).is_some_and(|media|!media.is_empty())||facts.poll_row.as_ref().is_some_and(|row|!super::card::poll_html(row,note,facts).is_empty()){return Ok(None)}
@@ -32,12 +31,13 @@ pub(crate) async fn resolve(db:&Client,dns:&dyn crate::direct_preview::PreviewDn
  // body facts replace its visible text. A missing URL still spends one attempt.
  let source_text=original_content.unwrap_or(&plain);
  // No URL performs no cache/DNS/fetch/warm IO in the original PHP helper.
- // The fresh grant above remains the only proof needed across this pure branch;
- // enclosing admission still rechecks current facts before publication.
+ // Pure returns perform no IO; enclosing admission rechecks current facts
+ // before publication. Refresh the grant before the first binding/IO below.
  if crate::direct_preview::extract_url(source_text)?.is_none(){
   if *budget>0{*budget-=1;}
   return Ok(None)
  }
+ grant.require_current().await?;
  grant.bind_preview_text(source_text).await?;
  let mut card=fetch.resolve_text(db,dns,source_text,false,facts.now,grant).await?;
  if card.is_none()&&*budget>0{*budget-=1;card=fetch.resolve_text(db,dns,source_text,true,facts.now,grant).await?;}

@@ -240,7 +240,7 @@ async fn admit_for_render_impl(db:&Client,session:&SearchSession,statuses:Vec<Va
   // cursor arithmetic while ensuring enrichment cannot precede this gate.
   if crate::audience::admission_mask(db,session.owner,crate::audience::Surface::Search,std::slice::from_ref(&status)).await?.first()!=Some(&true){continue}
   crate::interaction_flags::apply_to_statuses(db,session.owner,std::slice::from_mut(&mut status)).await?;
-  let source_grant=if session.warm.is_some(){Some(std::sync::Arc::new(crate::library::context::SelectedLibrarySearchSource::search(db,session,status.clone(),source_index).await?))}else{None};
+  let source_grant=if session.warm.is_some(){Some(std::sync::Arc::new(crate::library::context::SelectedLibrarySearchSource::search(db,session,status.clone(),source_index,&actor,&key).await?))}else{None};
   #[cfg(test)] selection::final_facts::boundary_fixture::at(db,"before_status_card_facts").await?;
   let mut facts=if let (Some(warm),Some(selected))=(&session.warm,&source_grant){
    let bound=crate::library::facts::BoundPresentationSession{session,warm:warm.bound(selected.clone())};

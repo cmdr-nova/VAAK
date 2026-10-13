@@ -216,7 +216,19 @@ function ap_ask_card_html(array $opts): string
             . ' style="border-radius:50%;object-fit:cover;flex:0 0 auto">';
     }
 
-    $askerUrl = ($askerActor !== '' && str_starts_with($askerActor, 'https://')) ? $askerActor : '';
+    // Keep profile navigation inside VAAK. Local actors use the canonical
+    // pretty on-VAAK profile; remote actors use VAAK's remote-profile view.
+    $askerUrl = '';
+    if ($askerActor !== '' && str_starts_with($askerActor, 'https://')) {
+        if (function_exists('admin_profile_app_href')) {
+            $askerUrl = admin_profile_app_href($askerActor, 'home');
+        } elseif (function_exists('ap_vaak_pretty_profile_path')
+            && preg_match('#^https://mkultra\.monster/users/([A-Za-z0-9_]+)$#i', $askerActor, $mLocalAsk)) {
+            $askerUrl = ap_vaak_pretty_profile_path(strtolower($mLocalAsk[1]));
+        } else {
+            $askerUrl = '/vaak/?view=remote_profile&actor=' . rawurlencode($askerActor) . '&from=home';
+        }
+    }
     if ($askerUrl !== '') {
         $labelBlock = '<a class="ask-label" href="'
             . htmlspecialchars($askerUrl, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8')

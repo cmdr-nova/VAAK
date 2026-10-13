@@ -159,14 +159,15 @@ if (in_array($sub, ['outbox', 'followers', 'following'], true)) {
     exit;
 }
 
-// Featured (pinned posts — empty for invitees for now)
+// Featured pins, scoped to this actor and public/unlisted discovery.
 if ($sub === 'collections/featured' || $sub === 'featured') {
+    $items = ap_masto_featured_note_ids($actorKey);
     $doc = [
         '@context' => 'https://www.w3.org/ns/activitystreams',
         'id' => $actorId . '/collections/featured',
         'type' => 'OrderedCollection',
-        'totalItems' => 0,
-        'orderedItems' => [],
+        'totalItems' => count($items),
+        'orderedItems' => $items,
     ];
     ap_user_json($doc, $accept);
     exit;
