@@ -6,7 +6,7 @@
 
 **Current release:** alpha **0.8.45** · 2026-10-13
 
-Deployed [0.8.45](docs/RELEASE-0.8.45.md) repairs ActivityPub pin delivery and featured collections, aligns worker Ask profile navigation, and removes redundant Search reads. Native Search rendering is enabled following separate user authorization and verified activation; PHP remains the collector and write owner, with whole-batch fallback. The local 40-card handler took 0.718s, but the complete native bridge request took 0.834s versus PHP’s0.262s. Further speed work and broader Rust, Library, profile and provider parity remain open.
+Notes: [0.8.45](docs/RELEASE-0.8.45.md).
 
 VAAK (pronounced “vaak”) is a multi-user social web client for the Fediverse, with an optional Bluesky / AT Protocol connection. One interface for reading, posting, following, moderating, and carrying a conversation across both networks.
 
@@ -100,4 +100,4 @@ This repository is the public source mirror. Live accounts and profiles belong t
 
 Active alpha. **0.8.45** is the deployed version in `api/ap-version.php`. Federation and Bluesky behavior vary by remote software. Performance work favors warm caches, bounded queues, and safe fallbacks over making a remote API a hard dependency for every screen.
 
-Version labels in the app come from `api/ap-version.php` (channel, semver, date).
+Version labels in the app come from `api/ap-version.php` (channel, version, and date). The production counter increments the last component and rolls `0.8.99` to `0.9.00`.

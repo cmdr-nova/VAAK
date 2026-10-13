@@ -3,7 +3,16 @@ declare(strict_types=1);
 
 /**
  * Public VAAK release channel / version label.
- * Bump these together when shipping a batch to the public mirror.
+ *
+ * This file is the only version source. The login and registration page
+ * (vaak/index.php) and the signed-in shell render vaak_version_label() from
+ * these constants. deploy/bump_version.py updates them; do not hardcode the
+ * number anywhere else.
+ *
+ * The counter is not semver. Each production deploy increments the last
+ * component by 1 and always prints it as two digits (0.8.45 → 0.8.46).
+ * After 99 the middle component increments and the last resets to 00
+ * (0.8.99 → 0.9.00). After 0.99.99 the next value is 1.0.00.
  */
 const VAAK_VERSION = '0.8.45';
 const VAAK_CHANNEL = 'alpha';
