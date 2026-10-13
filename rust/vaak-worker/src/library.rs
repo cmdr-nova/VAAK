@@ -17,6 +17,8 @@ pub(crate) mod facts;
 pub(crate) mod bridge;
 #[path = "library_source.rs"]
 pub(crate) mod source;
+#[path = "library_bookmark.rs"]
+pub(crate) mod bookmark;
 #[path = "library_own.rs"]
 pub(crate) mod own;
 #[path = "library_rss.rs"]
