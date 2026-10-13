@@ -1,0 +1,112 @@
+{
+  "local": {
+    "row": {
+      "status_id": "42",
+      "object_id": "https://mkultra.monster/users/peer/notes/abc",
+      "created_at": "2024-06-01T12:00:00Z",
+      "target_actor": "https://mkultra.monster/users/peer"
+    },
+    "local": {
+      "local_id": 42,
+      "note_id": "https://mkultra.monster/users/peer/notes/abc",
+      "content_text": "hello local bookmark",
+      "published": "2024-06-01T12:00:00Z",
+      "visibility": "local",
+      "sensitive": true,
+      "spoiler_text": ""
+    }
+  },
+  "remote": {
+    "row": {
+      "status_id": "77",
+      "object_id": "https://remote.test/users/alice/statuses/9",
+      "created_at": "2024-06-02T08:30:00Z",
+      "target_actor": "https://remote.test/users/alice"
+    },
+    "event": {
+      "id": 9,
+      "type": "Create",
+      "object_id": "https://remote.test/users/alice/statuses/9",
+      "actor_id": "https://remote.test/users/alice",
+      "summary": "hello remote bookmark",
+      "created_at": "2024-06-02T08:30:00Z",
+      "visibility": "public",
+      "sensitive": false,
+      "spoiler_text": ""
+    },
+    "actor": {
+      "actor_id": "https://remote.test/users/alice",
+      "username": "alice",
+      "display_name": "Alice Remote",
+      "host": "remote.test"
+    }
+  },
+  "bluesky": {
+    "post": {
+      "uri": "at://did:plc:abc/app.bsky.feed.post/xyz",
+      "cid": "bafyfixture",
+      "indexedAt": "2024-06-03T00:00:00.000Z",
+      "author": {
+        "did": "did:plc:abc",
+        "handle": "alice.bsky.social",
+        "displayName": "Alice",
+        "avatar": "https://cdn.example/alice.jpg"
+      },
+      "record": {
+        "text": "hello bluesky bookmark",
+        "createdAt": "2024-06-03T00:00:00.000Z"
+      },
+      "likeCount": 1,
+      "repostCount": 2,
+      "replyCount": 3,
+      "viewer": { "bookmarked": true }
+    }
+  },
+  "bluesky_cold": {
+    "post": {
+      "uri": "at://did:plc:cold/app.bsky.feed.post/cold1",
+      "author": {
+        "did": "did:plc:cold",
+        "handle": "cold.bsky.social",
+        "displayName": "",
+        "avatar": ""
+      },
+      "record": {
+        "text": "cold bluesky body",
+        "createdAt": "2024-06-04T00:00:00.000Z"
+      },
+      "viewer": { "bookmarked": true }
+    }
+  },
+  "cold": {
+    "row": {
+      "status_id": "cold-1",
+      "object_id": "https://remote.test/users/alice/statuses/missing",
+      "created_at": "2024-06-05T01:02:03Z",
+      "target_actor": "https://remote.test/users/alice"
+    }
+  },
+  "cold_bsky_url": {
+    "row": {
+      "status_id": "bsky:uncached",
+      "object_id": "https://bsky.app/profile/did:plc:abc/post/xyz",
+      "created_at": "2024-06-05T04:00:00Z",
+      "target_actor": ""
+    }
+  },
+  "at_only": {
+    "row": {
+      "status_id": "bsky:abc",
+      "object_id": "at://did:plc:abc/app.bsky.feed.post/xyz",
+      "created_at": "2024-06-06T00:00:00Z",
+      "target_actor": ""
+    }
+  },
+  "privacy": {
+    "blocked_actor": "https://remote.test/users/alice",
+    "blocked_domain": "remote.test",
+    "phrase": "secretword",
+    "own_note": "https://mkultra.monster/users/viewer/notes/own",
+    "own_actor": "https://mkultra.monster/users/viewer"
+  }
+}
