@@ -1,4 +1,7 @@
 # Manual production deploy for VAAK. This file is the only workflow this change adds.
+# The build stays on a GitHub-hosted runner. Activation runs on the production
+# self-hosted runner (labels self-hosted, vaak-prod) as vaak-deploy. There is
+# no inbound SSH.
 name: Deploy production
 
 on:
@@ -36,6 +39,7 @@ concurrency:
 permissions:
   contents: write
   checks: read
+  actions: write
 
 jobs:
   vaak-deploy-guard:
@@ -73,6 +77,7 @@ jobs:
           fi
           python3 deploy/test_bump_version.py
           python3 deploy/test_require_green_ci.py
+          python3 deploy/test_restart_plan.py
           python3 deploy/require_green_ci.py --sha "${SHA}"
           git checkout --detach "${SHA}"
           python3 deploy/bump_version.py --check
@@ -94,14 +99,60 @@ jobs:
             echo "Live counter \`${CURRENT}\`. This run ships \`${SHIP}\` (\`${VERSION_BUMP}\`)."
           } >> "${GITHUB_STEP_SUMMARY}"
 
-  vaak-deploy-ship:
-    name: vaak-deploy-ship
+  vaak-deploy-build:
+    name: vaak-deploy-build
     needs: vaak-deploy-guard
     if: inputs.action == 'deploy'
     runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out the CI-green commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.vaak-deploy-guard.outputs.sha }}
+          persist-credentials: false
+
+      - name: Build the worker on Debian bookworm
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -e "HOST_UID=$(id -u)" \
+            -e "HOST_GID=$(id -g)" \
+            -v "${GITHUB_WORKSPACE}:/src" \
+            -w /src \
+            debian:bookworm-slim \
+            bash /src/deploy/ci-build-worker.sh
+
+      - name: Upload the worker binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: vaak-worker-bin
+          path: vaak-worker.bin
+          if-no-files-found: error
+          retention-days: 1
+
+  vaak-deploy-ship:
+    name: vaak-deploy-ship
+    needs: [vaak-deploy-guard, vaak-deploy-build]
+    if: github.event_name == 'workflow_dispatch' && github.repository == 'cmdr-nova/VAAK' && github.ref == 'refs/heads/main' && inputs.action == 'deploy'
+    runs-on: [self-hosted, vaak-prod]
     environment: production
     timeout-minutes: 90
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      sha: ${{ steps.version.outputs.sha }}
     steps:
+      - name: Refuse anything except a manual production deploy
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REPOSITORY: ${{ github.repository }}
+          REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          [[ "${EVENT_NAME}" == "workflow_dispatch" ]]
+          [[ "${REPOSITORY}" == "cmdr-nova/VAAK" ]]
+          [[ "${REF}" == "refs/heads/main" ]]
+
       - name: Check out the CI-green commit
         uses: actions/checkout@v4
         with:
@@ -143,27 +194,21 @@ jobs:
           echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
           echo "sha=${SHA}" >> "${GITHUB_OUTPUT}"
 
-      - name: Build the worker on Debian bookworm
-        env:
-          RELEASE_SHA: ${{ steps.version.outputs.sha }}
-        run: |
-          set -euo pipefail
-          [[ "$(git rev-parse HEAD)" == "${RELEASE_SHA}" ]]
-          docker run --rm \
-            -e "HOST_UID=$(id -u)" \
-            -e "HOST_GID=$(id -g)" \
-            -v "${GITHUB_WORKSPACE}:/src" \
-            -w /src \
-            debian:bookworm-slim \
-            bash /src/deploy/ci-build-worker.sh
+      - name: Download the worker binary
+        uses: actions/download-artifact@v4
+        with:
+          name: vaak-worker-bin
+          path: ${{ github.workspace }}/worker-artifact
 
-      - name: Assemble the release artifact
+      - name: Assemble and activate
         env:
           RELEASE_SHA: ${{ steps.version.outputs.sha }}
         run: |
           set -euo pipefail
+          [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]
+          [[ "${GITHUB_REPOSITORY}" == "cmdr-nova/VAAK" ]]
           bash deploy/assemble-release.sh \
-            --binary "${GITHUB_WORKSPACE}/vaak-worker.bin" \
+            --binary "${GITHUB_WORKSPACE}/worker-artifact/vaak-worker.bin" \
             --revision "${RELEASE_SHA}" \
             --output "${GITHUB_WORKSPACE}/dist-release"
           tar -C "${GITHUB_WORKSPACE}/dist-release" -czf "${GITHUB_WORKSPACE}/vaak-release.tar.gz" .
@@ -171,43 +216,34 @@ jobs:
             echo "release tarball has an unsafe path" >&2
             exit 1
           fi
+          PREV="$(cat /srv/mkultra/vaak-releases/live-revision 2>/dev/null || true)"
+          if [[ ! "${PREV}" =~ ^[0-9a-f]{40}$ ]] || ! git cat-file -e "${PREV}^{commit}" 2>/dev/null; then
+            export VAAK_RESTART_JETSTREAM=1
+            export VAAK_RESTART_SHADOW=1
+          else
+            eval "$(git diff --name-only "${PREV}" "${RELEASE_SHA}" | python3 deploy/restart_plan.py)"
+            export VAAK_RESTART_JETSTREAM VAAK_RESTART_SHADOW
+          fi
+          bash deploy/remote/vaak-release-activate.sh deploy "${GITHUB_WORKSPACE}/vaak-release.tar.gz"
 
-      - name: Configure SSH
-        env:
-          VAAK_SSH_KEY: ${{ secrets.VAAK_SSH_KEY }}
-          VAAK_SSH_KNOWN_HOSTS: ${{ secrets.VAAK_SSH_KNOWN_HOSTS }}
-        run: |
-          set -euo pipefail
-          umask 077
-          mkdir -p ~/.ssh
-          printf '%s\n' "${VAAK_SSH_KNOWN_HOSTS}" > ~/.ssh/known_hosts
-          printf '%s\n' "${VAAK_SSH_KEY}" > ~/.ssh/id_deploy
-          chmod 600 ~/.ssh/id_deploy ~/.ssh/known_hosts
-          [[ -s ~/.ssh/known_hosts && -s ~/.ssh/id_deploy ]]
-          ssh-keygen -y -f ~/.ssh/id_deploy >/dev/null
-
-      - name: Activate the release
-        env:
-          VAAK_SSH_HOST: ${{ secrets.VAAK_SSH_HOST }}
-          VAAK_SSH_USER: ${{ secrets.VAAK_SSH_USER }}
-        run: |
-          set -euo pipefail
-          [[ "${VAAK_SSH_HOST}" =~ ^[A-Za-z0-9._:-]+$ ]]
-          [[ "${VAAK_SSH_USER}" =~ ^[a-z_][a-z0-9_-]*$ ]]
-          SSH=(ssh -i "${HOME}/.ssh/id_deploy" -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes)
-          SCP=(scp -i "${HOME}/.ssh/id_deploy" -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes)
-          DEST="${VAAK_SSH_USER}@${VAAK_SSH_HOST}"
-          "${SCP[@]}" \
-            "${GITHUB_WORKSPACE}/vaak-release.tar.gz" \
-            "${GITHUB_WORKSPACE}/deploy/remote/vaak-release-activate.sh" \
-            "${DEST}:/srv/mkultra/vaak-releases/incoming/"
-          "${SSH[@]}" "${DEST}" \
-            "bash /srv/mkultra/vaak-releases/incoming/vaak-release-activate.sh deploy /srv/mkultra/vaak-releases/incoming/vaak-release.tar.gz"
+  vaak-deploy-release:
+    name: vaak-deploy-release
+    needs: vaak-deploy-ship
+    if: github.event_name == 'workflow_dispatch' && github.repository == 'cmdr-nova/VAAK' && github.ref == 'refs/heads/main' && inputs.action == 'deploy'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out the deployed commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.vaak-deploy-ship.outputs.sha }}
+          fetch-depth: 0
+          persist-credentials: true
 
       - name: Tag and publish the GitHub release
         env:
-          VERSION: ${{ steps.version.outputs.version }}
-          RELEASE_SHA: ${{ steps.version.outputs.sha }}
+          VERSION: ${{ needs.vaak-deploy-ship.outputs.version }}
+          RELEASE_SHA: ${{ needs.vaak-deploy-ship.outputs.sha }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
@@ -235,8 +271,8 @@ jobs:
 
   vaak-deploy-rollback:
     name: vaak-deploy-rollback
-    if: inputs.action == 'rollback'
-    runs-on: ubuntu-24.04
+    if: github.event_name == 'workflow_dispatch' && github.repository == 'cmdr-nova/VAAK' && github.ref == 'refs/heads/main' && inputs.action == 'rollback'
+    runs-on: [self-hosted, vaak-prod]
     environment: production
     timeout-minutes: 20
     steps:
@@ -245,37 +281,17 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Configure SSH
-        env:
-          VAAK_SSH_KEY: ${{ secrets.VAAK_SSH_KEY }}
-          VAAK_SSH_KNOWN_HOSTS: ${{ secrets.VAAK_SSH_KNOWN_HOSTS }}
-        run: |
-          set -euo pipefail
-          umask 077
-          mkdir -p ~/.ssh
-          printf '%s\n' "${VAAK_SSH_KNOWN_HOSTS}" > ~/.ssh/known_hosts
-          printf '%s\n' "${VAAK_SSH_KEY}" > ~/.ssh/id_deploy
-          chmod 600 ~/.ssh/id_deploy ~/.ssh/known_hosts
-          ssh-keygen -y -f ~/.ssh/id_deploy >/dev/null
-
       - name: Roll back to an installed release
         env:
-          VAAK_SSH_HOST: ${{ secrets.VAAK_SSH_HOST }}
-          VAAK_SSH_USER: ${{ secrets.VAAK_SSH_USER }}
           ROLLBACK_TO: ${{ inputs.rollback_to }}
         run: |
           set -euo pipefail
-          [[ "${ROLLBACK_TO}" =~ ^([0-9a-f]{40}|[0-9]+\.[0-9]+\.[0-9]{2}|v[0-9]+\.[0-9]+\.[0-9]{2})$ ]] || {
+          [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]
+          [[ "${GITHUB_REPOSITORY}" == "cmdr-nova/VAAK" ]]
+          [[ "${GITHUB_REF}" == "refs/heads/main" ]]
+          [[ "${ROLLBACK_TO}" =~ ^([0-9a-f]{40}|legacy-[0-9]{8}T[0-9]{6}Z|[0-9]+\.[0-9]+\.[0-9]{2}|v[0-9]+\.[0-9]+\.[0-9]{2})$ ]] || {
             echo "rollback_to must be a git sha or a version such as 0.8.45" >&2
             exit 1
           }
-          [[ "${VAAK_SSH_HOST}" =~ ^[A-Za-z0-9._:-]+$ ]]
-          [[ "${VAAK_SSH_USER}" =~ ^[a-z_][a-z0-9_-]*$ ]]
-          SSH=(ssh -i "${HOME}/.ssh/id_deploy" -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes)
-          SCP=(scp -i "${HOME}/.ssh/id_deploy" -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes)
-          DEST="${VAAK_SSH_USER}@${VAAK_SSH_HOST}"
-          "${SCP[@]}" \
-            "${GITHUB_WORKSPACE}/deploy/remote/vaak-release-activate.sh" \
-            "${DEST}:/srv/mkultra/vaak-releases/incoming/vaak-release-activate.sh"
-          "${SSH[@]}" "${DEST}" \
-            "bash /srv/mkultra/vaak-releases/incoming/vaak-release-activate.sh rollback ${ROLLBACK_TO}"
+          unset VAAK_RESTART_JETSTREAM VAAK_RESTART_SHADOW
+          bash deploy/remote/vaak-release-activate.sh rollback "${ROLLBACK_TO}"

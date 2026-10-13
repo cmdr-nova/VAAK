@@ -1,10 +1,14 @@
 # Deploying VAAK
 
-Production deploys run from GitHub Actions. The workflow is [`.github/workflows/deploy-production.yml`](../.github/workflows/deploy-production.yml). It is manual (`workflow_dispatch`), it deploys only a commit that is on `main` and already has a green CI check, and the SSH step waits on the GitHub Environment named `production`.
+Production deploys run from GitHub Actions. The workflow is [`.github/workflows/deploy-production.yml`](../.github/workflows/deploy-production.yml). It is manual (`workflow_dispatch` on `main`). It deploys only a commit that is already on `main` and has a green CI check. The activate job waits on the GitHub Environment named `production` and runs on a self-hosted runner on the production host. GitHub-hosted runners cannot SSH to the server, so this workflow does not use SSH.
 
-Nothing in this workflow publishes the Jekyll blog. `NovaLandia/update_site.sh` stays the blog publisher. It excludes `/api/`, `/vaak/`, and `/clearance/`. This deploy never writes those exclusions' siblings: not the site root, not `clearance/`, not `/img/profile`, and not `update_site.sh`.
+Nothing in this workflow publishes the Jekyll blog. `NovaLandia/update_site.sh` stays the blog publisher. It `rsync -avz --delete`s the site root with `--exclude '/api/'` and `--exclude '/vaak/'` (trailing slash, so those rules match directories only; a second rsync uses `api/` and `vaak/`). This deploy never writes the site root, `clearance/`, `/img/profile`, or `update_site.sh`.
+
+`/srv/mkultra/html/api` and `/srv/mkultra/html/vaak` stay **real directories**. rsync without `-L` treats a symlink as a non-directory, so if those paths were symlinks the blog publish would delete them. This deploy does not depend on a change to `update_site.sh`. The safest companion change, in the owner's NovaLandia copy of that script, is to drop the trailing slash (`--exclude '/api'` and `--exclude '/vaak'`, and the same for the second rsync). Do that when convenient. Do not treat it as a requirement for this deploy.
 
 The live version in this checkout is **alpha 0.8.45** (`api/ap-version.php`, dated 2026-10-13). **0.8.35** is an older note at `docs/RELEASE-0.8.35.md`, not the constant the app reads.
+
+The production host is the documented machine (bots, Bluesky feeds, the Jekyll site, and VAAK). Web roots are `/srv/mkultra/html/api` and `/srv/mkultra/html/vaak`. The worker path is `/usr/local/bin/vaak-worker`. The app env file is `/etc/mkultra/vaak.env`. PHP-FPM is `php8.3-fpm.service`. The host is Ubuntu 24.04.4 LTS, x86_64, glibc 2.39. The workflow still builds the binary inside `debian:bookworm-slim` (glibc 2.36), which that host can run.
 
 ## Version counter
 
@@ -33,63 +37,92 @@ The bump updates only the live surfaces:
 
 Choose `version_bump=none` when that commit already contains the counter you want to ship. The workflow then does not make another commit.
 
-After a successful SSH activate, the workflow pushes an annotated tag `v<version>` and opens a GitHub Release whose notes are that release file. The tag is created only after the server health check passes. If the version commit was pushed and the later build or SSH step fails, re-run the workflow with `version_bump=none` and the version commit's SHA. Do not increment again until that commit has actually gone live, or the counter will skip a number that never deployed.
+After a successful activate, the workflow pushes an annotated tag `v<version>` and opens a GitHub Release whose notes are that release file. The tag is created only after the health check passes. If the version commit was pushed and a later step fails, re-run the workflow with `version_bump=none` and the version commit's SHA. Do not increment again until that commit has actually gone live, or the counter will skip a number that never deployed.
 
 NodeInfo `software.version` stays `1.0.0`, and the Mastodon instance `version` stays `4.5.0 (compatible; vaak)`. Those strings are client-compatibility markers, not this counter.
 
 ## What you run
 
-1. Create the GitHub Environment `production` and add yourself as a required reviewer. The workflow cannot create that protection; it only selects the environment name.
-2. Put the four secrets on that environment (not as ordinary repository secrets, so other workflows cannot read them):
-
-   | Secret | Contents |
-   | --- | --- |
-   | `VAAK_SSH_HOST` | Hostname or IP the runner can SSH to |
-   | `VAAK_SSH_USER` | `vaak-deploy` |
-   | `VAAK_SSH_KEY` | Private key for that user, PEM text including the header line |
-   | `VAAK_SSH_KNOWN_HOSTS` | One or more `known_hosts` lines for the host. The workflow refuses a missing file and does not use `ssh-keyscan`. |
-
-3. Actions → Deploy production → Run workflow.
+1. Create the GitHub Environment `production` and add yourself as a required reviewer. The workflow cannot create that protection; it only selects the environment name. This workflow does not read deploy secrets. Do not put an SSH private key on the environment.
+2. Install the self-hosted runner (below) with labels `self-hosted` and `vaak-prod`, running as `vaak-deploy`, registered on this repository only.
+3. Actions → Deploy production → Run workflow, from `main`.
    - `action=deploy`
    - `sha` empty for current `main`, or a full SHA that is already on `main`
    - `version_bump=increment` (default) or `none`
-4. Approve the `production` environment prompt. The job then bumps (when asked), pushes that commit to `main`, waits until CI on the new commit is green, builds `vaak-worker` in a Debian bookworm container, and SSHes the artifact over.
+4. The guard job checks CI. The build job compiles `vaak-worker` on a GitHub-hosted runner and uploads the binary. Approve the `production` environment prompt. The self-hosted job then bumps (when asked), pushes that commit to `main`, waits until CI on the new commit is green, and activates the release locally.
 5. The guard job's summary shows the commit and the version it intends to ship. CI for this repository must report at least one successful check on that commit other than the jobs in this workflow. A pending or failed check blocks the deploy. A commit with no other checks is refused.
 
-`main` has to allow `github-actions[bot]` to push the version commit and the tag. If branch protection blocks that, add a bypass for the bot or the deploy stops before it builds.
+`main` has to allow `github-actions[bot]` to push the version commit and the tag. If branch protection blocks that, add a bypass for the bot or the deploy stops before it activates.
+
+There is no SSH step. Delete the secret `VAAK_DEPLOY` if it is still present: that was a personal SSH key, and a personal key must not be a deploy credential. Delete `VAAK_SSH_HOST`, `VAAK_SSH_USER`, `VAAK_SSH_KEY`, and `VAAK_SSH_KNOWN_HOSTS` too if they were added. This workflow does not read them.
+
+## Self-hosted runner
+
+GitHub-hosted runners cannot reach SSH on this host. The activate and rollback jobs run on the server as `vaak-deploy`.
+
+Register a **repository** runner on `cmdr-nova/VAAK`, not an organization runner. In the runner's `config.sh`, add the label `vaak-prod` (`self-hosted` is added automatically). Install the service as `vaak-deploy`, not as root:
+
+```bash
+install -d -o vaak-deploy -g vaak-deploy /home/vaak-deploy/actions-runner
+# As vaak-deploy, from the unpacked runner directory:
+./config.sh --url https://github.com/cmdr-nova/VAAK --token '<one-time token from repo Settings → Actions → Runners>' --name vaak-prod --labels vaak-prod --unattended
+./svc.sh install vaak-deploy
+./svc.sh start
+```
+
+`svc.sh install` writes a systemd unit that runs `run.sh` as `vaak-deploy`. Leave it that way. Do not point the unit at root. The activate step uses `python3` from the stdlib (no extra packages), plus `bash`, `rsync`, `tar`, and the system `php`. Ubuntu 24.04 has those. The GitHub Release is tagged from a GitHub-hosted job after activate succeeds, so the server does not need the `gh` CLI.
+
+This repository is public. A self-hosted runner will execute whatever workflow job names its labels. A pull request from a fork can propose a workflow that uses `runs-on: [self-hosted, vaak-prod]` and omit the `production` environment, and GitHub will not ask the environment reviewers. The runner must not pick up those jobs.
+
+- The deploy workflow is `workflow_dispatch` only, and its self-hosted jobs also require `github.repository == cmdr-nova/VAAK`, `github.ref == refs/heads/main`, and the `production` environment.
+- Do not put the `vaak-prod` label on any other workflow, including pull-request CI.
+- In Settings → Actions → General, require approval for all outside collaborators, and do not approve a fork workflow that targets this runner.
+- Do not send repository secrets to workflows from fork pull requests (the GitHub default).
+
+The runner only needs outbound HTTPS to GitHub. It does not open an SSH port.
 
 ## One-time server setup
 
-Do this as root on the host. Do not point the release tree at the Jekyll document root.
+Do this as root on the host. Do not point the release tree at the Jekyll document root, and do not replace `html/api` or `html/vaak` with symlinks.
 
 ```bash
 id vaak-deploy >/dev/null 2>&1 || useradd --system --create-home --shell /bin/bash vaak-deploy
-install -d -o vaak-deploy -g www-data -m 2775 /srv/mkultra/vaak-releases/{releases,incoming}
+install -d -o vaak-deploy -g www-data -m 2775 /srv/mkultra/vaak-releases/{releases,incoming,bin}
 usermod -aG www-data vaak-deploy
 
-# Seed the current live tree so the symlink cutover does not change bytes.
-STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
-install -d -o vaak-deploy -g www-data -m 2775 "/srv/mkultra/vaak-releases/releases/legacy-${STAMP}"
-cp -a /srv/mkultra/html/api "/srv/mkultra/vaak-releases/releases/legacy-${STAMP}/api"
-cp -a /srv/mkultra/html/vaak "/srv/mkultra/vaak-releases/releases/legacy-${STAMP}/vaak"
-install -d -o vaak-deploy -g www-data -m 2775 "/srv/mkultra/vaak-releases/releases/legacy-${STAMP}/bin"
-install -m 0755 /usr/local/bin/vaak-worker "/srv/mkultra/vaak-releases/releases/legacy-${STAMP}/bin/vaak-worker"
-# VERSION is required by a later rollback. Read it from the seeded PHP if it defines VAAK_VERSION.
-php -r 'require $argv[1]; echo VAAK_VERSION, "\n";' /srv/mkultra/html/api/ap-version.php \
-  > "/srv/mkultra/vaak-releases/releases/legacy-${STAMP}/VERSION"
-printf 'legacy\n' > "/srv/mkultra/vaak-releases/releases/legacy-${STAMP}/REVISION"
-chgrp -R www-data "/srv/mkultra/vaak-releases/releases/legacy-${STAMP}"
-ln -sfn "releases/legacy-${STAMP}" /srv/mkultra/vaak-releases/current
+# api and vaak stay real directories. Group-writable and setgid so vaak-deploy
+# can replace files and www-data can read what the deploy writes.
+chgrp www-data /srv/mkultra/html/api /srv/mkultra/html/vaak
+chmod 2775 /srv/mkultra/html/api /srv/mkultra/html/vaak
+find /srv/mkultra/html/api /srv/mkultra/html/vaak -type d -exec chmod 2775 {} +
+find /srv/mkultra/html/api /srv/mkultra/html/vaak -type d -exec chgrp www-data {} +
 
-# Replace only the VAAK paths. Leave index.html, the blog, clearance, and img/ alone.
-mv /srv/mkultra/html/api /srv/mkultra/html/api.pre-symlink
-mv /srv/mkultra/html/vaak /srv/mkultra/html/vaak.pre-symlink
-ln -s /srv/mkultra/vaak-releases/current/api /srv/mkultra/html/api
-ln -s /srv/mkultra/vaak-releases/current/vaak /srv/mkultra/html/vaak
-ln -sfn /srv/mkultra/vaak-releases/current/bin/vaak-worker /usr/local/bin/vaak-worker
+# Seed a rollback target from the tree that is already live.
+STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+REL="/srv/mkultra/vaak-releases/releases/legacy-${STAMP}"
+install -d -o vaak-deploy -g www-data -m 2775 "$REL"
+cp -a /srv/mkultra/html/api "$REL/api"
+cp -a /srv/mkultra/html/vaak "$REL/vaak"
+install -d -o vaak-deploy -g www-data -m 2775 "$REL/bin"
+install -m 0755 /usr/local/bin/vaak-worker "$REL/bin/vaak-worker"
+php -r 'require $argv[1]; echo VAAK_VERSION, "\n";' /srv/mkultra/html/api/ap-version.php > "$REL/VERSION"
+printf 'legacy\n' > "$REL/REVISION"
+chgrp -R www-data "$REL"
+printf 'legacy-%s\n' "$STAMP" > /srv/mkultra/vaak-releases/live-revision
+install -m 0755 /usr/local/bin/vaak-worker /srv/mkultra/vaak-releases/bin/vaak-worker
+ln -sfn /srv/mkultra/vaak-releases/bin/vaak-worker /usr/local/bin/vaak-worker
 ```
 
-Confirm the site still answers before deleting `api.pre-symlink` and `vaak.pre-symlink`. The activate script refuses to run unless those three symlinks point at `current`. It will not convert a real directory itself, because that directory sits in the blog's web root.
+`/usr/local/bin/vaak-worker` is outside the blog tree. A symlink there is safe. The activate script refuses to run if `html/api` or `html/vaak` is a symlink. If an earlier experiment already replaced them with symlinks, put real directories back (`cp -aL` into a new directory, then `mv` it into place) before the next blog publish.
+
+Leave these four files in `/srv/mkultra/html/api` alone. They are not in git. `update_site.sh` no longer copies `network-status.php` or `discord-presence.php`; the copies on the server are canonical:
+
+- `network-status.php`
+- `discord-presence.php`
+- `.gts-config.php`
+- `sl_visitors.json`
+
+The activate script excludes those four names from every rsync into `html/api`, including a rollback. They are not deleted and they are not replaced from a release tree. Any other file under `api/` or `vaak/` that is not in the release is removed. Add a name to `PRESERVE_API_FILES` in `deploy/remote/vaak-release-activate.sh` before relying on another untracked file surviving a deploy.
 
 Install the sudoers snippet after `visudo -cf`:
 
@@ -97,9 +130,9 @@ Install the sudoers snippet after `visudo -cf`:
 install -m 0440 -o root -g root deploy/vaak-deploy.sudoers /etc/sudoers.d/vaak-deploy
 ```
 
-The lines grant `systemctl restart` for the VAAK units and `php8.3-fpm.service` only. There is no `ALL`, no shell, and no `daemon-reload`.
+The lines grant `systemctl restart` for the VAAK units and `php8.3-fpm.service` only. There is no `ALL`, no shell, and no `daemon-reload`. Restarting `php8.3-fpm` is a brief outage and is the intended signal so PHP-FPM loads the new files. The sudoers file stays restart-only.
 
-Create the migration env as a DDL role that is not `www-data`. `www-data` is intentionally unable to `CREATE`, and `ap_db_migrate_postgres()` swallows that failure during normal requests. The deploy runs `deploy/remote/migrate.php` as `vaak-deploy` before the symlink swap:
+Create the migration env as a DDL role that is not `www-data`. `www-data` is intentionally unable to `CREATE`, and `ap_db_migrate_postgres()` swallows that failure during normal requests. The deploy runs `deploy/remote/migrate.php` as `vaak-deploy` before switching the live tree:
 
 ```bash
 install -m 0640 -o root -g vaak-deploy /dev/null /etc/mkultra/vaak-migrate.env
@@ -113,23 +146,20 @@ AP_DB_PASSWORD=replace-me
 
 `vaak_migrate` needs `CREATE` on the application schema and must not be a superuser. The script takes a Postgres advisory lock, refuses to run when `CREATE` is missing, and fails the deploy if `ap-db.php` logs that a change was not provisioned. DDL is not wrapped in a down-migration. A failed health check puts the previous code back, but it does not undo columns that already committed.
 
-Put `vaak-deploy`'s SSH public key in `/home/vaak-deploy/.ssh/authorized_keys`. The runner is a GitHub-hosted Ubuntu runner, so the host firewall has to allow that inbound SSH, or this workflow cannot connect.
-
 ## What the activate step does
 
 `deploy/remote/vaak-release-activate.sh` runs on the server as `vaak-deploy`.
 
 1. Takes a non-blocking lock at `/srv/mkultra/vaak-releases/.deploy.lock`.
-2. Checks the three symlinks and refuses to continue if the release root is inside `/srv/mkultra/html`.
+2. Refuses to continue unless `html/api` and `html/vaak` are real directories, `/usr/local/bin/vaak-worker` is a symlink to `/srv/mkultra/vaak-releases/bin/vaak-worker`, and the release root is outside `/srv/mkultra/html`.
 3. Extracts the tarball under `releases/<git sha>/`. The tarball is the CI artifact: filtered `api/`, `vaak/`, `bin/vaak-worker`, and `migrate.php`. Replay tools under `api/bin/` are omitted except the production CLIs `home-timeline-warm.php`, `notif-projection-fill.php`, `phyrian-decay.php`, `phyrian-sync.php`, and `ranked-warm.php`. `api/fixtures/` and `docs/` are omitted.
-4. Copies these files forward from the previous tree when the new tree does not contain them: `api/network-status.php`, `api/discord-presence.php`, `api/.gts-config.php`, `api/sl_visitors.json`. The blog publisher SCPs the first two; they are not in this repository.
-5. Runs `php -l` on the new PHP, then `migrate.php` against that tree, before changing `current`.
-6. Points `current` at the new directory with `mv -Tf` on a symlink. `html/api`, `html/vaak`, and `/usr/local/bin/vaak-worker` follow `current` and are not rewritten.
-7. Restarts the units below, then requires `http://127.0.0.1:8787/healthz` to contain `"ok":true`, every required unit to be active, and `VAAK_VERSION` to match the release `VERSION` file.
-8. On a failed health check, points `current` back at the previous release, restarts again, and exits non-zero.
-9. Keeps the live release, the previous release, and five other directories. It does not touch backup timers or `/var/backups`.
+4. Runs `php -l` on the new PHP, then `migrate.php` against that tree, before copying it into the live directories.
+5. `rsync -a --checksum --delete-delay --delay-updates` copies `api/` and `vaak/` into the real directories. `--checksum` replaces a file whose bytes changed even when the size and mtime match. The four canonical files above are excluded, so a deploy and a rollback both leave them as they are on disk. The worker binary is installed with `mv` onto `/srv/mkultra/vaak-releases/bin/vaak-worker`.
+6. Restarts the required units, then requires `http://127.0.0.1:8787/healthz` to contain `"ok":true`, every required unit to be active, and the live `VAAK_VERSION` to match the release `VERSION` file.
+7. On a failed health check, rsyncs the previous release back the same way (still excluding the four canonical files), restarts, and exits non-zero.
+8. Keeps the live release, the previous release, and five other directories. It does not touch backup timers or `/var/backups`.
 
-Required restarts:
+Required restarts, including the brief `php8.3-fpm` restart:
 
 - `php8.3-fpm.service`
 - `vaak-redis-queue-worker.service`
@@ -142,26 +172,28 @@ Required restarts:
 - `vaak-worker-timeline-fanout.service`
 - `vaak-worker-shadow-http.service` (Axum on `127.0.0.1:8787`)
 
-Restarted only when the unit is installed:
+Restarted only when that unit is installed **and** the diff says so:
 
-- `vaak-worker-shadow.service`
-- `ap-bsky-jetstream.service`
+- `vaak-worker-shadow.service`, when the diff touches `rust/vaak-worker/`, `rust/vaak-types/`, `rust/Cargo.toml`, `rust/Cargo.lock`, or `deploy/vaak-worker-shadow.service`. The workflow passes that decision from `git diff` so a fresh bookworm build of unchanged Rust does not restart it. A PHP-only deploy leaves the running shadow process on its current binary.
+- `ap-bsky-jetstream.service`, when the diff touches `deploy/ap-bsky-jetstream.py`, its requirements or friend-host file, or the Jetstream unit files.
 
-`ap-bsky-jetstream@.service` instances are not restarted. Their `ExecStart` reads `api/deploy/ap-bsky-jetstream.py` from the tree this release ships, so an enabled instance keeps the old process until it is restarted by hand. Oneshot timers pick up the new PHP on their next run because they exec the path through `current`.
+`ap-bsky-jetstream@.service` instances are not restarted. Their `ExecStart` reads `api/deploy/ap-bsky-jetstream.py` through the real `html/api` directory. An enabled instance keeps the old process until it is restarted by hand. Oneshot timers pick up the new PHP on their next run because they exec the path in the real directory. Rollback compares the two release trees and restarts an optional unit when that tree diff includes its files.
 
-The worker binary is built in CI (`cargo build --release --locked -p vaak-worker` inside `debian:bookworm-slim`) and is not compiled on the server.
+The worker binary is built in CI (`cargo build --release --locked -p vaak-worker` inside `debian:bookworm-slim`) and is not compiled on the server. The version commit does not rebuild it. That commit only changes the version surfaces, and the binary uploaded from the parent commit is the one that ships.
 
 ## Roll back
 
-Run the same workflow with `action=rollback` and `rollback_to` set to a git SHA already under `/srv/mkultra/vaak-releases/releases/`, or to a version such as `0.8.45`. The environment approval still applies. Rollback swaps `current`, restarts, and health-checks. It does not run migrations and it does not move the git tag.
+Run the same workflow with `action=rollback` and `rollback_to` set to a git SHA already under `/srv/mkultra/vaak-releases/releases/`, or to a version such as `0.8.45`. The environment approval still applies. Rollback rsyncs that release into the real directories, restarts, and health-checks. It does not run migrations, it does not move the git tag, and it does not touch the four canonical `api/` files.
 
 From the server, the same command is:
 
 ```bash
-bash /srv/mkultra/vaak-releases/incoming/vaak-release-activate.sh rollback 0.8.45
+bash /home/vaak-deploy/actions-runner/_work/VAAK/VAAK/deploy/remote/vaak-release-activate.sh rollback 0.8.45
 ```
 
-Stopping the Rust units entirely, and turning the PHP feature flags off, is still the cutover rollback in `rust/README.md`. That is a different operation from swapping this release symlink.
+The checked-out path depends on the runner layout. The workflow runs the script from its own checkout; the line above is the usual repository-runner work directory.
+
+Stopping the Rust units entirely, and turning the PHP feature flags off, is still the cutover rollback in `rust/README.md`. That is a different operation from putting the previous release back.
 
 ## Scripts this replaces
 
@@ -184,6 +216,7 @@ These are not deploys of the VAAK app and this workflow does not replace them:
 ```bash
 python3 deploy/test_bump_version.py
 python3 deploy/test_require_green_ci.py
+python3 deploy/test_restart_plan.py
 python3 deploy/bump_version.py --check
 bash deploy/assemble-release.sh --self-test
 bash deploy/remote/vaak-release-activate.sh --self-test
