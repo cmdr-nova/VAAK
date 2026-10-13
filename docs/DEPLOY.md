@@ -132,7 +132,7 @@ install -m 0440 -o root -g root deploy/vaak-deploy.sudoers /etc/sudoers.d/vaak-d
 
 The lines grant `systemctl restart` for the VAAK units and `php8.3-fpm.service` only. There is no `ALL`, no shell, and no `daemon-reload`. Restarting `php8.3-fpm` is a brief outage and is the intended signal so PHP-FPM loads the new files. The sudoers file stays restart-only.
 
-Create the migration env as a DDL role that is not `www-data`. `www-data` is intentionally unable to `CREATE`, and `ap_db_migrate_postgres()` swallows that failure during normal requests. The deploy runs `deploy/remote/migrate.php` as `vaak-deploy` before switching the live tree:
+Create the migration env as a DDL role that is not `www-data`. The deploy runs `deploy/remote/migrate.php` as `vaak-deploy` before switching the live tree:
 
 ```bash
 install -m 0640 -o root -g vaak-deploy /dev/null /etc/mkultra/vaak-migrate.env
@@ -141,10 +141,48 @@ install -m 0640 -o root -g vaak-deploy /dev/null /etc/mkultra/vaak-migrate.env
 ```
 AP_DB_DSN=pgsql:dbname=novalandia
 AP_DB_USER=vaak_migrate
-AP_DB_PASSWORD=replace-me
 ```
 
 `vaak_migrate` needs `CREATE` on the application schema and must not be a superuser. The script takes a Postgres advisory lock, refuses to run when `CREATE` is missing, and fails the deploy if `ap-db.php` logs that a change was not provisioned. DDL is not wrapped in a down-migration. A failed health check puts the previous code back, but it does not undo columns that already committed.
+
+VAAK's PHP calls `ap_db_migrate_postgres()` on normal requests, so that DDL runs as `www-data`. The function catches a missing `CREATE` and logs it. Altering a table or sequence owned by `vaak_migrate` is different: `www-data` has to be a member of `vaak_migrate`, or those requests fail and the app returns 503s. Create `vaak_migrate` as a non-superuser `LOGIN` role, transfer table and sequence ownership to it, grant `www-data` DML and default privileges, then grant the membership:
+
+```sql
+CREATE ROLE vaak_migrate WITH LOGIN NOSUPERUSER;
+GRANT CREATE ON SCHEMA public TO vaak_migrate;
+
+-- Moves tables and sequences in the application schema.
+DO $$
+DECLARE
+  obj record;
+BEGIN
+  FOR obj IN
+    SELECT n.nspname AS schema_name, c.relname AS object_name, c.relkind
+    FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname = 'public'
+      AND c.relkind IN ('r', 'p', 'S')
+  LOOP
+    IF obj.relkind = 'S' THEN
+      EXECUTE format('ALTER SEQUENCE %I.%I OWNER TO vaak_migrate', obj.schema_name, obj.object_name);
+    ELSE
+      EXECUTE format('ALTER TABLE %I.%I OWNER TO vaak_migrate', obj.schema_name, obj.object_name);
+    END IF;
+  END LOOP;
+END
+$$;
+
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO "www-data";
+GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO "www-data";
+ALTER DEFAULT PRIVILEGES FOR ROLE vaak_migrate IN SCHEMA public
+  GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO "www-data";
+ALTER DEFAULT PRIVILEGES FOR ROLE vaak_migrate IN SCHEMA public
+  GRANT USAGE, SELECT ON SEQUENCES TO "www-data";
+
+GRANT vaak_migrate TO "www-data";
+```
+
+Run that SQL as a superuser. The env file also sets `AP_DB_PASSWORD`. Keep that value only on the server. `GRANT vaak_migrate TO "www-data";` is required once tables are owned by `vaak_migrate`. `"www-data"` inherits that membership, which is what lets request-time DDL succeed.
 
 ## What the activate step does
 
@@ -175,9 +213,9 @@ Required restarts, including the brief `php8.3-fpm` restart:
 Restarted only when that unit is installed **and** the diff says so:
 
 - `vaak-worker-shadow.service`, when the diff touches `rust/vaak-worker/`, `rust/vaak-types/`, `rust/Cargo.toml`, `rust/Cargo.lock`, or `deploy/vaak-worker-shadow.service`. The workflow passes that decision from `git diff` so a fresh bookworm build of unchanged Rust does not restart it. A PHP-only deploy leaves the running shadow process on its current binary.
-- `ap-bsky-jetstream.service`, when the diff touches `deploy/ap-bsky-jetstream.py`, its requirements or friend-host file, or the Jetstream unit files.
+- `ap-bsky-jetstream@0.service` and `ap-bsky-jetstream@1.service`, when the diff touches `deploy/ap-bsky-jetstream.py`, its requirements or friend-host file, or the Jetstream unit files.
 
-`ap-bsky-jetstream@.service` instances are not restarted. Their `ExecStart` reads `api/deploy/ap-bsky-jetstream.py` through the real `html/api` directory. An enabled instance keeps the old process until it is restarted by hand. Oneshot timers pick up the new PHP on their next run because they exec the path in the real directory. Rollback compares the two release trees and restarts an optional unit when that tree diff includes its files.
+Production runs those two template instances. There is no `ap-bsky-jetstream.service`. Their `ExecStart` reads `api/deploy/ap-bsky-jetstream.py` through the real `html/api` directory, so a Jetstream diff restarts both installed instances. Oneshot timers pick up the new PHP on their next run because they exec the path in the real directory. Rollback compares the two release trees and restarts an optional unit when that tree diff includes its files.
 
 The worker binary is built in CI (`cargo build --release --locked -p vaak-worker` inside `debian:bookworm-slim`) and is not compiled on the server. The version commit does not rebuild it. That commit only changes the version surfaces, and the binary uploaded from the parent commit is the one that ships.
 
