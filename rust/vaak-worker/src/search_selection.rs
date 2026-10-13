@@ -3,6 +3,11 @@ use anyhow::{bail,Context,Result};
 use serde_json::Value;
 use sha2::{Digest,Sha256};
 use tokio_postgres::Client;
+#[path="search_final_facts.rs"]
+pub(crate) mod final_facts;
+#[cfg(test)]
+#[path="search_perf_fixture.rs"]
+pub(crate) mod fixture_performance;
 
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -22,12 +27,13 @@ impl FileIdentity {
  }
 }
 pub(crate) struct SearchWindowGrant {
- owner:i64,actor:String,key:String,path:std::path::PathBuf,bytes:Vec<u8>,
- candidates:Vec<Value>,selected:Vec<usize>,offset:usize,limit:usize,identity:FileIdentity,
+ owner:i64,actor:String,key:String,viewer_profile:Value,raw_scope:final_facts::Scope,raw_snapshot:Value,path:std::path::PathBuf,bytes:Vec<u8>,
+ preview_snapshot:std::sync::Mutex<Option<Value>>,candidates:Vec<Value>,selected:Vec<usize>,offset:usize,limit:usize,identity:FileIdentity,
 }
-/// Invocation-scoped result of fresh file/owner/source predicate reads. These
-/// reads are ordered checks, not an atomic SQL transaction snapshot. The proof
-/// is used only for synchronous final source bindings, never stored across IO.
+/// Invocation-scoped result of original ordered predicates followed by one
+/// combined raw SQL snapshot and a synchronous file check. SQL dependencies
+/// share that final statement snapshot; the filesystem is checked separately.
+/// The proof is used only synchronously, never retained across later IO.
 pub(crate) struct FreshSearchWindow<'a>{window:&'a SearchWindowGrant}
 impl FreshSearchWindow<'_>{
  pub(crate) fn require_bound_source(&self,association:&std::sync::Arc<SearchWindowGrant>,owner:i64,actor:&str,key:&str,index:usize,source:&Value)->Result<()>{
@@ -45,9 +51,9 @@ impl SearchWindowGrant {
   // These are the two actual admin_search_run locations. No supplied path is
   // accepted. PHP supplies its exact mb_strtolower query bytes, preserving its
   // Unicode semantics; the owner/resolve key is independently recomputed.
-  let directory=match descriptor.cache_location.as_str(){"primary"=>"/var/lib/mkultra/ap/search-cache","temporary"=>"/tmp/vaak-search-cache",_=>bail!("invalid Search cache location")};
+  let directory=match descriptor.cache_location.as_str(){"primary"=>std::path::PathBuf::from("/var/lib/mkultra/ap/search-cache"),"temporary"=>std::env::temp_dir().join("vaak-search-cache"),_=>bail!("invalid Search cache location")};
   let key_hex=format!("{:x}",Sha256::digest(format!("mf3|{owner}|{}|{}|121|80",descriptor.normalized_query,if descriptor.resolve{"1"}else{"0"}).as_bytes()));
-  let path=std::path::Path::new(directory).join(format!("s_{key_hex}.json"));
+  let path=directory.join(format!("s_{key_hex}.json"));
   let (bytes,identity)=Self::read(&path).await?;
   if format!("{:x}",Sha256::digest(&bytes))!=descriptor.cache_sha256{bail!("Search collector file differs from actual producer")}
   let cached:Value=serde_json::from_slice(&bytes)?;
@@ -57,7 +63,13 @@ impl SearchWindowGrant {
   // cache-key fetch121 remains exact PHP arithmetic, not wider source authority.
   if candidates.len()>40||candidates.iter().any(|value|!value.is_object()){bail!("Search collector candidate bound")}
   let row=db.query_opt("SELECT actor_id,actor_key FROM ap_users WHERE id=$1::bigint AND disabled_at IS NULL",&[&owner]).await?.context("inactive Search collector owner")?;
-  let grant=Self{owner,actor:row.get(0),key:row.get(1),path,bytes,candidates,selected:descriptor.selected_ordinals,offset:descriptor.offset,limit:descriptor.limit,identity};
+  let actor:String=row.get(0);let key:String=row.get(1);
+  // Complete viewer Settings snapshot, including absence. This is immutable
+  // presentation provenance; every IO/final invocation still reads current DB.
+  let viewer_profile=db.query_opt("SELECT to_jsonb(p) FROM actor_profile p WHERE actor_key=$1 LIMIT 1",&[&key]).await?.map(|row|row.get::<_,Value>(0)).unwrap_or(Value::Null);
+  let raw_scope=final_facts::Scope::new(owner,&key,&actor,&candidates,&[],&[],false);
+  let raw_snapshot=raw_scope.read(db).await?;
+  let grant=Self{owner,actor,key,viewer_profile,raw_scope,raw_snapshot,path,bytes,preview_snapshot:std::sync::Mutex::new(None),candidates,selected:descriptor.selected_ordinals,offset:descriptor.offset,limit:descriptor.limit,identity};
   for (index,source) in sources.iter().enumerate(){grant.require_source_binding(index,source)?}
   grant.require_current(db).await?;Ok(grant)
  }
@@ -76,22 +88,112 @@ impl SearchWindowGrant {
  async fn require_file_current(&self)->Result<()>{let (bytes,identity)=Self::read(&self.path).await?;if bytes!=self.bytes||identity!=self.identity{bail!("Search collector file replaced/changed")}Ok(())}
 
  pub(crate) fn owner_id(&self)->i64{self.owner}
+ pub(crate) fn viewer_profile(&self)->&Value{&self.viewer_profile}
+ /// Actual status action facts must use the same retained owner role as the
+ /// initial/final raw witness. INTEGER/BIGINT NULL coalesces to zero.
+ pub(crate) fn require_painted_owner_role(&self,facts:&crate::library::card::CardFacts)->Result<()>{
+  if facts.owner_id!=self.owner{bail!("Search painted status owner differs from collector")}
+  let users=self.raw_snapshot["users"].as_array().context("Search retained owner rows")?;
+  let owners=users.iter().filter(|row|row["id"].as_i64()==Some(self.owner)).collect::<Vec<_>>();
+  if owners.len()!=1{bail!("Search retained owner role ambiguous")}
+  let value=&owners[0]["is_admin"];
+  let expected=if value.is_null(){false}else{value.as_i64().context("Search retained INTEGER/BIGINT admin role")?!=0};
+  if facts.moderation.is_admin!=expected{bail!("Search painted status admin role differs from retained owner facts")}Ok(())
+ }
+
  pub(crate) fn require_owner_binding(&self,owner:i64,actor:&str,key:&str)->Result<()>{if owner!=self.owner||actor!=self.actor||key!=self.key{bail!("Search source owner identity differs from producer capability")}Ok(())}
  pub(crate) async fn refresh_current<'a>(&'a self,db:&Client)->Result<FreshSearchWindow<'a>>{self.require_current(db).await?;Ok(FreshSearchWindow{window:self})}
+ pub(crate) async fn refresh_current_with_components<'a>(&'a self,db:&Client,components:Option<&crate::search_components::admission::ComponentsGrant>)->Result<FreshSearchWindow<'a>>{self.require_current_with_components(db,components,true).await?;Ok(FreshSearchWindow{window:self})}
  pub(crate) fn require_source_binding(&self,index:usize,source:&Value)->Result<()>{
   let ordinal=*self.selected.get(index).context("Search source not in selected producer page")?;
   if self.candidates.get(ordinal)!=Some(source){bail!("Search supplied source differs from exact selected producer entry")}
   Ok(())
  }
- pub(crate) async fn require_current(&self,db:&Client)->Result<()>{
+ pub(crate) async fn bind_preview_write_url(&self,db:&Client,index:usize,source:&Value,url:&str)->Result<()>{
+  if self.preview_snapshot.lock().map_err(|_|anyhow::anyhow!("Search preview journal poisoned"))?.is_none(){bail!("Search preview writer lacks actual root extraction dependency")}
+  // This URL comes only from the authorized native cache writer after actual
+  // OG parsing. Re-extracting it as article text truncates Unicode canonical URLs.
+  self.bind_preview_exact_url(db,index,source,url).await
+ }
+ pub(crate) async fn bind_preview_text(&self,db:&Client,index:usize,source:&Value,text:&str)->Result<()>{
+  self.require_source_binding(index,source)?;self.require_current(db).await?;
+  let Some(url)=crate::direct_preview::extract_url(text)?else{return Ok(())};
+  self.bind_preview_exact_url(db,index,source,&url).await
+ }
+ async fn bind_preview_exact_url(&self,db:&Client,index:usize,source:&Value,url:&str)->Result<()>{
+  self.require_source_binding(index,source)?;self.require_current(db).await?;
+  let url=crate::direct_preview::normalize(url)?;if url.is_empty(){return Ok(())}
+  let previous=self.preview_snapshot.lock().map_err(|_|anyhow::anyhow!("Search preview journal poisoned"))?.clone();
+  let mut urls=previous.as_ref().and_then(|v|v["urls"].as_array()).into_iter().flatten().filter_map(Value::as_str).map(str::to_owned).collect::<Vec<_>>();
+  if urls.contains(&url){return Ok(())}if urls.len()>=80{bail!("Search preview exact URL scope exceeded")}urls.push(url);urls.sort();
+  self.require_file_current().await?;
+  let (raw,_,preview)=self.raw_scope.read_with_previews(db,None,&urls,false).await?;
+  final_facts::Scope::require_same(&self.raw_snapshot,&raw,Some(&self.viewer_profile))?;
+  if let Some(previous)=previous{
+   if previous["shape"]!=preview["shape"]{bail!("Search preview shape changed during dependency capture")}
+   for existing in previous["urls"].as_array().context("Search preview URL journal")?{
+    if Self::preview_rows(&previous,existing.as_str().context("Search preview URL")?)!=Self::preview_rows(&preview,existing.as_str().unwrap()){bail!("Search retained preview rows changed during capture")}
+   }
+  }
+  let rows=preview["rows"].as_array().context("Search preview row witness")?;
+  for url in &urls{if rows.iter().filter(|row|row["url"].as_str()==Some(url.as_str())).count()>1{bail!("PHP fallback: ambiguous legacy preview cache rows")}}
+  self.require_file_current_sync()?;
+  *self.preview_snapshot.lock().map_err(|_|anyhow::anyhow!("Search preview journal poisoned"))?=Some(preview);Ok(())
+ }
+ fn preview_rows(snapshot:&Value,url:&str)->Vec<Value>{snapshot["rows"].as_array().into_iter().flatten().filter(|row|row["url"].as_str()==Some(url)).cloned().collect()}
+ pub(crate) fn accept_preview_write(&self,write:&crate::profile_preview_fetch::PreviewCacheWrite)->Result<()>{
+  let mut retained=self.preview_snapshot.lock().map_err(|_|anyhow::anyhow!("Search preview journal poisoned"))?;
+  let snapshot=retained.as_mut().context("Search preview writer lacks retained dependency")?;
+  if !snapshot["urls"].as_array().context("Search preview URL journal")?.iter().any(|url|url.as_str()==Some(write.url())){bail!("Search preview receipt URL outside selected native dependency")}
+  if Self::preview_rows(snapshot,write.url()).as_slice()!=write.before(){bail!("Search preview writer before rows differ from retained snapshot")}
+  if write.after().len()!=1||write.after()[0]["url"].as_str()!=Some(write.url()){bail!("Search preview writer after rows invalid")}
+  let rows=snapshot["rows"].as_array_mut().context("Search preview row journal")?;rows.retain(|row|row["url"].as_str()!=Some(write.url()));rows.extend_from_slice(write.after());rows.sort_by(|a,b|a["url"].as_str().cmp(&b["url"].as_str()));Ok(())
+ }
+ pub(crate) async fn require_current(&self,db:&Client)->Result<()>{self.require_current_with_components(db,None,false).await}
+ async fn require_current_with_components(&self,db:&Client,components:Option<&crate::search_components::admission::ComponentsGrant>,_terminal:bool)->Result<()>{
+  #[cfg(test)] let _timing=fixture_performance::span("collector_refresh",self.candidates.len());
   self.require_file_current().await?;
   let row=db.query_opt("SELECT actor_id,actor_key FROM ap_users WHERE id=$1::bigint AND disabled_at IS NULL",&[&self.owner]).await?.context("Search collector owner withdrawn")?;
   if row.get::<_,String>(0)!=self.actor||row.get::<_,String>(1)!=self.key{bail!("Search collector owner changed")}
+  let viewer_profile=db.query_opt("SELECT to_jsonb(p) FROM actor_profile p WHERE actor_key=$1 LIMIT 1",&[&self.key]).await?.map(|row|row.get::<_,Value>(0)).unwrap_or(Value::Null);
+  if viewer_profile!=self.viewer_profile{bail!("Search viewer Settings changed")}
+  #[cfg(test)] if _terminal{final_facts::boundary_fixture::at(db,"after_viewer_before_components").await?;}
+  // Component checks precede the final complete status/source predicate;
+  // they never add a new SQL await after status publication admission.
+  if let Some(components)=components{components.require_ordered_current(db).await?;}
+  #[cfg(test)] if _terminal{final_facts::boundary_fixture::at(db,"after_components_before_status").await?;}
   let mut filtered=Vec::new();
   for (ordinal,allowed) in super::selected_current_mask(db,self.owner,&self.actor,&self.key,&self.candidates).await?.into_iter().enumerate(){if allowed{filtered.push(ordinal)}}
   let selected=filtered.into_iter().skip(self.offset).take(self.limit).collect::<Vec<_>>();
   if selected!=self.selected{bail!("Search current filtered producer window changed")}
   self.require_file_current().await?;
+  #[cfg(test)] if _terminal{final_facts::boundary_fixture::at(db,"after_status_before_final_raw").await?;}
+  // This is the last async operation: one SQL statement reads every scoped
+  // dependency together. No previous allow survives a changed raw witness.
+  let preview=self.preview_snapshot.lock().map_err(|_|anyhow::anyhow!("Search preview journal poisoned"))?.clone();
+  let raw_after=if let Some(preview)=preview{
+   let urls=preview["urls"].as_array().context("Search preview URL journal")?.iter().map(|v|v.as_str().map(str::to_owned).context("Search preview URL")).collect::<Result<Vec<_>>>()?;
+   let (raw,component_after,preview_after)=self.raw_scope.read_with_previews(db,components.map(|c|c.raw_binding().0),&urls,_terminal).await?;
+   if let Some(components)=components{final_facts::Scope::require_same(components.raw_binding().1,component_after.as_ref().context("Search component final witness")?,None)?;}
+   if preview_after!=preview{bail!("Search preview dependency changed before publication")}raw
+  }else if let Some(components)=components{
+   let (scope,before)=components.raw_binding();
+   let (status_after,component_after)=self.raw_scope.read_pair(db,scope).await?;
+   final_facts::Scope::require_same(before,&component_after,None)?;
+   status_after
+  }else{self.raw_scope.read(db).await?};
+  final_facts::Scope::require_same(&self.raw_snapshot,&raw_after,Some(&self.viewer_profile))?;
+  self.require_file_current_sync()?;
+  Ok(())
+ }
+ fn require_file_current_sync(&self)->Result<()>{
+  let before=std::fs::symlink_metadata(&self.path)?;
+  if !before.is_file()||before.file_type().is_symlink()||FileIdentity::of(&before)?!=self.identity{bail!("Search collector file changed before final synchronous read")}
+  let mut file=std::fs::File::open(&self.path)?;
+  if FileIdentity::of(&file.metadata()?)?!=self.identity{bail!("Search collector file replaced before final synchronous read")}
+  use std::io::Read;let mut bytes=Vec::new();file.by_ref().take(2*1024*1024+1).read_to_end(&mut bytes)?;
+  let after=std::fs::symlink_metadata(&self.path)?;
+  if !after.is_file()||after.file_type().is_symlink()||FileIdentity::of(&after)?!=self.identity||bytes!=self.bytes{bail!("Search collector file changed during final synchronous read")}
   Ok(())
  }
 }
@@ -99,7 +201,7 @@ impl SearchWindowGrant {
 
 /// Fresh bounded source rows shared only within one predicate invocation. No
 /// allowed decision or row snapshot is reused across any enrichment await.
-pub(super) struct CurrentSourceRows {rows:Value,indexability:std::collections::HashMap<String,(i64,i64)>}
+pub(super) struct CurrentSourceRows {rows:Value,pub(super) indexability:std::collections::HashMap<String,(i64,i64)>}
 impl CurrentSourceRows {
  fn refs(status:&Value,uris:&mut std::collections::HashSet<String>,depth:usize){
   if depth>16{return}
@@ -109,6 +211,7 @@ impl CurrentSourceRows {
   for (field,child) in super::children(status){if !super::descriptor(field,child){Self::refs(child,uris,depth+1)}}
  }
  pub(super) async fn load(db:&Client,statuses:&[Value])->Result<Self>{
+  #[cfg(test)] let _timing=fixture_performance::span("source_rows_load_two_SQL",statuses.len());
   let mut uris=std::collections::HashSet::new();for status in statuses{Self::refs(status,&mut uris,0)}
   let uris=uris.into_iter().collect::<Vec<_>>();
   const SQL:&str="SELECT COALESCE(jsonb_object_agg(q.uri,jsonb_build_object('bsky',EXISTS(SELECT 1 FROM bsky_posts b WHERE b.bsky_uri=q.uri),'local',EXISTS(SELECT 1 FROM masto_statuses s WHERE rtrim(s.note_id,'/')=q.uri),'event',to_jsonb(e),'mention',to_jsonb(m))),'{}'::jsonb) FROM unnest($1::text[]) q(uri) LEFT JOIN LATERAL (SELECT actor_id,type,action_taken FROM events ev WHERE ev.object_id IN(q.uri,q.uri||'/') AND (ev.type IN('Create','Update','Delete','Tombstone') OR (ev.type IN('Quote','QuotePost') AND NOT EXISTS(SELECT 1 FROM events note_source WHERE note_source.object_id IN(q.uri,q.uri||'/') AND note_source.type IN('Create','Update')))) ORDER BY id DESC LIMIT 1) e ON true LEFT JOIN LATERAL (SELECT mention_source.actor_id,mention_source.deleted_at::text FROM mentions mention_source WHERE mention_source.object_id IN(q.uri,q.uri||'/') ORDER BY mention_source.id DESC LIMIT 1) m ON true";
@@ -285,3 +388,6 @@ mod differential_tests {
   std::fs::write(std::env::var("VAAK_SEARCH_FAULT_OUTPUT")?,serde_json::to_vec_pretty(&results)?)?;Ok(())
  }
 }
+
+#[cfg(test)]
+mod status_admin_aba_fixture { include!("search_status_admin_aba_fixture.rs"); }

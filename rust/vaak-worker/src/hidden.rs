@@ -21,6 +21,14 @@ pub struct HiddenSets {
 }
 
 impl HiddenSets {
+    // Equivalent to the original exact-domain or ".domain" suffix predicate.
+    // Check every ASCII dot boundary, including empty/repeated-dot suffixes.
+    fn host_blocked(&self, host: &str) -> bool {
+        let blocked = |candidate: &str| self.user_blocked_domains.contains(candidate)
+            || self.instance_blocked_domains.contains(candidate);
+        blocked(host) || host.match_indices('.').any(|(offset, _)| blocked(&host[offset + 1..]))
+    }
+
     pub fn is_hidden(&self, actor_id: &str) -> bool {
         self.actor_hidden(actor_id, false)
     }
@@ -42,8 +50,7 @@ impl HiddenSets {
         let host = host_of(actor);
         if let Some(host) = host {
             let host_l = host.to_ascii_lowercase();
-            if self.user_blocked_domains.iter().chain(self.instance_blocked_domains.iter())
-                .any(|domain| host_l == *domain || host_l.ends_with(&format!(".{domain}")))
+            if self.host_blocked(&host_l)
             {
                 return true;
             }
@@ -192,8 +199,7 @@ fn status_hidden_at(status: &Value, hidden: &HiddenSets, depth: usize, profile_r
     for field in ["uri", "url"] {
         if let Some(reference) = status.get(field).and_then(Value::as_str) {
             if let Some(host) = host_of(reference) {
-                if hidden.user_blocked_domains.iter().chain(hidden.instance_blocked_domains.iter())
-                    .any(|domain| host == *domain || host.ends_with(&format!(".{domain}"))) { return true; }
+                if hidden.host_blocked(&host) { return true; }
             }
         }
     }
@@ -250,18 +256,20 @@ fn norm_actor(s: &str) -> String {
 }
 
 pub(crate) fn actor_aliases(s: &str) -> Vec<String> {
+    static BSKY_ACTOR_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static FEDERATED_ACTOR_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let actor = norm_actor(s);
     if actor.is_empty() { return Vec::new(); }
     let mut aliases = vec![actor.clone()];
     if actor.starts_with("did:") {
         aliases.push(format!("https://bsky.app/profile/{actor}"));
         aliases.push(format!("https://bsky.app/profile/{}", crate::library::actions::query(&actor)));
-    } else if let Some(captures) = regex::Regex::new(r"(?i)^https://bsky\.app/profile/([^/?#]+)$").unwrap().captures(&actor) {
+    } else if let Some(captures) = BSKY_ACTOR_RE.get_or_init(|| regex::Regex::new(r"(?i)^https://bsky\.app/profile/([^/?#]+)$").unwrap()).captures(&actor) {
         let decoded = raw_percent_decode(&captures[1]);
         aliases.push(decoded.clone());
         aliases.push(format!("https://bsky.app/profile/{decoded}"));
         aliases.push(format!("https://bsky.app/profile/{}", crate::library::actions::query(&decoded)));
-    } else if let Some(captures) = regex::Regex::new(r"(?i)^https://([^/]+)/(users/|@)([^/?#]+)$").unwrap().captures(&actor) {
+    } else if let Some(captures) = FEDERATED_ACTOR_RE.get_or_init(|| regex::Regex::new(r"(?i)^https://([^/]+)/(users/|@)([^/?#]+)$").unwrap()).captures(&actor) {
         let host = captures[1].to_ascii_lowercase();
         let (decoded, encoded) = path_segment_forms(&captures[3]);
         for variant in [decoded, encoded] {
@@ -472,6 +480,42 @@ pub(crate) async fn load_canonical_library_hidden_sets(db:&Client,owner:i64)->Re
     Ok(sets)
 }
 
+/// Ordinary Search-only fresh moderation batch. Guest reads retain their
+/// original optional-word table contract. Authenticated Search still reads
+/// words (and errors) before its caller clears phrases by explicit policy.
+/// Bluesky hide rows are deliberately absent: these are ordinary AP controls.
+pub(crate) async fn load_search_hidden_sets(db:&Client,owner:i64)->Result<HiddenSets>{
+    if owner<1{return load_hidden_sets(db,owner).await}
+    let rows=db.query("SELECT 'mute' AS source, NULL::text AS scope, actor_id AS value, NULL::text AS kind FROM ap_mutes WHERE owner_user_id=$1::bigint
+        UNION ALL SELECT 'user',scope,value,NULL::text FROM ap_user_blocks WHERE owner_user_id=$1::bigint
+        UNION ALL SELECT 'instance',scope,value,COALESCE(to_jsonb(ap_blocks)->>'kind','block') FROM ap_blocks
+        UNION ALL SELECT 'word',NULL::text,phrase,NULL::text FROM ap_muted_words WHERE owner_user_id=$1::bigint",&[&owner]).await.context("read current ordinary Search moderation")?;
+    let mut sets=HiddenSets::default();
+    for row in rows{
+        let source:String=row.try_get(0)?;
+        let value:String=row.try_get::<_,Option<String>>(2)?.unwrap_or_default();
+        match source.as_str(){
+            "mute"=>{let actor=norm_actor(&value);if !actor.is_empty(){insert_actor_aliases(&mut sets.muted_actors,&actor)}},
+            "word"=>{let phrase=normalize_muted_text(&row.try_get::<_,String>(2)?);if !phrase.is_empty(){sets.muted_phrases.push(phrase)}},
+            "user"|"instance"=>{
+                let scope:String=row.try_get::<_,Option<String>>(1)?.unwrap_or_default();
+                if scope=="actor"{
+                    let actor=norm_actor(&value);if actor.is_empty(){continue}
+                    if source=="user"{insert_actor_aliases(&mut sets.user_blocked_actors,&actor)}
+                    else if row.try_get::<_,String>(3)?=="mute"{for alias in actor_aliases(&actor){sets.instance_muted_actors.insert(alias.to_ascii_lowercase());}}
+                    else{insert_actor_aliases(&mut sets.instance_blocked_actors,&actor)}
+                }else if scope=="domain"{
+                    let host=value.trim().trim_start_matches('.').to_ascii_lowercase();if host.is_empty(){continue}
+                    if source=="user"{sets.user_blocked_domains.insert(host);}else{sets.instance_blocked_domains.insert(host);}
+                }
+            },
+            _=>anyhow::bail!("unknown Search moderation source"),
+        }
+    }
+    Ok(sets)
+}
+
+
 /// Personal mute/block/deprioritize state for lean ⋯ menus (PHP `block_quick_actions`).
 #[derive(Debug, Default, Clone)]
 pub struct ViewerModeration {
@@ -619,6 +663,76 @@ pub async fn is_favourited(db: &Client, owner_user_id: i64, object_id: &str) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn domain_lookup_matches_original_predicate_for_arbitrary_string_boundaries() {
+        // Preserve the actual original production formula as an independent oracle.
+        let original = |hidden: &HiddenSets, host: &str| hidden.user_blocked_domains.iter()
+            .chain(hidden.instance_blocked_domains.iter())
+            .any(|domain| host == *domain || host.ends_with(&format!(".{domain}")));
+        let table = [
+            ("example.com", "example.com", true),
+            ("sub.example.com", "example.com", true),
+            ("badexample.com", "example.com", false),
+            ("example.com.", "example.com", false),
+            ("example.com.", "", true),
+            (".example.com", "example.com", true),
+            ("a..b", ".b", true),
+            ("a..b", "b", true),
+            ("a..b", "..b", false),
+            ("a...", "..", true),
+            (".", "", true),
+            ("", "", true),
+            ("", ".", false),
+            ("EXAMPLE.COM", "example.com", false),
+            ("é.example.com", "example.com", true),
+            ("é。example.com", "example.com", false),
+            ("a．b", "b", false),
+            ("a.é", "é", true),
+            ("127.0.0.1", "1", true),
+            ("[::1]", "::1", false),
+            ("[::1]", "[::1]", true),
+            ("::ffff:192.0.2.1", "1", true),
+            ("a.\0", "\0", true),
+            ("a. b", "b", false),
+            ("a. b", " b", true),
+        ];
+        let mut strings = vec![String::new()];
+        let mut frontier = vec![String::new()];
+        for _ in 0..3 {
+            let next = frontier.iter().flat_map(|prefix| ["a", "A", ".", "é", "。", ":"].into_iter()
+                .map(move |part| format!("{prefix}{part}"))).collect::<Vec<_>>();
+            strings.extend(next.iter().cloned());frontier = next;
+        }
+        for (host, domain, expected) in table {
+            let hidden = HiddenSets { user_blocked_domains: HashSet::from([domain.into()]), ..Default::default() };
+            assert_eq!(original(&hidden, host), expected, "original edge host={host:?} domain={domain:?}");
+            assert_eq!(hidden.host_blocked(host), expected, "edge host={host:?} domain={domain:?}");
+            strings.push(host.into());strings.push(domain.into());
+        }
+        strings.sort();strings.dedup();
+        for domain in &strings {
+            for placement in 0..3 {
+                let mut hidden = HiddenSets::default();
+                if placement != 1 { hidden.user_blocked_domains.insert(domain.clone()); }
+                if placement != 0 { hidden.instance_blocked_domains.insert(domain.clone()); }
+                for host in &strings {
+                    assert_eq!(hidden.host_blocked(host), original(&hidden, host),
+                        "host={host:?} domain={domain:?} placement={placement}");
+                }
+            }
+        }
+        // Mixed sets exercise union semantics and several matching suffixes.
+        let hidden = HiddenSets {
+            user_blocked_domains: HashSet::from([".b".into(), "EXAMPLE.COM".into(), "é".into()]),
+            instance_blocked_domains: HashSet::from(["b".into(), "example.com".into(), "".into()]),
+            ..Default::default()
+        };
+        for host in &strings {
+            assert_eq!(hidden.host_blocked(host), original(&hidden, host), "mixed host={host:?}");
+            assert!(!HiddenSets::default().host_blocked(host), "empty sets host={host:?}");
+        }
+    }
 
     #[test]
     fn moderation_preserves_actor_path_case_and_expands_structural_aliases() {
@@ -886,3 +1000,7 @@ mod canonical_policy_differential {
     }
 
 }
+
+#[cfg(test)]
+#[path="search_batch_hidden_fixture.rs"]
+pub(crate) mod batch_differential;

@@ -2181,13 +2181,14 @@ function ap_masto_account_actor_remember(string $accountId, string $actorId): vo
  *
  * @return list<string>
  */
-function ap_masto_actor_id_aliases(string $actorId): array
+function ap_masto_actor_id_aliases(string $actorId, bool $refresh = false, bool $strict = false): array
 {
     $actorId = rtrim(trim($actorId), '/');
     if ($actorId === '' || !str_starts_with($actorId, 'https://')) {
         return $actorId !== '' ? [$actorId] : [];
     }
     static $memo = [];
+    if ($refresh) unset($memo[$actorId]);
     if (isset($memo[$actorId])) {
         return $memo[$actorId];
     }
@@ -2216,6 +2217,7 @@ function ap_masto_actor_id_aliases(string $actorId): array
             }
         }
     } catch (Throwable $e) {
+        if ($strict) throw $e;
         // ignore
     }
     if ($uname === '' && $pathUname !== '' && !ctype_digit($pathUname)) {
@@ -2239,6 +2241,7 @@ function ap_masto_actor_id_aliases(string $actorId): array
                 }
             }
         } catch (Throwable $e) {
+        if ($strict) throw $e;
             // ignore
         }
         try {
@@ -2258,6 +2261,7 @@ function ap_masto_actor_id_aliases(string $actorId): array
                 }
             }
         } catch (Throwable $e) {
+        if ($strict) throw $e;
             // ignore
         }
     }
@@ -2291,6 +2295,7 @@ function ap_masto_actor_id_aliases(string $actorId): array
                 }
             }
         } catch (Throwable $e) {
+        if ($strict) throw $e;
             // ignore
         }
         arsort($scored, SORT_NUMERIC);
@@ -4164,6 +4169,7 @@ function ap_masto_remote_account(string $actorId, bool $allowFetch = false): arr
     static $memo = [];
     $memoKey = $actorId . ':' . ($allowFetch ? '1' : '0');
     if (isset($memo[$memoKey])) {
+        if (!empty($GLOBALS['vaak_search_collect_account_sources'])) $GLOBALS['vaak_search_account_sources'][hash('sha256',json_encode($memo[$memoKey],JSON_THROW_ON_ERROR))]??=$actorId;
         return $memo[$memoKey];
     }
     $fallback = defined('AP_REMOTE_AVATAR_FALLBACK')
@@ -4308,6 +4314,7 @@ function ap_masto_remote_account(string $actorId, bool $allowFetch = false): arr
         'emojis' => [],
         'fields' => [],
     ];
+    if (!empty($GLOBALS['vaak_search_collect_account_sources'])) $GLOBALS['vaak_search_account_sources'][hash('sha256',json_encode($account,JSON_THROW_ON_ERROR))]??=$actorId;
     return $memo[$memoKey] = $account;
 }
 
@@ -4399,6 +4406,17 @@ function ap_masto_remote_link_card(string $text, bool $hasMedia = false): ?array
         }
     }
     return null;
+}
+
+/** Single-paragraph API reply teaser; authored reply text is never modified. */
+function ap_masto_reply_parent_preview(string $text): string
+{
+    $text = html_entity_decode($text, ENT_QUOTES | ENT_HTML5, 'UTF-8');
+    $single = preg_replace('/\s+/u', ' ', trim($text));
+    if (!is_string($single)) $single = preg_replace('/[\r\n\t\v\f ]+/', ' ', trim($text)) ?? '';
+    $single = function_exists('mb_substr') ? mb_substr($single, 0, 140) : substr($single, 0, 140);
+    // Protect this normalized teaser from the formatter's subsequent entity decode.
+    return htmlspecialchars($single, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
 }
 
 /**
@@ -4608,11 +4626,7 @@ function ap_masto_status_from_mention(array $row): array
         if ($parentPreview === '' || in_array($parentPreview, ['(media)', '(attachment)', '(poll)', '(quote)'], true)) {
             $parentPreview = 'your post';
         }
-        if (function_exists('mb_substr')) {
-            $parentPreview = mb_substr($parentPreview, 0, 140);
-        } else {
-            $parentPreview = substr($parentPreview, 0, 140);
-        }
+        $parentPreview = ap_masto_reply_parent_preview($parentPreview);
         $text = '↩ ' . $parentPreview . ($text !== '' ? "\n\n" . $text : '');
     }
     $extraActors = [];
@@ -5673,6 +5687,21 @@ function ap_masto_notifications_grouped_fetch(int $limit = 40, ?string $maxId = 
     ];
 }
 
+/** Internal projection provenance; never part of the public notification DTO. */
+function ap_notification_projection_payload(array $item): string|false
+{
+    $item['_vaak_reply_preview_version'] = 2;
+    return json_encode($item, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+}
+
+/** Legacy projection bodies must be rebuilt from canonical rows, never heuristically stripped. */
+function ap_notification_projection_item(array $item): ?array
+{
+    if (($item['_vaak_reply_preview_version'] ?? null) !== 2) return null;
+    unset($item['_vaak_reply_preview_version']);
+    return $item;
+}
+
 /** Write a bounded, rebuildable notification response projection. */
 function ap_notification_projection_write(int $ownerUserId, array $items): void
 {
@@ -5705,7 +5734,7 @@ function ap_notification_projection_write(int $ownerUserId, array $items): void
             $account = is_array($item['account'] ?? null) ? $item['account'] : [];
             $status = is_array($item['status'] ?? null) ? $item['status'] : [];
             $created = trim((string) ($item['created_at'] ?? $now));
-            $payload = json_encode($item, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+            $payload = ap_notification_projection_payload($item);
             if (!is_string($payload) || $payload === '') {
                 continue;
             }
@@ -5739,9 +5768,15 @@ function ap_notification_projection_read(int $ownerUserId, int $limit, array $wa
         );
         $st->execute([$ownerUserId, $cutoff]);
         $out = [];
+        $items = [];
         foreach ($st->fetchAll() ?: [] as $row) {
             $item = json_decode((string) ($row['payload_json'] ?? ''), true);
-            if (!is_array($item)) continue;
+            if (!is_array($item)) return [];
+            $item = ap_notification_projection_item($item);
+            if ($item === null) return [];
+            $items[] = $item;
+        }
+        foreach ($items as $item) {
             $type = (string) ($item['type'] ?? '');
             if ($type === '' || !in_array($type, $want, true) || in_array($type, $exclude, true)) continue;
             $acct = is_array($item['account'] ?? null) ? $item['account'] : [];
@@ -5780,7 +5815,7 @@ function ap_masto_notifications_list_redis_key(
     array $want,
     array $exclude = []
 ): string {
-    return 'vaak:notifications:v1:' . $ownerUserId . ':' . hash('sha256', json_encode([
+    return 'vaak:notifications:v2:' . $ownerUserId . ':' . hash('sha256', json_encode([
         // Include exclusions so an Ice Cubes request using exclude_types cannot
         // reuse a cache entry built for a different notification filter.
         'limit' => $limit, 'max' => $maxId, 'since' => $sinceId, 'types' => $want, 'exclude' => $exclude,
@@ -9793,7 +9828,7 @@ function ap_masto_search_accounts(string $q, bool $resolve, int $limit): array
     $out = [];
     $remoteRefs = [];
 
-    $addActor = static function (string $actorId) use (&$seen, &$out, &$remoteRefs, $limit): void {
+    $addActor = static function (string $actorId, ?array $sourceWitness = null) use (&$seen, &$out, &$remoteRefs, $limit): void {
         $actorId = rtrim(trim($actorId), '/');
         if ($actorId === '' || isset($seen['u:' . $actorId]) || count($out) >= $limit) {
             return;
@@ -9803,6 +9838,7 @@ function ap_masto_search_accounts(string $q, bool $resolve, int $limit): array
         }
         // Never return non-https or javascript: etc. — already gated above
         $seen['u:' . $actorId] = true;
+        if (!empty($GLOBALS['vaak_search_collect_account_sources']) && is_array($sourceWitness)) $GLOBALS['vaak_search_selected_actor_witnesses'][$actorId] ??= $sourceWitness;
         if (preg_match('#^https://mkultra\.monster/users/([A-Za-z0-9_]+)$#', rtrim($actorId, '/'), $lm)) {
             try {
                 $st = ap_db()->prepare(
@@ -9864,6 +9900,10 @@ function ap_masto_search_accounts(string $q, bool $resolve, int $limit): array
             }
             if ($aid !== '') {
                 $seen['id:' . $aid] = true;
+            }
+            if (!empty($GLOBALS['vaak_search_collect_account_sources'])) {
+                $hash=hash('sha256',json_encode($acct,JSON_THROW_ON_ERROR));
+                $GLOBALS['vaak_search_account_witnesses'][$hash] ??= ['provider'=>$actorId,'source'=>$GLOBALS['vaak_search_selected_actor_witnesses'][$actorId] ?? null];
             }
             $out[] = $acct;
         }
@@ -10060,35 +10100,41 @@ function ap_masto_search_accounts(string $q, bool $resolve, int $limit): array
         }
         try {
             $st = ap_db()->prepare(
-                "SELECT actor_id FROM following WHERE lower(COALESCE(host,'')) = ? LIMIT ?"
+                "SELECT actor_id,owner_actor_id FROM following WHERE lower(COALESCE(host,'')) = ? LIMIT ?"
             );
             $st->execute([$hostExact, $limit * 2]);
             foreach ($st->fetchAll() as $row) {
-                $addActor((string) ($row['actor_id'] ?? ''));
+                $addActor((string) ($row['actor_id'] ?? ''), ['table'=>'following','owner_actor_id'=>(string)($row['owner_actor_id'] ?? ''),'actor_id'=>(string)($row['actor_id'] ?? '')]);
             }
         } catch (Throwable $e) {
             // ignore
         }
         try {
             $st = ap_db()->prepare(
-                "SELECT actor_id FROM followers WHERE lower(COALESCE(host,'')) = ? LIMIT ?"
+                "SELECT actor_id,owner_actor_id FROM followers WHERE lower(COALESCE(host,'')) = ? LIMIT ?"
             );
             $st->execute([$hostExact, $limit * 2]);
             foreach ($st->fetchAll() as $row) {
-                $addActor((string) ($row['actor_id'] ?? ''));
+                $addActor((string) ($row['actor_id'] ?? ''), ['table'=>'followers','owner_actor_id'=>(string)($row['owner_actor_id'] ?? ''),'actor_id'=>(string)($row['actor_id'] ?? '')]);
             }
         } catch (Throwable $e) {
             // ignore
         }
         try {
             $st = ap_db()->prepare(
-                "SELECT DISTINCT actor_id FROM events
+                "SELECT actor_id FROM events
                  WHERE actor_id IS NOT NULL AND lower(COALESCE(host,'')) = ?
-                 ORDER BY id DESC LIMIT ?"
+                 GROUP BY actor_id ORDER BY MAX(id) DESC LIMIT ?"
             );
             $st->execute([$hostExact, $limit * 3]);
             foreach ($st->fetchAll() as $row) {
-                $addActor((string) ($row['actor_id'] ?? ''));
+                $sourceWitness=null;
+            if (!empty($GLOBALS['vaak_search_collect_account_sources']) && !isset($seen['u:' . rtrim((string)($row['actor_id'] ?? ''),'/')])) {
+                $w=ap_db()->prepare("SELECT id FROM events WHERE actor_id=? AND lower(COALESCE(host,''))=? ORDER BY id DESC LIMIT 1");
+                $w->execute([(string)($row['actor_id'] ?? ''),$hostExact]);$id=$w->fetchColumn();
+                if ($id!==false) $sourceWitness=['table'=>'events','id'=>(string)$id,'actor_id'=>(string)($row['actor_id'] ?? ''),'host'=>$hostExact];
+            }
+            $addActor((string) ($row['actor_id'] ?? ''),$sourceWitness);
             }
         } catch (Throwable $e) {
             // ignore
@@ -10126,7 +10172,7 @@ function ap_masto_search_accounts(string $q, bool $resolve, int $limit): array
     // followers has username; following is actor_id + host only
     try {
         $st = ap_db()->prepare(
-            "SELECT actor_id FROM followers
+            "SELECT actor_id,owner_actor_id FROM followers
              WHERE lower(COALESCE(username,'')) LIKE ? $escapeSql
                 OR lower(COALESCE(host,'')) LIKE ? $escapeSql
                 OR lower(actor_id) LIKE ? $escapeSql
@@ -10134,21 +10180,21 @@ function ap_masto_search_accounts(string $q, bool $resolve, int $limit): array
         );
         $st->execute([$like, $like, $like, $limit * 2]);
         foreach ($st->fetchAll() as $row) {
-            $addActor((string) ($row['actor_id'] ?? ''));
+            $addActor((string) ($row['actor_id'] ?? ''), ['table'=>'followers','owner_actor_id'=>(string)($row['owner_actor_id'] ?? ''),'actor_id'=>(string)($row['actor_id'] ?? '')]);
         }
     } catch (Throwable $e) {
         // ignore
     }
     try {
         $st = ap_db()->prepare(
-            "SELECT actor_id FROM following
+            "SELECT actor_id,owner_actor_id FROM following
              WHERE lower(COALESCE(host,'')) LIKE ? $escapeSql
                 OR lower(actor_id) LIKE ? $escapeSql
              LIMIT ?"
         );
         $st->execute([$like, $like, $limit * 2]);
         foreach ($st->fetchAll() as $row) {
-            $addActor((string) ($row['actor_id'] ?? ''));
+            $addActor((string) ($row['actor_id'] ?? ''), ['table'=>'following','owner_actor_id'=>(string)($row['owner_actor_id'] ?? ''),'actor_id'=>(string)($row['actor_id'] ?? '')]);
         }
     } catch (Throwable $e) {
         // ignore
@@ -10157,14 +10203,20 @@ function ap_masto_search_accounts(string $q, bool $resolve, int $limit): array
     // Actors seen in mentions / events
     try {
         $st = ap_db()->prepare(
-            "SELECT DISTINCT actor_id FROM mentions
+            "SELECT actor_id FROM mentions
              WHERE deleted_at IS NULL AND actor_id IS NOT NULL
                AND (lower(actor_id) LIKE ? $escapeSql OR lower(COALESCE(content,'')) LIKE ? $escapeSql)
-             ORDER BY id DESC LIMIT ?"
+             GROUP BY actor_id ORDER BY MAX(id) DESC LIMIT ?"
         );
         $st->execute([$like, $like, $limit * 2]);
         foreach ($st->fetchAll() as $row) {
-            $addActor((string) ($row['actor_id'] ?? ''));
+            $sourceWitness=null;
+            if (!empty($GLOBALS['vaak_search_collect_account_sources']) && !isset($seen['u:' . rtrim((string)($row['actor_id'] ?? ''),'/')])) {
+                $w=ap_db()->prepare("SELECT id FROM mentions WHERE actor_id=? AND deleted_at IS NULL AND (lower(actor_id) LIKE ? $escapeSql OR lower(COALESCE(content,'')) LIKE ? $escapeSql) ORDER BY id DESC LIMIT 1");
+                $w->execute([(string)($row['actor_id'] ?? ''),$like,$like]);$id=$w->fetchColumn();
+                if ($id!==false) $sourceWitness=['table'=>'mentions','id'=>(string)$id,'actor_id'=>(string)($row['actor_id'] ?? '')];
+            }
+            $addActor((string) ($row['actor_id'] ?? ''),$sourceWitness);
         }
     } catch (Throwable $e) {
         // ignore

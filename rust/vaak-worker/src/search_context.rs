@@ -41,7 +41,8 @@ fn actor_hidden(actor:&str,identity:&SearchIdentity,hidden:&HiddenSets)->bool {
  let refs=actor_refs(actor);if identity.is_self(&refs,""){return false}
  refs.iter().any(|actor|hidden.is_hidden(actor))
 }
-fn account_hidden(account:&Value,identity:&SearchIdentity,hidden:&HiddenSets)->bool {
+fn account_hidden(account:&Value,identity:&SearchIdentity,hidden:&HiddenSets)->bool {account_hidden_with_sources(account,identity,hidden,&[])}
+fn account_hidden_with_sources(account:&Value,identity:&SearchIdentity,hidden:&HiddenSets,sources:&[String])->bool {
  let mut refs=Vec::new();for field in ["uri","url","id"]{refs.extend(actor_refs(text(account,field)))}
  let acct=trim(text(account,"acct")).trim_start_matches('@');
  let mut host=String::new();
@@ -51,6 +52,7 @@ fn account_hidden(account:&Value,identity:&SearchIdentity,hidden:&HiddenSets)->b
   if matches!(host.as_str(),"vaak.monster"|"www.vaak.monster"){refs.push(format!("https://mkultra.monster/users/{username}"));host="mkultra.monster".into();}
  }
  if identity.is_self(&refs,acct){return false}
+ refs.extend(sources.iter().flat_map(|source|actor_refs(source)));
  refs.iter().any(|actor|actor_hidden(actor,identity,hidden))||(!host.is_empty()&&hidden.is_hidden(&format!("https://{host}")))
 }
 fn status_hidden(status:&Value,identity:&SearchIdentity,hidden:&HiddenSets)->bool {
@@ -63,8 +65,10 @@ fn status_hidden(status:&Value,identity:&SearchIdentity,hidden:&HiddenSets)->boo
 }
 
 /// Server session bridge only; no HTTP deserializer or browser capabilities.
-pub(crate) struct SearchSession {bridge_identity:Option<(String,String)>,owner:i64,csrf:String,bsky_enabled:bool,bsky_did:String,bookmarks:std::collections::HashMap<String,bool>,warm:Option<std::sync::Arc<crate::profile_enrichment::WarmContext>>,collector:Option<std::sync::Arc<selection::SearchWindowGrant>>}
+pub(crate) struct SearchSession {#[cfg(test)] fixture_clock:Option<chrono::DateTime<chrono::Utc>>,bridge_identity:Option<(String,String)>,owner:i64,csrf:String,bsky_enabled:bool,bsky_did:String,bookmarks:std::collections::HashMap<String,bool>,warm:Option<std::sync::Arc<crate::profile_enrichment::WarmContext>>,collector:Option<std::sync::Arc<selection::SearchWindowGrant>>,components:Option<std::sync::Arc<crate::search_components::admission::ComponentsGrant>>}
 impl SearchSession {
+ #[cfg(test)] pub(crate) fn with_fixture_clock(mut self,clock:Option<chrono::DateTime<chrono::Utc>>)->Self{self.fixture_clock=clock;self}
+ pub(crate) fn with_components(mut self,components:Option<std::sync::Arc<crate::search_components::admission::ComponentsGrant>>)->Self{self.components=components;self}
  pub(crate) fn with_bridge_identity(mut self,actor:String,key:String)->Self{self.bridge_identity=Some((actor,key));self}
  pub(crate) fn owner_id(&self)->i64{self.owner}
  pub(crate) fn bsky_did(&self)->&str{&self.bsky_did}
@@ -78,7 +82,7 @@ impl SearchSession {
  pub(crate) fn with_warm_context(mut self,warm:Option<std::sync::Arc<crate::profile_enrichment::WarmContext>>)->Self{self.warm=warm;self}
  pub(crate) fn from_php_session(owner:i64,csrf:String,bsky_enabled:bool)->Result<Self>{
   if owner<1||csrf.is_empty(){bail!("invalid canonical Search session")}
-  Ok(Self{bridge_identity:None,owner,csrf,bsky_enabled,bsky_did:String::new(),bookmarks:Default::default(),warm:None,collector:None})
+  Ok(Self{#[cfg(test)] fixture_clock:None,bridge_identity:None,owner,csrf,bsky_enabled,bsky_did:String::new(),bookmarks:Default::default(),warm:None,collector:None,components:None})
  }
  pub(crate) async fn with_native_bookmarks(mut self,db:&Client,states:Vec<(String,String,bool)>)->Result<Self>{
   if states.len()>121{bail!("Search provenance exceeds canonical window")}
@@ -155,12 +159,42 @@ pub(crate) async fn selected_current_allowed(db:&Client,owner:i64,actor:&str,key
  Ok(selected_current_mask(db,owner,actor,key,std::slice::from_ref(status)).await?.first()==Some(&true))
 }
 pub(crate) async fn selected_current_mask(db:&Client,owner:i64,actor:&str,key:&str,statuses:&[Value])->Result<Vec<bool>> {
+ #[cfg(test)] let _timing=selection::fixture_performance::span("selected_policy_mask",statuses.len());
  let mut identity=SearchIdentity{refs:crate::hidden::actor_aliases(actor).iter().map(|value|value.to_ascii_lowercase()).collect()};
  for value in [format!("acct:{}",key.to_ascii_lowercase()),format!("acct:{}@mkultra.monster",key.to_ascii_lowercase()),format!("acct:{}@vaak.monster",key.to_ascii_lowercase()),format!("https://mkultra.monster/users/{}",key.to_ascii_lowercase()),format!("https://vaak.monster/users/{}",key.to_ascii_lowercase()),format!("https://www.vaak.monster/users/{}",key.to_ascii_lowercase())]{identity.refs.insert(value);}
- let mut hidden=crate::hidden::load_hidden_sets(db,owner).await?;hidden.muted_phrases.clear();
+ let mut hidden=crate::hidden::load_search_hidden_sets(db,owner).await?;hidden.muted_phrases.clear();
  let sources=selection::CurrentSourceRows::load(db,statuses).await?;
  let audience=crate::audience::admission_mask(db,owner,crate::audience::Surface::Search,statuses).await?;
  Ok(statuses.iter().zip(audience).map(|(status,allowed)|allowed&&sources.tree_allowed(status,owner,&identity,&hidden,0)).collect())
+}
+
+/// Fresh actor policy for actual account collector rows. Account discovery does
+/// not apply the status/tag indexing predicate or word-mute predicate in PHP.
+pub(crate) async fn require_component_accounts(db:&Client,owner:i64,actor:&str,key:&str,accounts:&[Value],source_refs:&[Vec<String>])->Result<()> {
+ if accounts.len()!=source_refs.len(){bail!("Search account policy source count differs")}
+ let mut identity=SearchIdentity{refs:crate::hidden::actor_aliases(actor).iter().map(|v|v.to_ascii_lowercase()).collect()};
+ for value in [format!("acct:{}",key.to_ascii_lowercase()),format!("acct:{}@mkultra.monster",key.to_ascii_lowercase()),format!("acct:{}@vaak.monster",key.to_ascii_lowercase())]{identity.refs.insert(value);}
+ let mut hidden=crate::hidden::load_search_hidden_sets(db,owner).await?;hidden.muted_phrases.clear();
+ if accounts.iter().zip(source_refs).any(|(account,sources)|account_hidden_with_sources(account,&identity,&hidden,sources)){bail!("Search account policy changed")}
+ Ok(())
+}
+
+/// Actual hashtag corpus: outbox rows use indexing/actor/audience policy but
+/// do not require the separate masto_statuses projection. Event/mention rows
+/// use the complete ordinary Search status current-source predicate.
+pub(crate) async fn current_tag_contributions(db:&Client,owner:i64,actor:&str,key:&str,rows:&[(bool,Value)])->Result<Vec<bool>> {
+ let statuses:Vec<Value>=rows.iter().map(|(_,status)|status.clone()).collect();
+ let ordinary=selected_current_mask(db,owner,actor,key,&statuses).await?;
+ let mut identity=SearchIdentity{refs:crate::hidden::actor_aliases(actor).iter().map(|v|v.to_ascii_lowercase()).collect()};
+ for value in [format!("acct:{}",key.to_ascii_lowercase()),format!("acct:{}@mkultra.monster",key.to_ascii_lowercase()),format!("acct:{}@vaak.monster",key.to_ascii_lowercase())]{identity.refs.insert(value);}
+ let mut hidden=crate::hidden::load_search_hidden_sets(db,owner).await?;hidden.muted_phrases.clear();
+ let sources=selection::CurrentSourceRows::load(db,&statuses).await?;
+ let audience=crate::audience::admission_mask(db,owner,crate::audience::Surface::Search,&statuses).await?;
+ Ok(rows.iter().enumerate().map(|(i,(outbox,status))|if *outbox {
+   let author=canonical_actor(text(&status["account"],"uri"));
+   let indexed=sources.indexability.get(&author).is_none_or(|(id,index)|*id==owner||*index!=0);
+   indexed && !status_hidden(status,&identity,&hidden) && audience[i]
+ }else{ordinary[i]}).collect())
 }
 
 /// Input is canonical server-normalized Search source. Thin/unknown source IO
@@ -180,8 +214,11 @@ async fn admit_for_render_impl(db:&Client,session:&SearchSession,statuses:Vec<Va
  let actor:String=row.try_get(0)?;let key:String=row.try_get(1)?;
  let mut identity=SearchIdentity{refs:crate::hidden::actor_aliases(&actor).iter().map(|value|value.to_ascii_lowercase()).collect()};
  for value in [format!("acct:{}",key.to_ascii_lowercase()),format!("acct:{}@mkultra.monster",key.to_ascii_lowercase()),format!("acct:{}@vaak.monster",key.to_ascii_lowercase()),format!("https://mkultra.monster/users/{}",key.to_ascii_lowercase()),format!("https://vaak.monster/users/{}",key.to_ascii_lowercase()),format!("https://www.vaak.monster/users/{}",key.to_ascii_lowercase())]{identity.refs.insert(value);}
- let mut hidden=crate::hidden::load_hidden_sets(db,session.owner).await?;hidden.muted_phrases.clear();
+ let mut hidden=crate::hidden::load_search_hidden_sets(db,session.owner).await?;hidden.muted_phrases.clear();
  let profile=db.query_opt("SELECT to_jsonb(p) FROM actor_profile p WHERE actor_key=$1 LIMIT 1",&[&key]).await?.map(|row|row.get::<_,Value>(0)).unwrap_or(Value::Null);
+ let standalone_scope=if session.collector().is_none(){Some(selection::final_facts::Scope::new(session.owner,&key,&actor,&statuses,&[],&[],false))}else{None};
+ let standalone_snapshot=if let Some(scope)=&standalone_scope{Some(scope.read(db).await?)}else{None};
+ if session.collector().is_some_and(|collector|collector.viewer_profile()!=&profile){bail!("Search viewer Settings changed before assembly")}
  let auto_unblur=crate::library::card::boolean(&profile,"auto_unblur_sensitive");
  let mut output=Vec::new();let mut source_grants=Vec::new();
  for (source_index,mut status) in statuses.into_iter().enumerate(){
@@ -204,10 +241,13 @@ async fn admit_for_render_impl(db:&Client,session:&SearchSession,statuses:Vec<Va
   if crate::audience::admission_mask(db,session.owner,crate::audience::Surface::Search,std::slice::from_ref(&status)).await?.first()!=Some(&true){continue}
   crate::interaction_flags::apply_to_statuses(db,session.owner,std::slice::from_mut(&mut status)).await?;
   let source_grant=if session.warm.is_some(){Some(std::sync::Arc::new(crate::library::context::SelectedLibrarySearchSource::search(db,session,status.clone(),source_index).await?))}else{None};
+  #[cfg(test)] selection::final_facts::boundary_fixture::at(db,"before_status_card_facts").await?;
   let mut facts=if let (Some(warm),Some(selected))=(&session.warm,&source_grant){
    let bound=crate::library::facts::BoundPresentationSession{session,warm:warm.bound(selected.clone())};
    crate::library::facts::resolve(db,session.owner,&actor,&status,&bound,auto_unblur).await?
   }else{crate::library::facts::resolve(db,session.owner,&actor,&status,session,auto_unblur).await?};
+  #[cfg(test)] selection::final_facts::boundary_fixture::at(db,"after_status_card_facts").await?;
+  #[cfg(test)] if let Some(clock)=session.fixture_clock{facts.now=clock;}
   if let Some(sid)=crate::library::context::incoming_ap_boost_sid(&status){facts.boosted=crate::library::context::exact_incoming_boost(db,session.owner,&sid).await?;}
   if facts.rss_quote_row.is_some(){bail!("PHP fallback: fresh RSS quote needs complete Search source binding")}
   let inner=status.get("reblog").is_some_and(Value::is_object)&&text(&status,"content").is_empty();
@@ -225,7 +265,19 @@ async fn admit_for_render_impl(db:&Client,session:&SearchSession,statuses:Vec<Va
   let mut checked=vec![status];crate::audience::filter_statuses(db,session.owner,crate::audience::Surface::Search,&mut checked).await?;
   if let Some(status)=checked.pop(){let current=db.query_opt("SELECT actor_id,actor_key FROM ap_users WHERE id=$1::bigint AND disabled_at IS NULL",&[&session.owner]).await?.context("Search owner changed during assembly")?;if current.get::<_,String>(0)!=actor||current.get::<_,String>(1)!=key{bail!("Search identity changed during assembly")}let root_preview=if let Some((_,dns))=preview {
     crate::library::context::require_ap_preview_protocol(&status,0)?;
-     let card=if let Some(grant)=&source_grant{crate::library::preview::resolve_cached_current(db,dns,&status,original_content.as_deref(),&facts,&mut budget,grant.as_ref()).await?}else{crate::direct_preview::resolve(db,dns,&status,original_content.as_deref(),&facts,&mut budget).await?};
+     let card=if let Some(grant)=&source_grant{
+      if let Some(fetch)=session.warm.as_ref().and_then(|warm|warm.preview_context()){
+       struct PreviewGrant<'a>{db:&'a Client,source:&'a crate::library::context::SelectedLibrarySearchSource}
+       impl crate::profile_quote_warm::CurrentQuoteGrant for PreviewGrant<'_>{
+        fn require_current(&self)->std::pin::Pin<Box<dyn std::future::Future<Output=Result<()>>+Send+'_>>{Box::pin(async move{self.source.require_current(self.db).await})}
+        fn bind_preview_text<'a>(&'a self,text:&'a str)->std::pin::Pin<Box<dyn std::future::Future<Output=Result<()>>+Send+'a>>{Box::pin(async move{self.source.bind_search_preview_text(self.db,text).await})}
+        fn bind_preview_write_url<'a>(&'a self,url:&'a str)->std::pin::Pin<Box<dyn std::future::Future<Output=Result<()>>+Send+'a>>{Box::pin(async move{self.source.bind_search_preview_write_url(self.db,url).await})}
+        #[cfg(test)] fn fixture_after_preview_write<'a>(&'a self,db:&'a Client,fetch:&'a crate::profile_preview_fetch::PreviewFetchContext,now:chrono::DateTime<chrono::Utc>)->std::pin::Pin<Box<dyn std::future::Future<Output=Result<()>>+Send+'a>>{Box::pin(async move{if std::env::var("VAAK_SEARCH_PREVIEW_TERMINAL_CASE").as_deref()==Ok("outside_selected_receipt"){crate::profile_preview_fetch::fixture_reject_outside_receipt(db,fetch,now,self).await?;}Ok(())})}
+        fn accept_preview_write(&self,write:&crate::profile_preview_fetch::PreviewCacheWrite)->Result<()>{crate::profile_enrichment::CurrentEnrichmentGrant::accept_preview_write(self.source,write)}
+       }
+       crate::library::preview::resolve(db,dns,&status,original_content.as_deref(),&facts,&mut budget,fetch,&PreviewGrant{db,source:grant.as_ref()}).await?
+      }else{crate::library::preview::resolve_cached_current(db,dns,&status,original_content.as_deref(),&facts,&mut budget,grant.as_ref()).await?}
+     }else{crate::direct_preview::resolve(db,dns,&status,original_content.as_deref(),&facts,&mut budget).await?};
      if !current_tree(db,session.owner,&status,&identity,&hidden,0).await?{continue}
      let mut final_checked=vec![status.clone()];crate::audience::filter_statuses(db,session.owner,crate::audience::Surface::Search,&mut final_checked).await?;
      if final_checked.is_empty(){continue}
@@ -237,13 +289,26 @@ async fn admit_for_render_impl(db:&Client,session:&SearchSession,statuses:Vec<Va
  if final_owner.get::<_,String>(0)!=actor||final_owner.get::<_,String>(1)!=key{bail!("Search identity changed before publication")}
  if let Some((bridge_actor,bridge_key))=&session.bridge_identity{if &actor!=bridge_actor||&key!=bridge_key{bail!("Search bridge identity changed during assembly")}}
  if bsky_source{crate::library::context::require_bsky_did(db,session.owner,&session.bsky_did).await?;}
+ let current_profile=db.query_opt("SELECT to_jsonb(p) FROM actor_profile p WHERE actor_key=$1 LIMIT 1",&[&key]).await?.map(|row|row.get::<_,Value>(0)).unwrap_or(Value::Null);
+ if current_profile!=profile{bail!("Search viewer Settings changed before publication")}
  if let Some(collector)=session.collector(){
   // Owner and DID SQL awaits above precede this one fresh complete window.
   // All selected opaque sources then bind synchronously to the same capability;
   // no permission result is retained or reused across an enrichment await.
-  let final_window=collector.refresh_current(db).await?;
+  let final_window=collector.refresh_current_with_components(db,session.components.as_deref()).await?;
   for grant in source_grants{grant.require_fresh_search_window(&final_window,&session.bsky_did)?;}
- }else{for grant in source_grants{grant.require_current(db).await?;}}
+ }else{
+  if let Some(components)=&session.components{components.require_ordered_current(db).await?;}
+  #[cfg(test)] selection::final_facts::boundary_fixture::at(db,"after_components_before_status").await?;
+  for grant in source_grants{grant.require_current(db).await?;}
+  #[cfg(test)] selection::final_facts::boundary_fixture::at(db,"after_status_before_final_raw").await?;
+  let scope=standalone_scope.as_ref().context("missing Search final raw source scope")?;
+  let after=if let Some(components)=&session.components{
+   let (component_scope,before)=components.raw_binding();let (after,component_after)=scope.read_pair(db,component_scope).await?;
+   selection::final_facts::Scope::require_same(before,&component_after,None)?;after
+  }else{scope.read(db).await?};
+  selection::final_facts::Scope::require_same(standalone_snapshot.as_ref().context("missing Search raw source snapshot")?,&after,Some(&profile))?;
+ }
  Ok((output,budget))
 }
 

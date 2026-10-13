@@ -21,6 +21,7 @@ struct Batch {
     statuses:Vec<Value>,
     #[serde(default)] bsky_bookmarks:Vec<BookmarkState>,
     #[serde(default)] collector:Option<crate::search_context::selection::SearchCollectorDescriptor>,
+    #[serde(default)] component_collector:Option<crate::search_components::admission::ComponentCollectorDescriptor>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -68,17 +69,24 @@ async fn paint_with_warm(db:&tokio_postgres::Client,batch:Batch,deps:&crate::dir
     let actor:String=identity.try_get(0)?;let key:String=identity.try_get(1)?;
     let source_counts=SourceCounts{accounts:batch.accounts.len(),hashtags:batch.hashtags.len(),statuses:batch.statuses.len()};
     let states=batch.bsky_bookmarks.into_iter().map(|value|(value.uri,value.did,value.bookmarked)).collect();
-    let session=crate::search_context::SearchSession::from_php_session(batch.owner_id,batch.csrf,batch.bsky_enabled)?.with_bridge_identity(actor,key).with_native_bookmarks(db,states).await?.with_collector(db,batch.collector,&batch.statuses).await?.with_warm_context(warm);
+    let component_grant=if let Some(descriptor)=batch.component_collector.filter(|_|!batch.accounts.is_empty()||!batch.hashtags.is_empty()) {Some(std::sync::Arc::new(crate::search_components::admission::ComponentsGrant::load(db,batch.owner_id,actor.clone(),key.clone(),&batch.accounts,&batch.hashtags,descriptor).await?))}else{None};
+    let session=crate::search_context::SearchSession::from_php_session(batch.owner_id,batch.csrf,batch.bsky_enabled)?.with_bridge_identity(actor,key).with_components(component_grant.clone()).with_native_bookmarks(db,states).await?.with_collector(db,batch.collector,&batch.statuses).await?.with_warm_context(warm);
+    #[cfg(test)] let session=session.with_fixture_clock(deps.render_clock);
     // One bounded resolver per account section, including an empty section: it also
     // rechecks the current owner when no status card is present.
+    #[cfg(test)] crate::search_context::selection::final_facts::boundary_fixture::at(db,"after_component_expected_before_account_paint").await?;
     let components=crate::search_components::ComponentContext::load(db,Some(batch.owner_id),&batch.accounts).await?;
     let accounts=batch.accounts.iter().map(|account|components.resolve_account(account).map(|token|crate::search_render::render_account(&token))).collect::<anyhow::Result<Vec<_>>>()?;
     let hashtags=batch.hashtags.iter().map(|tag|components.resolve_tag(tag).map(|token|crate::search_render::render_tag(&token))).collect::<anyhow::Result<Vec<_>>>()?;
+    #[cfg(test)] crate::search_context::selection::final_facts::boundary_fixture::at(db,"after_account_paint_before_status_admission").await?;
     let (mut admitted,remaining)=crate::search_context::admit_for_render_with_preview(db,&session,batch.statuses,batch.status_preview_budget,deps.dns).await?;
     #[cfg(test)] if let Some(clock)=deps.render_clock{for token in &mut admitted{token.set_render_clock(clock);}}
+    // Synchronous after the final fresh window; never query or widen actions.
+    if let Some(collector)=session.collector(){for token in &admitted{collector.require_painted_owner_role(token.facts())?;}}
     let statuses=admitted.iter().map(|token|crate::library::card::render_search_admitted(token).map(|html|StatusCard{source_index:token.source_index(),html})).collect::<anyhow::Result<Vec<_>>>()?;
     // The session binds the original bridge identity into context final checks;
     // painting and serialization after its fresh complete window contain no await.
+    if let Some(grant)=&component_grant{grant.require_painted_accounts(&accounts)?;}
     Ok(Reply{protocol_version:1,status_preview_state:crate::direct_preview::PreviewState::from_remaining(batch.status_preview_budget,remaining,source_counts.statuses)?,ok:true,source_counts,accounts,hashtags,statuses})
 }
 
@@ -101,6 +109,7 @@ async fn render_request_with_warm_inner(database_url:&str,secret:Option<&str>,he
     let batch=match decode(&bytes){Ok(batch)=>batch,Err(_)=>return (StatusCode::BAD_REQUEST,axum::Json(json!({"fallback":true,"error":"invalid batch"}))).into_response()};
     if batch.bsky_budget_deadline.is_some_and(|value|!value.is_finite()){return StatusCode::BAD_REQUEST.into_response()}
     if cfg.is_some()&&!batch.statuses.is_empty()&&batch.collector.is_none(){return (StatusCode::UNPROCESSABLE_ENTITY,axum::Json(json!({"fallback":true}))).into_response()}
+    if cfg.is_some()&&(!batch.accounts.is_empty()||!batch.hashtags.is_empty())&&batch.component_collector.is_none(){return (StatusCode::UNPROCESSABLE_ENTITY,axum::Json(json!({"fallback":true}))).into_response()}
     let warm=warm.or_else(||cfg.map(|cfg|crate::library::bridge::native_warm(cfg,batch.bsky_budget_deadline)));
     let result: anyhow::Result<Vec<u8>>=async{
         let db=crate::db::connect(database_url).await?;

@@ -6,6 +6,8 @@ use std::collections::{HashMap, HashSet};
 use tokio_postgres::Client;
 #[path = "search_query.rs"]
 mod canonical_query;
+#[path = "search_component_admission.rs"]
+pub(crate) mod admission;
 
 pub(crate) struct ResolvedSearchAccount {
     account: Value,
@@ -38,6 +40,18 @@ fn syntactic(actor:&str)->HashSet<String> {
     crate::hidden::actor_aliases(actor).into_iter().map(|s|root(&s).to_owned()).collect()
 }
 
+// The raw profile witness retains raw DID keys and colon-only URL encoding.
+// Refuse native for a valid graph identity those representations cannot cover;
+// the existing PHP fallback preserves its original trimming/encoding behavior.
+fn native_bsky_graph_did(raw:&str)->Result<Option<&str>> {
+    let did=trim(raw);
+    if !did.starts_with("did:"){return Ok(None)}
+    if did!=raw || crate::library::actions::query(did)!=did.replace(':',"%3A") {
+        bail!("Search graph DID profile witness requires canonical PHP fallback")
+    }
+    Ok(Some(did))
+}
+
 fn pattern(value: &'static str, cache: &'static std::sync::OnceLock<regex::Regex>) -> &'static regex::Regex {
     cache.get_or_init(|| regex::Regex::new(value).expect("constant Search component regex"))
 }
@@ -58,14 +72,18 @@ pub(crate) struct ComponentContext {
     owner:Option<i64>, owner_actor:String, viewer:String,
     remote:HashMap<String,(String,String)>, following:HashSet<String>, relationship_actors:HashSet<String>,
     following_ids:HashSet<String>, mapped_ids:HashMap<String,String>,
-    local_ids:HashMap<String,String>,
+    local_ids:HashMap<String,String>, local_sources:HashMap<String,String>, canonical_sources:HashMap<String,(String,String,Vec<String>)>,
     emoji:HashMap<String,HashMap<String,String>>,
     allowed_accounts:HashSet<String>,
+    bsky_profile_dependency:bool,
+    bsky_graph_snapshot:Value,
 }
 impl ComponentContext {
     /// `accounts` are the complete current server source entities for this
     /// batch. Browser-supplied identity or relationship booleans are not inputs.
-    pub(crate) async fn load(db:&Client,owner:Option<i64>,accounts:&[Value])->Result<Self> {
+    pub(crate) async fn load(db:&Client,owner:Option<i64>,accounts:&[Value])->Result<Self> {Self::load_bound(db,owner,accounts,&[]).await}
+    async fn load_bound(db:&Client,owner:Option<i64>,accounts:&[Value],sources:&[String])->Result<Self> {
+        if !sources.is_empty()&&sources.len()!=accounts.len(){bail!("Search provider source count differs")}
         if accounts.len()>100 {bail!("Search component batch limit")}
         let (owner_actor,viewer)=if let Some(owner)=owner {
             let row=db.query_opt("SELECT actor_id,username,actor_key FROM ap_users WHERE id=$1::bigint AND disabled_at IS NULL",&[&owner]).await?.context("inactive Search component owner")?;
@@ -73,7 +91,10 @@ impl ComponentContext {
             let name=if trim(&username).is_empty()||trim(&username)=="guest" {trim(&key)}else{trim(&username)};
             (root(&actor).to_owned(),if name=="__guest__" {String::new()}else{name.into()})
         }else{(String::new(),String::new())};
-        let mut context=Self {owner,owner_actor,viewer,remote:HashMap::new(),following:HashSet::new(),relationship_actors:HashSet::new(),following_ids:HashSet::new(),mapped_ids:HashMap::new(),local_ids:HashMap::new(),emoji:HashMap::new(),allowed_accounts:HashSet::new()};
+        let mut context=Self {owner,owner_actor,viewer,remote:HashMap::new(),following:HashSet::new(),relationship_actors:HashSet::new(),following_ids:HashSet::new(),mapped_ids:HashMap::new(),local_ids:HashMap::new(),local_sources:HashMap::new(),canonical_sources:HashMap::new(),emoji:HashMap::new(),allowed_accounts:HashSet::new(),bsky_profile_dependency:false,bsky_graph_snapshot:serde_json::json!([])};
+        // Empty account sections need current owner identity, not an AP/Bsky
+        // relationship or emoji scan. Tags contain no account relationship.
+        if accounts.is_empty() { return Ok(context); }
         let mut actor_keys=HashSet::new();let mut numeric_ids=HashSet::new();let mut hosts=HashSet::new();
         for account in accounts {
             if !account.is_object(){bail!("malformed Search account")}
@@ -85,12 +106,18 @@ impl ComponentContext {
             }
             let id=text(account,"id");if !id.is_empty(){numeric_ids.insert(id.to_owned());}
         }
+        for source in sources {if source.len()>2048||source.is_empty(){bail!("invalid Search provider URI")}actor_keys.insert(root(source).into());actor_keys.insert(format!("{}/",root(source)));}
         let mut followed=Vec::new();let mut graph=Vec::new();
         if let Some(owner)=owner {
             for row in db.query("SELECT actor_id,host FROM following WHERE owner_actor_id=$1 OR owner_actor_id=$2",&[&context.owner_actor,&format!("{}/",context.owner_actor)]).await? {
                 let actor:String=row.try_get(0)?;actor_keys.insert(root(&actor).into());actor_keys.insert(format!("{}/",root(&actor)));followed.push((actor,row.try_get::<_,Option<String>>(1)?));
             }
-            for row in db.query("SELECT target_did FROM bsky_graph_sync WHERE owner_user_id=$1::bigint AND kind='follow'",&[&owner]).await? {let did:String=row.try_get(0)?;if trim(&did).starts_with("did:"){graph.push(trim(&did).to_owned());}}
+            let mut graph_rows=Vec::new();
+            for row in db.query("SELECT to_jsonb(g) FROM bsky_graph_sync g WHERE owner_user_id=$1::bigint AND kind='follow' ORDER BY to_jsonb(g)::text",&[&owner]).await? {
+                let value:Value=row.try_get(0)?;let did=value["target_did"].as_str().context("Search follow graph DID must be text")?;
+                if let Some(did)=native_bsky_graph_did(did)?{graph.push(did.to_owned());}graph_rows.push(value);
+            }
+            context.bsky_graph_snapshot=Value::Array(graph_rows);
 
         }
         let ids:Vec<String>=numeric_ids.into_iter().collect();
@@ -98,19 +125,25 @@ impl ComponentContext {
             let id:String=row.try_get(0)?;let actor:String=row.try_get(1)?;actor_keys.insert(root(&actor).into());actor_keys.insert(format!("{}/",root(&actor)));context.mapped_ids.insert(id,actor);
         }
         let numeric:Vec<i64>=ids.iter().filter_map(|id|id.parse().ok()).collect();
-        for row in db.query("SELECT id::bigint,actor_id,actor_key FROM ap_users WHERE disabled_at IS NULL AND (id=ANY($1::bigint[]) OR ($2 AND actor_key='cmdr_nova'))",&[&numeric,&ids.iter().any(|id|id=="1")]).await? {
-            let id:i64=row.try_get(0)?;let actor:String=row.try_get(1)?;let key:String=row.try_get(2)?;if id!=1{context.local_ids.insert(id.to_string(),actor.clone());}if key=="cmdr_nova"{context.local_ids.insert("1".into(),actor);}
+        let source_actors:Vec<String>=actor_keys.iter().map(|actor|root(actor).to_owned()).collect();
+        for row in db.query("SELECT id::bigint,actor_id,actor_key FROM ap_users WHERE disabled_at IS NULL AND (id=ANY($1::bigint[]) OR ($2 AND actor_key='cmdr_nova') OR rtrim(actor_id,'/')=ANY($3::text[]))",&[&numeric,&ids.iter().any(|id|id=="1"),&source_actors]).await? {
+            let id:i64=row.try_get(0)?;let actor:String=row.try_get(1)?;let key:String=row.try_get(2)?;context.local_sources.insert(root(&actor).into(),if key=="cmdr_nova"{"1".into()}else{id.to_string()});if id!=1{context.local_ids.insert(id.to_string(),actor.clone());}if key=="cmdr_nova"{context.local_ids.insert("1".into(),actor);}
         }
         let actors:Vec<String>=actor_keys.into_iter().collect();
         for row in db.query("SELECT actor_id,username,host FROM remote_actors WHERE actor_id=ANY($1)",&[&actors]).await? {let actor:String=row.try_get(0)?;let user:Option<String>=row.try_get(1)?;let host:Option<String>=row.try_get(2)?;context.remote.insert(root(&actor).into(),(user.unwrap_or_default(),host.unwrap_or_default()));}
         for (actor,host) in followed {context.relationship_actors.insert(root(&actor).into());context.following.extend(context.following_aliases(&actor,host.as_deref()));context.following_ids.insert(context.remote_id(&actor));}
         let profile_keys:Vec<String>=graph.iter().flat_map(|did|[did.clone(),format!("https://bsky.app/profile/{did}"),format!("https://bsky.app/profile/{}",crate::library::actions::query(did))]).collect();
         let mut profiles:HashMap<String,(u8,String)>=HashMap::new();
+        // The canonical component reader needs profiles only for actual followed
+        // DIDs. Empty parameter arrays still resolve tables in PostgreSQL.
+        context.bsky_profile_dependency=!(graph.is_empty()&&profile_keys.is_empty());
+        if context.bsky_profile_dependency {
         for row in db.query("SELECT actor_ref,did,profile_json FROM bsky_actor_profiles WHERE actor_ref=ANY($1) OR did=ANY($2) ORDER BY updated_at DESC",&[&profile_keys,&graph]).await? {
             let actor:String=row.try_get(0)?;let did:String=row.try_get(1)?;let json:String=row.try_get(2)?;
             let priority=if actor==did {0}else if actor==format!("https://bsky.app/profile/{did}"){1}else if actor==format!("https://bsky.app/profile/{}",crate::library::actions::query(&did)){2}else{3};
             if profiles.get(&did).is_none_or(|(previous,_)|priority<*previous){profiles.insert(did,(priority,json));}
 
+        }
         }
         for did in graph {
             context.following.extend(syntactic(&did));context.relationship_actors.insert(format!("https://bsky.app/profile/{did}"));context.relationship_actors.insert(format!("https://bsky.app/profile/{}",crate::library::actions::query(&did)));
@@ -118,7 +151,56 @@ impl ComponentContext {
         }
         let hosts:Vec<String>=hosts.into_iter().collect();
         for row in db.query("SELECT host,shortcode,url FROM remote_custom_emojis WHERE host=ANY($1)",&[&hosts]).await? {let host:String=row.try_get(0)?;let code:String=row.try_get(1)?;let url:String=row.try_get(2)?;if url.starts_with("https://"){context.emoji.entry(host).or_default().insert(code,url);}}
+        for source in sources {
+            if local_key(source).is_none() && context.remote.contains_key(root(source)) {
+                let family=context.canonical_alias_family(db,source).await?;let canonical=family.first().context("empty Search canonical family")?.clone();
+                let id=context.remote_id(source);
+                context.canonical_sources.insert(root(source).into(),(canonical,id,family));
+            }
+        }
         Ok(context)
+    }
+    pub(super) fn bsky_profile_dependency(&self)->bool {self.bsky_profile_dependency}
+    pub(super) fn bsky_graph_snapshot(&self)->&Value {&self.bsky_graph_snapshot}
+    pub(super) fn raw_alias_queries(&self,providers:&[String])->Value{
+        let mut queries=Vec::new();
+        for provider in providers{
+            if self.local_sources.contains_key(root(provider)){continue}
+            let Some((_,_,family))=self.canonical_sources.get(root(provider))else{continue};
+            let Ok(url)=reqwest::Url::parse(provider)else{continue};let mut host=url.host_str().unwrap_or("").to_ascii_lowercase();let mut user=String::new();
+            if let Some((u,h))=self.remote.get(root(provider)){user=trim(u).into();if !trim(h).is_empty(){host=trim(h).to_ascii_lowercase();}}
+            if user.is_empty(){static PATH:std::sync::OnceLock<regex::Regex>=std::sync::OnceLock::new();if let Some(c)=pattern(r"(?i)/(?:users|ap/users|@)([^/]+)/?$",&PATH).captures(root(provider)){let path=crate::hidden::raw_percent_decode(&c[1]).trim_start_matches('@').to_owned();if !path.bytes().all(|b|b.is_ascii_digit()){user=path;}}}
+            if !user.is_empty(){queries.push(serde_json::json!({"host":host,"username":canonical_query::lowercase(&user),"family":family}));}
+        }
+        Value::Array(queries)
+    }
+    async fn canonical_alias_family(&self,db:&Client,provider:&str)->Result<Vec<String>> {
+        let provider=root(provider);if !provider.starts_with("https://"){return Ok(vec![provider.into()])}
+        let url=reqwest::Url::parse(provider)?;let mut host=url.host_str().unwrap_or("").to_ascii_lowercase();
+        let mut user=String::new();
+        if let Some((u,h))=self.remote.get(provider){user=trim(u).into();if !trim(h).is_empty(){host=trim(h).to_ascii_lowercase();}}
+        if user.is_empty(){static PATH:std::sync::OnceLock<regex::Regex>=std::sync::OnceLock::new();if let Some(c)=pattern(r"(?i)/(?:users|ap/users|@)([^/]+)/?$",&PATH).captures(provider){let path=crate::hidden::raw_percent_decode(&c[1]).trim_start_matches('@').to_owned();if !path.bytes().all(|b|b.is_ascii_digit()){user=path;}}}
+        let mut candidates=vec![provider.to_owned()];
+        if !user.is_empty(){
+            candidates.push(format!("https://{host}/users/{}",crate::library::actions::query(&user)));candidates.push(format!("https://{host}/@{}",crate::library::actions::query(&user)));
+            let folded=canonical_query::lowercase(&user);
+            let aliases=db.query("SELECT actor_id FROM remote_actors WHERE lower(COALESCE(host,''))=$1 AND lower(COALESCE(username,''))=$2 LIMIT 129",&[&host,&folded]).await?;
+            if aliases.len()>128{bail!("Search canonical cached alias bound")}
+            candidates.extend(aliases.into_iter().map(|r|r.get::<_,String>(0)));
+            let follows=db.query("SELECT actor_id FROM following WHERE lower(COALESCE(host,''))=$1 LIMIT 1025",&[&host]).await?;
+            if follows.len()>1024{bail!("Search canonical host follow bound")}
+            static PATH:std::sync::OnceLock<regex::Regex>=std::sync::OnceLock::new();
+            for row in follows{let actor:String=row.try_get(0)?;if let Some(c)=pattern(r"(?i)/(?:users|@)([^/]+)/?$",&PATH).captures(root(&actor)){if canonical_query::lowercase(&crate::hidden::raw_percent_decode(&c[1]))==folded{candidates.push(actor);}}}
+        }
+        let mut seen=HashSet::new();candidates.retain_mut(|candidate|{*candidate=root(candidate).to_owned();candidate.starts_with("https://")&&seen.insert(candidate.clone())});
+        if candidates.len()>256{bail!("Search canonical actor family bound")}
+        if candidates.len()==1{return Ok(candidates)}
+        let variants:Vec<String>=candidates.iter().flat_map(|c|[c.clone(),format!("{c}/")]).collect();
+        let rows=db.query("SELECT rtrim(actor_id,'/'),COUNT(*)::bigint FROM events WHERE type='Create' AND actor_id=ANY($1::text[]) GROUP BY rtrim(actor_id,'/')",&[&variants]).await?;
+        let mut counts=HashMap::new();for row in rows{counts.insert(row.get::<_,String>(0),row.get::<_,i64>(1));}
+        // PHP arsort preserves insertion order for equal Create counts.
+        candidates.sort_by(|a,b|counts.get(b).copied().unwrap_or(0).cmp(&counts.get(a).copied().unwrap_or(0)));
+        Ok(candidates)
     }
     fn following_aliases(&self,actor:&str,row_host:Option<&str>)->HashSet<String> {
         let mut out=syntactic(actor);out.insert(root(actor).into());
@@ -169,6 +251,30 @@ impl ComponentContext {
         }
         Ok(false)
     }
+    fn require_source(&self,input:&Value,provider:&str)->Result<()> {
+        // Bind the exact target the PHP/native painter uses. A different backed
+        // web URL cannot grant an unbacked nonempty URI.
+        let uri=text(input,"uri").trim_end_matches('/');
+        let target=if uri.is_empty(){text(input,"url").trim_end_matches('/')}else{uri};
+        let id=text(input,"id");
+        if local_key(target).is_some() {
+            // Local source authority is an enabled user, even when a remote
+            // cache row also exists for this actor.
+            if root(provider)!=target {bail!("Search local selected provider differs")}
+            let expected=self.local_sources.get(target).context("Search local user source withdrawn")?;
+            if id!=expected {bail!("Search local account ID differs from current source")}
+        }else{
+            let (canonical,expected,_)=self.canonical_sources.get(root(provider)).context("Search raw provider source withdrawn or cold")?;
+            if canonical!=target||expected!=id{bail!("Search remote selected target/ID differs from current provider") }
+            if let Some(mapped)=self.mapped_ids.get(id){
+                if root(mapped)!=target {bail!("Search remote canonical mapping differs from selected source")}
+            }else{bail!("Search remote current producer mapping missing")}
+        }
+        Ok(())
+    }
+    fn source_policy_refs(&self,provider:&str)->Vec<String> {
+        if let Some((_,_,family))=self.canonical_sources.get(root(provider)){family.clone()}else{vec![root(provider).into()]}
+    }
     pub(crate) fn resolve_account(&self,input:&Value)->Result<ResolvedSearchAccount> {
         if !self.allowed_accounts.contains(&input.to_string()){bail!("Search account was not bound to current component batch")}
         let mut account=input.clone();let uri=text(&account,"uri").trim_end_matches('/').to_owned();let url=text(&account,"url").trim_end_matches('/').to_owned();let mut target=if uri.is_empty(){url.clone()}else{uri.clone()};let local=local_key(&target);
@@ -193,3 +299,27 @@ impl ComponentContext {
 // context for their whole batch to avoid owner-graph reads for every card.
 #[cfg(test)]
 pub(crate) async fn resolve_account(db:&Client,owner:Option<i64>,account:&Value)->Result<ResolvedSearchAccount>{ComponentContext::load(db,owner,&[account.clone()]).await?.resolve_account(account)}
+
+
+#[cfg(test)]
+mod graph_profile_shape_regression {
+    use super::*;
+    #[test]
+    fn canonical_plc_and_web_graph_profiles_keep_native_representation(){
+        for did in ["did:plc:abcd1234","did:web:example.com","did:web:example.com:users:nova","did:web:example-domain.com:actor_name~one"] {
+            assert_eq!(native_bsky_graph_did(did).unwrap(),Some(did));
+        }
+    }
+    #[test]
+    fn php_ascii_trim_and_full_encoding_mismatches_fall_back(){
+        for raw in [" did:plc:abcd1234","did:plc:abcd1234 ","\tdid:plc:abcd1234\n","\rdid:plc:abcd1234\0","\u{b}did:plc:abcd1234","did:web:example.com%3A8443","did:web:example.com/users/nova","did:web:example.com?key","did:web:example.com#actor","did:web:exämple.com"] {
+            assert!(native_bsky_graph_did(raw).is_err(),"irregular valid graph DID must use PHP: {raw:?}");
+        }
+    }
+    #[test]
+    fn original_non_did_graph_filter_is_preserved(){
+        for raw in [""," ","not-a-did"," https://bsky.app/profile/friend.test ","DID:plc:abcd1234","\u{a0}did:plc:abcd1234"] {
+            assert_eq!(native_bsky_graph_did(raw).unwrap(),None);
+        }
+    }
+}

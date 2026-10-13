@@ -807,6 +807,7 @@ function ap_notification_projection_invalidate_owner(int $ownerUserId): void
         ap_db()->prepare('DELETE FROM ap_notification_projection WHERE owner_user_id = ?')->execute([$ownerUserId]);
         if (function_exists('ap_redis_delete_pattern')) {
             ap_redis_delete_pattern('vaak:notifications:v1:' . $ownerUserId . ':*');
+            ap_redis_delete_pattern('vaak:notifications:v2:' . $ownerUserId . ':*');
         }
     } catch (Throwable $e) {
         error_log('[ap-db] notification projection owner invalidation skipped: ' . $e->getMessage());
@@ -830,6 +831,7 @@ function ap_notification_projection_invalidate_all(): void
         ap_db()->exec('DELETE FROM ap_notification_projection');
         if (function_exists('ap_redis_delete_pattern')) {
             ap_redis_delete_pattern('vaak:notifications:v1:*');
+            ap_redis_delete_pattern('vaak:notifications:v2:*');
         }
     } catch (Throwable $e) {
         error_log('[ap-db] notification projection global invalidation skipped: ' . $e->getMessage());
@@ -7764,7 +7766,7 @@ function ap_followers_id_set(?string $ownerActorId = null, ?int $ownerUserId = n
  *
  * @return array<string,bool>
  */
-function ap_blocks_actor_id_set(int $ownerUserId): array
+function ap_blocks_actor_id_set(int $ownerUserId, ?array $freshRows = null): array
 {
     if ($ownerUserId < 1) {
         return [];
@@ -7773,10 +7775,11 @@ function ap_blocks_actor_id_set(int $ownerUserId): array
     if (!isset($GLOBALS['ap_relset_memo']) || !is_array($GLOBALS['ap_relset_memo'])) {
         $GLOBALS['ap_relset_memo'] = [];
     }
+    if ($freshRows !== null) unset($GLOBALS['ap_relset_memo'][$memoKey]);
     if (isset($GLOBALS['ap_relset_memo'][$memoKey]) && is_array($GLOBALS['ap_relset_memo'][$memoKey])) {
         return $GLOBALS['ap_relset_memo'][$memoKey];
     }
-    $useRedis = function_exists('ap_redis_relsets_enabled') && ap_redis_relsets_enabled();
+    $useRedis = $freshRows === null && function_exists('ap_redis_relsets_enabled') && ap_redis_relsets_enabled();
     $redisKey = $useRedis ? ('vaak:relset:v3:blocks-actors:' . $ownerUserId) : '';
     if ($redisKey !== '' && function_exists('ap_redis_json_get')) {
         $cached = ap_redis_json_get($redisKey);
@@ -7791,7 +7794,7 @@ function ap_blocks_actor_id_set(int $ownerUserId): array
         }
     }
     $map = [];
-    foreach (ap_user_blocks_list_cached($ownerUserId) as $b) {
+    foreach (($freshRows ?? ap_user_blocks_list_cached($ownerUserId)) as $b) {
         if (!is_array($b) || (string) ($b['scope'] ?? '') !== 'actor') {
             continue;
         }
@@ -7799,7 +7802,7 @@ function ap_blocks_actor_id_set(int $ownerUserId): array
         if ($v === '') {
             continue;
         }
-        foreach (array_unique(array_merge(ap_actor_moderation_aliases($v), ap_moderation_syntactic_refs($v))) as $alias) {
+        foreach (array_unique(array_merge(ap_actor_moderation_aliases($v, false, $freshRows !== null), ap_moderation_syntactic_refs($v))) as $alias) {
             $map[$alias] = true;
             $map[$alias . '/'] = true;
         }
@@ -8651,9 +8654,10 @@ function ap_block_list(): array
  *
  * @return list<array<string,mixed>>
  */
-function ap_block_list_cached(bool $refresh = false): array
+function ap_block_list_cached(bool $refresh = false, ?array $freshRows = null): array
 {
     static $cache = null;
+    if ($freshRows !== null) return $cache = $freshRows;
     if ($refresh || $cache === null) {
         $cache = ap_block_list();
     }
@@ -8739,13 +8743,14 @@ function ap_block_normalize_actor(string $raw): ?string
  *
  * @return list<string>
  */
-function ap_actor_moderation_aliases(?string $actorId): array
+function ap_actor_moderation_aliases(?string $actorId, bool $refresh = false, bool $strict = false): array
 {
+    static $memo = [];
+    if ($refresh) $memo = [];
     $actorId = rtrim(trim((string) $actorId), '/');
     if ($actorId === '') {
         return [];
     }
-    static $memo = [];
     if (isset($memo[$actorId])) {
         return $memo[$actorId];
     }
@@ -8829,6 +8834,7 @@ function ap_actor_moderation_aliases(?string $actorId): array
                 }
             }
         } catch (Throwable $e) {
+            if ($strict) throw $e;
             // keep what we have
         }
     }
@@ -9016,10 +9022,11 @@ function ap_is_blocked_host(?string $host): bool
 }
 
 /** @return array<string,bool> Expanded server-wide actor block membership. */
-function ap_server_blocked_actors_set(bool $refresh = false): array
+function ap_server_blocked_actors_set(bool $refresh = false, ?array $freshRows = null): array
 {
     static $cache = null;
-    if ($refresh) {
+    if ($freshRows !== null) $cache = null;
+    if ($refresh && $freshRows === null) {
         $cache = null;
         if (function_exists('ap_redis_delete')) {
             ap_redis_delete('vaak:moderation:server-blocks:v1', 'vaak:moderation:server-blocks:v2', 'vaak:moderation:server-blocks:v3');
@@ -9029,14 +9036,14 @@ function ap_server_blocked_actors_set(bool $refresh = false): array
         return $cache;
     }
     $redisKey = 'vaak:moderation:server-blocks:v3';
-    if (function_exists('ap_redis_json_get')) {
+    if ($freshRows === null && function_exists('ap_redis_json_get')) {
         $hit = ap_redis_json_get($redisKey);
         if (is_array($hit)) {
             return $cache = $hit;
         }
     }
     $map = [];
-    foreach (ap_block_list_cached() as $b) {
+    foreach (($freshRows ?? ap_block_list_cached()) as $b) {
         if (($b['scope'] ?? '') !== 'actor' || ($b['kind'] ?? 'block') === 'mute') {
             continue;
         }
@@ -9044,7 +9051,7 @@ function ap_server_blocked_actors_set(bool $refresh = false): array
         if ($val === '') {
             continue;
         }
-        foreach (ap_actor_moderation_aliases($val) as $alias) {
+        foreach (ap_actor_moderation_aliases($val, false, $freshRows !== null) as $alias) {
             $alias = rtrim((string) $alias, '/');
             if ($alias !== '') {
                 $map[$alias] = true;
@@ -9055,7 +9062,7 @@ function ap_server_blocked_actors_set(bool $refresh = false): array
             $map[$alias] = true;
         }
     }
-    if (function_exists('ap_redis_json_set')) {
+    if ($freshRows === null && function_exists('ap_redis_json_set')) {
         ap_redis_json_set($redisKey, $map, function_exists('ap_redis_relset_ttl') ? ap_redis_relset_ttl() : 300);
     }
     return $cache = $map;
@@ -10113,7 +10120,7 @@ function ap_moderation_syntactic_refs(string $actorId): array
     return array_keys($uniq);
 }
 
-function ap_mutes_set_cached(int $ownerUserId, bool $refresh = false): array
+function ap_mutes_set_cached(int $ownerUserId, bool $refresh = false, ?array $freshRows = null): array
 {
     static $cache = [];
     if ($ownerUserId < 1) {
@@ -10122,7 +10129,8 @@ function ap_mutes_set_cached(int $ownerUserId, bool $refresh = false): array
         }
         return [];
     }
-    if ($refresh) {
+    if ($freshRows !== null) unset($cache[$ownerUserId]);
+    if ($refresh && $freshRows === null) {
         unset($cache[$ownerUserId]);
         if (function_exists('ap_redis_delete')) ap_redis_delete('vaak:moderation:mutes:v2:' . $ownerUserId, 'vaak:moderation:mutes:v3:' . $ownerUserId, 'vaak:moderation:mutes:v4:' . $ownerUserId);
         if (function_exists('ap_redis_delete')) ap_redis_delete('vaak:moderation:mutes:' . $ownerUserId);
@@ -10130,23 +10138,23 @@ function ap_mutes_set_cached(int $ownerUserId, bool $refresh = false): array
     if (!isset($cache[$ownerUserId])) {
         // v4 preserves reserved escapes; reject older expanded alias maps.
         $redisKey = 'vaak:moderation:mutes:v4:' . $ownerUserId;
-        $redisCached = function_exists('ap_redis_json_get') ? ap_redis_json_get($redisKey) : null;
+        $redisCached = $freshRows === null && function_exists('ap_redis_json_get') ? ap_redis_json_get($redisKey) : null;
         if (is_array($redisCached)) {
-            if (function_exists('ap_redis_relset_metric')) {
+            if ($freshRows === null && function_exists('ap_redis_relset_metric')) {
                 ap_redis_relset_metric('hit');
             }
             $cache[$ownerUserId] = $redisCached;
         } else {
-            if (function_exists('ap_redis_relset_metric') && function_exists('ap_redis_client') && ap_redis_client('cache')) {
+            if ($freshRows === null && function_exists('ap_redis_relset_metric') && function_exists('ap_redis_client') && ap_redis_client('cache')) {
                 ap_redis_relset_metric('miss');
             }
             $cache[$ownerUserId] = [];
-            foreach (ap_mutes_list($ownerUserId) as $row) {
+            foreach (($freshRows ?? ap_mutes_list($ownerUserId)) as $row) {
                 $id = rtrim((string) ($row['actor_id'] ?? ''), '/');
                 if ($id === '') {
                     continue;
                 }
-                foreach (ap_actor_moderation_aliases($id) as $alias) {
+                foreach (ap_actor_moderation_aliases($id, false, $freshRows !== null) as $alias) {
                     $alias = rtrim((string) $alias, '/');
                     if ($alias === '') {
                         continue;
@@ -10158,7 +10166,7 @@ function ap_mutes_set_cached(int $ownerUserId, bool $refresh = false): array
                     $cache[$ownerUserId][$alias] = true;
                 }
             }
-            if (function_exists('ap_redis_json_set')) {
+            if ($freshRows === null && function_exists('ap_redis_json_set')) {
                 ap_redis_json_set(
                     $redisKey,
                     $cache[$ownerUserId],
@@ -11015,9 +11023,10 @@ function ap_user_blocks_list(int $ownerUserId): array
 }
 
 /** @return list<array<string,mixed>> */
-function ap_user_blocks_list_cached(int $ownerUserId, bool $refresh = false): array
+function ap_user_blocks_list_cached(int $ownerUserId, bool $refresh = false, ?array $freshRows = null): array
 {
     static $cache = [];
+    if ($freshRows !== null) return $cache[$ownerUserId] = $freshRows;
     if ($ownerUserId < 1) {
         if ($refresh) {
             $cache = [];
@@ -16399,4 +16408,192 @@ function ap_ordinary_outbox_matches_muted_words(array $row, array $extraTexts, i
     if (!ap_ordinary_note_owned((string)($row['id']??''),$ownerUserId)) return true;
     // Flattened foreign text is never covered by the root grant.
     return ap_muted_words_match($ownerUserId,(string)($row['object_summary']??''),(string)($row['reblog_content']??'')) !== null;
+}
+
+
+/** Refresh mandatory current owner/moderation state for final PHP Search fallback. */
+function ap_search_refresh_current_policy(int $ownerUserId): bool
+{
+    try {
+        if ($ownerUserId > 0) {
+            $owner = ap_db()->prepare('SELECT actor_id,actor_key FROM ap_users WHERE id=? AND disabled_at IS NULL');
+            $owner->execute([$ownerUserId]); $identity = $owner->fetch();
+            if (!is_array($identity)
+                || rtrim((string)$identity['actor_id'],'/') !== rtrim((string)($GLOBALS['vaak_actor_id'] ?? ''),'/')
+                || (string)$identity['actor_key'] !== (string)($GLOBALS['vaak_actor_key'] ?? '')) return false;
+        }
+        // Direct PDO reads propagate errors into this fail-closed boundary.
+        $server = ap_db()->query('SELECT * FROM ap_blocks')->fetchAll();
+        $blocks = ap_db()->prepare('SELECT * FROM ap_user_blocks WHERE owner_user_id=?'); $blocks->execute([$ownerUserId]); $blocks = $blocks->fetchAll();
+        $mutes = ap_db()->prepare('SELECT * FROM ap_mutes WHERE owner_user_id=?'); $mutes->execute([$ownerUserId]); $mutes = $mutes->fetchAll();
+        ap_actor_moderation_aliases(null, true);
+        ap_block_list_cached(false, $server);
+        ap_server_blocked_actors_set(false, $server);
+        ap_user_blocks_list_cached($ownerUserId, false, $blocks);
+        ap_blocks_actor_id_set($ownerUserId, $blocks);
+        ap_mutes_set_cached($ownerUserId, false, $mutes);
+        return true;
+    } catch (Throwable $error) { return false; }
+}
+
+/** Preserve selected tag display/order/cursor; omit names without current permitted contributors. */
+function ap_search_current_tags(array $tags, int $ownerUserId, ?array $collector, bool $freshActions = false): array
+{
+    try {
+        if (!is_array($collector) || !is_string($collector['query'] ?? null)
+            || !ap_search_refresh_current_policy($ownerUserId)) return [];
+        $current=ap_masto_search_hashtags($collector['query'],80);
+        $names=[];foreach ($current as $tag) {if (is_array($tag)) $names[(string)($tag['name'] ?? '')]=true;}
+        $followed=[];
+        if ($freshActions && $ownerUserId > 0) {
+            $query=ap_db()->prepare('SELECT name FROM masto_followed_tags WHERE owner_user_id=?');
+            $query->execute([$ownerUserId]);
+            foreach ($query->fetchAll() as $row) $followed[(string)$row['name']]=true;
+        }
+        $out=[];
+        foreach ($tags as $tag) {
+            if (!is_array($tag) || !isset($names[(string)($tag['name'] ?? '')])) continue;
+            if ($freshActions) $tag['following']=isset($followed[(string)$tag['name']]);
+            $out[]=$tag;
+        }
+        return $out;
+    } catch (Throwable $error) { return []; }
+}
+
+/** Fresh late-PHP action proof, bound to at most40 already source-validated
+ * selected accounts. Owner graphs load once; aliases/profile lookup scales only
+ * with selected accounts, never the number of graph edges. No Redis, migration,
+ * network, enqueue or stale relationship memo. Relevant read failure is null.
+ * @return array<string,bool>|null keyed by original selected DTO hash
+ */
+function ap_search_current_follow_actions(int $ownerUserId, array $accounts): ?array
+{
+    if (count($accounts)>40) return null;
+    try {
+        $states=[];
+        if ($ownerUserId<1) {
+            foreach ($accounts as $account) $states[hash('sha256',json_encode($account,JSON_THROW_ON_ERROR))]=false;
+            return $states;
+        }
+        $owner=rtrim((string)($GLOBALS['vaak_actor_id'] ?? ''),'/');
+        if ($owner==='') return null;
+        $query=ap_db()->prepare('SELECT actor_id FROM following WHERE owner_actor_id=? OR owner_actor_id=?');
+        $query->execute([$owner,$owner.'/']);$graph=[];
+        foreach ($query->fetchAll() as $row) {
+            $actor=rtrim((string)($row['actor_id'] ?? ''),'/');
+            if ($actor!=='') $graph[$actor]=true;
+            foreach (ap_moderation_syntactic_refs($actor) as $ref) $graph[rtrim($ref,'/')]=true;
+        }
+        $bskyGraph=null;$profile=null;
+        foreach ($accounts as $account) {
+            $target=rtrim((string)(($account['uri'] ?? '') ?: ($account['url'] ?? '')),'/');
+            $following=false;
+            if (preg_match('~^https://bsky\.app/profile/([^/?#]+)$~i',$target,$match)) {
+                if ($bskyGraph===null) {
+                    $query=ap_db()->prepare("SELECT target_did FROM bsky_graph_sync WHERE owner_user_id=? AND kind='follow'");
+                    $query->execute([$ownerUserId]);$bskyGraph=[];
+                    foreach ($query->fetchAll() as $row) $bskyGraph[(string)$row['target_did']]=true;
+                }
+                $identity=rawurldecode($match[1]);
+                if (str_starts_with($identity,'did:')) $following=isset($bskyGraph[$identity]);
+                else {
+                    // Exact selected handle, not one query per followed DID.
+                    $handle=strtolower(ltrim($identity,'@'));
+                    if ($profile===null) {
+                        $handleExpr=ap_db()->getAttribute(PDO::ATTR_DRIVER_NAME)==='pgsql' ? "lower((profile_json::jsonb)->>'handle')" : "lower(json_extract(profile_json,'$.handle'))";
+                        $profile=ap_db()->prepare('SELECT did FROM bsky_actor_profiles WHERE actor_ref IN (?,?,?) OR '.$handleExpr.'=?');
+                    }
+                    $profile->execute([$handle,'https://bsky.app/profile/'.$handle,'https://bsky.app/profile/'.rawurlencode($handle),$handle]);
+                    $dids=[];foreach ($profile->fetchAll() as $row) {if ((string)($row['did'] ?? '')!=='') $dids[(string)$row['did']]=true;}
+                    if (count($dids)>1) return null;
+                    $following=count($dids)===1 && isset($bskyGraph[array_key_first($dids)]);
+                }
+                // AP bridge follows remain valid alongside the Bsky graph.
+                foreach ([$target,'https://bsky.app/profile/'.$identity,'https://bsky.app/profile/'.rawurlencode($identity)] as $ref) $following=$following || isset($graph[$ref]);
+            } else {
+                // Refresh this selected identity explicitly. Do not assume the
+                // source filter's memo is fresh, or hash every graph edge's id.
+                $refs=ap_masto_actor_id_aliases($target,true,true);$refs[]=$target;
+                foreach (['uri','url'] as $field) foreach (ap_search_actor_ref_list((string)($account[$field] ?? '')) as $ref) $refs[]=$ref;
+                foreach ($refs as $ref) {if (isset($graph[rtrim((string)$ref,'/')])) {$following=true;break;}}
+            }
+            $states[hash('sha256',json_encode($account,JSON_THROW_ON_ERROR))]=$following;
+        }
+        return $states;
+    } catch (Throwable $error) { return null; }
+}
+
+/** Pure action lookup; no DB or cached relationship fallback per painted card. */
+function ap_search_account_following_from_actions(array $account, array $actions): bool
+{
+    return !empty($actions[hash('sha256',json_encode($account,JSON_THROW_ON_ERROR))]);
+}
+
+/** Fresh DB-only policy/source check after native Search awaits. Never recollect
+ * or renumber original selected rows, and never invalidate shared Redis caches.
+ * Account cards intentionally retain PHP's account-indexing and word-mute rules.
+ * @param list<array<string,mixed>> $accounts
+ * @return list<array<string,mixed>>
+ */
+function ap_search_current_accounts(array $accounts, int $ownerUserId, ?array $sourceActors = null): array
+{
+    if ($accounts === []) return [];
+    try {
+        if (!ap_search_refresh_current_policy($ownerUserId)) return [];
+        $local = ap_db()->prepare("SELECT id,actor_key FROM ap_users WHERE rtrim(actor_id,'/')=? AND disabled_at IS NULL LIMIT 1");
+        $remote = ap_db()->prepare("SELECT actor_id FROM remote_actors WHERE rtrim(actor_id,'/')=? LIMIT 1");
+        $mapping = ap_db()->prepare('SELECT actor_id FROM masto_account_actors WHERE account_id=? LIMIT 1');
+        $out=[];
+        foreach ($accounts as $sourceIndex => $account) {
+            if (!is_array($account)) continue;
+            $uri=rtrim((string)($account['uri'] ?? ''),'/');
+            $target=$uri!==''?$uri:rtrim((string)($account['url'] ?? ''),'/');
+            $policyRefs=[$target];
+            if (preg_match('#^https://mkultra\.monster/users/[A-Za-z0-9_]+$#',$target)) {
+                if (is_array($sourceActors) && rtrim((string)($sourceActors[$sourceIndex] ?? ''),'/') !== $target) continue;
+                $local->execute([$target]); $source=$local->fetch();
+                if (!is_array($source) || (string)($account['id'] ?? '') !== ((string)$source['actor_key']==='cmdr_nova'?'1':(string)$source['id'])) continue;
+            } else {
+                $provider=is_array($sourceActors)?rtrim((string)($sourceActors[$sourceIndex] ?? ''),'/'):$target;
+                $remote->execute([$provider]);
+                if (!$remote->fetchColumn()) {
+                    // Only actual request-selected collector rows can back a cold
+                    // public account. Account JSON/mapping/another actor URL alone
+                    // never grants source authority. Private relationships are not
+                    // copied from this discovery witness.
+                    $hash=hash('sha256',json_encode($account,JSON_THROW_ON_ERROR));
+                    $trace=$GLOBALS['vaak_search_account_witnesses'][$hash] ?? null;
+                    if (!is_array($trace) || ($trace['provider'] ?? null)!==$provider) continue;
+                    $witness=$trace['source'] ?? null;
+                    if (!is_array($witness) || ($witness['actor_id'] ?? null)!==$provider) continue;
+                    $table=$witness['table'] ?? null;
+                    if (in_array($table,['following','followers'],true) && is_string($witness['owner_actor_id'] ?? null)) {
+                        $witnessQuery=ap_db()->prepare('SELECT actor_id FROM '.$table.' WHERE owner_actor_id=? AND actor_id=? LIMIT 1');
+                        $witnessQuery->execute([$witness['owner_actor_id'],$provider]);
+                    } elseif ($table==='events' && is_string($witness['id'] ?? null) && is_string($witness['host'] ?? null)) {
+                        $witnessQuery=ap_db()->prepare("SELECT actor_id FROM events WHERE id=? AND actor_id=? AND lower(COALESCE(host,''))=? LIMIT 1");
+                        $witnessQuery->execute([$witness['id'],$provider,$witness['host']]);
+                    } elseif ($table==='mentions' && is_string($witness['id'] ?? null)) {
+                        $witnessQuery=ap_db()->prepare('SELECT actor_id FROM mentions WHERE id=? AND actor_id=? AND deleted_at IS NULL LIMIT 1');
+                        $witnessQuery->execute([$witness['id'],$provider]);
+                    } else continue;
+                    if ($witnessQuery->fetchColumn()!==$provider) continue;
+                }
+                $aliases=ap_masto_actor_id_aliases($provider,true,true);
+                $policyRefs=$aliases; $policyRefs[]=$provider;
+                if (($aliases[0] ?? $provider)!==$target || ap_masto_remote_account_id($provider)!==(string)($account['id'] ?? '')) continue;
+                $mapping->execute([(string)($account['id'] ?? '')]); $mapped=$mapping->fetchColumn();
+                if (!is_string($mapped) || rtrim($mapped,'/')!==$target) continue;
+            }
+            foreach (['uri','url','id'] as $field) foreach (ap_search_actor_ref_list((string)($account[$field] ?? '')) as $ref) ap_actor_moderation_aliases($ref, false, true);
+            if (ap_search_account_hidden($account,$ownerUserId)) continue;
+            $refs=[];foreach (['uri','url','id'] as $field) $refs=array_merge($refs,ap_search_actor_ref_list((string)($account[$field] ?? '')));
+            if (!ap_search_refs_are_self($refs,(string)($account['acct'] ?? ''),$ownerUserId)) {
+                $withdrawn=false;foreach ($policyRefs as $ref) {ap_actor_moderation_aliases($ref,false,true);if (ap_search_actor_hidden($ref,$ownerUserId)) {$withdrawn=true;break;}}
+                if ($withdrawn) continue;
+            }
+            $out[]=$account;
+        }
+        return $out;
+    } catch (Throwable $error) { return []; }
 }

@@ -30,13 +30,35 @@ impl PreviewFetchContext{
  async fn cache_put(&self,db:&tokio_postgres::Client,card:&Value,ttl:i64,now:chrono::DateTime<chrono::Utc>,grant:&dyn CurrentQuoteGrant)->Result<()>{
   let url=crate::direct_preview::normalize(card["url"].as_str().unwrap_or(""))?;if url.is_empty(){return Ok(())}let text=|key:&str,max:usize|card.get(key).filter(|v|!v.is_null()).map(|v|php_string(v).chars().take(max).collect::<String>());let title=text("title",500);let description=text("description",1000);let image=text("image",800);let provider=text("provider_name",200);let provider_url=text("provider_url",400);let kind=card["type"].as_str().unwrap_or("link");let status=card["status"].as_str().unwrap_or("ok");let fetched=now.to_rfc3339_opts(chrono::SecondsFormat::Secs,false);let expires=(now+chrono::Duration::seconds(ttl.max(60))).to_rfc3339_opts(chrono::SecondsFormat::Secs,false);
   grant.require_current().await?;
+  grant.bind_preview_write_url(&url).await?;
   let before=match db.query("SELECT to_jsonb(c) FROM link_preview_cards c WHERE url=$1 LIMIT 1",&[&url]).await{Ok(rows)=>rows.into_iter().map(|r|r.get::<_,Value>(0)).collect::<Vec<_>>(),Err(_)=>{grant.require_current().await?;return Ok(())}};
   grant.require_current().await?;let expected=before.first();
   let written=db.query("INSERT INTO link_preview_cards AS c(url,title,description,image,provider_name,provider_url,type,status,fetched_at,expires_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT(url) DO UPDATE SET title=excluded.title,description=excluded.description,image=excluded.image,provider_name=excluded.provider_name,provider_url=excluded.provider_url,type=excluded.type,status=excluded.status,fetched_at=excluded.fetched_at,expires_at=excluded.expires_at WHERE to_jsonb(c) IS NOT DISTINCT FROM $11::jsonb RETURNING to_jsonb(c)",&[&url,&title,&description,&image,&provider,&provider_url,&kind,&status,&fetched,&expires,&expected]).await;
   match written{Ok(rows)=>{let after=rows.into_iter().map(|r|r.get::<_,Value>(0)).collect::<Vec<_>>();if after.len()!=1{anyhow::bail!("PHP fallback: preview cache changed before exact authorized writer")}
-      let receipt=PreviewCacheWrite{url,before,after};grant.accept_preview_write(&receipt)?;},Err(_)=>{}}
+      let receipt=PreviewCacheWrite{url,before,after};grant.accept_preview_write(&receipt)?;#[cfg(test)] grant.fixture_after_preview_write(db,self,now).await?;},Err(_)=>{}}
   grant.require_current().await?;Ok(())
  }
+}
+#[cfg(test)]
+pub(crate) async fn fixture_reject_outside_receipt(db:&tokio_postgres::Client,fetch:&PreviewFetchContext,now:chrono::DateTime<chrono::Utc>,parent:&dyn CurrentQuoteGrant)->Result<()>{
+ struct Capture<'a>{parent:&'a dyn CurrentQuoteGrant,receipt:std::sync::Mutex<Option<PreviewCacheWrite>>}
+ impl CurrentQuoteGrant for Capture<'_>{
+  fn require_current(&self)->Pin<Box<dyn Future<Output=Result<()>>+Send+'_>>{self.parent.require_current()}
+  fn accept_preview_write(&self,write:&PreviewCacheWrite)->Result<()>{*self.receipt.lock().unwrap()=Some(write.clone());Ok(())}
+ }
+ parent.require_current().await?;
+ let capture=Capture{parent,receipt:std::sync::Mutex::new(None)};
+ // Deliberately independent public metadata written by the real conditional SQL
+ // writer. The capture adapter has no selected URL registration or content grant.
+ fetch.cache_put(db,&json!({"url":"https://outside-receipt.test/owned","title":"Owned outside receipt","type":"link","status":"ok"}),60,now,&capture).await?;
+ let receipt=capture.receipt.lock().unwrap().clone().ok_or_else(||anyhow::anyhow!("actual outside SQL writer receipt missing"))?;
+ let rejected=parent.accept_preview_write(&receipt).err().ok_or_else(||anyhow::anyhow!("outside writer receipt wrongly accepted"))?;
+ anyhow::ensure!(rejected.to_string().contains("outside selected native dependency"),"exact URL capability refusal required");
+ let schema:String=db.query_one("SELECT current_schema()",&[]).await?.get(0);
+ let output=std::env::var("VAAK_SEARCH_OUTSIDE_RECEIPT_OUTPUT")?;
+ use std::io::Write;let mut file=std::fs::OpenOptions::new().write(true).create_new(true).open(format!("{output}.{schema}.json"))?;
+ file.write_all(&serde_json::to_vec_pretty(&json!({"schema":schema,"url":receipt.url(),"before":receipt.before(),"after":receipt.after(),"refusal":rejected.to_string(),"actual_native_sql_writer":true,"synthetic_receipt":false}))?)?;
+ Err(rejected)
 }
 fn php_string(v:&Value)->String{match v{Value::String(s)=>s.clone(),Value::Null=>String::new(),Value::Bool(false)=>String::new(),Value::Bool(true)=>"1".into(),Value::Array(_)|Value::Object(_)=>"Array".into(),Value::Number(n)=>n.to_string()}}
 // Production writers use RFC3339; legacy SQL/RFC2822 are explicit supported
