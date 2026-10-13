@@ -670,6 +670,7 @@ ASCII;
       <div class="landing-mascot" aria-hidden="true"><img src="/api/assets/mascot/vaak-landing.webp" alt=""></div>
       <pre><?= htmlspecialchars($asciiV, ENT_QUOTES, 'UTF-8') ?></pre>
       <h1>VAAK</h1>
+      <?php /* Login and registration both use vaak_version_label() from api/ap-version.php. Do not hardcode a version. */ ?>
       <p class="vaak-version"><?= htmlspecialchars(vaak_version_label(), ENT_QUOTES, 'UTF-8') ?></p>
     </div>
 
@@ -784,6 +785,7 @@ ASCII;
       <a href="https://mkultra.monster/">mkultra.monster</a>
     </nav>
     <p class="ai-disclaimer">This app was developed in conjunction with AI</p>
+    <p class="vaak-version-foot"><?= htmlspecialchars(vaak_version_label(), ENT_QUOTES, 'UTF-8') ?></p>
   </main>
   <script>
     (() => {

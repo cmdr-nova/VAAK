@@ -57,6 +57,7 @@ I run [mkultra.monster](https://mkultra.monster), and I wanted a server I could 
 
 The app I actually use is the link above. If you want to see how a copy is wired:
 
+- How a production deploy actually ships: [docs/DEPLOY.md](docs/DEPLOY.md)
 - Worker build, environment, and the commands that stay up: [rust/README.md](rust/README.md)
 - systemd units and backup scripts: [deploy/](deploy/)
 - Backups and the integrity check: [docs/vaak-integrity-policy.md](docs/vaak-integrity-policy.md)
@@ -70,4 +71,4 @@ A small explainable ranker can train beside the live Home ordering and compare t
 
 Active alpha. **0.8.45** is the deployed version in `api/ap-version.php`.
 
-The label in the app comes from that file: channel, number, and date. The counter steps the last component, and `0.8.99` rolls to `0.9.00`. Federation and Bluesky still depend on the other server. I would rather keep a cache warm and a queue bounded than make a page wait on somebody else's API.
+The label in the app comes from that file: channel, number, and date. The counter steps the last component, and `0.8.99` rolls to `0.9.00`. How that bump is applied is written up in [docs/DEPLOY.md](docs/DEPLOY.md). Federation and Bluesky still depend on the other server. I would rather keep a cache warm and a queue bounded than make a page wait on somebody else's API.
