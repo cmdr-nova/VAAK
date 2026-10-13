@@ -118,7 +118,7 @@ function ap_action_queue_error_context(array $row, array $payload, string $error
         }
     }
     $code = null;
-    if (preg_match('/\b(?:http|status|code)[ _:=/-]*([45]\d{2})\b/i', $error, $m)) {
+    if (preg_match('~\b(?:http|status|code)[ _:=/-]*([45]\d{2})\b~i', $error, $m)) {
         $code = (int) $m[1];
     }
     return ['host' => $host, 'code' => $code];

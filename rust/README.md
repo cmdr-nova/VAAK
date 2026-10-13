@@ -1,5 +1,7 @@
 # VAAK Rust workers (shadow + live cutover)
 
+Release documentation: **alpha 0.8.44 · 2026-10-13** ([release notes](../docs/RELEASE-0.8.44.md)). Search batches bind current source, follow, moderation and owner-action facts before rendering. PHP remains the collector and write owner; the release retains existing activation settings and whole-batch fallback.
+
 | Command | Mode | Role |
 |---|---|---|
 | `notif-badge --live --loop --owner-id 0` | **LIVE** | Owns production notif Redis + file cache for **all** local `ap_users` (multi-user) |

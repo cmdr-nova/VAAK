@@ -1895,19 +1895,11 @@ $vaakAdminOnlyActions = [
         } elseif ($action === 'pin_status') {
             $res = function_exists('ap_masto_status_pin') ? ap_masto_status_pin($localId) : ['ok' => false, 'error' => 'Pin unavailable'];
             if (!empty($res['ok'])) {
-                $notice = 'Pinned — shows on your HTML profile Pinned tab (up to 5).';
+                $notice = 'Pinned!';
                 if (function_exists('ap_bsky_sync_pin_to_bluesky')) {
                     require_once __DIR__ . '/ap-bsky.php';
                     // Bluesky has one pin: newest VAAK pin with a twin. Never clear here.
                     $bpin = ap_bsky_sync_pin_to_bluesky($vaakOwnerId, false);
-                    if (!empty($bpin['ok']) && !empty($bpin['uri']) && empty($bpin['skipped'])) {
-                        $notice .= ' Bluesky pin set to the newest mirrored pin.';
-                    } elseif (!empty($bpin['ok']) && !empty($bpin['skipped'])) {
-                        $notice .= ' Bluesky pin will follow the newest mirror when ready.';
-                    } elseif (!empty($bpin['error']) && $bpin['error'] !== 'Bluesky not connected'
-                        && empty($bpin['skipped'])) {
-                        $notice .= ' (Bluesky pin: ' . (string) $bpin['error'] . ')';
-                    }
                 }
             } else {
                 $error = $res['error'] ?? 'Could not pin.';
@@ -12324,7 +12316,12 @@ function admin_search_run(string $sq, string $stype, bool $sresolve, int $limit 
     $accounts = [];
     $acctMore = false;
     if ($needAccounts) {
-        $accounts = admin_search_account_results($sq, $sresolve, $limit, $offset);
+        $GLOBALS['vaak_search_account_sources'] = [];
+        $GLOBALS['vaak_search_selected_actor_witnesses'] = [];
+        $GLOBALS['vaak_search_account_witnesses'] = [];
+        $GLOBALS['vaak_search_collect_account_sources'] = true;
+        try { $accounts = admin_search_account_results($sq, $sresolve, $limit, $offset); }
+        finally { $GLOBALS['vaak_search_collect_account_sources'] = false; }
         $acctMore = !empty($GLOBALS['vaak_search_account_more']);
     }
     $owner = admin_owner_user_id();
@@ -12372,6 +12369,8 @@ function admin_search_run(string $sq, string $stype, bool $sresolve, int $limit 
     }
     return [
         '_native_collector' => $nativeCollector,
+        '_native_components' => ['query' => $sq, 'section' => $stype, 'offset' => $offset, 'limit' => $limit,
+            'account_sources' => array_map(static fn(array $account): string => (string)($GLOBALS['vaak_search_account_sources'][hash('sha256',json_encode($account,JSON_THROW_ON_ERROR))] ?? rtrim((string)($account['uri'] ?? $account['url'] ?? ''),'/')), $accounts)],
         'accounts' => $accounts,
         'hashtags' => $tags,
         'statuses' => $statuses,
@@ -12608,7 +12607,7 @@ function admin_search_sentinel(bool $hasMore): void
  * @param array<string,mixed> $acc
  * @param array<string,mixed> $followingIds
  */
-function admin_search_render_account(array $acc, array $followingIds): void
+function admin_search_render_account(array $acc, array $followingIds, ?bool $followingOverride = null): void
 {
     $vaakUsername = admin_search_viewer_username();
     $actorUri = rtrim((string) ($acc['uri'] ?? ''), '/');
@@ -12628,12 +12627,12 @@ function admin_search_render_account(array $acc, array $followingIds): void
     $shownAddress = $localKey !== ''
         ? ('https://mkultra.monster/vaak/users/' . rawurlencode($localKey))
         : ($followTarget !== '' ? $followTarget : $actorUrl);
-    $already = $followTarget !== '' && admin_is_following(
+    $already = $followingOverride ?? ($followTarget !== '' && admin_is_following(
         $followingIds,
         $followTarget,
         $actorUrl,
         $actorUri
-    );
+    ));
     $acctStr = (string) ($acc['acct'] ?? '');
     $isMe = ($followTarget !== '' && vaak_is_own_url($followTarget))
         || ($actorUri !== '' && vaak_is_own_url($actorUri))
@@ -12642,7 +12641,7 @@ function admin_search_render_account(array $acc, array $followingIds): void
             strtolower($acctStr) === strtolower($vaakUsername)
             || strtolower($acctStr) === strtolower($vaakUsername . '@mkultra.monster')
         ));
-    if (!$already && !$isMe && !empty($acc['id'])
+    if ($followingOverride === null && !$already && !$isMe && !empty($acc['id'])
         && function_exists('ap_masto_relationship_for_account_id')) {
         $rel = ap_masto_relationship_for_account_id((string) $acc['id']);
         $already = !empty($rel['following']);
@@ -12723,7 +12722,8 @@ function admin_search_render_sections(array $sresults, string $sq, string $stype
         ($stype === '' || $stype === 'accounts') ? $accounts : [],
         ($stype === '' || $stype === 'hashtags') ? $tags : [],
         ($stype === '' || $stype === 'statuses') ? $statuses : [],
-        is_array($sresults['_native_collector'] ?? null) ? $sresults['_native_collector'] : null
+        is_array($sresults['_native_collector'] ?? null) ? $sresults['_native_collector'] : null,
+        is_array($sresults['_native_components'] ?? null) ? $sresults['_native_components'] : null
     );
     if (($stype === '' || $stype === 'accounts') && $accounts !== []) {
         $acctMore = !empty($more['accounts']);
@@ -12732,9 +12732,12 @@ function admin_search_render_sections(array $sresults, string $sq, string $stype
         if ($native !== null) {
             echo $native['accounts'];
         } else {
-            foreach ($accounts as $acc) {
+            $renderAccounts=ap_search_current_accounts($accounts, admin_owner_user_id(), $sresults['_native_components']['account_sources'] ?? null);
+            $refreshActions=!empty($GLOBALS['vaak_search_native_attempted']);
+            $followActions=$refreshActions && $renderAccounts!==[]?ap_search_current_follow_actions(admin_owner_user_id(),$renderAccounts):[];
+            foreach ($followActions!==null?$renderAccounts:[] as $acc) {
                 if (is_array($acc)) {
-                    admin_search_render_account($acc, $followingIds);
+                    admin_search_render_account($acc, $followingIds, $refreshActions?ap_search_account_following_from_actions($acc,$followActions):null);
                 }
             }
         }
@@ -12748,7 +12751,7 @@ function admin_search_render_sections(array $sresults, string $sq, string $stype
         if ($native !== null) {
             echo $native['hashtags'];
         } else {
-            foreach ($tags as $tag) {
+            foreach (ap_search_current_tags($tags,admin_owner_user_id(),$sresults['_native_components'] ?? null,!empty($GLOBALS['vaak_search_native_attempted'])) as $tag) {
                 if (is_array($tag)) {
                     admin_search_render_hashtag($tag);
                 }
@@ -12816,7 +12819,8 @@ function admin_search_page_fragment(string $q, string $section, bool $resolve, i
         $section === 'accounts' ? $rows : [],
         $section === 'hashtags' ? $rows : [],
         $section === 'statuses' ? $rows : [],
-        is_array($bundle['_native_collector'] ?? null) ? $bundle['_native_collector'] : null
+        is_array($bundle['_native_collector'] ?? null) ? $bundle['_native_collector'] : null,
+        is_array($bundle['_native_components'] ?? null) ? $bundle['_native_components'] : null
     );
     ob_start();
     echo '<div data-search-fragment data-section="' . h($section) . '" data-offset="' . (int) ($offset + count($rows))
@@ -12824,12 +12828,17 @@ function admin_search_page_fragment(string $q, string $section, bool $resolve, i
     if ($native !== null) {
         echo $native[$section];
     } else {
-        foreach ($rows as $row) {
+        $renderRows = $section === 'accounts' ? ap_search_current_accounts($rows, $owner, $bundle['_native_components']['account_sources'] ?? null)
+            : ($section === 'hashtags' ? ap_search_current_tags($rows,$owner,$bundle['_native_components'] ?? null,!empty($GLOBALS['vaak_search_native_attempted'])) : $rows);
+        $refreshActions=!empty($GLOBALS['vaak_search_native_attempted']);
+        $followActions=$refreshActions && $section==='accounts' && $renderRows!==[]?ap_search_current_follow_actions($owner,$renderRows):[];
+        if ($section==='accounts' && $followActions===null) $renderRows=[];
+        foreach ($renderRows as $row) {
             if (!is_array($row)) {
                 continue;
             }
             if ($section === 'accounts') {
-                admin_search_render_account($row, $followingIds);
+                admin_search_render_account($row, $followingIds, $refreshActions?ap_search_account_following_from_actions($row,$followActions):null);
             } elseif ($section === 'hashtags') {
                 admin_search_render_hashtag($row);
             } else {
@@ -24422,7 +24431,7 @@ function admin_mentions_html_axum_fetch(int $limit, ?string $maxId, array $types
 
 /**
  * Fetch Mentions nested-card HTML from Axum `/shadow/notif-embed` (0.6.90).
- * Key parity with Redis `vaak:notif-embed:v1:*`. Returns HTML on 200, null on miss/error.
+ * Key parity with Redis `vaak:notif-embed:v2:*`. Returns HTML on 200, null on miss/error.
  *
  * Flag: VAAK_NOTIF_EMBED_AXUM (default on). Rollback: set 0.
  */
@@ -24515,6 +24524,31 @@ function admin_notif_embed_axum_fetch(
     return $body;
 }
 
+/** Capability routing only. Never resolves handles, reads DB or grants actions. */
+function admin_notif_status_requires_php_bsky_render(array $status): bool
+{
+    if (($status['source'] ?? '') === 'bluesky') return true;
+    $atPost = static fn(string $uri): bool => (bool) preg_match('~^at://did:[^/\s?#]+/app\.bsky\.feed\.post/[^/\s?#]+$~D', $uri);
+    $web = static function(string $uri, bool $actor = false): bool {
+        $parts = parse_url($uri);
+        if (!is_array($parts) || strtolower((string) ($parts['scheme'] ?? '')) !== 'https'
+            || strtolower((string) ($parts['host'] ?? '')) !== 'bsky.app') return false;
+        $path = (string) ($parts['path'] ?? '');
+        return (bool) preg_match($actor ? '~^/profile/[^/]+/?$~D' : '~^/profile/[^/]+/post/[^/]+/?$~D', $path);
+    };
+    foreach (['uri','url'] as $key) {
+        $uri = is_string($status[$key] ?? null) ? trim($status[$key]) : '';
+        if ($atPost($uri) || $web($uri)) return true;
+    }
+    if (str_starts_with((string) ($status['id'] ?? ''), 'bsky:')) return true;
+    $post = is_array($status['bsky_post'] ?? null) ? $status['bsky_post'] : [];
+    if ($atPost((string) ($post['uri'] ?? ''))) return true;
+    $account = is_array($status['account'] ?? null) ? $status['account'] : [];
+    if (str_ends_with(strtolower((string) ($account['acct'] ?? '')), '@bsky.app')) return true;
+    foreach (['uri','url'] as $key) if (is_string($account[$key] ?? null) && $web($account[$key], true)) return true;
+    return false;
+}
+
 function admin_notif_try_embed_status_card(?array $status, array $followingIds, bool $hideHeader = false): bool
 {
     if (!is_array($status) || $status === []) {
@@ -24540,7 +24574,7 @@ function admin_notif_try_embed_status_card(?array $status, array $followingIds, 
     $statusId = (string) ($status['id'] ?? '');
     $fragLogical = $ownerUserId . '|' . $uri . '|h' . ($hideHeader ? '1' : '0') . '|f' . $flagBits
         . '|id' . $statusId;
-    $fragKey = 'vaak:notif-embed:v1:' . hash('sha256', $fragLogical);
+    $fragKey = 'vaak:notif-embed:v2:' . hash('sha256', $fragLogical);
 
     static $fragMemo = [];
     $track = static function (string $src) use ($fragKey): void {
@@ -24563,7 +24597,11 @@ function admin_notif_try_embed_status_card(?array $status, array $followingIds, 
     }
 
     // Prefer Axum fragment serve (0.6.90). '' = confirmed miss; null = try Redis.
-    $axumHtml = admin_notif_embed_axum_fetch($ownerUserId, $uri, $hideHeader, $flagBits, $statusId);
+    // Bluesky notification cards need the complete hydrated PHP PostView renderer
+    // until the native renderer matches its identity, controls and full markup.
+    $axumHtml = admin_notif_status_requires_php_bsky_render($status)
+        ? null
+        : admin_notif_embed_axum_fetch($ownerUserId, $uri, $hideHeader, $flagBits, $statusId);
     if (is_string($axumHtml) && $axumHtml !== '') {
         $fragMemo[$fragKey] = $axumHtml;
         $track('hit_axum');
@@ -27680,9 +27718,28 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     }
     .quote-block {
       margin-top: .55rem; padding: .65rem .8rem;
-      border-left: 3px solid var(--primary);
-      background: var(--panel-2); border-radius: 0 10px 10px 0;
-      color: var(--muted); white-space: pre-wrap; line-height: 1.4;
+      border: 1px solid var(--border);
+      background: var(--panel); border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      color: var(--text); white-space: pre-wrap; line-height: 1.4;
+    }
+    /* Shared Rust quotes already contain a post card: let that one card own
+       the chrome rather than adding a second border around its wrapper. */
+    .quote-block:has(> .notif-status-embed) {
+      padding: 0 !important; border: 0 !important;
+      background: transparent !important; border-radius: 0 !important;
+      box-shadow: none;
+    }
+    .quote-block > .notif-status-embed {
+      margin: 0; padding: 0; border: 0;
+    }
+    .quote-block > .notif-status-embed > article.tweet {
+      margin: 0; padding: .65rem .8rem;
+      border: 1px solid var(--border); border-radius: var(--radius);
+      background: var(--panel); box-shadow: var(--shadow); color: var(--text);
+    }
+    .quote-block > .notif-status-embed > article.tweet:hover {
+      background: var(--panel); border-color: #3a3a3a;
     }
     .quote-block--openable {
       cursor: pointer;
@@ -27690,8 +27747,12 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     }
     .quote-block--openable:hover,
     .quote-block--openable:focus-visible {
-      background: color-mix(in srgb, var(--panel-2) 70%, var(--primary-dim));
+      background: var(--panel); border-color: #3a3a3a;
       outline: none;
+    }
+    .quote-block--openable:focus-visible {
+      border-color: var(--primary); outline: 2px solid var(--primary);
+      outline-offset: 2px;
     }
     .quote-block .notification-snippet { white-space: pre-wrap; }
     .tweet-notif .quote-block { white-space: normal; }

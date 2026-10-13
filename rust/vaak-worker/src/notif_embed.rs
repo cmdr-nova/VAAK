@@ -1,4 +1,4 @@
-//! Mentions nested-card HTML fragments (`vaak:notif-embed:v1:*`).
+//! Mentions nested-card HTML fragments (`vaak:notif-embed:v2:*`).
 //!
 //! 0.6.89–0.6.90: Redis read + PHP lean paint.
 //! 0.6.91: on miss, resolve status JSON from the owner's Mentions Redis
@@ -34,7 +34,7 @@ pub fn frag_key(
     );
     let mut hasher = Sha256::new();
     hasher.update(logical.as_bytes());
-    format!("vaak:notif-embed:v1:{}", hex::encode(hasher.finalize()))
+    format!("vaak:notif-embed:v2:{}", hex::encode(hasher.finalize()))
 }
 
 fn uri_eq(a: &str, b: &str) -> bool {
@@ -47,7 +47,7 @@ pub async fn find_status_in_notif_envelopes(
     owner_id: i64,
     uri: &str,
 ) -> Result<Option<Value>> {
-    let pattern = format!("vaak:notifications:v1:{owner_id}:*");
+    let pattern = format!("vaak:notifications:v2:{owner_id}:*");
     // Owners keep a handful of Mentions keys — KEYS is fine at this scale.
     let keys: Vec<String> = redis::cmd("KEYS")
         .arg(&pattern)
@@ -4147,8 +4147,8 @@ mod tests {
     #[test]
     fn frag_key_parity_shape() {
         let k = frag_key(1, "https://example.com/a/", true, false, false, false, "");
-        assert!(k.starts_with("vaak:notif-embed:v1:"));
-        assert_eq!(k.len(), "vaak:notif-embed:v1:".len() + 64);
+        assert!(k.starts_with("vaak:notif-embed:v2:"));
+        assert_eq!(k.len(), "vaak:notif-embed:v2:".len() + 64);
     }
 
     #[test]
@@ -4460,6 +4460,21 @@ mod tests {
         assert!(html.contains("compose=1") && html.contains("reply_to="), "{html}");
         assert!(html.contains("view=dms&amp;peer="), "Fediverse overflow should offer DM: {html}");
         assert!(!html.contains(">Open</a></div>"), "Home should not be Open-only: {html}");
+    }
+
+    #[test]
+    fn mentions_reply_preserves_authored_paragraphs_after_one_generated_teaser() {
+        let status = json!({
+            "id":"fixture-reply", "uri":"https://reply.test/notes/1",
+            "vaak_in_reply_to_url":"https://mkultra.monster/users/fixture/notes/1",
+            "content":"<p>↩ First parent paragraph. Second parent paragraph.</p>\n<p>↩ Authored reply begins with an arrow.</p>\n<p>Second authored paragraph repeats Second parent paragraph.</p>",
+            "account":{"acct":"reply@reply.test","uri":"https://reply.test/users/reply"},
+            "media_attachments":[]
+        });
+        let html = paint_lean_embed_from(&status,true,"mentions","https://mkultra.monster/users/fixture",true);
+        assert!(!html.contains("First parent paragraph."), "generated teaser leaked: {html}");
+        assert!(html.contains("Authored reply begins with an arrow."), "author text removed: {html}");
+        assert!(html.contains("Second authored paragraph repeats Second parent paragraph."), "legitimate repeated parent-like text removed: {html}");
     }
 
     #[test]

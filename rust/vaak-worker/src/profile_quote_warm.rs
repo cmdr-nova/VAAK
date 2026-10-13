@@ -10,6 +10,9 @@ type GrantFuture<'a>=Pin<Box<dyn Future<Output=Result<()>>+Send+'a>>;
 type EffectFuture<'a>=Pin<Box<dyn Future<Output=Result<bool>>+Send+'a>>;
 /// Implemented only against current SQL source/owner/audience capabilities.
 pub(crate) trait CurrentQuoteGrant:Sync{fn require_current(&self)->GrantFuture<'_>;
+ fn bind_preview_text<'a>(&'a self,_text:&'a str)->GrantFuture<'a>{Box::pin(async{Ok(())})}
+ fn bind_preview_write_url<'a>(&'a self,_url:&'a str)->GrantFuture<'a>{Box::pin(async{Ok(())})}
+ #[cfg(test)] fn fixture_after_preview_write<'a>(&'a self,_db:&'a Client,_fetch:&'a crate::profile_preview_fetch::PreviewFetchContext,_now:chrono::DateTime<chrono::Utc>)->GrantFuture<'a>{Box::pin(async{Ok(())})}
  fn accept_preview_write(&self,_:&crate::profile_preview_fetch::PreviewCacheWrite)->Result<()>{anyhow::bail!("PHP fallback: preview SQL writer lacks receipt capability")}
  /// Remaining shared PHP-compatible request budget; absent means per-call timeout only.
  fn bsky_budget_remaining(&self)->Option<f64>{None}

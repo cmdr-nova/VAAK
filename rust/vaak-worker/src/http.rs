@@ -138,7 +138,7 @@ pub async fn serve(cfg: Config, bind: SocketAddr) -> Result<()> {
         .route("/shadow/jetstream", get(shadow_jetstream))
         .route("/shadow/thin-media", get(shadow_thin_media))
         .route("/shadow/timelines/home", get(shadow_home))
-        // Mentions nested status HTML fragments (PHP writes `vaak:notif-embed:v1:*`).
+        // Mentions nested status HTML fragments (PHP writes `vaak:notif-embed:v2:*`).
         .route("/shadow/notif-embed", get(shadow_notif_embed))
         // Mentions fill HTML from warm Redis list (0.7.1).
         .route("/shadow/mentions-html", get(shadow_mentions_html))
@@ -375,7 +375,7 @@ fn embed_html_response(html: String, source: &'static str) -> axum::response::Re
     (StatusCode::OK, headers, html).into_response()
 }
 
-/// Serve Mentions nested-card HTML from Redis (`vaak:notif-embed:v1:*`).
+/// Serve Mentions nested-card HTML from Redis (`vaak:notif-embed:v2:*`).
 /// Key parity with PHP `admin_notif_try_embed_status_card` (0.6.89).
 /// On miss (0.6.91): resolve status from Mentions envelopes and lean-paint in Rust.
 async fn shadow_notif_embed(

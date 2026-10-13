@@ -31,6 +31,14 @@ pub(crate) async fn resolve(db:&Client,dns:&dyn crate::direct_preview::PreviewDn
  // PHP extracts from the original incoming HTML even when current own/Ask
  // body facts replace its visible text. A missing URL still spends one attempt.
  let source_text=original_content.unwrap_or(&plain);
+ // No URL performs no cache/DNS/fetch/warm IO in the original PHP helper.
+ // The fresh grant above remains the only proof needed across this pure branch;
+ // enclosing admission still rechecks current facts before publication.
+ if crate::direct_preview::extract_url(source_text)?.is_none(){
+  if *budget>0{*budget-=1;}
+  return Ok(None)
+ }
+ grant.bind_preview_text(source_text).await?;
  let mut card=fetch.resolve_text(db,dns,source_text,false,facts.now,grant).await?;
  if card.is_none()&&*budget>0{*budget-=1;card=fetch.resolve_text(db,dns,source_text,true,facts.now,grant).await?;}
  if card.is_none(){fetch.warm_text(source_text,grant).await?;}

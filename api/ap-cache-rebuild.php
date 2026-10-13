@@ -66,6 +66,7 @@ $add = static function (string $pattern) use (&$patterns): void {
 };
 if ($scope === 'notifications' || $scope === 'all') {
     $add('vaak:notifications:v1:' . $ownerId . ':*');
+    $add('vaak:notifications:v2:' . $ownerId . ':*');
     $add('vaak:notifications:v1:unread:' . $ownerId . ':*');
 }
 if ($scope === 'timelines' || $scope === 'all') {

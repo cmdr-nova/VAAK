@@ -163,6 +163,7 @@ pub(crate) async fn emoji_maps(db:&Client,status:&Value)->Result<std::collection
 
 pub(crate) async fn avatar(db:&Client,status:&Value,actor:&str)->Result<String>{avatar_with_context(db,status,actor,None).await}
 pub(crate) async fn avatar_with_context(db:&Client,status:&Value,actor:&str,warm:Option<&crate::profile_enrichment::WarmContext>)->Result<String> {
+    #[cfg(test)] let _timing=crate::search_context::selection::fixture_performance::span("avatar_facts",1);
     if let Some(url)=warm.and_then(|context|context.cached_avatar(actor)){return Ok(url)}
     let result=avatar_current(db,status,actor,warm).await?;
     if let Some(context)=warm{context.cache_avatar(actor,&result)}
@@ -235,6 +236,7 @@ pub(crate) async fn ask_identity(db:&Client,mut ask:Value)->Result<Value>{
 }
 
 pub(crate) async fn resolve(db: &Client, owner_id: i64, owner_actor: &str, status: &Value, session: &impl PresentationSession, auto_unblur: bool) -> Result<CardFacts> {
+    #[cfg(test)] let _timing=crate::search_context::selection::fixture_performance::span("card_facts",1);
     let owner = db.query_one("SELECT actor_key,COALESCE(is_admin,0)::bigint FROM ap_users WHERE id::bigint=$1 AND disabled_at IS NULL", &[&owner_id]).await?;
     let key: String = owner.get(0); let admin = owner.get::<_,i64>(1) != 0;
     let st = status.get("reblog").filter(|v| v.is_object() && s(status,"content").is_empty()).unwrap_or(status);

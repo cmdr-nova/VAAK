@@ -72,11 +72,22 @@ impl TrustedSession {
 }
 impl crate::profile_enrichment::CurrentEnrichmentGrant for SelectedLibrarySearchSource {
  fn require_current<'a>(&'a self,db:&'a Client)->std::pin::Pin<Box<dyn std::future::Future<Output=Result<()>>+Send+'a>>{Box::pin(async move{SelectedLibrarySearchSource::require_current(self,db).await})}
+ fn accept_preview_write(&self,write:&crate::profile_preview_fetch::PreviewCacheWrite)->Result<()>{
+  match &self.inner{SelectedSurfaceSource::Search{association:Some(window),..}=>window.accept_preview_write(write),_=>anyhow::bail!("PHP fallback: selected surface lacks Search preview receipt capability")}
+ }
 }
 
 /// Current surface authority for the shared SQL projector. This capability is
 /// never deserialized and cannot be constructed from a cached presentation.
 pub(crate) struct SelectedLibrarySearchSource { inner: SelectedSurfaceSource,bsky_did:Option<String> }
+impl SelectedLibrarySearchSource {
+ pub(crate) async fn bind_search_preview_write_url(&self,db:&Client,url:&str)->Result<()>{
+  match &self.inner{SelectedSurfaceSource::Search{source,source_index,association:Some(window),..}=>window.bind_preview_write_url(db,*source_index,source,url).await,_=>anyhow::bail!("PHP fallback: cold Search preview writer lacks actual collector window")}
+ }
+ pub(crate) async fn bind_search_preview_text(&self,db:&Client,text:&str)->Result<()>{
+  match &self.inner{SelectedSurfaceSource::Search{source,source_index,association:Some(window),..}=>window.bind_preview_text(db,*source_index,source,text).await,_=>anyhow::bail!("PHP fallback: cold Search preview lacks actual collector window")}
+ }
+}
 pub(crate) fn has_bsky_source(value:&Value)->bool{
  if value.get("post").is_some_and(Value::is_object)||value.get("bsky_post").is_some_and(Value::is_object)||value.get("uri").and_then(Value::as_str).is_some_and(|uri|uri.starts_with("at://")){return true}
  match value{Value::Object(map)=>map.values().filter(|value|value.is_object()||value.is_array()).any(has_bsky_source),Value::Array(values)=>values.iter().any(has_bsky_source),_=>false}

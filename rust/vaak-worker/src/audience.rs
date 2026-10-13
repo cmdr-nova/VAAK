@@ -192,11 +192,60 @@ async fn audience_records(db: &Client, owner: i64, statuses: &[Value]) -> Result
     Ok((records, viewer, following))
 }
 
+/// Fresh full-page Search audience reads. This shares the original predicates
+/// and positional decoder; no permission results or prepared plans are cached.
+async fn search_audience_records(db:&Client,owner:i64,statuses:&[Value])->Result<(HashMap<String,Audience>,String,HashSet<String>)>{
+    // Guest/ownerless callers retain the original conditional-table contract.
+    if owner<=0{return audience_records(db,owner,statuses).await}
+    // Preserve the original conditional relation contract for inactive/empty
+    // viewers. This row is not permission: the batched statement rereads the
+    // viewer and its recipients/follows freshly in the same SQL snapshot.
+    let owner_row=db.query_opt("SELECT actor_id FROM ap_users WHERE id=$1::bigint AND disabled_at IS NULL",&[&owner]).await?;
+    if owner_row.as_ref().is_none_or(|row|key(&row.get::<_,String>(0)).is_empty()){return audience_records(db,owner,statuses).await}
+    let mut ids=HashSet::new();let mut aliases=HashSet::new();
+    for status in statuses{collect(status,&mut ids,0);collect_requested_quote_aliases(status,&mut aliases,0);}
+    let ids=ids.into_iter().collect::<Vec<_>>();
+    let variants=ids.iter().flat_map(|id|[id.clone(),format!("{id}/")]).collect::<Vec<_>>();
+    let aliases=aliases.into_iter().collect::<Vec<_>>();
+    const SEARCH_SQL:&str="WITH viewer AS (SELECT rtrim(split_part(btrim(actor_id,$4),'#',1),'/') AS actor FROM ap_users WHERE id=$1::bigint AND disabled_at IS NULL AND $1::bigint>0), event_rows AS (SELECT DISTINCT ON (rtrim(object_id,'/')) rtrim(object_id,'/') AS object_id,COALESCE(visibility,'public') AS visibility,rtrim(COALESCE(actor_id,''),'/') AS actor_id FROM events e WHERE (e.type IN ('Create','Update') OR (e.type IN ('Quote','QuotePost') AND NOT EXISTS(SELECT 1 FROM events note_source WHERE note_source.object_id IN (rtrim(e.object_id,'/'),rtrim(e.object_id,'/')||'/') AND note_source.type IN ('Create','Update')))) AND action_taken=ANY(ARRAY['log','local_observe','local_fav_update']) AND object_id=ANY($2) ORDER BY rtrim(object_id,'/'),id DESC), outbox_rows AS (SELECT id,COALESCE(visibility,'public') AS visibility,COALESCE(to_json,'[]') AS to_json,COALESCE(cc_json,'[]') AS cc_json FROM outbox_notes WHERE id=ANY($2)), alias_rows AS (SELECT DISTINCT rtrim(e.object_id,'/') AS object_id FROM events e WHERE rtrim(e.object_id,'/')=ANY($3) AND (e.type IN ('Delete','Tombstone') OR (e.type IN ('Create','Update') AND e.action_taken='deleted') OR (e.type='Announce' AND COALESCE(e.action_taken,'')<>'deleted' AND COALESCE(e.visibility,'public')<>'public' AND NOT EXISTS(SELECT 1 FROM events original WHERE rtrim(original.object_id,'/')=rtrim(e.object_id,'/') AND original.type IN ('Create','Update'))))), mention_rows AS (SELECT object_id FROM mentions WHERE owner_user_id=$1::bigint AND deleted_at IS NULL AND activity_type IN ('Create','Update','Quote','QuotePost') AND object_id=ANY($2) AND EXISTS(SELECT 1 FROM viewer WHERE actor<>'')), followed AS (SELECT rtrim(owner_actor_id,'/') AS actor FROM followers WHERE rtrim(actor_id,'/')=(SELECT actor FROM viewer LIMIT 1) AND EXISTS(SELECT 1 FROM viewer WHERE actor<>'') UNION SELECT rtrim(actor_id,'/') FROM following WHERE rtrim(owner_actor_id,'/')=(SELECT actor FROM viewer LIMIT 1) AND actor_id NOT LIKE 'https://mkultra.monster/users/%' AND EXISTS(SELECT 1 FROM viewer WHERE actor<>'')) SELECT (SELECT COALESCE(jsonb_agg(jsonb_build_array(object_id,visibility,actor_id)),'[]'::jsonb) FROM event_rows),(SELECT COALESCE(jsonb_agg(jsonb_build_array(id,visibility,to_json,cc_json)),'[]'::jsonb) FROM outbox_rows),(SELECT COALESCE(jsonb_agg(object_id),'[]'::jsonb) FROM alias_rows),(SELECT actor FROM viewer LIMIT 1),(SELECT COALESCE(jsonb_agg(object_id),'[]'::jsonb) FROM mention_rows),(SELECT COALESCE(jsonb_agg(actor),'[]'::jsonb) FROM followed)";
+    let whitespace=" \t\n\r\u{b}\u{c}\u{85}\u{a0}\u{1680}\u{2000}\u{2001}\u{2002}\u{2003}\u{2004}\u{2005}\u{2006}\u{2007}\u{2008}\u{2009}\u{200a}\u{2028}\u{2029}\u{202f}\u{205f}\u{3000}";
+    // Execute anew on the current Client/schema for every original boundary.
+    // No profile_plan invocation: relation replacement/errors remain observable.
+    #[cfg(test)] let _timing=crate::search_context::selection::fixture_performance::span("search_audience_one_SQL",statuses.len());
+    let row=db.query_one(SEARCH_SQL,&[&owner,&variants,&aliases,&whitespace]).await?;
+    let mut records=HashMap::new();
+    let events:Value=row.try_get(0)?;
+    for event in events.as_array().ok_or_else(||anyhow::anyhow!("invalid Search event audience rows"))?{
+        records.insert(event[0].as_str().ok_or_else(||anyhow::anyhow!("invalid Search event URI"))?.into(),Audience{visibility:event[1].as_str().ok_or_else(||anyhow::anyhow!("invalid Search event visibility"))?.into(),author:event[2].as_str().ok_or_else(||anyhow::anyhow!("invalid Search event author"))?.into(),..Default::default()});
+    }
+    let outbox:Value=row.try_get(1)?;
+    let mut local_aliases=HashMap::<String,(String,HashSet<String>)>::new();
+    // Equal canonical/slash audiences preserve original semantics regardless
+    // of unspecified whole-table scan order. Conflicting audiences explicitly
+    // refuse native admission and preserve the genuine PHP fallback winner.
+    for note in outbox.as_array().ok_or_else(||anyhow::anyhow!("invalid Search outbox audience rows"))?{
+        let id=key(note[0].as_str().ok_or_else(||anyhow::anyhow!("invalid Search outbox URI"))?);let mut recipients=HashSet::new();
+        for column in [2,3]{if let Ok(Value::Array(values))=serde_json::from_str::<Value>(note[column].as_str().ok_or_else(||anyhow::anyhow!("invalid Search recipient text"))?){for value in values{if let Some(recipient)=value.as_str(){recipients.insert(key(recipient));}}}}
+        let visibility=note[1].as_str().ok_or_else(||anyhow::anyhow!("invalid Search local visibility"))?;
+        let effective=(visibility.trim().to_ascii_lowercase(),recipients.clone());
+        if let Some(previous)=local_aliases.insert(id.clone(),effective.clone()){anyhow::ensure!(previous==effective,"PHP fallback: conflicting canonical/slash Search audience rows");}
+        let author=id.split("/notes/").next().unwrap_or("").to_owned();records.insert(id,Audience{visibility:visibility.into(),author,recipients,denied:false});
+    }
+    let denied:Value=row.try_get(2)?;
+    for alias in denied.as_array().ok_or_else(||anyhow::anyhow!("invalid Search requested aliases"))?{records.insert(alias.as_str().ok_or_else(||anyhow::anyhow!("invalid Search denied URI"))?.into(),Audience{denied:true,..Default::default()});}
+    let viewer=row.try_get::<_,Option<String>>(3)?.unwrap_or_default();
+    let mentions:Value=row.try_get(4)?;
+    for mention in mentions.as_array().ok_or_else(||anyhow::anyhow!("invalid Search delivered audiences"))?{if let Some(record)=records.get_mut(&key(mention.as_str().ok_or_else(||anyhow::anyhow!("invalid Search delivered URI"))?)){record.recipients.insert(viewer.clone());}}
+    let followed:Value=row.try_get(5)?;
+    let following=followed.as_array().ok_or_else(||anyhow::anyhow!("invalid Search following audiences"))?.iter().map(|actor|actor.as_str().map(str::to_owned).ok_or_else(||anyhow::anyhow!("invalid Search following URI"))).collect::<Result<HashSet<_>>>()?;
+    Ok((records,viewer,following))
+}
+
 /// Positional decisions from the same bounded current-record engine. No source
 /// JSON is stamped or matched back to another snapshot.
 pub(crate) async fn admission_mask(db:&Client,owner:i64,surface:Surface,statuses:&[Value])->Result<Vec<bool>> {
     if statuses.is_empty(){return Ok(Vec::new())}
-    let (records,viewer,following)=audience_records(db,owner,statuses).await?;
+    let (records,viewer,following)=if matches!(surface,Surface::Search){search_audience_records(db,owner,statuses).await?}else{audience_records(db,owner,statuses).await?};
     Ok(positional_decisions(statuses,&records,&viewer,&following,surface))
 }
 fn positional_decisions(statuses:&[Value],records:&HashMap<String,Audience>,viewer:&str,following:&HashSet<String>,surface:Surface)->Vec<bool>{
@@ -205,7 +254,7 @@ fn positional_decisions(statuses:&[Value],records:&HashMap<String,Audience>,view
 
 pub async fn filter_statuses(db: &Client, owner: i64, surface: Surface, statuses: &mut Vec<Value>) -> Result<()> {
     if statuses.is_empty() { return Ok(()); }
-    let (records,viewer,following)=audience_records(db,owner,statuses).await?;
+    let (records,viewer,following)=if matches!(surface,Surface::Search){search_audience_records(db,owner,statuses).await?}else{audience_records(db,owner,statuses).await?};
     statuses.retain(|st| tree_allowed(st, &records, &viewer, &following, surface, 0));
     // Direct-reference painters preserve canonical source labels/actions.
     // Current records above still decide every grant, including nested targets.
@@ -408,3 +457,7 @@ pub async fn filter_notifications(db: &Client, owner: i64, items: &mut Vec<Value
     });
     Ok(())
 }
+
+#[cfg(test)]
+#[path="search_batch_audience_fixture.rs"]
+pub(crate) mod batch_differential;

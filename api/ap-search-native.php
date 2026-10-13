@@ -147,8 +147,9 @@ function ap_search_native_validate_reply(array $reply, array $counts, int $initi
 }
 
 /** All selected sections succeed together, or the caller paints its original PHP rows. */
-function ap_search_native_render_batch(array $accounts, array $hashtags, array $statuses, ?array $collector = null): ?array
+function ap_search_native_render_batch(array $accounts, array $hashtags, array $statuses, ?array $collector = null, ?array $components = null): ?array
 {
+    $GLOBALS['vaak_search_native_attempted'] = false;
     if (!ap_search_native_enabled() || !function_exists('ap_auth_current_user')
         || !function_exists('ap_auth_csrf_token') || !function_exists('curl_init')) {
         return null;
@@ -186,7 +187,7 @@ function ap_search_native_render_batch(array $accounts, array $hashtags, array $
             'bsky_budget_deadline' => $bskyRemaining === null ? null : microtime(true) + $bskyRemaining,
             'owner_id' => (int) $user['id'], 'csrf' => ap_auth_csrf_token(),
             'bsky_enabled' => function_exists('ap_bsky_tab_enabled') && ap_bsky_tab_enabled(),
-            'accounts' => $accounts, 'hashtags' => $hashtags, 'statuses' => $assembled, 'collector' => $collector,
+            'accounts' => $accounts, 'hashtags' => $hashtags, 'statuses' => $assembled, 'collector' => $collector, 'component_collector' => $components,
             'bsky_bookmarks' => ap_search_native_bsky_bookmark_states($assembled, (int) $user['id'])],
             JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
         if (strlen($body) > 2 * 1024 * 1024) {
@@ -209,6 +210,7 @@ function ap_search_native_render_batch(array $accounts, array $hashtags, array $
             },
             CURLOPT_CONNECTTIMEOUT_MS => 200, CURLOPT_TIMEOUT_MS => 3000,
             CURLOPT_PROXY => '', CURLOPT_PROTOCOLS => CURLPROTO_HTTP]);
+        $GLOBALS['vaak_search_native_attempted'] = true;
         $success = curl_exec($handle);
         $code = curl_getinfo($handle, CURLINFO_RESPONSE_CODE);
         curl_close($handle);
