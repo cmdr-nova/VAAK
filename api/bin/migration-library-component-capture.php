@@ -41,20 +41,47 @@ $mentions=[];
 foreach (['full'=>['Hello @Alice@remote.test',[['acct'=>'Alice@remote.test','username'=>'Alice','url'=>'https://remote.test/users/Alice']]],'bare'=>['Hello @Alice and #Rust',[['acct'=>'Alice@remote.test','username'=>'Alice','url'=>'https://remote.test/users/Alice']]],'local'=>['Hello @bob@mkultra.monster',[['acct'=>'bob@mkultra.monster','username'=>'bob','url'=>'https://mkultra.monster/users/bob']]],'self'=>['Hello @fixture@mkultra.monster',[['acct'=>'fixture@mkultra.monster','username'=>'fixture','url'=>'https://mkultra.monster/users/fixture']]],'bsky'=>['Hello @alice.bsky.test',[['acct'=>'alice.bsky.test','username'=>'alice.bsky.test','url'=>'https://bsky.app/profile/did:plc:alice']]],'protected'=>['Code `@Alice` https://example.test/@Alice @Alice',[['acct'=>'Alice@remote.test','username'=>'Alice','url'=>'https://remote.test/users/Alice']]]] as $name=>[$text,$rows]) {
     $mentions[$name]=['text'=>$text,'mentions'=>$rows,'html'=>admin_linkify_body_html($text,'bookmarks',$rows)];
 }
+function reference_render_card(array $st): array
+{
+    // created_at is two hours behind the captured clock, in the middle of the
+    // hour bucket, so a one-second tick during render cannot change "2h".
+    $clock = time();
+    $stable = gmdate('c', $clock - 7200);
+    $st['created_at'] = $stable;
+    if (isset($st['quote']['quoted_status']) && is_array($st['quote']['quoted_status'])) {
+        $st['quote']['quoted_status']['created_at'] = $stable;
+    }
+    $GLOBALS['fixture_render_clock'] = $clock;
+    ob_start();
+    admin_render_masto_status_card($st, [], 'bookmarks');
+    $html = (string) ob_get_clean();
+    unset($GLOBALS['fixture_render_clock']);
+    return ['status' => $st, 'rendered_at' => $clock, 'html' => $html, 'avatar' => admin_actor_avatar_url($st['account']['uri'])];
+}
 $degradedcards=[];
 foreach (['flag_body'=>['vaak_degraded'=>true,'vaak_degraded_reason'=>'half_parsed'],'create'=>['content'=>'','vaak_degraded'=>true,'vaak_degraded_reason'=>'fetch_failed'],'boost'=>['content'=>'','vaak_degraded'=>true,'vaak_degraded_reason'=>'announce_only','vaak_announce_event_id'=>7]] as $name=>$changes) {
-    $st=array_replace($captures['plain']['status'],$changes);$renderedAt=time();ob_start();admin_render_masto_status_card($st,[],'bookmarks');$html=ob_get_clean();
-    $degradedcards[$name]=['status'=>$st,'rendered_at'=>$renderedAt,'html'=>$html,'avatar'=>admin_actor_avatar_url($st['account']['uri'])];
+    $degradedcards[$name]=reference_render_card(array_replace($captures['plain']['status'],$changes));
 }
 $accountrefs=[];
 foreach (['canonical'=>['uri'=>'https://actor.test/users/alice','url'=>'https://actor.test/@alice'],'web'=>['uri'=>'https://actor.test/@alice','url'=>'https://actor.test/@alice'],'url'=>['url'=>'https://actor.test/@caf%C3%A9'],'reserved'=>['url'=>'https://actor.test/@alice%2F'],'double'=>['url'=>'https://actor.test/@alice%252F'],'invalid'=>['url'=>'https://actor.test/@alice%FF'],'opaque'=>['uri'=>'did:plc:alice'],'empty'=>[]] as $name=>$account)$accountrefs[$name]=['account'=>$account,'actor'=>admin_account_actor_ref($account)];
-$now = time();
 $times = [];
-foreach (['seconds'=>25,'minute'=>80,'hour'=>3900,'day'=>90000,'week'=>604800,'month'=>2678400,'year'=>31622400,'future'=>-90] as $name=>$offset) {
-    $iso = gmdate('c', $now - $offset);
-    $times[$name] = ['input'=>$iso,'html'=>relative_time($iso)];
+$now = 0;
+for ($attempt = 0; $attempt < 8; $attempt++) {
+    $now = time();
+    $built = [];
+    foreach (['seconds'=>25,'minute'=>80,'hour'=>3900,'day'=>90000,'week'=>604800,'month'=>2678400,'year'=>31622400,'future'=>-90] as $name=>$offset) {
+        $iso = gmdate('c', $now - $offset);
+        $built[$name] = ['input'=>$iso,'html'=>relative_time($iso)];
+    }
+    foreach (['empty'=>'','malformed'=>'not a timestamp','sql_date'=>gmdate('Y-m-d H:i:s',$now-7200),'rfc2822'=>gmdate(DATE_RFC2822,$now-7200)] as $name=>$iso) $built[$name]=['input'=>$iso,'html'=>relative_time($iso)];
+    if (time() === $now) {
+        $times = $built;
+        break;
+    }
 }
-foreach (['empty'=>'','malformed'=>'not a timestamp','sql_date'=>gmdate('Y-m-d H:i:s',$now-7200),'rfc2822'=>gmdate(DATE_RFC2822,$now-7200)] as $name=>$iso) $times[$name]=['input'=>$iso,'html'=>relative_time($iso)];
+if ($times === []) {
+    throw new RuntimeException('relative time fixture crossed a second boundary');
+}
 $mediaInputs = [
     'image'=>[['url'=>'https://cdn.test/photo.jpg','preview_url'=>'https://cdn.test/thumb.jpg','description'=>'a <bright> photo']],
     'video'=>[['url'=>'https://cdn.test/movie.mp4','preview_url'=>'https://cdn.test/poster.png','type'=>'video','mediaType'=>'video/mp4']],
@@ -150,22 +177,20 @@ ap_db()->exec('UPDATE actor_profile SET auto_unblur_sensitive=0');
 foreach(['qt_comment'=>"Comment\n↪ QT: quoted body",'dump'=>'{ "type":"Note","attributedTo":"x" }','placeholder'=>'(media)','re_url'=>"RE: https://example.test/posts/q\nComment",'html_blocks'=>'<p>First</p><p>Second<br>Third</p>','same_quote'=>'Quoted body'] as $name=>$content){
     $st=$captures['plain']['status'];$st['content']=$content;
     if($name==='same_quote')$st['quote']=['state'=>'accepted','quoted_status'=>array_replace($st,['id'=>'https://quoted.test/posts/q','uri'=>'https://quoted.test/posts/q','url'=>'https://quoted.test/posts/q','content'=>'Quoted body','account'=>['uri'=>'https://quoted.test/users/quoted','acct'=>'quoted@quoted.test']])];
-    $renderedAt=time();ob_start();admin_render_masto_status_card($st,[],'bookmarks');$html=ob_get_clean();
-    $rawQuoteCards[$name]=['status'=>$st,'rendered_at'=>$renderedAt,'html'=>$html,'avatar'=>admin_actor_avatar_url($st['account']['uri'])];
+    $rawQuoteCards[$name]=reference_render_card($st);
 }
 foreach(['fallback','pending','accepted'] as $state){
     $st=$captures['plain']['status'];$st['content']="Comment\n↪ QT: quoted body";
     $st['quote']=['state'=>$state,'quoted_status'=>array_replace($st,['id'=>'https://quoted.test/posts/q','uri'=>'https://quoted.test/posts/q','url'=>'https://quoted.test/posts/q','content'=>'Quoted body','quote'=>null,'account'=>['uri'=>'https://quoted.test/users/quoted','acct'=>'quoted@quoted.test']])];
-    $renderedAt=time();$GLOBALS['fixture_render_clock']=$renderedAt;ob_start();admin_render_masto_status_card($st,[],'bookmarks');$html=ob_get_clean();unset($GLOBALS['fixture_render_clock']);
-    $rawQuoteCards['assembled_'.$state]=['status'=>$st,'rendered_at'=>$renderedAt,'html'=>$html,'avatar'=>admin_actor_avatar_url($st['account']['uri'])];
+    $rawQuoteCards['assembled_'.$state]=reference_render_card($st);
 }
 reference_load(dirname(__DIR__).'/ap-inbox.php',['ap_quote_post_parent_url','ap_object_url_lookup_candidates']);
 $urlAliases=[];
 foreach([['https://a.test/@alice/123','https://a.test/ap/users/42/statuses/123'],['https://a.test/@alice/opaque','https://a.test/users/alice/posts/opaque'],['https://a.test/@alice/opaque','https://a.test/notes/opaque'],['https://a.test/statuses/q/QuotePost','https://a.test/statuses/q'],['https://a.test/notes/q/activity','https://a.test/notes/q'],['https://a.test/@Alice/123/','https://A.test/@alice/123'],['https://a.test/notes/123','https://b.test/notes/123'],['https://a.test/notes/123','https://a.test/notes/124'],['http://a.test/notes/q','http://a.test/notes/q']] as [$a,$b])$urlAliases[]=['a'=>$a,'b'=>$b,'equivalent'=>admin_status_urls_equivalent($a,$b)];
 foreach(['same'=>'https://quoted.test/users/quoted/statuses/123','snowflake'=>'https://quoted.test/@quoted/123','different'=>'https://article.test/read'] as $name=>$cardUrl){
     $st=$captures['plain']['status'];$st['content']='Comment';$st['quote']=['state'=>'accepted','quoted_status'=>array_replace($st,['uri'=>'https://quoted.test/users/quoted/statuses/123','url'=>'https://quoted.test/@quoted/123','content'=>'Quoted body','account'=>['uri'=>'https://quoted.test/users/quoted','acct'=>'quoted@quoted.test']])];
-    $st['card']=['url'=>$cardUrl,'title'=>'Link','description'=>'Description'];$renderedAt=time();$GLOBALS['fixture_render_clock']=$renderedAt;ob_start();admin_render_masto_status_card($st,[],'bookmarks');$html=ob_get_clean();unset($GLOBALS['fixture_render_clock']);
-    $rawQuoteCards['og_'.$name]=['status'=>$st,'rendered_at'=>$renderedAt,'html'=>$html,'avatar'=>admin_actor_avatar_url($st['account']['uri'])];
+    $st['card']=['url'=>$cardUrl,'title'=>'Link','description'=>'Description'];
+    $rawQuoteCards['og_'.$name]=reference_render_card($st);
 }
 foreach (["\u{00A0}", "\u{2009}", "\u{00A0} Answer \u{00A0}", "\u{2009} Answer \u{2009}"] as $i => $answer) {
     $row = ['question'=>'Current question', 'answer'=>$answer, 'asker_label'=>'Tester'];
@@ -173,9 +198,7 @@ foreach (["\u{00A0}", "\u{2009}", "\u{00A0} Answer \u{00A0}", "\u{2009} Answer \
     $asks['unicode_question_'.$i]=['row'=>$qrow,'html'=>ap_ask_card_html($qrow)];
     $asks['unicode_answer_'.$i] = ['row'=>$row, 'html'=>ap_ask_card_html($row)];
     $st=$captures['plain']['status']; $st['content']='Old body'; $st['vaak_ask']=$row;
-    $renderedAt=time(); $GLOBALS['fixture_render_clock']=$renderedAt;
-    ob_start(); admin_render_masto_status_card($st,[], 'bookmarks'); $html=ob_get_clean(); unset($GLOBALS['fixture_render_clock']);
-    $rawQuoteCards['unicode_ask_'.$i]=['status'=>$st,'rendered_at'=>$renderedAt,'html'=>$html,'avatar'=>admin_actor_avatar_url($st['account']['uri'])];
+    $rawQuoteCards['unicode_ask_'.$i]=reference_render_card($st);
     $htmlPlain[]=['input'=>$answer,'plain'=>ap_html_to_plain_text($answer)];
     $rawQuotes[]=['input'=>$answer,'quoted'=>null,'looks'=>ap_text_looks_like_as2_json($answer),'scrub'=>ap_text_scrub_as2_dump($answer),'plain'=>ap_plain_strip_raw_quote_lines($answer)];
 }

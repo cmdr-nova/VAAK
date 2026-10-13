@@ -1,0 +1,23 @@
+# Install on the production host as root:
+#   visudo -cf deploy/vaak-deploy.sudoers
+#   install -m 0440 -o root -g root deploy/vaak-deploy.sudoers /etc/sudoers.d/vaak-deploy
+#
+# vaak-deploy may restart these units and nothing else. No shell, no reboot,
+# no daemon-reload, no systemctl edit, and no restart of unrelated services.
+# Template instances such as ap-bsky-jetstream@0.service are not listed; add
+# one explicit line per instance only after confirming it is a VAAK unit.
+
+Defaults:vaak-deploy !requiretty
+
+vaak-deploy ALL=(root) NOPASSWD: /usr/bin/systemctl restart php8.3-fpm.service
+vaak-deploy ALL=(root) NOPASSWD: /usr/bin/systemctl restart vaak-redis-queue-worker.service
+vaak-deploy ALL=(root) NOPASSWD: /usr/bin/systemctl restart vaak-worker-notif.service
+vaak-deploy ALL=(root) NOPASSWD: /usr/bin/systemctl restart vaak-worker-notif-list.service
+vaak-deploy ALL=(root) NOPASSWD: /usr/bin/systemctl restart vaak-worker-ranked-warm.service
+vaak-deploy ALL=(root) NOPASSWD: /usr/bin/systemctl restart vaak-worker-thin-warm.service
+vaak-deploy ALL=(root) NOPASSWD: /usr/bin/systemctl restart vaak-worker-actor-warm.service
+vaak-deploy ALL=(root) NOPASSWD: /usr/bin/systemctl restart vaak-worker-ap-actor-warm.service
+vaak-deploy ALL=(root) NOPASSWD: /usr/bin/systemctl restart vaak-worker-timeline-fanout.service
+vaak-deploy ALL=(root) NOPASSWD: /usr/bin/systemctl restart vaak-worker-shadow-http.service
+vaak-deploy ALL=(root) NOPASSWD: /usr/bin/systemctl restart vaak-worker-shadow.service
+vaak-deploy ALL=(root) NOPASSWD: /usr/bin/systemctl restart ap-bsky-jetstream.service
