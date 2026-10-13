@@ -1,0 +1,297 @@
+# Manual production deploy for VAAK. This file is the only workflow this change adds.
+# The build stays on a GitHub-hosted runner. Activation runs on the production
+# self-hosted runner (labels self-hosted, vaak-prod) as vaak-deploy. There is
+# no inbound SSH.
+name: Deploy production
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: Deploy a main commit, or roll back to a release already on the server
+        type: choice
+        options:
+          - deploy
+          - rollback
+        default: deploy
+      sha:
+        description: Full 40-character commit on main. Empty deploys the current main HEAD.
+        required: false
+        default: ""
+      version_bump:
+        description: >
+          increment advances the VAAK counter (0.8.45 to 0.8.46, 0.8.99 to 0.9.00)
+          and commits it. none ships the version already in api/ap-version.php.
+        type: choice
+        options:
+          - increment
+          - none
+        default: increment
+      rollback_to:
+        description: Git SHA or version (0.8.45) of a release directory already on the server
+        required: false
+        default: ""
+
+concurrency:
+  group: vaak-production-deploy
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  checks: read
+  actions: write
+
+jobs:
+  vaak-deploy-guard:
+    name: vaak-deploy-guard
+    if: inputs.action == 'deploy'
+    runs-on: ubuntu-24.04
+    outputs:
+      sha: ${{ steps.resolve.outputs.sha }}
+      version: ${{ steps.resolve.outputs.version }}
+      next_version: ${{ steps.resolve.outputs.next_version }}
+    steps:
+      - name: Fetch main
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Require a main commit whose CI passed
+        id: resolve
+        env:
+          INPUT_SHA: ${{ inputs.sha }}
+          VERSION_BUMP: ${{ inputs.version_bump }}
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          if [[ -z "${INPUT_SHA}" ]]; then
+            SHA="$(git rev-parse origin/main)"
+          else
+            [[ "${INPUT_SHA}" =~ ^[0-9a-f]{40}$ ]] || { echo "sha must be 40 hex characters" >&2; exit 1; }
+            git cat-file -e "${INPUT_SHA}^{commit}"
+            git merge-base --is-ancestor "${INPUT_SHA}" origin/main
+            SHA="${INPUT_SHA}"
+          fi
+          python3 deploy/test_bump_version.py
+          python3 deploy/test_require_green_ci.py
+          python3 deploy/test_restart_plan.py
+          python3 deploy/require_green_ci.py --sha "${SHA}"
+          git checkout --detach "${SHA}"
+          python3 deploy/bump_version.py --check
+          CURRENT="$(python3 deploy/bump_version.py --print-current)"
+          NEXT="$(python3 deploy/bump_version.py --print-next)"
+          if [[ "${VERSION_BUMP}" == "none" ]]; then
+            SHIP="${CURRENT}"
+          else
+            SHIP="${NEXT}"
+          fi
+          {
+            echo "sha=${SHA}"
+            echo "version=${CURRENT}"
+            echo "next_version=${SHIP}"
+          } >> "${GITHUB_OUTPUT}"
+          {
+            echo "### VAAK deploy"
+            echo "Commit \`${SHA}\` is on main and CI is green."
+            echo "Live counter \`${CURRENT}\`. This run ships \`${SHIP}\` (\`${VERSION_BUMP}\`)."
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+  vaak-deploy-build:
+    name: vaak-deploy-build
+    needs: vaak-deploy-guard
+    if: inputs.action == 'deploy'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out the CI-green commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.vaak-deploy-guard.outputs.sha }}
+          persist-credentials: false
+
+      - name: Build the worker on Debian bookworm
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -e "HOST_UID=$(id -u)" \
+            -e "HOST_GID=$(id -g)" \
+            -v "${GITHUB_WORKSPACE}:/src" \
+            -w /src \
+            debian:bookworm-slim \
+            bash /src/deploy/ci-build-worker.sh
+
+      - name: Upload the worker binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: vaak-worker-bin
+          path: vaak-worker.bin
+          if-no-files-found: error
+          retention-days: 1
+
+  vaak-deploy-ship:
+    name: vaak-deploy-ship
+    needs: [vaak-deploy-guard, vaak-deploy-build]
+    if: github.event_name == 'workflow_dispatch' && github.repository == 'cmdr-nova/VAAK' && github.ref == 'refs/heads/main' && inputs.action == 'deploy'
+    runs-on: [self-hosted, vaak-prod]
+    environment: production
+    timeout-minutes: 90
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      sha: ${{ steps.version.outputs.sha }}
+    steps:
+      - name: Refuse anything except a manual production deploy
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REPOSITORY: ${{ github.repository }}
+          REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          [[ "${EVENT_NAME}" == "workflow_dispatch" ]]
+          [[ "${REPOSITORY}" == "cmdr-nova/VAAK" ]]
+          [[ "${REF}" == "refs/heads/main" ]]
+
+      - name: Check out the CI-green commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.vaak-deploy-guard.outputs.sha }}
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Publish the version commit
+        id: version
+        env:
+          GUARD_SHA: ${{ needs.vaak-deploy-guard.outputs.sha }}
+          VERSION_BUMP: ${{ inputs.version_bump }}
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          [[ "$(git rev-parse origin/main)" == "${GUARD_SHA}" ]] || {
+            echo "main moved after the CI check; run the deploy again" >&2
+            exit 1
+          }
+          git checkout --detach "${GUARD_SHA}"
+          if [[ "${VERSION_BUMP}" == "increment" ]]; then
+            DATE="$(date -u +%F)"
+            VERSION="$(python3 deploy/bump_version.py --increment --date "${DATE}" --commit "${GUARD_SHA}")"
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add api/ap-version.php README.md rust/README.md "docs/RELEASE-${VERSION}.md"
+            git diff --cached --quiet && { echo "version bump produced no changes" >&2; exit 1; }
+            git commit -m "Release VAAK alpha ${VERSION}"
+            git push origin "HEAD:refs/heads/main"
+            SHA="$(git rev-parse HEAD)"
+            python3 deploy/require_green_ci.py --sha "${SHA}" --wait --timeout-seconds 1500
+          else
+            VERSION="$(python3 deploy/bump_version.py --print-current)"
+            SHA="${GUARD_SHA}"
+          fi
+          [[ "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]{2}$ ]]
+          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
+          echo "sha=${SHA}" >> "${GITHUB_OUTPUT}"
+
+      - name: Download the worker binary
+        uses: actions/download-artifact@v4
+        with:
+          name: vaak-worker-bin
+          path: ${{ github.workspace }}/worker-artifact
+
+      - name: Assemble and activate
+        env:
+          RELEASE_SHA: ${{ steps.version.outputs.sha }}
+        run: |
+          set -euo pipefail
+          [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]
+          [[ "${GITHUB_REPOSITORY}" == "cmdr-nova/VAAK" ]]
+          bash deploy/assemble-release.sh \
+            --binary "${GITHUB_WORKSPACE}/worker-artifact/vaak-worker.bin" \
+            --revision "${RELEASE_SHA}" \
+            --output "${GITHUB_WORKSPACE}/dist-release"
+          tar -C "${GITHUB_WORKSPACE}/dist-release" -czf "${GITHUB_WORKSPACE}/vaak-release.tar.gz" .
+          if tar -tzf "${GITHUB_WORKSPACE}/vaak-release.tar.gz" | grep -E '(^|/)\.\.(/|$)|^/'; then
+            echo "release tarball has an unsafe path" >&2
+            exit 1
+          fi
+          PREV="$(cat /srv/mkultra/vaak-releases/live-revision 2>/dev/null || true)"
+          if [[ ! "${PREV}" =~ ^[0-9a-f]{40}$ ]] || ! git cat-file -e "${PREV}^{commit}" 2>/dev/null; then
+            export VAAK_RESTART_JETSTREAM=1
+            export VAAK_RESTART_SHADOW=1
+          else
+            eval "$(git diff --name-only "${PREV}" "${RELEASE_SHA}" | python3 deploy/restart_plan.py)"
+            export VAAK_RESTART_JETSTREAM VAAK_RESTART_SHADOW
+          fi
+          bash deploy/remote/vaak-release-activate.sh deploy "${GITHUB_WORKSPACE}/vaak-release.tar.gz"
+
+  vaak-deploy-release:
+    name: vaak-deploy-release
+    needs: vaak-deploy-ship
+    if: github.event_name == 'workflow_dispatch' && github.repository == 'cmdr-nova/VAAK' && github.ref == 'refs/heads/main' && inputs.action == 'deploy'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out the deployed commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.vaak-deploy-ship.outputs.sha }}
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Tag and publish the GitHub release
+        env:
+          VERSION: ${{ needs.vaak-deploy-ship.outputs.version }}
+          RELEASE_SHA: ${{ needs.vaak-deploy-ship.outputs.sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git fetch origin "refs/tags/v${VERSION}:refs/tags/v${VERSION}" || true
+          if git rev-parse -q --verify "refs/tags/v${VERSION}" >/dev/null; then
+            TARGET="$(git rev-list -n 1 "v${VERSION}")"
+            [[ "${TARGET}" == "${RELEASE_SHA}" ]] || {
+              echo "tag v${VERSION} already points at ${TARGET}" >&2
+              exit 1
+            }
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git tag -a "v${VERSION}" -m "VAAK alpha ${VERSION}" "${RELEASE_SHA}"
+            git push origin "refs/tags/v${VERSION}"
+          fi
+          if gh release view "v${VERSION}" >/dev/null 2>&1; then
+            echo "GitHub release v${VERSION} already exists"
+          else
+            gh release create "v${VERSION}" \
+              --target "${RELEASE_SHA}" \
+              --title "VAAK alpha ${VERSION}" \
+              --notes-file "docs/RELEASE-${VERSION}.md"
+          fi
+
+  vaak-deploy-rollback:
+    name: vaak-deploy-rollback
+    if: github.event_name == 'workflow_dispatch' && github.repository == 'cmdr-nova/VAAK' && github.ref == 'refs/heads/main' && inputs.action == 'rollback'
+    runs-on: [self-hosted, vaak-prod]
+    environment: production
+    timeout-minutes: 20
+    steps:
+      - name: Check out the activate script
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Roll back to an installed release
+        env:
+          ROLLBACK_TO: ${{ inputs.rollback_to }}
+        run: |
+          set -euo pipefail
+          [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]
+          [[ "${GITHUB_REPOSITORY}" == "cmdr-nova/VAAK" ]]
+          [[ "${GITHUB_REF}" == "refs/heads/main" ]]
+          [[ "${ROLLBACK_TO}" =~ ^([0-9a-f]{40}|legacy-[0-9]{8}T[0-9]{6}Z|[0-9]+\.[0-9]+\.[0-9]{2}|v[0-9]+\.[0-9]+\.[0-9]{2})$ ]] || {
+            echo "rollback_to must be a git sha or a version such as 0.8.45" >&2
+            exit 1
+          }
+          unset VAAK_RESTART_JETSTREAM VAAK_RESTART_SHADOW
+          bash deploy/remote/vaak-release-activate.sh rollback "${ROLLBACK_TO}"
