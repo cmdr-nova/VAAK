@@ -49,6 +49,47 @@ struct Audience {
 
 fn key(uri: &str) -> String { uri.trim().split('#').next().unwrap_or("").trim_end_matches('/').to_string() }
 
+/// Offline decision used by the parity harness. Records are the durable map
+/// `audience_records` would have built; this does not open a database.
+pub(crate) fn replay_surface(name: &str) -> Option<Surface> {
+    Some(match name {
+        "home" => Surface::Home,
+        "profile" => Surface::Profile,
+        "local" => Surface::Local,
+        "federated" => Surface::Federated,
+        "library" => Surface::Library,
+        "search" => Surface::Search,
+        "direct" => Surface::Direct,
+        _ => return None,
+    })
+}
+
+pub(crate) struct ReplayRecord {
+    pub denied: bool,
+    pub visibility: String,
+    pub author: String,
+    pub recipients: Vec<String>,
+}
+
+pub(crate) fn replay_decision(
+    status: &Value,
+    records: &HashMap<String, ReplayRecord>,
+    viewer: &str,
+    following: &[String],
+    surface: Surface,
+) -> bool {
+    let records = records.iter().map(|(id, record)| {
+        (key(id), Audience {
+            denied: record.denied,
+            visibility: record.visibility.clone(),
+            author: key(&record.author),
+            recipients: record.recipients.iter().map(|recipient| key(recipient)).collect(),
+        })
+    }).collect();
+    let following = following.iter().map(|actor| key(actor)).collect();
+    tree_allowed(status, &records, &key(viewer), &following, surface, 0)
+}
+
 fn allowed(a: &Audience, viewer: &str, following: &HashSet<String>, surface: Surface, nested: bool) -> bool {
     if a.denied { return false; }
     let vis = a.visibility.trim().to_ascii_lowercase();
