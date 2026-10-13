@@ -31,13 +31,22 @@ pub(crate) fn preserve_saved(source: &Value, mut fresh: Value) -> Value {
 /// Sources are server-owned normalized rows. The PHP bridge currently supplies
 /// complete AS2/legacy PostView normalization; native PostView refresh is read
 /// from durable cache. Signed network fetch and OG preview recovery remain PHP.
-pub(crate) async fn hydrate(db: &Client,statuses:Vec<Value>)->Result<Vec<Value>>{hydrate_depth(db,statuses,0).await}
-async fn hydrate_depth(db: &Client, mut statuses: Vec<Value>,depth:usize) -> Result<Vec<Value>> {
+pub(crate) async fn hydrate(db: &Client,statuses:Vec<Value>)->Result<Vec<Value>>{hydrate_depth(db,statuses,0,false).await}
+
+/// Bookmark pages keep PHP's cold URL stubs and plain bookmark-cache PostViews.
+/// Favourites stay on [`hydrate`], which still refuses those branches.
+pub(crate) async fn hydrate_bookmarks(db: &Client, statuses: Vec<Value>) -> Result<Vec<Value>> {
+    let statuses = super::bookmark::recover_thin_bookmarks(db, statuses).await?;
+    hydrate_depth(db, statuses, 0, true).await
+}
+
+async fn hydrate_depth(db: &Client, mut statuses: Vec<Value>, depth: usize, bookmarks: bool) -> Result<Vec<Value>> {
     if depth>16{bail!("PHP fallback: nested source depth exceeds canonical limit");}
     let mut projected_bsky=std::collections::HashSet::new();
     for (index,status) in statuses.iter_mut().enumerate(){
         if status.get("post").is_some_and(Value::is_object){
-            *status=super::bsky_normalize::complete_plain(status)?;projected_bsky.insert(index);
+            *status = if bookmarks { super::bookmark::project_bsky_bookmark(status)? } else { super::bsky_normalize::complete_plain(status)? };
+            projected_bsky.insert(index);
         }
     }
     let targets = statuses.iter().filter_map(|st| super::mixed::bsky_at_uri(s(st, "uri"))).collect::<Vec<_>>();
@@ -48,6 +57,8 @@ async fn hydrate_depth(db: &Client, mut statuses: Vec<Value>,depth:usize) -> Res
         // saved-cache selection is separately retained by SavedEntryGrant;
         // an assembled convenience URI must not send them through AP refresh.
         if projected_bsky.contains(&index){continue}
+        // Uncached https Bluesky bookmarks are Fediverse URL stubs, not AppView rows.
+        if bookmarks && super::bookmark::keep_cold_bookmark_stub(status) { continue; }
         if let Some(uri) = super::mixed::bsky_at_uri(s(status, "uri")) {
             let Some(raw) = bsky.get(&uri) else { bail!("PHP fallback: Bluesky source needs AppView hydration (shared fetch budget 3)"); };
             let raw:Value=serde_json::from_str(raw).context("PHP fallback: malformed Bluesky cache source")?;
@@ -67,15 +78,15 @@ async fn hydrate_depth(db: &Client, mut statuses: Vec<Value>,depth:usize) -> Res
             // native CID/facets/labels/reply/embeds and their provenance.
             status["bsky_post_view"]=post.clone();
             status["bsky_post"]=raw;
-        } else if !s(status, "id").starts_with("rss:") && s(status, "source") != "rss" && thin(status)
-            && !(s(status,"content").is_empty() && status.get("reblog").filter(|value|value.is_object()).is_some_and(|inner|!thin(inner)) && !matches!(s(&status["account"],"acct"),""|"?")) {
-            bail!("PHP fallback: thin AS2 source needs canonical cached/signed hydration (shared fetch budget 3)");
+        } else if let Some(reason) = reject_thin_source(status, bookmarks) {
+            bail!(reason);
         }
     }
     for status in &mut statuses {
         let uri=s(status,"uri").trim_end_matches('/').to_owned();
         if uri.starts_with("https://mkultra.monster/users/") && uri.contains("/notes/") {
-            if !db.query_one("SELECT EXISTS(SELECT 1 FROM masto_statuses WHERE rtrim(note_id,'/')=$1)",&[&uri]).await?.get::<_,bool>(0){
+            if !db.query_one("SELECT EXISTS(SELECT 1 FROM masto_statuses WHERE rtrim(note_id,'/')=$1)",&[&uri]).await?.get::<_,bool>(0)
+                && !(bookmarks && super::bookmark::keep_cold_bookmark_stub(status)) {
                 bail!("PHP fallback: local quote/source row missing current normalization");
             }
             // Complete canonical Library snapshots retain their body, CW and
@@ -87,7 +98,7 @@ async fn hydrate_depth(db: &Client, mut statuses: Vec<Value>,depth:usize) -> Res
         for key in ["reblog","quoted_status"] {
             let child=if key=="reblog"{status.get(key)}else{status.get("quote").and_then(|q|q.get(key))}.filter(|v|v.is_object()).cloned();
             if let Some(child)=child {
-                let mut fresh=Box::pin(hydrate_depth(db,vec![child],depth+1)).await?;
+                let mut fresh=Box::pin(hydrate_depth(db,vec![child],depth+1,bookmarks)).await?;
                 let fresh=fresh.pop().context("PHP fallback: nested canonical source missing")?;
                 if key=="reblog"{status[key]=fresh;}else{status["quote"][key]=fresh;}
             }
@@ -95,6 +106,17 @@ async fn hydrate_depth(db: &Client, mut statuses: Vec<Value>,depth:usize) -> Res
     }
     for status in &statuses { require_source_authority(status)?; }
     Ok(statuses)
+}
+
+/// Favourites still refuse URL-only stubs. Bookmarks keep the stub PHP paints
+/// once the shared fetch budget is spent or the signed fetch returns nothing.
+pub(crate) fn reject_thin_source(status: &Value, bookmarks: bool) -> Option<&'static str> {
+    if bookmarks && super::bookmark::keep_cold_bookmark_stub(status) { return None; }
+    if !s(status, "id").starts_with("rss:") && s(status, "source") != "rss" && thin(status)
+        && !(s(status,"content").is_empty() && status.get("reblog").filter(|value|value.is_object()).is_some_and(|inner|!thin(inner)) && !matches!(s(&status["account"],"acct"),""|"?")) {
+        return Some("PHP fallback: thin AS2 source needs canonical cached/signed hydration (shared fetch budget 3)");
+    }
+    None
 }
 
 fn same_source_content(a:&Value,b:&Value)->bool{
