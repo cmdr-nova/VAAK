@@ -64,6 +64,10 @@ pub struct SearchHashtag {
 /// Exact PHP ap_search_fts_match_query behavior for text queries.
 pub fn text_match_query(q: &str) -> Option<String> { query::text_match(q) }
 
+pub(crate) fn parity_text_match(value: &str) -> Option<String> { query::text_match(value) }
+pub(crate) fn parity_tag_match(tag: &str) -> Option<String> { query::tag_match(tag) }
+pub(crate) fn parity_postgres_match(value: &str) -> String { query::postgres_match(value) }
+
 pub fn tag_match_query(tag: &str) -> Option<String> { query::tag_match(tag) }
 
 fn postgres_tsquery(value: &str) -> String { query::postgres_match(value) }

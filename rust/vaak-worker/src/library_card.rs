@@ -631,6 +631,9 @@ fn render_core_mode(status:&Value,facts:&CardFacts,direct:Option<&crate::direct_
     html.push_str("</article>"); Ok(html)
 }
 
+pub(crate) fn parity_quote_card(status: &Value, facts: &CardFacts) -> Result<String> { quote_card(status, facts) }
+pub(crate) fn parity_reply_meta(status: &Value, view: &str) -> Result<String> { reply_meta(status, view) }
+
 /// Runtime callers can only render a final hydrated/admitted owner-bound token.
 /// The raw template entry remains private to Library components and fixtures.
 pub(crate) fn render_admitted(status: &super::context::AdmittedStatus) -> Result<String> {
