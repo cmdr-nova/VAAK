@@ -4,8 +4,9 @@
 #
 # vaak-deploy may restart these units and nothing else. No shell, no reboot,
 # no daemon-reload, no systemctl edit, and no restart of unrelated services.
-# Template instances such as ap-bsky-jetstream@0.service are not listed; add
-# one explicit line per instance only after confirming it is a VAAK unit.
+# Template instances are listed one explicit line per instance. Production
+# runs ap-bsky-jetstream@0.service and ap-bsky-jetstream@1.service. There is
+# no ap-bsky-jetstream.service.
 
 Defaults:vaak-deploy !requiretty
 
@@ -20,4 +21,5 @@ vaak-deploy ALL=(root) NOPASSWD: /usr/bin/systemctl restart vaak-worker-ap-actor
 vaak-deploy ALL=(root) NOPASSWD: /usr/bin/systemctl restart vaak-worker-timeline-fanout.service
 vaak-deploy ALL=(root) NOPASSWD: /usr/bin/systemctl restart vaak-worker-shadow-http.service
 vaak-deploy ALL=(root) NOPASSWD: /usr/bin/systemctl restart vaak-worker-shadow.service
-vaak-deploy ALL=(root) NOPASSWD: /usr/bin/systemctl restart ap-bsky-jetstream.service
+vaak-deploy ALL=(root) NOPASSWD: /usr/bin/systemctl restart ap-bsky-jetstream@0.service
+vaak-deploy ALL=(root) NOPASSWD: /usr/bin/systemctl restart ap-bsky-jetstream@1.service

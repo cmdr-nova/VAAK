@@ -216,6 +216,9 @@ jobs:
             echo "release tarball has an unsafe path" >&2
             exit 1
           fi
+          # Production Jetstream is ap-bsky-jetstream@0.service and
+          # ap-bsky-jetstream@1.service. VAAK_RESTART_JETSTREAM restarts both.
+          # There is no ap-bsky-jetstream.service.
           PREV="$(cat /srv/mkultra/vaak-releases/live-revision 2>/dev/null || true)"
           if [[ ! "${PREV}" =~ ^[0-9a-f]{40}$ ]] || ! git cat-file -e "${PREV}^{commit}" 2>/dev/null; then
             export VAAK_RESTART_JETSTREAM=1

@@ -47,6 +47,12 @@ JETSTREAM_RELEASE_FILES=(
   api/deploy/wafrn-friend-hosts.txt
 )
 
+# Production runs the template instances. There is no ap-bsky-jetstream.service.
+JETSTREAM_UNITS=(
+  ap-bsky-jetstream@0.service
+  ap-bsky-jetstream@1.service
+)
+
 die() {
   echo "vaak-release: $*" >&2
   exit 1
@@ -169,9 +175,13 @@ restart_units() {
     echo "vaak-release: skip vaak-worker-shadow.service (diff does not touch the shadow worker)"
   fi
   if want_optional jetstream "$old" "$new"; then
-    restart_if_installed ap-bsky-jetstream.service || return 1
+    for unit in "${JETSTREAM_UNITS[@]}"; do
+      restart_if_installed "$unit" || return 1
+    done
   else
-    echo "vaak-release: skip ap-bsky-jetstream.service (diff does not touch Jetstream)"
+    for unit in "${JETSTREAM_UNITS[@]}"; do
+      echo "vaak-release: skip ${unit} (diff does not touch Jetstream)"
+    done
   fi
 }
 
@@ -496,17 +506,24 @@ PY
   [[ "$(cat "${tmp}/html/index.html")" == "blog" ]]
   [[ "$(cat "${tmp}/html/clearance/config.local.php")" == "clearance" ]]
   [[ "$(readlink "${tmp}/bin/vaak-worker")" == "${tmp}/root/bin/vaak-worker" ]]
-  grep -q "restart php8.3-fpm.service" "${SYSTEMCTL_LOG}"
-  grep -q "restart vaak-worker-shadow-http.service" "${SYSTEMCTL_LOG}"
-  grep -q "restart vaak-worker-shadow.service" "${SYSTEMCTL_LOG}"
-  grep -q "restart ap-bsky-jetstream.service" "${SYSTEMCTL_LOG}"
+  grep -q -F "restart php8.3-fpm.service" "${SYSTEMCTL_LOG}"
+  grep -q -F "restart vaak-worker-shadow-http.service" "${SYSTEMCTL_LOG}"
+  grep -q -F "restart vaak-worker-shadow.service" "${SYSTEMCTL_LOG}"
+  grep -q -F "restart ap-bsky-jetstream@0.service" "${SYSTEMCTL_LOG}"
+  grep -q -F "restart ap-bsky-jetstream@1.service" "${SYSTEMCTL_LOG}"
+  if grep -E 'restart ap-bsky-jetstream\.service( |$)' "${SYSTEMCTL_LOG}"; then
+    echo "bare ap-bsky-jetstream.service was restarted" >&2
+    exit 1
+  fi
 
-  local jet_before shadow_before
-  jet_before="$(grep -c 'restart ap-bsky-jetstream.service' "${SYSTEMCTL_LOG}")"
-  shadow_before="$(grep -c 'restart vaak-worker-shadow.service' "${SYSTEMCTL_LOG}")"
+  local jet0_before jet1_before shadow_before
+  jet0_before="$(grep -c -F 'restart ap-bsky-jetstream@0.service' "${SYSTEMCTL_LOG}")"
+  jet1_before="$(grep -c -F 'restart ap-bsky-jetstream@1.service' "${SYSTEMCTL_LOG}")"
+  shadow_before="$(grep -c -F 'restart vaak-worker-shadow.service' "${SYSTEMCTL_LOG}")"
   bash "$0" deploy "${tmp}/${sha_skip}.tar.gz"
-  [[ "$(grep -c 'restart ap-bsky-jetstream.service' "${SYSTEMCTL_LOG}")" == "$jet_before" ]]
-  [[ "$(grep -c 'restart vaak-worker-shadow.service' "${SYSTEMCTL_LOG}")" == "$shadow_before" ]]
+  [[ "$(grep -c -F 'restart ap-bsky-jetstream@0.service' "${SYSTEMCTL_LOG}")" == "$jet0_before" ]]
+  [[ "$(grep -c -F 'restart ap-bsky-jetstream@1.service' "${SYSTEMCTL_LOG}")" == "$jet1_before" ]]
+  [[ "$(grep -c -F 'restart vaak-worker-shadow.service' "${SYSTEMCTL_LOG}")" == "$shadow_before" ]]
   [[ "$(sed -n "s/.*'\\([0-9.]*\\)'.*/\\1/p" "${tmp}/html/api/ap-version.php")" == "0.8.47" ]]
   [[ "$(cat "${tmp}/html/api/network-status.php")" == "canonical-status" ]]
 
