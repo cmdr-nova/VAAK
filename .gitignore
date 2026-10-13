@@ -1,17 +1,42 @@
-# Runtime and deployment secrets
+# Runtime and deployment secrets. Keep examples; ignore everything else.
 .env
 .env.*
+.env*
 !.env.example
 *.pem
 *.key
 *.crt
+*.p12
+*.pfx
+*.kdbx
+id_rsa
+id_dsa
+id_ecdsa
+id_ed25519
+id_*
+*.token
+*credentials*
+*-credentials
+*-credentials.*
+.gts-config.php
+**/.gts-config.php
+config.local.php
+**/config.local.php
+.netrc
+*.htpasswd
+
+# Databases, logs, backups, and dumps
 *.sqlite
 *.sqlite-*
 *.db
 *.log
-*.token
-*-credentials
-*-credentials.*
+*.dump
+*.dump.*
+*.bak
+*.backup
+*.sql.gz
+*.sql.bz2
+mkultra-config-*.tar.gz
 
 # Local/runtime data
 api/sl_visitors.json

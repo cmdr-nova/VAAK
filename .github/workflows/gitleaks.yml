@@ -1,0 +1,40 @@
+# Secret scan. Kept out of ci.yml so a leak fails on its own and does not
+# share that workflow's PHP/Rust job graph.
+#
+# Scans the full history of the checked-out branch with the default gitleaks
+# rules plus .gitleaks.toml. Findings that are already reviewed live in that
+# allowlist. Anything else fails the job.
+
+name: gitleaks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gitleaks-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gitleaks:
+    name: Scan git history for secrets
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install gitleaks
+        run: |
+          set -euo pipefail
+          version=8.28.0
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${version}/gitleaks_${version}_linux_x64.tar.gz" \
+            | tar -xz -C "${RUNNER_TEMP}" gitleaks
+          sudo install -m 0755 "${RUNNER_TEMP}/gitleaks" /usr/local/bin/gitleaks
+          gitleaks version
+      - name: Scan
+        run: gitleaks detect --source . --config .gitleaks.toml --redact --verbose --exit-code 1
