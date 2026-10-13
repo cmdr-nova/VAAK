@@ -132,16 +132,25 @@ impl SelectedLibrarySearchSource {
         if let SelectedSurfaceSource::Library{association:binding,..}=&mut selected.inner{*binding=Some(association)}
         selected.require_current(db).await?;Ok(selected)
     }
-    pub(crate) async fn search(db:&Client,session:&crate::search_context::SearchSession,source:Value,source_index:usize)->Result<Self>{
+    pub(crate) async fn search(db:&Client,session:&crate::search_context::SearchSession,source:Value,source_index:usize,owner_actor:&str,owner_key:&str)->Result<Self>{
         let association=session.collector().cloned();
         if let Some(association)=&association{if association.owner_id()!=session.owner_id(){anyhow::bail!("Search collector owner mismatch")}association.require_source_binding(source_index,&source)?;}else{
             #[cfg(not(test))] anyhow::bail!("PHP fallback: Search enrichment requires enclosing collector association");
             #[cfg(test)] if session.warm_context().and_then(|warm|warm.fixture_clock()).is_none(){anyhow::bail!("PHP fallback: Search enrichment requires enclosing collector association")}
         }
         let owner=session.owner_id();
-        let row=db.query_opt("SELECT actor_id,actor_key FROM ap_users WHERE id=$1::bigint AND disabled_at IS NULL",&[&owner]).await?.context("inactive Search selected source owner")?;
+        // The caller's server-read identity must match the collector's immutable
+        // binding. The unchanged require_current below freshly checks the owner,
+        // settings, complete selected window and raw witness before enrichment.
+        let (actor,key)=if let Some(association)=&association{
+            association.require_owner_binding(owner,owner_actor,owner_key)?;
+            (owner_actor.to_owned(),owner_key.to_owned())
+        }else{
+            let row=db.query_opt("SELECT actor_id,actor_key FROM ap_users WHERE id=$1::bigint AND disabled_at IS NULL",&[&owner]).await?.context("inactive Search selected source owner")?;
+            (row.get::<_,String>(0),row.get::<_,String>(1))
+        };
         let bsky_did=has_bsky_source(&source).then(||session.bsky_did().to_owned());
-        let selected=Self{bsky_did,inner:SelectedSurfaceSource::Search{owner,actor:row.get(0),key:row.get(1),saved_sid:super::card::scalar_string(&source,"id"),source,source_index,association}};
+        let selected=Self{bsky_did,inner:SelectedSurfaceSource::Search{owner,actor,key,saved_sid:super::card::scalar_string(&source,"id"),source,source_index,association}};
         selected.require_current(db).await?;Ok(selected)
     }
     pub(crate) fn owner_id(&self)->i64 {match &self.inner{SelectedSurfaceSource::CanonicalLibrary{owner,..}|SelectedSurfaceSource::Library{owner,..}|SelectedSurfaceSource::Search{owner,..}=>*owner}}

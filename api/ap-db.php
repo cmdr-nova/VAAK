@@ -13036,6 +13036,69 @@ function ap_masto_pinned_statuses(int $limit = 5, ?string $actorKey = null): arr
     return $st->fetchAll() ?: [];
 }
 
+/** Public ActivityPub pin references, explicitly scoped to the profile owner. */
+function ap_masto_featured_note_ids(string $actorKey): array
+{
+    $ids = [];
+    foreach (ap_masto_pinned_statuses(5, $actorKey) as $row) {
+        $id = (string) ($row['note_id'] ?? '');
+        if (ap_masto_pin_is_federatable($row, 'https://mkultra.monster/users/' . $actorKey)) {
+            $ids[] = $id;
+        }
+    }
+    return $ids;
+}
+
+/** Both stored representations must permit public collection discovery. */
+function ap_masto_pin_is_federatable(array $row, string $actor): bool
+{
+    $id = (string) ($row['note_id'] ?? '');
+    if (!str_starts_with($id, rtrim($actor, '/') . '/notes/')
+        || !in_array((string) ($row['visibility'] ?? ''), ['public', 'unlisted'], true)) return false;
+    $st = ap_db()->prepare('SELECT visibility FROM outbox_notes WHERE id = ? OR id = ? LIMIT 1');
+    $st->execute([$id, rtrim($id, '/') . '/']);
+    $visibility = $st->fetchColumn();
+    return is_string($visibility) && in_array($visibility, ['public', 'unlisted'], true);
+}
+
+/** Queue only actual pin transitions; Bluesky keeps its separate latest-pin sync. */
+function ap_masto_pin_federate(array $row, bool $pinned): void
+{
+    $actor = rtrim(ap_local_actor_id(), '/');
+    try {
+        if (!ap_masto_pin_is_federatable($row, $actor)) return;
+        if (!function_exists('ap_deliver_fanout_background')) {
+            if (!defined('AP_INBOX_LIB_ONLY')) define('AP_INBOX_LIB_ONLY', true);
+            require_once __DIR__ . '/ap-inbox.php';
+        }
+        $ident = ap_outbound_identity();
+        $activity = [
+            '@context' => 'https://www.w3.org/ns/activitystreams',
+            'id' => $actor . '/pin-activities/' . bin2hex(random_bytes(16)),
+            'type' => $pinned ? 'Add' : 'Remove',
+            'actor' => $actor,
+            'object' => (string) $row['note_id'],
+            'target' => $actor . '/collections/featured',
+            'to' => ['https://www.w3.org/ns/activitystreams#Public'],
+            'cc' => [$actor . '/followers'],
+        ];
+        // Match profile-update delivery: followers and cmdr_nova's known peers.
+        // Unlisted pins reach followers only. Bridgy pin state is synced separately.
+        $st = ap_db()->prepare('SELECT visibility FROM outbox_notes WHERE id = ? OR id = ? LIMIT 1');
+        $st->execute([(string) $row['note_id'], rtrim((string) $row['note_id'], '/') . '/']);
+        $extra = $st->fetchColumn() === 'public' && ($row['visibility'] ?? '') === 'public' && $actor === 'https://mkultra.monster/users/cmdr_nova'
+            ? ap_known_shared_inboxes(40) : [];
+        $targets = ap_delivery_targets_filtered(ap_followers_list($actor), $extra);
+        $targets = array_values(array_filter($targets, static fn($url) => !str_contains((string) parse_url($url, PHP_URL_HOST), 'brid.gy')));
+        if ($targets !== [] && !ap_deliver_fanout_background($activity, $targets, $ident['key_id'], $ident['priv'])) {
+            ap_log('pin_federation_enqueue_failed type=' . $activity['type']);
+        }
+    } catch (Throwable $e) {
+        // A delivery failure must not undo the saved pin or prevent Bluesky sync.
+        error_log('VAAK pin federation enqueue failed');
+    }
+}
+
 /**
  * Pin a local status. Up to 5 pins per account (HTML profile Pinned tab).
  * Bluesky's single pinnedPost follows the newest pin that has a Bluesky twin.
@@ -13085,6 +13148,7 @@ function ap_masto_status_pin(int $localId): array
         }
         return ['ok' => false, 'error' => 'Could not pin'];
     }
+    ap_masto_pin_federate($row, true);
     return ['ok' => true];
 }
 
@@ -13097,8 +13161,10 @@ function ap_masto_status_unpin(int $localId): array
     if ($localId <= 0 || $ownerUserId < 1) {
         return ['ok' => false, 'error' => 'Record not found'];
     }
-    ap_db()->prepare('DELETE FROM masto_pins WHERE status_local_id = ? AND owner_user_id = ?')
-        ->execute([$localId, $ownerUserId]);
+    $row = ap_masto_status_by_local_id($localId);
+    $st = ap_db()->prepare('DELETE FROM masto_pins WHERE status_local_id = ? AND owner_user_id = ?');
+    $st->execute([$localId, $ownerUserId]);
+    if ($st->rowCount() > 0 && is_array($row)) ap_masto_pin_federate($row, false);
     return ['ok' => true];
 }
 

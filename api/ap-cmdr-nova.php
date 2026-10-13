@@ -225,25 +225,7 @@ if (preg_match('#^/users/cmdr_nova/(outbox|followers|following)$#', $path, $m)) 
 
 // Mastodon-style pinned posts (featured collection of Notes)
 if ($path === '/users/cmdr_nova/collections/featured' || $path === '/users/cmdr_nova/featured') {
-    $items = [];
-    if (function_exists('ap_masto_pinned_statuses') && function_exists('ap_local_note_as2_doc')) {
-        foreach (ap_masto_pinned_statuses(5) as $prow) {
-            if (!is_array($prow)) {
-                continue;
-            }
-            $nid = (string) ($prow['note_id'] ?? '');
-            if ($nid === '') {
-                continue;
-            }
-            $noteDoc = ap_local_note_as2_doc($nid);
-            if (is_array($noteDoc)) {
-                unset($noteDoc['@context']);
-                $items[] = $noteDoc;
-            } else {
-                $items[] = $nid;
-            }
-        }
-    }
+    $items = ap_masto_featured_note_ids('cmdr_nova');
     $doc = [
         '@context' => 'https://www.w3.org/ns/activitystreams',
         'id' => CMDR_ACTOR_ID . '/collections/featured',
