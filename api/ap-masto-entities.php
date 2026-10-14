@@ -1052,6 +1052,30 @@ function ap_masto_quote_url_from_event_summary(string $summary): ?string
         }
         $candidates[] = ['url' => $url, 'pri' => $pri];
     };
+    // Bridgy / Fedibird quote-inline and Misskey blockquotes cite the target
+    // inside markup, so the URL is not always flush against "RE:".
+    if (preg_match_all(
+        '#<(?:span|p|div)\b[^>]*class="[^"]*\bquote-inline\b[^"]*"[^>]*>([\s\S]*?)</(?:span|p|div)>#iu',
+        $summary,
+        $blocks
+    )) {
+        foreach ($blocks[1] as $inner) {
+            if (preg_match_all('#https://[^\s"\'<>]+#', (string) $inner, $um)) {
+                foreach ($um[0] as $u) {
+                    $push(html_entity_decode((string) $u, ENT_QUOTES | ENT_HTML5, 'UTF-8'), 45);
+                }
+            }
+        }
+    }
+    if (preg_match_all('#<blockquote\b[^>]*>[\s\S]*?RE:\s*[\s\S]*?</blockquote>#iu', $summary, $blocks)) {
+        foreach ($blocks[0] as $block) {
+            if (preg_match_all('#https://[^\s"\'<>]+#', (string) $block, $um)) {
+                foreach ($um[0] as $u) {
+                    $push(html_entity_decode((string) $u, ENT_QUOTES | ENT_HTML5, 'UTF-8'), 42);
+                }
+            }
+        }
+    }
     // RE: prefix — usually the real object id for quote-boosts / boosts.
     if (preg_match_all('/(?:^|\n)RE:\s*(https:\/\/[^\s<>]+)/u', $summary, $mm)) {
         foreach ($mm[1] as $u) {
@@ -4369,8 +4393,32 @@ function ap_masto_mention_id_from_status_id(int $statusId): ?int
  */
 function ap_masto_clean_mention_text(string $text): string
 {
+    // Bridgy / Fedibird quote-inline is a machine fallback (quoted excerpt + RE: url).
+    // Drop the element before strip_tags so the excerpt does not become reply text.
+    $text = preg_replace(
+        '#<(?:span|p|div)\b[^>]*class="[^"]*\bquote-inline\b[^"]*"[^>]*>[\s\S]*?</(?:span|p|div)>#iu',
+        '',
+        $text
+    ) ?? $text;
+    // Misskey/Fedibird blockquote that exists only to cite RE: <status url>.
+    if (stripos($text, '<blockquote') !== false && preg_match('/RE:\s*https?:\/\//iu', $text)) {
+        $text = preg_replace(
+            '#<blockquote\b[^>]*>[\s\S]*?RE:\s*https?://[\s\S]*?</blockquote>#iu',
+            '',
+            $text
+        ) ?? $text;
+    }
     $text = html_entity_decode($text, ENT_QUOTES | ENT_HTML5, 'UTF-8');
     $text = trim(strip_tags($text));
+    // Bluesky mirror prefix ("↩ re: https://…"). An authored "↩ …" line stays.
+    $text = preg_replace('/^↩\s*re:\s*https?:\/\/\S+\s*/iu', '', $text) ?? $text;
+    // Trailing quote fallback after real commentary:
+    // "commentary\n\nRE: https://…/notes/abc\nquoted excerpt"
+    $text = preg_replace(
+        '/(?<=\S)\R{2,}RE:\s*https?:\/\/\S+[^\S\r\n]*(?:\R[^\r\n]*)*$/iu',
+        '',
+        $text
+    ) ?? $text;
     // Leading RE: <local-note-or-status-id>… (stop before following commentary word)
     $text = preg_replace(
         '#^RE:\s*https?://\S+?(?:/notes/[a-f0-9]+(?![a-f0-9])|/\d+(?!\d))#iu',
@@ -4387,6 +4435,142 @@ function ap_masto_clean_mention_text(string $text): string
     $text = preg_replace("/[ \t]+/u", ' ', $text) ?? $text;
     $text = preg_replace("/\n{3,}/u", "\n\n", $text) ?? $text;
     return trim($text);
+}
+
+/**
+ * Plain text that becomes Mastodon status content for a reply.
+ *
+ * $parentPreview is the replied-to excerpt (Ice Cubes already has it via
+ * in_reply_to_id). It is never concatenated onto the reply. A body that is
+ * exactly the legacy "↩ {preview}\n\n{reply}" bake of this same preview is
+ * unwrapped back to the reply; any other authored "↩" text is kept.
+ */
+function ap_masto_reply_api_text(string $replyText, string $parentPreview = ''): string
+{
+    $text = ap_masto_clean_mention_text($replyText);
+    $preview = trim(html_entity_decode($parentPreview, ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+    $preview = preg_replace('/\s+/u', ' ', $preview) ?? $preview;
+    if ($preview !== '' && function_exists('mb_substr')) {
+        $preview = mb_substr($preview, 0, 140);
+    } elseif ($preview !== '') {
+        $preview = substr($preview, 0, 140);
+    }
+    $prefix = '↩ ' . $preview;
+    if ($preview !== '' && str_starts_with($text, $prefix)) {
+        $rest = substr($text, strlen($prefix));
+        $rest = preg_replace('/^\R{2,}/u', '', $rest) ?? $rest;
+        if (trim($rest) !== '') {
+            return trim($rest);
+        }
+    }
+    return $text;
+}
+
+/**
+ * True when a Mastodon status is a reply (parent ids belong on the status,
+ * not inside content).
+ *
+ * @param array<string,mixed> $status
+ */
+function ap_masto_status_is_reply(array $status): bool
+{
+    foreach (['in_reply_to_id', 'in_reply_to_account_id', 'in_reply_to', 'vaak_in_reply_to_url'] as $key) {
+        $value = $status[$key] ?? null;
+        if (is_string($value) && trim($value) !== '') {
+            return true;
+        }
+        if (is_int($value) && $value > 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/**
+ * Drop machine reply-context from an already-built Mastodon status.
+ *
+ * Removes the legacy VAAK "↩ parent preview" paragraph (only on replies, and
+ * only when the authored reply follows), a Bluesky "↩ re: https://…" prefix,
+ * quote-inline fallbacks, and Misskey/Fedibird RE: blockquotes. in_reply_to_*
+ * and quote fields are left in place. A post that is only an authored "↩"
+ * line, or a non-reply, keeps that text.
+ *
+ * @param array<string,mixed> $status
+ * @return array<string,mixed>
+ */
+function ap_masto_api_strip_reply_context(array $status): array
+{
+    $content = (string) ($status['content'] ?? '');
+    if ($content === '') {
+        return $status;
+    }
+    $next = $content;
+    $next = preg_replace(
+        '#<(?:span|p|div)\b[^>]*class="[^"]*\bquote-inline\b[^"]*"[^>]*>[\s\S]*?</(?:span|p|div)>#iu',
+        '',
+        $next
+    ) ?? $next;
+    if (stripos($next, '<blockquote') !== false && preg_match('/RE:\s*https?:\/\//iu', $next)) {
+        $next = preg_replace(
+            '#<blockquote\b[^>]*>[\s\S]*?RE:\s*https?://[\s\S]*?</blockquote>#iu',
+            '',
+            $next
+        ) ?? $next;
+    }
+    $next = ap_masto_drop_leading_machine_paragraph(
+        $next,
+        '/^↩\s*re:\s*https?:\/\/\S+\s*$/iu'
+    );
+    if (ap_masto_status_is_reply($status)) {
+        $next = ap_masto_drop_leading_reply_bake_paragraph($next);
+    }
+    if ($next !== $content) {
+        $status['content'] = trim($next);
+    }
+    return $status;
+}
+
+/**
+ * Drop the first <p> when its plain text matches $plainPattern and a reply remains.
+ */
+function ap_masto_drop_leading_machine_paragraph(string $content, string $plainPattern): string
+{
+    if (!preg_match('/^\s*<p\b[^>]*>[\s\S]*?<\/p>\s*/iu', $content, $m)) {
+        return $content;
+    }
+    $firstPlain = trim(html_entity_decode(strip_tags($m[0]), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+    if (!preg_match($plainPattern, $firstPlain)) {
+        return $content;
+    }
+    return ltrim(substr($content, strlen($m[0])));
+}
+
+/**
+ * Drop a leading "↩ {≤140 chars}" paragraph when another paragraph follows.
+ * A reply whose entire body is one authored "↩" line is kept.
+ */
+function ap_masto_drop_leading_reply_bake_paragraph(string $content): string
+{
+    if (!preg_match('/^\s*<p\b[^>]*>[\s\S]*?<\/p>\s*/iu', $content, $m)) {
+        return $content;
+    }
+    $firstPlain = trim(html_entity_decode(strip_tags($m[0]), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+    if (!preg_match('/^↩\s+(\S.*)$/us', $firstPlain, $pm)) {
+        return $content;
+    }
+    $preview = trim((string) $pm[1]);
+    if ($preview === '' || str_contains($preview, "\n")) {
+        return $content;
+    }
+    $previewLen = function_exists('mb_strlen') ? mb_strlen($preview) : strlen($preview);
+    if ($previewLen > 140) {
+        return $content;
+    }
+    $rest = ltrim(substr($content, strlen($m[0])));
+    if ($rest === '') {
+        return $content;
+    }
+    return $rest;
 }
 
 /** Cached link card for remote text, with a background warm on cache miss. */
@@ -4427,7 +4611,8 @@ function ap_masto_status_from_mention(array $row): array
     $mentionId = (int) ($row['id'] ?? 0);
     $actorId = (string) ($row['actor_id'] ?? '');
     $account = $actorId !== '' ? ap_masto_remote_account($actorId) : ap_masto_account();
-    $text = ap_masto_clean_mention_text((string) ($row['content'] ?? ''));
+    // Reply text only. Parent excerpt stays on in_reply_to_id, not in content.
+    $text = ap_masto_reply_api_text((string) ($row['content'] ?? ''));
     $objectId = (string) ($row['object_id'] ?? '');
     // Strip interaction hash suffixes (#like-… / #reblog-… / #quote-…) for the public URL.
     $urlBase = ap_masto_mention_target_object_id($objectId);
@@ -4598,37 +4783,8 @@ function ap_masto_status_from_mention(array $row): array
             }
         }
     }
-    // Reply parent teaser for notification lists (Ice Cubes / clients that only
-    // show status.content). VAAK's notifications UI strips this line when it
-    // renders the separate "In reply to" block.
-    if ($inReplyTo !== '') {
-        $parentPreview = '';
-        if (isset($parent) && is_array($parent)) {
-            $parentPreview = trim((string) ($parent['content_text'] ?? ''));
-            if ($parentPreview === '') {
-                $parentPreview = trim(strip_tags((string) ($parent['content_html'] ?? $parent['content'] ?? '')));
-            }
-        }
-        if ($parentPreview === '' || in_array($parentPreview, ['(media)', '(attachment)', '(poll)', '(quote)'], true)) {
-            if (!function_exists('ap_bsky_subject_post_preview_text')) {
-                $bskyLib = __DIR__ . '/ap-bsky.php';
-                if (is_file($bskyLib)) {
-                    require_once $bskyLib;
-                }
-            }
-            if (function_exists('ap_bsky_subject_post_preview_text')) {
-                $parentPreview = ap_bsky_subject_post_preview_text(
-                    $inReplyTo,
-                    (int) ($row['owner_user_id'] ?? 0)
-                );
-            }
-        }
-        if ($parentPreview === '' || in_array($parentPreview, ['(media)', '(attachment)', '(poll)', '(quote)'], true)) {
-            $parentPreview = 'your post';
-        }
-        $parentPreview = ap_masto_reply_parent_preview($parentPreview);
-        $text = '↩ ' . $parentPreview . ($text !== '' ? "\n\n" . $text : '');
-    }
+    // in_reply_to_id / in_reply_to_account_id carry the parent. Do not prepend
+    // "↩ {parent preview}" into content — Ice Cubes renders content as the reply.
     $extraActors = [];
     if (is_string($replyParentActor) && $replyParentActor !== '') {
         $extraActors[] = $replyParentActor;
@@ -4692,9 +4848,13 @@ function ap_masto_status_from_mention(array $row): array
     $quoteEnt = null;
     $quoteObjectUrl = null;
     $rawContentForQuote = (string) ($row['content'] ?? '');
-    if (function_exists('ap_masto_quote_entity')
-        && (str_contains($rawContentForQuote, '↪ QT') || str_contains($rawContentForQuote, '↪QT')
-            || str_contains($text, '↪ QT') || str_contains($text, '↪QT'))) {
+    $quoteFallback = str_contains($rawContentForQuote, '↪ QT') || str_contains($rawContentForQuote, '↪QT')
+        || str_contains($text, '↪ QT') || str_contains($text, '↪QT')
+        || stripos($rawContentForQuote, 'quote-inline') !== false
+        || str_contains($rawContentForQuote, '_misskey_quote')
+        || preg_match('/(?:^|\n)\s*RE:\s*https?:\/\//u', $rawContentForQuote) === 1
+        || preg_match('/(?:^|\n)\s*RE:\s*https?:\/\//u', $text) === 1;
+    if (function_exists('ap_masto_quote_entity') && $quoteFallback) {
         $quoteObjectUrl = ap_masto_quote_url_from_event_summary($rawContentForQuote);
         if (($quoteObjectUrl === null || $quoteObjectUrl === '') && $text !== $rawContentForQuote) {
             $quoteObjectUrl = ap_masto_quote_url_from_event_summary($text);
@@ -5687,17 +5847,21 @@ function ap_masto_notifications_grouped_fetch(int $limit = 40, ?string $maxId = 
     ];
 }
 
-/** Internal projection provenance; never part of the public notification DTO. */
+/**
+ * Internal projection provenance; never part of the public notification DTO.
+ * 3 = status.content is the reply or quote commentary only (no ↩ parent preview).
+ * Older bodies baked that preview and must be rebuilt from the mention row.
+ */
 function ap_notification_projection_payload(array $item): string|false
 {
-    $item['_vaak_reply_preview_version'] = 2;
+    $item['_vaak_reply_preview_version'] = 3;
     return json_encode($item, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
 }
 
 /** Legacy projection bodies must be rebuilt from canonical rows, never heuristically stripped. */
 function ap_notification_projection_item(array $item): ?array
 {
-    if (($item['_vaak_reply_preview_version'] ?? null) !== 2) return null;
+    if (($item['_vaak_reply_preview_version'] ?? null) !== 3) return null;
     unset($item['_vaak_reply_preview_version']);
     return $item;
 }
@@ -5815,7 +5979,7 @@ function ap_masto_notifications_list_redis_key(
     array $want,
     array $exclude = []
 ): string {
-    return 'vaak:notifications:v2:' . $ownerUserId . ':' . hash('sha256', json_encode([
+    return 'vaak:notifications:v3:' . $ownerUserId . ':' . hash('sha256', json_encode([
         // Include exclusions so an Ice Cubes request using exclude_types cannot
         // reuse a cache entry built for a different notification filter.
         'limit' => $limit, 'max' => $maxId, 'since' => $sinceId, 'types' => $want, 'exclude' => $exclude,

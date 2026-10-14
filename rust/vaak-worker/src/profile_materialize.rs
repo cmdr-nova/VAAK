@@ -534,7 +534,7 @@ impl Projector<'_>{
         let owner_actor=owner.first().map(|u|s(u,"actor_id").trim_end_matches('/')).unwrap_or("");
         if !owner_actor.is_empty()&&actor.trim_end_matches('/')==owner_actor&&(!profile_boost||s(row,"type")!="Announce"||profile_actor.trim_end_matches('/')!=owner_actor){return Ok(None)}
         let account=self.remote_account(actor).await?;let object=s(row,"object_id");let url=if object.is_empty(){actor}else{object};
-        let mut text=crate::home_hydrate_ranked::html_entity_decode(s(row,"summary"));if text.contains('<'){text=crate::library::body::html_to_plain(&text)}
+        let mut text=entities::strip_machine_quote_html(&crate::home_hydrate_ranked::html_entity_decode(s(row,"summary")));if text.contains('<'){text=crate::library::body::html_to_plain(&text)}
         if matches!(crate::library::card::php_trim(&text),"(attachment)"|"(media)"|"(poll)"|"(quote)"|"(boost)")&&truth(&row["media_urls"])&&s(row,"media_urls")!="[]"{text.clear()}
         if text.contains("↪"){bail!("PHP fallback: event QT source splitter unfinished")}text=entities::clean_event_text(&text);
         let spoiler=crate::library::card::php_trim(s(row,"spoiler_text"));
