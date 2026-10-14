@@ -78,12 +78,38 @@ fn hidden(name: &str, value: &str) -> String {
     format!("<input type=\"hidden\" name=\"{name}\" value=\"{}\">", esc(value))
 }
 
+/// `#announce-{eventId}` names the boost wrapper, not the original post.
+pub(crate) fn strip_announce_fragment(value: &str) -> &str {
+    let value = value.trim();
+    let Some(hash) = value.rfind('#') else { return value };
+    let Some(rest) = value[hash + 1..].strip_prefix("announce-") else { return value };
+    if !rest.is_empty() && rest.bytes().all(|byte| byte.is_ascii_digit()) { &value[..hash] } else { value }
+}
+
 fn open_target(object:&str)->String {
+    let trimmed = object.trim();
+    let stripped = strip_announce_fragment(trimmed);
+    let object = if stripped.len() != trimmed.len() { stripped.trim_end_matches('/') } else { stripped };
     object.strip_prefix("at://").and_then(|rest|rest.split_once("/app.bsky.feed.post/"))
         .map(|(did,key)|format!("https://bsky.app/profile/{did}/post/{key}")).unwrap_or_else(||object.to_owned())
 }
 fn status_href(object: &str, view: &str) -> String {
     format!("?view=status&object={}&from={}", query(&open_target(object)), query(view))
+}
+
+/// Canonical in-app URL for the overflow Copy link. Unsafe schemes are omitted.
+pub(crate) fn copy_link_button(object: &str, view: &str) -> String {
+    let object = strip_announce_fragment(object.trim());
+    if object.is_empty() { return String::new(); }
+    let lower = object.to_ascii_lowercase();
+    if lower.starts_with("javascript:") || lower.starts_with("data:") || lower.starts_with("vbscript:") {
+        return String::new();
+    }
+    let target = open_target(object);
+    if !target.starts_with("https://") || target == "https://bsky.app/" { return String::new(); }
+    let view = if view.is_empty() { "home" } else { view };
+    let href = format!("https://mkultra.monster/vaak/{}", status_href(object, view));
+    format!("<button type=\"button\" class=\"menu-action\" data-copy-value=\"{}\" title=\"Copy link to post\">Copy link</button>", esc(&href))
 }
 
 pub fn reply_suffix(mentions: &[String], spoiler: &str, sensitive: bool) -> String {
@@ -195,11 +221,13 @@ pub(crate) fn render_moderation_with_protocol_navigation(ctx: &FediActionContext
     if state.is_local || state.is_wafrn { menu.push_str(&format!("<a class=\"menu-action\" href=\"?view=ask&amp;target_actor={}&amp;from={}\">Ask</a>", query(actor), query(link_from))); }
     if ctx.object_id.starts_with("https://") {
         menu.push_str(&format!("<a class=\"menu-action\" href=\"{}\">Open</a><a class=\"menu-action\" href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\">{}</a>", esc(&status_href(&ctx.object_id, &ctx.return_view)), esc(if ctx.remote_url.starts_with("https://"){&ctx.remote_url}else{&ctx.object_id}), if ctx.object_id.to_lowercase().contains("bsky.app") { "Open on Bluesky" } else { "Remote" }));
+        menu.push_str(&copy_link_button(&ctx.object_id, &ctx.return_view));
     }
     if !ctx.object_id.is_empty() && !ctx.object_id.starts_with("https://") {
         if let Some(show_open) = protocol_open {
             if show_open { menu.push_str(&format!("<a class=\"menu-action\" href=\"{}\">Open</a>", esc(&status_href(&ctx.object_id, &ctx.return_view)))); }
             if ctx.remote_url.starts_with("https://") || ctx.remote_url.starts_with("http://") { menu.push_str(&format!("<a class=\"menu-action\" href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\">Remote</a>", esc(&ctx.remote_url))); }
+            menu.push_str(&copy_link_button(&ctx.object_id, &ctx.return_view));
         }
     }
     if actor.starts_with("https://") {
@@ -282,6 +310,20 @@ mod tests {
         assert!(render_moderation_with_protocol_navigation(&ctx, "home", Some(true)).is_empty());
     }
     #[test]
+    fn copy_link_uses_the_original_post_and_skips_unsafe_targets() {
+        let mut ctx = context();
+        ctx.object_id = "https://remote.test/users/alice/statuses/123#announce-9".into();
+        let html = render_fedi_actions(&ctx, 1).unwrap();
+        assert!(html.contains(">Copy link</button>"));
+        assert!(html.contains("data-copy-value=\"https://mkultra.monster/vaak/?view=status&amp;object=https%3A%2F%2Fremote.test%2Fusers%2Falice%2Fstatuses%2F123&amp;from=bookmarks\""));
+        assert!(html.contains("<a class=\"menu-action\" href=\"?view=status&amp;object=https%3A%2F%2Fremote.test%2Fusers%2Falice%2Fstatuses%2F123&amp;from=bookmarks\">Open</a>"));
+        ctx.object_id = "javascript:alert(1)".into();
+        ctx.actor_id = "https://bsky.app/profile/dame.is".into();
+        let html = render_moderation_with_protocol_navigation(&ctx, "home", Some(true));
+        assert!(!html.contains("Copy link"));
+        assert!(!html.contains("javascript:"));
+    }
+    #[test]
     fn owner_and_view_are_bound_before_action_paint() {
         assert!(render_fedi_actions(&context(), 2).is_err());
         assert!(render_fedi_actions(&context(), 0).is_err());
@@ -338,6 +380,7 @@ pub(crate) fn read_only_overflow(uri:&str,view:&str,remote:&str)->String{read_on
 pub(crate) fn read_only_overflow_mode(uri:&str,view:&str,remote:&str,show_open:bool)->String{
  if uri.is_empty(){return String::new()}let mut menu=if show_open{format!("<a class=\"menu-action\" href=\"{}\">Open</a>",esc(&status_href(uri,view)))}else{String::new()};
  if remote.starts_with("https://")||remote.starts_with("http://"){menu.push_str(&format!("<a class=\"menu-action\" href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\">Remote</a>",esc(remote)));}
+ menu.push_str(&copy_link_button(uri,view));
  if menu.is_empty(){return String::new()}
  format!("<details class=\"post-action-menu\"><summary class=\"icon-btn\" title=\"More actions\" aria-label=\"More actions\">⋯</summary><div class=\"post-action-menu__body\">{menu}</div></details>")
 }

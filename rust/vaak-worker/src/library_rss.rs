@@ -72,7 +72,7 @@ pub(super) fn actions(status:&Value,facts:&CardFacts)->Result<String>{
         if key=="status_id"{html.push_str(&hidden("object_id",&sid));}
         html.push_str(&format!("<button class=\"icon-btn{}\" type=\"submit\" title=\"{title}\" aria-label=\"{label}\"{}{}><i class=\"ph{} ph-{icon}\" aria-hidden=\"true\"></i></button></form>",if on{" on"}else{""},if pressed{format!(" aria-pressed=\"{}\"",if on{"true"}else{"false"})}else{String::new()},if picker{format!(" data-bm-picker=\"{}\"",if on{"1"}else{"0"})}else{String::new()},if on&&matches!(icon,"heart"|"bookmark-simple"){"-fill"}else{""}));
     }
-    let uri=s(status,"uri");let open=if uri.starts_with("http://")||uri.starts_with("https://"){format!("<a class=\"menu-action\" href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\">Open</a>",esc(uri))}else{String::new()};
+    let uri=s(status,"uri");let open=if uri.starts_with("http://")||uri.starts_with("https://"){format!("<a class=\"menu-action\" href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\">Open</a>{}",esc(uri),super::actions::copy_link_button(uri,view))}else{String::new()};
     html.push_str(&format!("<details class=\"post-action-menu\"><summary class=\"icon-btn\" title=\"More actions\" aria-label=\"More actions\">⋯</summary><div class=\"post-action-menu__body\">{open}<form method=\"post\" action=\"?view={}\" onsubmit=\"return confirm('Remove this RSS feed from your Home mix?');\">{}{}{}{}<button class=\"menu-action\" type=\"submit\" style=\"color:var(--danger)\">Remove feed</button></form></div></details></div>",esc(view),hidden("csrf",&facts.csrf),hidden("action","rss_remove_feed"),hidden("return_view",view),hidden("feed_id",&feed.to_string())));Ok(html)
 }
 
