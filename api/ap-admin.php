@@ -21368,17 +21368,8 @@ if ($isPartial && $view === 'status' && isset($_GET['thread'])) {
         require_once __DIR__.'/ap-bsky.php';
         require_once __DIR__.'/ap-masto-entities.php';
         $html=admin_bsky_thread_fragment($stObject,$threadPart,$stFrom,$followingIds);
-        if(is_string($html)){echo $html;exit;}
-        $fallback=admin_status_bsky_local_fallback($stObject);
-        if(is_string($fallback)){$stObject=$fallback;}
-        else{
-            $native=str_starts_with($stObject,'at://')||str_starts_with($stObject,'bsky:')||str_starts_with($stObject,'https://bsky.app/');
-            if($native||!str_starts_with($stObject,'https://')){
-                header('X-VAAK-Status-Reason: missing');
-                http_response_code(404);
-                exit;
-            }
-        }
+        if($html===null){http_response_code(404);exit;}
+        echo $html;exit;
     }
     if ($stObject === '' || !str_starts_with($stObject, 'https://')) {
         echo '<div class="meta">Missing post URL.</div>';
