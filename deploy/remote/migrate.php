@@ -351,6 +351,89 @@ function vaak_migrate_notification_read_indexes(PDO $db): void
 }
 
 /**
+ * Home Bluesky indexes on bsky_posts, which already exists in production.
+ *
+ * Same rules as the notification read indexes: not part of
+ * vaak_migrate_deploy_sql_files(), CREATE INDEX CONCURRENTLY outside a
+ * transaction, a valid index is left untouched, and an invalid leftover
+ * from a failed concurrent build is dropped and created again.
+ *
+ * idx_bsky_posts_post_rkey matches
+ * split_part(bsky_uri, '/app.bsky.feed.post/', 2) used by Home rkey lookup.
+ * idx_bsky_posts_embed_indexed is a partial index for the thin-media scan
+ * (WHERE embed_json IS NOT NULL, ordered by indexed_at).
+ *
+ * @return array<string, array{table: string, create: string, drop: string}>
+ */
+function vaak_migrate_home_bsky_index_specs(): array
+{
+    return [
+        'idx_bsky_posts_post_rkey' => [
+            'table' => 'bsky_posts',
+            'create' => "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_bsky_posts_post_rkey ON bsky_posts (split_part(bsky_uri, '/app.bsky.feed.post/', 2))",
+            'drop' => 'DROP INDEX CONCURRENTLY IF EXISTS idx_bsky_posts_post_rkey',
+        ],
+        'idx_bsky_posts_embed_indexed' => [
+            'table' => 'bsky_posts',
+            'create' => 'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_bsky_posts_embed_indexed ON bsky_posts (indexed_at DESC NULLS LAST) WHERE embed_json IS NOT NULL',
+            'drop' => 'DROP INDEX CONCURRENTLY IF EXISTS idx_bsky_posts_embed_indexed',
+        ],
+    ];
+}
+
+/** @return list<string> */
+function vaak_migrate_home_bsky_index_statements(string $name, string $action): array
+{
+    $specs = vaak_migrate_home_bsky_index_specs();
+    if (!isset($specs[$name])) {
+        throw new RuntimeException('unknown home bsky index');
+    }
+    if ($action === 'skip') {
+        return [];
+    }
+    if ($action === 'create') {
+        return [$specs[$name]['create']];
+    }
+    if ($action === 'rebuild') {
+        return [$specs[$name]['drop'], $specs[$name]['create']];
+    }
+    throw new RuntimeException('home bsky index was not created');
+}
+
+function vaak_migrate_home_bsky_indexes(PDO $db): void
+{
+    if ($db->inTransaction()) {
+        throw new RuntimeException('home bsky indexes must not run inside a transaction');
+    }
+    foreach (vaak_migrate_home_bsky_index_specs() as $name => $spec) {
+        $table = $db->prepare(
+            'SELECT 1 FROM pg_tables WHERE schemaname = current_schema() AND tablename = ?'
+        );
+        $table->execute([$spec['table']]);
+        $tableExists = $table->fetchColumn() !== false;
+        $index = $db->prepare(
+            'SELECT i.indisvalid FROM pg_class c
+             JOIN pg_index i ON i.indexrelid = c.oid
+             JOIN pg_namespace n ON n.oid = c.relnamespace
+             WHERE n.nspname = current_schema() AND c.relname = ?'
+        );
+        $index->execute([$name]);
+        $row = $index->fetch();
+        $valid = is_array($row) ? vaak_migrate_pg_bool($row['indisvalid'] ?? null) : null;
+        if (is_array($row) && $valid === null) {
+            throw new RuntimeException('home bsky index validity is unknown');
+        }
+        $action = vaak_migrate_notification_index_plan($tableExists, $valid);
+        if ($action === 'missing-table') {
+            throw new RuntimeException($spec['table'] . ' is missing; home bsky index was not created');
+        }
+        foreach (vaak_migrate_home_bsky_index_statements($name, $action) as $statement) {
+            $db->exec($statement);
+        }
+    }
+}
+
+/**
  * Apply one additive migration. The statement list is checked before any
  * SQL runs, so a rejected file leaves the schema untouched.
  *
@@ -463,6 +546,7 @@ function vaak_migrate_main(array $argv): void
             vaak_migrate_fail('schema is missing ap_users after migration');
         }
         vaak_migrate_notification_read_indexes($lock);
+        vaak_migrate_home_bsky_indexes($lock);
     } catch (Throwable $e) {
         vaak_migrate_fail(vaak_migrate_redact($e->getMessage(), $password));
     }
