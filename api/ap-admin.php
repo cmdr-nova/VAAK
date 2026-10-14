@@ -34404,7 +34404,10 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
                 && empty($rpContentBlocked)
                 && is_string($rpLocalKey)
                 && $rpLocalKey !== ''
-                && preg_match('#^https://mkultra\\.monster/users/[A-Za-z0-9_]+$#', $rpActor)) {
+                && preg_match('#^https://mkultra\\.monster/users/[A-Za-z0-9_]+$#', $rpActor)
+                // The opt-in Phyrian card is printed inside this header. Leave the
+                // whole paint on PHP while that flag is on; the check is env only.
+                && !in_array(strtolower(trim((string) getenv('VAAK_PHYRIAN_PROFILE_CARD'))), ['1', 'true', 'yes', 'on'], true)) {
                 $rpWhoName = (string) ((is_array($rpMeta) ? ($rpMeta['display_name'] ?? null) : null) ?: actor_handle($rpActor));
                 $rpWhoHtml = admin_emoji_html($rpWhoName, $rpActor);
                 $rpMenuOwner = (int) $vaakOwnerId;
