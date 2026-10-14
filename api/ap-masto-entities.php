@@ -10632,7 +10632,7 @@ function ap_trends_painted_key(string $kind, int $ownerUserId): string
 {
     $kind = preg_replace('/[^a-z]/', '', strtolower($kind)) ?: 'tags';
     $epoch = function_exists('ap_trends_policy_epoch') ? ap_trends_policy_epoch(ap_trends_painted_owner($kind, $ownerUserId)) : '0:0';
-    return 'vaak:trends:painted:v3:' . $kind . ':' . ap_trends_painted_owner($kind, $ownerUserId) . ':' . $epoch;
+    return 'vaak:trends:painted:v4:' . $kind . ':' . ap_trends_painted_owner($kind, $ownerUserId) . ':' . $epoch;
 }
 
 /** @return array{items:list<array<string,mixed>>,age:int,stale:bool}|null */
@@ -10674,7 +10674,7 @@ function ap_trends_http_key(string $kind, int $ownerUserId, string $variant): ?s
     $epoch = function_exists('ap_trends_policy_epoch') ? ap_trends_policy_epoch($ownerUserId) : '0:0';
     $kind = preg_replace('/[^a-z]/', '', strtolower($kind)) ?: 'tags';
     $variant = preg_replace('/[^a-z0-9_-]/', '', strtolower($variant)) ?: 'all';
-    return 'vaak:trends:http:v1:' . $kind . ':' . max(0, $ownerUserId) . ':' . $epoch . ':' . $stamp . ':' . $variant;
+    return 'vaak:trends:http:v2:' . $kind . ':' . max(0, $ownerUserId) . ':' . $epoch . ':' . $stamp . ':' . $variant;
 }
 
 /** @return array{body:string,etag:string,age:int,stale:bool}|null */
@@ -11061,6 +11061,9 @@ function ap_masto_trend_tree_hidden(array $item, int $ownerUserId, int $depth = 
 
 function ap_masto_trends_filter_for_owner(array $items, int $ownerUserId, int $limit): array
 {
+    $items = array_values(array_filter($items, static function ($item): bool {
+        return is_array($item) && ap_masto_trend_status_listable($item);
+    }));
     if ($ownerUserId < 1) return array_slice($items, 0, $limit);
     $user = ap_auth_user_by_id($ownerUserId);
     if (!is_array($user) || (int) ($user['id'] ?? 0) !== $ownerUserId || !empty($user['disabled_at'])) return [];
@@ -11137,6 +11140,201 @@ function ap_masto_trend_status_fingerprint(array $row): string
     return hash('sha256',json_encode($row,JSON_UNESCAPED_SLASHES|JSON_UNESCAPED_UNICODE));
 }
 
+/** AT record key, including the characters Bluesky accepts beyond base32 TIDs. */
+function ap_masto_trend_status_rkey_pattern(): string
+{
+    return '[A-Za-z0-9._:\~-]+';
+}
+
+/**
+ * Stable at:// DID identity embedded in a trending id, uri, or web URL.
+ * Handle permalinks are intentionally not resolved here.
+ */
+function ap_masto_trend_status_embedded_at(string $raw): string
+{
+    $raw = trim($raw);
+    if ($raw === '') {
+        return '';
+    }
+    if (str_starts_with($raw, 'bsky:')) {
+        $raw = substr($raw, 5);
+    }
+    $rkey = ap_masto_trend_status_rkey_pattern();
+    $candidates = [$raw];
+    $decoded = rawurldecode($raw);
+    if ($decoded !== $raw) {
+        $candidates[] = $decoded;
+    }
+    foreach ($candidates as $candidate) {
+        if (preg_match('~at://(did:[^/\s?#]+)/app\.bsky\.feed\.post/(' . $rkey . ')~', $candidate, $m)
+            || preg_match('~^https://bsky\.app/profile/(did:[^/?#]+)/post/(' . $rkey . ')(?:[/?#]|$)~i', $candidate, $m)) {
+            if ($m[2] === '.' || $m[2] === '..') {
+                continue;
+            }
+            return 'at://' . $m[1] . '/app.bsky.feed.post/' . $m[2];
+        }
+    }
+    return '';
+}
+
+/** Web aliases that do not name one post the status view can open. */
+function ap_masto_trend_status_ref_is_lossy_web(string $url): bool
+{
+    $url = trim($url);
+    if ($url === '' || !str_starts_with($url, 'https://')) {
+        return true;
+    }
+    if (preg_match('~^https://bsky\.app/profile/[^/?#]+/?$~i', $url)) {
+        return true;
+    }
+    if (preg_match('~^https://bsky\.app/profile/(?!did:)[^/?#]+/post/' . ap_masto_trend_status_rkey_pattern() . '(?:[/?#]|$)~i', $url)) {
+        return true;
+    }
+    if (preg_match('~^https://(?:www\.)?threads\.(?:net|com)/@[^/?#]+/?$~i', $url)) {
+        return true;
+    }
+    return false;
+}
+
+/**
+ * Identifier the status view can open without a handle lookup.
+ * A stored https object id stays intact so a Bridgy copy can fall back to
+ * ActivityPub. Native Bluesky rows resolve to their at:// DID instead.
+ */
+function ap_masto_trend_status_open_ref(array $item): string
+{
+    foreach (['uri', 'id'] as $key) {
+        $raw = trim((string) ($item[$key] ?? ''));
+        if ($raw !== '' && str_starts_with($raw, 'https://') && !ap_masto_trend_status_ref_is_lossy_web($raw)) {
+            return $raw;
+        }
+    }
+    $blobs = [];
+    foreach (['uri', 'id', 'url'] as $key) {
+        $blobs[] = (string) ($item[$key] ?? '');
+    }
+    $bsky = $item['bsky_post'] ?? null;
+    if (is_array($bsky)) {
+        $post = is_array($bsky['post'] ?? null) ? $bsky['post'] : $bsky;
+        $blobs[] = (string) ($post['uri'] ?? '');
+    }
+    foreach ($blobs as $blob) {
+        $at = ap_masto_trend_status_embedded_at($blob);
+        if ($at !== '') {
+            return $at;
+        }
+    }
+    $url = trim((string) ($item['url'] ?? ''));
+    if ($url !== '' && str_starts_with($url, 'https://') && !ap_masto_trend_status_ref_is_lossy_web($url)) {
+        return $url;
+    }
+    return '';
+}
+
+/**
+ * Tag rows pass through. Status rows need a resolvable public id already on the payload.
+ */
+function ap_masto_trend_status_listable(array $item): bool
+{
+    $looksStatus = array_key_exists('uri', $item) || array_key_exists('url', $item)
+        || array_key_exists('content', $item) || array_key_exists('account', $item);
+    if (!$looksStatus) {
+        return true;
+    }
+    if (ap_masto_trend_status_open_ref($item) === '') {
+        return false;
+    }
+    $visibility = strtolower(trim((string) ($item['visibility'] ?? '')));
+    return $visibility === '' || $visibility === 'public';
+}
+
+/** A known local twin that is missing, deleted, or not public cannot be advertised. */
+function ap_masto_trend_status_twin_blocked(?array $local): bool
+{
+    if (!is_array($local)) {
+        return true;
+    }
+    if (!empty($local['deleted_at']) || ($local['action_taken'] ?? '') === 'deleted') {
+        return true;
+    }
+    if (in_array((string) ($local['type'] ?? ''), ['Delete', 'Tombstone'], true)) {
+        return true;
+    }
+    return strtolower(trim((string) ($local['visibility'] ?? ''))) !== 'public';
+}
+
+/**
+ * Optional local mirrors of Bluesky posts. A missing table contributes nothing.
+ *
+ * @param list<string> $uris
+ * @return array<string,string> at:// uri => local note id
+ */
+function ap_masto_trend_status_twin_map(array $uris): array
+{
+    $clean = [];
+    foreach ($uris as $uri) {
+        $uri = trim((string) $uri);
+        if (str_starts_with($uri, 'at://')) {
+            $clean[$uri] = true;
+        }
+    }
+    $uris = array_keys($clean);
+    if ($uris === []) {
+        return [];
+    }
+    $out = [];
+    $remember = static function (string $uri, string $noteId) use (&$out): void {
+        $noteId = rtrim(trim($noteId), '/');
+        if ($uri === '' || $noteId === '' || !str_contains($noteId, '/notes/')) {
+            return;
+        }
+        $out[$uri] = $noteId;
+        $trimmed = rtrim($uri, '/');
+        if (!isset($out[$trimmed])) {
+            $out[$trimmed] = $noteId;
+        }
+    };
+    try {
+        foreach (array_chunk($uris, 200) as $batch) {
+            $marks = implode(',', array_fill(0, count($batch), '?'));
+            $q = ap_db()->prepare('SELECT bsky_uri, note_id FROM bsky_crossposts WHERE bsky_uri IN (' . $marks . ')');
+            $q->execute($batch);
+            foreach ($q->fetchAll() ?: [] as $row) {
+                if (!is_array($row)) {
+                    continue;
+                }
+                $remember((string) ($row['bsky_uri'] ?? ''), (string) ($row['note_id'] ?? ''));
+            }
+        }
+    } catch (Throwable $e) {
+        // Optional table. Its absence must not empty the status list.
+    }
+    try {
+        foreach (array_chunk($uris, 200) as $batch) {
+            $marks = implode(',', array_fill(0, count($batch), '?'));
+            $q = ap_db()->prepare('SELECT bsky_uri, fediverse_id, ap_object_id FROM bsky_post_links WHERE bsky_uri IN (' . $marks . ')');
+            $q->execute($batch);
+            foreach ($q->fetchAll() ?: [] as $row) {
+                if (!is_array($row)) {
+                    continue;
+                }
+                $uri = (string) ($row['bsky_uri'] ?? '');
+                if ($uri !== '' && isset($out[$uri])) {
+                    continue;
+                }
+                $note = (string) ($row['fediverse_id'] ?? '');
+                if ($note === '') {
+                    $note = (string) ($row['ap_object_id'] ?? '');
+                }
+                $remember($uri, $note);
+            }
+        }
+    } catch (Throwable $e) {
+        // Optional table. Its absence must not empty the status list.
+    }
+    return $out;
+}
+
 function ap_masto_trend_status_current(array $items): ?array
 {
     $entries=[];$ids=[];$origins=[];
@@ -11156,6 +11354,8 @@ function ap_masto_trend_status_current(array $items): ?array
         $entries[]=['source'=>$proof['source'],'row'=>$proof['row']];
         if($proof['source']==='bsky')$ids[]=(string)($proof['row']['bsky_uri']??'');
     }
+    $twins=ap_masto_trend_status_twin_map($ids);
+    foreach($twins as $noteId)$entries[]=['source'=>'outbox','row'=>['id'=>$noteId]];
     $canonical=ap_masto_trend_status_canonical_rows(array_merge($entries,array_values($nestedEntries)));
     $policy=ap_masto_trend_tag_policy_snapshot(0);
     if($canonical===null||$policy===null)return null;
@@ -11168,7 +11368,7 @@ function ap_masto_trend_status_current(array $items): ?array
         $fallback=[];$fallbackUris=[];foreach($entries as $entry){$uri=rtrim((string)($entry['row']['object_id']??''),'/');if($uri!==''&&!isset($canonical['events'][$uri])&&isset($canonical['mentions'][$uri]))$fallbackUris[$uri]=true;}
         foreach(array_chunk(array_keys($fallbackUris),200) as $batch){$marks=implode(',',array_fill(0,count($batch),'?'));$q=ap_db()->prepare("SELECT * FROM (SELECT events.*,ROW_NUMBER() OVER(PARTITION BY object_id ORDER BY id DESC) AS latest FROM events WHERE object_id IN ($marks) AND type='Announce' AND ((summary IS NOT NULL AND summary!='') OR (media_urls IS NOT NULL AND media_urls!='' AND media_urls!='[]'))) selected_announcer WHERE latest=1");$q->execute($batch);foreach($q->fetchAll()?:[] as $row)$fallback[rtrim((string)$row['object_id'],'/')]=$row;}
         $originRows=[];foreach(ap_masto_trend_tag_current_rows(array_values($origins)) as $entry)$originRows[(string)$entry['row']['id']]=$entry['row'];foreach($fallback as $row)$originRows[(string)$row['id']]=$row;
-        return ['canonical'=>$canonical,'policy'=>$policy,'index'=>$currentRows,'bsky'=>$bsky,'announcers'=>$originRows,'fallback_announces'=>$fallback];
+        return ['canonical'=>$canonical,'policy'=>$policy,'index'=>$currentRows,'bsky'=>$bsky,'announcers'=>$originRows,'fallback_announces'=>$fallback,'twins'=>$twins];
     }catch(Throwable $e){return null;}
 }
 
@@ -11213,6 +11413,14 @@ function ap_masto_trend_status_world_items(array $items, ?array $facts = null): 
             continue;
         }
         if (!ap_masto_trend_status_nested_current($item,$facts)) continue;
+        if($source==='bsky'){
+            $twinId=(string)(($facts['twins'][(string)($row['bsky_uri']??'')]??''));
+            if($twinId!==''){
+                $local=$facts['canonical']['outbox'][rtrim($twinId,'/')]??null;
+                if(ap_masto_trend_status_twin_blocked(is_array($local)?$local:null))continue;
+            }
+        }
+        if(!ap_masto_trend_status_listable($item))continue;
         $out[]=$item;
     }
     return $out;
