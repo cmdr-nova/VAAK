@@ -5041,11 +5041,76 @@ if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'bookmark_folders') {
     exit;
 }
 
+/**
+ * Web Library pages clamp the cursor before SQL. Offset cannot go below zero.
+ * A page is never smaller than 10 or larger than 40.
+ *
+ * @return array{0:int,1:int}
+ */
+function admin_library_page_bounds(int $offset, int $limit): array
+{
+    return [max(0, $offset), max(10, min(40, $limit))];
+}
+
+/**
+ * Window after the query already applied OFFSET and LIMIT limit+1.
+ * The next cursor moves by selected source keys, including a key that
+ * hydrates to no card.
+ *
+ * @param list<mixed> $keys
+ * @return array{keys:list<mixed>,next_offset:int,has_more:bool,offset:int,limit:int}
+ */
+function admin_library_fetched_page(array $keys, int $offset, int $limit): array
+{
+    [$offset, $limit] = admin_library_page_bounds($offset, $limit);
+    $hasMore = count($keys) > $limit;
+    $keys = array_values(array_slice($keys, 0, $limit));
+    return [
+        'keys' => $keys,
+        'next_offset' => $offset + count($keys),
+        'has_more' => $hasMore,
+        'offset' => $offset,
+        'limit' => $limit,
+    ];
+}
+
+/**
+ * Same window as the Library SQL: skip offset rows, read one extra, then
+ * keep limit. Callers pass keys already ordered by time descending, then
+ * reference descending.
+ *
+ * @param list<mixed> $keys
+ * @return array{keys:list<mixed>,next_offset:int,has_more:bool,offset:int,limit:int}
+ */
+function admin_library_source_page(array $keys, int $offset, int $limit): array
+{
+    [$offset, $limit] = admin_library_page_bounds($offset, $limit);
+    return admin_library_fetched_page(array_slice(array_values($keys), $offset, $limit + 1), $offset, $limit);
+}
+
+/**
+ * The full Favourites page still asks whether hydration passed 20 before
+ * Bluesky rows are removed. Soft-nav and AJAX ask that question after the
+ * filter, using the clamped page size.
+ */
+function admin_library_favourite_has_more(string $surface, int $hydratedCount, int $filteredCount, int $offset, int $limit): bool
+{
+    if ($surface === 'page') {
+        return $hydratedCount > 20;
+    }
+    [$offset, $limit] = admin_library_page_bounds($offset, $limit);
+    return $filteredCount > ($offset + $limit);
+}
+
+function admin_library_favourite_sentinel(bool $hasMore): string
+{
+    return $hasMore ? 'Scroll for more…' : 'End of Fediverse favourites';
+}
+
 /** Exact PHP favourite hydration/filter/page contract, shared by both producers. */
 function admin_favourite_fedi_page(int $ownerUserId, int $offset = 0, int $limit = 20): array
 {
-    $offset = max(0, $offset);
-    $limit = max(10, min(40, $limit));
+    [$offset, $limit] = admin_library_page_bounds($offset, $limit);
     $data = admin_library_data_axum_fetch($ownerUserId, $offset, $limit);
     $sourceRows = is_array($data) ? $data['fedi_rows'] : null;
     $rows = function_exists('ap_masto_favourites_list')
@@ -5060,14 +5125,13 @@ function admin_favourite_fedi_page(int $ownerUserId, int $offset = 0, int $limit
             || str_contains($uri, 'bsky.app/'));
     }));
     return ['items' => array_slice($rows, $offset, $limit), 'hydrated_count' => $hydratedCount,
-        'has_more' => count($rows) > ($offset + $limit),
+        'has_more' => admin_library_favourite_has_more('ajax', $hydratedCount, count($rows), $offset, $limit),
         'source' => is_array($data) ? 'axum-data' : 'miss'];
 }
 
 function admin_favourite_fedi_fragment(int $ownerUserId, int $offset = 0, int $limit = 20): array
 {
-    $offset = max(0, $offset);
-    $limit = max(10, min(40, $limit));
+    [$offset, $limit] = admin_library_page_bounds($offset, $limit);
     $page = admin_favourite_fedi_page($ownerUserId, $offset, $limit);
     $items = $page['items'];
     $hasMore = $page['has_more'];
@@ -5109,7 +5173,8 @@ function admin_library_data_axum_fetch(int $ownerUserId, int $offset = 0, int $l
     $host = parse_url($base, PHP_URL_HOST);
     if (!is_string($host) || !in_array(strtolower($host), ['127.0.0.1', 'localhost', '::1'], true)) return null;
     $libraryKind = in_array($libraryKind, ['favourites', 'bookmarks'], true) ? $libraryKind : 'favourites';
-    $ch = curl_init($base . '/shadow/library-data?' . http_build_query(['owner_id' => $ownerUserId, 'library_kind' => $libraryKind, 'folder_id' => max(0, $folderId), 'offset' => max(0, $offset), 'limit' => max(10, min(40, $limit))]));
+    [$libraryOffset, $libraryLimit] = admin_library_page_bounds($offset, $limit);
+    $ch = curl_init($base . '/shadow/library-data?' . http_build_query(['owner_id' => $ownerUserId, 'library_kind' => $libraryKind, 'folder_id' => max(0, $folderId), 'offset' => $libraryOffset, 'limit' => $libraryLimit]));
     if ($ch === false) return null;
     curl_setopt_array($ch, [CURLOPT_RETURNTRANSFER => true, CURLOPT_CONNECTTIMEOUT_MS => 80, CURLOPT_TIMEOUT_MS => 350, CURLOPT_HTTPHEADER => ['Accept: application/json', 'Connection: close']]);
     $raw = curl_exec($ch);
@@ -5316,8 +5381,7 @@ function admin_bookmark_network_fragment(string $network, int $ownerUserId, int 
 {
     $folderFediMatch = vaak_bookmark_folder_fedi_match_sql();
     $network = $network === 'bsky' ? 'bsky' : 'fedi';
-    $offset = max(0, $offset);
-    $limit = max(10, min(40, $limit));
+    [$offset, $limit] = admin_library_page_bounds($offset, $limit);
     $folderId = max(0, $folderId);
     $kind = $network === 'bsky' ? 'bookmarks_bsky' : 'bookmarks_fedi';
     $suffix = 'folder=' . $folderId . '|offset=' . $offset . '|limit=' . $limit;
@@ -5409,8 +5473,9 @@ function admin_bookmark_network_fragment(string $network, int $ownerUserId, int 
                 $st->execute([$ownerUserId, $offset, $limit + 1]);
             }
             $raw = $st->fetchAll() ?: [];
-            $hasMore = count($raw) > $limit;
-            $raw = array_slice($raw, 0, $limit);
+            $paged = admin_library_fetched_page($raw, $offset, $limit);
+            $raw = $paged['keys'];
+            $hasMore = $paged['has_more'];
             $rawCount = count($raw);
             $canonicalAttempted = false;
             $native = ap_library_native_render_saved_local($raw, 'bookmarks_fedi', $ownerUserId, $folderId, $offset, $limit, $canonicalAttempted);
@@ -5461,8 +5526,9 @@ function admin_bookmark_network_fragment(string $network, int $ownerUserId, int 
                 $st->execute([$ownerUserId, $offset, $limit + 1]);
             }
             $raw = $st->fetchAll() ?: [];
-            $hasMore = count($raw) > $limit;
-            $raw = array_slice($raw, 0, $limit);
+            $paged = admin_library_fetched_page($raw, $offset, $limit);
+            $raw = $paged['keys'];
+            $hasMore = $paged['has_more'];
             $rawCount = count($raw);
             foreach ($raw as $rawOrdinal => $row) {
                 if (!is_array($row)) {
@@ -5574,8 +5640,7 @@ function admin_bookmark_mixed_markup(array $items, int $nextOffset, int $limit, 
 function admin_bookmark_mixed_fragment(int $ownerUserId, int $folderId, int $offset, int $limit): array
 {
     $folderFediMatch = vaak_bookmark_folder_fedi_match_sql();
-    $offset = max(0, $offset);
-    $limit = max(10, min(40, $limit));
+    [$offset, $limit] = admin_library_page_bounds($offset, $limit);
     $folderId = max(0, $folderId);
     $empty = static function (string $source) use ($offset, $limit, $folderId): array {
         return [
@@ -5673,8 +5738,9 @@ function admin_bookmark_mixed_fragment(int $ownerUserId, int $folderId, int $off
         $st = ap_db()->prepare($sql);
         $st->execute($params);
         $keys = $st->fetchAll() ?: [];
-        $hasMore = count($keys) > $limit;
-        $keys = array_slice($keys, 0, $limit);
+        $paged = admin_library_fetched_page($keys, $offset, $limit);
+        $keys = $paged['keys'];
+        $hasMore = $paged['has_more'];
         $fediIds = [];
         $bskyUris = [];
         foreach ($keys as $key) {
@@ -5746,7 +5812,7 @@ function admin_bookmark_mixed_fragment(int $ownerUserId, int $folderId, int $off
             }
         }
         return [
-            'html' => admin_bookmark_mixed_markup($items, $offset + count($keys), $limit, $hasMore, $folderId, $offset === 0),
+            'html' => admin_bookmark_mixed_markup($items, $paged['next_offset'], $limit, $hasMore, $folderId, $offset === 0),
             'has_more' => $hasMore,
             'source' => 'mixed',
         ];
@@ -6047,8 +6113,7 @@ if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'favourites_bsky') {
     if (session_status() === PHP_SESSION_ACTIVE) {
         session_write_close();
     }
-    $offset = max(0, (int) ($_GET['offset'] ?? 0));
-    $limit = max(10, min(40, (int) ($_GET['limit'] ?? 20)));
+    [$offset, $limit] = admin_library_page_bounds((int) ($_GET['offset'] ?? 0), (int) ($_GET['limit'] ?? 20));
     if (is_array($favData = admin_library_data_axum_fetch($vaakOwnerId, $offset, $limit))) {
         $items = is_array($favData['bsky_rows'] ?? null) ? $favData['bsky_rows'] : [];
         $hasMore = !empty($favData['has_more_bsky']);
@@ -6175,7 +6240,7 @@ if (isset($_GET['partial'], $_GET['shell'])
                     || str_starts_with($uri, 'at://')
                     || str_contains($uri, 'bsky.app/'));
             }));
-            $favHasMore = count($favRows) > 20;
+            $favHasMore = admin_library_favourite_has_more('soft', count($favRows), count($favRows), 0, 20);
             $favList = array_slice($favRows, 0, 20);
             if ($favList === []) {
                 echo '<div class="empty">No Fediverse favourites yet.</div>';
@@ -6185,7 +6250,7 @@ if (isset($_GET['partial'], $_GET['shell'])
                     . '" data-limit="20" data-has-more="' . ($favHasMore ? '1' : '0') . '">';
                 admin_render_library_network_items($favList, 'fedi', 'favourites');
                 echo '<div data-fedi-favourites-sentinel class="meta" style="padding:1rem 0 2rem;text-align:center">'
-                    . ($favHasMore ? 'Scroll for more…' : 'End of Fediverse favourites') . '</div></div>';
+                    . admin_library_favourite_sentinel($favHasMore) . '</div></div>';
             }
         }
         echo '</div>';
@@ -29112,7 +29177,7 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
             $favList = $favPage['items'];
             // The full PHP shell historically tests the hydrated count before
             // protocol exclusion; soft navigation/AJAX use the filtered count.
-            $favHasMore = $favPage['hydrated_count'] > 20;
+            $favHasMore = admin_library_favourite_has_more('page', (int) $favPage['hydrated_count'], count($favList), 0, 20);
           ?>
           <?php if (!$favList): ?>
             <?= admin_mascot_empty('No Fediverse favourites yet.') ?>
@@ -29120,7 +29185,7 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
             <?php $GLOBALS['admin_library_fetch_budget'] = 3; ?>
             <div data-fedi-favourites-fragment data-offset="<?= (int) count($favList) ?>" data-limit="20" data-has-more="<?= $favHasMore ? '1' : '0' ?>">
               <?php admin_render_library_network_items($favList, 'fedi', 'favourites'); ?>
-              <div data-fedi-favourites-sentinel class="meta" style="padding:1rem 0 2rem;text-align:center"><?= $favHasMore ? 'Scroll for more…' : 'End of Fediverse favourites' ?></div>
+              <div data-fedi-favourites-sentinel class="meta" style="padding:1rem 0 2rem;text-align:center"><?= admin_library_favourite_sentinel($favHasMore) ?></div>
             </div>
           <?php endif; ?>
         <?php else: ?>
