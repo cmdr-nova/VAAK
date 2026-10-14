@@ -91,4 +91,25 @@ foreach ([['élise','%C3%A9lise'],['%C3%A9lise','élise']] as [$stored,$candidat
     check(policy_match('https://edge.test/@'.$candidate)===[true,true,true,true],'valid UTF8 canonical/web aliases '.$stored);
 }
 foreach(['vaak:relset:v3:blocks-actors:201','vaak:moderation:mutes:v4:201','vaak:moderation:server-blocks:v3'] as $key) check(in_array($key,$GLOBALS['deleted'],true),'latest exact namespace invalidation '.$key);
+$_SERVER['REQUEST_TIME_FLOAT'] = '2000.1';
+ap_actor_moderation_aliases(null, true);
+ap_db()->exec("INSERT INTO bsky_posts(author_handle, author_did) VALUES('alice.bsky.social','did:plc:aliasfixture')");
+$resolved = ap_actor_moderation_aliases('https://bsky.app/profile/alice.bsky.social');
+check(in_array('did:plc:aliasfixture', $resolved, true) && in_array('alice.bsky.social', $resolved, true), 'handle resolves to the local did');
+$aliasKey = '';
+foreach ($GLOBALS['redis_fixture'] as $key => $value) {
+    if (is_string($key) && str_starts_with($key, 'vaak:modalias:v1:') && is_array($value) && in_array('did:plc:aliasfixture', $value['aliases'] ?? [], true)) {
+        $aliasKey = $key;
+    }
+}
+check($aliasKey !== '', 'successful alias lookup is stored briefly in redis');
+ap_db()->exec('DELETE FROM bsky_posts');
+$_SERVER['REQUEST_TIME_FLOAT'] = '2000.2';
+ap_actor_moderation_aliases(null, true);
+$_SERVER['REQUEST_TIME_FLOAT'] = '2000.3';
+$shared = ap_actor_moderation_aliases('https://bsky.app/profile/alice.bsky.social');
+check(in_array('did:plc:aliasfixture', $shared, true), 'a later request reuses the brief redis copy');
+ap_actor_moderation_aliases(null, true);
+$reread = ap_actor_moderation_aliases('https://bsky.app/profile/alice.bsky.social');
+check(!in_array('did:plc:aliasfixture', $reread, true), 'refresh in this request reads the database instead of redis');
 echo "moderation-alias-cache: PASS ($count actual-helper controls; SQLite DB and Redis transport fixture)\n";
