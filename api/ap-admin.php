@@ -39991,11 +39991,15 @@ window.vaakBootStatusThread();
   }
 
   function maybeLoadMoreIfNeeded() {
+    // A parked Home column is detached. Its sentinel rect is empty, which
+    // would otherwise keep paging the timeline while Notifications is open.
+    if (!items || !items.isConnected) return;
     if (sentinelNeedsMore()) loadMore();
   }
 
   async function loadMore() {
     syncTimelineKindFlags();
+    if (!items || !items.isConnected) return;
     // Soft-nav Mentions→Home can leave this boot script thinking it is still
     // on notifications; refuse to page the wrong endpoint into Home.
     if (items && items.dataset && items.dataset.view
@@ -40147,6 +40151,9 @@ window.vaakBootStatusThread();
     } finally {
       if (skeleton && skeleton.parentNode) skeleton.remove();
       loading = false;
+      // The page we were filling may have been parked. Do not scroll the
+      // window the reader is looking at now, and do not chain another fetch.
+      if (!items || !items.isConnected) return;
       if (stickToTop) {
         sc.setTop(0, false);
       } else {
@@ -40967,6 +40974,63 @@ window.vaakBootStatusThread();
     }
     return true;
   };
+  // Home → Notifications detaches this column instead of destroying it.
+  // Stop the head poll and SSE so a parked timeline does not hold a worker.
+  // Resume re-arms the same poll; it does not clear the new-posts pill or
+  // refetch the cards already on screen.
+  window.vaakPauseTimelineForPark = function () {
+    try { stopTimelineStream(); } catch (e) {}
+    stopTimelinePollTimer();
+    if (timelineCatchUpTimer) {
+      window.clearTimeout(timelineCatchUpTimer);
+      timelineCatchUpTimer = 0;
+    }
+    timelineCatchUpPending = false;
+    if (activeTimelinePollAbort) {
+      try { activeTimelinePollAbort.abort(); } catch (e) {}
+    }
+    // Copy the held posts. A later Local/Federated boot clears this closure,
+    // and the pill would come back empty if the copy lived only here.
+    return {
+      pendingHtml: pendingHtml,
+      pendingCount: pendingCount,
+      pendingSourceCount: pendingSourceCount,
+      newestTs: newestTs
+    };
+  };
+  window.vaakResumeParkedTimeline = function (snap) {
+    items = document.getElementById('timeline-items');
+    status = document.getElementById('timeline-status');
+    sentinel = document.getElementById('timeline-sentinel');
+    newBtn = document.getElementById('feed-new-btn');
+    topBtn = document.getElementById('feed-top-btn');
+    if (!items || !items.isConnected) return false;
+    const live = String(items.dataset.view || '');
+    if (!['home', 'local', 'feed'].includes(live)) return false;
+    viewName = live;
+    syncTimelineKindFlags();
+    offset = parseInt(items.dataset.offset || '0', 10) || 0;
+    limit = parseInt(items.dataset.limit || '15', 10) || 15;
+    tlBefore = items.dataset.before ? String(items.dataset.before) : '';
+    hasMore = items.dataset.hasMore === '1';
+    const paintedNewest = parseInt(items.dataset.newest || '0', 10) || 0;
+    if (paintedNewest > 0) newestTs = paintedNewest;
+    if (snap && typeof snap === 'object') {
+      pendingHtml = String(snap.pendingHtml || '');
+      pendingCount = Number(snap.pendingCount) || 0;
+      pendingSourceCount = Number(snap.pendingSourceCount) || 0;
+      const snappedNewest = Number(snap.newestTs) || 0;
+      if (snappedNewest > 0) newestTs = snappedNewest;
+    }
+    window.__vaakNavigationPending = false;
+    try { bindInfiniteScrollObserver(); } catch (e) {}
+    try { bindTopBtn(); } catch (e) {}
+    try { ensureNewPostsBtn(); } catch (e) {}
+    try { updateNewBtn(); } catch (e) {}
+    try { ensureTimelinePollTimer(); } catch (e) {}
+    try { syncTimelineStreamVisibility(); } catch (e) {}
+    return true;
+  };
   document.querySelectorAll('.timeline-tabs a').forEach((a) => {
     a.addEventListener('click', (ev) => {
       if (ev.metaKey || ev.ctrlKey || ev.shiftKey || ev.altKey || a.target === '_blank') return;
@@ -41154,12 +41218,17 @@ window.vaakBootStatusThread();
     sync();
   }
 
-  function bindNotifScroll(main) {
+  function bindNotifScroll(main, prefetch) {
     const items = document.getElementById('timeline-items');
     const sentinel = document.getElementById('timeline-sentinel');
     const status = document.getElementById('timeline-status');
     const feed = main.querySelector('.feed') || document.querySelector('section.main > .feed');
-    if (!items || !sentinel) return;
+    if (!items || !sentinel) {
+      if (prefetch && prefetch.abort) {
+        try { prefetch.abort.abort(); } catch (e) {}
+      }
+      return;
+    }
     let loading = false;
     let hasMore = items.dataset.hasMore === '1';
     let maxId = items.dataset.maxId || '';
@@ -41167,7 +41236,7 @@ window.vaakBootStatusThread();
     const filter = items.dataset.filter || 'all';
     const limit = parseInt(items.dataset.limit || '30', 10) || 30;
     let aborted = false;
-    let fetchAbort = null;
+    let fetchAbort = prefetch && prefetch.abort ? prefetch.abort : null;
     const stillOnMentions = () => {
       const live = document.getElementById('timeline-items');
       return !aborted && live === items && live && live.dataset.view === 'mentions';
@@ -41179,7 +41248,14 @@ window.vaakBootStatusThread();
       try { io.disconnect(); } catch (e) {}
     };
     async function loadInitial() {
-      if (!initialPending || loading || aborted) return;
+      if (!initialPending || loading || aborted) {
+        // A restored column already has its first page. Drop a fill that
+        // this binder is not going to paint.
+        if (!initialPending && prefetch && prefetch.abort && !aborted) {
+          try { prefetch.abort.abort(); } catch (e) {}
+        }
+        return;
+      }
       initialPending = false;
       try { items.dataset.initialPending = '0'; } catch (e) {}
       loading = true;
@@ -41189,13 +41265,18 @@ window.vaakBootStatusThread();
         const firstUrl = '?view=mentions&partial=1'
           + '&notification_filter=' + encodeURIComponent(filter)
           + '&limit=' + encodeURIComponent(String(limit));
-        fetchAbort = (typeof AbortController !== 'undefined') ? new AbortController() : null;
-        const firstRes = await fetch(firstUrl, {
-          credentials: 'same-origin',
-          headers: { 'Accept': 'text/html', 'X-Requested-With': 'XMLHttpRequest' },
-          cache: 'no-store',
-          signal: fetchAbort ? fetchAbort.signal : undefined
-        });
+        let firstRes;
+        if (prefetch && prefetch.response) {
+          firstRes = await prefetch.response;
+        } else {
+          fetchAbort = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+          firstRes = await fetch(firstUrl, {
+            credentials: 'same-origin',
+            headers: { 'Accept': 'text/html', 'X-Requested-With': 'XMLHttpRequest' },
+            cache: 'no-store',
+            signal: fetchAbort ? fetchAbort.signal : undefined
+          });
+        }
         if (!stillOnMentions()) return;
         if (!firstRes.ok) throw new Error('HTTP ' + firstRes.status);
         const firstHtml = await firstRes.text();
@@ -41720,6 +41801,205 @@ window.vaakBootStatusThread();
   }
   window.vaakSoftNavProfile = softNavProfile;
 
+  // Painted Home / Local / Federated / Notifications columns, kept off-document
+  // so a round trip does not re-render them. PHP and Rust cards stay as the
+  // nodes that were painted; this map does not rewrite either painter.
+  // Hover prefetch is intentionally absent: those responses are Cache-Control
+  // no-store, so a prefetch would be another PHP/Rust hit rather than a cache read.
+  const parkedColumns = new Map();
+
+  function columnParkKey(view, filter) {
+    if (view === 'home' || view === 'local' || view === 'feed') return 'timeline:' + view;
+    if (view === 'mentions') {
+      const name = String(filter || 'all');
+      return 'mentions:' + (name === '' ? 'all' : name);
+    }
+    return '';
+  }
+
+  function mentionsParkIsFresh() {
+    const badge = document.getElementById('notif-badge');
+    if (!badge || badge.hidden) return true;
+    const label = String(badge.textContent || '').replace(/\s+/g, '');
+    return label === '' || label === '0';
+  }
+
+  function discardMentionsParks() {
+    Array.from(parkedColumns.keys()).forEach((key) => {
+      if (key.indexOf('mentions:') === 0) parkedColumns.delete(key);
+    });
+  }
+
+  function liveColumnState() {
+    const main = document.querySelector('section.main');
+    if (!main || main.querySelector('.vaak-soft-loading')) return null;
+    const items = main.querySelector('#timeline-items');
+    if (!items) return null;
+    const view = String(items.dataset.view || '');
+    const filter = String(items.dataset.filter || 'all') || 'all';
+    if (view === 'home' || view === 'local' || view === 'feed') {
+      if (items.dataset.needsFill === '1' && !items.querySelector('article')) return null;
+      return { main: main, view: view, filter: filter, key: columnParkKey(view, filter) };
+    }
+    if (view === 'mentions') {
+      if (items.dataset.initialPending === '1') return null;
+      if (!items.querySelector('article, .empty')) return null;
+      return { main: main, view: view, filter: filter, key: columnParkKey(view, filter) };
+    }
+    return null;
+  }
+
+  function readColumnScroll(main) {
+    const feed = main.querySelector('.feed');
+    let feedTop = 0;
+    if (feed) {
+      try { feedTop = feed.scrollTop || 0; } catch (e) {}
+    }
+    return {
+      feed: feedTop,
+      window: window.scrollY || document.documentElement.scrollTop || 0
+    };
+  }
+
+  function applyColumnScroll(main, saved) {
+    if (!saved) return;
+    const feed = main.querySelector('.feed');
+    if (feed) {
+      try { feed.scrollTop = Math.max(0, Number(saved.feed) || 0); } catch (e) {}
+    }
+    try { window.scrollTo(0, Math.max(0, Number(saved.window) || 0)); } catch (e) {}
+  }
+
+  function parkLiveColumn(timelineSnap) {
+    const state = liveColumnState();
+    if (!state || !state.key) return false;
+    const scroll = readColumnScroll(state.main);
+    const holder = document.createElement('div');
+    while (state.main.firstChild) holder.appendChild(state.main.firstChild);
+    if (typeof window.vaakSilencePinnedMedia === 'function') {
+      try { window.vaakSilencePinnedMedia(holder); } catch (e) {}
+    }
+    parkedColumns.set(state.key, {
+      holder: holder,
+      scroll: scroll,
+      view: state.view,
+      filter: state.filter,
+      timelineSnap: timelineSnap || null
+    });
+    return true;
+  }
+
+  function releaseLiveColumn() {
+    const main = document.querySelector('section.main');
+    const items = main ? main.querySelector('#timeline-items') : null;
+    const view = items ? String(items.dataset.view || '') : '';
+    if (view === 'mentions' && typeof window.vaakAbortNotifScroll === 'function') {
+      try { window.vaakAbortNotifScroll(); } catch (e) {}
+    }
+    let timelineSnap = null;
+    if ((view === 'home' || view === 'local' || view === 'feed')
+        && typeof window.vaakPauseTimelineForPark === 'function') {
+      try { timelineSnap = window.vaakPauseTimelineForPark() || null; } catch (e) {}
+    }
+    parkComposer();
+    return parkLiveColumn(timelineSnap);
+  }
+
+  function takeParkedColumn(view, filter) {
+    const key = columnParkKey(view, filter);
+    if (!key) return null;
+    if (view === 'mentions' && !mentionsParkIsFresh()) {
+      discardMentionsParks();
+      return null;
+    }
+    const parked = parkedColumns.get(key);
+    if (!parked) return null;
+    parkedColumns.delete(key);
+    return parked;
+  }
+
+  function pushSoftHistory(view, filter, extra) {
+    extra = extra && typeof extra === 'object' ? extra : {};
+    const href = (typeof window.vaakAppHistoryUrl === 'function')
+      ? window.vaakAppHistoryUrl((u) => {
+          u.searchParams.set('view', view);
+          if (view === 'status') {
+            u.searchParams.set('object', extra.object || '');
+            u.searchParams.set('from', extra.from || 'home');
+          } else { u.searchParams.delete('object'); u.searchParams.delete('from'); }
+          u.searchParams.delete('refresh_thread');
+          u.searchParams.delete('_r');
+          if (view === 'mentions' && filter && filter !== 'all') u.searchParams.set('notification_filter', filter);
+          else u.searchParams.delete('notification_filter');
+          if ((view === 'favourites' || view === 'following' || view === 'followers') && extra.network) {
+            u.searchParams.set('network', extra.network);
+          } else if (view !== 'favourites' && view !== 'following' && view !== 'followers') {
+            u.searchParams.delete('network');
+          }
+          if ((view === 'following' || view === 'followers') && extra.limit) {
+            u.searchParams.set('limit', String(extra.limit));
+          } else if (view !== 'following' && view !== 'followers') {
+            u.searchParams.delete('limit');
+          }
+          if (view === 'bookmarks' && extra.folder) u.searchParams.set('folder', String(extra.folder));
+          else u.searchParams.delete('folder');
+          if (view === 'search') {
+            if (extra.q) u.searchParams.set('q', String(extra.q));
+            else u.searchParams.delete('q');
+            if (extra.type) u.searchParams.set('type', String(extra.type));
+            else u.searchParams.delete('type');
+            if (extra.resolve) u.searchParams.set('resolve', '1');
+            else u.searchParams.delete('resolve');
+          } else {
+            u.searchParams.delete('q');
+            u.searchParams.delete('type');
+            u.searchParams.delete('resolve');
+          }
+        })
+      : (() => {
+          const u = new URL(window.location.href);
+          u.searchParams.set('view', view);
+          return u.pathname + u.search;
+        })();
+    history.pushState({ vaakSoft: view, filter: filter || '', extra: extra }, '', href);
+  }
+
+  function restoreParkedColumn(view, push, filter, extra) {
+    const parked = takeParkedColumn(view, filter);
+    if (!parked) return false;
+    const main = document.querySelector('section.main');
+    if (!main) {
+      parkedColumns.set(columnParkKey(view, filter), parked);
+      return false;
+    }
+    if (push !== false) saveViewPosition();
+    releaseLiveColumn();
+    while (main.firstChild) main.removeChild(main.firstChild);
+    while (parked.holder.firstChild) main.appendChild(parked.holder.firstChild);
+    updateChrome(view);
+    if (push !== false) pushSoftHistory(view, filter, extra);
+    applyColumnScroll(main, parked.scroll);
+    if (typeof window.vaakAdoptComposerAfterSoftNav === 'function') {
+      try { window.vaakAdoptComposerAfterSoftNav(); } catch (e) {}
+    }
+    bindFeedTopBtn(main);
+    if (view === 'home' || view === 'local' || view === 'feed') {
+      if (typeof window.vaakResumeParkedTimeline === 'function') {
+        try { window.vaakResumeParkedTimeline(parked.timelineSnap || null); } catch (e) {}
+      }
+    } else if (view === 'mentions') {
+      bindNotifScroll(main);
+    }
+    if (typeof window.vaakHideLoading === 'function') window.vaakHideLoading();
+    window.__vaakNavigationPending = false;
+    const savedScroll = parked.scroll;
+    requestAnimationFrame(() => {
+      if (!main.isConnected || document.querySelector('section.main') !== main) return;
+      applyColumnScroll(main, savedScroll);
+    });
+    return true;
+  }
+
   async function softNavTo(view, push, filter, extra) {
     view = String(view || '');
     filter = filter == null ? '' : String(filter);
@@ -41738,6 +42018,10 @@ window.vaakBootStatusThread();
       return;
     }
     if (typeof window.vaakCloseMobileNav === 'function') window.vaakCloseMobileNav();
+
+    // Home ↔ Notifications (and the other parked columns) reuse the nodes
+    // already on screen, including scroll position and the new-posts pill.
+    if (restoreParkedColumn(view, push, filter, extra)) return;
 
     if (['home', 'local', 'feed'].includes(view) && typeof window.vaakSwapTimelineView === 'function') {
       const cur = new URL(window.location.href).searchParams.get('view') || '';
@@ -41775,22 +42059,10 @@ window.vaakBootStatusThread();
     }
     const loadingLabel = view === 'search' ? 'Searching…' : 'Loading…';
     if (typeof window.vaakShowLoading === 'function') window.vaakShowLoading(loadingLabel);
-    // Park the live compose panel BEFORE wiping section.main. The inline
-    // composer lives in #compose-inline-slot inside main; clearing innerHTML
-    // first destroyed the only .compose-modal__panel and left Home/FAB dead
-    // until a hard refresh (0.7.12).
-    if (typeof window.vaakParkComposerForSoftNav === 'function') {
-      try { window.vaakParkComposerForSoftNav(); } catch (e) {}
-    } else {
-      const livePanelEarly = document.querySelector('.compose-modal__panel');
-      const modalShellEarly = document.getElementById('compose-modal');
-      if (livePanelEarly && modalShellEarly) {
-        livePanelEarly.classList.remove('compose-inline-panel');
-        if (livePanelEarly.parentElement !== modalShellEarly) {
-          modalShellEarly.appendChild(livePanelEarly);
-        }
-      }
-    }
+    // Move the composer out, then detach a painted timeline or notifications
+    // column before the spinner replaces section.main. innerHTML used to
+    // destroy the only compose panel and the Home cards we can show again.
+    releaseLiveColumn();
     if (typeof window.vaakStopStatusThread === 'function') window.vaakStopStatusThread();
     // Replace main immediately so slow shells show a spinner instead of stale content.
     try {
@@ -41798,6 +42070,8 @@ window.vaakBootStatusThread();
       // communicates progress; avoid two simultaneous Loading… messages.
       main.innerHTML = '<div class="vaak-soft-loading" role="status" aria-live="polite" aria-busy="true"></div>';
     } catch (e) {}
+    let mentionsPrefetch = null;
+    let mentionsPrefetchHeld = false;
     try {
       let url = '/vaak/?view=' + encodeURIComponent(view) + '&partial=1&shell=1&limit='
         + encodeURIComponent(view === 'mentions' ? '12' : (view === 'outbox' ? '20' : '15'));
@@ -41816,6 +42090,23 @@ window.vaakBootStatusThread();
         if (extra.q) url += '&q=' + encodeURIComponent(extra.q);
         if (extra.type) url += '&type=' + encodeURIComponent(extra.type);
         if (extra.resolve) url += '&resolve=1';
+      }
+      // The notifications shell is an empty frame. Start the first-page fill
+      // now so it can paint from the warm Redis/Axum list without waiting for
+      // that frame to come back first. Same two requests as before, overlapped.
+      if (view === 'mentions') {
+        const fillAbort = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+        const fillUrl = '?view=mentions&partial=1'
+          + '&notification_filter=' + encodeURIComponent(filter || 'all')
+          + '&limit=12';
+        const pendingFill = fetch(fillUrl, {
+          credentials: 'same-origin',
+          headers: { 'Accept': 'text/html', 'X-Requested-With': 'XMLHttpRequest' },
+          cache: 'no-store',
+          signal: fillAbort ? fillAbort.signal : undefined
+        });
+        pendingFill.catch(() => {});
+        mentionsPrefetch = { abort: fillAbort, response: pendingFill };
       }
       const res = await fetch(url, {
         credentials: 'same-origin',
@@ -41895,50 +42186,7 @@ window.vaakBootStatusThread();
       const feedEl = main.querySelector('.feed');
       if (feedEl) { try { feedEl.scrollTop = 0; } catch (e) {} }
       updateChrome(view);
-      if (push !== false) {
-        const href = (typeof window.vaakAppHistoryUrl === 'function')
-          ? window.vaakAppHistoryUrl((u) => {
-              u.searchParams.set('view', view);
-              if (view === 'status') {
-                u.searchParams.set('object', extra.object || '');
-                u.searchParams.set('from', extra.from || 'home');
-              } else { u.searchParams.delete('object'); u.searchParams.delete('from'); }
-              u.searchParams.delete('refresh_thread');
-              u.searchParams.delete('_r');
-              if (view === 'mentions' && filter && filter !== 'all') u.searchParams.set('notification_filter', filter);
-              else u.searchParams.delete('notification_filter');
-              if ((view === 'favourites' || view === 'following' || view === 'followers') && extra.network) {
-                u.searchParams.set('network', extra.network);
-              } else if (view !== 'favourites' && view !== 'following' && view !== 'followers') {
-                u.searchParams.delete('network');
-              }
-              if ((view === 'following' || view === 'followers') && extra.limit) {
-                u.searchParams.set('limit', String(extra.limit));
-              } else if (view !== 'following' && view !== 'followers') {
-                u.searchParams.delete('limit');
-              }
-              if (view === 'bookmarks' && extra.folder) u.searchParams.set('folder', String(extra.folder));
-              else u.searchParams.delete('folder');
-              if (view === 'search') {
-                if (extra.q) u.searchParams.set('q', String(extra.q));
-                else u.searchParams.delete('q');
-                if (extra.type) u.searchParams.set('type', String(extra.type));
-                else u.searchParams.delete('type');
-                if (extra.resolve) u.searchParams.set('resolve', '1');
-                else u.searchParams.delete('resolve');
-              } else {
-                u.searchParams.delete('q');
-                u.searchParams.delete('type');
-                u.searchParams.delete('resolve');
-              }
-            })
-          : (() => {
-              const u = new URL(window.location.href);
-              u.searchParams.set('view', view);
-              return u.pathname + u.search;
-            })();
-        history.pushState({ vaakSoft: view, filter: filter || '', extra }, '', href);
-      }
+      if (push !== false) pushSoftHistory(view, filter, extra);
       if (typeof window.novaEnhanceTweetFolds === 'function') {
         const foldRoot = document.getElementById('timeline-items') || main.querySelector('.feed');
         if (foldRoot) window.novaEnhanceTweetFolds(foldRoot);
@@ -41947,7 +42195,8 @@ window.vaakBootStatusThread();
       if (view === 'status') {
         if (typeof window.vaakBootStatusThread !== 'function' || !window.vaakBootStatusThread()) throw new Error('status-boot');
       } else if (view === 'mentions') {
-        bindNotifScroll(main);
+        bindNotifScroll(main, mentionsPrefetch);
+        mentionsPrefetchHeld = true;
       } else if (['favourites', 'bookmarks'].includes(view)) {
         bootLibraryView(view, main);
       } else if (['following', 'followers', 'search'].includes(view)) {
@@ -41974,6 +42223,9 @@ window.vaakBootStatusThread();
     } catch (e) {
       hardNav(view, filter, extra); return;
     } finally {
+      if (mentionsPrefetch && !mentionsPrefetchHeld && mentionsPrefetch.abort) {
+        try { mentionsPrefetch.abort.abort(); } catch (err) {}
+      }
       busy = false;
       if (!leaving) {
         window.__vaakNavigationPending = false;
