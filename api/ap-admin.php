@@ -34992,7 +34992,7 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
                         : 'https://secondlife.com/';
                   ?>
                   <a href="<?= h($rpSlHref) ?>" rel="noopener noreferrer me" title="Open <?= h($rpSlName) ?> in Second Life" aria-label="Open <?= h($rpSlName) ?> in Second Life">
-                    <img src="/vaak/second-life.jpg" alt="Second Life" width="43" height="34" loading="lazy">
+                    <img src="/vaak/second-life.svg" alt="Second Life" width="43" height="34" loading="lazy">
                   </a>
                   <span class="meta"><?= h($rpSlName) ?></span>
                 <?php endif; ?>

@@ -245,6 +245,16 @@ if (!str_contains($byId['requested']['chrome'], 'Cancel this follow request?') |
 if (!str_contains($byId['badges_fields']['chrome'], 'custom-emoji') || !str_contains($byId['badges_fields']['chrome'], '◈ Resonant') || !str_contains($byId['badges_fields']['chrome'], 'Cat person')) {
     throw new RuntimeException('emoji, resonant badge, or catalog badge drifted');
 }
+$slIcon = dirname(__DIR__, 2) . '/vaak/second-life.svg';
+if (!is_file($slIcon)) {
+    throw new RuntimeException('shipped Second Life icon missing: ' . $slIcon);
+}
+foreach (['badges_fields', 'wow_text'] as $slCase) {
+    $slChrome = $byId[$slCase]['chrome'];
+    if (!str_contains($slChrome, '<img src="/vaak/second-life.svg" alt="Second Life" width="43" height="34" loading="lazy">') || str_contains($slChrome, 'second-life.jpg') || str_contains($slChrome, 'second-life.png')) {
+        throw new RuntimeException($slCase . ' Second Life icon must use vaak/second-life.svg at 43x34');
+    }
+}
 if (!str_contains($byId['tabs']['chrome'], '>Pinned<') || str_contains($byId['tabs']['chrome'], '>Boosts<') || !str_contains($byId['tabs']['chrome'], '>Replies<') || !str_contains($byId['asks_empty']['secondary'] ?? '', 'No answered Asks yet.') || !str_contains($byId['tabs']['secondary'] ?? '', 'No pinned posts.')) {
     throw new RuntimeException('tab visibility or empty pin/ask body drifted');
 }

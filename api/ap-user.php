@@ -704,7 +704,7 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
             $slName = htmlspecialchars((string) $slLink['sl_username'], ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
             $slHref = htmlspecialchars(function_exists('ap_sl_viewer_profile_url') ? ap_sl_viewer_profile_url((string) ($slLink['sl_agent_id'] ?? '')) : 'https://secondlife.com/', ENT_QUOTES, 'UTF-8');
             echo '<a href="' . $slHref . '" rel="noopener noreferrer me" title="Open ' . $slName . ' in Second Life" aria-label="Open ' . $slName . ' in Second Life">'
-                . '<img src="/vaak/second-life.jpg" alt="Second Life" width="43" height="34" loading="lazy"></a>';
+                . '<img src="/vaak/second-life.svg" alt="Second Life" width="43" height="34" loading="lazy"></a>';
         }
         if (is_array($wowLink) && !empty($wowLink['armory_url'])) {
             $wowName = htmlspecialchars((string) ($wowLink['character_name'] ?? 'World of Warcraft character'), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
