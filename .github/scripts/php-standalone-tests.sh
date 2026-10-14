@@ -76,6 +76,7 @@ php_tests=(
   api/bin/settings-parity-smoke.php
   api/bin/trends-response-cache-smoke.php
   api/bin/trending-open-ref-smoke.php
+  api/bin/timeline-newer-counter-smoke.php
 )
 
 # Drivers for isolated PHP fixtures. They do not open Postgres or a worker.

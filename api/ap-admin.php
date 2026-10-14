@@ -8008,6 +8008,7 @@ if (
         . '</div>';
     echo '<div id="timeline-sentinel" aria-hidden="true" style="height:1px"></div>';
     echo '</div>';
+    echo admin_timeline_new_posts_button();
     echo '<button type="button" class="feed-top-btn" id="feed-top-btn" title="Back to top" aria-label="Back to top">↑</button>';
     $shellHtml = (string) ob_get_clean();
     if (function_exists('ap_redis_json_set') && $shellHtml !== '') {
@@ -21810,6 +21811,60 @@ if ($isPartial && $view === 'status' && isset($_GET['thread'])) {
 }
 
 /**
+ * Cursor a newer=1 response may advertise. Only timestamps of posts whose
+ * HTML was actually returned can move it. An empty slice stays on $sinceTs.
+ *
+ * @param list<int> $returnedTs
+ */
+function admin_tl_newer_cursor(int $sinceTs, array $returnedTs): int
+{
+    $cursor = max(0, $sinceTs);
+    foreach ($returnedTs as $ts) {
+        $ts = (int) $ts;
+        if ($ts > $cursor) {
+            $cursor = $ts;
+        }
+    }
+    return $cursor;
+}
+
+/** Unix time of a Mastodon status, used so a filtered newer row cannot move the poll cursor. */
+function admin_tl_status_created_ts(array $st): int
+{
+    $raw = $st['created_at'] ?? 0;
+    if (is_int($raw) || (is_string($raw) && ctype_digit($raw))) {
+        return max(0, (int) $raw);
+    }
+    if (!is_string($raw) || trim($raw) === '') {
+        return 0;
+    }
+    $ts = strtotime($raw);
+    return $ts === false ? 0 : $ts;
+}
+
+/**
+ * Initial poll cursor for a painted timeline. Axum HTML has no per-card
+ * sort on the div, so keep the same 300s overlap Home uses. A plain PHP
+ * page keeps the first row's sort.
+ */
+function admin_tl_poll_since_cursor(int $rowSort, int $axumNewest, bool $fromAxumHtml): int
+{
+    if ($fromAxumHtml) {
+        return $axumNewest > 0 ? max(0, $axumNewest - 300) : max(0, time() - 300);
+    }
+    if ($rowSort > 0) {
+        return $rowSort;
+    }
+    return time();
+}
+
+/** The bar/pill the live poller fills. Soft-nav shells must include the same node. */
+function admin_timeline_new_posts_button(): string
+{
+    return '<button type="button" class="feed-new-btn" id="feed-new-btn" hidden>New posts</button>';
+}
+
+/**
  * Lightweight "anything newer than $sinceTs" poll for live feed updates.
  *
  * @param list<array<string,mixed>> $following
@@ -22611,7 +22666,7 @@ if ($isPartial && in_array($view, ['home', 'feed', 'local'], true)) {
             );
             if (is_array($axumHtml)) {
                 header('X-New-Count: ' . (int) ($axumHtml['count'] ?? 0));
-                header('X-Newest: ' . (int) ($axumHtml['newest'] ?? $sinceTs));
+                header('X-Newest: ' . admin_tl_newer_cursor($sinceTs, [(int) ($axumHtml['newest'] ?? $sinceTs)]));
                 header('X-TL-Newer-Source: axum-ranked-since-html');
                 header('X-TL-Newer-Fetch-Ms: ' . (string) (int) round((microtime(true) - $newerT0) * 1000));
                 header('X-TL-Newer-Render-Ms: 0');
@@ -22633,7 +22688,7 @@ if ($isPartial && in_array($view, ['home', 'feed', 'local'], true)) {
             );
             if (is_array($axumHtml)) {
                 header('X-New-Count: ' . (int) ($axumHtml['count'] ?? 0));
-                header('X-Newest: ' . (int) ($axumHtml['newest'] ?? $sinceTs));
+                header('X-Newest: ' . admin_tl_newer_cursor($sinceTs, [(int) ($axumHtml['newest'] ?? $sinceTs)]));
                 header('X-TL-Newer-Source: axum-chrono-since-html');
                 header('X-TL-Newer-Fetch-Ms: ' . (string) (int) round((microtime(true) - $newerT0) * 1000));
                 header('X-TL-Newer-Render-Ms: 0');
@@ -22654,10 +22709,9 @@ if ($isPartial && in_array($view, ['home', 'feed', 'local'], true)) {
                 $newerFetchMs = (int) round((microtime(true) - $newerT0) * 1000);
                 /** @var list<array<string,mixed>> $axumStatuses */
                 $axumStatuses = is_array($axumSince['statuses'] ?? null) ? $axumSince['statuses'] : [];
-                $newest = max($sinceTs, (int) ($axumSince['newest'] ?? $sinceTs));
                 if ($axumStatuses === []) {
                     header('X-New-Count: 0');
-                    header('X-Newest: ' . $newest);
+                    header('X-Newest: ' . admin_tl_newer_cursor($sinceTs, []));
                     header('X-TL-Newer-Source: axum-ranked');
                     header('X-TL-Newer-Fetch-Ms: ' . (string) $newerFetchMs);
                     header('X-TL-Newer-Render-Ms: 0');
@@ -22686,6 +22740,7 @@ if ($isPartial && in_array($view, ['home', 'feed', 'local'], true)) {
                 $newerRenderT0 = microtime(true);
                 ob_start();
                 $rendered = 0;
+                $returnedTs = [];
                 foreach ($axumStatuses as $st) {
                     if (!is_array($st)) {
                         continue;
@@ -22696,11 +22751,12 @@ if ($isPartial && in_array($view, ['home', 'feed', 'local'], true)) {
                     if (function_exists('admin_render_masto_status_card')) {
                         admin_render_masto_status_card($st, $followingIds, $view, false, true);
                         $rendered++;
+                        $returnedTs[] = admin_tl_status_created_ts($st);
                     }
                 }
                 $newerHtml = (string) ob_get_clean();
                 header('X-New-Count: ' . $rendered);
-                header('X-Newest: ' . $newest);
+                header('X-Newest: ' . admin_tl_newer_cursor($sinceTs, $returnedTs));
                 header('X-TL-Newer-Source: axum-ranked');
                 header('X-TL-Newer-Fetch-Ms: ' . (string) $newerFetchMs);
                 header('X-TL-Newer-Render-Ms: ' . (string) (int) round((microtime(true) - $newerRenderT0) * 1000));
@@ -22711,24 +22767,24 @@ if ($isPartial && in_array($view, ['home', 'feed', 'local'], true)) {
         }
         $slice = admin_tl_fetch_newer($view, $following, $sinceTs, $newerLimit);
         $newerFetchMs = (int) round((microtime(true) - $newerT0) * 1000);
-        $newest = $sinceTs;
-        foreach ($slice as $it) {
-            $newest = max($newest, (int) ($it['sort'] ?? 0));
-        }
         if (function_exists('ap_masto_status_flags_prefetch')) {
             ap_masto_status_flags_prefetch(admin_timeline_status_ids($slice));
         }
         $newerRenderT0 = microtime(true);
         ob_start();
+        $returnedTs = [];
+        $rendered = 0;
         foreach ($slice as $item) {
             if (admin_timeline_item_muted_by_words($item)) {
                 continue;
             }
+            $returnedTs[] = (int) ($item['sort'] ?? 0);
             admin_render_timeline_item($item, $followingIds, $view);
+            $rendered++;
         }
         $newerHtml = (string) ob_get_clean();
-        header('X-New-Count: ' . count($slice));
-        header('X-Newest: ' . $newest);
+        header('X-New-Count: ' . $rendered);
+        header('X-Newest: ' . admin_tl_newer_cursor($sinceTs, $returnedTs));
         header('X-TL-Newer-Source: php-pg');
         header('X-TL-Newer-Fetch-Ms: ' . (string) $newerFetchMs);
         header('X-TL-Newer-Render-Ms: ' . (string) (int) round((microtime(true) - $newerRenderT0) * 1000));
@@ -29196,7 +29252,7 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
         <?php if (!$localFromAxumHtml && !$localTimeline && empty($adminTlFullPageDefer)): ?>
           <?= admin_mascot_empty('No local posts yet. When anyone on this instance posts, it shows up here.') ?>
         <?php endif; ?>
-        <div id="timeline-items" data-view="local" data-offset="<?= $localNeedsFill ? '0' : (int) $localPaintCount ?>" data-limit="<?= (int) $tlLimit ?>" data-has-more="<?= $localHasMore ? '1' : '0' ?>" data-newest="<?= (int) (!empty($localPage[0]['sort']) ? $localPage[0]['sort'] : time()) ?>"<?= $localNeedsFill ? ' data-needs-fill="1"' : '' ?><?= $localTlCacheAttr !== '' ? ' data-tl-cache="' . h($localTlCacheAttr) . '"' : '' ?>>
+        <div id="timeline-items" data-view="local" data-offset="<?= $localNeedsFill ? '0' : (int) $localPaintCount ?>" data-limit="<?= (int) $tlLimit ?>" data-has-more="<?= $localHasMore ? '1' : '0' ?>" data-newest="<?= (int) admin_tl_poll_since_cursor((int) ($localPage[0]['sort'] ?? 0), (int) ($adminTlAxumHtml['newest'] ?? 0), $localFromAxumHtml) ?>"<?= $localNeedsFill ? ' data-needs-fill="1"' : '' ?><?= $localTlCacheAttr !== '' ? ' data-tl-cache="' . h($localTlCacheAttr) . '"' : '' ?>>
           <?php if ($localFromAxumHtml): ?>
             <?= $adminTlAxumHtml['html'] ?>
           <?php else: ?>
@@ -29237,7 +29293,7 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
           }
         ?>
         <?php if (!$feedFromAxumHtml && !$feedTimeline && empty($adminTlFullPageDefer)): ?><?= admin_mascot_empty('No federation events yet.') ?><?php endif; ?>
-        <div id="timeline-items" data-view="feed" data-offset="<?= $feedNeedsFill ? '0' : (int) $feedPaintCount ?>" data-limit="<?= (int) $tlLimit ?>" data-has-more="<?= $feedHasMore ? '1' : '0' ?>" data-newest="<?= (int) (!empty($feedPage[0]['sort']) ? $feedPage[0]['sort'] : time()) ?>"<?= $feedNeedsFill ? ' data-needs-fill="1"' : '' ?><?= $feedTlCacheAttr !== '' ? ' data-tl-cache="' . h($feedTlCacheAttr) . '"' : '' ?>>
+        <div id="timeline-items" data-view="feed" data-offset="<?= $feedNeedsFill ? '0' : (int) $feedPaintCount ?>" data-limit="<?= (int) $tlLimit ?>" data-has-more="<?= $feedHasMore ? '1' : '0' ?>" data-newest="<?= (int) admin_tl_poll_since_cursor((int) ($feedPage[0]['sort'] ?? 0), (int) ($adminTlAxumHtml['newest'] ?? 0), $feedFromAxumHtml) ?>"<?= $feedNeedsFill ? ' data-needs-fill="1"' : '' ?><?= $feedTlCacheAttr !== '' ? ' data-tl-cache="' . h($feedTlCacheAttr) . '"' : '' ?>>
           <?php if ($feedFromAxumHtml): ?>
             <?= $adminTlAxumHtml['html'] ?>
           <?php else: ?>
@@ -36462,7 +36518,7 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
     </div>
     <?php if (in_array($view, ['home', 'feed', 'local', 'bluesky', 'outbox', 'search', 'favourites', 'bookmarks', 'mentions'], true)): ?>
       <?php if (in_array($view, ['home', 'feed', 'local', 'bluesky'], true)): ?>
-      <button type="button" class="feed-new-btn" id="feed-new-btn" hidden>New posts</button>
+      <?= admin_timeline_new_posts_button() ?>
       <?php endif; ?>
       <button type="button" class="feed-top-btn" id="feed-top-btn" title="Back to top" aria-label="Back to top">↑</button>
     <?php endif; ?>
@@ -38971,20 +39027,52 @@ window.vaakBootStatusThread();
     return keys;
   }
 
+  function isPollTimelineCard(el) {
+    if (!el || !el.tagName || el.tagName !== 'ARTICLE') return false;
+    if (el.classList && (el.classList.contains('tweet') || el.classList.contains('tweet-thread'))) return true;
+    return !!(el.getAttribute('data-timeline-key') || el.getAttribute('data-note-id')
+      || el.getAttribute('data-sort') || el.getAttribute('data-rss-item') || el.getAttribute('data-bsky-uri'));
+  }
+  // Newer HTML is a list of cards. A wrapper (soft-nav embed, thread shell)
+  // is unwrapped once. Cards inside an article stay inside it so a quote is
+  // not counted as its own post.
+  function collectPollCards(root) {
+    const cards = [];
+    const walk = (node) => {
+      Array.from(node.children || []).forEach((el) => {
+        if (!el || !el.tagName) return;
+        if (el.tagName === 'ARTICLE') {
+          if (isPollTimelineCard(el)) cards.push(el);
+          return;
+        }
+        walk(el);
+      });
+    };
+    walk(root);
+    return cards;
+  }
   function filterNewHtml(html) {
     const wrap = document.createElement('div');
     wrap.innerHTML = (html || '').trim();
+    const cards = collectPollCards(wrap);
+    let sortCeiling = 0;
+    let everySorted = cards.length > 0;
+    cards.forEach((el) => {
+      const sort = parseInt(el.getAttribute('data-sort') || '0', 10) || 0;
+      if (sort <= 0) everySorted = false;
+      else if (sort > sortCeiling) sortCeiling = sort;
+    });
     const known = seenKeys();
     // Raw selected entries and painted thread wrappers are different counts.
-    // Count new top-level source entries before folding their shared parent.
+    // Count new source entries before folding their shared parent.
     const sourceKnown = Object.assign({}, known);
     let sourceCount = 0;
-    Array.from(wrap.children).forEach((el) => {
+    cards.forEach((el) => {
       const key = timelineCardKey(el);
       if (!sourceKnown[key]) { sourceKnown[key] = true; sourceCount++; }
     });
     const out = document.createElement('div');
-    Array.from(wrap.children).forEach((el) => {
+    cards.forEach((el) => {
       const key = timelineCardKey(el);
       if (known[key]) return;
       known[key] = true;
@@ -38996,7 +39084,13 @@ window.vaakBootStatusThread();
         if (!candidate.classList.contains('tweet-thread') && timelineCardKey(candidate) === key) candidate.remove();
       });
     });
-    return { html: out.innerHTML, count: out.children.length, sourceCount };
+    return {
+      html: out.innerHTML,
+      count: out.children.length,
+      sourceCount,
+      parsed: cards.length,
+      sortCeiling: everySorted ? sortCeiling : 0,
+    };
   }
 
   function reconcileThreadAncestors(scope) {
@@ -39023,7 +39117,9 @@ window.vaakBootStatusThread();
     }
   }
   function updateNewBtn() {
-    const liveBtn = document.getElementById('feed-new-btn');
+    let liveBtn = document.getElementById('feed-new-btn');
+    if ((!liveBtn || !liveBtn.isConnected) && pendingCount > 0) ensureNewPostsBtn();
+    liveBtn = document.getElementById('feed-new-btn');
     if (liveBtn) newBtn = liveBtn;
     if (!newBtn) {
       syncPendingPostTitle();
@@ -39041,7 +39137,7 @@ window.vaakBootStatusThread();
     }
     newBtn.hidden = false;
     newBtn.classList.add('show');
-    newBtn.textContent = pendingCount === 1 ? 'Show 1 post' : ('Show ' + pendingCount + ' posts');
+    newBtn.textContent = pendingCount === 1 ? '1 new post' : (pendingCount + ' new posts');
     const pin = !nearTop();
     newBtn.classList.toggle('is-pinned', pin);
     if (!pin) {
@@ -39118,13 +39214,34 @@ window.vaakBootStatusThread();
   const CATCHUP_JITTER_MS = 1600;
   // A fetch the browser suspended with the frozen tab is not a fresh answer.
   const STALE_HIDDEN_POLL_MS = 15000;
+  function syncLiveTimelineView() {
+    // Soft-nav can leave this closure's viewName behind the live timeline
+    // node. Local was then requested as Home, so that tab never polled.
+    const live = (items && items.dataset && items.dataset.view) ? String(items.dataset.view) : '';
+    if (['home', 'local', 'feed', 'mentions', 'bluesky', 'outbox'].includes(live) && live !== viewName) {
+      viewName = live;
+      syncTimelineKindFlags();
+    }
+  }
   function timelineHeadPollView() {
     // Head polls exist for Home, Local, and Federated only. Bluesky is cursor
     // pages against the PDS, and list timelines are a one-shot render. Neither
     // has this poller; do not add a heavier query for them.
+    syncLiveTimelineView();
     syncTimelineKindFlags();
     return ['home', 'local', 'feed'].includes(viewName)
       && !isNotifTimeline && !isOutboxTimeline && !isBskyTimeline;
+  }
+  function commitNewerCursor(filtered, headerTs) {
+    // Trust per-card data-sort when every returned card has one. An X-Newest
+    // ahead of those cards is a post the browser did not receive.
+    let next = newestTs;
+    if (filtered && filtered.sortCeiling > 0) next = Math.max(next, filtered.sortCeiling);
+    else if (headerTs > next) next = headerTs;
+    if (next > newestTs) {
+      newestTs = next;
+      if (items) items.dataset.newest = String(newestTs);
+    }
   }
   function pollTimelineAutomatically(options) {
     if (timelinePollSuspended || window.__vaakNavigationPending || tabSwapBusy
@@ -39198,6 +39315,7 @@ window.vaakBootStatusThread();
     const force = !!(options && options.freshPost);
     // Every standard timeline may poll, but the server scopes the query to
     // the active view (Home, Local, or Federated).
+    syncLiveTimelineView();
     if (!['home', 'local', 'feed'].includes(viewName)) return;
     if (isNotifTimeline || isOutboxTimeline) return; // list views do not poll head rows.
     if (isBskyTimeline) return; // Bluesky uses cursor pages, not since= head polls.
@@ -39233,23 +39351,27 @@ window.vaakBootStatusThread();
         return;
       }
       if (!res.ok) return;
-      if (items !== requestItems || viewName !== requestView || timelineGeneration !== requestGeneration || !requestItems.isConnected) return;
+      const liveViewNow = () => (items && items.dataset && items.dataset.view) ? String(items.dataset.view) : viewName;
+      if (items !== requestItems || liveViewNow() !== requestView || timelineGeneration !== requestGeneration || !requestItems.isConnected) return;
       timelinePollCompleted = true;
-      const newestHdr = parseInt(res.headers.get('X-Newest') || '0', 10);
-      if (newestHdr > newestTs) newestTs = newestHdr;
-      items.dataset.newest = String(newestTs);
+      const newestHdr = parseInt(res.headers.get('X-Newest') || '0', 10) || 0;
       const raw = await res.text();
-      if (items !== requestItems || viewName !== requestView || timelineGeneration !== requestGeneration || !requestItems.isConnected) return;
+      if (items !== requestItems || liveViewNow() !== requestView || timelineGeneration !== requestGeneration || !requestItems.isConnected) return;
       if (typeof window.vaakLooksLikeLoginHtml === 'function' && window.vaakLooksLikeLoginHtml(raw)) {
         window.vaakRedirectToLogin('poll-html');
         return;
       }
+      // Empty, or a body with no timeline card: the cursor stays. Advancing
+      // it here is what skipped the post the counter never got to show.
       if (!raw || !raw.trim()) return;
       const filtered = filterNewHtml(raw);
+      if (!filtered.parsed) return;
+      commitNewerCursor(filtered, newestHdr);
       if (!filtered.count) return;
       pendingHtml = filtered.html + pendingHtml;
       pendingCount += filtered.count;
       pendingSourceCount += filtered.sourceCount;
+      ensureNewPostsBtn();
       updateNewBtn();
     } catch (e) {
       // A frozen or aborted hidden poll must not count as a fresh check.
@@ -39484,10 +39606,11 @@ window.vaakBootStatusThread();
   }, { passive: true, capture: true });
 
   function updateTopBtn() {
-    if (!topBtn) return;
     const y = sc.top();
-    if (y > 280) topBtn.classList.add('show');
-    else topBtn.classList.remove('show');
+    if (topBtn) {
+      if (y > 280) topBtn.classList.add('show');
+      else topBtn.classList.remove('show');
+    }
     // User scrolled away from the top on purpose — drop the pin.
     if (stickToTop && y > NEAR_TOP_PX + 80) {
       stickToTop = false;
@@ -39523,8 +39646,27 @@ window.vaakBootStatusThread();
       insertPending({ scrollToTop: true });
     });
   }
+  function ensureNewPostsBtn() {
+    if (!timelineHeadPollView()) return;
+    let live = document.getElementById('feed-new-btn');
+    if (!live || !live.isConnected) {
+      live = document.createElement('button');
+      live.type = 'button';
+      live.id = 'feed-new-btn';
+      live.className = 'feed-new-btn';
+      if (live.classList && live.classList.add) live.classList.add('feed-new-btn');
+      live.hidden = true;
+      live.textContent = 'New posts';
+      const liveFeed = document.querySelector('.feed');
+      if (liveFeed) liveFeed.appendChild(live);
+      else if (document.body) document.body.appendChild(live);
+    }
+    newBtn = live;
+    placeNewPostsBtn();
+    bindNewPostsBtn();
+  }
   bindTopBtn();
-  bindNewPostsBtn();
+  ensureNewPostsBtn();
 
   // Bluesky: first paint is Following-only; saved-feed samples load after paint
   // (mirrors Home deferred boost hydrate — keep TTFB / first paint snappy).
@@ -39802,16 +39944,17 @@ window.vaakBootStatusThread();
       source.addEventListener('posts', (event) => {
         try {
           const payload = JSON.parse(event.data || '{}');
-          const newest = parseInt(payload.newest || '0', 10);
-          if (newest > newestTs) {
-            newestTs = newest;
-            items.dataset.newest = String(newestTs);
-          }
-          const filtered = filterNewHtml(payload.html || '');
+          const html = String(payload.html || '');
+          const headerTs = parseInt(payload.newest || '0', 10) || 0;
+          if (!html.trim()) return;
+          const filtered = filterNewHtml(html);
+          if (!filtered.parsed) return;
+          commitNewerCursor(filtered, headerTs);
           if (!filtered.count) return;
           pendingHtml = filtered.html + pendingHtml;
           pendingCount += filtered.count;
-      pendingSourceCount += filtered.sourceCount;
+          pendingSourceCount += filtered.sourceCount;
+          ensureNewPostsBtn();
           updateNewBtn();
         } catch (e) {}
       });
@@ -40124,7 +40267,7 @@ window.vaakBootStatusThread();
       pollBusy = false;
       window.__vaakNavigationPending = false;
       bindTopBtn();
-      bindNewPostsBtn();
+      ensureNewPostsBtn();
       ensureTimelinePollTimer();
       syncTimelineStreamVisibility();
       if (sidebarInstalled && items && items.isConnected && document.getElementById('timeline-items') === items
@@ -40208,7 +40351,7 @@ window.vaakBootStatusThread();
       setTimeout(function () { try { loadMore(); } catch (e) {} }, 0);
     }
     try { bindTopBtn(); } catch (e) {}
-    try { bindNewPostsBtn(); } catch (e) {}
+    try { ensureNewPostsBtn(); } catch (e) {}
     try { ensureTimelinePollTimer(); } catch (e) {}
     try { syncTimelineStreamVisibility(); } catch (e) {}
     // The initial shell already contains the current head.  Do not issue an
