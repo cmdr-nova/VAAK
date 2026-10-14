@@ -208,6 +208,9 @@ if (is_array($json)) {
             ap_fail('Signature key does not match activity actor', 401);
         }
     }
+    if (is_string($keyHost) && $keyHost !== '' && function_exists('ap_inbox_host_seen_note')) {
+        ap_inbox_host_seen_note(strtolower($keyHost), $type);
+    }
     $action = ap_route_verified_activity($json, strlen($raw));
 }
 
@@ -1034,24 +1037,19 @@ function ap_route_verified_activity(array $activity, int $bytes): string
             ap_metrics_record('Accept', $actorId, $objectId, LOCAL_ACTOR, $bytes, 'relay_accepted', null);
             return 'relay_accepted';
         }
-        $inner = $activity['object'] ?? null;
-        if (is_array($inner) && ($inner['type'] ?? '') === 'Follow') {
-            $innerActor = ap_as_id($inner['actor'] ?? null);
-            $innerObject = ap_as_id($inner['object'] ?? null);
-            // Remote accepted Follow(us → them)
-            if ($innerActor && rtrim($innerActor, '/') === rtrim(LOCAL_ACTOR, '/')) {
-                ap_following_upsert($actorId);
-                ap_metrics_record('Accept', $actorId, $objectId, LOCAL_ACTOR, $bytes, 'follow_accepted', $actorId);
-                ap_log('follow_accepted by=' . ap_short($actorId));
-                // AP does not push history — pull recent outbox notes so Home isn't empty
-                ap_outbox_backfill_async($actorId);
-                return 'follow_accepted';
-            }
-            // Remote ack of us accepting their Follow(them → us)
-            if ($innerObject && rtrim($innerObject, '/') === rtrim(LOCAL_ACTOR, '/')) {
-                ap_metrics_record('Accept', $actorId, $objectId, LOCAL_ACTOR, $bytes, 'follow_accept_ack', null);
-                return 'follow_accept_ack';
-            }
+        $applied = function_exists('ap_follow_response_apply')
+            ? ap_follow_response_apply($activity, LOCAL_ACTOR)
+            : null;
+        if ($applied === 'follow_accepted') {
+            ap_metrics_record('Accept', $actorId, $objectId, LOCAL_ACTOR, $bytes, 'follow_accepted', $actorId);
+            ap_log('follow_accepted by=' . ap_short($actorId));
+            // AP does not push history — pull recent outbox notes so Home isn't empty
+            ap_outbox_backfill_async($actorId);
+            return 'follow_accepted';
+        }
+        if ($applied === 'follow_accept_ack') {
+            ap_metrics_record('Accept', $actorId, $objectId, LOCAL_ACTOR, $bytes, 'follow_accept_ack', null);
+            return 'follow_accept_ack';
         }
     }
 
@@ -1068,6 +1066,14 @@ function ap_route_verified_activity(array $activity, int $bytes): string
         if (function_exists('ap_relay_handle_reject') && ap_relay_handle_reject($activity)) {
             ap_metrics_record('Reject', $actorId, $objectId, LOCAL_ACTOR, $bytes, 'relay_rejected', null);
             return 'relay_rejected';
+        }
+        $applied = function_exists('ap_follow_response_apply')
+            ? ap_follow_response_apply($activity, LOCAL_ACTOR)
+            : null;
+        if ($applied === 'follow_rejected') {
+            ap_metrics_record('Reject', $actorId, $objectId, LOCAL_ACTOR, $bytes, 'follow_rejected', $actorId);
+            ap_log('follow_rejected by=' . ap_short((string) $actorId));
+            return 'follow_rejected';
         }
     }
 
@@ -3420,7 +3426,7 @@ function ap_follow_request_decide(array $request, bool $approve): array
         ap_follower_upsert($follower, $inbox, $sharedInbox, (string) ($request['username'] ?? ''), $localId);
         if ($isLocalFollower && function_exists('ap_following_upsert')) {
             // The requester's following row is created only once the private account approves.
-            ap_following_upsert($localId, $follower);
+            ap_following_upsert($localId, $follower, 'accepted');
         }
     }
     $status = $approve ? 'accepted' : 'rejected';
@@ -3727,7 +3733,7 @@ function ap_follow_remote_actor(string $actorId, bool $respectRateLimit = true, 
                 ap_log('follow_local_pending target=' . ap_short($targetId) . ' from=' . ap_short($localId));
                 return ['ok' => true, 'follow_id' => $backId, 'already' => false, 'requested' => true];
             }
-            ap_following_upsert($targetId, $localId);
+            ap_following_upsert($targetId, $localId, 'accepted');
             ap_follower_upsert(
                 $localId,
                 $localId . '/inbox',
@@ -3781,7 +3787,7 @@ function ap_follow_remote_actor(string $actorId, bool $respectRateLimit = true, 
         }
         return ['ok' => false, 'error' => $hint];
     }
-    ap_following_upsert($targetId, $localId);
+    ap_following_upsert($targetId, $localId, 'pending', $backId);
     ap_metrics_record('Follow', $localId, $backId, $targetId, strlen(json_encode($follow) ?: ''), 'manual_follow', $targetId);
     ap_log('follow_remote_ok target=' . ap_short($targetId) . ' inbox=' . ap_short($usedInbox));
     if (function_exists('ap_remote_media_warm_async')) {
@@ -4947,11 +4953,13 @@ function ap_deliver_signed_json(string $inboxUrl, array $activity, string $keyId
     $parts = parse_url($inboxUrl);
     if (!is_array($parts) || ($parts['scheme'] ?? '') !== 'https') {
         $GLOBALS['ap_delivery_last_error'] = 'Invalid HTTPS inbox URL';
+        ap_delivery_observe($inboxUrl, $activity, 0, false, 'invalid_inbox');
         return false;
     }
     $host = (string) ($parts['host'] ?? '');
     if ($host === '' || !ap_host_resolves_public($host)) {
         $GLOBALS['ap_delivery_last_error'] = 'Inbox host is unavailable or not public';
+        ap_delivery_observe($inboxUrl, $activity, 0, false, 'host_unavailable');
         return false;
     }
     $path = (string) ($parts['path'] ?? '/');
@@ -4965,17 +4973,20 @@ function ap_deliver_signed_json(string $inboxUrl, array $activity, string $keyId
     $body = json_encode($activity, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
     if (!is_string($body)) {
         $GLOBALS['ap_delivery_last_error'] = 'Activity JSON encoding failed';
+        ap_delivery_observe($inboxUrl, $activity, 0, false, 'encode_failed');
         return false;
     }
 
     $privPem = @file_get_contents($privPath);
     if (!is_string($privPem) || $privPem === '') {
         $GLOBALS['ap_delivery_last_error'] = 'Signing key is unavailable';
+        ap_delivery_observe($inboxUrl, $activity, 0, false, 'key_unavailable');
         return false;
     }
     $priv = openssl_pkey_get_private($privPem);
     if ($priv === false) {
         $GLOBALS['ap_delivery_last_error'] = 'Signing key could not be opened';
+        ap_delivery_observe($inboxUrl, $activity, 0, false, 'key_unreadable');
         return false;
     }
 
@@ -4990,6 +5001,7 @@ function ap_deliver_signed_json(string $inboxUrl, array $activity, string $keyId
     $sigRaw = '';
     if (!openssl_sign($signing, $sigRaw, $priv, OPENSSL_ALGO_SHA256)) {
         $GLOBALS['ap_delivery_last_error'] = 'Activity signature generation failed';
+        ap_delivery_observe($inboxUrl, $activity, 0, false, 'sign_failed');
         return false;
     }
     $sigHeader = sprintf(
@@ -5062,16 +5074,15 @@ function ap_deliver_signed_json(string $inboxUrl, array $activity, string $keyId
     $statusLine = $status > 0 ? 'HTTP ' . $status : 'No HTTP response from inbox';
     if (!$ok) {
         $detail = $curlErr !== '' ? ' ' . $curlErr : '';
-        $GLOBALS['ap_delivery_last_error'] = $statusLine
-            . (is_string($resp) && trim($resp) !== '' ? ' ' . ap_short($resp, 180) : '')
-            . $detail;
-        ap_log('deliver_fail inbox=' . ap_short($inboxUrl, 80) . ' status=' . ap_short($statusLine, 80)
-            . ' body=' . ap_short(is_string($resp) ? $resp : '', 120)
-            . ($curlErr !== '' ? ' curl=' . ap_short($curlErr, 120) : ''));
-    } elseif (is_string($resp) && $resp !== '' && $resp !== 'ok' && !str_starts_with(ltrim($resp), '{')) {
-        // Akkoma often returns literal "ok"; anything else is worth logging at debug level
-        ap_log('deliver_ok inbox=' . ap_short($inboxUrl, 80) . ' status=' . ap_short($statusLine, 40)
-            . ' body=' . ap_short($resp, 80));
+        $snippet = is_string($resp) ? ap_short($resp, 180) : '';
+        $GLOBALS['ap_delivery_last_error'] = trim($statusLine . ' ' . $snippet . $detail);
+    }
+    $observed = is_string($resp) ? $resp : '';
+    if ($curlErr !== '' && !$ok) {
+        $observed = trim($observed . ' ' . $curlErr);
+    }
+    if (function_exists('ap_delivery_observe')) {
+        ap_delivery_observe($inboxUrl, $activity, $status, (bool) $ok, $observed);
     }
     return (bool) $ok;
 }

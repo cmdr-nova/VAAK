@@ -7,6 +7,7 @@ declare(strict_types=1);
 
 require_once __DIR__ . '/ap-redis.php';
 require_once __DIR__ . '/ap-recommendations.php';
+require_once __DIR__ . '/ap-follow-state.php';
 
 /**
  * Runtime feature switches. Values come from the process environment so an
@@ -741,6 +742,70 @@ SQL);
         }
     } catch (Throwable $e) {
         error_log('[ap-db] blog table not provisioned: ' . $e->getMessage());
+    }
+    // Follow acceptance state and silent-host fallback bookkeeping. Columns use a
+    // constant default so PostgreSQL 11+ updates only the catalog. Indexes on
+    // `following` are small; the SQL migration file creates them CONCURRENTLY.
+    try {
+        if (isset($present['following'])) {
+            if (!ap_schema_has_column($db, 'following', 'follow_state')) {
+                $db->exec("ALTER TABLE following ADD COLUMN IF NOT EXISTS follow_state TEXT NOT NULL DEFAULT 'unknown'");
+                ap_schema_remember_column($db, 'following', 'follow_state', "'unknown'::text");
+            }
+            if (!ap_schema_has_column($db, 'following', 'follow_activity_id')) {
+                $db->exec('ALTER TABLE following ADD COLUMN IF NOT EXISTS follow_activity_id TEXT');
+                ap_schema_remember_column($db, 'following', 'follow_activity_id', null);
+            }
+            if (!ap_schema_has_column($db, 'following', 'state_at')) {
+                $db->exec('ALTER TABLE following ADD COLUMN IF NOT EXISTS state_at TEXT');
+                ap_schema_remember_column($db, 'following', 'state_at', null);
+            }
+            if (!ap_schema_has_index($db, 'idx_following_host_state')) {
+                $db->exec('CREATE INDEX IF NOT EXISTS idx_following_host_state ON following (host, follow_state)');
+                ap_schema_remember_index($db, 'idx_following_host_state');
+            }
+            if (!ap_schema_has_index($db, 'idx_following_state_at')) {
+                $db->exec('CREATE INDEX IF NOT EXISTS idx_following_state_at ON following (follow_state, state_at)');
+                ap_schema_remember_index($db, 'idx_following_state_at');
+            }
+            if (!ap_schema_has_index($db, 'idx_following_follow_activity')) {
+                $db->exec('CREATE INDEX IF NOT EXISTS idx_following_follow_activity ON following (follow_activity_id)');
+                ap_schema_remember_index($db, 'idx_following_follow_activity');
+            }
+        }
+        if (!isset($present['ap_inbox_host_seen'])) {
+            $db->exec(<<<'SQL'
+CREATE TABLE IF NOT EXISTS ap_inbox_host_seen (
+    host TEXT PRIMARY KEY,
+    last_seen_at TEXT NOT NULL,
+    last_type TEXT
+)
+SQL);
+            ap_schema_remember_table($db, 'ap_inbox_host_seen');
+        }
+        if (!isset($present['ap_follow_fallback_state'])) {
+            $db->exec(<<<'SQL'
+CREATE TABLE IF NOT EXISTS ap_follow_fallback_state (
+    actor_id TEXT PRIMARY KEY,
+    host TEXT NOT NULL,
+    outbox_url TEXT,
+    featured_url TEXT,
+    etag TEXT,
+    last_modified TEXT,
+    featured_etag TEXT,
+    featured_last_modified TEXT,
+    next_attempt_at TEXT,
+    fail_count INTEGER NOT NULL DEFAULT 0,
+    last_status INTEGER,
+    updated_at TEXT NOT NULL
+)
+SQL);
+            $db->exec('CREATE INDEX IF NOT EXISTS idx_follow_fallback_next ON ap_follow_fallback_state (next_attempt_at)');
+            ap_schema_remember_table($db, 'ap_follow_fallback_state');
+            ap_schema_remember_index($db, 'idx_follow_fallback_next');
+        }
+    } catch (Throwable $e) {
+        error_log('[ap-db] follow state not provisioned: ' . $e->getMessage());
     }
     // Additive notice-read cursor (may exist on older installs that already have ap_notices).
     try {
@@ -2238,6 +2303,9 @@ CREATE TABLE following (
     actor_id TEXT NOT NULL,
     followed_at TEXT NOT NULL,
     host TEXT,
+    follow_state TEXT NOT NULL DEFAULT 'unknown',
+    follow_activity_id TEXT,
+    state_at TEXT,
     PRIMARY KEY (owner_actor_id, actor_id)
 );
 CREATE INDEX IF NOT EXISTS idx_following_owner ON following(owner_actor_id, followed_at DESC);
@@ -2250,6 +2318,45 @@ SQL);
         $db->exec('DROP TABLE following_legacy_e');
         $db->exec('COMMIT');
     }
+
+    $followStateCols = $db->query('PRAGMA table_info(following)')->fetchAll();
+    $followStateNames = array_column($followStateCols, 'name');
+    if ($followStateNames && !in_array('follow_state', $followStateNames, true)) {
+        $db->exec("ALTER TABLE following ADD COLUMN follow_state TEXT NOT NULL DEFAULT 'unknown'");
+    }
+    if ($followStateNames && !in_array('follow_activity_id', $followStateNames, true)) {
+        $db->exec('ALTER TABLE following ADD COLUMN follow_activity_id TEXT');
+    }
+    if ($followStateNames && !in_array('state_at', $followStateNames, true)) {
+        $db->exec('ALTER TABLE following ADD COLUMN state_at TEXT');
+    }
+    $db->exec('CREATE INDEX IF NOT EXISTS idx_following_host_state ON following (host, follow_state)');
+    $db->exec('CREATE INDEX IF NOT EXISTS idx_following_state_at ON following (follow_state, state_at)');
+    $db->exec('CREATE INDEX IF NOT EXISTS idx_following_follow_activity ON following (follow_activity_id)');
+    $db->exec(<<<'SQL'
+CREATE TABLE IF NOT EXISTS ap_inbox_host_seen (
+    host TEXT PRIMARY KEY,
+    last_seen_at TEXT NOT NULL,
+    last_type TEXT
+)
+SQL);
+    $db->exec(<<<'SQL'
+CREATE TABLE IF NOT EXISTS ap_follow_fallback_state (
+    actor_id TEXT PRIMARY KEY,
+    host TEXT NOT NULL,
+    outbox_url TEXT,
+    featured_url TEXT,
+    etag TEXT,
+    last_modified TEXT,
+    featured_etag TEXT,
+    featured_last_modified TEXT,
+    next_attempt_at TEXT,
+    fail_count INTEGER NOT NULL DEFAULT 0,
+    last_status INTEGER,
+    updated_at TEXT NOT NULL
+)
+SQL);
+    $db->exec('CREATE INDEX IF NOT EXISTS idx_follow_fallback_next ON ap_follow_fallback_state (next_attempt_at)');
 
     // Slice D: per-user mutes / muted words (backfill → cmdr_nova)
     $muteCols = $db->query('PRAGMA table_info(ap_mutes)')->fetchAll();
@@ -6072,18 +6179,33 @@ function ap_follow_request_set_status(int $id, string $ownerActorId, string $sta
     }
 }
 
-function ap_following_upsert(string $actorId, ?string $ownerActorId = null): void
-{
+function ap_following_upsert(
+    string $actorId,
+    ?string $ownerActorId = null,
+    ?string $followState = null,
+    ?string $followActivityId = null
+): void {
     $owner = rtrim($ownerActorId ?? ap_local_actor_id(), '/');
     $actorId = rtrim($actorId, '/');
     $host = parse_url($actorId, PHP_URL_HOST);
     $host = is_string($host) ? strtolower($host) : null;
     $db = ap_db();
-    $stmt = $db->prepare(
-        'INSERT INTO following (owner_actor_id, actor_id, followed_at, host) VALUES (?, ?, ?, ?)
-         ON CONFLICT(owner_actor_id, actor_id) DO NOTHING'
-    );
-    $stmt->execute([$owner, $actorId, ap_db_now(), $host]);
+    if (function_exists('ap_following_state_write')) {
+        try {
+            ap_following_state_write($db, $owner, $actorId, $host, ap_db_now(), $followState, $followActivityId);
+        } catch (Throwable $e) {
+            error_log('[ap-db] following state write failed: ' . $e->getMessage());
+            $db->prepare(
+                'INSERT INTO following (owner_actor_id, actor_id, followed_at, host) VALUES (?, ?, ?, ?)
+                 ON CONFLICT(owner_actor_id, actor_id) DO NOTHING'
+            )->execute([$owner, $actorId, ap_db_now(), $host]);
+        }
+    } else {
+        $db->prepare(
+            'INSERT INTO following (owner_actor_id, actor_id, followed_at, host) VALUES (?, ?, ?, ?)
+             ON CONFLICT(owner_actor_id, actor_id) DO NOTHING'
+        )->execute([$owner, $actorId, ap_db_now(), $host]);
+    }
     ap_follow_lists_reset_memo($owner);
     if (function_exists('ap_db_owner_user_id_for_actor')) {
         ap_timeline_cache_invalidate_owner(ap_db_owner_user_id_for_actor($owner));
@@ -7851,7 +7973,11 @@ function ap_following_count(?string $ownerActorId = null): int
         }
     }
     try {
-        $st = ap_db()->prepare('SELECT COUNT(*) FROM following WHERE owner_actor_id = ? OR owner_actor_id = ?');
+        $countSql = 'SELECT COUNT(*) FROM following WHERE owner_actor_id = ? OR owner_actor_id = ?';
+        if (function_exists('ap_following_has_state') && ap_following_has_state(ap_db())) {
+            $countSql .= " AND COALESCE(follow_state, 'unknown') <> 'rejected'";
+        }
+        $st = ap_db()->prepare($countSql);
         $st->execute([$owner, $owner . '/']);
         $count = max(0, (int) $st->fetchColumn());
         if (function_exists('ap_redis_json_set')) {
@@ -7889,6 +8015,9 @@ function ap_following_list(?string $ownerActorId = null): array
             if (function_exists('ap_redis_relset_metric')) {
                 ap_redis_relset_metric('hit');
             }
+            if (function_exists('ap_following_rows_active')) {
+                $cached = ap_following_rows_active($cached);
+            }
             return $memo[$owner] = $cached;
         }
         if (function_exists('ap_redis_relset_metric')) {
@@ -7900,6 +8029,9 @@ function ap_following_list(?string $ownerActorId = null): array
     );
     $st->execute([$owner, $owner . '/']);
     $rows = $st->fetchAll() ?: [];
+    if (function_exists('ap_following_rows_active')) {
+        $rows = ap_following_rows_active($rows);
+    }
     if (function_exists('ap_redis_json_set')) {
         ap_redis_json_set($redisKey, $rows, function_exists('ap_redis_follow_graph_ttl') ? ap_redis_follow_graph_ttl() : 300);
     }

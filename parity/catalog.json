@@ -58,6 +58,12 @@
       "area": "Phyrian",
       "summary": "OpenSim bridge envelope and response decoder, including the numeric ok:1 case. Fixture: parity/fixtures/phyrian-bridge.json.",
       "php": {"script": "parity/php/phyrian-bridge.php", "args": ["parity/fixtures/phyrian-bridge.json"]}
+    },
+    {
+      "id": "follow-fallback",
+      "area": "ActivityPub follows",
+      "summary": "Follow Accept/Reject state, delivery-log redaction, and quiet-host fallback selection. PHP ap_follow_state.php is the live decision code. Rust follow_fallback replays the same inputs and does not fetch or open a database.",
+      "php": {"script": "parity/php/follow-fallback.php", "args": []}
     }
   ]
 }

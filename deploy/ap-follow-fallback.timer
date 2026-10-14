@@ -1,0 +1,12 @@
+[Unit]
+Description=Run the quiet-host follow fallback every 20 minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=20min
+AccuracySec=5min
+Persistent=false
+Unit=ap-follow-fallback.service
+
+[Install]
+WantedBy=timers.target
