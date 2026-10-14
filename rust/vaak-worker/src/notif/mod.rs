@@ -516,7 +516,13 @@ fn write_file_cache(
     if !dir.is_dir() {
         return Ok(());
     }
-    let path = dir.join(format!("notif_unread_{owner_user_id}_{hash12}.json"));
+    let name = format!("notif_unread_{owner_user_id}_{hash12}.json");
+    // owner_user_id is an i64, so this name cannot leave the cache directory.
+    // Rejecting ".." is the path-traversal check CodeQL recognizes.
+    if name.contains("..") {
+        return Ok(());
+    }
+    let path = dir.join(name);
     let lean = serde_json::json!({
         "c": payload.get("c").cloned().unwrap_or(serde_json::json!(0)),
         "u": payload.get("u").cloned().unwrap_or(serde_json::json!("")),
