@@ -58,6 +58,7 @@ php_tests=(
   api/bin/notif-reply-content-smoke.php
   api/bin/notif-reply-preview-smoke.php
   api/bin/phyrian-parity-smoke.php
+  api/bin/phyrian-profile-card-smoke.php
   api/bin/pin-federation-behavior-smoke.php
   api/bin/pluraldawn-decode-smoke.php
   api/bin/post-single-overflow-smoke.php

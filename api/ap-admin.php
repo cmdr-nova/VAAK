@@ -34622,6 +34622,27 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
             <?php endif; ?>
             <?php if ($rpHasCombinedStats): ?>
               <?php
+                // Off unless VAAK_PHYRIAN_PROFILE_CARD=1. Checked before the helper
+                // loads, so a disabled profile does no extra database or Redis work.
+                $rpPhyrianCardFlag = getenv('VAAK_PHYRIAN_PROFILE_CARD');
+                if ($rpIsLocal && is_string($rpPhyrianCardFlag) && in_array(strtolower(trim($rpPhyrianCardFlag)), ['1', 'true', 'yes', 'on'], true)) {
+                    require_once __DIR__ . '/ap-phyrian-profile-card.php';
+                    $rpCardOwner = 0;
+                    if (!empty($rpIsOwn) && (int) $vaakOwnerId > 0) {
+                        $rpCardOwner = (int) $vaakOwnerId;
+                    } elseif (isset($rpAskOwnerId) && (int) $rpAskOwnerId > 0) {
+                        $rpCardOwner = (int) $rpAskOwnerId;
+                    } elseif (isset($rpFeaturedOwner) && (int) $rpFeaturedOwner > 0) {
+                        $rpCardOwner = (int) $rpFeaturedOwner;
+                    } elseif (isset($rpOwnerForBoosts) && (int) $rpOwnerForBoosts > 0) {
+                        $rpCardOwner = (int) $rpOwnerForBoosts;
+                    }
+                    echo ap_phyrian_profile_card_markup(true, $rpCardOwner, [
+                        'is_self' => !empty($rpIsOwn),
+                        'opensim_linked' => is_array($rpPhyrianBridge ?? null),
+                        'avatar_name' => is_array($rpPhyrianBridge ?? null) ? (string) ($rpPhyrianBridge['avatar_name'] ?? '') : '',
+                    ]);
+                }
                 $rpStatsTitle = $rpBskyStatsHandle ? ' title="Includes ActivityPub and connected Bluesky counts"' : '';
                 $rpFollowingHref = $rpIsOwn
                     ? '?view=following'
