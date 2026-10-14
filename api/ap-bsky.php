@@ -1268,21 +1268,52 @@ function ap_bsky_at_uri_from_https(string $url, int $ownerUserId = 0): ?string
     // the post exists only in the shared bsky_posts cache. Resolve by handle
     // and rkey before attempting identity resolution or a network fetch.
     try {
-        $st = ap_db()->prepare(
-            'SELECT bsky_uri FROM bsky_posts
-             WHERE bsky_uri LIKE ? AND lower(author_handle) = lower(?)
-             LIMIT 1'
-        );
-        $st->execute(['%/' . $rkey, $actor]);
-        $cachedUri = $st->fetchColumn();
-        if (is_string($cachedUri) && str_starts_with($cachedUri, 'at://')) {
-            return $cachedUri;
-        }
-        $st = ap_db()->prepare('SELECT bsky_uri FROM bsky_posts WHERE bsky_uri LIKE ? LIMIT 1');
-        $st->execute(['%/' . $rkey]);
-        $cachedUri = $st->fetchColumn();
-        if (is_string($cachedUri) && str_starts_with($cachedUri, 'at://')) {
-            return $cachedUri;
+        if (ap_db()->getAttribute(PDO::ATTR_DRIVER_NAME) === 'pgsql') {
+            // Same expression as idx_bsky_posts_post_rkey. One lookup for this
+            // permalink; Home batches many rkeys with = ANY($1).
+            $st = ap_db()->prepare(
+                "SELECT bsky_uri, COALESCE(author_handle, '')
+                 FROM bsky_posts
+                 WHERE split_part(bsky_uri, '/app.bsky.feed.post/', 2) = ?"
+            );
+            $st->execute([$rkey]);
+            $fallback = null;
+            foreach ($st->fetchAll() ?: [] as $row) {
+                if (!is_array($row)) {
+                    continue;
+                }
+                $cachedUri = (string) ($row['bsky_uri'] ?? '');
+                if (!str_starts_with($cachedUri, 'at://')) {
+                    continue;
+                }
+                $handle = (string) ($row['author_handle'] ?? '');
+                if ($handle !== '' && strcasecmp($handle, $actor) === 0) {
+                    return $cachedUri;
+                }
+                if ($fallback === null) {
+                    $fallback = $cachedUri;
+                }
+            }
+            if (is_string($fallback)) {
+                return $fallback;
+            }
+        } else {
+            $st = ap_db()->prepare(
+                'SELECT bsky_uri FROM bsky_posts
+                 WHERE bsky_uri LIKE ? AND lower(author_handle) = lower(?)
+                 LIMIT 1'
+            );
+            $st->execute(['%/' . $rkey, $actor]);
+            $cachedUri = $st->fetchColumn();
+            if (is_string($cachedUri) && str_starts_with($cachedUri, 'at://')) {
+                return $cachedUri;
+            }
+            $st = ap_db()->prepare('SELECT bsky_uri FROM bsky_posts WHERE bsky_uri LIKE ? LIMIT 1');
+            $st->execute(['%/' . $rkey]);
+            $cachedUri = $st->fetchColumn();
+            if (is_string($cachedUri) && str_starts_with($cachedUri, 'at://')) {
+                return $cachedUri;
+            }
         }
     } catch (Throwable $e) {
         // ignore cache lookup failures; identity resolution remains the fallback
