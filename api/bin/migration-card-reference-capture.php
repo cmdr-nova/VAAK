@@ -83,7 +83,7 @@ reference_load($api.'/ap-rss.php',['ap_rss_migrate','ap_rss_item_by_id','ap_rss_
 reference_load($api.'/ap-normalize.php',['ap_normalize_from_rss_item','ap_normalize_from_bsky_post']);
 reference_load($api.'/ap-bsky.php',['ap_bsky_bookmark_owner_state','ap_bsky_bookmark_owner_state_set','ap_bsky_access_owner_register','ap_bsky_authenticated_viewer_response','ap_bsky_viewer_for_owner']);
 reference_load($api.'/ap-bsky-urls.php',['ap_bsky_https_url_from_at_uri','ap_bsky_normalize_web_url','ap_bsky_actor_profile_url']);
-reference_load($api.'/ap-bsky.php',['ap_bsky_post_is_sensitive','ap_bsky_sensitive_label_vals','ap_bsky_post_label_vals','ap_bsky_compact_label_list','ap_bsky_at_uri_from_any_url','ap_bsky_at_uri_from_https','ap_bsky_enrich_feed_item_authors','ap_bsky_enrich_author_view','ap_bsky_post_text','ap_bsky_post_image_urls','ap_bsky_post_external','ap_bsky_post_url','ap_bsky_hide_did_set']);
+reference_load($api.'/ap-bsky.php',['ap_bsky_post_is_sensitive','ap_bsky_sensitive_label_vals','ap_bsky_post_label_vals','ap_bsky_compact_label_list','ap_bsky_at_uri_from_any_url','ap_bsky_at_uri_from_https','ap_bsky_avatar_public_url','ap_bsky_avatar_cid_ok','ap_bsky_enrich_feed_item_authors','ap_bsky_enrich_author_view','ap_bsky_post_text','ap_bsky_post_image_urls','ap_bsky_post_external','ap_bsky_post_url','ap_bsky_hide_did_set']);
 reference_load($api.'/ap-masto-entities.php',['ap_masto_bsky_trend_status','ap_masto_bsky_media_attachments','ap_masto_animated_media_from_url']);
 ap_db()->exec('CREATE TABLE bsky_hide_dids(owner_user_id INTEGER,did TEXT)');
 if(ap_rss_item_by_id(22,1)!==null || ap_rss_item_by_id(11,2)!==null || ap_rss_item_by_id(11,1)===null) throw new RuntimeException('actual RSS lookup owner isolation failed');

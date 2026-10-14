@@ -2595,7 +2595,8 @@ pub(crate) async fn fetch_bsky_map(db: &Client, uris: &[String]) -> Result<HashM
                         .and_then(|v| v.as_str()).unwrap_or("").to_string();
                 }
                 if post.author_avatar.trim().is_empty() {
-                    post.author_avatar = author.get("avatar").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    post.author_avatar = crate::actor_warm::bsky_avatar_url(author.get("avatar"), &post.author_did)
+                        .unwrap_or_default();
                 }
             }
         }
@@ -2619,7 +2620,7 @@ pub(crate) async fn fetch_bsky_map(db: &Client, uris: &[String]) -> Result<HashM
                 let Ok(profile) = serde_json::from_str::<Value>(&raw) else { continue; };
                 let handle = profile.get("handle").and_then(|v| v.as_str()).unwrap_or("").to_string();
                 let display = profile.get("displayName").or_else(|| profile.get("display_name")).and_then(|v| v.as_str()).unwrap_or("").to_string();
-                let avatar = profile.get("avatar").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let avatar = crate::actor_warm::bsky_avatar_url(profile.get("avatar"), &did).unwrap_or_default();
                 for post in map.values_mut().filter(|p| p.author_did == did) {
                     if post.author_handle.trim().is_empty() { post.author_handle = handle.clone(); }
                     if post.author_display.trim().is_empty() { post.author_display = display.clone(); }
@@ -3139,9 +3140,10 @@ async fn fetch_actors_map(db: &Client, actor_ids: &[String]) -> Result<HashMap<S
                     }
                 }
             }
-            if icon.trim().is_empty() {
-                icon = profile.get("icon").and_then(|v| v.get("url")).and_then(|v| v.as_str())
-                    .or_else(|| profile.get("icon").and_then(|v| v.as_str())).unwrap_or("").to_string();
+            if !icon.starts_with("https://") {
+                if let Some(found) = crate::actor_warm::activitypub_image_url(profile.get("icon")) {
+                    icon = found;
+                }
             }
             emojis = actor_emojis(&profile);
         }
@@ -3156,6 +3158,22 @@ async fn fetch_actors_map(db: &Client, actor_ids: &[String]) -> Result<HashMap<S
                 emojis,
             },
         );
+    }
+    let missing: Vec<String> = map
+        .iter()
+        .filter(|(_, row)| !row.icon.starts_with("https://"))
+        .map(|(id, _)| id.clone())
+        .collect();
+    if !missing.is_empty() {
+        if let Ok(cached) = fetch_remote_avatar_cache(db, &missing).await {
+            for (id, url) in cached {
+                if let Some(row) = map.get_mut(&id) {
+                    if !row.icon.starts_with("https://") && url.starts_with("https://") {
+                        row.icon = url;
+                    }
+                }
+            }
+        }
     }
     Ok(map)
 }
@@ -4474,6 +4492,7 @@ async fn resolve_missing_actor_labels(
             actor: String::new(),
             ts: chrono::Utc::now().timestamp(),
             source: "hydrate-label".into(),
+            force: false,
         })
         .collect();
     match crate::ap_actor_warm::process_batch(&jobs).await {

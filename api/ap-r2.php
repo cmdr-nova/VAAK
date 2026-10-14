@@ -874,6 +874,15 @@ function ap_r2_delete_object(string $key, bool $allowLocalMedia = false): array
  */
 function ap_as2_media_url(mixed $node): ?string
 {
+    if (is_array($node) && array_is_list($node)) {
+        foreach ($node as $item) {
+            $found = ap_as2_media_url($item);
+            if (is_string($found) && $found !== '') {
+                return $found;
+            }
+        }
+        return null;
+    }
     if (is_string($node)) {
         return ap_profile_sanitize_https_url($node);
     }

@@ -3364,7 +3364,7 @@ function ap_bsky_post_embed_compact(?array $embed): ?array
                 'did' => (string) ($author['did'] ?? ''),
                 'handle' => (string) ($author['handle'] ?? ''),
                 'displayName' => (string) ($author['displayName'] ?? ''),
-                'avatar' => (string) ($author['avatar'] ?? ''),
+                'avatar' => ap_bsky_avatar_public_url($author['avatar'] ?? null, (string) ($author['did'] ?? '')) ?? '',
             ],
             'value' => [
                 '$type' => 'app.bsky.feed.post',
@@ -3506,6 +3506,7 @@ function ap_bsky_post_upsert_from_feed_item(array $itemOrPost, ?int $ownerUserId
     if ($authorDid === '') {
         return;
     }
+    $avatarPublic = ap_bsky_avatar_public_url($author['avatar'] ?? null, $authorDid);
     ap_bsky_posts_migrate();
     $record = is_array($post['record'] ?? null) ? $post['record'] : [];
     $originalText = (string) ($record['text'] ?? '');
@@ -3542,7 +3543,7 @@ function ap_bsky_post_upsert_from_feed_item(array $itemOrPost, ?int $ownerUserId
             'did' => $authorDid,
             'handle' => (string) ($author['handle'] ?? ''),
             'displayName' => (string) ($author['displayName'] ?? ''),
-            'avatar' => (string) ($author['avatar'] ?? ''),
+            'avatar' => $avatarPublic ?? '',
         ],
         'record' => [
             '$type' => (string) ($record['$type'] ?? 'app.bsky.feed.post'),
@@ -3703,7 +3704,7 @@ function ap_bsky_post_upsert_from_feed_item(array $itemOrPost, ?int $ownerUserId
             $authorDid,
             trim((string) ($author['handle'] ?? '')) ?: null,
             trim((string) ($author['displayName'] ?? '')) ?: null,
-            trim((string) ($author['avatar'] ?? '')) ?: null,
+            $avatarPublic,
             $indexedAt,
             $publishedAt,
             $text,
@@ -4523,11 +4524,71 @@ function ap_bsky_author_apply_flat(array $author, array $flat, string $handle, s
         $author['displayName'] = $cdn;
         $display = $cdn;
     }
-    if ($avatar === '' && $cav !== '' && preg_match('#^https?://#i', $cav)) {
-        $author['avatar'] = $cav;
-        $avatar = $cav;
+    if ($avatar === '' && $cav !== '') {
+        $norm = ap_bsky_avatar_public_url($cav, trim((string) ($author['did'] ?? ''))) ?? '';
+        if ($norm !== '') {
+            $author['avatar'] = $norm;
+            $avatar = $norm;
+        }
     }
     return [$author, $handle, $display, $avatar, $handleThin];
+}
+
+/**
+ * Public Bluesky avatar URL. AppView usually sends an https CDN string. Jetstream
+ * and some embeds send a blob ref. The DID must stay unescaped: did%3Aplc%3A 404s.
+ */
+function ap_bsky_avatar_public_url(mixed $avatar, string $did = ''): ?string
+{
+    $did = trim($did);
+    if (is_string($avatar)) {
+        $avatar = trim($avatar);
+        if ($avatar === '') {
+            return null;
+        }
+        if (str_starts_with($avatar, 'https://')) {
+            return function_exists('ap_profile_sanitize_https_url')
+                ? ap_profile_sanitize_https_url($avatar)
+                : $avatar;
+        }
+        if (str_starts_with($did, 'did:') && !str_contains($did, '%') && ap_bsky_avatar_cid_ok($avatar)) {
+            return 'https://cdn.bsky.app/img/avatar/plain/' . $did . '/' . $avatar . '@jpeg';
+        }
+        return null;
+    }
+    if (!is_array($avatar)) {
+        return null;
+    }
+    $mime = strtolower((string) ($avatar['mimeType'] ?? $avatar['mime'] ?? ''));
+    $ext = 'jpeg';
+    if (str_contains($mime, 'png')) {
+        $ext = 'png';
+    } elseif (str_contains($mime, 'webp')) {
+        $ext = 'webp';
+    } elseif (str_contains($mime, 'gif')) {
+        $ext = 'gif';
+    }
+    $cid = '';
+    $ref = $avatar['ref'] ?? null;
+    if (is_array($ref)) {
+        $cid = trim((string) ($ref['$link'] ?? $ref['link'] ?? ''));
+    } elseif (is_string($ref)) {
+        $cid = trim($ref);
+    }
+    if ($cid === '') {
+        $cid = trim((string) ($avatar['cid'] ?? $avatar['$link'] ?? ''));
+    }
+    if (!str_starts_with($did, 'did:') || str_contains($did, '%') || !ap_bsky_avatar_cid_ok($cid)) {
+        return null;
+    }
+    return 'https://cdn.bsky.app/img/avatar/plain/' . $did . '/' . $cid . '@' . $ext;
+}
+
+function ap_bsky_avatar_cid_ok(string $cid): bool
+{
+    $cid = trim($cid);
+    $len = strlen($cid);
+    return $len >= 20 && $len <= 128 && (bool) preg_match('/^[A-Za-z0-9]+$/', $cid);
 }
 
 /**
@@ -4546,7 +4607,8 @@ function ap_bsky_enrich_author_view(array $author, int $ownerUserId = 0): array
     $did = trim((string) ($author['did'] ?? ''));
     $handle = trim((string) ($author['handle'] ?? ''));
     $display = trim((string) ($author['displayName'] ?? ''));
-    $avatar = trim((string) ($author['avatar'] ?? ''));
+    $avatar = ap_bsky_avatar_public_url($author['avatar'] ?? null, $did) ?? '';
+    $author['avatar'] = $avatar;
     $handleThin = $handle === '' || str_starts_with($handle, 'did:');
     $needs = $handleThin || $display === '' || $avatar === '';
     if (!$needs || $did === '' || !str_starts_with($did, 'did:')) {
@@ -4587,7 +4649,7 @@ function ap_bsky_enrich_author_view(array $author, int $ownerUserId = 0): array
         if ($profile !== []) {
             $ch = trim((string) ($profile['handle'] ?? ''));
             $cdn = trim((string) ($profile['displayName'] ?? ''));
-            $cav = trim((string) ($profile['avatar'] ?? ''));
+            $cav = ap_bsky_avatar_public_url($profile['avatar'] ?? null, $did) ?? '';
             if ($handleThin && $ch !== '' && !str_starts_with($ch, 'did:')) {
                 $author['handle'] = $ch;
                 $handle = $ch;
@@ -4597,7 +4659,7 @@ function ap_bsky_enrich_author_view(array $author, int $ownerUserId = 0): array
                 $author['displayName'] = $cdn;
                 $display = $cdn;
             }
-            if ($avatar === '' && $cav !== '' && preg_match('#^https?://#i', $cav)) {
+            if ($avatar === '' && $cav !== '') {
                 $author['avatar'] = $cav;
                 $avatar = $cav;
             }
@@ -4605,40 +4667,74 @@ function ap_bsky_enrich_author_view(array $author, int $ownerUserId = 0): array
     }
 
     // 2) Denormalized columns on any prior post by this DID.
+    // author_did + indexed_at matches idx_bsky_posts_author_idx. seen_at does not,
+    // and sorting the whole author history of a huge table is the wrong plan.
     if ($handleThin || $display === '' || $avatar === '') {
-        try {
-            ap_bsky_posts_migrate();
-            $st = ap_db()->prepare(
-                "SELECT author_handle, author_display, author_avatar
-                 FROM bsky_posts
-                 WHERE author_did = ?
-                   AND author_handle IS NOT NULL AND author_handle <> ''
-                   AND author_handle NOT LIKE 'did:%'
-                 ORDER BY seen_at DESC
-                 LIMIT 1"
-            );
-            $st->execute([$did]);
-            $row = $st->fetch();
-            if (is_array($row)) {
-                $ph = trim((string) ($row['author_handle'] ?? ''));
-                $pd = trim((string) ($row['author_display'] ?? ''));
-                $pa = trim((string) ($row['author_avatar'] ?? ''));
-                if ($handleThin && $ph !== '') {
-                    $author['handle'] = $ph;
-                    $handle = $ph;
-                    $handleThin = false;
-                }
-                if ($display === '' && $pd !== '') {
-                    $author['displayName'] = $pd;
-                    $display = $pd;
-                }
-                if ($avatar === '' && $pa !== '' && preg_match('#^https?://#i', $pa)) {
-                    $author['avatar'] = $pa;
-                    $avatar = $pa;
+        static $bskyAuthorMemo = [];
+        if (!array_key_exists($did, $bskyAuthorMemo)) {
+            $bskyAuthorMemo[$did] = null;
+            try {
+                ap_bsky_posts_migrate();
+                $st = ap_db()->prepare(
+                    "SELECT author_handle, author_display, author_avatar
+                     FROM bsky_posts
+                     WHERE author_did = ?
+                       AND author_handle IS NOT NULL AND author_handle <> ''
+                       AND author_handle NOT LIKE 'did:%'
+                     ORDER BY indexed_at DESC
+                     LIMIT 1"
+                );
+                $st->execute([$did]);
+                $row = $st->fetch();
+                $bskyAuthorMemo[$did] = is_array($row) ? $row : false;
+            } catch (Throwable $e) {
+                $bskyAuthorMemo[$did] = false;
+            }
+        }
+        $row = $bskyAuthorMemo[$did];
+        if (is_array($row)) {
+            $ph = trim((string) ($row['author_handle'] ?? ''));
+            $pd = trim((string) ($row['author_display'] ?? ''));
+            $pa = ap_bsky_avatar_public_url($row['author_avatar'] ?? null, $did) ?? '';
+            if ($handleThin && $ph !== '') {
+                $author['handle'] = $ph;
+                $handle = $ph;
+                $handleThin = false;
+            }
+            if ($display === '' && $pd !== '') {
+                $author['displayName'] = $pd;
+                $display = $pd;
+            }
+            if ($avatar === '' && $pa !== '') {
+                $author['avatar'] = $pa;
+                $avatar = $pa;
+            }
+        }
+        if ($avatar === '') {
+            static $bskyAvatarMemo = [];
+            if (!array_key_exists($did, $bskyAvatarMemo)) {
+                $bskyAvatarMemo[$did] = '';
+                try {
+                    $stAv = ap_db()->prepare(
+                        "SELECT author_avatar
+                         FROM bsky_posts
+                         WHERE author_did = ?
+                           AND author_avatar IS NOT NULL AND author_avatar <> ''
+                         ORDER BY indexed_at DESC
+                         LIMIT 1"
+                    );
+                    $stAv->execute([$did]);
+                    $av = $stAv->fetchColumn();
+                    $bskyAvatarMemo[$did] = is_string($av) ? trim($av) : '';
+                } catch (Throwable $e) {
+                    $bskyAvatarMemo[$did] = '';
                 }
             }
-        } catch (Throwable $e) {
-            // non-fatal
+            $pa = ap_bsky_avatar_public_url($bskyAvatarMemo[$did], $did) ?? '';
+            if ($pa !== '') {
+                $author['avatar'] = $pa;
+                $avatar = $pa;
+            }
         }
     }
 
@@ -12993,8 +13089,7 @@ function ap_bsky_notification_to_mention_row(int $ownerUserId, string $ownerActo
                 ? (string) $author['displayName']
                 : ($handle !== '' ? $handle : $did),
             'host' => 'bsky.app',
-            'icon_source_url' => isset($author['avatar']) && is_string($author['avatar'])
-                ? $author['avatar'] : null,
+            'icon_source_url' => ap_bsky_avatar_public_url($author['avatar'] ?? null, $did),
         ]);
     }
 
@@ -13058,8 +13153,7 @@ function ap_bsky_ingest_follow_notification(
                 ? (string) $author['displayName']
                 : ($handle !== '' ? $handle : $did),
             'host' => 'bsky.app',
-            'icon_source_url' => isset($author['avatar']) && is_string($author['avatar'])
-                ? $author['avatar'] : null,
+            'icon_source_url' => ap_bsky_avatar_public_url($author['avatar'] ?? null, $did),
         ]);
     }
 
