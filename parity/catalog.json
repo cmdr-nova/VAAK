@@ -88,6 +88,12 @@
       "area": "Profiles",
       "summary": "Bluesky profile header, relationship row, and tabs. PHP capture is api/bin/profile-bsky-chrome-capture.php. Rust profile_bsky_chrome paints the same chrome and does not open a database.",
       "php": {"script": "parity/php/profile-bsky-chrome.php", "args": []}
+    },
+    {
+      "id": "profile-guest-actions",
+      "area": "Profiles",
+      "summary": "Guest profile follow panel and action row, cold avatar facts, and the local pagination shell. PHP capture is api/bin/profile-guest-actions-capture.php. Rust paints the same chrome and does not open a database or warm media.",
+      "php": {"script": "parity/php/profile-guest-actions.php", "args": []}
     }
   ]
 }

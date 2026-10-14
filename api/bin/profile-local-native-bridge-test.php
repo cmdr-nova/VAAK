@@ -103,6 +103,46 @@ $withSecondary = ap_profile_native_validate_local([
     'secondary' => $empty,
 ], $binding);
 check(is_array($withSecondary) && $withSecondary['secondary'] === $empty, 'empty ask body accepted');
+$withFeed = ap_profile_native_validate_local([
+    'ok' => true,
+    'protocol_version' => 1,
+    'request_binding' => $binding,
+    'chrome' => $chrome,
+    'page_back' => 'page-back-bytes',
+    'header' => 'header-bytes',
+    'secondary' => null,
+    'feed_open' => '<div id="timeline-items">',
+    'feed_close' => '</div>',
+], $binding);
+check(is_array($withFeed) && ($withFeed['feed_open'] ?? '') === '<div id="timeline-items">' && ($withFeed['feed_close'] ?? '') === '</div>', 'pagination shell accepted');
+check(ap_profile_native_validate_local([
+    'ok' => true,
+    'protocol_version' => 1,
+    'request_binding' => $binding,
+    'chrome' => $chrome,
+    'page_back' => 'page-back-bytes',
+    'header' => 'header-bytes',
+    'feed_open' => '<div id="timeline-items">',
+], $binding) === null, 'pagination shell is all or nothing');
+check(ap_profile_native_validate_local([
+    'ok' => true,
+    'protocol_version' => 1,
+    'request_binding' => $binding,
+    'chrome' => $chrome,
+    'page_back' => 'page-back-bytes',
+    'header' => 'header-bytes',
+    'feed_open' => '',
+    'feed_close' => '</div>',
+], $binding) === null, 'empty pagination shell rejected');
+$guest = ['actor' => 'https://mkultra.monster/users/ada', 'guest' => true, 'tab' => 'posts', 'from' => 'search'];
+putenv('VAAK_PROFILE_NATIVE_URL=http://public.invalid/internal/profile/local');
+check(ap_profile_native_render_local($guest) === null, 'guest local paint stays off the public network');
+check(ap_profile_native_render_remote(['actor' => 'https://remote.example/users/ada', 'guest' => true]) === null, 'guest remote paint stays off the public network');
+check(ap_profile_native_render_bsky(['actor' => 'https://bsky.app/profile/ada.example', 'guest' => true]) === null, 'guest bluesky paint stays off the public network');
+putenv('VAAK_PROFILE_NATIVE_URL=http://127.0.0.1/internal/profile/page');
+check(ap_profile_native_render_local($guest) === null, 'guest paint does not use the complete-native page route');
+putenv('VAAK_PROFILE_NATIVE_URL=http://127.0.0.1/internal/profile/full');
+check(ap_profile_native_render_local($guest) === null, 'guest paint does not use the complete-native full route');
 
 putenv('VAAK_PROFILE_NATIVE_RENDER');
 putenv('VAAK_PROFILE_NATIVE_SECRET');

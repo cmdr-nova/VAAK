@@ -107,6 +107,14 @@ struct Facts {
     blog_count: i64,
     blog_open: bool,
     media_total: Option<i64>,
+    guest: bool,
+    guest_bsky: String,
+    feed_shell: bool,
+    feed_empty: bool,
+    feed_offset: i64,
+    feed_limit: i64,
+    feed_has_more: bool,
+    feed_cache: String,
 }
 
 pub(crate) struct LocalChrome {
@@ -114,6 +122,8 @@ pub(crate) struct LocalChrome {
     pub header: String,
     pub chrome: String,
     pub secondary: Option<String>,
+    pub feed_open: Option<String>,
+    pub feed_close: Option<String>,
 }
 
 fn flag(value: &Value, key: &str) -> bool {
@@ -494,7 +504,93 @@ fn tabs(w: &mut W, f: &Facts) {
     w.line(10, "</nav>");
 }
 
+fn php_json_string(value: &str) -> String {
+    let mut out = String::from("\"");
+    for ch in value.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\u{0008}' => out.push_str("\\b"),
+            '\u{000c}' => out.push_str("\\f"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Guest follow panel from the live header. Signed-in pages leave this out.
+pub(crate) fn guest_follow_panel(actor: &str, bsky_handle: &str) -> String {
+    let mut out = include_str!("profile_guest_panel_prefix.txt").to_owned();
+    if !bsky_handle.is_empty() {
+        out.push_str(
+            &include_str!("profile_guest_panel_bsky.txt")
+                .replace("__HANDLE_URL__", &query(bsky_handle))
+                .replace("__HANDLE_HTML__", &esc(bsky_handle)),
+        );
+    }
+    out.push_str(&include_str!("profile_guest_panel_suffix.txt").replace("__ACTOR_JSON__", &php_json_string(actor)));
+    out
+}
+
+/// Signed-in relationship forms stay on the existing painters. A guest row is
+/// only the mute and block tags the template still prints.
+pub(crate) fn guest_action_close(muted: bool, blocked_personal: bool, blocked_server: bool) -> String {
+    let mut row = " ".repeat(44);
+    let flags = [
+        (muted, "<span class=\"tag\" title=\"Hidden from your timelines &amp; notifications\">muted for me</span>"),
+        (blocked_personal, "<span class=\"tag\" style=\"color:var(--danger)\" title=\"Personal block — hidden from your timelines only\">blocked for me</span>"),
+        (blocked_server, "<span class=\"tag\" style=\"color:var(--danger)\" title=\"Server-wide block\">blocked server-wide</span>"),
+    ];
+    for (on, html) in flags {
+        row.push_str(&" ".repeat(14));
+        if on { row.push_str(html); }
+    }
+    row.push_str(&" ".repeat(14 * 4 + 12));
+    row.push_str("</div>\n");
+    row
+}
+
+fn feed_markup(f: &Facts) -> (Option<String>, Option<String>) {
+    if !f.feed_shell { return (None, None); }
+    let cache = if f.feed_cache.is_empty() {
+        String::new()
+    } else {
+        format!(" data-tl-cache=\"{}\"", esc(&f.feed_cache))
+    };
+    let open_div = format!(
+        "<div id=\"timeline-items\" data-view=\"remote_profile\" data-actor=\"{}\" data-tab=\"{}\" data-offset=\"{}\" data-limit=\"{}\" data-has-more=\"{}\" data-newest=\"0\"{cache}>",
+        esc(&f.actor), esc(&f.tab), f.feed_offset, f.feed_limit, if f.feed_has_more { "1" } else { "0" }
+    );
+    let mut open = String::new();
+    if f.feed_empty {
+        open.push_str(&format!("            <div class=\"empty\">No {} available.</div>", esc(&f.tab)));
+        open.push_str("            ");
+    } else {
+        open.push_str("                        ");
+    }
+    open.push_str(&open_div);
+    open.push('\n');
+    open.push_str("            ");
+    let status = if f.feed_has_more { "Scroll for more…" } else { "End of profile" };
+    let close = format!("            </div><div id=\"timeline-status\" class=\"meta\" style=\"padding:.75rem 0;text-align:center\">{status}</div><div id=\"timeline-sentinel\" aria-hidden=\"true\" style=\"height:1px\"></div><button type=\"button\" class=\"feed-top-btn\" id=\"feed-top-btn\" title=\"Back to top\" aria-label=\"Back to top\">↑</button>\n            ");
+    (Some(open), Some(close))
+}
+
+pub(crate) fn profile_hover_attr(actor: &str) -> String {
+    let trimmed = actor.trim().trim_end_matches('/');
+    if trimmed.is_empty() || !trimmed.to_ascii_lowercase().starts_with("https://") {
+        return String::new();
+    }
+    format!(" data-profile-hover-actor=\"{}\" ", esc(trimmed))
+}
+
 fn page_back(f: &Facts) -> String {
+    if f.guest { return "          ".to_owned(); }
     let mut w = W::new();
     let (href, label, view) = back(&f.from);
     w.indent(10);
@@ -531,7 +627,7 @@ fn header(f: &Facts) -> String {
         w.indent(16);
     } else {
         w.indent(18);
-        let hover = format!(" data-profile-hover-actor=\"{}\" ", esc(&f.actor));
+        let hover = profile_hover_attr(&f.actor);
         let src = f.bare_src.as_deref().unwrap_or(f.fallback_avatar.as_str());
         w.text(&format!("<img class=\"tweet-av\" src=\"{}\" alt=\"\" width=\"40\" height=\"40\" {hover}loading=\"lazy\" decoding=\"async\" referrerpolicy=\"no-referrer\" onerror=\"this.onerror=null;this.src='{}'\">", esc(src), esc(&f.fallback_avatar)));
         w.indent(16);
@@ -567,6 +663,9 @@ fn header(f: &Facts) -> String {
     w.line(14, "</div>");
     w.indent(14);
     w.line(12, "</div>");
+    if f.guest && f.actor.starts_with("https://") {
+        w.text(&guest_follow_panel(&f.actor, &f.guest_bsky));
+    }
     w.indent(12);
     w.indent(12);
     if !f.bio.is_empty() {
@@ -665,6 +764,9 @@ fn header(f: &Facts) -> String {
     w.line(14, "</div>");
     w.indent(12);
     w.line(12, "<div class=\"tweet-actions remote-profile-actions\" style=\"flex-wrap:wrap;align-items:center;gap:.45rem\">");
+    if f.guest {
+        w.text(&guest_action_close(f.muted, f.blocked_personal, f.blocked_server));
+    } else {
     w.indent(14);
     if !f.is_own {
         w.line(16, "<span class=\"remote-profile-follow-inline\">");
@@ -743,6 +845,7 @@ fn header(f: &Facts) -> String {
     w.indent(16);
     w.indent(14);
     w.line(12, "</div>");
+    }
     w.line(10, "</article>");
     w.line(10, "<nav class=\"remote-profile-tabs\" aria-label=\"Profile posts\">");
     tabs(&mut w, f);
@@ -809,6 +912,10 @@ fn load(input: &Value) -> Result<Facts, String> {
         featured_rows: num(input, "featured_rows"), featured_count: num(input, "featured_count"),
         blog_rows: num(input, "blog_rows"), blog_count: num(input, "blog_count"), blog_open: flag(input, "blog_open"),
         media_total: input.get("media_total").and_then(Value::as_i64),
+        guest: flag(input, "guest"), guest_bsky: text(input, "guest_bsky").to_owned(),
+        feed_shell: flag(input, "feed_shell"), feed_empty: flag(input, "feed_empty"),
+        feed_offset: num(input, "feed_offset"), feed_limit: num(input, "feed_limit"),
+        feed_has_more: flag(input, "feed_has_more"), feed_cache: text(input, "feed_cache").to_owned(),
     })
 }
 
@@ -824,7 +931,8 @@ pub(crate) fn paint_local(input: &Value) -> Result<LocalChrome, String> {
     } else {
         None
     };
-    Ok(LocalChrome { page_back, header, chrome, secondary })
+    let (feed_open, feed_close) = feed_markup(&facts);
+    Ok(LocalChrome { page_back, header, chrome, secondary, feed_open, feed_close })
 }
 
 pub(crate) fn secret() -> Option<String> {
@@ -849,7 +957,7 @@ pub(crate) async fn render(_cfg: &crate::config::Config, headers: HeaderMap, byt
     }
     let painted = match paint_local(&input) { Ok(painted) => painted, Err(_) => return (StatusCode::UNPROCESSABLE_ENTITY, axum::Json(json!({"fallback": true}))).into_response() };
     let binding = json!({"actor": input.get("actor").and_then(Value::as_str).unwrap_or("").trim_end_matches('/'), "tab": text(&input, "tab"), "from": text(&input, "from")});
-    let body = json!({"ok": true, "protocol_version": 1, "request_binding": binding, "chrome": painted.chrome, "page_back": painted.page_back, "header": painted.header, "secondary": painted.secondary});
+    let body = json!({"ok": true, "protocol_version": 1, "request_binding": binding, "chrome": painted.chrome, "page_back": painted.page_back, "header": painted.header, "secondary": painted.secondary, "feed_open": painted.feed_open, "feed_close": painted.feed_close});
     let bytes = match serde_json::to_vec(&body) { Ok(bytes) => bytes, Err(_) => return (StatusCode::UNPROCESSABLE_ENTITY, axum::Json(json!({"fallback": true}))).into_response() };
     if bytes.len() > 2 * 1024 * 1024 { return (StatusCode::UNPROCESSABLE_ENTITY, axum::Json(json!({"fallback": true}))).into_response(); }
     (StatusCode::OK, [(axum::http::header::CONTENT_TYPE, "application/json"), (axum::http::header::CACHE_CONTROL, "no-store")], bytes).into_response()
@@ -891,6 +999,43 @@ mod tests {
         }
         for id in ["peer", "own", "follow_back", "following", "requested", "locked", "muted_blocked", "admin_target", "badges_fields", "tabs", "asks_empty", "asks_filled", "pins_filled", "wow_text"] {
             assert!(seen.iter().any(|seen| seen == id), "missing {id}");
+        }
+    }
+
+    #[test]
+    fn guest_actions_match_php() {
+        let file = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../api/bin/profile-guest-actions-capture.php");
+        let output = std::process::Command::new(file.parent().unwrap().join("php-policy-test")).arg(&file).output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        let captured: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let cases = captured["cases"].as_array().unwrap();
+        assert!(cases.len() >= 14, "guest capture cases");
+        for case in cases {
+            let id = text(case, "id");
+            let input = &case["input"];
+            let expected = &case["output"];
+            let kind = text(input, "kind");
+            let (chrome, page_back, header, secondary, feed_open, feed_close) = match kind {
+                "remote" => {
+                    let painted = crate::profile_remote::paint_remote(input).unwrap_or_else(|err| panic!("{id}: {err}"));
+                    (painted.chrome, painted.page_back, painted.header, painted.secondary, None, None)
+                }
+                "bsky" => {
+                    let painted = crate::profile_bsky_chrome::paint_bsky(input).unwrap_or_else(|err| panic!("{id}: {err}"));
+                    (painted.chrome, painted.page_back, painted.header, painted.secondary, None, None)
+                }
+                _ => {
+                    let painted = paint_local(input).unwrap_or_else(|err| panic!("{id}: {err}"));
+                    (painted.chrome, painted.page_back, painted.header, painted.secondary, painted.feed_open, painted.feed_close)
+                }
+            };
+            assert_eq!(chrome, text(expected, "chrome"), "{id} chrome {}", mismatch(&chrome, text(expected, "chrome")));
+            assert_eq!(page_back, text(expected, "page_back"), "{id} page_back");
+            assert_eq!(header, text(expected, "header"), "{id} header {}", mismatch(&header, text(expected, "header")));
+            assert_eq!(secondary.as_deref(), expected.get("secondary").and_then(Value::as_str), "{id} secondary");
+            assert_eq!(feed_open.as_deref(), expected.get("feed_open").and_then(Value::as_str), "{id} feed_open {}", mismatch(feed_open.as_deref().unwrap_or(""), expected.get("feed_open").and_then(Value::as_str).unwrap_or("")));
+            assert_eq!(feed_close.as_deref(), expected.get("feed_close").and_then(Value::as_str), "{id} feed_close {}", mismatch(feed_close.as_deref().unwrap_or(""), expected.get("feed_close").and_then(Value::as_str).unwrap_or("")));
+            assert_eq!(format!("{page_back}{header}"), chrome, "{id} split");
         }
     }
 }

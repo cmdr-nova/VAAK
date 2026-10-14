@@ -1,0 +1,8 @@
+                                      <form class="guest-follow-bsky" action="https://bsky.app/profile/__HANDLE_URL__" method="get" target="_blank" rel="noopener noreferrer">
+                      <label for="rp-guest-bsky-handle">Follow on Bluesky</label>
+                      <div class="guest-follow-row">
+                        <input id="rp-guest-bsky-handle" type="text" value="@__HANDLE_HTML__" readonly>
+                        <button type="submit">Open</button>
+                      </div>
+                      <p class="guest-follow-hint">Opens this profile in Bluesky so you can follow it there.</p>
+                    </form>
