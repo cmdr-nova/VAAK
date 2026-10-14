@@ -362,8 +362,39 @@ pub(crate) fn require_ap_preview_protocol(status:&Value,depth:usize)->Result<()>
     for field in ["reblog","quote","vaak_quote_preview"] {
         if let Some(value)=status.get(field).filter(|value|value.is_object()) {
             let child=value.get("quoted_status").or_else(||value.get("status")).filter(|value|value.is_object()).unwrap_or(value);
-            require_ap_preview_protocol(child,depth+1)?;
+            if field=="reblog" { require_ap_preview_protocol(child,depth+1)?; }
+            else { require_library_quote_child(child,depth+1)?; }
         }
+    }
+    Ok(())
+}
+
+/// Quote and compact-preview children are not the root link-preview budget.
+/// A Bluesky or `at://` quote target can be painted from the fields already
+/// on the card. Unproved shapes (bad ids, raw facet bundles, non-HTTPS URIs)
+/// still fall back.
+fn require_library_quote_child(status:&Value, depth:usize)->Result<()> {
+    if depth>16 { anyhow::bail!("PHP fallback: preview protocol depth"); }
+    if is_rss(status) { return Ok(()); }
+    let uri=status.get("uri").and_then(Value::as_str).unwrap_or("");
+    if !uri.is_empty() && !uri.starts_with("https://") && !uri.starts_with("at://") {
+        anyhow::bail!("PHP fallback: root-preview object URI lacks supported durable HTTPS identity");
+    }
+    let id=super::card::scalar_string(status,"id");
+    if status.get("record").is_some_and(Value::is_object)||status.get("vaak_bsky_text").is_some_and(|value|value.as_str().is_none_or(|text|!text.is_empty()))||status.get("vaak_bsky_facets").is_some_and(|value|value.as_array().is_none_or(|facets|!facets.is_empty())){
+        anyhow::bail!("PHP fallback: root-preview facet bundle normalization not certified");
+    }
+    if id.starts_with("bsky:") || matches!(status.get("source").and_then(Value::as_str), Some("rss")) {
+        anyhow::bail!("PHP fallback: protocol-specific root preview not certified");
+    }
+    for field in ["quote","vaak_quote_preview"] {
+        if let Some(value)=status.get(field).filter(|value|value.is_object()) {
+            let child=value.get("quoted_status").or_else(||value.get("status")).filter(|value|value.is_object()).unwrap_or(value);
+            require_library_quote_child(child,depth+1)?;
+        }
+    }
+    if let Some(reblog)=status.get("reblog").filter(|value|value.is_object()) {
+        require_ap_preview_protocol(reblog, depth+1)?;
     }
     Ok(())
 }
@@ -377,17 +408,22 @@ pub(crate) async fn exact_incoming_boost(db:&Client,owner:i64,sid:&str)->Result<
 /// unresolved branch returns whole-page canonical PHP fallback without a
 /// dropped feature or partial HTML.
 pub(crate) async fn admit_for_render(db: &Client, session: &TrustedSession, statuses: Vec<Value>) -> Result<Vec<AdmittedStatus>> {
-    admit_for_render_impl(db,session,statuses,None).await.map(|value|value.0)
+    admit_for_render_impl(db,session,statuses,None,None).await.map(|value|value.0)
 }
 pub(crate) async fn admit_for_render_with_preview(db:&Client,session:&TrustedSession,statuses:Vec<Value>,budget:i64,dns:&dyn crate::direct_preview::PreviewDns)->Result<(Vec<AdmittedStatus>,i64)> {
-    admit_for_render_impl(db,session,statuses,Some((budget,dns))).await
+    let (cards,remaining,_quote)=admit_for_render_impl(db,session,statuses,Some((budget,dns)),None).await?;
+    Ok((cards,remaining))
 }
-async fn admit_for_render_impl(db:&Client,session:&TrustedSession,statuses:Vec<Value>,preview:Option<(i64,&dyn crate::direct_preview::PreviewDns)>)->Result<(Vec<AdmittedStatus>,i64)> {
+pub(crate) async fn admit_for_render_with_quote_preview(db:&Client,session:&TrustedSession,statuses:Vec<Value>,budget:i64,quote_budget:i64,dns:&dyn crate::direct_preview::PreviewDns)->Result<(Vec<AdmittedStatus>,i64,super::quote::QuotePreviewState)> {
+    admit_for_render_impl(db,session,statuses,Some((budget,dns)),Some(quote_budget)).await
+}
+async fn admit_for_render_impl(db:&Client,session:&TrustedSession,statuses:Vec<Value>,preview:Option<(i64,&dyn crate::direct_preview::PreviewDns)>,quote_budget:Option<i64>)->Result<(Vec<AdmittedStatus>,i64,super::quote::QuotePreviewState)> {
     let bsky_source=statuses.iter().any(has_bsky_source);
     if bsky_source{session.require_bsky_current(db).await?;}
     let identity=db.query_opt("SELECT actor_id,actor_key FROM ap_users WHERE id=$1::bigint AND disabled_at IS NULL",&[&session.owner_id]).await?.context("inactive Library painter owner")?;
     let actor:String=identity.get(0);let actor_key:String=identity.get(1);
     let mut budget=preview.map(|value|value.0).unwrap_or(0);
+    let mut quote_state=super::quote::QuotePreviewState::new(quote_budget.unwrap_or(2));
     let mut bound=Vec::new();let mut source_indices=Vec::new();let mut originals=std::collections::HashMap::new();
     for (source_index,status) in statuses.into_iter().enumerate() {
         if preview.is_some(){require_canonical_source_ids(&status,0)?;require_ap_preview_protocol(&status,0)?;}
@@ -493,7 +529,7 @@ async fn admit_for_render_impl(db:&Client,session:&TrustedSession,statuses:Vec<V
         }
         let final_page = admit_indexed(db,session.owner_id,vec![(source_index,status)]).await?;
         if preview.is_some()&&final_page.statuses.is_empty(){anyhow::bail!("PHP fallback: Library pre-preview final omission state not certified");}
-        if let Some(status) = final_page.statuses.into_iter().next() {
+        if let Some(mut status) = final_page.statuses.into_iter().next() {
             // RSS does not use AS2 actor-domain/audience filtering, but its
             // freshly normalized title/summary still obey saved muted words.
             if is_rss(&status) {
@@ -508,6 +544,13 @@ async fn admit_for_render_impl(db:&Client,session:&TrustedSession,statuses:Vec<V
                     if rechecked.statuses.is_empty(){continue}
                     Some(card)
             }else{None};
+            if quote_budget.is_some() {
+                if let Some((_,dns))=preview {
+                    super::quote::prepare_admitted(db, dns, &mut status, &mut quote_state, facts.now).await?;
+                } else {
+                    super::quote::prepare_presentation(&mut status, &mut quote_state, &std::collections::HashMap::new())?;
+                }
+            }
             cards.push(AdmittedStatus { source_index,status,facts,root_preview });
             if let Some(grant)=source_grant{source_grants.push(grant)}
         }
@@ -516,7 +559,7 @@ async fn admit_for_render_impl(db:&Client,session:&TrustedSession,statuses:Vec<V
     if final_owner.get::<_,String>(0)!=actor||final_owner.get::<_,String>(1)!=actor_key{anyhow::bail!("Library identity changed during assembly")}
     if bsky_source{session.require_bsky_current(db).await?;}
     for grant in source_grants{grant.require_current(db).await?;}
-    Ok((cards,budget))
+    Ok((cards,budget,quote_state))
 }
 
 // Every synthetic subscription source, including a quote/reblog/compact child,
