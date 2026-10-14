@@ -344,12 +344,19 @@ function boot(view) {
   function elapse(ms) { now += ms; }
   function dropTimers() { timers.clear(); }
   function newer() { return calls.filter((call) => call.url.includes('newer=1')); }
-  function response(noteId, newest) {
+  function response(noteId, newest, extra) {
+    extra = extra || {};
+    let body = Object.prototype.hasOwnProperty.call(extra, 'body') ? extra.body : null;
+    if (body == null) {
+      body = noteId
+        ? '<article class="tweet" data-note-id="' + noteId + '"' + (extra.sort ? ' data-sort="' + extra.sort + '"' : '') + '></article>'
+        : ' ';
+    }
     return {
       ok: true,
       status: 200,
       headers: { get(name) { return String(name).toLowerCase() === 'x-newest' ? String(newest) : null; } },
-      text: async () => (noteId ? '<article class="tweet" data-note-id="' + noteId + '"></article>' : ' '),
+      text: async () => body,
     };
   }
   win.vaakRenderInboxTitle = () => {
@@ -384,7 +391,7 @@ function check(ok, label) {
   check(page.newer().at(-1).url.includes('since=1000'), 'background check keeps the same cursor');
   page.newer().at(-1).pending.resolve(page.response('note-hidden', 1500));
   await page.flush();
-  check(page.newBtn().hidden === false && page.newBtn().textContent === 'Show 1 post', 'background check arms the new-posts indicator');
+  check(page.newBtn().hidden === false && page.newBtn().textContent === '1 new post', 'background check arms the new-posts indicator');
   check(page.items.children.length === 0, 'background check does not insert posts into the feed');
   check(page.doc.title === '(1) VAAK', 'pending posts prefix the tab title');
 
@@ -418,7 +425,7 @@ function check(ok, label) {
   check(page.newer().at(-1).url.includes('view=home') && page.newer().at(-1).url.includes('since=1500'), 'return check continues from the cursor, it does not jump to now');
   page.newer().at(-1).pending.resolve(page.response('note-wake', 1800));
   await page.flush();
-  check(page.newBtn().textContent === 'Show 1 post' && page.items.querySelector('[data-note-id="note-wake"]') == null, 'return check shows the indicator and still does not insert');
+  check(page.newBtn().textContent === '1 new post' && page.items.querySelector('[data-note-id="note-wake"]') == null, 'return check shows the indicator and still does not insert');
 
   // Request frozen in flight: its abort timer never runs, so the old catch-up
   // saw pollBusy and did nothing. Returning must abort that stale flight and
@@ -514,6 +521,73 @@ function check(ok, label) {
   await expectView('outbox', false);
 
   check(!source.includes("view === 'lists'") || !source.slice(source.indexOf('function timelineHeadPollView'), source.indexOf('function pollTimelineAutomatically')).includes("'lists'"), 'list pages are not given this head poller');
+
+  // Response → counter. The cursor moves only after the body is a real card,
+  // and an X-Newest past those cards cannot skip a post the bar never showed.
+  const held = boot('home');
+  await held.advance(5000);
+  held.win.scrollY = 480;
+  held.newer()[0].pending.resolve(held.response('post-a', 99999, { sort: 1100 }));
+  await held.flush();
+  check(held.items.children.length === 0, 'a returned card is held instead of inserted');
+  check(held.newBtn().hidden === false && held.newBtn().textContent === '1 new post' && held.newBtn().classList.contains('show'), 'the bar counts the held card');
+  check(held.newBtn().classList.contains('is-pinned'), 'the bar becomes the floating pill while scrolled down');
+  check(held.items.dataset.newest === '1100', 'data-sort caps an X-Newest that is ahead of the card');
+
+  // The boot timer is armed at t=0 and the first check is at 5s, so the
+  // next eligible visible check is the timer that lands at 90s.
+  await held.advance(85000);
+  check(held.newer().at(-1).url.includes('since=1100'), 'the next poll starts at the card that was actually shown to the counter');
+  held.newer().at(-1).pending.resolve(held.response('', 50000, {
+    body: '<article class="tweet" data-note-id="post-a" data-sort="1100"></article><article class="tweet" data-note-id="post-b" data-sort="1200"></article>',
+  }));
+  await held.flush();
+  check(held.newBtn().textContent === '2 new posts', 'a later poll adds to the count and drops the duplicate');
+  check(held.items.dataset.newest === '1200', 'duplicate cards still advance the cursor to their data-sort ceiling');
+
+  await held.advance(45000);
+  held.newer().at(-1).pending.resolve(held.response('', 80000, { body: '<div class="nope">not a post</div>' }));
+  await held.flush();
+  check(held.items.dataset.newest === '1200' && held.newBtn().textContent === '2 new posts', 'a body with no timeline card does not move the cursor or the count');
+
+  await held.advance(45000);
+  held.newer().at(-1).pending.resolve(held.response('', 70000));
+  await held.flush();
+  check(held.items.dataset.newest === '1200', 'an empty body does not move the cursor');
+
+  await held.advance(45000);
+  held.newer().at(-1).pending.resolve(held.response('', 99999, {
+    body: '<div class="notif-status-embed"><article class="tweet" data-note-id="wrapped" data-sort="1300"></article></div>',
+  }));
+  await held.flush();
+  check(held.newBtn().textContent === '3 new posts' && held.items.dataset.newest === '1300', 'a wrapped card counts and its data-sort caps X-Newest');
+
+  const timelineNode = held.items;
+  held.newBtn().remove();
+  await held.advance(45000);
+  held.newer().at(-1).pending.resolve(held.response('post-c', 1400, { sort: 1400 }));
+  await held.flush();
+  check(held.newBtn() && held.newBtn().textContent === '4 new posts', 'a missing new-posts button is recreated by the poll');
+  held.newBtn().click();
+  const inserted = held.items.querySelectorAll('article.tweet').map((el) => el.getAttribute('data-note-id'));
+  check(held.items === timelineNode && inserted.join(',') === 'post-c,wrapped,post-b,post-a', 'click inserts the held cards at the top of the same timeline');
+  check(held.newBtn().hidden === true && held.items.querySelectorAll('[data-note-id="post-a"]').length === 1, 'click clears the indicator and does not duplicate a card');
+
+  const drift = boot('home');
+  await drift.advance(5000);
+  drift.newer()[0].pending.resolve(drift.response('', 1000));
+  await drift.flush();
+  drift.items.dataset.view = 'local';
+  drift.doc.hidden = true;
+  drift.doc.emit('visibilitychange');
+  drift.dropTimers();
+  drift.elapse(10000);
+  drift.doc.hidden = false;
+  drift.doc.emit('visibilitychange');
+  await drift.advance(200);
+  await drift.flush();
+  const drifted = drift.newer().slice(1);
+  check(drifted.length === 1 && drifted[0].url.includes('view=local') && drifted[0].url.includes('since=1000'), 'Local is polled from the live timeline view when the boot closure still says home');
   console.log(JSON.stringify({ file, checks: result.length, passed: true, labels: result }, null, 2));
 })().catch((error) => {
   console.error(error && error.stack ? error.stack : error);
