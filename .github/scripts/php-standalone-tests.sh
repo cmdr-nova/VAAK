@@ -48,6 +48,7 @@ php_tests=(
   api/bin/library-deletion-smoke.php
   api/bin/library-folder-capture.php
   api/bin/library-page-capture.php
+  api/bin/library-privacy-capture.php
   api/bin/library-moderation-actions-smoke.php
   api/bin/library-native-bridge-test.php
   api/bin/library-own-cw-smoke.php
