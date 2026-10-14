@@ -14443,7 +14443,7 @@ function ap_masto_resolve_status_interaction(int $statusId): ?array
  */
 function ap_masto_favourites_list(int $limit = 40, ?string $maxId = null, ?array $nativeWindow = null, ?array $sourceRows = null): array
 {
-    $limit = max(1, min(80, $limit));
+    $limit = ap_masto_library_api_bounds($limit)['limit'];
     $out = [];
     foreach (($sourceRows ?? ap_masto_favourite_rows($limit, $maxId)) as $rawOrdinal => $row) {
         $status = ap_masto_interaction_row_to_status($row, 'favourited');
@@ -14605,7 +14605,7 @@ function ap_masto_interaction_row_to_status(array $row, string $flag): ?array
  */
 function ap_masto_bookmarks_list(int $limit = 40, ?string $maxId = null): array
 {
-    $limit = max(1, min(80, $limit));
+    $limit = ap_masto_library_api_bounds($limit)['limit'];
     $out = [];
     foreach (ap_masto_bookmark_rows($limit, $maxId) as $row) {
         $status = ap_masto_interaction_row_to_status($row, 'bookmarked');

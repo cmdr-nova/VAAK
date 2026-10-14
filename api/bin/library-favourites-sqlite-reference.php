@@ -4,8 +4,11 @@ declare(strict_types=1);
 function ap_db(): PDO { return $GLOBALS['favourite_sqlite']; }
 function ap_db_default_owner_user_id(): int { return 1; }
 $path=dirname(__DIR__).'/ap-db.php';$source=(string)file_get_contents($path);
-if(!preg_match('/^function ap_masto_favourite_rows\(.*?^}/ms',$source,$match))throw new RuntimeException('actual favourite row declaration');
-eval($match[0]);
+foreach(['ap_masto_library_api_bounds','ap_masto_library_created_before','ap_masto_favourite_rows'] as $name){
+    if(!preg_match('/^function '.preg_quote($name,'/').'\(.*?^}/ms',$source,$part))throw new RuntimeException('actual favourite row declaration');
+    eval($part[0]);
+    if($name==='ap_masto_favourite_rows')$match=$part;
+}
 $db=new PDO('sqlite::memory:');$db->setAttribute(PDO::ATTR_ERRMODE,PDO::ERRMODE_EXCEPTION);$db->setAttribute(PDO::ATTR_DEFAULT_FETCH_MODE,PDO::FETCH_ASSOC);$GLOBALS['favourite_sqlite']=$db;
 $db->exec('CREATE TABLE masto_favourites(id INTEGER PRIMARY KEY,owner_user_id INTEGER,status_id TEXT,object_id TEXT,created_at TEXT)');
 $insert=$db->prepare('INSERT INTO masto_favourites VALUES(?,?,?,?,?)');
