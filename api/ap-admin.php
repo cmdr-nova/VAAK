@@ -6485,6 +6485,7 @@ function admin_trends_sidebar_html(string $viewForTrends, bool $allowStale = tru
             }
             if ($kind === 'statuses') {
                 if (admin_trend_status_hidden($candidate, $viewerId, $downrankRefs)) continue;
+                if (function_exists('ap_masto_trend_status_listable') && !ap_masto_trend_status_listable($candidate)) continue;
             } elseif (ap_masto_trend_item_hidden($candidate, $viewerId, [], false)
                 || admin_trend_status_is_downranked($candidate, $downrankRefs)) {
                 continue;
@@ -6557,7 +6558,9 @@ function admin_trends_sidebar_html(string $viewForTrends, bool $allowStale = tru
                 ? admin_html_to_plain((string) ($ts['content'] ?? ''))
                 : trim(html_entity_decode(strip_tags((string) ($ts['content'] ?? '')), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
             $excerpt = $admin_strim($content, 96);
-            $surl = (string) ($ts['url'] ?? $ts['uri'] ?? '');
+            $surl = function_exists('ap_masto_trend_status_open_ref')
+                ? ap_masto_trend_status_open_ref($ts)
+                : (string) ($ts['uri'] ?? $ts['url'] ?? '');
             $html .= '<div style="margin:0 0 .65rem;line-height:1.35">';
             $html .= '<div class="meta" style="margin-bottom:.15rem">' . h($who) . '</div>';
             if ($surl !== '') {
@@ -13205,6 +13208,135 @@ function admin_status_href(string $objectUrl, string $from = 'home'): string
     }
     $from = preg_replace('/[^a-z_]/', '', $from) ?: 'home';
     return '?view=status&object=' . rawurlencode($objectUrl) . '&from=' . rawurlencode($from);
+}
+
+/** Public home-server page for a post this instance could not open. */
+function admin_status_home_href(string $object): string
+{
+    $object = trim($object);
+    if (str_starts_with($object, 'bsky:')) {
+        $object = substr($object, 5);
+    }
+    if (function_exists('admin_bsky_thread_extract_at')) {
+        $at = admin_bsky_thread_extract_at($object);
+        if (is_string($at)) {
+            $object = $at;
+        }
+    }
+    if (str_starts_with($object, 'at://')) {
+        if (!function_exists('ap_bsky_https_url_from_at_uri')) {
+            return '';
+        }
+        $https = ap_bsky_https_url_from_at_uri($object, null);
+        return is_string($https) && str_starts_with($https, 'https://') && $https !== 'https://bsky.app/' ? $https : '';
+    }
+    if (function_exists('vaak_is_local_url') && vaak_is_local_url($object)) {
+        return '';
+    }
+    if (function_exists('admin_remote_object_href')) {
+        $href = admin_remote_object_href($object);
+        if (is_string($href) && str_starts_with($href, 'https://')
+            && !(function_exists('vaak_is_local_url') && vaak_is_local_url($href))) {
+            return $href;
+        }
+    }
+    return str_starts_with($object, 'https://') ? $object : '';
+}
+
+/** Unavailable post copy. Hidden posts do not get a link around the block. */
+function admin_status_unavailable_html(string $object, bool $hidden): string
+{
+    if ($hidden) {
+        return '<div class="empty">This post is unavailable or hidden.</div>';
+    }
+    $object = trim($object);
+    if (function_exists('vaak_is_local_url') && vaak_is_local_url($object)) {
+        return '<div class="empty">This post was deleted or is no longer on this instance.</div>';
+    }
+    $home = admin_status_home_href($object);
+    $html = '<div class="empty">This post is unavailable.';
+    if ($home !== '') {
+        $html .= '<div style="margin-top:.75rem"><a href="' . h($home) . '" target="_blank" rel="noopener noreferrer">Open on its home server</a></div>';
+    }
+    return $html . '</div>';
+}
+
+/**
+ * When the Bluesky thread cannot be painted, use a still-public local copy.
+ * Returns null when there is no twin or the twin is not allowed.
+ */
+function admin_status_bsky_local_fallback(string $object): ?string
+{
+    if (!function_exists('admin_bsky_thread_extract_at') || !function_exists('admin_bsky_thread_local_twin')) {
+        return null;
+    }
+    $at = admin_bsky_thread_extract_at($object);
+    if (!is_string($at) || !function_exists('ap_masto_status_by_note_id') || !function_exists('ap_masto_status_from_row')) {
+        return null;
+    }
+    try {
+        $twin = admin_bsky_thread_local_twin($at);
+    } catch (Throwable $e) {
+        return null;
+    }
+    if (!is_string($twin) || !str_starts_with($twin, 'https://')) {
+        return null;
+    }
+    $row = ap_masto_status_by_note_id($twin);
+    if (!is_array($row)) {
+        return null;
+    }
+    $status = ap_masto_status_from_row($row, true, false);
+    $owner = function_exists('admin_owner_user_id') ? (int) admin_owner_user_id() : 0;
+    if (!is_array($status) || !admin_direct_status_allowed($status, $owner) || admin_direct_status_content_blocked($status)) {
+        return null;
+    }
+    return $twin;
+}
+
+/** Bluesky miss: explain a block without offering a way around it. */
+function admin_status_bsky_unavailable_html(string $object): string
+{
+    $hidden = false;
+    $owner = function_exists('admin_owner_user_id') ? (int) admin_owner_user_id() : 0;
+    $at = function_exists('admin_bsky_thread_extract_at') ? admin_bsky_thread_extract_at($object) : null;
+    if (is_string($at)) {
+        $did = '';
+        if (preg_match('~^at://(did:[^/]+)/~', $at, $m)) {
+            $did = $m[1];
+        }
+        if ($did !== '' && function_exists('ap_actor_is_content_blocked') && ap_actor_is_content_blocked($did, null, $owner)) {
+            $hidden = true;
+        }
+        if (!$hidden && $did !== '') {
+            try {
+                $q = ap_db()->prepare('SELECT 1 FROM bsky_hide_dids WHERE owner_user_id=? AND did=? LIMIT 1');
+                $q->execute([$owner, $did]);
+                if ($q->fetchColumn()) {
+                    $hidden = true;
+                }
+            } catch (Throwable $e) {
+            }
+        }
+        if (!$hidden && function_exists('admin_bsky_thread_local_twin')) {
+            try {
+                $twin = admin_bsky_thread_local_twin($at);
+                if (is_string($twin) && $twin !== '') {
+                    $hidden = true;
+                    if (function_exists('ap_masto_status_by_note_id') && function_exists('ap_masto_status_from_row')) {
+                        $row = ap_masto_status_by_note_id($twin);
+                        if (is_array($row)) {
+                            $status = ap_masto_status_from_row($row, true, false);
+                            $hidden = !is_array($status) || !admin_direct_status_allowed($status, $owner) || admin_direct_status_content_blocked($status);
+                        }
+                    }
+                }
+            } catch (Throwable $e) {
+                $hidden = true;
+            }
+        }
+    }
+    return admin_status_unavailable_html($object, $hidden);
 }
 
 /**
@@ -20915,10 +21047,12 @@ if ($isPartial && $view === 'status' && (string) ($_GET['shell'] ?? '') === '1')
     }
     $shellSource = str_starts_with($shellObject, 'https://')
         ? ap_masto_lookup_status_by_object_url($shellObject, 0, false, true) : null;
-    if ((is_array($shellSource) && (!admin_direct_status_allowed($shellSource, admin_owner_user_id())
-            || admin_direct_status_content_blocked($shellSource)))
-        || (vaak_is_local_url($shellObject) && !is_array($shellSource))) {
+    $shellDenied = is_array($shellSource) && (!admin_direct_status_allowed($shellSource, admin_owner_user_id())
+        || admin_direct_status_content_blocked($shellSource));
+    $shellMissingLocal = vaak_is_local_url($shellObject) && !is_array($shellSource);
+    if ($shellDenied || $shellMissingLocal) {
         header('Cache-Control: private, no-store');
+        header('X-VAAK-Status-Reason: ' . ($shellDenied ? 'hidden' : 'missing'));
         http_response_code(404);
         exit;
     }
@@ -20939,7 +21073,7 @@ function admin_bsky_thread_fragment(string $object, string $part, string $from, 
         ap_bsky_posts_migrate();ap_bsky_crossposts_migrate();ap_bsky_post_links_migrate();
         $policy = admin_bsky_thread_policy_snapshot($owner);
         $at = admin_bsky_thread_target_uri($object);
-        if (!is_string($at) || !preg_match('~^at://did:[^/\s]+/app\.bsky\.feed\.post/[A-Za-z0-9]+$~D', $at)) return null;
+        if (!is_string($at) || !admin_bsky_thread_at_uri_ok($at)) return null;
         $focus = admin_bsky_thread_focus_item($at, $owner, $part === 'focus');
         if (!is_array($focus) || ($focus['post']['uri'] ?? '') !== $at
             || !admin_bsky_thread_focus_allowed($focus, $owner)
@@ -21058,28 +21192,61 @@ function admin_bsky_thread_focus_item(string $at, int $owner, bool $repairFocus)
     return ['post'=>$live];
 }
 
+function admin_bsky_thread_at_uri_ok(string $at): bool
+{
+    if (!preg_match('~^at://did:[^/\s]+/app\.bsky\.feed\.post/([A-Za-z0-9._:\~-]+)$~D', $at, $m)) return false;
+    return $m[1] !== '.' && $m[1] !== '..';
+}
+
+/** DID at:// embedded in the requested URL. Handle permalinks stay unresolved. */
+function admin_bsky_thread_extract_at(string $object): ?string
+{
+    $object = trim($object);
+    if (str_starts_with($object, 'bsky:')) $object = substr($object, 5);
+    $rkey = '[A-Za-z0-9._:\~-]+';
+    $candidates = [$object];
+    $decoded = rawurldecode($object);
+    if ($decoded !== $object) $candidates[] = $decoded;
+    foreach ($candidates as $candidate) {
+        if (preg_match('~at://(did:[^/\s?#]+)/app\.bsky\.feed\.post/(' . $rkey . ')~', $candidate, $m)
+            || preg_match('~^https://bsky\.app/profile/(did:[^/?#]+)/post/(' . $rkey . ')$~D', $candidate, $m)) {
+            $at = 'at://' . $m[1] . '/app.bsky.feed.post/' . $m[2];
+            if (admin_bsky_thread_at_uri_ok($at)) return $at;
+        }
+    }
+    return null;
+}
+
+function admin_bsky_thread_like_literal(string $value): string
+{
+    return str_replace(['\\', '%', '_'], ['\\\\', '\\%', '\\_'], $value);
+}
+
 /** Resolve only the requested identity, never a same-rkey cache fallback. */
 function admin_bsky_thread_target_uri(string $object): ?string
 {
     $object=trim($object);if(str_starts_with($object,'bsky:'))$object=substr($object,5);
-    if(preg_match('~^at://did:[^/\s]+/app\.bsky\.feed\.post/[A-Za-z0-9]+$~D',$object))return $object;
-    if(!preg_match('~^https://bsky\.app/profile/([^/?#]+)/post/([A-Za-z0-9]+)$~D',$object,$m))return null;
+    $embedded=admin_bsky_thread_extract_at($object);
+    if(is_string($embedded))return $embedded;
+    if(!preg_match('~^https://bsky\.app/profile/([^/?#]+)/post/([A-Za-z0-9._:\~-]+)$~D',$object,$m))return null;
     $actor=rawurldecode($m[1]);$rkey=$m[2];
+    if($rkey==='.'||$rkey==='..')return null;
     if(str_starts_with($actor,'did:'))$did=$actor;
     else{
-        $q=ap_db()->prepare('SELECT bsky_uri FROM bsky_posts WHERE lower(author_handle)=lower(?) AND bsky_uri LIKE ? LIMIT 2');
-        $q->execute([$actor,'%/app.bsky.feed.post/'.$rkey]);$matches=$q->fetchAll(PDO::FETCH_COLUMN);
-        if(count($matches)===1)return preg_match('~^at://did:[^/\s]+/app\.bsky\.feed\.post/[A-Za-z0-9]+$~D',$matches[0])?$matches[0]:null;
+        $q=ap_db()->prepare("SELECT bsky_uri FROM bsky_posts WHERE lower(author_handle)=lower(?) AND bsky_uri LIKE ? ESCAPE '\\' LIMIT 2");
+        $q->execute([$actor,'%/app.bsky.feed.post/'.admin_bsky_thread_like_literal($rkey)]);$matches=$q->fetchAll(PDO::FETCH_COLUMN);
+        if(count($matches)===1)return admin_bsky_thread_extract_at((string)$matches[0]);
         $r=ap_bsky_xrpc(AP_BSKY_PUBLIC_API,'com.atproto.identity.resolveHandle','GET',['handle'=>$actor],null,null,4);
         $did=!empty($r['ok'])?($r['json']['did']??null):null;
     }
-    return is_string($did)&&preg_match('~^did:[^/\s]+$~D',$did)?'at://'.$did.'/app.bsky.feed.post/'.$rkey:null;
+    return is_string($did)&&preg_match('~^did:[^/\s]+$~D',$did)?admin_bsky_thread_extract_at('at://'.$did.'/app.bsky.feed.post/'.$rkey):null;
 }
 
 function admin_bsky_thread_post_valid(array $post): bool
 {
     return is_string($post['uri']??null) && is_array($post['author']??null)
-        && preg_match('~^at://(did:[^/\s]+)/app\.bsky\.feed\.post/[A-Za-z0-9]+$~D',$post['uri'],$m)
+        && preg_match('~^at://(did:[^/\s]+)/app\.bsky\.feed\.post/([A-Za-z0-9._:\~-]+)$~D',$post['uri'],$m)
+        && $m[2] !== '.' && $m[2] !== '..'
         && is_string($post['author']['did']??null) && ($post['author']['did']??'')===$m[1]
         && is_array($post['record']??null) && is_string($post['record']['text']??null)
         && is_string($post['record']['createdAt']??null);
@@ -21201,8 +21368,17 @@ if ($isPartial && $view === 'status' && isset($_GET['thread'])) {
         require_once __DIR__.'/ap-bsky.php';
         require_once __DIR__.'/ap-masto-entities.php';
         $html=admin_bsky_thread_fragment($stObject,$threadPart,$stFrom,$followingIds);
-        if($html===null){http_response_code(404);exit;}
-        echo $html;exit;
+        if(is_string($html)){echo $html;exit;}
+        $fallback=admin_status_bsky_local_fallback($stObject);
+        if(is_string($fallback)){$stObject=$fallback;}
+        else{
+            $native=str_starts_with($stObject,'at://')||str_starts_with($stObject,'bsky:')||str_starts_with($stObject,'https://bsky.app/');
+            if($native||!str_starts_with($stObject,'https://')){
+                header('X-VAAK-Status-Reason: missing');
+                http_response_code(404);
+                exit;
+            }
+        }
     }
     if ($stObject === '' || !str_starts_with($stObject, 'https://')) {
         echo '<div class="meta">Missing post URL.</div>';
@@ -32772,6 +32948,16 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
                   $stBskyFocusHtml = null;
               }
           }
+          if ($stIsBskyObject && $stBskyFocusHtml === null) {
+              $stBskyFallback = admin_status_bsky_local_fallback($stObject);
+              if (is_string($stBskyFallback)) {
+                  $stObject = $stBskyFallback;
+                  $stIsBskyObject = false;
+              } elseif (str_starts_with($stObject, 'https://') && !str_starts_with($stObject, 'https://bsky.app/')) {
+                  // Bridgy and other https copies still have a stored ActivityPub event.
+                  $stIsBskyObject = false;
+              }
+          }
           if ($stObject !== '' && str_starts_with($stObject, 'https://') && !$stIsBskyObject) {
               // Strip like/reblog/bite interaction fragments so Open hits the real Note.
               if (function_exists('ap_masto_mention_target_object_id')) {
@@ -32989,7 +33175,7 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
           </div>
         <?php elseif ($stIsBskyObject): ?>
           <?php if ($stBskyFocusHtml === null): ?>
-            <div class="empty">This post is unavailable or hidden.</div>
+            <?= admin_status_bsky_unavailable_html($stObject) ?>
           <?php else: ?>
           <div id="status-thread-ancestors" data-object="<?= h($stObject) ?>" data-from="<?= h($stFrom) ?>" data-need-more="1">
             <div class="meta status-thread-loading" style="margin-bottom:.5rem">Loading earlier posts…</div>
@@ -40544,7 +40730,31 @@ window.vaakBootStatusThread();
         return;
       }
       if (view === 'status' && res.status === 404) {
-        main.innerHTML = '<div class="empty">This post is unavailable.</div>';
+        const reason = res.headers.get('X-VAAK-Status-Reason') || '';
+        const object = String((extra && extra.object) || '');
+        const esc = (value) => String(value).replace(/[&<>"']/g, (ch) => ({
+          '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+        }[ch]));
+        let home = '';
+        const raw = object.trim();
+        const decoded = (() => { try { return decodeURIComponent(raw); } catch (e) { return raw; } })();
+        const embedded = decoded.match(/at:\/\/(did:[^/\s?#]+)\/app\.bsky\.feed\.post\/([A-Za-z0-9._:~-]+)/);
+        if (embedded && embedded[2] !== '.' && embedded[2] !== '..') {
+          home = 'https://bsky.app/profile/' + embedded[1] + '/post/' + encodeURIComponent(embedded[2]);
+        } else if (/^https:\/\//i.test(raw)) {
+          try {
+            const parsed = new URL(raw);
+            if (parsed.protocol === 'https:' && parsed.host !== location.host) home = parsed.href;
+          } catch (e) {}
+        }
+        let message = 'This post is unavailable.';
+        if (reason === 'hidden') message = 'This post is unavailable or hidden.';
+        else if (reason === 'missing') message = 'This post was deleted or is no longer on this instance.';
+        let html = '<div class="empty">' + message;
+        if (reason !== 'hidden' && reason !== 'missing' && home) {
+          html += '<div style="margin-top:.75rem"><a href="' + esc(home) + '" target="_blank" rel="noopener noreferrer">Open on its home server</a></div>';
+        }
+        main.innerHTML = html + '</div>';
         updateChrome(view);
         return;
       }
