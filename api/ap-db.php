@@ -14331,6 +14331,34 @@ function ap_masto_favourite_remove(string $statusId, ?int $ownerUserId = null, ?
 }
 
 /**
+ * Mastodon library lists clamp to 1..80 and read twice that, capped at 160,
+ * so a row that fails hydration can be skipped without shortening the page.
+ *
+ * @return array{limit:int,fetch:int}
+ */
+function ap_masto_library_api_bounds(int $limit): array
+{
+    $limit = max(1, min(80, $limit));
+    return ['limit' => $limit, 'fetch' => min(160, $limit * 2)];
+}
+
+/**
+ * max_id is a status id. The next page is strictly older than that row's
+ * created_at. An unknown id, another owner's id, or a blank id starts over.
+ * since_id and min_id are not library cursors.
+ */
+function ap_masto_library_created_before(string $table, int $ownerUserId, ?string $maxId): ?string
+{
+    if ($maxId === null || $maxId === '' || !in_array($table, ['masto_favourites', 'masto_bookmarks'], true)) {
+        return null;
+    }
+    $st = ap_db()->prepare("SELECT created_at FROM {$table} WHERE owner_user_id = ? AND status_id = ?");
+    $st->execute([$ownerUserId, $maxId]);
+    $val = $st->fetchColumn();
+    return is_string($val) && $val !== '' ? $val : null;
+}
+
+/**
  * Newest-first favourite rows. $maxId is a public status_id for created_at pagination.
  *
  * @return list<array<string,mixed>>
@@ -14338,18 +14366,9 @@ function ap_masto_favourite_remove(string $statusId, ?int $ownerUserId = null, ?
 function ap_masto_favourite_rows(int $limit = 40, ?string $maxId = null, ?int $ownerUserId = null): array
 {
     $ownerUserId = $ownerUserId ?? ap_db_default_owner_user_id();
-    $limit = max(1, min(80, $limit));
-    $fetch = min(160, $limit * 2);
+    $fetch = ap_masto_library_api_bounds($limit)['fetch'];
     try {
-        $before = null;
-        if ($maxId !== null && $maxId !== '') {
-            $st = ap_db()->prepare(
-                'SELECT created_at FROM masto_favourites WHERE owner_user_id = ? AND status_id = ?'
-            );
-            $st->execute([$ownerUserId, $maxId]);
-            $val = $st->fetchColumn();
-            $before = is_string($val) && $val !== '' ? $val : null;
-        }
+        $before = ap_masto_library_created_before('masto_favourites', $ownerUserId, $maxId);
         if ($before !== null) {
             $st = ap_db()->prepare(
                 'SELECT * FROM masto_favourites WHERE owner_user_id = ? AND created_at < ?
@@ -14484,18 +14503,9 @@ function ap_masto_bookmark_remove(string $statusId, ?int $ownerUserId = null, ?s
 function ap_masto_bookmark_rows(int $limit = 40, ?string $maxId = null, ?int $ownerUserId = null): array
 {
     $ownerUserId = $ownerUserId ?? ap_db_default_owner_user_id();
-    $limit = max(1, min(80, $limit));
-    $fetch = min(160, $limit * 2);
+    $fetch = ap_masto_library_api_bounds($limit)['fetch'];
     try {
-        $before = null;
-        if ($maxId !== null && $maxId !== '') {
-            $st = ap_db()->prepare(
-                'SELECT created_at FROM masto_bookmarks WHERE owner_user_id = ? AND status_id = ?'
-            );
-            $st->execute([$ownerUserId, $maxId]);
-            $val = $st->fetchColumn();
-            $before = is_string($val) && $val !== '' ? $val : null;
-        }
+        $before = ap_masto_library_created_before('masto_bookmarks', $ownerUserId, $maxId);
         if ($before !== null) {
             $st = ap_db()->prepare(
                 'SELECT * FROM masto_bookmarks WHERE owner_user_id = ? AND created_at < ?
