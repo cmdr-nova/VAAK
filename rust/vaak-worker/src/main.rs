@@ -34,6 +34,7 @@ mod profile_materialize;
 #[cfg(test)]
 mod profile_admission_fixture;
 mod profile_header;
+mod profile_local;
 mod profile_quote_state;
 mod profile_warm;
 mod profile_quote_warm;
