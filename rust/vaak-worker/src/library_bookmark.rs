@@ -1,10 +1,10 @@
-//! Bookmark-only resolution for mixed-network saves and cold URL stubs.
+//! Saved-row resolution for mixed-network Library items and cold URL stubs.
 //!
 //! PHP `ap_masto_interaction_row_to_status` paints a local row, a cached
 //! ActivityPub Create/Update, a plain Bluesky PostView, or an https URL stub.
 //! `at://` rows with no post are omitted. Quotes, polls, Asks, announce-only
 //! boosts, and reply-parent chrome stay on the canonical PHP renderer.
-//! Favourites do not use this module.
+//! Bookmarks and favourites share this projector; the saved flag differs.
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -19,6 +19,22 @@ pub(crate) enum BookmarkPath {
     RemoteActivityPub,
     Bluesky,
     Cold,
+}
+
+/// PHP passes `'bookmarked'` or `'favourited'` into the same row projector.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SavedFlag {
+    Bookmarked,
+    Favourited,
+}
+
+impl SavedFlag {
+    pub(crate) fn field(self) -> &'static str {
+        match self {
+            Self::Bookmarked => "bookmarked",
+            Self::Favourited => "favourited",
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -547,7 +563,7 @@ fn resolve_sid(status_id: i64, cache: &BookmarkCache, now: chrono::DateTime<chro
     }
 }
 
-fn cold_activitypub_stub(row: &Value, object: &str, cache: &BookmarkCache, now: chrono::DateTime<chrono::Utc>) -> Value {
+fn cold_activitypub_stub(row: &Value, object: &str, cache: &BookmarkCache, now: chrono::DateTime<chrono::Utc>, flag: SavedFlag) -> Value {
     let actor = s(row, "target_actor").trim().trim_end_matches('/').to_owned();
     let account = if !actor.is_empty() {
         account_for(&actor, cache)
@@ -571,10 +587,10 @@ fn cold_activitypub_stub(row: &Value, object: &str, cache: &BookmarkCache, now: 
         "reblogs_count": 0,
         "favourites_count": 0,
         "edited_at": null,
-        "favourited": false,
+        "favourited": flag == SavedFlag::Favourited,
         "reblogged": false,
         "muted": false,
-        "bookmarked": true,
+        "bookmarked": flag == SavedFlag::Bookmarked,
         "pinned": false,
         "content": format!("<p><a href=\"{href}\">{href}</a></p>"),
         "reblog": null,
@@ -595,8 +611,13 @@ fn visible_body(status: &Value) -> bool {
 }
 
 /// PHP `ap_masto_interaction_row_to_status` for a bookmark row.
-/// `Ok(None)` omits the card (`at://` with no cached post, or a non-https object).
 pub(crate) fn project_saved_bookmark(row: &Value, cache: &BookmarkCache, now: chrono::DateTime<chrono::Utc>) -> Result<Option<Value>> {
+    project_saved_interaction(row, cache, now, SavedFlag::Bookmarked)
+}
+
+/// PHP `ap_masto_interaction_row_to_status` for one saved flag.
+/// `Ok(None)` omits the card (`at://` with no cached post, or a non-https object).
+pub(crate) fn project_saved_interaction(row: &Value, cache: &BookmarkCache, now: chrono::DateTime<chrono::Utc>, flag: SavedFlag) -> Result<Option<Value>> {
     let status_id_raw = s(row, "status_id").trim();
     if status_id_raw.starts_with("rss:") || s(row, "object_id").trim().starts_with("rss:") {
         bail!("PHP fallback: RSS bookmark remains on the canonical renderer");
@@ -607,7 +628,8 @@ pub(crate) fn project_saved_bookmark(row: &Value, cache: &BookmarkCache, now: ch
     let sid_visible = status.as_ref().is_some_and(visible_body);
     if !sid_visible && object.starts_with("https://") {
         if let Some(fresh) = lookup_object(&object, cache, now)? {
-            let mut source = json!({"id": status_id_raw, "bookmarked": true});
+            let mut source = json!({"id": status_id_raw});
+            source[flag.field()] = json!(true);
             if status_id_raw.is_empty() {
                 source["id"] = json!("0");
             }
@@ -615,10 +637,10 @@ pub(crate) fn project_saved_bookmark(row: &Value, cache: &BookmarkCache, now: ch
         }
     }
     if status.is_none() && object.starts_with("https://") {
-        status = Some(cold_activitypub_stub(row, &object, cache, now));
+        status = Some(cold_activitypub_stub(row, &object, cache, now, flag));
     }
     let Some(mut status) = status else { return Ok(None); };
-    status["bookmarked"] = json!(true);
+    status[flag.field()] = json!(true);
     Ok(Some(status))
 }
 
@@ -655,9 +677,19 @@ pub(crate) fn keep_cold_bookmark_stub(status: &Value) -> bool {
     uri.starts_with("https://") || uri.starts_with("http://")
 }
 
-/// Plain bookmark-cache PostView, including a cold author PHP's legacy card fills in.
-/// Structured embeds, replies, and reposts stay on PHP.
+/// Plain bookmark-cache PostView. `viewer.bookmarked` is the saved flag.
 pub(crate) fn project_bsky_bookmark(item: &Value) -> Result<Value> {
+    project_bsky_saved(item, SavedFlag::Bookmarked)
+}
+
+/// Plain favourite-cache PostView. A non-empty `viewer.like` record is the like.
+pub(crate) fn project_bsky_favourite(item: &Value) -> Result<Value> {
+    project_bsky_saved(item, SavedFlag::Favourited)
+}
+
+/// Plain bookmark-cache or favourite-cache PostView, including a cold author
+/// PHP's legacy card fills in. Structured embeds, replies, and reposts stay on PHP.
+pub(crate) fn project_bsky_saved(item: &Value, flag: SavedFlag) -> Result<Value> {
     let post = &item["post"];
     let author = &post["author"];
     let record = &post["record"];
@@ -695,7 +727,11 @@ pub(crate) fn project_bsky_bookmark(item: &Value) -> Result<Value> {
     let key = uri.rsplit('/').next().unwrap_or("");
     let account_url = format!("https://bsky.app/profile/{}", query(&handle));
     let sensitive = super::bsky::sensitive(post);
-    let bookmarked = post.get("viewer").and_then(|viewer| viewer.get("bookmarked")).and_then(Value::as_bool) == Some(true);
+    let viewer = &post["viewer"];
+    let bookmarked = viewer.get("bookmarked").and_then(Value::as_bool) == Some(true);
+    // PHP treats only a non-empty like-record string as a like. Bookmark cards
+    // keep the previous favourite bit off; the favourites view reads the record.
+    let favourited = flag == SavedFlag::Favourited && !s(viewer, "like").is_empty();
     let mut status = json!({
         "id": uri,
         "url": format!("{account_url}/post/{}", query(key)),
@@ -729,7 +765,7 @@ pub(crate) fn project_bsky_bookmark(item: &Value) -> Result<Value> {
         "in_reply_to_id": null,
         "in_reply_to_account_id": null,
         "bookmarked": bookmarked,
-        "favourited": false
+        "favourited": favourited
     });
     if let Some(value) = item.get("_vaak_feed_source") {
         status["vaak_feed_source"] = value.clone();
@@ -1023,9 +1059,9 @@ mod tests {
     }
 
     #[test]
-    fn cold_stubs_stay_on_bookmarks_and_favourites_still_refuse_them() {
+    fn cold_stubs_stay_on_saved_library_views() {
         let cold = project_saved_bookmark(&fixture()["cold"]["row"], &BookmarkCache::default(), now()).unwrap().unwrap();
-        assert!(reject_thin_source(&cold, true).is_none());
+        assert!(reject_thin_source(&cold, true).is_none(), "bookmarks and favourites keep the https stub");
         assert_eq!(
             reject_thin_source(&cold, false),
             Some("PHP fallback: thin AS2 source needs canonical cached/signed hydration (shared fetch budget 3)")
@@ -1051,7 +1087,7 @@ mod tests {
         announce["summary"] = json!("");
         let cache = cache_from(None, Some(announce.clone()), None);
         let error = enrich_thin_bookmark(
-            &cold_activitypub_stub(&fixture["remote"]["row"], "https://remote.test/users/alice/statuses/9", &cache, now()),
+            &cold_activitypub_stub(&fixture["remote"]["row"], "https://remote.test/users/alice/statuses/9", &cache, now(), SavedFlag::Bookmarked),
             &cache,
             now(),
         ).unwrap_err();
@@ -1075,7 +1111,7 @@ mod tests {
     fn thin_cache_hit_keeps_the_saved_bookmark_id() {
         let fixture = fixture();
         let cache = cache_from(None, Some(fixture["remote"]["event"].clone()), Some(fixture["remote"]["actor"].clone()));
-        let stub = cold_activitypub_stub(&fixture["remote"]["row"], "https://remote.test/users/alice/statuses/9", &BookmarkCache::default(), now());
+        let stub = cold_activitypub_stub(&fixture["remote"]["row"], "https://remote.test/users/alice/statuses/9", &BookmarkCache::default(), now(), SavedFlag::Bookmarked);
         let fresh = enrich_thin_bookmark(&stub, &cache, now()).unwrap().unwrap();
         let saved = super::super::source::preserve_saved(&stub, fresh);
         assert_eq!(saved["id"], "77");
