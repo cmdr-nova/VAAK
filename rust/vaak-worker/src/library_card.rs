@@ -210,13 +210,18 @@ pub(crate) fn relative_time(iso: &str, now: chrono::DateTime<chrono::Utc>) -> St
 
 pub(crate) fn cw_gate(spoiler: &str, sensitive: bool, inner: &str, auto_unblur: bool) -> String {
     let spoiler = php_trim(spoiler);
-    let mut inner = php_trim(inner).to_owned();
-    if inner.is_empty() {
+    // auto_unblur opens a sensitive post only when that post has no custom CW.
+    // Whitespace-only body is not "empty": PHP still trims it inside the wrap
+    // and does not substitute the sensitive-media placeholder.
+    let auto = sensitive && spoiler.is_empty() && auto_unblur;
+    let mut body = inner.to_owned();
+    if body.is_empty() {
         if !sensitive && spoiler.is_empty() { return String::new(); }
-        inner = "<div class=\"meta\">(sensitive media — open post on remote if nothing appears)</div>".into();
+        body = "<div class=\"meta\">(sensitive media — open post on remote if nothing appears)</div>".into();
     }
-    let wrapped = format!("<div class=\"tweet-content\">{inner}</div>");
-    if (!sensitive || auto_unblur) && spoiler.is_empty() { return wrapped; }
+    let trimmed = php_trim(&body);
+    let wrapped = if trimmed.is_empty() { String::new() } else { format!("<div class=\"tweet-content\">{trimmed}</div>") };
+    if (!sensitive || auto) && spoiler.is_empty() { return wrapped; }
     let label = if spoiler.is_empty() { "Sensitive content" } else { spoiler };
     format!("<details class=\"cw-gate\"><summary><span class=\"cw-label\">CW</span><span class=\"cw-text\">{}</span><span class=\"cw-hint\"></span></summary><div class=\"cw-body\">{wrapped}</div></details>", esc(label))
 }
