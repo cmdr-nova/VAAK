@@ -3243,6 +3243,29 @@ function ap_profile_save_unlocked(array $fields, string $actorKey = 'cmdr_nova')
     if (function_exists('ap_redis_delete')) {
         ap_redis_delete('vaak:profile:v1:' . hash('sha256', trim($actorKey)));
     }
+    $trendsPrefChanged = false;
+    if (array_key_exists('trending_enabled', $fields)) {
+        $prevTrending = !array_key_exists('trending_enabled', $existingProfile) || $existingProfile['trending_enabled'] === null
+            ? 1
+            : (!empty($existingProfile['trending_enabled']) ? 1 : 0);
+        $trendsPrefChanged = (int) $trendingEnabled !== $prevTrending;
+    }
+    if (array_key_exists('downranking_enabled', $fields)) {
+        $prevDownrank = !array_key_exists('downranking_enabled', $existingProfile) || $existingProfile['downranking_enabled'] === null
+            ? 1
+            : (!empty($existingProfile['downranking_enabled']) ? 1 : 0);
+        $trendsPrefChanged = $trendsPrefChanged || (int) $downrankingEnabled !== $prevDownrank;
+    }
+    if ($trendsPrefChanged && function_exists('ap_trends_policy_epoch_bump')) {
+        try {
+            $trendOwnerQuery = ap_db()->prepare('SELECT id FROM ap_users WHERE actor_key = ?');
+            $trendOwnerQuery->execute([$actorKey]);
+            $trendOwnerId = (int) $trendOwnerQuery->fetchColumn();
+            if ($trendOwnerId > 0) ap_trends_policy_epoch_bump($trendOwnerId);
+        } catch (Throwable $e) {
+            error_log('[ap-db] trends preference epoch: ' . $e->getMessage());
+        }
+    }
     if ((bool) ($existingProfile['algorithm_enabled'] ?? true) !== (bool) $algorithmEnabled) {
         $ownerQuery = ap_db()->prepare('SELECT id FROM ap_users WHERE actor_key = ?');
         $ownerQuery->execute([$actorKey]);
@@ -8673,6 +8696,7 @@ function ap_block_cache_clear(): void
     if (function_exists('ap_notification_projection_invalidate_all')) {
         ap_notification_projection_invalidate_all();
     }
+    if (function_exists('ap_trends_policy_epoch_bump')) ap_trends_policy_epoch_bump(null);
 }
 
 function ap_block_normalize_domain(string $raw): ?string
@@ -10182,11 +10206,13 @@ function ap_mutes_cache_clear(?int $ownerUserId = null): void
 {
     if ($ownerUserId === null || $ownerUserId < 1) {
         ap_mutes_set_cached(0, true);
+        if (function_exists('ap_trends_policy_epoch_bump')) ap_trends_policy_epoch_bump(null);
         return;
     }
     ap_mutes_set_cached($ownerUserId, true);
     ap_timeline_cache_invalidate_owner($ownerUserId);
     ap_notification_projection_invalidate_owner($ownerUserId);
+    if (function_exists('ap_trends_policy_epoch_bump')) ap_trends_policy_epoch_bump($ownerUserId);
 }
 
 function ap_is_muted_actor(?string $actorId, int $ownerUserId): bool
@@ -10364,11 +10390,13 @@ function ap_deprioritized_cache_clear(?int $ownerUserId = null): void
 {
     if ($ownerUserId === null || $ownerUserId < 1) {
         ap_deprioritized_set_cached(0, true);
+        if (function_exists('ap_trends_policy_epoch_bump')) ap_trends_policy_epoch_bump(null);
         return;
     }
     ap_deprioritized_set_cached($ownerUserId, true);
     ap_timeline_cache_invalidate_owner($ownerUserId);
     ap_notification_projection_invalidate_owner($ownerUserId);
+    if (function_exists('ap_trends_policy_epoch_bump')) ap_trends_policy_epoch_bump($ownerUserId);
 }
 
 function ap_is_deprioritized_actor(?string $actorId, int $ownerUserId): bool
@@ -11066,6 +11094,7 @@ function ap_user_blocks_cache_clear(?int $ownerUserId = null): void
 {
     if ($ownerUserId === null || $ownerUserId < 1) {
         ap_user_blocks_list_cached(0, true);
+        if (function_exists('ap_trends_policy_epoch_bump')) ap_trends_policy_epoch_bump(null);
         return;
     }
     ap_user_blocks_list_cached($ownerUserId, true);
@@ -11082,6 +11111,7 @@ function ap_user_blocks_cache_clear(?int $ownerUserId = null): void
     if (function_exists('ap_masto_notifications_unread_invalidate')) {
         ap_masto_notifications_unread_invalidate($ownerUserId);
     }
+    if (function_exists('ap_trends_policy_epoch_bump')) ap_trends_policy_epoch_bump($ownerUserId);
 }
 
 function ap_user_is_blocked(?string $actorId, ?string $host, int $ownerUserId): bool
@@ -11881,10 +11911,12 @@ function ap_muted_words_cache_clear(?int $ownerUserId = null): void
 {
     if ($ownerUserId === null || $ownerUserId < 1) {
         ap_muted_words_phrases_cached(0, true);
+        if (function_exists('ap_trends_policy_epoch_bump')) ap_trends_policy_epoch_bump(null);
         return;
     }
     ap_muted_words_phrases_cached($ownerUserId, true);
     ap_timeline_cache_invalidate_owner($ownerUserId);
+    if (function_exists('ap_trends_policy_epoch_bump')) ap_trends_policy_epoch_bump($ownerUserId);
 }
 
 /**

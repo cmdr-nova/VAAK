@@ -146,6 +146,46 @@ function ap_redis_delete(string ...$keys): void
     try { $redis->del($keys); } catch (Throwable $e) { error_log('[ap-redis] delete failed: ' . $e->getMessage()); }
 }
 
+/**
+ * Per-viewer (or server-wide) generation for cached trending cards.
+ * Moderation writes bump it so the next read cannot reuse the previous viewer's mix.
+ * A missing Redis is a miss, not a shared cache.
+ */
+function ap_trends_policy_epoch(?int $ownerUserId = null): string
+{
+    $redis = ap_redis_client('cache');
+    if (!$redis) return '0:0';
+    $owner = $ownerUserId !== null && $ownerUserId > 0 ? $ownerUserId : 0;
+    try {
+        $server = (string) ($redis->get('vaak:trends:policy-epoch:v1:server') ?: '0');
+        $user = $owner > 0 ? (string) ($redis->get('vaak:trends:policy-epoch:v1:' . $owner) ?: '0') : '0';
+        if (!preg_match('/^\d+$/', $server)) $server = '0';
+        if (!preg_match('/^\d+$/', $user)) $user = '0';
+        return $server . ':' . $user;
+    } catch (Throwable $e) {
+        error_log('[ap-redis] trends epoch read failed: ' . $e->getMessage());
+        return '0:0';
+    }
+}
+
+function ap_trends_policy_epoch_bump(?int $ownerUserId = null): void
+{
+    $redis = ap_redis_client('cache');
+    if (!$redis) return;
+    try {
+        if ($ownerUserId === null || $ownerUserId < 1) {
+            $redis->incr('vaak:trends:policy-epoch:v1:server');
+            $redis->expire('vaak:trends:policy-epoch:v1:server', 86400 * 30);
+            return;
+        }
+        $key = 'vaak:trends:policy-epoch:v1:' . $ownerUserId;
+        $redis->incr($key);
+        $redis->expire($key, 86400 * 30);
+    } catch (Throwable $e) {
+        error_log('[ap-redis] trends epoch bump failed: ' . $e->getMessage());
+    }
+}
+
 function ap_redis_delete_pattern(string $pattern): void
 {
     $redis = ap_redis_client('cache');

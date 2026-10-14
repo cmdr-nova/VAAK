@@ -10461,6 +10461,9 @@ function ap_masto_tag_entity(string $name, ?array $history = null, ?int $ownerUs
 /** Shared trends cache TTL (admin sidebar + Ice Cubes /api/v1/trends/*). */
 const AP_MASTO_TRENDS_CACHE_TTL = 7200; // 2 hours
 
+/** Browser/Redis reuse window for an already filtered trending response. */
+const AP_TRENDS_RESPONSE_TTL = 600;
+
 /**
  * @return array{path:string,ttl:int}
  */
@@ -10598,6 +10601,175 @@ function ap_masto_trends_cache_info(string $kind): array
 }
 
 /**
+ * Active Home suppression plus the saved downrank switch.
+ * Null means the stamp could not be read, so callers must not reuse a response.
+ */
+function ap_trends_privacy_stamp(int $ownerUserId): ?string
+{
+    if ($ownerUserId < 1) return 'guest';
+    try {
+        $st = ap_db()->prepare('SELECT actor_id, suppressed_until FROM ap_home_suppression WHERE owner_user_id = ? AND suppressed_until > ? ORDER BY actor_id');
+        $st->execute([$ownerUserId, gmdate('c')]);
+        $parts = [];
+        foreach ($st->fetchAll(PDO::FETCH_ASSOC) ?: [] as $row) {
+            $parts[] = (string) ($row['actor_id'] ?? '') . '=' . (string) ($row['suppressed_until'] ?? '');
+        }
+        $pref = ap_db()->prepare('SELECT COALESCE(p.downranking_enabled, 1) FROM ap_users u LEFT JOIN actor_profile p ON p.actor_key = u.actor_key WHERE u.id = ?');
+        $pref->execute([$ownerUserId]);
+        return sha1(implode("\n", $parts) . "\n" . (string) $pref->fetchColumn());
+    } catch (Throwable $e) {
+        return null;
+    }
+}
+
+function ap_trends_painted_owner(string $kind, int $ownerUserId): int
+{
+    // Status paint is the shared public candidate list. Tags and links are scored per viewer.
+    return $kind === 'statuses' ? 0 : max(0, $ownerUserId);
+}
+
+function ap_trends_painted_key(string $kind, int $ownerUserId): string
+{
+    $kind = preg_replace('/[^a-z]/', '', strtolower($kind)) ?: 'tags';
+    $epoch = function_exists('ap_trends_policy_epoch') ? ap_trends_policy_epoch(ap_trends_painted_owner($kind, $ownerUserId)) : '0:0';
+    return 'vaak:trends:painted:v3:' . $kind . ':' . ap_trends_painted_owner($kind, $ownerUserId) . ':' . $epoch;
+}
+
+/** @return array{items:list<array<string,mixed>>,age:int,stale:bool}|null */
+function ap_trends_painted_read(string $kind, int $ownerUserId, int $minItems): ?array
+{
+    if (!empty($GLOBALS['vaak_trends_bypass_paint']) || !function_exists('ap_redis_json_get')) return null;
+    $kind = preg_replace('/[^a-z]/', '', strtolower($kind)) ?: 'tags';
+    $payload = ap_redis_json_get(ap_trends_painted_key($kind, $ownerUserId));
+    if (!is_array($payload) || !is_array($payload['items'] ?? null)) return null;
+    $items = $payload['items'];
+    if (!in_array($kind, ['tags', 'links', 'statuses'], true) && count($items) < $minItems) return null;
+    $cachedAt = (int) ($payload['cached_at'] ?? time());
+    $elapsed = max(0, time() - $cachedAt);
+    return [
+        'items' => $items,
+        'age' => (int) ($payload['age'] ?? 0) + $elapsed,
+        'stale' => !empty($payload['stale']),
+    ];
+}
+
+/** @param array{items:list<array<string,mixed>>,age:int,stale:bool} $row */
+function ap_trends_painted_remember(string $kind, int $ownerUserId, array $row): array
+{
+    if (function_exists('ap_redis_json_set')) {
+        ap_redis_json_set(ap_trends_painted_key($kind, $ownerUserId), [
+            'cached_at' => time(),
+            'items' => $row['items'],
+            'age' => (int) ($row['age'] ?? 0),
+            'stale' => !empty($row['stale']),
+        ], AP_TRENDS_RESPONSE_TTL);
+    }
+    return $row;
+}
+
+function ap_trends_http_key(string $kind, int $ownerUserId, string $variant): ?string
+{
+    $stamp = ap_trends_privacy_stamp($ownerUserId);
+    if ($stamp === null) return null;
+    $epoch = function_exists('ap_trends_policy_epoch') ? ap_trends_policy_epoch($ownerUserId) : '0:0';
+    $kind = preg_replace('/[^a-z]/', '', strtolower($kind)) ?: 'tags';
+    $variant = preg_replace('/[^a-z0-9_-]/', '', strtolower($variant)) ?: 'all';
+    return 'vaak:trends:http:v1:' . $kind . ':' . max(0, $ownerUserId) . ':' . $epoch . ':' . $stamp . ':' . $variant;
+}
+
+/** @return array{body:string,etag:string,age:int,stale:bool}|null */
+function ap_trends_http_get(string $kind, int $ownerUserId, string $variant): ?array
+{
+    if (!empty($GLOBALS['vaak_trends_bypass_paint']) || !function_exists('ap_redis_json_get')) return null;
+    $key = ap_trends_http_key($kind, $ownerUserId, $variant);
+    if ($key === null) return null;
+    $payload = ap_redis_json_get($key);
+    if (!is_array($payload) || !is_string($payload['body'] ?? null) || !is_string($payload['etag'] ?? null)) return null;
+    $elapsed = max(0, time() - (int) ($payload['cached_at'] ?? time()));
+    return [
+        'body' => $payload['body'],
+        'etag' => $payload['etag'],
+        'age' => (int) ($payload['age'] ?? 0) + $elapsed,
+        'stale' => !empty($payload['stale']),
+    ];
+}
+
+/** @return array{body:string,etag:string,age:int,stale:bool} */
+function ap_trends_http_put(string $kind, int $ownerUserId, string $variant, string $body, int $age, bool $stale): array
+{
+    $etag = '"' . sha1($kind . '|' . $ownerUserId . '|' . $variant . '|' . $body) . '"';
+    $payload = ['body' => $body, 'etag' => $etag, 'age' => $age, 'stale' => $stale, 'cached_at' => time()];
+    $key = ap_trends_http_key($kind, $ownerUserId, $variant);
+    if ($key !== null && function_exists('ap_redis_json_set')) {
+        ap_redis_json_set($key, $payload, AP_TRENDS_RESPONSE_TTL);
+    }
+    return ['body' => $body, 'etag' => $etag, 'age' => $age, 'stale' => $stale];
+}
+
+/** @return list<string> */
+function ap_trends_reuse_header_lines(string $etag, bool $shared): array
+{
+    return [
+        'Cache-Control: ' . ($shared ? 'public' : 'private') . ', max-age=' . AP_TRENDS_RESPONSE_TTL,
+        'ETag: ' . $etag,
+        'Vary: Authorization',
+    ];
+}
+
+function ap_trends_send_reuse_headers(string $etag, bool $shared): void
+{
+    foreach (ap_trends_reuse_header_lines($etag, $shared) as $line) {
+        header($line);
+    }
+}
+
+function ap_trends_not_modified(string $etag): bool
+{
+    $header = (string) ($_SERVER['HTTP_IF_NONE_MATCH'] ?? '');
+    if ($header === '' || $etag === '') return false;
+    foreach (explode(',', $header) as $part) {
+        $part = trim($part);
+        if ($part === '*' || $part === $etag || $part === 'W/' . $etag) return true;
+    }
+    return false;
+}
+
+function ap_trends_replay_json(string $kind, int $ownerUserId, int $limit): bool
+{
+    if (!empty($_GET['fresh']) || !empty($_GET['refresh'])) {
+        $GLOBALS['vaak_trends_bypass_paint'] = true;
+        return false;
+    }
+    $hit = ap_trends_http_get($kind, $ownerUserId, 'json-' . $limit);
+    if (!is_array($hit)) return false;
+    ap_trends_send_reuse_headers($hit['etag'], $ownerUserId < 1);
+    if (ap_trends_not_modified($hit['etag'])) {
+        http_response_code(304);
+        exit;
+    }
+    header('Content-Type: application/json; charset=utf-8');
+    echo $hit['body'];
+    exit;
+}
+
+function ap_trends_emit_json(string $kind, int $ownerUserId, int $limit, mixed $data): void
+{
+    $json = json_encode($data, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE);
+    if (!is_string($json)) {
+        ap_masto_json(['error' => 'JSON encode failed'], 500);
+    }
+    $saved = ap_trends_http_put($kind, $ownerUserId, 'json-' . $limit, $json, 0, false);
+    ap_trends_send_reuse_headers($saved['etag'], $ownerUserId < 1);
+    if (ap_trends_not_modified($saved['etag'])) {
+        http_response_code(304);
+        exit;
+    }
+    header('Content-Type: application/json; charset=utf-8');
+    echo $json;
+    exit;
+}
+
+/**
  * Read trends cache. When $allowStale is true, expired files are still returned
  * so the sidebar can paint immediately (stale-while-revalidate).
  *
@@ -10608,6 +10780,9 @@ function ap_masto_trends_cache_info(string $kind): array
 function ap_masto_trends_cache_read(string $kind, int $minItems = 1, bool $allowStale = false, int $ownerUserId = 0): ?array
 {
     $info = ap_masto_trends_cache_info($kind);
+    $paintedKind = preg_replace('/[^a-z]/', '', strtolower($kind)) ?: 'tags';
+    $painted = ap_trends_painted_read($paintedKind, $ownerUserId, $minItems);
+    if (is_array($painted)) return $painted;
     $redisKey = 'vaak:trends:' . (in_array($kind,['tags','links','statuses'],true) ? 'v3:' : 'v2:') . preg_replace('/[^a-z]/', '', strtolower($kind));
     $redisPayload = function_exists('ap_redis_json_get') ? ap_redis_json_get($redisKey) : null;
     if (is_array($redisPayload) && isset($redisPayload['items']) && is_array($redisPayload['items'])) {
@@ -10617,13 +10792,13 @@ function ap_masto_trends_cache_read(string $kind, int $minItems = 1, bool $allow
         if ((!$stale || $allowStale) && (in_array($kind,['tags','links','statuses'],true) || count($redisPayload['items']) >= $minItems)) {
             if (in_array($kind,['tags','links'],true)) {
                 if (($redisPayload['source_policy_version'] ?? 0) !== 3 || !is_array($redisPayload['sources'] ?? null)) return null;
-                return ['items' => ($kind==='tags'?ap_masto_trend_tags_recount($redisPayload['sources'],$ownerUserId):ap_masto_trend_links_recount($redisPayload['sources'],$ownerUserId)), 'age' => $age, 'stale' => $stale];
+                return ap_trends_painted_remember($paintedKind, $ownerUserId, ['items' => ($kind==='tags'?ap_masto_trend_tags_recount($redisPayload['sources'],$ownerUserId):ap_masto_trend_links_recount($redisPayload['sources'],$ownerUserId)), 'age' => $age, 'stale' => $stale]);
             }
             if ($kind === 'statuses') {
                 if (($redisPayload['status_source_version'] ?? 0) !== 3) return null;
-                return ['items'=>ap_masto_trend_status_public_items(ap_masto_trend_status_world_items($redisPayload['items'])), 'age'=>$age, 'stale'=>$stale];
+                return ap_trends_painted_remember($paintedKind, $ownerUserId, ['items'=>ap_masto_trend_status_public_items(ap_masto_trend_status_world_items($redisPayload['items'])), 'age'=>$age, 'stale'=>$stale]);
             }
-            return ['items' => $redisPayload['items'], 'age' => $age, 'stale' => $stale];
+            return ap_trends_painted_remember($paintedKind, $ownerUserId, ['items' => $redisPayload['items'], 'age' => $age, 'stale' => $stale]);
         }
     }
     $path = $info['path'];
@@ -10650,20 +10825,20 @@ function ap_masto_trends_cache_read(string $kind, int $minItems = 1, bool $allow
     }
     if (in_array($kind,['tags','links'],true)) {
         if (($decoded['source_policy_version'] ?? 0) !== 3 || !is_array($decoded['sources'] ?? null)) return null;
-        return ['items' => ($kind==='tags'?ap_masto_trend_tags_recount($decoded['sources'],$ownerUserId):ap_masto_trend_links_recount($decoded['sources'],$ownerUserId)), 'age' => $age, 'stale' => $stale];
+        return ap_trends_painted_remember($paintedKind, $ownerUserId, ['items' => ($kind==='tags'?ap_masto_trend_tags_recount($decoded['sources'],$ownerUserId):ap_masto_trend_links_recount($decoded['sources'],$ownerUserId)), 'age' => $age, 'stale' => $stale]);
     }
     if ($kind === 'statuses') {
         if (($decoded['status_source_version'] ?? 0) !== 3) return null;
-        return ['items'=>ap_masto_trend_status_public_items(ap_masto_trend_status_world_items($decoded['items'])), 'age'=>$age, 'stale'=>$stale];
+        return ap_trends_painted_remember($paintedKind, $ownerUserId, ['items'=>ap_masto_trend_status_public_items(ap_masto_trend_status_world_items($decoded['items'])), 'age'=>$age, 'stale'=>$stale]);
     }
     if (count($decoded['items']) < $minItems) {
         return null;
     }
-    return [
+    return ap_trends_painted_remember($paintedKind, $ownerUserId, [
         'items' => $decoded['items'],
         'age' => $age,
         'stale' => $stale,
-    ];
+    ]);
 }
 
 /**
