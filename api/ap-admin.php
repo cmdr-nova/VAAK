@@ -4349,6 +4349,7 @@ $vaakAdminOnlyActions = [
                     $st = ap_db()->prepare('DELETE FROM ap_home_suppression WHERE actor_id = ?');
                     $st->execute([$actor]);
                     admin_home_downrank_audit('signal_cleared', $actor, 0, '', ['rows' => $st->rowCount()]);
+                    if (function_exists('ap_trends_policy_epoch_bump')) ap_trends_policy_epoch_bump(null);
                     $notice = 'Temporary downranking signal removed for this actor.';
                 } catch (Throwable $e) {
                     $error = 'Could not clear the downranking signal.';
@@ -6349,7 +6350,7 @@ if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'home_suggestions') {
 function admin_trends_loading_html(): string
 {
     return <<<'HTML'
-        <div class="side-card" aria-busy="true" aria-label="Loading trending tags">
+        <div class="side-card" data-trend-module="tags" aria-busy="true" aria-label="Loading trending tags">
           <h3>Trending tags</h3>
           <div class="trends-skeleton" aria-hidden="true">
             <div class="trends-skeleton-row"></div>
@@ -6359,7 +6360,7 @@ function admin_trends_loading_html(): string
             <div class="trends-skeleton-row" style="width:62%"></div>
           </div>
         </div>
-        <div class="side-card" aria-busy="true" aria-label="Loading trending posts">
+        <div class="side-card" data-trend-module="statuses" aria-busy="true" aria-label="Loading trending posts">
           <h3>Trending posts</h3>
           <div class="trends-skeleton" aria-hidden="true">
             <div class="trends-skeleton-row wide"></div>
@@ -6431,9 +6432,10 @@ function admin_trends_display_state(?array $user = null): array
     }
 }
 
-function admin_trends_sidebar_html(string $viewForTrends, bool $allowStale = true, ?array &$meta = null, bool $bypassFragment = false): string
+function admin_trends_sidebar_html(string $viewForTrends, bool $allowStale = true, ?array &$meta = null, bool $bypassFragment = false, string $module = 'all'): string
 {
     if (!admin_trends_display_state()['enabled']) { $meta = ['disabled' => true]; return ''; }
+    $module = in_array($module, ['tags', 'statuses'], true) ? $module : 'all';
     $viewForTrends = preg_replace('/[^a-z_]/', '', $viewForTrends) ?: 'home';
     $trendTags = [];
     $trendStatuses = [];
@@ -6450,7 +6452,8 @@ function admin_trends_sidebar_html(string $viewForTrends, bool $allowStale = tru
     $viewerId = is_array($viewer) ? (int) ($viewer['id'] ?? 0) : 0;
     // Global raw trend data remains cached; HTML must be authorized anew each request.
     $cachedKinds = [];
-    foreach (['tags' => 5, 'statuses' => 5] as $kind => $limit) {
+    $trendKinds = $module === 'all' ? ['tags' => 5, 'statuses' => 5] : [$module => 5];
+    foreach ($trendKinds as $kind => $limit) {
         $row = function_exists('ap_masto_trends_cache_read')
             ? ap_masto_trends_cache_read($kind, 1, $allowStale, $viewerId)
             : null;
@@ -6472,7 +6475,7 @@ function admin_trends_sidebar_html(string $viewForTrends, bool $allowStale = tru
     if ((int) ($currentViewer['id'] ?? 0) !== $viewerId) return '';
     if (!admin_trends_display_state($currentViewer)['enabled']) { $meta = ['disabled' => true]; return ''; }
     $downrankRefs = admin_trend_downrank_ref_set($viewerId);
-    foreach (['tags' => 5, 'statuses' => 5] as $kind => $limit) {
+    foreach ($trendKinds as $kind => $limit) {
         $row = $cachedKinds[$kind] ?? null;
         if (!is_array($row)) continue;
         $items = [];
@@ -6514,7 +6517,9 @@ function admin_trends_sidebar_html(string $viewForTrends, bool $allowStale = tru
         return strlen($s) > $width ? (substr($s, 0, max(0, $width - 1)) . '…') : $s;
     };
 
-    $html = '<div class="side-card"><h3>Trending tags</h3>';
+    $html = '';
+    if ($module === 'all' || $module === 'tags') {
+    $html .= '<div class="side-card" data-trend-module="tags"><h3>Trending tags</h3>';
     if ($trendTags === []) {
         $html .= '<div class="meta empty-state">No hashtag signal yet…</div>';
     } else {
@@ -6536,7 +6541,9 @@ function admin_trends_sidebar_html(string $viewForTrends, bool $allowStale = tru
         }
     }
     $html .= '</div>';
-    $html .= '<div class="side-card"><h3>Trending posts</h3>';
+    }
+    if ($module === 'all' || $module === 'statuses') {
+    $html .= '<div class="side-card" data-trend-module="statuses"><h3>Trending posts</h3>';
     if ($trendStatuses === []) {
         $html .= '<div class="meta empty-state">No post signal yet…</div>';
     } else {
@@ -6564,47 +6571,69 @@ function admin_trends_sidebar_html(string $viewForTrends, bool $allowStale = tru
         }
     }
     $html .= '</div>';
+    }
     if (!admin_trends_display_state($currentViewer)['enabled']) { $meta = ['disabled' => true]; return ''; }
     return $html;
 }
 
-// Deferred trends sidebar (cache-first; background refresh when stale).
+// Deferred trends sidebar. One module per request; Redis holds the filtered card.
 if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'trends') {
     $displayState = admin_trends_display_state();
     header('X-VAAK-Trends-Enabled: ' . ($displayState['enabled'] ? '1' : '0'));
     header('X-VAAK-Trends-Owner: ' . $displayState['owner']);
-    if (!$displayState['enabled']) { header('Content-Type: text/html; charset=utf-8'); header('Cache-Control: no-store'); exit; }
+    if (!$displayState['enabled']) { header('Content-Type: text/html; charset=utf-8'); header('Cache-Control: private, no-store'); exit; }
     if (function_exists('ap_auth_session_write_close')) {
         ap_auth_session_write_close();
     } elseif (session_status() === PHP_SESSION_ACTIVE) {
         session_write_close();
     }
     header('Content-Type: text/html; charset=utf-8');
-    $forceRefresh = !empty($_GET['refresh']);
+    $module = (string) ($_GET['module'] ?? 'all');
+    $module = in_array($module, ['tags', 'statuses'], true) ? $module : 'all';
+    $forceRefresh = !empty($_GET['refresh']) || !empty($_GET['fresh']);
+    if ($forceRefresh) $GLOBALS['vaak_trends_bypass_paint'] = true;
     $viewForTrends = preg_replace('/[^a-z_]/', '', (string) ($_GET['from'] ?? 'home')) ?: 'home';
+    $variant = 'html-' . $module;
+    if (!$forceRefresh && function_exists('ap_trends_http_get')) {
+        $hit = ap_trends_http_get('sidebar', (int) $displayState['owner'], $variant);
+        if (is_array($hit)) {
+            $publishDisplay = admin_trends_display_state();
+            header('X-VAAK-Trends-Enabled: ' . ($publishDisplay['enabled'] ? '1' : '0'));
+            header('X-VAAK-Trends-Owner: ' . $publishDisplay['owner']);
+            if (!$publishDisplay['enabled'] || $publishDisplay['owner'] !== $displayState['owner']) {
+                header('Cache-Control: private, no-store');
+                exit;
+            }
+            if (function_exists('ap_trends_send_reuse_headers')) ap_trends_send_reuse_headers((string) $hit['etag'], false);
+            header('X-Vaak-Trends-Age: ' . (int) $hit['age']);
+            header('X-Vaak-Trends-Stale: ' . (!empty($hit['stale']) ? '1' : '0'));
+            if (function_exists('ap_trends_not_modified') && ap_trends_not_modified((string) $hit['etag'])) {
+                http_response_code(304);
+                exit;
+            }
+            echo (string) $hit['body'];
+            exit;
+        }
+    }
     $meta = null;
     $html = '';
+    $wantTags = $module === 'all' || $module === 'tags';
+    $wantStatuses = $module === 'all' || $module === 'statuses';
     try {
         if ($forceRefresh) {
-            // Recompute now (caller asked), then render from fresh cache.
-            if (function_exists('ap_masto_trends_tags')) {
-                ap_masto_trends_tags(5);
-            }
-            if (admin_trends_display_state()['enabled'] && function_exists('ap_masto_trends_statuses')) {
+            if ($wantTags && function_exists('ap_masto_trends_tags')) ap_masto_trends_tags(5);
+            if ($wantStatuses && admin_trends_display_state()['enabled'] && function_exists('ap_masto_trends_statuses')) {
                 ap_masto_trends_statuses(5);
             }
-            $html = admin_trends_sidebar_html($viewForTrends, true, $meta, true);
+            $html = admin_trends_sidebar_html($viewForTrends, true, $meta, true, $module);
         } else {
-            $html = admin_trends_sidebar_html($viewForTrends, true, $meta);
+            $html = admin_trends_sidebar_html($viewForTrends, true, $meta, false, $module);
             if ($html === '' && empty($meta['disabled'])) {
-                // Cold cache: compute once for this request.
-                if (function_exists('ap_masto_trends_tags')) {
-                    ap_masto_trends_tags(5);
-                }
-                if (admin_trends_display_state()['enabled'] && function_exists('ap_masto_trends_statuses')) {
+                if ($wantTags && function_exists('ap_masto_trends_tags')) ap_masto_trends_tags(5);
+                if ($wantStatuses && admin_trends_display_state()['enabled'] && function_exists('ap_masto_trends_statuses')) {
                     ap_masto_trends_statuses(5);
                 }
-                $html = admin_trends_sidebar_html($viewForTrends, true, $meta);
+                $html = admin_trends_sidebar_html($viewForTrends, true, $meta, false, $module);
             } elseif (!empty($meta['stale']) && function_exists('ap_masto_trends_schedule_refresh')) {
                 ap_masto_trends_schedule_refresh();
             }
@@ -6615,12 +6644,29 @@ if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'trends') {
     $publishDisplay = admin_trends_display_state();
     header('X-VAAK-Trends-Enabled: ' . ($publishDisplay['enabled'] ? '1' : '0'));
     header('X-VAAK-Trends-Owner: ' . $publishDisplay['owner']);
-    if (!$publishDisplay['enabled'] || $publishDisplay['owner'] !== $displayState['owner']) $html = '';
+    if (!$publishDisplay['enabled'] || $publishDisplay['owner'] !== $displayState['owner']) {
+        header('Cache-Control: private, no-store');
+        exit;
+    }
+    // A thrown render has no metadata. Do not store that miss for the TTL.
+    if (!is_array($meta)) {
+        header('Cache-Control: private, no-store');
+        http_response_code(503);
+        exit;
+    }
     $age = (int) ($meta['age'] ?? 0);
-    $stale = !empty($meta['stale']) ? '1' : '0';
-    header('Cache-Control: private, no-store');
+    $stale = !empty($meta['stale']);
+    $saved = function_exists('ap_trends_http_put')
+        ? ap_trends_http_put('sidebar', (int) $displayState['owner'], $variant, $html, $age, $stale)
+        : ['etag' => '"' . sha1($html) . '"'];
+    if (function_exists('ap_trends_send_reuse_headers')) ap_trends_send_reuse_headers((string) $saved['etag'], false);
+    else header('Cache-Control: private, max-age=600');
     header('X-Vaak-Trends-Age: ' . $age);
-    header('X-Vaak-Trends-Stale: ' . $stale);
+    header('X-Vaak-Trends-Stale: ' . ($stale ? '1' : '0'));
+    if (function_exists('ap_trends_not_modified') && ap_trends_not_modified((string) $saved['etag'])) {
+        http_response_code(304);
+        exit;
+    }
     echo $html;
     exit;
 }
@@ -39388,7 +39434,6 @@ window.vaakBootStatusThread();
     syncTimelineKindFlags();
     if (nextView === viewName && !push) return true;
     window.__vaakNavigationPending = true;
-    if (typeof window.novaInvalidateDeferredTrends === 'function') window.novaInvalidateDeferredTrends(true);
     // The old view's stream/fallback poll must not keep running while the
     // replacement timeline is being rendered.
     stopTimelineStream();
@@ -39699,7 +39744,6 @@ window.vaakBootStatusThread();
     leaving = true;
     if (typeof window.vaakCloseMobileNav === 'function') window.vaakCloseMobileNav();
     window.__vaakNavigationPending = true;
-    if (typeof window.novaInvalidateDeferredTrends === 'function') window.novaInvalidateDeferredTrends(true);
     if (typeof window.vaakShowLoading === 'function') window.vaakShowLoading('Loading…');
     // Absolute /vaak/ path: relative ?view= on /users/{key} would reload the profile
     // when <base> is missing; with <base href="/vaak/"> it works, but stay explicit.
@@ -40286,7 +40330,6 @@ window.vaakBootStatusThread();
     if (push !== false) saveViewPosition();
     busy = true;
     window.__vaakNavigationPending = true;
-    if (typeof window.novaInvalidateDeferredTrends === 'function') window.novaInvalidateDeferredTrends(true);
     if (typeof window.vaakCloseMobileNav === 'function') window.vaakCloseMobileNav();
     if (typeof window.vaakShowLoading === 'function') window.vaakShowLoading('Loading…');
     stopProfileScroll();
@@ -40432,7 +40475,6 @@ window.vaakBootStatusThread();
     if (push !== false) saveViewPosition();
     busy = true;
     window.__vaakNavigationPending = true;
-    if (typeof window.novaInvalidateDeferredTrends === 'function') window.novaInvalidateDeferredTrends(true);
     // Always abort prior Mentions scroll work — including Mentions→Mentions
     // filter swaps — so loadInitial cannot append twice onto a live shell.
     if (typeof window.vaakAbortNotifScroll === 'function') {
@@ -41132,26 +41174,66 @@ window.vaakBootStatusThread();
 })();
 </script>
 <script>
-// Cached global candidates are cheap; viewer-specific HTML is always revalidated.
+// Cached global candidates are cheap; viewer-specific cards stay cached for a short TTL.
 (function () {
+  const MODULES = ['tags', 'statuses'];
+  const TTL_MS = 10 * 60 * 1000;
+  const STORAGE_KEY = 'vaak.trends.modules.v1';
   let generation = 0;
-  let pending = null;
   let scheduled = false;
   let scheduleTicket = null;
-  let loadedKey = '';
   let mutationPending = false;
   let suspended = false;
-  let wasHidden = document.hidden;
+  let active = 0;
+  let pendingAbort = null;
+  let resumeTimer = 0;
+  const waiters = [];
+  const inflight = new Map();
   const loadingHtml = <?= json_encode(admin_trends_loading_html()) ?>;
-  function showLoading(box) {
-    if (!box || mutationPending || !visible(box)) return;
-    if (!box.querySelector('.trends-skeleton')) box.innerHTML = loadingHtml;
-    box.setAttribute('aria-busy', 'true');
+
+  function readStore() {
+    try {
+      const raw = sessionStorage.getItem(STORAGE_KEY);
+      const data = raw ? JSON.parse(raw) : null;
+      return data && typeof data === 'object' ? data : null;
+    } catch (e) { return null; }
+  }
+  function writeStore(data) {
+    try { sessionStorage.setItem(STORAGE_KEY, JSON.stringify(data)); } catch (e) {}
+  }
+  function clearStore() {
+    try {
+      sessionStorage.removeItem(STORAGE_KEY);
+      sessionStorage.removeItem('vaak.trends.html.v3');
+    } catch (e) {}
   }
   try { sessionStorage.removeItem('vaak.trends.html.v3'); } catch (e) {}
-
-  function contextKey(box) {
-    return (box.dataset.owner || '0') + '\n' + (box.dataset.enabled || '0') + '\n' + (box.dataset.from || 'home') + '\n' + location.pathname + location.search;
+  function storeFor(box) {
+    const data = readStore();
+    if (!data || String(data.owner) !== String(box.dataset.owner || '0')) return null;
+    if (String(data.enabled) !== String(box.dataset.enabled || '0')) return null;
+    return data;
+  }
+  function moduleRow(box, module) {
+    const data = storeFor(box);
+    return data && data.modules ? data.modules[module] : null;
+  }
+  function moduleFresh(box, module) {
+    const row = moduleRow(box, module);
+    return !!(row && row.ok && (Date.now() - row.savedAt) < TTL_MS);
+  }
+  function touch(box, module, html, etag) {
+    const data = storeFor(box) || {
+      v: 1,
+      owner: String(box.dataset.owner || '0'),
+      enabled: String(box.dataset.enabled || '0'),
+      modules: {}
+    };
+    data.owner = String(box.dataset.owner || '0');
+    data.enabled = String(box.dataset.enabled || '0');
+    data.modules = data.modules || {};
+    data.modules[module] = { html: html || '', etag: etag || '', savedAt: Date.now(), ok: true };
+    writeStore(data);
   }
   function visible(box) {
     if (suspended || document.hidden || !box || !box.isConnected || box.dataset.enabled !== '1' || box.hidden) return false;
@@ -41159,15 +41241,86 @@ window.vaakBootStatusThread();
     return box.getClientRects().length > 0 && rect.width > 0
       && rect.bottom >= 0 && rect.top < innerHeight && rect.right > 0 && rect.left < innerWidth;
   }
+  function rewriteFrom(box) {
+    if (!box) return;
+    const from = box.dataset.from || 'home';
+    box.querySelectorAll('a[href]').forEach((link) => {
+      const href = link.getAttribute('href') || '';
+      if (!/[?&]from=/.test(href)) return;
+      try {
+        const url = new URL(href, location.href);
+        url.searchParams.set('from', from);
+        link.setAttribute('href', url.pathname + url.search + url.hash);
+      } catch (e) {}
+    });
+  }
+  function paintHtml(box, module, html) {
+    const existing = box.querySelector('[data-trend-module="' + module + '"]');
+    if (!html) {
+      if (existing) existing.remove();
+      return;
+    }
+    const holder = document.createElement('div');
+    holder.innerHTML = html;
+    const next = holder.querySelector('[data-trend-module="' + module + '"]') || holder.firstElementChild;
+    if (!next) return;
+    if (!next.getAttribute('data-trend-module')) next.setAttribute('data-trend-module', module);
+    if (existing) existing.replaceWith(next);
+    else if (module === 'statuses') box.appendChild(next);
+    else box.insertBefore(next, box.firstChild);
+  }
+  function cardStable(box, module) {
+    const card = box.querySelector('[data-trend-module="' + module + '"]');
+    return !!(card && !card.querySelector('.trends-skeleton, [data-trends-retry]'));
+  }
+  function restoreCached(box) {
+    if (!box || box.dataset.enabled !== '1') return false;
+    let painted = false;
+    MODULES.forEach((module) => {
+      if (!moduleFresh(box, module)) return;
+      if (!cardStable(box, module)) paintHtml(box, module, moduleRow(box, module).html);
+      painted = true;
+    });
+    if (painted) {
+      rewriteFrom(box);
+      box.dataset.deferred = '0';
+      box.setAttribute('aria-busy', 'false');
+    }
+    return MODULES.every((module) => moduleFresh(box, module));
+  }
+  function showLoading(box, module) {
+    if (!box || mutationPending || !visible(box)) return;
+    if (module) {
+      const holder = document.createElement('div');
+      holder.innerHTML = loadingHtml;
+      const card = holder.querySelector('[data-trend-module="' + module + '"]');
+      const existing = box.querySelector('[data-trend-module="' + module + '"]');
+      if (card && existing) existing.replaceWith(card);
+      else if (card) box.appendChild(card);
+    } else if (!box.querySelector('.trends-skeleton')) {
+      box.innerHTML = loadingHtml;
+    }
+    box.setAttribute('aria-busy', 'true');
+  }
+  function retryHtml(module) {
+    return '<div class="side-card" data-trend-module="' + module + '" role="status">Trending could not load. <button type="button" data-trends-retry>Retry</button></div>';
+  }
   function invalidate() {
     ++generation;
     scheduled = false;
     scheduleTicket = null;
-    if (pending && pending.controller) pending.controller.abort();
-    pending = null;
-    loadedKey = '';
+    waiters.length = 0;
+    inflight.clear();
+    if (pendingAbort) pendingAbort.abort();
+    pendingAbort = null;
+    active = 0;
+    clearStore();
     const box = document.getElementById('trends-sidebar');
-    if (box) { box.innerHTML = ''; box.dataset.deferred = '1'; box.setAttribute('aria-busy', 'false'); }
+    if (box) {
+      box.innerHTML = '';
+      box.dataset.deferred = '1';
+      box.setAttribute('aria-busy', 'false');
+    }
   }
   function syncPolicy(res) {
     const enabled = res.headers.get('X-VAAK-Trends-Enabled');
@@ -41183,70 +41336,135 @@ window.vaakBootStatusThread();
     if (box.hidden) { box.innerHTML = ''; box.setAttribute('aria-busy', 'false'); }
   }
   window.novaSyncDeferredTrendsPolicy = syncPolicy;
-  function fetchTrends() {
+
+  function settleBusy(box) {
+    if (active === 0 && waiters.length === 0 && box && box.isConnected) box.setAttribute('aria-busy', 'false');
+  }
+  async function runModule(job) {
     const box = document.getElementById('trends-sidebar');
-    if (mutationPending || !visible(box)) return;
-    if (window.__vaakNavigationPending) return;
-    const key = contextKey(box);
-    if (loadedKey === key || (pending && pending.key === key)) return;
-    if (pending || loadedKey) invalidate();
     const current = generation;
-    const controller = typeof AbortController === 'function' ? new AbortController() : null;
-    pending = { controller: controller, key: key };
-    let discardedOffscreen = false;
-    showLoading(box);
+    if (!box || current !== generation) return false;
+    if (!job.force && moduleFresh(box, job.module)) {
+      paintHtml(box, job.module, moduleRow(box, job.module).html);
+      rewriteFrom(box);
+      box.dataset.deferred = '0';
+      return true;
+    }
+    const hadCard = box.querySelector('[data-trend-module="' + job.module + '"]');
+    const failed = hadCard && hadCard.querySelector('[data-trends-retry]');
+    if (!hadCard || failed || (hadCard.querySelector && hadCard.querySelector('.trends-skeleton'))) showLoading(box, job.module);
     box.dataset.deferred = 'loading';
     box.setAttribute('aria-busy', 'true');
-    // Current policy, without forcing global collection/network work.
-    fetch('?ajax=trends&from=' + encodeURIComponent(box.dataset.from || 'home') + '&frag=4', {
-      credentials: 'same-origin', headers: { 'Accept': 'text/html' },
-      cache: 'no-store', ...(controller ? { signal: controller.signal } : {})
-    }).then((res) => {
+    const controller = typeof AbortController === 'function' ? new AbortController() : null;
+    if (controller) pendingAbort = controller;
+    const row = moduleRow(box, job.module);
+    const headers = { Accept: 'text/html' };
+    if (!job.force && row && row.etag) headers['If-None-Match'] = row.etag;
+    try {
+      const res = await fetch('?ajax=trends&module=' + encodeURIComponent(job.module) + '&frag=5' + (job.force ? '&fresh=1' : ''), {
+        credentials: 'same-origin',
+        headers: headers,
+        cache: job.force ? 'reload' : 'default',
+        ...(controller ? { signal: controller.signal } : {})
+      });
+      if (current !== generation || document.getElementById('trends-sidebar') !== box) return false;
+      if (res.status === 304 && row && row.ok) {
+        touch(box, job.module, row.html, row.etag);
+        paintHtml(box, job.module, row.html);
+        rewriteFrom(box);
+        box.dataset.deferred = '0';
+        return true;
+      }
       if (!res.ok) throw new Error('Trending request failed');
-      if (current !== generation || document.getElementById('trends-sidebar') !== box || contextKey(box) !== key) throw new Error('Stale trending response');
       syncPolicy(res);
-      const age = parseInt(res.headers.get('X-Vaak-Trends-Age') || '0', 10) || 0;
-      const stale = res.headers.get('X-Vaak-Trends-Stale') === '1';
-      return res.text().then((html) => ({ html: html || '', age: age, stale: stale }));
-    }).then((payload) => {
-      if (current !== generation || document.getElementById('trends-sidebar') !== box || contextKey(box) !== key) return;
-      if (!visible(box)) { discardedOffscreen = true; return; }
-      box.innerHTML = payload.html;
-      loadedKey = key;
+      if (current !== generation || document.getElementById('trends-sidebar') !== box || box.dataset.enabled !== '1') return false;
+      const html = await res.text();
+      if (current !== generation || document.getElementById('trends-sidebar') !== box) return false;
+      const etag = res.headers.get('ETag') || '';
+      touch(box, job.module, html, etag);
+      paintHtml(box, job.module, html);
+      rewriteFrom(box);
+      box.dataset.cachedAge = res.headers.get('X-Vaak-Trends-Age') || '0';
+      box.dataset.stale = res.headers.get('X-Vaak-Trends-Stale') === '1' ? '1' : '0';
       box.dataset.deferred = '0';
-      box.dataset.cachedAge = String(payload.age);
-      box.dataset.stale = payload.stale ? '1' : '0';
-    }).catch(() => {
-      if (current !== generation || !visible(box) || contextKey(box) !== key) return;
-      box.innerHTML = '<div class="side-card" role="status">Trending could not load. <button type="button" data-trends-retry>Retry</button></div>';
+      return true;
+    } catch (err) {
+      if (current !== generation || document.getElementById('trends-sidebar') !== box) return false;
+      if (err && err.name === 'AbortError') return false;
+      if (moduleFresh(box, job.module)) return false;
+      paintHtml(box, job.module, retryHtml(job.module));
       box.dataset.deferred = '1';
-    }).finally(() => {
-      if (current === generation && box.isConnected) box.setAttribute('aria-busy', 'false');
-      if (pending && pending.controller === controller) pending = null;
-      // A resize/intersection callback may have coalesced while this response
-      // was finishing. Re-arm only discarded, visible responses, never errors.
-      if (discardedOffscreen && current === generation && visible(box)) loadDeferredTrends(false);
+      return false;
+    } finally {
+      if (pendingAbort === controller) pendingAbort = null;
+      settleBusy(box);
+    }
+  }
+  function pump() {
+    if (active >= 1) return;
+    const job = waiters.shift();
+    if (!job) return;
+    const box = document.getElementById('trends-sidebar');
+    if (mutationPending || window.__vaakNavigationPending || !visible(box) || generation !== job.generation) {
+      if (inflight.get(job.module) === job.promise) inflight.delete(job.module);
+      job.resolve(false);
+      pump();
+      return;
+    }
+    active += 1;
+    runModule(job).then(job.resolve, job.reject).finally(() => {
+      active = Math.max(0, active - 1);
+      if (inflight.get(job.module) === job.promise) inflight.delete(job.module);
+      settleBusy(document.getElementById('trends-sidebar'));
+      pump();
     });
+  }
+  function enqueue(module, force) {
+    if (inflight.has(module)) {
+      if (force) {
+        const queued = waiters.find((job) => job.module === module);
+        if (queued) queued.force = true;
+      }
+      return inflight.get(module);
+    }
+    let resolve;
+    let reject;
+    const promise = new Promise((res, rej) => { resolve = res; reject = rej; });
+    inflight.set(module, promise);
+    waiters.push({ module: module, force: force === true, generation: generation, promise: promise, resolve: resolve, reject: reject });
+    pump();
+    return promise;
   }
   function loadDeferredTrends(force) {
     const box = document.getElementById('trends-sidebar');
-    if (!box) return;
-    const key = contextKey(box);
-    if (force || (pending && pending.key !== key) || (loadedKey && loadedKey !== key)) invalidate();
-    if (mutationPending || !visible(box) || loadedKey === key || (pending && pending.key === key) || scheduled) return;
-    showLoading(box);
+    if (!box || mutationPending || box.dataset.enabled !== '1') return;
+    const allFresh = !force && MODULES.every((module) => moduleFresh(box, module));
+    if (allFresh && MODULES.every((module) => cardStable(box, module))) return;
+    if (!force) restoreCached(box);
+    rewriteFrom(box);
+    if (force) {
+      MODULES.forEach((module) => {
+        const card = box.querySelector('[data-trend-module="' + module + '"]');
+        if (card && card.querySelector('[data-trends-retry]')) showLoading(box, module);
+      });
+    }
+    if (!force && MODULES.every((module) => moduleFresh(box, module))) return;
+    if (!visible(box)) return;
+    if (scheduled && !force) return;
     scheduled = true;
     const ticket = {};
     scheduleTicket = ticket;
-    // Parsing and two paints put the main column first on every full/soft page.
-    // Idle scheduling keeps a reply/timeline refresh ahead of sidebar work.
+    const forceFlag = force === true;
     const idle = () => {
       if (scheduleTicket !== ticket) return;
       const run = () => {
         if (scheduleTicket !== ticket) return;
         scheduled = false;
         scheduleTicket = null;
-        fetchTrends();
+        const live = document.getElementById('trends-sidebar');
+        if (!live || mutationPending || window.__vaakNavigationPending || !visible(live)) return;
+        const needed = forceFlag ? MODULES.slice() : MODULES.filter((module) => !moduleFresh(live, module));
+        needed.forEach((module) => enqueue(module, forceFlag));
       };
       if ('requestIdleCallback' in window) requestIdleCallback(run, { timeout: 1500 });
       else setTimeout(run, 120);
@@ -41258,6 +41476,13 @@ window.vaakBootStatusThread();
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', afterPaint, { once: true });
     else afterPaint();
   }
+  function scheduleResume() {
+    clearTimeout(resumeTimer);
+    resumeTimer = setTimeout(() => {
+      if (document.hidden || mutationPending) return;
+      loadDeferredTrends(false);
+    }, 1000);
+  }
 
   window.novaInvalidateDeferredTrends = (loading) => {
     invalidate();
@@ -41266,20 +41491,24 @@ window.vaakBootStatusThread();
   window.novaLoadDeferredTrends = loadDeferredTrends;
   window.novaSetDeferredTrendsView = (view) => {
     const box = document.getElementById('trends-sidebar');
-    if (box) box.dataset.from = String(view || 'home');
+    if (!box) return;
+    box.dataset.from = String(view || 'home');
+    rewriteFrom(box);
     loadDeferredTrends(false);
   };
-  window.addEventListener('pagehide', () => { suspended = true; invalidate(); });
+  window.addEventListener('pagehide', () => {
+    suspended = true;
+    if (pendingAbort) pendingAbort.abort();
+  });
   window.addEventListener('pageshow', (event) => {
     suspended = false;
-    if (event.persisted) { mutationPending = false; loadDeferredTrends(true); }
+    if (event.persisted) mutationPending = false;
+    loadDeferredTrends(false);
   });
   document.addEventListener('visibilitychange', () => {
-    if (document.hidden) { wasHidden = true; invalidate(); }
-    else if (wasHidden) { wasHidden = false; loadDeferredTrends(true); }
+    if (!document.hidden) scheduleResume();
   });
-  // Policy forms navigate after submission. Remove old cards immediately; do
-  // not race that POST with a GET using the previous policy. Replies are exempt.
+  window.addEventListener('focus', scheduleResume);
   document.addEventListener('submit', (event) => {
     const form = event.target;
     if (!(form instanceof HTMLFormElement) || form.method.toLowerCase() !== 'post') return;
@@ -41298,11 +41527,7 @@ window.vaakBootStatusThread();
     const link = event.target.closest('a[href]');
     if (link && /[?&]logout=1(?:&|$)/.test(link.getAttribute('href') || '')) { mutationPending = true; invalidate(); }
   });
-  window.addEventListener('resize', () => {
-    const box = document.getElementById('trends-sidebar');
-    if (!visible(box)) invalidate();
-    else loadDeferredTrends(false);
-  }, { passive: true });
+  window.addEventListener('resize', () => loadDeferredTrends(false), { passive: true });
   window.addEventListener('scroll', () => loadDeferredTrends(false), { passive: true });
   const trendsBox = document.getElementById('trends-sidebar');
   if (trendsBox && 'IntersectionObserver' in window) {
