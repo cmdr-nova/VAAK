@@ -1,6 +1,9 @@
-const fs=require('fs'),vm=require('vm'),assert=require('assert');
-const abortCapable=process.argv[3]!=='--without-abort-controller';
-const file=process.argv[2]; const source=fs.readFileSync(file,'utf8');
+const fs=require('fs'),vm=require('vm'),assert=require('assert'),path=require('path');
+const args=process.argv.slice(2);
+const flag=args.find((arg)=>arg.startsWith('--'))||'';
+const abortCapable=flag!=='--without-abort-controller';
+const file=args.find((arg)=>!arg.startsWith('--'))||path.join(__dirname,'..','ap-admin.php');
+const source=fs.readFileSync(file,'utf8');
 const begin=source.indexOf('  // Notification + DM badges and tab title');const end=source.indexOf('\n})();\n\n// VAAK browser Web Push',begin);
 assert(begin>0&&end>begin);
 let js='(function(){\n'+source.slice(begin,end)+'\n})();';
@@ -30,7 +33,7 @@ const advance=async(ms)=>{const till=now+ms;while(true){const due=[...timers].fi
 const response=(count=3,dm=1,extra={})=>({ok:true,json:async()=>({count,dm_count:dm,latest_unread_id:'200',last_read_id:'0',latest_dm_id:'4',phyrian_pending:0,...extra})});
 const result=[];function check(ok,label){assert(ok,label);result.push(label)}
 (async()=>{
- if(process.argv[3]==='--baseline-hang'){await advance(12000);await advance(60000);check(calls.length===1,'one unresolved periodic request prevents every later scheduled poll');console.log(JSON.stringify({file,baseline_hang_reproduced:true,elapsed_fake_ms:now,requests:calls.length}));return;}
+ if(flag==='--baseline-hang'){await advance(12000);await advance(60000);check(calls.length===1,'one unresolved periodic request prevents every later scheduled poll');console.log(JSON.stringify({file,baseline_hang_reproduced:true,elapsed_fake_ms:now,requests:calls.length}));return;}
  check(elements['notif-badge'].textContent==='2','genuine initial seed retained');
  const a=win.vaakPollNotif(),b=win.vaakPollNotif();sw.emit('message',{data:{type:'vaak-push'}});win.emit('vaak:mobile-nav-open');check(calls.length===1&&a===b,'manual/push/mobile coalesce same in-flight request');
  await advance(5000);check((abortCapable?calls[0].opts.signal.aborted:calls[0].opts.signal===undefined),'deadline releases never resolving transport with or without abort support');check(elements['notif-badge'].textContent==='2','timeout preserves seeded badge');
@@ -51,6 +54,8 @@ const result=[];function check(ok,label){assert(ok,label);result.push(label)}
  queue.push(d=>d.resolve(response(7,0)));doc.emit('visibilitychange');await flush();check(elements['notif-badge'].textContent==='7','visible return refreshes badge');
  queue.push(d=>d.resolve(response(8,0)));win.emit('vaak:mobile-nav-open');await flush();check(elements['notif-badge'].textContent==='8','mobile menu trigger refreshes badge');
  queue.push(d=>d.resolve(response(10,0)));sw.emit('message',{data:{type:'vaak-push'}});await flush();check(elements['notif-badge'].textContent==='10','service worker push refreshes badge');
+ win.__vaakPendingPostCount=3;win.vaakRenderInboxTitle();check(doc.title.startsWith('(3'),'pending timeline posts prefix the tab title');
+ win.__vaakPendingPostCount=0;win.vaakRenderInboxTitle();check(!doc.title.startsWith('(3'),'clearing pending posts removes that prefix');
  check(calls.every(c=>c.url==='?ajax=notif_unread'&&c.opts.credentials==='same-origin'&&c.opts.cache==='no-store'),'current authenticated endpoint semantics preserved');
  console.log(JSON.stringify({file,abort_capable:abortCapable,checks:result.length,passed:true,bindings,labels:result},null,2));
 })().catch(e=>{console.error(e.stack);process.exitCode=1});
