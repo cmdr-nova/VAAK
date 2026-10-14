@@ -144,7 +144,7 @@ fn maybe_text(value: &Value, key: &str) -> Option<String> {
     }
 }
 
-fn php_urlencode(value: &str) -> String {
+pub(crate) fn php_urlencode(value: &str) -> String {
     let mut encoded = String::new();
     for byte in value.bytes() {
         match byte {
@@ -184,7 +184,7 @@ fn html_decode(value: &str) -> String {
     out
 }
 
-fn field_html(raw: &str) -> String {
+pub(crate) fn field_html(raw: &str) -> String {
     let decoded = html_decode(raw);
     let mut out = String::new();
     let chars: Vec<char> = decoded.chars().collect();
@@ -286,7 +286,7 @@ fn badge(key: &str) -> Option<(&'static str, &'static str)> {
     })
 }
 
-fn emoji_html(text: &str, emoji: &[(String, String)]) -> String {
+pub(crate) fn emoji_html(text: &str, emoji: &[(String, String)]) -> String {
     if text.is_empty() || emoji.is_empty() || !text.contains(':') { return esc(text); }
     let mut out = String::new();
     let mut rest = text;
@@ -827,14 +827,14 @@ pub(crate) fn paint_local(input: &Value) -> Result<LocalChrome, String> {
     Ok(LocalChrome { page_back, header, chrome, secondary })
 }
 
-fn secret() -> Option<String> {
+pub(crate) fn secret() -> Option<String> {
     if std::env::var("VAAK_PROFILE_NATIVE_RENDER").ok().as_deref() != Some("1") { return None; }
     std::env::var("VAAK_PROFILE_NATIVE_SECRET").ok().filter(|value| value.len() >= 32)
 }
 
 pub(crate) fn enabled() -> bool { secret().is_some() }
 
-fn authorized(headers: &HeaderMap, expected: &str) -> bool {
+pub(crate) fn authorized(headers: &HeaderMap, expected: &str) -> bool {
     let supplied = headers.get("x-vaak-profile-token").and_then(|value| value.to_str().ok()).unwrap_or("");
     supplied.len() == expected.len() && supplied.bytes().zip(expected.bytes()).fold(0u8, |diff, (a, b)| diff | (a ^ b)) == 0
 }
