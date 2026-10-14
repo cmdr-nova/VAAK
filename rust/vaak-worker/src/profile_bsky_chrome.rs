@@ -84,6 +84,8 @@ struct Facts {
     item_replies: i64,
     item_boosts: i64,
     item_media: i64,
+    guest: bool,
+    guest_bsky: String,
 }
 
 pub(crate) struct BskyChrome {
@@ -308,6 +310,7 @@ fn tabs(w: &mut W, f: &Facts) {
 }
 
 fn page_back(f: &Facts) -> String {
+    if f.guest { return "          ".to_owned(); }
     let mut w = W::new();
     let (href, label, view) = back(&f.from);
     w.indent(10);
@@ -344,7 +347,7 @@ fn header(f: &Facts) -> String {
         w.indent(16);
     } else {
         w.indent(18);
-        let hover = format!(" data-profile-hover-actor=\"{}\" ", esc(&f.actor));
+        let hover = crate::profile_local::profile_hover_attr(&f.actor);
         let src = f.bare_src.as_deref().unwrap_or(f.fallback_avatar.as_str());
         w.text(&format!("<img class=\"tweet-av\" src=\"{}\" alt=\"\" width=\"40\" height=\"40\" {hover}loading=\"lazy\" decoding=\"async\" referrerpolicy=\"no-referrer\" onerror=\"this.onerror=null;this.src='{}'\">", esc(src), esc(&f.fallback_avatar)));
         w.indent(16);
@@ -384,6 +387,10 @@ fn header(f: &Facts) -> String {
     w.line(14, "</div>");
     w.indent(14);
     w.line(12, "</div>");
+    if f.guest && f.actor.starts_with("https://") {
+        let handle = if f.guest_bsky.is_empty() { f.bsky_handle.as_str() } else { f.guest_bsky.as_str() };
+        w.text(&crate::profile_local::guest_follow_panel(&f.actor, handle));
+    }
     w.indent(12);
     w.indent(12);
     if !f.bio.is_empty() {
@@ -430,6 +437,10 @@ fn flag_span(w: &mut W, on: bool, html: &str) {
 }
 
 fn actions(w: &mut W, f: &Facts) {
+    if f.guest {
+        w.text(&crate::profile_local::guest_action_close(f.muted, f.blocked_personal, f.blocked_server));
+        return;
+    }
     w.indent(14);
     if !f.is_own {
         w.line(16, "<span class=\"remote-profile-follow-inline\">");
@@ -529,6 +540,7 @@ fn load(input: &Value) -> Result<Facts, String> {
         csrf: text(input, "csrf").to_owned(), fields,
         item_posts: num(input, "item_posts"), item_replies: num(input, "item_replies"),
         item_boosts: num(input, "item_boosts"), item_media: num(input, "item_media"),
+        guest: flag(input, "guest"), guest_bsky: text(input, "guest_bsky").to_owned(),
     })
 }
 
@@ -550,7 +562,7 @@ pub(crate) async fn render(_cfg: &crate::config::Config, headers: HeaderMap, byt
     }
     let painted = match paint_bsky(&input) { Ok(painted) => painted, Err(_) => return (StatusCode::UNPROCESSABLE_ENTITY, axum::Json(json!({"fallback": true}))).into_response() };
     let binding = json!({"actor": input.get("actor").and_then(Value::as_str).unwrap_or("").trim().trim_end_matches('/'), "tab": text(&input, "tab"), "from": text(&input, "from")});
-    let body = json!({"ok": true, "protocol_version": 1, "request_binding": binding, "chrome": painted.chrome, "page_back": painted.page_back, "header": painted.header, "secondary": Value::Null});
+    let body = json!({"ok": true, "protocol_version": 1, "request_binding": binding, "chrome": painted.chrome, "page_back": painted.page_back, "header": painted.header, "secondary": Value::Null, "feed_open": Value::Null, "feed_close": Value::Null});
     let bytes = match serde_json::to_vec(&body) { Ok(bytes) => bytes, Err(_) => return (StatusCode::UNPROCESSABLE_ENTITY, axum::Json(json!({"fallback": true}))).into_response() };
     if bytes.len() > 2 * 1024 * 1024 { return (StatusCode::UNPROCESSABLE_ENTITY, axum::Json(json!({"fallback": true}))).into_response(); }
     (StatusCode::OK, [(axum::http::header::CONTENT_TYPE, "application/json"), (axum::http::header::CACHE_CONTROL, "no-store")], bytes).into_response()

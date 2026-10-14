@@ -63,7 +63,20 @@ function ap_profile_native_validate_local(array $reply, array $binding): ?array
     if ($secondary !== null && (!is_string($secondary) || $secondary === '' || strlen($secondary) > 64 * 1024)) {
         return null;
     }
-    return ['chrome' => $reply['chrome'], 'page_back' => $pageBack, 'header' => $header, 'secondary' => $secondary];
+    $feedOpen = $reply['feed_open'] ?? null;
+    $feedClose = $reply['feed_close'] ?? null;
+    if ($feedOpen !== null || $feedClose !== null) {
+        if (!is_string($feedOpen) || $feedOpen === '' || strlen($feedOpen) > 64 * 1024
+            || !is_string($feedClose) || $feedClose === '' || strlen($feedClose) > 64 * 1024) {
+            return null;
+        }
+    }
+    $out = ['chrome' => $reply['chrome'], 'page_back' => $pageBack, 'header' => $header, 'secondary' => $secondary];
+    if (is_string($feedOpen) && is_string($feedClose)) {
+        $out['feed_open'] = $feedOpen;
+        $out['feed_close'] = $feedClose;
+    }
+    return $out;
 }
 
 /**
@@ -129,7 +142,7 @@ function ap_profile_native_render_local(array $facts): ?array
 
 /**
  * Paint a remote ActivityPub header, relationship row, and tabs. Null keeps
- * the caller on the PHP template. Pins, Asks, guests, and writes stay on PHP.
+ * the caller on the PHP template. Pins, Asks, filled cards, and writes stay on PHP.
  * Bluesky actors use the bsky route. The same off switch and secret gate this route.
  *
  * @param array<string,mixed> $facts
@@ -242,7 +255,7 @@ function ap_profile_native_is_bsky_actor(string $actor): bool
 
 /**
  * Paint a Bluesky header, relationship row, and tabs. Null keeps the caller
- * on the PHP template. Guests, cold cards, pagination, and writes stay on PHP.
+ * on the PHP template. Filled cards and writes stay on PHP.
  * The same off switch and secret gate this route.
  *
  * @param array<string,mixed> $facts
