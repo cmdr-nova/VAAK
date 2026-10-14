@@ -47,7 +47,7 @@ pub async fn find_status_in_notif_envelopes(
     owner_id: i64,
     uri: &str,
 ) -> Result<Option<Value>> {
-    let pattern = format!("vaak:notifications:v2:{owner_id}:*");
+    let pattern = format!("vaak:notifications:v3:{owner_id}:*");
     // Owners keep a handful of Mentions keys — KEYS is fine at this scale.
     let keys: Vec<String> = redis::cmd("KEYS")
         .arg(&pattern)
@@ -3692,8 +3692,8 @@ pub fn paint_lean_embed_from(
         .unwrap_or("");
     let when = relative_time(created);
     let raw_content = status.get("content").and_then(|v| v.as_str()).unwrap_or("");
-    // Mentions nests already show "in reply to @user". The API still bakes a
-    // parent teaser into content for Ice Cubes; do not paint that twice.
+    // Mentions nests already show "in reply to @user". Legacy envelopes baked a
+    // parent teaser into content; do not paint that twice.
     let baked_content = if hide_header && from == "mentions" {
         strip_mentions_reply_bake(raw_content)
     } else {

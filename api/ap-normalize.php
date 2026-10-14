@@ -237,6 +237,15 @@ function ap_normalize_status(array $status): array
     $status = ap_normalize_attach_ask($status);
     $status = ap_normalize_apply_bsky_sensitivity($status);
     $status = ap_normalize_scrub_quote_pollution($status);
+    if (function_exists('ap_masto_api_strip_reply_context')) {
+        $status = ap_masto_api_strip_reply_context($status);
+        if (isset($status['reblog']) && is_array($status['reblog'])) {
+            $status['reblog'] = ap_masto_api_strip_reply_context($status['reblog']);
+        }
+        if (isset($status['quote']['quoted_status']) && is_array($status['quote']['quoted_status'])) {
+            $status['quote']['quoted_status'] = ap_masto_api_strip_reply_context($status['quote']['quoted_status']);
+        }
+    }
     return $status;
 }
 
