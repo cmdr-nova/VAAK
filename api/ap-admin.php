@@ -34577,6 +34577,72 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
                     $rpFacts['media_total'] = (int) $rpOutboxMediaCount;
                 }
                 $rpLocalNative = ap_profile_native_render_local($rpFacts);
+            } elseif (ap_profile_native_enabled()
+                && !$rpIsLocal
+                && !$rpIsBsky
+                && empty($GLOBALS['vaak_guest_profile'])
+                && empty($rpContentBlocked)
+                && is_string($rpActor)
+                && str_starts_with($rpActor, 'https://')
+                && !preg_match('#^https://mkultra\\.monster/users/[A-Za-z0-9_]+$#', rtrim($rpActor, '/'))
+                && !str_contains(strtolower($rpActor), 'bsky.app')) {
+                $rpWhoName = (string) ((is_array($rpMeta) ? ($rpMeta['display_name'] ?? null) : null) ?: actor_handle($rpActor));
+                $rpWhoHtml = admin_emoji_html($rpWhoName, $rpActor);
+                $rpHandleText = actor_handle($rpActor, is_array($rpMeta) ? ($rpMeta['username'] ?? null) : null);
+                $rpOpenHref = admin_remote_actor_href($rpActor, is_array($rpMeta) ? (string) ($rpMeta['username'] ?? '') : null);
+                $rpMenuOwner = (int) $vaakOwnerId;
+                $rpPersonalBlock = function_exists('ap_user_block_find')
+                    ? ap_user_block_find($rpActor, short_host($rpActor), $rpMenuOwner)
+                    : null;
+                $rpBareSrc = null;
+                if (!is_string($rpAvatar) || $rpAvatar === '') {
+                    $rpBareSrc = admin_actor_avatar_url($rpActor);
+                }
+                $rpServerControl = (!empty($vaakIsAdmin) && function_exists('admin_global_actor_control'))
+                    ? admin_global_actor_control($rpActor)
+                    : null;
+                $rpFacts = [
+                    'actor' => rtrim($rpActor, '/'),
+                    'from' => (string) $rpFrom,
+                    'tab' => (string) $rpTab,
+                    'tab_href' => (string) ($rpTabHref ?? ''),
+                    'display_name' => (string) (is_array($rpMeta) ? ($rpMeta['display_name'] ?? '') : ''),
+                    'username' => (string) (is_array($rpMeta) ? ($rpMeta['username'] ?? '') : ''),
+                    'handle' => $rpHandleText,
+                    'open_href' => $rpOpenHref,
+                    'bio' => (string) $rpBio,
+                    'avatar' => is_string($rpAvatar) && $rpAvatar !== '' ? $rpAvatar : null,
+                    'banner' => is_string($rpHeader) && $rpHeader !== '' ? $rpHeader : null,
+                    'fallback_avatar' => defined('AP_REMOTE_AVATAR_FALLBACK')
+                        ? AP_REMOTE_AVATAR_FALLBACK
+                        : 'https://mkultra.monster/img/avatar/default.jpg',
+                    'bare_src' => is_string($rpBareSrc) && $rpBareSrc !== '' ? $rpBareSrc : null,
+                    'display_html' => $rpWhoHtml,
+                    'is_own' => !empty($rpIsOwn),
+                    'following' => !empty($rpFollowing),
+                    'follows_you' => !empty($rpFollowsYou),
+                    'requested' => !empty($rpRequested),
+                    'locked' => !empty($rpLocked),
+                    'muted' => !empty($rpMuted),
+                    'blocked_personal' => !empty($rpBlockedPersonal),
+                    'blocked_server' => !empty($rpBlockedServer),
+                    'personal_block_id' => is_array($rpPersonalBlock) ? (int) ($rpPersonalBlock['id'] ?? 0) : null,
+                    'deprioritized' => function_exists('ap_is_deprioritized_actor') && ap_is_deprioritized_actor($rpActor, $rpMenuOwner),
+                    'target_is_admin' => function_exists('admin_is_local_admin_actor') && admin_is_local_admin_actor($rpActor),
+                    'viewer_is_admin' => !empty($vaakIsAdmin),
+                    'wafrn_known' => function_exists('ap_wafrn_actor_host_known') && ap_wafrn_actor_host_known($rpActor),
+                    'server_control' => is_array($rpServerControl) ? [
+                        'id' => (int) ($rpServerControl['id'] ?? 0),
+                        'kind' => (string) ($rpServerControl['kind'] ?? ''),
+                    ] : null,
+                    'csrf' => function_exists('ap_auth_csrf_token') ? (string) ap_auth_csrf_token() : '',
+                    'fields' => array_values(is_array($rpProfileFields) ? $rpProfileFields : []),
+                    'item_posts' => count($rpTabItems['posts'] ?? []),
+                    'item_replies' => count($rpTabItems['replies'] ?? []),
+                    'item_boosts' => count($rpTabItems['boosts'] ?? []),
+                    'item_media' => count($rpTabItems['media'] ?? []),
+                ];
+                $rpLocalNative = ap_profile_native_render_remote($rpFacts);
             }
             if (is_array($rpLocalNative)) {
                 echo $rpLocalNative['page_back'];
@@ -34651,7 +34717,7 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
                         echo ap_phyrian_bridge_resonant_badge_html(is_array($rpPhyrianBridge) ? $rpPhyrianBridge : null);
                     }
                   ?></div>
-                  <div class="meta"><?= h($rpIsBsky && $rpBskyHandle !== '' ? ('@' . $rpBskyHandle) : actor_handle($rpActor, is_array($rpMeta) ? ($rpMeta['username'] ?? null) : null)) ?>
+                  <div class="meta"><?= h($rpIsBsky && $rpBskyHandle !== '' ? ('@' . $rpBskyHandle) : ($rpHandleText ?? actor_handle($rpActor, is_array($rpMeta) ? ($rpMeta['username'] ?? null) : null))) ?>
                     <?php if ($rpIsLocal): ?><span class="tag" style="margin-left:.35rem" title="Account on this instance">local</span><?php endif; ?>
                     <?php if ($rpIsBsky): ?><span class="tag" style="margin-left:.35rem" title="Bluesky / AT Protocol">Bluesky</span><?php endif; ?>
                     <?php if ($rpIsOwn): ?><span class="tag" style="margin-left:.35rem" title="Signed-in account">you</span><?php endif; ?>
@@ -34967,10 +35033,10 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
                 <?php if ($rpIsBsky): ?>
                   <a href="<?= h($rpActor) ?>" target="_blank" rel="noopener noreferrer">Open on Bluesky</a>
                 <?php elseif (!$rpIsLocal): ?>
-                  <a href="<?= h(admin_remote_actor_href($rpActor, is_array($rpMeta) ? (string) ($rpMeta['username'] ?? '') : null)) ?>" target="_blank" rel="noopener noreferrer"><?= h(admin_open_profile_label($rpActor)) ?></a>
+                  <a href="<?= h($rpOpenHref ?? admin_remote_actor_href($rpActor, is_array($rpMeta) ? (string) ($rpMeta['username'] ?? '') : null)) ?>" target="_blank" rel="noopener noreferrer"><?= h(admin_open_profile_label($rpActor)) ?></a>
                   <?php if (!$rpIsOwn): ?>
                     <?php
-                      $rpRemoteFollowHref = admin_remote_actor_href(
+                      $rpRemoteFollowHref = $rpOpenHref ?? admin_remote_actor_href(
                           $rpActor,
                           is_array($rpMeta) ? (string) ($rpMeta['username'] ?? '') : null
                       );

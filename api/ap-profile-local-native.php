@@ -18,6 +18,34 @@ function ap_profile_native_url_allowed(string $url): bool
         && !isset($p['user']) && !isset($p['pass']) && !isset($p['query']) && !isset($p['fragment']);
 }
 
+function ap_profile_native_remote_url_allowed(string $url): bool
+{
+    $p = parse_url($url);
+    return is_array($p) && ($p['scheme'] ?? '') === 'http'
+        && in_array($p['host'] ?? '', ['127.0.0.1', '[::1]'], true)
+        && ($p['path'] ?? '') === '/internal/profile/remote'
+        && !isset($p['user']) && !isset($p['pass']) && !isset($p['query']) && !isset($p['fragment']);
+}
+
+/** Loopback remote paint route. A local-path override keeps its scheme, host, and port. */
+function ap_profile_native_remote_url(): ?string
+{
+    $base = getenv('VAAK_PROFILE_NATIVE_URL');
+    if (!is_string($base) || $base === '') {
+        return 'http://127.0.0.1:8787/internal/profile/remote';
+    }
+    $parts = parse_url($base);
+    if (!is_array($parts) || ($parts['path'] ?? '') !== '/internal/profile/local' || ($parts['scheme'] ?? '') !== 'http') {
+        return null;
+    }
+    $host = (string) ($parts['host'] ?? '');
+    if ($host === '') {
+        return null;
+    }
+    $port = isset($parts['port']) ? ':' . $parts['port'] : '';
+    return 'http://' . $host . $port . '/internal/profile/remote';
+}
+
 /** @param array<string,mixed> $reply */
 function ap_profile_native_validate_local(array $reply, array $binding): ?array
 {
@@ -57,6 +85,72 @@ function ap_profile_native_render_local(array $facts): ?array
     }
     $url = (string) (getenv('VAAK_PROFILE_NATIVE_URL') ?: 'http://127.0.0.1:8787/internal/profile/local');
     if (!ap_profile_native_url_allowed($url)) {
+        return null;
+    }
+    $binding = [
+        'actor' => $actor,
+        'tab' => (string) ($facts['tab'] ?? ''),
+        'from' => (string) ($facts['from'] ?? ''),
+    ];
+    try {
+        $body = json_encode(['protocol_version' => 1] + $facts + ['actor' => $actor], JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
+    } catch (Throwable $error) {
+        return null;
+    }
+    if (!is_string($body) || strlen($body) > 256 * 1024) {
+        return null;
+    }
+    $response = '';
+    $ch = curl_init($url);
+    if ($ch === false) {
+        return null;
+    }
+    curl_setopt_array($ch, [CURLOPT_POST => true, CURLOPT_POSTFIELDS => $body,
+        CURLOPT_HTTPHEADER => ['Content-Type: application/json', 'X-VAAK-Profile-Token: ' . getenv('VAAK_PROFILE_NATIVE_SECRET')],
+        CURLOPT_RETURNTRANSFER => false, CURLOPT_FOLLOWLOCATION => false, CURLOPT_MAXREDIRS => 0,
+        CURLOPT_WRITEFUNCTION => static function ($ch, string $chunk) use (&$response): int {
+            if (strlen($response) + strlen($chunk) > 2 * 1024 * 1024) {
+                return 0;
+            }
+            $response .= $chunk;
+            return strlen($chunk);
+        },
+        CURLOPT_CONNECTTIMEOUT_MS => 200, CURLOPT_TIMEOUT_MS => 3000,
+        CURLOPT_PROXY => '', CURLOPT_PROTOCOLS => CURLPROTO_HTTP]);
+    $success = curl_exec($ch);
+    $code = curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+    curl_close($ch);
+    if ($success === false || $code !== 200 || strlen($response) > 2 * 1024 * 1024) {
+        return null;
+    }
+    $reply = json_decode($response, true);
+    return is_array($reply) ? ap_profile_native_validate_local($reply, $binding) : null;
+}
+
+/**
+ * Paint a remote ActivityPub header, relationship row, and tabs. Null keeps
+ * the caller on the PHP template. Pins, Asks, Bluesky, guests, and writes stay
+ * on PHP. The same off switch and secret gate this route.
+ *
+ * @param array<string,mixed> $facts
+ * @return array{chrome:string,page_back:string,header:string,secondary:?string}|null
+ */
+function ap_profile_native_render_remote(array $facts): ?array
+{
+    if (!ap_profile_native_enabled() || !function_exists('curl_init')) {
+        return null;
+    }
+    $actor = rtrim(trim((string) ($facts['actor'] ?? '')), '/');
+    $lower = strtolower($actor);
+    if (!str_starts_with($actor, 'https://')
+        || preg_match('#^https://mkultra\.monster/users/[A-Za-z0-9_]+$#', $actor)
+        || str_contains($lower, 'bsky.app')
+        || str_starts_with($lower, 'https://bsky.')
+        || str_starts_with($lower, 'at://')) {
+        return null;
+    }
+    $url = ap_profile_native_remote_url();
+    if (!is_string($url) || !ap_profile_native_remote_url_allowed($url)) {
         return null;
     }
     $binding = [

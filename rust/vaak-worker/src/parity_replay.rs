@@ -53,6 +53,7 @@ fn produce(producer: &str, cases: &[InputCase]) -> Result<Vec<Value>> {
             "settings-fields" => settings_fields(&case.id)?,
             "follow-fallback" => follow_fallback(&case.input)?,
             "profile-local-chrome" => profile_local_chrome(&case.input)?,
+            "profile-remote-chrome" => profile_remote_chrome(&case.input)?,
             other => bail!("unknown producer {other}"),
         };
         Ok(json!({"id": case.id, "output": output}))
@@ -268,6 +269,11 @@ fn follow_fallback(input: &Value) -> Result<Value> {
 
 fn profile_local_chrome(input: &Value) -> Result<Value> {
     let painted = crate::profile_local::paint_local(input).map_err(anyhow::Error::msg)?;
+    Ok(json!({"chrome": painted.chrome, "secondary": painted.secondary}))
+}
+
+fn profile_remote_chrome(input: &Value) -> Result<Value> {
+    let painted = crate::profile_remote::paint_remote(input).map_err(anyhow::Error::msg)?;
     Ok(json!({"chrome": painted.chrome, "secondary": painted.secondary}))
 }
 
