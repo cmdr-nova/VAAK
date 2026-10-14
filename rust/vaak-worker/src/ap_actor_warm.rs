@@ -40,6 +40,9 @@ pub struct WarmJob {
     pub ts: i64,
     #[serde(default)]
     pub source: String,
+    /// Broken or explicitly stale avatars bypass the 12h freshness gate in PHP.
+    #[serde(default)]
+    pub force: bool,
 }
 
 impl WarmJob {
@@ -119,6 +122,7 @@ fn parse_job(item: &str) -> Option<WarmJob> {
                 } else {
                     j.source
                 },
+                force: j.force,
             });
         }
     }
@@ -128,6 +132,7 @@ fn parse_job(item: &str) -> Option<WarmJob> {
             actor: String::new(),
             ts: chrono::Utc::now().timestamp(),
             source: "plain".into(),
+            force: false,
         });
     }
     None
@@ -153,6 +158,7 @@ pub async fn enqueue(cfg: &Config, actor_id: &str, source: &str) -> Result<bool>
         actor: String::new(),
         ts: chrono::Utc::now().timestamp(),
         source: source.to_string(),
+        force: false,
     };
     let item = serde_json::to_string(&job)?;
     redis_util::queue_push(&mut q, QUEUE_NAME, &item).await?;
@@ -252,8 +258,19 @@ pub async fn backfill_flat_from_pg(cfg: &Config, limit: usize) -> Result<WarmOnc
                     || u.chars().all(|c| c.is_ascii_digit()) && u.len() >= 6
             })
             .unwrap_or(true);
-        if thin {
-            match enqueue(cfg, &actor_id, "pg-thin").await {
+        let icon_missing = icon
+            .as_deref()
+            .map(|value| {
+                let value = value.trim();
+                value.is_empty() || !value.starts_with("https://")
+            })
+            .unwrap_or(true);
+        // Fresh partial upserts are already queued by timeline paint. Retry an
+        // icon-less row only after it has had time to land, so this scan does
+        // not requeue the same actors every pass.
+        let icon_due = icon_missing && updated_older_than(&updated_at, 15);
+        if thin || icon_due {
+            match enqueue(cfg, &actor_id, if thin { "pg-thin" } else { "pg-icon" }).await {
                 Ok(true) => report.enqueued += 1,
                 Ok(false) => {}
                 Err(e) => {
@@ -270,7 +287,25 @@ pub async fn backfill_flat_from_pg(cfg: &Config, limit: usize) -> Result<WarmOnc
     Ok(report)
 }
 
-async fn spawn_php_warm(paths: &WarmPaths, actor_id: &str) -> Result<()> {
+fn updated_older_than(updated_at: &Option<String>, minutes: i64) -> bool {
+    let Some(raw) = updated_at.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
+        return true;
+    };
+    let parsed = chrono::DateTime::parse_from_rfc3339(raw)
+        .map(|t| t.timestamp())
+        .or_else(|_| {
+            chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S").map(|n| n.and_utc().timestamp())
+        })
+        .or_else(|_| {
+            chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S%.f").map(|n| n.and_utc().timestamp())
+        });
+    match parsed {
+        Ok(ts) => chrono::Utc::now().timestamp() - ts >= minutes * 60,
+        Err(_) => false,
+    }
+}
+
+async fn spawn_php_warm(paths: &WarmPaths, actor_id: &str, force: bool) -> Result<()> {
     if !paths.script.is_file() {
         bail!("ap-actor-warm script missing: {}", paths.script.display());
     }
@@ -280,6 +315,9 @@ async fn spawn_php_warm(paths: &WarmPaths, actor_id: &str) -> Result<()> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    if force {
+        cmd.arg("--force");
+    }
     if std::env::var_os("AP_DB_DSN").is_none() {
         cmd.env("AP_DB_DSN", "pgsql:dbname=novalandia");
     }
@@ -306,15 +344,20 @@ pub async fn process_batch(jobs: &[WarmJob]) -> Result<(usize, usize)> {
         return Ok((0, 0));
     }
     let paths = warm_paths();
-    let mut seen = std::collections::HashSet::new();
-    let mut actors: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut actors: Vec<(String, bool)> = Vec::new();
     for job in jobs {
         let Some(a) = normalize_actor_url(&job.actor_ref()) else {
             continue;
         };
-        if seen.insert(a.clone()) {
-            actors.push(a);
+        if let Some(index) = seen.get(&a).copied() {
+            if job.force {
+                actors[index].1 = true;
+            }
+            continue;
         }
+        seen.insert(a.clone(), actors.len());
+        actors.push((a, job.force));
     }
     if actors.is_empty() {
         return Ok((0, 0));
@@ -322,13 +365,13 @@ pub async fn process_batch(jobs: &[WarmJob]) -> Result<(usize, usize)> {
 
     let sem = Arc::new(Semaphore::new(MAX_CONCURRENT_PHP));
     let mut handles = Vec::with_capacity(actors.len());
-    for actor_id in actors {
+    for (actor_id, force) in actors {
         let permit = sem.clone().acquire_owned().await?;
         let paths = paths.clone();
         handles.push(tokio::spawn(async move {
             let _permit = permit;
             let started = Instant::now();
-            let res = spawn_php_warm(&paths, &actor_id).await;
+            let res = spawn_php_warm(&paths, &actor_id, force).await;
             let ms = started.elapsed().as_millis();
             (actor_id, res, ms)
         }));
@@ -434,6 +477,7 @@ pub async fn run_once_cli(cfg: &Config, actors: &[String]) -> Result<()> {
                 actor: String::new(),
                 ts: chrono::Utc::now().timestamp(),
                 source: "cli".into(),
+                force: false,
             })
         })
         .collect();
