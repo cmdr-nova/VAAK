@@ -18071,6 +18071,10 @@ function admin_render_masto_status_card(
     $boostHeader = '';
     // Preserve Announce event id across reblog unwrap for thin-boost AJAX hydrate.
     $announceEventId = (int) ($st['vaak_announce_event_id'] ?? 0);
+    // Captured before the reblog unwrap so the timeline id stays the boost's
+    // own id. The inner status id is what interactions use, not the poll key.
+    $outerStatusId = trim((string) ($st['id'] ?? ''));
+    $outerCreatedAt = (string) ($st['created_at'] ?? '');
     // Keep Mastodon reblog wrapper: show "X boosted" then the original author card.
     // Fav/bookmark/boost buttons below use the INNER status id + object URL — the
     // same keys Ice Cubes / Mastodon API clients see on status.reblog.
@@ -18800,6 +18804,26 @@ function admin_render_masto_status_card(
             $actionBase .= '&actor=' . rawurlencode($profileReturnActor);
         }
     }
+    $cardIsBoost = $boostHeader !== '' || $boostHydrate;
+    $cardSort = admin_tl_status_created_ts([
+        'created_at' => $cardIsBoost && $outerCreatedAt !== ''
+            ? $outerCreatedAt
+            : (string) ($st['created_at'] ?? ''),
+    ]);
+    $cardTimelineKey = '';
+    if (!$cardIsBoost && $isRss && $rssItemId > 0) {
+        $cardTimelineKey = 'rss:' . $rssItemId;
+    } elseif (!$cardIsBoost && $isBsky && str_starts_with($uri, 'at://')) {
+        $cardTimelineKey = 'bsky:' . rtrim($uri, '/');
+    }
+    $identityAttrs = admin_tl_card_identity_attrs([
+        'boost' => $cardIsBoost,
+        'timeline_key' => $cardTimelineKey,
+        'status_id' => $cardIsBoost ? $outerStatusId : (string) ($st['id'] ?? ''),
+        'note_id' => $cardIsBoost ? '' : $uri,
+        'announce_id' => $cardIsBoost && $announceEventId > 0 ? (string) $announceEventId : '',
+        'sort' => $cardSort,
+    ]);
     $createHydrateAttrs = '';
     if ($boostHydrate && $announceEventId > 0) {
         $createHydrateAttrs = ' data-boost-hydrate="1"'
@@ -18834,7 +18858,7 @@ function admin_render_masto_status_card(
             $plain, is_array($askRow) ? $askRow : [])) return;
     }
     ?>
-          <article class="tweet<?= $focused ? ' tweet-focus' : '' ?><?= ($boostHeader !== '' || $boostHydrate) ? ' tweet-boost' : '' ?><?= $isBsky ? ' tweet-bsky' : '' ?><?= $hideHeader ? ' tweet-embed-nohd' : '' ?>"<?= $focused ? ' id="status-focus"' : '' ?><?= $isRss && $rssItemId > 0 ? ' data-rss-item="' . (int) $rssItemId . '" data-timeline-key="rss:' . (int) $rssItemId . '"' : '' ?><?= $isBsky && str_starts_with($uri, 'at://') ? ' data-bsky-uri="' . h($uri) . '" data-bsky-cid="' . h($bskyCid) . '"' : '' ?><?= $createHydrateAttrs ?><?= $rankAttrs ?>>
+          <article class="tweet<?= $focused ? ' tweet-focus' : '' ?><?= ($boostHeader !== '' || $boostHydrate) ? ' tweet-boost' : '' ?><?= $isBsky ? ' tweet-bsky' : '' ?><?= $hideHeader ? ' tweet-embed-nohd' : '' ?>"<?= $focused ? ' id="status-focus"' : '' ?><?= $isRss && $rssItemId > 0 ? ' data-rss-item="' . (int) $rssItemId . '"' : '' ?><?= $isBsky && str_starts_with($uri, 'at://') ? ' data-bsky-uri="' . h($uri) . '" data-bsky-cid="' . h($bskyCid) . '"' : '' ?><?= $identityAttrs ?><?= $createHydrateAttrs ?><?= $rankAttrs ?>>
             <?php if ($boostHeader !== ''): ?><?= $boostHeader ?><?php endif; ?>
             <?php if (!$hideHeader): ?>
             <div class="tweet-hd">
@@ -19787,9 +19811,12 @@ function admin_render_boost_card(array $rb, array $followingIds, string $returnV
     $rankKey = $objectId !== '' ? $objectId : ($statusId !== '' ? 'status:' . $statusId : '');
     $rankAttrs = admin_home_rank_tracking_attrs('fedi', $rankKey, $targetActor);
     $timelineBoostKey = rtrim($boostId !== '' ? $boostId : $objectId, '/');
-    $timelineAttrs = $timelineBoostKey !== ''
-        ? ' data-timeline-key="' . h('boost:' . $timelineBoostKey) . '"'
-        : '';
+    $timelineAttrs = admin_tl_card_identity_attrs([
+        'boost' => true,
+        'timeline_key' => $timelineBoostKey,
+        'status_id' => rtrim($boostId, '/'),
+        'sort' => strtotime((string) $created) ?: 0,
+    ]);
     ?>
           <article class="tweet tweet-boost"<?= $rankAttrs ?><?= $timelineAttrs ?><?= ($innerSummary === '' && $objectId !== '' && str_starts_with($objectId, 'https://')) ? ' data-boost-hydrate-local="1" data-object-id="' . h($objectId) . '" data-return-view="' . h($returnView) . '"' : '' ?>>
             <div class="meta meta-row" style="color:var(--primary)"><i class="ph ph-repeat" aria-hidden="true"></i> <?= $boostWho ?> · <?= h(relative_time($created)) ?></div>
@@ -20311,7 +20338,11 @@ function admin_render_outbox_card(array $n, string $returnView): void
         ? admin_home_rank_tracking_attrs('fedi', $noteId, $actor)
         : '';
     ?>
-          <article class="tweet tweet-own"<?= $rankAttrs ?><?= $noteId !== '' ? ' id="note-' . h(md5($noteId)) . '" data-note-id="' . h($noteId) . '"' : '' ?>>
+          <article class="tweet tweet-own"<?= $rankAttrs ?><?= $noteId !== '' ? ' id="note-' . h(md5($noteId)) . '"' : '' ?><?= admin_tl_card_identity_attrs([
+              'status_id' => $ownQuoteStatusId,
+              'note_id' => $noteId,
+              'sort' => admin_tl_status_created_ts(['created_at' => $published]),
+          ]) ?>>
             <div class="tweet-hd">
               <?= admin_avatar_img($actor) ?>
               <div class="tweet-hd-main tweet-hd-main--fedi">
@@ -21838,6 +21869,64 @@ if ($isPartial && $view === 'status' && isset($_GET['thread'])) {
         }
     }
     $emitThread();
+}
+
+/**
+ * Identity attributes shared by the PHP and Rust timeline painters.
+ *
+ * A post carries both its Mastodon/local id and its ActivityPub URI so a poll
+ * painted by the other runtime matches the card already on screen. A boost is
+ * keyed only by the boost itself (status id and announce id), never by the
+ * original post, so a new boost still counts when the original is visible.
+ *
+ * @param array{boost?:bool,timeline_key?:string,status_id?:string,note_id?:string,announce_id?:string,sort?:int} $identity
+ */
+function admin_tl_card_identity_attrs(array $identity): string
+{
+    $boost = !empty($identity['boost']);
+    $statusId = rtrim(trim((string) ($identity['status_id'] ?? '')), '/');
+    $noteId = rtrim(trim((string) ($identity['note_id'] ?? '')), '/');
+    $announceId = rtrim(trim((string) ($identity['announce_id'] ?? '')), '/');
+    $key = rtrim(trim((string) ($identity['timeline_key'] ?? '')), '/');
+    if ($boost) {
+        $boostId = $statusId;
+        if (str_starts_with($boostId, 'boost:')) {
+            $boostId = substr($boostId, strlen('boost:'));
+        }
+        if ($key === '') {
+            if ($boostId !== '') {
+                $key = 'boost:' . $boostId;
+            } elseif ($announceId !== '') {
+                $key = 'boost:' . $announceId;
+            }
+        } elseif (!str_starts_with($key, 'boost:')) {
+            $key = 'boost:' . $key;
+        }
+        $statusId = $boostId;
+        // The boosted note is a different timeline row. Its URI stays off this
+        // card so a new boost still counts when the original is already shown.
+        $noteId = '';
+    } elseif ($key === '') {
+        $key = $statusId !== '' ? $statusId : $noteId;
+    }
+    $html = '';
+    if ($key !== '') {
+        $html .= ' data-timeline-key="' . htmlspecialchars($key, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '"';
+    }
+    if (!$boost && $noteId !== '') {
+        $html .= ' data-note-id="' . htmlspecialchars($noteId, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '"';
+    }
+    if ($statusId !== '') {
+        $html .= ' data-status-id="' . htmlspecialchars($statusId, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '"';
+    }
+    if ($boost && $announceId !== '') {
+        $html .= ' data-announce-id="' . htmlspecialchars($announceId, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '"';
+    }
+    $sort = (int) ($identity['sort'] ?? 0);
+    if ($sort > 0) {
+        $html .= ' data-sort="' . $sort . '"';
+    }
+    return $html;
 }
 
 /**
@@ -39343,24 +39432,88 @@ window.vaakBootStatusThread();
     return 'node:' + (tip.textContent || '').slice(0, 64);
   }
 
+  function timelineCardIsBoost(el) {
+    if (!el || !el.getAttribute) return false;
+    const timelineKey = el.getAttribute('data-timeline-key') || '';
+    if (timelineKey.indexOf('boost:') === 0) return true;
+    return !!(el.classList && el.classList.contains('tweet-boost'));
+  }
+
+  // Every id a card is allowed to claim. PHP and Rust disagree about which
+  // one is primary (local/Mastodon id, ActivityPub URI, announce id), so the
+  // counter treats any shared alias as the same post. A boost does not claim
+  // the original post's id.
+  function explicitCardAliases(el) {
+    const out = [];
+    const add = (raw) => {
+      const v = String(raw || '').trim().replace(/\/+$/, '');
+      if (!v || out.indexOf(v) !== -1) return;
+      out.push(v);
+    };
+    if (!el || !el.getAttribute) return out;
+    const tip = el.querySelector('.tweet-thread-seg--tip') || el;
+    const nodes = tip === el ? [el] : [el, tip];
+    nodes.forEach((node) => {
+      if (!node || !node.getAttribute) return;
+      const timelineKey = node.getAttribute('data-timeline-key') || '';
+      const boost = timelineCardIsBoost(node) || timelineCardIsBoost(el);
+      if (timelineKey) add(timelineKey);
+      if (boost) {
+        const announce = node.getAttribute('data-announce-id') || '';
+        if (announce) add('announce:' + String(announce).trim().replace(/\/+$/, ''));
+        return;
+      }
+      add(node.getAttribute('data-note-id'));
+      add(node.getAttribute('data-status-id'));
+      const bsky = node.getAttribute('data-bsky-uri') || '';
+      if (bsky) {
+        add(bsky);
+        add(bsky.indexOf('bsky:') === 0 ? bsky.slice(5) : ('bsky:' + bsky));
+      }
+      if (timelineKey.indexOf('bsky:') === 0) add(timelineKey.slice(5));
+      const rss = node.getAttribute('data-rss-item') || '';
+      if (rss) add('rss:' + rss);
+    });
+    return out;
+  }
+
+  function rememberTimelineCard(map, el) {
+    if (!el || !el.getAttribute) return;
+    const key = timelineCardKey(el);
+    if (key) map[key] = true;
+    explicitCardAliases(el).forEach((id) => { map[id] = true; });
+    const boost = timelineCardIsBoost(el);
+    const rid = el.getAttribute('data-rss-item') || '';
+    if (rid) map['rss:' + rid] = true;
+    const bsky = el.getAttribute('data-bsky-uri') || '';
+    if (bsky && !boost) map['bsky:' + bsky] = true;
+    const note = el.getAttribute('data-note-id') || '';
+    if (note && !boost) map[note.replace(/\/$/, '')] = true;
+    // A boost's permalink is the original post. Counting that link made the
+    // original look already-shown, and skipping it is what let a repainted
+    // copy of a visible post through when its id spelling differed.
+    if (boost) return;
+    el.querySelectorAll('a[href*="object="]').forEach((link) => {
+      const m = (link.getAttribute('href') || '').match(/[?&]object=([^&]+)/);
+      if (m) { try { map[decodeURIComponent(m[1]).replace(/\/$/, '')] = true; } catch (e) {} }
+    });
+  }
+
+  function cardIsKnown(map, el) {
+    const key = timelineCardKey(el);
+    if (key && map[key]) return true;
+    const aliases = explicitCardAliases(el);
+    for (let i = 0; i < aliases.length; i++) {
+      if (map[aliases[i]]) return true;
+    }
+    return false;
+  }
+
   function seenKeys() {
     const keys = {};
     const add = (scope) => {
       scope.querySelectorAll('article.tweet, .tweet-thread-seg').forEach((el) => {
-        const key = timelineCardKey(el);
-        if (key) keys[key] = true;
-        const timelineKey = el.getAttribute('data-timeline-key') || '';
-        if (timelineKey) keys['timeline:' + timelineKey] = true;
-        const rid = el.getAttribute('data-rss-item') || '';
-        if (rid) keys['rss:' + rid] = true;
-        const bsky = el.getAttribute('data-bsky-uri') || '';
-        if (bsky) keys['bsky:' + bsky] = true;
-        const note = el.getAttribute('data-note-id') || '';
-        if (note) keys[note.replace(/\/$/, '')] = true;
-        el.querySelectorAll('a[href*="object="]').forEach((link) => {
-          const m = (link.getAttribute('href') || '').match(/[?&]object=([^&]+)/);
-          if (m) { try { keys[decodeURIComponent(m[1]).replace(/\/$/, '')] = true; } catch (e) {} }
-        });
+        rememberTimelineCard(keys, el);
       });
     };
     add(items);
@@ -39412,20 +39565,22 @@ window.vaakBootStatusThread();
     const sourceKnown = Object.assign({}, known);
     let sourceCount = 0;
     cards.forEach((el) => {
-      const key = timelineCardKey(el);
-      if (!sourceKnown[key]) { sourceKnown[key] = true; sourceCount++; }
+      if (cardIsKnown(sourceKnown, el)) return;
+      rememberTimelineCard(sourceKnown, el);
+      sourceCount++;
     });
     const out = document.createElement('div');
     cards.forEach((el) => {
-      const key = timelineCardKey(el);
-      if (known[key]) return;
-      known[key] = true;
+      if (cardIsKnown(known, el)) return;
+      rememberTimelineCard(known, el);
       out.appendChild(el);
     });
     out.querySelectorAll('article.tweet-thread .tweet-thread-seg--ancestor').forEach((ancestor) => {
-      const key = timelineCardKey(ancestor);
+      const ancestorIds = {};
+      rememberTimelineCard(ancestorIds, ancestor);
       Array.from(out.children).forEach((candidate) => {
-        if (!candidate.classList.contains('tweet-thread') && timelineCardKey(candidate) === key) candidate.remove();
+        if (candidate.classList.contains('tweet-thread')) return;
+        if (cardIsKnown(ancestorIds, candidate)) candidate.remove();
       });
     });
     return {
@@ -39442,9 +39597,10 @@ window.vaakBootStatusThread();
     // standalone parent only when the new thread is actually inserted.
     scope.querySelectorAll('article.tweet-thread').forEach((thread) => {
       thread.querySelectorAll('.tweet-thread-seg--ancestor').forEach((ancestor) => {
-        const key = timelineCardKey(ancestor);
+        const ancestorIds = {};
+        rememberTimelineCard(ancestorIds, ancestor);
         Array.from(items.children).forEach((existing) => {
-          if (timelineCardKey(existing) === key) existing.remove();
+          if (cardIsKnown(ancestorIds, existing)) existing.remove();
         });
       });
     });
@@ -39521,6 +39677,15 @@ window.vaakBootStatusThread();
     incoming.innerHTML = html;
     reconcileThreadAncestors(incoming);
     items.insertAdjacentHTML('afterbegin', html);
+    // The inserted card is now the head. Move the poll cursor to its sort so
+    // the next check does not count the post the reader already sees.
+    incoming.querySelectorAll('article.tweet, article.tweet-thread').forEach((el) => {
+      const sort = parseInt(el.getAttribute('data-sort') || '0', 10) || 0;
+      if (sort > newestTs) {
+        newestTs = sort;
+        items.dataset.newest = String(newestTs);
+      }
+    });
     offset += count;
     items.dataset.offset = String(offset);
     if (typeof window.novaEnhanceTweetFolds === 'function') {
