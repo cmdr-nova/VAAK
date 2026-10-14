@@ -1160,8 +1160,9 @@ function ap_masto_api(string $method, string $path): void
         $limit = isset($_GET['limit']) ? (int) $_GET['limit'] : 10;
         $limit = max(1, min(30, $limit));
         $owner = ap_masto_trends_viewer_user_id();
+        ap_trends_replay_json('tags', $owner, $limit);
         $items = ap_masto_trends_tags($owner > 0 ? 30 : $limit, $owner);
-        ap_masto_json(ap_masto_trends_filter_for_owner($items, $owner, $limit));
+        ap_trends_emit_json('tags', $owner, $limit, ap_masto_trends_filter_for_owner($items, $owner, $limit));
         return;
     }
 
@@ -1170,7 +1171,8 @@ function ap_masto_api(string $method, string $path): void
         $limit = isset($_GET['limit']) ? (int) $_GET['limit'] : 10;
         $limit = max(1, min(20, $limit));
         $owner=ap_masto_trends_viewer_user_id();
-        ap_masto_json(ap_masto_trends_links($limit,$owner));
+        ap_trends_replay_json('links', $owner, $limit);
+        ap_trends_emit_json('links', $owner, $limit, ap_masto_trends_links($limit,$owner));
         return;
     }
 
@@ -1179,8 +1181,9 @@ function ap_masto_api(string $method, string $path): void
         $limit = isset($_GET['limit']) ? (int) $_GET['limit'] : 10;
         $limit = max(1, min(20, $limit));
         $owner = ap_masto_trends_viewer_user_id();
+        ap_trends_replay_json('statuses', $owner, $limit);
         $items = ap_masto_trends_statuses($owner > 0 ? 20 : $limit);
-        ap_masto_json(ap_masto_trends_filter_for_owner($items, $owner, $limit));
+        ap_trends_emit_json('statuses', $owner, $limit, ap_masto_trends_filter_for_owner($items, $owner, $limit));
         return;
     }
 

@@ -65,6 +65,7 @@ php_tests=(
   api/bin/schema-probe-cache-smoke.php
   api/bin/search-quote-preview-boundary-smoke.php
   api/bin/settings-parity-smoke.php
+  api/bin/trends-response-cache-smoke.php
 )
 
 # Drivers for isolated PHP fixtures. They do not open Postgres or a worker.

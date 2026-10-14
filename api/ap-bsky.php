@@ -9465,12 +9465,14 @@ function ap_bsky_hide_did_set(int $ownerUserId): array
 
 function ap_bsky_hide_did_set_clear_cache(?int $ownerUserId = null): void
 {
-    if (!isset($GLOBALS['ap_bsky_hide_did_cache']) || !is_array($GLOBALS['ap_bsky_hide_did_cache'])) return;
-    if ($ownerUserId === null || $ownerUserId < 1) {
-        $GLOBALS['ap_bsky_hide_did_cache'] = [];
-    } else {
-        unset($GLOBALS['ap_bsky_hide_did_cache'][$ownerUserId]);
+    if (isset($GLOBALS['ap_bsky_hide_did_cache']) && is_array($GLOBALS['ap_bsky_hide_did_cache'])) {
+        if ($ownerUserId === null || $ownerUserId < 1) {
+            $GLOBALS['ap_bsky_hide_did_cache'] = [];
+        } else {
+            unset($GLOBALS['ap_bsky_hide_did_cache'][$ownerUserId]);
+        }
     }
+    if (function_exists('ap_trends_policy_epoch_bump')) ap_trends_policy_epoch_bump($ownerUserId);
 }
 
 /**
