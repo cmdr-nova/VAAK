@@ -9,6 +9,67 @@ require_once __DIR__ . '/ap-asks.php';
 require_once __DIR__ . '/ap-normalize.php';
 require_once __DIR__ . '/ap-visibility.php';
 
+/** Drop a boost wrapper fragment so links name the original post. */
+function ap_masto_strip_announce_fragment(string $value): string
+{
+    $value = trim($value);
+    $stripped = preg_replace('/#announce-\d+$/', '', $value);
+    if (!is_string($stripped) || $stripped === $value) {
+        return $value;
+    }
+    return rtrim($stripped, '/');
+}
+
+/** True when this status is an empty boost/announce wrapper around reblog. */
+function ap_masto_status_is_boost_wrapper(array $status): bool
+{
+    if (!is_array($status['reblog'] ?? null)) {
+        return false;
+    }
+    $plain = trim(html_entity_decode(strip_tags((string) ($status['content'] ?? '')), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+    $uri = (string) ($status['uri'] ?? $status['url'] ?? '');
+    return $plain === '' || preg_match('/#announce-\d+$/', trim($uri)) === 1;
+}
+
+/**
+ * In-memory display form of a quoted status.
+ * Boost wrappers unwrap to the original post (at most four levels) so its
+ * media and id are the ones the quote card and post view already have.
+ * Wrapper media is carried onto an empty inner; parent media is not.
+ *
+ * @param array<string,mixed> $quoted
+ * @return array<string,mixed>
+ */
+function ap_masto_quoted_display_status(array $quoted): array
+{
+    for ($depth = 0; $depth < 4; $depth++) {
+        if (!ap_masto_status_is_boost_wrapper($quoted)) {
+            break;
+        }
+        $reblog = $quoted['reblog'];
+        if (!is_array($reblog)) {
+            break;
+        }
+        $innerMedia = $reblog['media_attachments'] ?? null;
+        $innerEmpty = !is_array($innerMedia) || $innerMedia === [];
+        $outerMedia = $quoted['media_attachments'] ?? null;
+        if ($innerEmpty && is_array($outerMedia) && $outerMedia !== []) {
+            $reblog['media_attachments'] = $outerMedia;
+        }
+        $quoted = $reblog;
+    }
+    foreach (['uri', 'url', 'id'] as $key) {
+        if (!isset($quoted[$key]) || !is_string($quoted[$key])) {
+            continue;
+        }
+        $stripped = ap_masto_strip_announce_fragment($quoted[$key]);
+        if ($stripped !== $quoted[$key]) {
+            $quoted[$key] = $stripped;
+        }
+    }
+    return $quoted;
+}
+
 /** Remove only exact quoted-asset copies from a parent's flattened media list. */
 function ap_masto_outer_media_without_quote_duplicates(array $status): array
 {
@@ -17,7 +78,7 @@ function ap_masto_outer_media_without_quote_duplicates(array $status): array
     if ($envelope === null || !is_array($envelope['quoted_status'] ?? null)) {
         return $outer;
     }
-    $quoted = $envelope['quoted_status'];
+    $quoted = ap_masto_quoted_display_status($envelope['quoted_status']);
     $media = is_array($quoted['media_attachments'] ?? null) ? $quoted['media_attachments'] : [];
     $assetUrl = static function ($attachment): ?string {
         if (!is_array($attachment)) return null;
@@ -4966,7 +5027,7 @@ function ap_masto_mention_target_object_id(string $objectId): string
     if (preg_match('/^(https:\/\/.+?)#(like|reblog|update|quote|bite|webmention)-[a-z0-9]+$/i', $objectId, $m)) {
         return rtrim($m[1], '/');
     }
-    return $objectId;
+    return ap_masto_strip_announce_fragment($objectId);
 }
 
 /**

@@ -7498,6 +7498,9 @@ if ($hydrateBoost || $hydrateCreate) {
     }
     require_once __DIR__ . '/ap-inbox.php';
     require_once __DIR__ . '/ap-masto-entities.php';
+    if (function_exists('ap_masto_mention_target_object_id')) {
+        $objectId = ap_masto_mention_target_object_id($objectId);
+    }
     if ($hydrateCreate) {
         if ($objectId === '' || !str_starts_with($objectId, 'https://')) {
             http_response_code(400);
@@ -13420,10 +13423,29 @@ function admin_object_is_bluesky_post(string $objectUrl): bool
     return function_exists('ap_quote_target_is_bluesky') && ap_quote_target_is_bluesky($objectUrl);
 }
 
+/**
+ * Absolute in-app URL for the overflow Copy link.
+ * Uses the same resolvable status id as Open, including boost originals.
+ */
+function admin_post_copy_button(string $objectUrl, string $from = 'home'): string
+{
+    $href = admin_status_href($objectUrl, $from);
+    if (!str_starts_with($href, '?view=status')) {
+        return '';
+    }
+    return '<button type="button" class="menu-action" data-copy-value="'
+        . h('https://mkultra.monster/vaak/' . $href)
+        . '" title="Copy link to post">Copy link</button>';
+}
+
 /** In-webview status detail link (Home / Federated / Notifications). */
 function admin_status_href(string $objectUrl, string $from = 'home'): string
 {
     $objectUrl = trim($objectUrl);
+    $stripped = preg_replace('/#announce-\d+$/', '', $objectUrl);
+    if (is_string($stripped) && $stripped !== $objectUrl) {
+        $objectUrl = rtrim($stripped, '/');
+    }
     if ($objectUrl === '') {
         return '#';
     }
@@ -13900,6 +13922,7 @@ function admin_own_post_overflow(
     $returnView = preg_replace('/[^a-z_]/', '', $returnView) ?: 'home';
     $from = preg_replace('/[^a-z_]/', '', $from) ?: '';
     $menu = '<a class="menu-action" href="' . h(admin_status_href($noteId, $returnView)) . '">Open</a>';
+    $menu .= admin_post_copy_button($noteId, $returnView);
     $menu .= admin_edit_post_button(
         $noteId,
         (string) ($edit['plain'] ?? ''),
@@ -14338,6 +14361,13 @@ function admin_quote_card_html(array $opts, string $returnView = 'home'): string
  */
 function admin_quote_opts_from_status(array $st, string $fallbackUrl = ''): array
 {
+    if (function_exists('ap_masto_quoted_display_status')) {
+        $st = ap_masto_quoted_display_status($st);
+    }
+    $fallbackStripped = preg_replace('/#announce-\d+$/', '', trim($fallbackUrl));
+    if (is_string($fallbackStripped)) {
+        $fallbackUrl = $fallbackStripped;
+    }
     foreach ([$st['uri'] ?? '', $st['url'] ?? '', $fallbackUrl] as $policyRef) {
         $policyKey = admin_library_quote_policy_key((string) $policyRef);
         if ($policyKey !== '') $GLOBALS['vaak_quote_policy_statuses'][$policyKey] = $st;
@@ -16997,7 +17027,7 @@ function admin_global_domain_control(string $host): ?array
 }
 
 /** Navigation-only overflow for guest and minimal post cards; never adds mutations. */
-function admin_post_navigation_menu_html(string $openHref, string $remoteHref = '', string $openLabel = 'Open', bool $externalOpen = false): string
+function admin_post_navigation_menu_html(string $openHref, string $remoteHref = '', string $openLabel = 'Open', bool $externalOpen = false, string $copyHref = ''): string
 {
     $menu = '';
     if ($openHref !== '') {
@@ -17006,6 +17036,12 @@ function admin_post_navigation_menu_html(string $openHref, string $remoteHref = 
     }
     if (str_starts_with($remoteHref, 'https://') || str_starts_with($remoteHref, 'http://')) {
         $menu .= '<a class="menu-action" href="' . h($remoteHref) . '" target="_blank" rel="noopener noreferrer">Remote</a>';
+    }
+    $copySource = $copyHref !== '' ? $copyHref : ((!$externalOpen && str_starts_with($openHref, '?view=status')) ? $openHref : '');
+    if (str_starts_with($copySource, '?view=status')) {
+        $menu .= '<button type="button" class="menu-action" data-copy-value="'
+            . h('https://mkultra.monster/vaak/' . $copySource)
+            . '" title="Copy link to post">Copy link</button>';
     }
     return $menu !== '' ? '<details class="post-action-menu">'
         . '<summary class="icon-btn" title="More actions" aria-label="More actions">⋯</summary>'
@@ -17094,6 +17130,7 @@ function block_quick_actions(?string $actorId, ?string $host, string $returnView
         $isBskyObject = str_contains(strtolower($objectId), 'bsky.app');
         $menu .= '<a class="menu-action" href="' . h(admin_remote_object_href($objectId, $objectUrlHint)) . '" target="_blank" rel="noopener noreferrer">'
             . ($isBskyObject ? 'Open on Bluesky' : 'Remote') . '</a>';
+        $menu .= admin_post_copy_button($objectId, $returnView);
     }
     // Protocol objects keep navigation in this same permission-aware menu.
     if ($objectId !== '' && !str_starts_with($objectId, 'https://') && $protocolShowOpen !== null) {
@@ -17104,6 +17141,7 @@ function block_quick_actions(?string $actorId, ?string $host, string $returnView
         if (str_starts_with($remoteHref, 'https://') || str_starts_with($remoteHref, 'http://')) {
             $menu .= '<a class="menu-action" href="' . h($remoteHref) . '" target="_blank" rel="noopener noreferrer">Remote</a>';
         }
+        $menu .= admin_post_copy_button($objectId, $returnView);
     }
     // Personal mute/block first — available to every signed-in user, including admins.
     // Don't offer personal actions for the signed-in actor itself.
@@ -18129,6 +18167,19 @@ function admin_render_masto_status_card(
             ? ('?view=remote_profile&actor=' . rawurlencode($actorRef) . '&from=' . rawurlencode($returnView))
             : '');
     $uri = (string) ($st['uri'] ?? $st['url'] ?? '');
+    $uriStripped = preg_replace('/#announce-\d+$/', '', $uri);
+    if (is_string($uriStripped) && $uriStripped !== $uri) {
+        $uri = rtrim($uriStripped, '/');
+        foreach (['uri', 'url'] as $announceKey) {
+            if (!isset($st[$announceKey]) || !is_string($st[$announceKey])) {
+                continue;
+            }
+            $fieldStripped = preg_replace('/#announce-\d+$/', '', $st[$announceKey]);
+            if (is_string($fieldStripped)) {
+                $st[$announceKey] = rtrim($fieldStripped, '/');
+            }
+        }
+    }
     $sidEarly = (string) ($st['id'] ?? '');
     $isRss = !empty($st['vaak_rss_item_id'])
         || (!empty($st['source']) && (string) $st['source'] === 'rss')
@@ -18326,7 +18377,10 @@ function admin_render_masto_status_card(
     // Prepare the existing cache-only synthetic quote lookup before media
     // partitioning, so the resolved quoted asset is never painted on the root.
     if (is_array($quote['quoted_status'] ?? null)) {
-        $qst = $quote['quoted_status'];
+        $qst = function_exists('ap_masto_quoted_display_status')
+            ? ap_masto_quoted_display_status($quote['quoted_status'])
+            : $quote['quoted_status'];
+        $quote['quoted_status'] = $qst;
         $qplain = admin_html_to_plain((string) ($qst['content'] ?? ''));
         $qacct = (string) ($qst['account']['acct'] ?? '');
         $quri = (string) ($qst['uri'] ?? $qst['url'] ?? '');
@@ -18923,13 +18977,15 @@ function admin_render_masto_status_card(
                   <span class="meta has-count" aria-label="<?= h($countLabel[1] . ' (' . admin_format_compact_count($guestCount) . ')') ?>"><i class="ph <?= h($countLabel[0]) ?>" aria-hidden="true"></i><?= admin_action_count_html($guestCount) ?></span>
                 <?php endforeach; endif; ?>
                 <?php if ($uri !== ''): ?>
-                  <?= admin_post_navigation_menu_html($showOpen ? admin_status_href($uri, $returnView) : '', admin_remote_object_href($uri, $st['url'] ?? null)) ?>
+                  <?php $guestStatusHref = admin_status_href($uri, $returnView); ?>
+                  <?= admin_post_navigation_menu_html($showOpen ? $guestStatusHref : '', admin_remote_object_href($uri, $st['url'] ?? null), 'Open', false, $guestStatusHref) ?>
                 <?php endif; ?>
               <?php elseif ($isRss): ?>
                 <?php
                   $rssOverflow = '';
                   if ($uri !== '' && preg_match('#^https?://#i', $uri)) {
                       $rssOverflow .= '<a class="menu-action" href="' . h($uri) . '" target="_blank" rel="noopener noreferrer">Open</a>';
+                      $rssOverflow .= admin_post_copy_button($uri, $returnView);
                   }
                   if ($rssFeedId > 0) {
                       $rssOverflow .= '<form method="post" action="?view=' . h($returnView) . '" onsubmit="return confirm(\'Remove this RSS feed from your Home mix?\');">'
@@ -19190,7 +19246,8 @@ function admin_render_masto_status_card(
                 $statusQuickActions = block_quick_actions($actorRef, short_host($actorRef), $returnView, admin_owner_user_id(), !empty($GLOBALS['vaak_is_admin']), $returnView, $uri, $st['url'] ?? null, $showOpen);
                 // Own actors have no moderation menu; retain their GET navigation.
                 if ($uri !== '' && $statusQuickActions === '') {
-                    echo admin_post_navigation_menu_html($showOpen ? admin_status_href($uri, $returnView) : '', admin_remote_object_href($uri, $st['url'] ?? null));
+                    $navStatusHref = admin_status_href($uri, $returnView);
+                    echo admin_post_navigation_menu_html($showOpen ? $navStatusHref : '', admin_remote_object_href($uri, $st['url'] ?? null), 'Open', false, $navStatusHref);
                 }
                 echo $statusQuickActions;
               ?>
