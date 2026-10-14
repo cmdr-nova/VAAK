@@ -199,6 +199,49 @@ function ap_masto_timeline_base_url(string $path): string
  * @param list<array<string,mixed>> $statuses
  * @param array<string,scalar|null> $extraQuery
  */
+/**
+ * Link header for a timeline page. next is max_id of the last id and prev is
+ * min_id of the first id. since_id is never written here. The limit is the
+ * requested limit, including a value the list itself will clamp.
+ *
+ * @param list<array<string,mixed>> $statuses
+ * @param array<string,scalar|null> $extraQuery
+ */
+function ap_masto_timeline_link(array $statuses, string $path, int $limit, array $extraQuery = []): string
+{
+    if (!$statuses) {
+        return '';
+    }
+    $first = (string) ($statuses[0]['id'] ?? '');
+    $last = (string) ($statuses[count($statuses) - 1]['id'] ?? '');
+    $base = ap_masto_timeline_base_url($path);
+    $parts = [];
+    if ($last !== '') {
+        $q = array_merge(['limit' => $limit, 'max_id' => $last], $extraQuery);
+        $parts[] = '<' . $base . '?' . http_build_query($q) . '>; rel="next"';
+    }
+    if ($first !== '') {
+        $q = array_merge(['limit' => $limit, 'min_id' => $first], $extraQuery);
+        $parts[] = '<' . $base . '?' . http_build_query($q) . '>; rel="prev"';
+    }
+    return $parts ? implode(', ', $parts) : '';
+}
+
+/**
+ * Favourites and bookmarks read limit and max_id only. since_id and min_id
+ * on those requests do not move the page.
+ *
+ * @param array<string,mixed> $query
+ * @return array{limit:int,max_id:?string}
+ */
+function ap_masto_library_list_request(array $query): array
+{
+    return [
+        'limit' => isset($query['limit']) ? (int) $query['limit'] : 40,
+        'max_id' => array_key_exists('max_id', $query) ? (string) $query['max_id'] : null,
+    ];
+}
+
 function ap_masto_json_timeline(array $statuses, string $path, int $limit, array $extraQuery = []): void
 {
     if ($path === '/api/v1/timelines/home') {
@@ -206,22 +249,9 @@ function ap_masto_json_timeline(array $statuses, string $path, int $limit, array
         header('Pragma: no-cache');
         header('Expires: 0');
     }
-    if ($statuses) {
-        $first = (string) ($statuses[0]['id'] ?? '');
-        $last = (string) ($statuses[count($statuses) - 1]['id'] ?? '');
-        $base = ap_masto_timeline_base_url($path);
-        $parts = [];
-        if ($last !== '') {
-            $q = array_merge(['limit' => $limit, 'max_id' => $last], $extraQuery);
-            $parts[] = '<' . $base . '?' . http_build_query($q) . '>; rel="next"';
-        }
-        if ($first !== '') {
-            $q = array_merge(['limit' => $limit, 'min_id' => $first], $extraQuery);
-            $parts[] = '<' . $base . '?' . http_build_query($q) . '>; rel="prev"';
-        }
-        if ($parts) {
-            header('Link: ' . implode(', ', $parts));
-        }
+    $link = ap_masto_timeline_link($statuses, $path, $limit, $extraQuery);
+    if ($link !== '') {
+        header('Link: ' . $link);
     }
     ap_masto_json($statuses);
 }
@@ -2630,16 +2660,14 @@ function ap_masto_api(string $method, string $path): void
 
     if ($path === '/api/v1/favourites' && $method === 'GET') {
         ap_masto_require_token('read');
-        $limit = isset($_GET['limit']) ? (int) $_GET['limit'] : 40;
-        $maxId = isset($_GET['max_id']) ? (string) $_GET['max_id'] : null;
-        ap_masto_json_timeline(ap_masto_favourites_list($limit, $maxId), '/api/v1/favourites', $limit);
+        $libraryPage = ap_masto_library_list_request($_GET);
+        ap_masto_json_timeline(ap_masto_favourites_list($libraryPage['limit'], $libraryPage['max_id']), '/api/v1/favourites', $libraryPage['limit']);
         return;
     }
     if ($path === '/api/v1/bookmarks' && $method === 'GET') {
         ap_masto_require_token('read');
-        $limit = isset($_GET['limit']) ? (int) $_GET['limit'] : 40;
-        $maxId = isset($_GET['max_id']) ? (string) $_GET['max_id'] : null;
-        ap_masto_json_timeline(ap_masto_bookmarks_list($limit, $maxId), '/api/v1/bookmarks', $limit);
+        $libraryPage = ap_masto_library_list_request($_GET);
+        ap_masto_json_timeline(ap_masto_bookmarks_list($libraryPage['limit'], $libraryPage['max_id']), '/api/v1/bookmarks', $libraryPage['limit']);
         return;
     }
 
