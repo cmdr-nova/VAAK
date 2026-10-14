@@ -514,6 +514,49 @@ pub(super) fn render(status: &Value, facts: &CardFacts) -> Result<String> {
 fn render_core(status:&Value,facts:&CardFacts,direct:Option<&crate::direct_context::DirectPresentation>,prepared_preview:Option<&Option<Value>>)->Result<String>{
     render_core_mode(status,facts,direct,prepared_preview,false,false)
 }
+
+/// Same attribute order as PHP `admin_tl_card_identity_attrs`. A boost keeps
+/// the outer status id and does not claim the boosted note.
+fn poll_identity_attrs(boost: bool, timeline_key: &str, status_id: &str, note_id: &str, announce_id: &str, sort: i64) -> String {
+    let mut status_id = status_id.trim().trim_end_matches('/').to_string();
+    let mut note_id = note_id.trim().trim_end_matches('/').to_string();
+    let announce_id = announce_id.trim().trim_end_matches('/').to_string();
+    let mut key = timeline_key.trim().trim_end_matches('/').to_string();
+    if boost {
+        if let Some(rest) = status_id.strip_prefix("boost:") {
+            status_id = rest.to_string();
+        }
+        if key.is_empty() {
+            if !status_id.is_empty() {
+                key = format!("boost:{status_id}");
+            } else if !announce_id.is_empty() {
+                key = format!("boost:{announce_id}");
+            }
+        } else if !key.starts_with("boost:") {
+            key = format!("boost:{key}");
+        }
+        note_id.clear();
+    } else if key.is_empty() {
+        key = if !status_id.is_empty() { status_id.clone() } else { note_id.clone() };
+    }
+    let mut html = String::new();
+    if !key.is_empty() {
+        html.push_str(&format!(" data-timeline-key=\"{}\"", esc(&key)));
+    }
+    if !boost && !note_id.is_empty() {
+        html.push_str(&format!(" data-note-id=\"{}\"", esc(&note_id)));
+    }
+    if !status_id.is_empty() {
+        html.push_str(&format!(" data-status-id=\"{}\"", esc(&status_id)));
+    }
+    if boost && !announce_id.is_empty() {
+        html.push_str(&format!(" data-announce-id=\"{}\"", esc(&announce_id)));
+    }
+    if sort > 0 {
+        html.push_str(&format!(" data-sort=\"{sort}\""));
+    }
+    html
+}
 fn render_core_mode(status:&Value,facts:&CardFacts,direct:Option<&crate::direct_context::DirectPresentation>,prepared_preview:Option<&Option<Value>>,read_only:bool,silent:bool)->Result<String>{
     if status.get("media_attachments").and_then(Value::as_array).is_some_and(|media| media.iter().any(|attachment|
         attachment.get("url").and_then(Value::as_str).unwrap_or("").is_empty()
@@ -525,9 +568,15 @@ fn render_core_mode(status:&Value,facts:&CardFacts,direct:Option<&crate::direct_
     let status = fresh_rss.as_ref().unwrap_or(status);
     let is_rss = fresh_rss.is_some();
     let mut st = status;
+    let outer_id = scalar_string(status, "id").trim().trim_end_matches('/').to_string();
+    let outer_created = string(status, "created_at").to_string();
+    let mut announce_id = integer(status, "vaak_announce_event_id");
     let mut boost = String::new();
     if plain(string(status, "content")).is_empty() {
         if let Some(inner) = status.get("reblog").filter(|v| v.is_object()) {
+            if announce_id < 1 {
+                announce_id = integer(inner, "vaak_announce_event_id");
+            }
             let account = status.get("account").unwrap_or(&Value::Null);
             let actor_ref=account_actor_ref(account);
             let actor = actor_ref.as_str();
@@ -565,12 +614,26 @@ fn render_core_mode(status:&Value,facts:&CardFacts,direct:Option<&crate::direct_
         && !st.get("quote").is_some_and(Value::is_object) && facts.poll_row.is_none() && facts.ask_row.is_none() && !st.get("vaak_ask").is_some_and(Value::is_object) && !st.get("card").is_some_and(Value::is_object);
     let boost_hydrate = degraded && string(st,"vaak_degraded_reason")=="announce_only" && integer(st,"vaak_announce_event_id")>0;
     let hydrate_attrs = if boost_hydrate { format!(" data-boost-hydrate=\"1\" data-event-id=\"{}\" data-object-id=\"{}\" data-return-view=\"{}\"",integer(st,"vaak_announce_event_id"),esc(uri),esc(&facts.return_view)) } else if degraded { format!(" data-create-hydrate=\"1\" data-object-id=\"{}\" data-return-view=\"{}\"", esc(uri), esc(&facts.return_view)) } else { String::new() };
-    let rss_attrs = if is_rss { format!(" data-rss-item=\"{}\" data-timeline-key=\"rss:{}\"",integer(st,"vaak_rss_item_id"),integer(st,"vaak_rss_item_id")) } else { String::new() };
-    let rank_attrs = if is_rss { format!(" data-rank-platform=\"rss\" data-rank-key=\"rss:item:{}\" data-rank-actor=\"rss:feed:{}\"",integer(st,"vaak_rss_item_id"),integer(st,"vaak_rss_feed_id")) } else { String::new() };
-    let protocol_attrs=if is_bsky {super::bsky::normalized_attrs(st)}else{String::new()};
+    let rss_id = integer(st, "vaak_rss_item_id");
+    let rss_attrs = if is_rss { format!(" data-rss-item=\"{rss_id}\"") } else { String::new() };
+    let (bsky_attrs, bsky_rank) = if is_bsky { super::bsky::normalized_attr_parts(st) } else { (String::new(), String::new()) };
+    let rank_attrs = if is_rss { format!(" data-rank-platform=\"rss\" data-rank-key=\"rss:item:{rss_id}\" data-rank-actor=\"rss:feed:{}\"", integer(st, "vaak_rss_feed_id")) } else { bsky_rank };
+    let card_is_boost = !boost.is_empty() || boost_hydrate;
+    let displayed_id = scalar_string(st, "id");
+    let timeline_key = if !card_is_boost && is_rss && rss_id > 0 {
+        format!("rss:{rss_id}")
+    } else if !card_is_boost && is_bsky && uri.trim().starts_with("at://") {
+        format!("bsky:{}", uri.trim().trim_end_matches('/'))
+    } else {
+        String::new()
+    };
+    let sort_raw = if card_is_boost && !outer_created.is_empty() { outer_created.as_str() } else { string(st, "created_at") };
+    let sort_ts = crate::timeline::status_created_ts(&serde_json::json!({ "created_at": sort_raw }));
+    let announce = if card_is_boost && announce_id > 0 { announce_id.to_string() } else { String::new() };
+    let identity_attrs = poll_identity_attrs(card_is_boost, &timeline_key, if card_is_boost { outer_id.as_str() } else { displayed_id.as_str() }, if card_is_boost { "" } else { uri }, &announce, sort_ts);
     let focused=direct.is_some_and(|options|options.focused());
     let hide_header=direct.is_some_and(|options|options.hide_header());
-    let mut html = format!("<article class=\"tweet{}{}{}{}\"{}{rss_attrs}{protocol_attrs}{hydrate_attrs}{rank_attrs}>{boost}",if focused {" tweet-focus"}else{""}, if boost.is_empty()&&!boost_hydrate { "" } else { " tweet-boost" },if is_bsky {" tweet-bsky"}else{""},if hide_header {" tweet-embed-nohd"}else{""},if focused {" id=\"status-focus\""}else{""});
+    let mut html = format!("<article class=\"tweet{}{}{}{}\"{}{rss_attrs}{bsky_attrs}{identity_attrs}{hydrate_attrs}{rank_attrs}>{boost}",if focused {" tweet-focus"}else{""}, if boost.is_empty()&&!boost_hydrate { "" } else { " tweet-boost" },if is_bsky {" tweet-bsky"}else{""},if hide_header {" tweet-embed-nohd"}else{""},if focused {" id=\"status-focus\""}else{""});
     if !hide_header {
     html.push_str("<div class=\"tweet-hd\">");
     if is_rss { html.push_str(&format!("<img class=\"tweet-av\" src=\"{}\" alt=\"\" width=\"40\" height=\"40\" loading=\"lazy\" decoding=\"async\" referrerpolicy=\"no-referrer\" onerror=\"this.onerror=null;this.src='https://mkultra.monster/img/avatar/default.webp'\">",esc(string(account,"avatar")))); }
