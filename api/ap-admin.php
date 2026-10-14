@@ -5190,6 +5190,74 @@ function admin_render_library_network_items(array $items, string $network, strin
 }
 
 /**
+ * Soft-nav bookmark folder tabs. Titles are escaped; counts stay on the full page.
+ *
+ * @param list<array<string,mixed>> $folders
+ */
+function admin_bookmark_folder_soft_nav_html(array $folders, int $selected): string
+{
+    $html = '<nav class="notification-tabs" aria-label="Bookmark folders" style="display:flex;gap:.5rem;flex-wrap:wrap;margin:0 0 1rem">';
+    $html .= '<a class="btn ' . ($selected < 1 ? 'btn-primary' : 'btn-ghost')
+        . '" href="?view=bookmarks" data-vaak-soft-nav="bookmarks" style="padding:.3rem .7rem;font-size:.82rem">All</a>';
+    foreach ($folders as $bf) {
+        $bfid = (int) ($bf['id'] ?? 0);
+        if ($bfid < 1) {
+            continue;
+        }
+        $html .= '<a class="btn ' . ($selected === $bfid ? 'btn-primary' : 'btn-ghost')
+            . '" href="?view=bookmarks&amp;folder=' . $bfid
+            . '" data-vaak-soft-nav="bookmarks" data-bm-folder="' . $bfid
+            . '" style="padding:.3rem .7rem;font-size:.82rem">'
+            . h((string) ($bf['title'] ?? 'Folder')) . '</a>';
+    }
+    return $html . '</nav>';
+}
+
+/**
+ * Full Bookmarks folder chrome: All, each folder with its count, create, and
+ * delete for the open folder. PHP still owns create/delete/move writes.
+ *
+ * @param list<array<string,mixed>> $folders
+ */
+function admin_bookmark_folder_page_html(array $folders, int $selected, string $csrf): string
+{
+    $links = '<a class="btn ' . ($selected < 1 ? 'btn-primary' : 'btn-ghost')
+        . '" href="?view=bookmarks" data-vaak-soft-nav="bookmarks" style="padding:.3rem .7rem;font-size:.82rem">All</a>';
+    foreach ($folders as $bf) {
+        $bfid = (int) ($bf['id'] ?? 0);
+        $links .= '<a class="btn ' . ($selected === $bfid ? 'btn-primary' : 'btn-ghost')
+            . '" href="?view=bookmarks&amp;folder=' . $bfid
+            . '" data-vaak-soft-nav="bookmarks" data-bm-folder="' . $bfid
+            . '" style="padding:.3rem .7rem;font-size:.82rem">'
+            . h((string) ($bf['title'] ?? 'Folder'))
+            . ' <span class="meta">(' . (int) ($bf['item_count'] ?? 0) . ')</span></a>';
+    }
+    $html = '<section class="side-card" style="margin-bottom:1rem">'
+        . '<div style="display:flex;flex-wrap:wrap;gap:.45rem;align-items:center;margin-bottom:.65rem">'
+        . $links
+        . '</div>'
+        . '<form method="post" action="?view=bookmarks" class="composer" style="margin:0;display:flex;gap:.5rem;flex-wrap:wrap;align-items:center">'
+        . '<input type="hidden" name="csrf" value="' . h($csrf) . '">'
+        . '<input type="hidden" name="action" value="bookmark_folder_create">'
+        . '<input type="hidden" name="return_view" value="bookmarks">'
+        . '<input name="title" maxlength="80" placeholder="New folder name…" required style="flex:1;min-width:10rem">'
+        . '<button class="btn btn-ghost" type="submit">Create folder</button>'
+        . '</form>'
+        . '<div class="meta" style="margin-top:.55rem">Folders are VAAK-only.</div>'
+        . '</section>';
+    if ($selected > 0) {
+        $html .= '<form method="post" action="?view=bookmarks" style="margin:0 0 1rem" onsubmit="return confirm(\'Delete this folder? Bookmarks stay saved under All.\');">'
+            . '<input type="hidden" name="csrf" value="' . h($csrf) . '">'
+            . '<input type="hidden" name="action" value="bookmark_folder_delete">'
+            . '<input type="hidden" name="return_view" value="bookmarks">'
+            . '<input type="hidden" name="folder_id" value="' . $selected . '">'
+            . '<button class="btn btn-ghost" type="submit" style="color:var(--danger)">Delete this folder</button>'
+            . '</form>';
+    }
+    return $html;
+}
+
+/**
  * @param list<array<string,mixed>> $items
  */
 function admin_bookmark_fragment_markup(string $network, array $items, int $nextOffset, int $limit, bool $hasMore, int $folderId, bool $firstPage, bool $refreshing): string
@@ -6136,23 +6204,7 @@ if (isset($_GET['partial'], $_GET['shell'])
     echo '<div class="feed timeline-feed">';
     $bmFolders = function_exists('vaak_bookmark_folders_list')
         ? vaak_bookmark_folders_list($vaakOwnerId) : [];
-    if ($bmFolders !== [] || true) {
-        echo '<nav class="notification-tabs" aria-label="Bookmark folders" style="display:flex;gap:.5rem;flex-wrap:wrap;margin:0 0 1rem">';
-        echo '<a class="btn ' . ($bmFolderFilter < 1 ? 'btn-primary' : 'btn-ghost')
-            . '" href="?view=bookmarks" data-vaak-soft-nav="bookmarks" style="padding:.3rem .7rem;font-size:.82rem">All</a>';
-        foreach ($bmFolders as $bf) {
-            $bfid = (int) ($bf['id'] ?? 0);
-            if ($bfid < 1) {
-                continue;
-            }
-            echo '<a class="btn ' . ($bmFolderFilter === $bfid ? 'btn-primary' : 'btn-ghost')
-                . '" href="?view=bookmarks&amp;folder=' . $bfid
-                . '" data-vaak-soft-nav="bookmarks" data-bm-folder="' . $bfid
-                . '" style="padding:.3rem .7rem;font-size:.82rem">'
-                . h((string) ($bf['title'] ?? 'Folder')) . '</a>';
-        }
-        echo '</nav>';
-    }
+    echo admin_bookmark_folder_soft_nav_html($bmFolders, $bmFolderFilter);
     echo '<div id="bookmarks-slot" data-folder="' . (int) $bmFolderFilter
         . '" data-limit="' . (int) $bookmarkLimit . '" aria-live="polite">'
         . '<div data-bookmark-sentinel class="meta" style="padding:1rem 0 2rem;text-align:center">'
@@ -29092,35 +29144,7 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
               && function_exists('ap_bsky_session_row')
               && ap_bsky_session_row($vaakOwnerId) !== null;
         ?>
-        <section class="side-card" style="margin-bottom:1rem">
-          <div style="display:flex;flex-wrap:wrap;gap:.45rem;align-items:center;margin-bottom:.65rem">
-            <a class="btn <?= $bmFolderFilter < 1 ? 'btn-primary' : 'btn-ghost' ?>" href="?view=bookmarks" data-vaak-soft-nav="bookmarks" style="padding:.3rem .7rem;font-size:.82rem">All</a>
-            <?php foreach ($bmFolders as $bf): ?>
-              <?php $bfid = (int) ($bf['id'] ?? 0); ?>
-              <a class="btn <?= $bmFolderFilter === $bfid ? 'btn-primary' : 'btn-ghost' ?>" href="?view=bookmarks&amp;folder=<?= $bfid ?>" data-vaak-soft-nav="bookmarks" data-bm-folder="<?= $bfid ?>" style="padding:.3rem .7rem;font-size:.82rem">
-                <?= h((string) ($bf['title'] ?? 'Folder')) ?>
-                <span class="meta">(<?= (int) ($bf['item_count'] ?? 0) ?>)</span>
-              </a>
-            <?php endforeach; ?>
-          </div>
-          <form method="post" action="?view=bookmarks" class="composer" style="margin:0;display:flex;gap:.5rem;flex-wrap:wrap;align-items:center">
-            <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
-            <input type="hidden" name="action" value="bookmark_folder_create">
-            <input type="hidden" name="return_view" value="bookmarks">
-            <input name="title" maxlength="80" placeholder="New folder name…" required style="flex:1;min-width:10rem">
-            <button class="btn btn-ghost" type="submit">Create folder</button>
-          </form>
-          <div class="meta" style="margin-top:.55rem">Folders are VAAK-only.</div>
-        </section>
-        <?php if ($bmFolderFilter > 0): ?>
-          <form method="post" action="?view=bookmarks" style="margin:0 0 1rem" onsubmit="return confirm('Delete this folder? Bookmarks stay saved under All.');">
-            <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
-            <input type="hidden" name="action" value="bookmark_folder_delete">
-            <input type="hidden" name="return_view" value="bookmarks">
-            <input type="hidden" name="folder_id" value="<?= $bmFolderFilter ?>">
-            <button class="btn btn-ghost" type="submit" style="color:var(--danger)">Delete this folder</button>
-          </form>
-        <?php endif; ?>
+        <?= admin_bookmark_folder_page_html($bmFolders, $bmFolderFilter, ap_auth_csrf_token()) ?>
         <div id="bookmarks-slot" data-folder="<?= (int) $bmFolderFilter ?>" data-limit="<?= (int) $bookmarkLimit ?>" aria-live="polite">
           <div data-bookmark-sentinel class="meta" style="padding:1rem 0 2rem;text-align:center"><?= admin_scroll_loading_html() ?></div>
         </div>
