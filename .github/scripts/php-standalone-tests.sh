@@ -54,6 +54,8 @@ php_tests=(
   api/bin/library-native-bridge-test.php
   api/bin/profile-local-chrome-capture.php
   api/bin/profile-local-native-bridge-test.php
+  api/bin/profile-remote-chrome-capture.php
+  api/bin/profile-remote-native-bridge-test.php
   api/bin/library-own-cw-smoke.php
   api/bin/migration-php-reference-smoke.php
   api/bin/moderation-alias-cache-smoke.php
