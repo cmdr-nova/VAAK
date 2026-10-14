@@ -11,9 +11,21 @@ declare(strict_types=1);
  *
  * Posts go out through the ordinary publisher as text plus one image with
  * alt text and a link back to the player's VAAK profile.
+ *
+ * Only the Strains card is offered. level_up, rare_find, and win still have
+ * suggestion text, but they have no game action yet, so they stay off
+ * AP_PHYRIAN_MOMENTS_ALLOWED. Add a kind back to that list to offer it
+ * again. Stored posts stay in place.
  */
 
 const AP_PHYRIAN_MOMENTS_TEXT_MAX = 500;
+
+/**
+ * Kinds the hub shows and publish accepts.
+ *
+ * @var list<string>
+ */
+const AP_PHYRIAN_MOMENTS_ALLOWED = ['card'];
 
 function ap_phyrian_moments_enabled(): bool
 {
@@ -135,6 +147,9 @@ function ap_phyrian_moments_snapshot(int $ownerUserId, ?PDO $db = null): array
 /**
  * Suggested post for a moment the player can actually share. Null means
  * that moment is not available from the synced row.
+ *
+ * Publish accepts only AP_PHYRIAN_MOMENTS_ALLOWED. The other suggestions
+ * stay here so a kind can be offered again by adding it to that list.
  *
  * @param array<string, mixed>|null $player
  */
@@ -399,6 +414,8 @@ function ap_phyrian_moments_hub_html(?array $player, string $actorKey, string $c
     }
     $url = ap_phyrian_moments_profile_url($actorKey);
     $player = is_array($player) ? ap_phyrian_moments_normalize($player) : null;
+    // Labels for kinds that are not offered stay here. The allowlist above
+    // decides what the hub actually prints.
     $kinds = [
         'level_up' => 'Level-up',
         'rare_find' => 'Rare find',
@@ -407,6 +424,9 @@ function ap_phyrian_moments_hub_html(?array $player, string $actorKey, string $c
     ];
     $blocks = [];
     foreach ($kinds as $kind => $label) {
+        if (!in_array($kind, AP_PHYRIAN_MOMENTS_ALLOWED, true)) {
+            continue;
+        }
         $suggestion = ap_phyrian_moments_suggestion($kind, $player, $url);
         if ($suggestion === null) {
             continue;
@@ -458,7 +478,7 @@ function ap_phyrian_moments_publish(
     if (!$confirmed) {
         return ['ok' => false, 'error' => 'Confirm the post before sharing it.'];
     }
-    if (!in_array($kind, ['level_up', 'rare_find', 'win', 'card'], true)) {
+    if (!in_array($kind, AP_PHYRIAN_MOMENTS_ALLOWED, true)) {
         return ['ok' => false, 'error' => 'Unknown moment.'];
     }
     $profileUrl = ap_phyrian_moments_profile_url($actorKey);
