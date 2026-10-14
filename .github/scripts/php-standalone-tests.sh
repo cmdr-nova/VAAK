@@ -89,4 +89,19 @@ for test in "${other_tests[@]}"; do
   python3 "$test"
 done
 
-echo "standalone tests: $((${#php_tests[@]} + ${#other_tests[@]})) passed"
+if ! command -v node >/dev/null 2>&1; then
+  echo "node is not on PATH" >&2
+  exit 127
+fi
+node_tests=(
+  api/bin/timeline-new-posts-poll-regression.js
+  api/bin/notif-badge-poll-regression.js
+)
+for test in "${node_tests[@]}"; do
+  echo "==> ${test}"
+  node "$test"
+done
+echo "==> api/bin/notif-badge-poll-regression.js --without-abort-controller"
+node api/bin/notif-badge-poll-regression.js --without-abort-controller
+
+echo "standalone tests: $((${#php_tests[@]} + ${#other_tests[@]} + ${#node_tests[@]} + 1)) passed"

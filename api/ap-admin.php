@@ -36731,13 +36731,16 @@ if (!empty($GLOBALS['vaak_profile_shell'])) {
   function renderCurrentInboxTitle() {
     const n = notifView ? 0 : titleNotifCount;
     const d = dmView ? 0 : titleDmCount;
+    const posts = Math.max(0, parseInt(window.__vaakPendingPostCount, 10) || 0);
     const bits = [];
+    if (posts > 0) bits.push(posts > 99 ? '99+' : String(posts));
     if (n > 0) bits.push(n > 99 ? '99+' : String(n));
     if (d > 0) bits.push('✉' + (d > 99 ? '99+' : String(d)));
     document.title = (bits.length ? '(' + bits.join(' · ') + ') ' : '') + notifBaseTitle;
     setBadge(notifBadge, n);
     setBadge(dmBadge, d);
   }
+  window.vaakRenderInboxTitle = renderCurrentInboxTitle;
   window.vaakSetCurrentViewTitle = function (view, label) {
     cancelNotifPoll();
     notifView = view === 'mentions';
@@ -38773,10 +38776,19 @@ window.vaakBootStatusThread();
     return sc.top() < AT_TOP_PX;
   }
 
+  function syncPendingPostTitle() {
+    window.__vaakPendingPostCount = pendingCount > 0 ? pendingCount : 0;
+    if (typeof window.vaakRenderInboxTitle === 'function') {
+      try { window.vaakRenderInboxTitle(); } catch (e) {}
+    }
+  }
   function updateNewBtn() {
     const liveBtn = document.getElementById('feed-new-btn');
     if (liveBtn) newBtn = liveBtn;
-    if (!newBtn) return;
+    if (!newBtn) {
+      syncPendingPostTitle();
+      return;
+    }
     if (pendingCount <= 0) {
       newBtn.hidden = true;
       newBtn.classList.remove('show', 'is-pinned');
@@ -38784,6 +38796,7 @@ window.vaakBootStatusThread();
       newBtn.style.left = '';
       newBtn.style.transform = '';
       newBtn.textContent = 'New posts';
+      syncPendingPostTitle();
       return;
     }
     newBtn.hidden = false;
@@ -38795,6 +38808,7 @@ window.vaakBootStatusThread();
       newBtn.style.top = '';
       newBtn.style.left = '';
       newBtn.style.transform = '';
+      syncPendingPostTitle();
       return;
     }
     const feed = document.querySelector('.feed') || root;
@@ -38806,6 +38820,7 @@ window.vaakBootStatusThread();
     newBtn.style.top = Math.round(top) + 'px';
     newBtn.style.left = Math.round(center) + 'px';
     newBtn.style.transform = 'translateX(-50%)';
+    syncPendingPostTitle();
   }
 
   function insertPending(opts) {
@@ -38848,20 +38863,76 @@ window.vaakBootStatusThread();
   let activeTimelinePollAbort = null;
   let timelineCatchUpPending = false;
   let timelinePollInvalidated = false;
+  let timelineHiddenAt = document.hidden ? Date.now() : 0;
+  let timelineSawHidden = !!document.hidden;
+  let timelineCatchUpTimer = 0;
+  let timelineCatchUpForce = false;
+  let timelinePollStartedHidden = false;
+  let timelinePollStartedAt = 0;
+  let timelinePollCompleted = false;
   const BACKGROUND_POLL_MS = 90000;
+  // Focus and visibility often arrive together. A check that just finished
+  // does not need a second request; a tab that was actually away does.
+  const CATCHUP_MIN_MS = 2500;
+  // Spread tabs that wake together so they do not hit newer=1 on the same tick.
+  const CATCHUP_JITTER_MS = 1600;
+  // A fetch the browser suspended with the frozen tab is not a fresh answer.
+  const STALE_HIDDEN_POLL_MS = 15000;
+  function timelineHeadPollView() {
+    // Head polls exist for Home, Local, and Federated only. Bluesky is cursor
+    // pages against the PDS, and list timelines are a one-shot render. Neither
+    // has this poller; do not add a heavier query for them.
+    syncTimelineKindFlags();
+    return ['home', 'local', 'feed'].includes(viewName)
+      && !isNotifTimeline && !isOutboxTimeline && !isBskyTimeline;
+  }
   function pollTimelineAutomatically(options) {
     if (timelinePollSuspended || window.__vaakNavigationPending || tabSwapBusy
-        || !items || !items.isConnected) return;
+        || !items || !items.isConnected || !timelineHeadPollView()) return;
+    const catchUp = !!(options && options.catchUp);
     if (pollPromise || pollBusy) {
-      if (options && options.catchUp && !document.hidden && timelinePollInvalidated) timelineCatchUpPending = true;
+      // Any return/reconnect check must survive a poll that is already in
+      // flight. The old gate required pagehide's invalidated flag, so a
+      // request frozen with the tab swallowed the check on the way back.
+      if (catchUp) timelineCatchUpPending = true;
       return;
     }
-    // Browsers may throttle background timers. Keep a single modest poll alive
-    // without holding an SSE connection or inserting cards into the reader's view.
-    const catchUp = !!(options && options.catchUp && !document.hidden);
-    const cadence = catchUp ? 5000 : (document.hidden ? BACKGROUND_POLL_MS : POLL_MS);
-    if (lastTimelinePollAt !== null && Date.now() - lastTimelinePollAt < cadence) return;
+    const elapsed = lastTimelinePollAt === null ? Infinity : (Date.now() - lastTimelinePollAt);
+    const cadence = document.hidden ? BACKGROUND_POLL_MS : POLL_MS;
+    if (catchUp) {
+      // A check that already succeeded this moment has the posts. Failed or
+      // aborted checks (completed stays false) still run, including on return.
+      if (timelinePollCompleted && elapsed + 50 < CATCHUP_MIN_MS) return;
+    } else if (elapsed + 50 < cadence) {
+      return;
+    }
     return pollNewer();
+  }
+  function scheduleTimelineCatchUp(force) {
+    if (!timelineHeadPollView()) return;
+    if (timelineCatchUpTimer) {
+      if (force) timelineCatchUpForce = true;
+      return;
+    }
+    const wantForce = !!force || timelineCatchUpForce;
+    timelineCatchUpForce = false;
+    const jitter = 200 + Math.floor(Math.random() * CATCHUP_JITTER_MS);
+    timelineCatchUpTimer = window.setTimeout(() => {
+      timelineCatchUpTimer = 0;
+      const forced = wantForce || timelineCatchUpForce;
+      timelineCatchUpForce = false;
+      if (document.hidden || timelinePollSuspended || window.__vaakNavigationPending || tabSwapBusy) return;
+      const inFlight = !!(pollPromise || pollBusy);
+      const age = inFlight && timelinePollStartedAt > 0 ? (Date.now() - timelinePollStartedAt) : 0;
+      if (inFlight && age >= STALE_HIDDEN_POLL_MS && activeTimelinePollAbort) {
+        timelineCatchUpPending = true;
+        timelinePollInvalidated = true;
+        lastTimelinePollAt = null;
+        try { activeTimelinePollAbort.abort(); } catch (e) {}
+        return;
+      }
+      pollTimelineAutomatically({ catchUp: true, afterHidden: forced });
+    }, jitter);
   }
   async function pollNewer(options) {
     const force = !!(options && options.freshPost);
@@ -38873,8 +38944,12 @@ window.vaakBootStatusThread();
     try { await pollPromise; } finally {
       pollPromise = null;
       if (timelineCatchUpPending) {
+        const retry = !timelinePollCompleted || timelinePollInvalidated;
+        const again = timelinePollInvalidated || timelinePollStartedHidden;
         timelineCatchUpPending = false;
-        pollTimelineAutomatically({ catchUp: true });
+        if (retry && !timelinePollSuspended && !window.__vaakNavigationPending && !tabSwapBusy) {
+          pollTimelineAutomatically({ catchUp: true, afterHidden: again });
+        }
       }
     }
   }
@@ -38895,6 +38970,9 @@ window.vaakBootStatusThread();
     const since = force && publishedTs > 0 ? Math.min(newestTs, publishedTs - 1) : newestTs;
     lastTimelinePollAt = Date.now();
     timelinePollInvalidated = false;
+    timelinePollStartedHidden = !!document.hidden;
+    timelinePollStartedAt = lastTimelinePollAt;
+    timelinePollCompleted = false;
     pollBusy = true;
     const ac = (typeof AbortController !== 'undefined') ? new AbortController() : null;
     activeTimelinePollAbort = ac;
@@ -38916,6 +38994,7 @@ window.vaakBootStatusThread();
       }
       if (!res.ok) return;
       if (items !== requestItems || viewName !== requestView || timelineGeneration !== requestGeneration || !requestItems.isConnected) return;
+      timelinePollCompleted = true;
       const newestHdr = parseInt(res.headers.get('X-Newest') || '0', 10);
       if (newestHdr > newestTs) newestTs = newestHdr;
       items.dataset.newest = String(newestTs);
@@ -38933,7 +39012,8 @@ window.vaakBootStatusThread();
       pendingSourceCount += filtered.sourceCount;
       updateNewBtn();
     } catch (e) {
-      // quiet — Refresh still works; abort/timeout must not stick pollBusy
+      // A frozen or aborted hidden poll must not count as a fresh check.
+      if (timelinePollStartedHidden || (e && e.name === 'AbortError')) lastTimelinePollAt = null;
     } finally {
       if (abortTimer) window.clearTimeout(abortTimer);
       if (activeTimelinePollAbort === ac) activeTimelinePollAbort = null;
@@ -39435,31 +39515,33 @@ window.vaakBootStatusThread();
       streamReconnectTimer = 0;
     }
   }
+  // Soft-nav Mentions→Home / tab swaps clear the timer; always re-arm for
+  // standard timelines so live head polls do not die until a hard refresh.
   function stopTimelinePollTimer() {
     if (streamFallbackTimer) {
+      window.clearTimeout(streamFallbackTimer);
       window.clearInterval(streamFallbackTimer);
       streamFallbackTimer = 0;
     }
   }
-  // Soft-nav Mentions→Home / tab swaps clear the interval; always re-arm for
-  // standard timelines so live head polls do not die until a hard refresh.
-  function ensureTimelinePollTimer() {
-    syncTimelineKindFlags();
-    if (!['home', 'local', 'feed'].includes(viewName)) {
+  function ensureTimelinePollTimer(reset) {
+    if (!timelineHeadPollView()
+        || timelinePollSuspended || window.__vaakNavigationPending || tabSwapBusy
+        || !items || !items.isConnected) {
       stopTimelinePollTimer();
       return;
     }
-    if (isNotifTimeline || isOutboxTimeline || isBskyTimeline) {
-      stopTimelinePollTimer();
-      return;
-    }
-    if (timelinePollSuspended || window.__vaakNavigationPending || !items || !items.isConnected) {
-      stopTimelinePollTimer();
-      return;
-    }
-    if (!streamFallbackTimer) {
-      streamFallbackTimer = window.setInterval(pollTimelineAutomatically, POLL_MS);
-    }
+    if (streamFallbackTimer && !reset) return;
+    stopTimelinePollTimer();
+    // One chained timeout, not setInterval. Background tabs throttle interval
+    // callbacks, and the old 45s interval plus a 90s gate could skip the
+    // hidden check entirely until the reader had been looking again.
+    const delay = document.hidden ? BACKGROUND_POLL_MS : POLL_MS;
+    streamFallbackTimer = window.setTimeout(() => {
+      streamFallbackTimer = 0;
+      pollTimelineAutomatically();
+      ensureTimelinePollTimer(false);
+    }, delay);
   }
   function scheduleStreamReconnect() {
     if (streamReconnectTimer || document.hidden || window.__vaakNavigationPending) return;
@@ -39520,6 +39602,11 @@ window.vaakBootStatusThread();
     timelineGeneration++;
     window.__vaakNavigationPending = true;
     timelineCatchUpPending = false;
+    timelineCatchUpForce = false;
+    if (timelineCatchUpTimer) {
+      window.clearTimeout(timelineCatchUpTimer);
+      timelineCatchUpTimer = 0;
+    }
     if (pollPromise || pollBusy) {
       lastTimelinePollAt = null;
       timelinePollInvalidated = true;
@@ -39529,15 +39616,36 @@ window.vaakBootStatusThread();
     stopTimelinePollTimer();
   });
   window.addEventListener('pageshow', (event) => {
-    if (!event.persisted) return;
+    // A normal load also fires pageshow. Resume only for bfcache, or when
+    // pagehide suspended this same document and the browser brought it back
+    // without persisted=true (Safari tab/app switches).
+    if (!event.persisted && !timelinePollSuspended) return;
     timelinePollSuspended = false;
     window.__vaakNavigationPending = false;
-    ensureTimelinePollTimer();
-    pollTimelineAutomatically({ catchUp: true });
+    timelineHiddenAt = 0;
+    ensureTimelinePollTimer(true);
+    scheduleTimelineCatchUp(true);
     syncTimelineStreamVisibility();
   });
   window.addEventListener('focus', () => {
-    if (!document.hidden) pollTimelineAutomatically({ catchUp: true });
+    if (document.hidden) return;
+    // First paint focuses the window before any poll. That is not a return.
+    if (lastTimelinePollAt === null && !timelineSawHidden && !timelinePollSuspended) return;
+    const elapsed = lastTimelinePollAt === null ? Infinity : (Date.now() - lastTimelinePollAt);
+    if (timelinePollCompleted && elapsed < POLL_MS && !timelineSawHidden) return;
+    scheduleTimelineCatchUp(elapsed >= BACKGROUND_POLL_MS || timelineSawHidden);
+  });
+  window.addEventListener('online', () => {
+    if (document.hidden || !timelinePollStartedAt) return;
+    const elapsed = lastTimelinePollAt === null ? Infinity : (Date.now() - lastTimelinePollAt);
+    if (timelinePollCompleted && elapsed < POLL_MS) return;
+    scheduleTimelineCatchUp(true);
+  });
+  window.addEventListener('resume', () => {
+    timelinePollSuspended = false;
+    if (!tabSwapBusy) window.__vaakNavigationPending = false;
+    ensureTimelinePollTimer(true);
+    scheduleTimelineCatchUp(true);
   });
   if (['home', 'local', 'feed'].includes(viewName)) {
     // Keep a bounded timestamp poll even when SSE is enabled. Bluesky
@@ -39551,11 +39659,23 @@ window.vaakBootStatusThread();
   }
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'visible') {
-      ensureTimelinePollTimer();
-      pollTimelineAutomatically({ catchUp: true });
+      const hiddenFor = timelineHiddenAt > 0 ? (Date.now() - timelineHiddenAt) : 0;
+      const wasSuspended = !!timelinePollSuspended;
+      if (wasSuspended || timelineSawHidden) {
+        timelinePollSuspended = false;
+        if (!tabSwapBusy) window.__vaakNavigationPending = false;
+      }
+      timelineHiddenAt = 0;
+      const away = timelineSawHidden;
+      timelineSawHidden = false;
+      ensureTimelinePollTimer(hiddenFor > 0 || wasSuspended);
+      if (away || wasSuspended) scheduleTimelineCatchUp(hiddenFor >= 8000 || wasSuspended);
       syncTimelineStreamVisibility();
     } else {
+      timelineSawHidden = true;
+      if (!timelineHiddenAt) timelineHiddenAt = Date.now();
       stopTimelineStream();
+      ensureTimelinePollTimer(true);
     }
   });
   function syncTimelineStreamVisibility() {
