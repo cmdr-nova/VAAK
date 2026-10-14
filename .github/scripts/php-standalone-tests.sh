@@ -42,6 +42,7 @@ fi
 
 php_tests=(
   api/bin/account-acct-key-error-smoke.php
+  api/bin/avatar-refresh-smoke.php
   api/bin/bsky-thread-fragment-smoke.php
   api/bin/dm-ask-parity-smoke.php
   api/bin/library-deletion-smoke.php

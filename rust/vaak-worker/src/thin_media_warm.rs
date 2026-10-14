@@ -175,10 +175,7 @@ async fn upsert_from_appview(
         .get("displayName")
         .and_then(|h| h.as_str())
         .map(|s| s.to_string());
-    let author_avatar = author
-        .get("avatar")
-        .and_then(|h| h.as_str())
-        .map(|s| s.to_string());
+    let author_avatar = crate::actor_warm::bsky_avatar_url(author.get("avatar"), &author_did);
     let indexed_at = post
         .get("indexedAt")
         .and_then(|t| t.as_str())

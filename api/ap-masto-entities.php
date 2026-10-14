@@ -12851,7 +12851,7 @@ function ap_masto_suggestion_account(string $actorId): ?array
                 $st = ap_db()->prepare(
                     "SELECT author_handle, author_display, author_avatar
                      FROM bsky_posts
-                     WHERE lower(author_did) = ?
+                     WHERE author_did = ?
                        AND author_handle IS NOT NULL AND author_handle != ''
                      ORDER BY indexed_at DESC
                      LIMIT 1"
