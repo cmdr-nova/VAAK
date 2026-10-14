@@ -68,6 +68,7 @@ if ($scope === 'notifications' || $scope === 'all') {
     $add('vaak:notifications:v1:' . $ownerId . ':*');
     $add('vaak:notifications:v2:' . $ownerId . ':*');
     $add('vaak:notifications:v3:' . $ownerId . ':*');
+    $add('vaak:notifications:v4:' . $ownerId . ':*');
     $add('vaak:notifications:v1:unread:' . $ownerId . ':*');
 }
 if ($scope === 'timelines' || $scope === 'all') {

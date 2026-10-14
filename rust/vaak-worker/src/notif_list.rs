@@ -1,7 +1,7 @@
 //! Mentions / Ice Cubes notification **list** warm + Axum shadow read.
 //!
 //! Warm path (10.5 / 0.6.66): native Rust materialize from
-//! `ap_notification_projection` → Redis `vaak:notifications:v3:{owner}:{hash}`.
+//! `ap_notification_projection` → Redis `vaak:notifications:v4:{owner}:{hash}`.
 //! When the projection window is thin/empty, spawn temporary PHP
 //! `bin/notif-projection-fill.php` (local PG hydrate → projection + Redis)
 //! then retry native materialize. HTTP Mentions still falls back to PHP
@@ -583,7 +583,7 @@ pub fn notifications_list_redis_key(
     let mut hasher = Sha256::new();
     hasher.update(encoded.as_bytes());
     format!(
-        "vaak:notifications:v3:{owner_user_id}:{}",
+        "vaak:notifications:v4:{owner_user_id}:{}",
         hex::encode(hasher.finalize())
     )
 }
