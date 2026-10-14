@@ -42,8 +42,20 @@ pub(super) fn event_pack(text:&str)->Value {
  let(html,_)=escaped_tags(&crate::library::actions::esc(text));let mut tags=vec![];for c in regex::Regex::new(r"#([\p{L}\p{N}_]{1,100})").unwrap().captures_iter(text){retain(&mut tags,tag(&c[1]));}
  json!({"content":if html.is_empty(){String::new()}else{format!("<p>{}</p>",html.replace('\n',"<br />\n"))},"mentions":[],"tags":tags})
 }
+/// Drop Bridgy/Fedibird quote-inline and Misskey RE: blockquotes before plain conversion.
+pub(super) fn strip_machine_quote_html(raw:&str)->String {
+ let mut text=regex::Regex::new(r#"(?i)<(?:span|p|div)\b[^>]*class="[^"]*\bquote-inline\b[^"]*"[^>]*>[\s\S]*?</(?:span|p|div)>"#).unwrap().replace_all(raw,"").into_owned();
+ if text.to_ascii_lowercase().contains("<blockquote") && regex::Regex::new(r"(?i)RE:\s*https?://").unwrap().is_match(&text) {
+  text=regex::Regex::new(r"(?i)<blockquote\b[^>]*>[\s\S]*?RE:\s*https?://[\s\S]*?</blockquote>").unwrap().replace_all(&text,"").into_owned();
+ }
+ text
+}
 pub(super) fn clean_event_text(raw:&str)->String {
- let decoded=crate::home_hydrate_ranked::html_entity_decode(raw);let mut text=crate::library::card::php_trim(&strip_html(&decoded)).to_owned();
+ let prepared=strip_machine_quote_html(raw);
+ let decoded=crate::home_hydrate_ranked::html_entity_decode(&prepared);let mut text=crate::library::card::php_trim(&strip_html(&decoded)).to_owned();
+ text=regex::Regex::new(r"(?i)^↩\s*re:\s*https?://\S+\s*").unwrap().replace(&text,"").into_owned();
+ // Same cut as PHP `(?<=\S)\R{2,}RE:…$`: keep the commentary character before the blank line.
+ text=regex::Regex::new(r"(?i)(\S)(?:\r\n|\n|\r){2,}RE:\s*https?://\S+[^\S\r\n]*(?:(?:\r\n|\n|\r)[^\r\n]*)*$").unwrap().replace(&text,"$1").into_owned();
  text=regex::Regex::new(r"(?i)^RE:\s*https?://\S+?(?:/notes/[a-f0-9]+|/[0-9]+)").unwrap().replace(&text,"").into_owned();text=regex::Regex::new(r"(?i)RE:\s*https?://\S+").unwrap().replace_all(&text,"").into_owned();
  text=regex::Regex::new(r"^↪ QT(?:\s+@\S+:)?\s*").unwrap().replace(&text,"").into_owned();text=regex::Regex::new(r"[ \t]+").unwrap().replace_all(&text," ").into_owned();text=regex::Regex::new(r"\n{3,}").unwrap().replace_all(&text,"\n\n").into_owned();crate::library::card::php_trim(&text).to_owned()
 }
@@ -85,4 +97,28 @@ impl Projector<'_> {
 mod tests{
  use super::*;
  #[test]fn actual_canonical_entity_helpers(){let reference:Value=serde_json::from_slice(&std::fs::read("/tmp/vaak-profile-entity-helper-reference.json").unwrap()).unwrap();let cases=reference["captures"].as_array().unwrap();assert_eq!(cases.len(),28);let mut counts=std::collections::HashMap::<String,usize>::new();for row in cases{*counts.entry(s(row,"helper").into()).or_default()+=1;let output=match s(row,"helper"){"plain_pack"=>plain_pack(s(row,"input")).unwrap(),"escaped_tags"=>{let(html,tags)=escaped_tags(s(row,"input"));json!([html,tags])},"html_tags"=>{let(html,tags)=html_tags(s(row,"input"));json!({"html":html,"tags":tags})},_=>panic!("unknown actual entity helper")};assert_eq!(output,row["expected"],"{} {:?}",row["helper"],row["input"]);}assert_eq!(counts.get("plain_pack"),Some(&11));assert_eq!(counts.get("escaped_tags"),Some(&11));assert_eq!(counts.get("html_tags"),Some(&6));}
+ #[test]
+ fn reply_context_cleanup_matches_api_plain_rules() {
+  let misskey = "nice thread\n\nRE: https://misskey.example/notes/abc123\nhell yup, the goat as usual";
+  assert_eq!(clean_event_text(misskey), "nice thread");
+  let leading = "RE: https://misskey.example/notes/abc123\nI disagree with the quote";
+  assert_eq!(clean_event_text(leading), "I disagree with the quote");
+  let bsky = "↩ re: https://bsky.app/profile/alice.test/post/abc123\n\n@cmdr_nova big ups https://youtu.be/Z0Uh3OJCx3o";
+  assert_eq!(clean_event_text(bsky), "@cmdr_nova big ups https://youtu.be/Z0Uh3OJCx3o");
+  let authored = "↩ I meant the other post\n\nsecond paragraph stays";
+  assert_eq!(clean_event_text(authored), authored);
+  // Ice Cubes screenshot shape. The plain cleaner keeps an authored ↩ line.
+  // Mastodon API reply HTML drops that leading paragraph only when the status is a reply.
+  let ice = "↩ hell yup, the goat as usual\n\n@cmdr_nova big ups https://youtu.be/Z0Uh3OJCx3o?si=-2MIb_0WE3_AACdV";
+  assert_eq!(clean_event_text(ice), ice);
+  let crlf = "nice thread\r\n\r\nRE: https://misskey.example/notes/abc123\r\nhell yup, the goat as usual";
+  assert_eq!(clean_event_text(crlf), "nice thread");
+  let leading_blank = "\n\nRE: https://misskey.example/notes/abc123\nkeep me";
+  assert_eq!(clean_event_text(leading_blank), "keep me");
+  let inline = "<p>@cmdr_nova big ups</p><span class=\"quote-inline\">hell yup, the goat as usual<br>RE: <a href=\"https://mkultra.monster/users/cmdr_nova/notes/abc123\">https://mkultra.monster/users/cmdr_nova/notes/abc123</a></span>";
+  let cleaned = clean_event_text(inline);
+  assert!(cleaned.contains("@cmdr_nova big ups"), "{cleaned}");
+  assert!(!cleaned.contains("hell yup"), "{cleaned}");
+  assert!(!cleaned.contains("notes/abc123"), "{cleaned}");
+ }
 }

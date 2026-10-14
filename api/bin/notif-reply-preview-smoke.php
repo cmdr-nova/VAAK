@@ -33,10 +33,10 @@ $dto=['id'=>'1','type'=>'mention','status'=>['content'=>$expected]];
 $serialized=ap_notification_projection_payload($dto);
 preview_check(is_string($serialized),'actual writer serializer emits payload');
 $fresh=json_decode($serialized,true);
-preview_check(($fresh['_vaak_reply_preview_version']??null)===2,'actual writer records strict integer provenance');
+preview_check(($fresh['_vaak_reply_preview_version']??null)===3,'actual writer records strict integer provenance');
 preview_check(ap_notification_projection_item($fresh)===$dto,'actual reader strips private metadata, authored DTO exact');
 preview_check(ap_notification_projection_item($dto)===null,'legacy body rejected rather than stripped');
-foreach(['2',1,2.0,null] as $invalid){$bad=$fresh;$bad['_vaak_reply_preview_version']=$invalid;preview_check(ap_notification_projection_item($bad)===null,'invalid provenance rejected');}
+foreach(['3',2,1,3.0,null] as $invalid){$bad=$fresh;$bad['_vaak_reply_preview_version']=$invalid;preview_check(ap_notification_projection_item($bad)===null,'invalid provenance rejected');}
 // The real bounded reader must reject an entire mixed window, even if a valid
 // first row already satisfies limit=1. No DB bootstrap or authored-text rewrite.
 class PreviewStatement {public function execute(array $args):void{} public function fetchAll():array{return $GLOBALS['projection_rows'];}}
@@ -46,5 +46,5 @@ $GLOBALS['projection_rows']=[['payload_json'=>$serialized],['payload_json'=>json
 preview_check(ap_notification_projection_read(1,1,['mention'],[])===[],'later legacy row rejects whole mixed window before page-limit break');
 $GLOBALS['projection_rows']=[['payload_json'=>$serialized]];
 preview_check(ap_notification_projection_read(1,1,['mention'],[])===[$dto],'versioned projection returns exact public DTO');
-preview_check(str_starts_with(ap_masto_notifications_list_redis_key(1,30,null,null,['mention']),'vaak:notifications:v2:1:'),'actual PHP list namespace bypasses every legacy envelope');
+preview_check(str_starts_with(ap_masto_notifications_list_redis_key(1,30,null,null,['mention']),'vaak:notifications:v3:1:'),'actual PHP list namespace bypasses every legacy envelope');
 echo "notif-reply-preview-smoke PASS $checks; legacy multi-paragraph leak reproduced, actual new producer helper/formatter/stripper preserve exact authored HTML\n";

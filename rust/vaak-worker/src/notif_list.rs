@@ -1,7 +1,7 @@
 //! Mentions / Ice Cubes notification **list** warm + Axum shadow read.
 //!
 //! Warm path (10.5 / 0.6.66): native Rust materialize from
-//! `ap_notification_projection` → Redis `vaak:notifications:v2:{owner}:{hash}`.
+//! `ap_notification_projection` → Redis `vaak:notifications:v3:{owner}:{hash}`.
 //! When the projection window is thin/empty, spawn temporary PHP
 //! `bin/notif-projection-fill.php` (local PG hydrate → projection + Redis)
 //! then retry native materialize. HTTP Mentions still falls back to PHP
@@ -260,7 +260,7 @@ async fn maybe_fill_projection(
 
 /// Projection provenance is private: reject legacy bodies before accepting a window.
 fn projection_item(mut item: Value) -> Option<Value> {
-    if item.get("_vaak_reply_preview_version").and_then(Value::as_i64) != Some(2) {
+    if item.get("_vaak_reply_preview_version").and_then(Value::as_i64) != Some(3) {
         return None;
     }
     item.as_object_mut()?.remove("_vaak_reply_preview_version");
@@ -583,7 +583,7 @@ pub fn notifications_list_redis_key(
     let mut hasher = Sha256::new();
     hasher.update(encoded.as_bytes());
     format!(
-        "vaak:notifications:v2:{owner_user_id}:{}",
+        "vaak:notifications:v3:{owner_user_id}:{}",
         hex::encode(hasher.finalize())
     )
 }
@@ -869,11 +869,11 @@ mod reply_preview_projection_regression {
     fn projection_requires_integer_provenance_and_preserves_authored_html() {
         let original = serde_json::json!({"id":"1", "status":{"content":"<p>↩ Authored arrow</p><p>Authored continuation</p>"}});
         assert!(super::projection_item(original.clone()).is_none());
-        for invalid in [serde_json::json!("2"), serde_json::json!(1), serde_json::json!(2.0), serde_json::json!(null)] {
+        for invalid in [serde_json::json!("3"), serde_json::json!(2), serde_json::json!(1), serde_json::json!(3.0), serde_json::json!(null)] {
             let mut item = original.clone(); item["_vaak_reply_preview_version"] = invalid;
             assert!(super::projection_item(item).is_none());
         }
-        let mut fresh = original.clone(); fresh["_vaak_reply_preview_version"] = serde_json::json!(2);
+        let mut fresh = original.clone(); fresh["_vaak_reply_preview_version"] = serde_json::json!(3);
         assert_eq!(super::projection_item(fresh), Some(original));
     }
 }
