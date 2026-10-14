@@ -314,8 +314,16 @@ fn quote_card_mode(status: &Value, facts: &CardFacts,silent:bool) -> Result<Stri
     let view = &facts.return_view;
     let media = status.get("media_attachments").and_then(Value::as_array).cloned().unwrap_or_default();
     let text = super::body::scrub_as2(&plain(string(status, "content")));
-    let href = status_href(uri, view);
-    let mut html = format!("<div class=\"quote-block quote-block--openable\" data-href=\"{}\" role=\"link\" tabindex=\"0\" aria-label=\"Open quoted post\"><span class=\"qt-label\">Quoted</span>", esc(&href));
+    // Supplied quotes keep the openable in-app chrome. Cold, deleted, and
+    // Bluesky previews set an open label or external flag and follow the
+    // shared PHP footer (in-app label, then "Open original" when external).
+    let href = if uri.is_empty() || uri == "https://bsky.app/" { String::new() } else { status_href(uri, view) };
+    let openable = !href.is_empty() && href != "#";
+    let mut html = if openable {
+        format!("<div class=\"quote-block quote-block--openable\" data-href=\"{}\" role=\"link\" tabindex=\"0\" aria-label=\"Open quoted post\"><span class=\"qt-label\">Quoted</span>", esc(&href))
+    } else {
+        "<div class=\"quote-block\"><span class=\"qt-label\">Quoted</span>".to_owned()
+    };
     if !acct.is_empty() { html.push_str(&format!("<div class=\"meta\" style=\"margin-top:.3rem\">{}</div>", esc(&format!("@{}", acct.trim_start_matches('@'))))); }
     if !text.is_empty() { html.push_str(&format!("<div style=\"margin-top:.25rem;white-space:pre-wrap\">{}</div>", body_text(&text, view, status.get("mentions").and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[]), &facts.owner_actor)?)); }
     if !media.is_empty() {
@@ -341,7 +349,26 @@ fn quote_card_mode(status: &Value, facts: &CardFacts,silent:bool) -> Result<Stri
         let preview = link_preview_mode(&card, false)?;
         if !preview.is_empty() { html.push_str(&format!("<div class=\"quote-link-card\" data-quote-chrome=\"1\" style=\"margin-top:.45rem;pointer-events:none\">{preview}</div>")); }
     }
-    if !uri.is_empty() { html.push_str(&format!("<div class=\"meta\" style=\"margin-top:.35rem\"><a href=\"{}\">Open quoted</a></div>", esc(&href))); }
+    let open_label = status.get("vaak_quote_open_label").and_then(Value::as_str).map(php_trim).filter(|label| !label.is_empty());
+    let open_external = status.get("vaak_quote_open_external").and_then(Value::as_bool).unwrap_or(false);
+    if !uri.is_empty() && uri != "https://bsky.app/" {
+        let label = open_label.unwrap_or_else(|| "Open quoted".into());
+        if !open_external && label == "Open quoted" && openable {
+            html.push_str(&format!("<div class=\"meta\" style=\"margin-top:.35rem\"><a href=\"{}\">Open quoted</a></div>", esc(&href)));
+        } else {
+            html.push_str("<div class=\"meta\" style=\"margin-top:.35rem\">");
+            if openable { html.push_str(&format!("<a href=\"{}\">{}</a>", esc(&href), esc(&label))); }
+            if open_external && uri.starts_with("https://") {
+                if openable { html.push_str(" · "); }
+                html.push_str(&format!("<a href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\">Open original</a>", esc(uri)));
+            } else if !openable {
+                html.push_str(&format!("<a href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\">{}</a>", esc(uri), esc(&label)));
+            }
+            html.push_str("</div>");
+        }
+    } else if text.is_empty() && acct.is_empty() && media.is_empty() && !status.get("card").is_some_and(Value::is_object) {
+        html.push_str("<div class=\"meta\" style=\"margin-top:.3rem\">Quoted post unavailable</div>");
+    }
     html.push_str("</div>"); Ok(html)
 }
 

@@ -2,8 +2,10 @@
 //!
 //! PHP `ap_masto_interaction_row_to_status` paints a local row, a cached
 //! ActivityPub Create/Update, a plain Bluesky PostView, or an https URL stub.
-//! `at://` rows with no post are omitted. Quotes, polls, Asks, announce-only
-//! boosts, and reply-parent chrome stay on the canonical PHP renderer.
+//! `at://` rows with no post are omitted. A quote with a cached target, a
+//! compact preview, or a cold/deleted/non-status stub is painted here. Polls,
+//! Asks, announce-only boosts, reply-parent chrome, and a QT line that is not
+//! a quote card stay on the canonical PHP renderer.
 //! Bookmarks and favourites share this projector; the saved flag differs.
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
@@ -48,6 +50,9 @@ pub(crate) struct BookmarkCache {
     pub actors: HashMap<String, Value>,
     pub profiles: HashMap<String, Value>,
     pub media_by_local: HashMap<i64, Vec<Value>>,
+    /// Compact Bluesky quote previews keyed by at:// URI or https web URL.
+    /// AppView misses are not fetched.
+    pub bsky_by_uri: HashMap<String, Value>,
 }
 
 fn s<'a>(v: &'a Value, key: &str) -> &'a str {
@@ -275,7 +280,10 @@ fn reply_present(row: &Value) -> bool {
 
 fn unsupported_note(text: &str, row: &Value) -> Option<&'static str> {
     let text = php_trim(text);
-    if text.contains('↪') || text == "(quote)" || raw_has_quote(s(row, "raw_create_json")) {
+    if text == "(quote)" || raw_has_quote(s(row, "raw_create_json")) {
+        return Some("PHP fallback: quote bookmark needs canonical quote assembly");
+    }
+    if text.contains('↪') && !super::quote::saved_quote_supported(text) {
         return Some("PHP fallback: quote bookmark needs canonical quote assembly");
     }
     if text == "(poll)" || row.get("poll").is_some_and(Value::is_object) {
@@ -317,7 +325,53 @@ fn media_attachments(local_id: i64, cache: &BookmarkCache) -> Result<Vec<Value>>
     Ok(media)
 }
 
+fn lookup_quoted(url: &str, cache: &BookmarkCache, now: chrono::DateTime<chrono::Utc>) -> Result<Option<Value>> {
+    let key = object_url(url);
+    if key.is_empty() {
+        return Ok(None);
+    }
+    if cache.events_by_object.get(&key).is_some_and(deleted_event) {
+        return Ok(None);
+    }
+    if let Some(local) = cache.local_by_note.get(&key) {
+        return Ok(Some(from_local_row_depth(local, cache, now, 1)?));
+    }
+    if let Some(event) = cache.events_by_object.get(&key) {
+        return Ok(Some(from_event_row_depth(event, cache, now, 1)?));
+    }
+    if let Some(mention) = cache.mentions_by_object.get(&key) {
+        return Ok(Some(from_mention_row_depth(mention, cache, now, 1)?));
+    }
+    Ok(None)
+}
+
+fn apply_saved_quote(status: &mut Value, summary: &str, cache: &BookmarkCache, now: chrono::DateTime<chrono::Utc>) -> Result<()> {
+    if !super::quote::saved_quote_supported(summary) {
+        return Ok(());
+    }
+    let url = super::quote::quote_target_url(summary).unwrap_or_default();
+    let deleted = !url.is_empty() && cache.events_by_object.get(&object_url(&url)).is_some_and(deleted_event);
+    let target = if deleted || url.is_empty() { None } else { lookup_quoted(&url, cache, now)? };
+    let bsky = if target.is_none() && !deleted {
+        cache.bsky_by_uri.get(&url).or_else(|| cache.bsky_by_uri.get(url.trim_end_matches('/')))
+    } else {
+        None
+    };
+    let saved = super::quote::assemble_saved_quote(summary, target.as_ref(), deleted, bsky)?;
+    let html = plain_html(&saved.commentary);
+    status["content"] = json!(html);
+    status["quote"] = saved.quote;
+    if !saved.quote_url.is_empty() {
+        status["quote_url"] = json!(saved.quote_url);
+    }
+    Ok(())
+}
+
 fn from_local_row(row: &Value, cache: &BookmarkCache, now: chrono::DateTime<chrono::Utc>) -> Result<Value> {
+    from_local_row_depth(row, cache, now, 0)
+}
+
+fn from_local_row_depth(row: &Value, cache: &BookmarkCache, now: chrono::DateTime<chrono::Utc>, depth: usize) -> Result<Value> {
     let note = object_url(s(row, "note_id"));
     if note.is_empty() {
         bail!("PHP fallback: local bookmark note identity missing");
@@ -333,7 +387,9 @@ fn from_local_row(row: &Value, cache: &BookmarkCache, now: chrono::DateTime<chro
         outbox
     };
     if let Some(reason) = unsupported_note(source_text, row).or_else(|| unsupported_note(s(row, "content_text"), row)) {
-        bail!(reason);
+        if depth == 0 || !reason.contains("quote") {
+            bail!(reason);
+        }
     }
     let local_id = n(row, "local_id");
     let media = media_attachments(local_id, cache)?;
@@ -353,7 +409,8 @@ fn from_local_row(row: &Value, cache: &BookmarkCache, now: chrono::DateTime<chro
         if html.is_empty() { "<p></p>".into() } else { html }
     };
     let actor = local_actor_key(&note).map(|key| format!("https://mkultra.monster/users/{key}")).unwrap_or_default();
-    Ok(json!({
+    let quote_summary = if super::quote::saved_quote_supported(source_text) { source_text.to_owned() } else if super::quote::saved_quote_supported(&text) { text.clone() } else { String::new() };
+    let mut status = json!({
         "id": crate::notif::snowflake_id(Some(&created), local_id, 0),
         "created_at": created,
         "in_reply_to_id": null,
@@ -384,10 +441,18 @@ fn from_local_row(row: &Value, cache: &BookmarkCache, now: chrono::DateTime<chro
         "emojis": [],
         "card": null,
         "poll": null
-    }))
+    });
+    if depth == 0 && !quote_summary.is_empty() {
+        apply_saved_quote(&mut status, &quote_summary, cache, now)?;
+    }
+    Ok(status)
 }
 
 fn from_event_row(row: &Value, cache: &BookmarkCache, now: chrono::DateTime<chrono::Utc>) -> Result<Value> {
+    from_event_row_depth(row, cache, now, 0)
+}
+
+fn from_event_row_depth(row: &Value, cache: &BookmarkCache, now: chrono::DateTime<chrono::Utc>, depth: usize) -> Result<Value> {
     let kind = s(row, "type");
     if kind.eq_ignore_ascii_case("Announce") {
         bail!("PHP fallback: announce bookmark chrome remains on the canonical renderer");
@@ -401,7 +466,9 @@ fn from_event_row(row: &Value, cache: &BookmarkCache, now: chrono::DateTime<chro
     }
     let text = s(row, "summary");
     if let Some(reason) = unsupported_note(text, row) {
-        bail!(reason);
+        if depth == 0 || !reason.contains("quote") {
+            bail!(reason);
+        }
     }
     let object = object_url(s(row, "object_id"));
     if !object.starts_with("https://") {
@@ -410,7 +477,7 @@ fn from_event_row(row: &Value, cache: &BookmarkCache, now: chrono::DateTime<chro
     let actor = s(row, "actor_id").trim_end_matches('/').to_owned();
     let created = format_time(s(row, "created_at"), now);
     let html = plain_html(text);
-    Ok(json!({
+    let mut status = json!({
         "id": crate::notif::snowflake_id(Some(&created), n(row, "id"), 1),
         "created_at": created,
         "in_reply_to_id": null,
@@ -440,10 +507,18 @@ fn from_event_row(row: &Value, cache: &BookmarkCache, now: chrono::DateTime<chro
         "emojis": [],
         "card": null,
         "poll": null
-    }))
+    });
+    if depth == 0 && super::quote::saved_quote_supported(text) {
+        apply_saved_quote(&mut status, text, cache, now)?;
+    }
+    Ok(status)
 }
 
 fn from_mention_row(row: &Value, cache: &BookmarkCache, now: chrono::DateTime<chrono::Utc>) -> Result<Value> {
+    from_mention_row_depth(row, cache, now, 0)
+}
+
+fn from_mention_row_depth(row: &Value, cache: &BookmarkCache, now: chrono::DateTime<chrono::Utc>, depth: usize) -> Result<Value> {
     if !s(row, "deleted_at").is_empty() && s(row, "deleted_at") != "0" {
         bail!("PHP fallback: deleted mention bookmark");
     }
@@ -456,14 +531,16 @@ fn from_mention_row(row: &Value, cache: &BookmarkCache, now: chrono::DateTime<ch
     }
     let text = s(row, "content");
     if let Some(reason) = unsupported_note(text, row) {
-        bail!(reason);
+        if depth == 0 || !reason.contains("quote") {
+            bail!(reason);
+        }
     }
     if !object.starts_with("https://") {
         bail!("PHP fallback: non-HTTPS mention bookmark source");
     }
     let created = format_time(s(row, "created_at"), now);
     let html = plain_html(text);
-    Ok(json!({
+    let mut status = json!({
         "id": crate::notif::snowflake_id(Some(&created), n(row, "id"), 2),
         "created_at": created,
         "in_reply_to_id": null,
@@ -479,7 +556,11 @@ fn from_mention_row(row: &Value, cache: &BookmarkCache, now: chrono::DateTime<ch
         "media_attachments": [],
         "bookmarked": false,
         "favourited": false
-    }))
+    });
+    if depth == 0 && super::quote::saved_quote_supported(text) {
+        apply_saved_quote(&mut status, text, cache, now)?;
+    }
+    Ok(status)
 }
 
 fn deleted_event(row: &Value) -> bool {

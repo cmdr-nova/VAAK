@@ -60,12 +60,66 @@ function ap_library_native_bsky_bookmark_states(array $statuses, int $owner): ar
     }
     return array_values($states);
 }
-/** Validate every indexed card before publishing HTML or preview state. */
-function ap_library_native_validate_reply(array $reply, int $count, int $initial): ?string
+/** Quote-preview budget is separate from the root status preview budget.
+ *  An unset PHP global starts at 2, matching the painter's first use. */
+function ap_library_native_quote_budget(): int
 {
-    if (!ap_native_preview_exact_keys($reply, ['ok', 'protocol_version', 'source_count', 'cards', 'status_preview_state'])
+    $raw = $GLOBALS['admin_quote_link_preview_budget'] ?? null;
+    return is_int($raw) ? $raw : 2;
+}
+/** Text quotes and cached preview cards can be painted natively. Synthetic
+ *  empty quotes, RSS mirror recovery, and Bluesky quotes with no text, media,
+ *  or card still need PHP. Search keeps ap_native_quote_requires_php. */
+function ap_library_native_quote_requires_php(array $quoted): bool
+{
+    if (!ap_native_quote_requires_php($quoted)) {
+        return false;
+    }
+    if (!function_exists('admin_html_to_plain') || !function_exists('admin_quote_opts_from_status')) {
+        return true;
+    }
+    $plain = admin_html_to_plain((string) ($quoted['content'] ?? ''));
+    if ($plain !== '' && function_exists('ap_text_looks_like_as2_json') && ap_text_looks_like_as2_json($plain)) {
+        $plain = function_exists('ap_text_scrub_as2_dump') ? ap_text_scrub_as2_dump($plain) : '';
+    }
+    $acct = (string) ($quoted['account']['acct'] ?? '');
+    $uri = (string) ($quoted['uri'] ?? $quoted['url'] ?? '');
+    if ($plain === '' && ($acct === '' || strtolower(ltrim($acct, '@')) === 'quoted') && $uri !== '') {
+        return true;
+    }
+    $opts = admin_quote_opts_from_status($quoted, $uri);
+    $text = trim((string) ($opts['text'] ?? ''));
+    $media = is_array($opts['media'] ?? null) ? $opts['media'] : [];
+    $card = is_array($opts['card'] ?? null) ? $opts['card'] : null;
+    if (!empty($opts['is_rss']) && $media === [] && $card === null && $text !== '') {
+        return true;
+    }
+    if ($media === [] && $card === null && $uri !== '' && function_exists('ap_quote_target_is_bluesky') && ap_quote_target_is_bluesky($uri) && $text === '') {
+        return true;
+    }
+    return false;
+}
+function ap_library_native_quote_tree_requires_php(array $status, int $depth = 0): bool
+{
+    if ($depth > 16) {
+        return true;
+    }
+    foreach (['reblog', 'vaak_quote_preview'] as $field) {
+        if (is_array($status[$field] ?? null) && ap_library_native_quote_tree_requires_php($status[$field], $depth + 1)) {
+            return true;
+        }
+    }
+    $quoted = $status['quote']['quoted_status'] ?? null;
+    return is_array($quoted) && (ap_library_native_quote_requires_php($quoted)
+        || ap_library_native_quote_tree_requires_php($quoted, $depth + 1));
+}
+/** Validate every indexed card before publishing HTML or preview state. */
+function ap_library_native_validate_reply(array $reply, int $count, int $initial, int $quoteInitial): ?string
+{
+    if (!ap_native_preview_exact_keys($reply, ['ok', 'protocol_version', 'source_count', 'cards', 'status_preview_state', 'quote_preview_state'])
         || $reply['ok'] !== true || $reply['protocol_version'] !== 1 || $reply['source_count'] !== $count
         || !ap_native_preview_state_valid($reply['status_preview_state'], $initial, $count)
+        || !ap_native_preview_state_valid($reply['quote_preview_state'], $quoteInitial, $count * 16)
         || !is_array($reply['cards']) || !array_is_list($reply['cards']) || count($reply['cards']) > $count) {
         return null;
     }
@@ -89,7 +143,7 @@ function ap_library_native_render_batch(array $statuses, string $view, array $sa
         || !array_is_list($statuses) || count($statuses) > 100 || !function_exists('ap_auth_current_user')) return null;
     try {
         foreach ($statuses as $status) {
-            if (!is_array($status) || ap_native_quote_tree_requires_php($status)) {
+            if (!is_array($status) || ap_library_native_quote_tree_requires_php($status)) {
                 return null;
             }
         }
@@ -101,11 +155,12 @@ function ap_library_native_render_batch(array $statuses, string $view, array $sa
     $url = (string) (getenv('VAAK_LIBRARY_NATIVE_URL') ?: 'http://127.0.0.1:8787/internal/library/render');
     if (!ap_library_native_url_allowed($url) || !function_exists('curl_init')) return null;
     $initial = ap_native_preview_effective_budget();
+    $quoteInitial = ap_library_native_quote_budget();
     try {
     json_encode($statuses, JSON_THROW_ON_ERROR);
     $bskyRemaining = function_exists('ap_bsky_budget_remaining') ? ap_bsky_budget_remaining() : null;
     if ($bskyRemaining !== null && ((!is_float($bskyRemaining) && !is_int($bskyRemaining)) || !is_finite((float)$bskyRemaining))) return null;
-    $body = json_encode(['protocol_version' => 1, 'status_preview_budget' => $initial,
+    $body = json_encode(['protocol_version' => 1, 'status_preview_budget' => $initial, 'quote_preview_budget' => $quoteInitial,
         'bsky_budget_deadline' => $bskyRemaining === null ? null : microtime(true) + $bskyRemaining,
         'owner_id' => (int) $user['id'], 'csrf' => ap_auth_csrf_token(),
         'return_view' => $view, 'lazy_media' => !empty($GLOBALS['admin_bookmark_lazy_media']), 'bsky_enabled' => function_exists('ap_bsky_tab_enabled') && ap_bsky_tab_enabled(),
@@ -131,9 +186,12 @@ function ap_library_native_render_batch(array $statuses, string $view, array $sa
     $success = curl_exec($ch); $code = curl_getinfo($ch, CURLINFO_RESPONSE_CODE); curl_close($ch);
     if ($success === false || $code !== 200 || !is_string($response) || strlen($response) > 8 * 1024 * 1024) return null;
     $reply = json_decode($response, true);
-    $html = is_array($reply) ? ap_library_native_validate_reply($reply, count($statuses), $initial) : null;
+    $html = is_array($reply) ? ap_library_native_validate_reply($reply, count($statuses), $initial, $quoteInitial) : null;
     if ($html === null) return null;
     ap_native_preview_commit_state($reply['status_preview_state']);
+    if ($reply['quote_preview_state']['attempts'] > 0) {
+        $GLOBALS['admin_quote_link_preview_budget'] = $reply['quote_preview_state']['remaining'];
+    }
     return $html;
 }
 
@@ -156,9 +214,10 @@ function ap_library_native_render_saved_local(array $rows, string $producer, int
             'selected_ordinal' => $ordinal, 'folder_id' => $folder, 'offset' => $offset, 'limit' => $limit];
     }
     $initial = ap_native_preview_effective_budget();
+    $quoteInitial = ap_library_native_quote_budget();
     try {
         $body = json_encode(['protocol_version' => 1, 'canonical_saved_only' => true,
-            'status_preview_budget' => $initial, 'owner_id' => $owner,
+            'status_preview_budget' => $initial, 'quote_preview_budget' => $quoteInitial, 'owner_id' => $owner,
             'csrf' => ap_auth_csrf_token(), 'return_view' => 'bookmarks',
             'lazy_media' => !empty($GLOBALS['admin_bookmark_lazy_media']), 'bsky_enabled' => false,
             'saved_sources' => $savedSources], JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
@@ -179,8 +238,11 @@ function ap_library_native_render_saved_local(array $rows, string $producer, int
     $success = curl_exec($ch); $code = curl_getinfo($ch, CURLINFO_RESPONSE_CODE); curl_close($ch);
     if ($success === false || $code !== 200 || !is_string($response) || strlen($response) > 8 * 1024 * 1024) return null;
     $reply = json_decode($response, true);
-    $html = is_array($reply) ? ap_library_native_validate_reply($reply, count($savedSources), $initial) : null;
+    $html = is_array($reply) ? ap_library_native_validate_reply($reply, count($savedSources), $initial, $quoteInitial) : null;
     if ($html === null) return null;
     ap_native_preview_commit_state($reply['status_preview_state']);
+    if ($reply['quote_preview_state']['attempts'] > 0) {
+        $GLOBALS['admin_quote_link_preview_budget'] = $reply['quote_preview_state']['remaining'];
+    }
     return $html;
 }

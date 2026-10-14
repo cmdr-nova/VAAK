@@ -3,8 +3,10 @@
 //! PHP `ap_masto_interaction_row_to_status` with the `favourited` flag is the
 //! bookmark projector with that flag flipped, plus a Bluesky like record.
 //! `VAAK_LIBRARY_NATIVE_RENDER` still has to be on before this painter runs.
-//! While it is off, PHP remains the favourites page. Quotes, polls, Asks,
-//! announce chrome, and reply parents still fall back to PHP.
+//! While it is off, PHP remains the favourites page. A quote with a cached
+//! target, a compact preview, or a cold/deleted/non-status stub is painted
+//! with bookmarks. Polls, Asks, announce chrome, and reply parents still
+//! fall back to PHP.
 
 use anyhow::Result;
 use serde_json::Value;
