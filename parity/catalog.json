@@ -70,6 +70,12 @@
       "area": "Profiles",
       "summary": "Local profile header, tabs, relationship row, and empty Pins or Asks bodies. PHP capture is api/bin/profile-local-chrome-capture.php. Rust profile_local paints the same chrome and does not open a database.",
       "php": {"script": "parity/php/profile-local-chrome.php", "args": []}
+    },
+    {
+      "id": "profile-remote-chrome",
+      "area": "Profiles",
+      "summary": "Remote ActivityPub profile header, relationship row, and tabs. PHP capture is api/bin/profile-remote-chrome-capture.php. Rust profile_remote paints the same chrome and does not open a database.",
+      "php": {"script": "parity/php/profile-remote-chrome.php", "args": []}
     }
   ]
 }

@@ -35,6 +35,7 @@ mod profile_materialize;
 mod profile_admission_fixture;
 mod profile_header;
 mod profile_local;
+mod profile_remote;
 mod profile_quote_state;
 mod profile_warm;
 mod profile_quote_warm;
