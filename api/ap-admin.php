@@ -34560,10 +34560,18 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
                 && function_exists('ap_post_subscription_is')
                 && ap_post_subscription_is($rpActor, admin_owner_user_id());
             $rpLocalNative = null;
+            $rpGuestView = !empty($GLOBALS['vaak_guest_profile']);
+            $rpGuestBskyFact = '';
+            if ($rpGuestView) {
+                if (!empty($rpBskyStatsHandle)) {
+                    $rpGuestBskyFact = (string) $rpBskyStatsHandle;
+                } elseif (isset($rpBskyHandle) && $rpBskyHandle !== '') {
+                    $rpGuestBskyFact = (string) $rpBskyHandle;
+                }
+            }
             if (ap_profile_native_enabled()
                 && $rpIsLocal
                 && !$rpIsBsky
-                && empty($GLOBALS['vaak_guest_profile'])
                 && empty($rpContentBlocked)
                 && is_string($rpLocalKey)
                 && $rpLocalKey !== ''
@@ -34574,7 +34582,7 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
                 $rpWhoName = (string) ((is_array($rpMeta) ? ($rpMeta['display_name'] ?? null) : null) ?: actor_handle($rpActor));
                 $rpWhoHtml = admin_emoji_html($rpWhoName, $rpActor);
                 $rpMenuOwner = (int) $vaakOwnerId;
-                $rpPersonalBlock = function_exists('ap_user_block_find')
+                $rpPersonalBlock = (!$rpGuestView && function_exists('ap_user_block_find'))
                     ? ap_user_block_find($rpActor, short_host($rpActor), $rpMenuOwner)
                     : null;
                 $rpBareSrc = null;
@@ -34607,10 +34615,12 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
                     'blocked_server' => !empty($rpBlockedServer),
                     'subscribed' => !empty($rpPostSub),
                     'personal_block_id' => is_array($rpPersonalBlock) ? (int) ($rpPersonalBlock['id'] ?? 0) : null,
-                    'deprioritized' => function_exists('ap_is_deprioritized_actor') && ap_is_deprioritized_actor($rpActor, $rpMenuOwner),
-                    'target_is_admin' => function_exists('admin_is_local_admin_actor') && admin_is_local_admin_actor($rpActor),
+                    'deprioritized' => !$rpGuestView && function_exists('ap_is_deprioritized_actor') && ap_is_deprioritized_actor($rpActor, $rpMenuOwner),
+                    'target_is_admin' => !$rpGuestView && function_exists('admin_is_local_admin_actor') && admin_is_local_admin_actor($rpActor),
                     'viewer_is_admin' => !empty($vaakIsAdmin),
-                    'csrf' => function_exists('ap_auth_csrf_token') ? (string) ap_auth_csrf_token() : '',
+                    'guest' => $rpGuestView,
+                    'guest_bsky' => $rpGuestBskyFact,
+                    'csrf' => (!$rpGuestView && function_exists('ap_auth_csrf_token')) ? (string) ap_auth_csrf_token() : '',
                     'bridge' => is_array($rpPhyrianBridge) ? [
                         'avatar_name' => (string) ($rpPhyrianBridge['avatar_name'] ?? ''),
                         'strain_snapshot' => (string) ($rpPhyrianBridge['strain_snapshot'] ?? ''),
@@ -34654,11 +34664,20 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
                     $rpOutboxMediaCount = ap_outbox_media_count((string) $rpLocalKey);
                     $rpFacts['media_total'] = (int) $rpOutboxMediaCount;
                 }
+                if (!in_array((string) $rpTab, ['asks', 'pinned', 'featured', 'blog'], true)) {
+                    $rpFacts['feed_shell'] = true;
+                    $rpFacts['feed_empty'] = (($rpTabItems[$rpTab] ?? []) === [])
+                        && ($rpAxumHtml === null || ($rpAxumHtml === '' && $rpCompleteSourceCount === 0))
+                        && (($rpLocalPageItems ?? []) === []);
+                    $rpFacts['feed_offset'] = (int) ($rpLocalNextOffset ?? 0);
+                    $rpFacts['feed_limit'] = (int) ($rpLocalPageLimit ?? 12);
+                    $rpFacts['feed_has_more'] = !empty($rpLocalHasMore);
+                    $rpFacts['feed_cache'] = (string) ($rpAxumCache ?? '');
+                }
                 $rpLocalNative = ap_profile_native_render_local($rpFacts);
             } elseif (ap_profile_native_enabled()
                 && !$rpIsLocal
                 && !$rpIsBsky
-                && empty($GLOBALS['vaak_guest_profile'])
                 && empty($rpContentBlocked)
                 && is_string($rpActor)
                 && str_starts_with($rpActor, 'https://')
@@ -34669,14 +34688,14 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
                 $rpHandleText = actor_handle($rpActor, is_array($rpMeta) ? ($rpMeta['username'] ?? null) : null);
                 $rpOpenHref = admin_remote_actor_href($rpActor, is_array($rpMeta) ? (string) ($rpMeta['username'] ?? '') : null);
                 $rpMenuOwner = (int) $vaakOwnerId;
-                $rpPersonalBlock = function_exists('ap_user_block_find')
+                $rpPersonalBlock = (!$rpGuestView && function_exists('ap_user_block_find'))
                     ? ap_user_block_find($rpActor, short_host($rpActor), $rpMenuOwner)
                     : null;
                 $rpBareSrc = null;
                 if (!is_string($rpAvatar) || $rpAvatar === '') {
                     $rpBareSrc = admin_actor_avatar_url($rpActor);
                 }
-                $rpServerControl = (!empty($vaakIsAdmin) && function_exists('admin_global_actor_control'))
+                $rpServerControl = (!$rpGuestView && !empty($vaakIsAdmin) && function_exists('admin_global_actor_control'))
                     ? admin_global_actor_control($rpActor)
                     : null;
                 $rpFacts = [
@@ -34705,15 +34724,17 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
                     'blocked_personal' => !empty($rpBlockedPersonal),
                     'blocked_server' => !empty($rpBlockedServer),
                     'personal_block_id' => is_array($rpPersonalBlock) ? (int) ($rpPersonalBlock['id'] ?? 0) : null,
-                    'deprioritized' => function_exists('ap_is_deprioritized_actor') && ap_is_deprioritized_actor($rpActor, $rpMenuOwner),
-                    'target_is_admin' => function_exists('admin_is_local_admin_actor') && admin_is_local_admin_actor($rpActor),
+                    'deprioritized' => !$rpGuestView && function_exists('ap_is_deprioritized_actor') && ap_is_deprioritized_actor($rpActor, $rpMenuOwner),
+                    'target_is_admin' => !$rpGuestView && function_exists('admin_is_local_admin_actor') && admin_is_local_admin_actor($rpActor),
                     'viewer_is_admin' => !empty($vaakIsAdmin),
-                    'wafrn_known' => function_exists('ap_wafrn_actor_host_known') && ap_wafrn_actor_host_known($rpActor),
+                    'wafrn_known' => !$rpGuestView && function_exists('ap_wafrn_actor_host_known') && ap_wafrn_actor_host_known($rpActor),
                     'server_control' => is_array($rpServerControl) ? [
                         'id' => (int) ($rpServerControl['id'] ?? 0),
                         'kind' => (string) ($rpServerControl['kind'] ?? ''),
                     ] : null,
-                    'csrf' => function_exists('ap_auth_csrf_token') ? (string) ap_auth_csrf_token() : '',
+                    'guest' => $rpGuestView,
+                    'guest_bsky' => $rpGuestBskyFact,
+                    'csrf' => (!$rpGuestView && function_exists('ap_auth_csrf_token')) ? (string) ap_auth_csrf_token() : '',
                     'fields' => array_values(is_array($rpProfileFields) ? $rpProfileFields : []),
                     'item_posts' => count($rpTabItems['posts'] ?? []),
                     'item_replies' => count($rpTabItems['replies'] ?? []),
@@ -34723,21 +34744,20 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
                 $rpLocalNative = ap_profile_native_render_remote($rpFacts);
             } elseif (ap_profile_native_enabled()
                 && $rpIsBsky
-                && empty($GLOBALS['vaak_guest_profile'])
                 && empty($rpContentBlocked)
                 && is_string($rpActor)
                 && $rpActor !== '') {
                 $rpWhoName = (string) ((is_array($rpMeta) ? ($rpMeta['display_name'] ?? null) : null) ?: actor_handle($rpActor));
                 $rpWhoHtml = admin_emoji_html($rpWhoName, $rpActor);
                 $rpMenuOwner = (int) $vaakOwnerId;
-                $rpPersonalBlock = function_exists('ap_user_block_find')
+                $rpPersonalBlock = (!$rpGuestView && function_exists('ap_user_block_find'))
                     ? ap_user_block_find($rpActor, 'bsky.app', $rpMenuOwner)
                     : null;
                 $rpBareSrc = null;
                 if (!is_string($rpAvatar) || $rpAvatar === '') {
                     $rpBareSrc = admin_actor_avatar_url($rpActor);
                 }
-                $rpServerControl = (!empty($vaakIsAdmin) && function_exists('admin_global_actor_control'))
+                $rpServerControl = (!$rpGuestView && !empty($vaakIsAdmin) && function_exists('admin_global_actor_control'))
                     ? admin_global_actor_control($rpActor)
                     : null;
                 $rpFacts = [
@@ -34765,15 +34785,17 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
                     'blocked_personal' => !empty($rpBlockedPersonal),
                     'blocked_server' => !empty($rpBlockedServer),
                     'personal_block_id' => is_array($rpPersonalBlock) ? (int) ($rpPersonalBlock['id'] ?? 0) : null,
-                    'deprioritized' => function_exists('ap_is_deprioritized_actor') && ap_is_deprioritized_actor($rpActor, $rpMenuOwner),
-                    'target_is_admin' => function_exists('admin_is_local_admin_actor') && admin_is_local_admin_actor($rpActor),
+                    'deprioritized' => !$rpGuestView && function_exists('ap_is_deprioritized_actor') && ap_is_deprioritized_actor($rpActor, $rpMenuOwner),
+                    'target_is_admin' => !$rpGuestView && function_exists('admin_is_local_admin_actor') && admin_is_local_admin_actor($rpActor),
                     'viewer_is_admin' => !empty($vaakIsAdmin),
-                    'wafrn_known' => function_exists('ap_wafrn_actor_host_known') && ap_wafrn_actor_host_known($rpActor),
+                    'wafrn_known' => !$rpGuestView && function_exists('ap_wafrn_actor_host_known') && ap_wafrn_actor_host_known($rpActor),
                     'server_control' => is_array($rpServerControl) ? [
                         'id' => (int) ($rpServerControl['id'] ?? 0),
                         'kind' => (string) ($rpServerControl['kind'] ?? ''),
                     ] : null,
-                    'csrf' => function_exists('ap_auth_csrf_token') ? (string) ap_auth_csrf_token() : '',
+                    'guest' => $rpGuestView,
+                    'guest_bsky' => $rpGuestBskyFact,
+                    'csrf' => (!$rpGuestView && function_exists('ap_auth_csrf_token')) ? (string) ap_auth_csrf_token() : '',
                     'fields' => array_values(is_array($rpProfileFields) ? $rpProfileFields : []),
                     'item_posts' => count($rpTabItems['posts'] ?? []),
                     'item_replies' => count($rpTabItems['replies'] ?? []),
@@ -35357,9 +35379,11 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
               <?php endforeach; ?>
             <?php endif; ?>
           <?php elseif ($rpIsLocal || $rpOutboxPosts || $rpBskyPosts): ?>
+<?php if (is_array($rpLocalNative ?? null) && is_string($rpLocalNative['feed_open'] ?? null)) { echo $rpLocalNative['feed_open']; } else { ?>
             <?php if ($rpTabItems[$rpTab] === [] && ($rpAxumHtml === null || ($rpAxumHtml === '' && $rpCompleteSourceCount === 0)) && ($rpLocalPageItems ?? []) === []): ?><div class="empty">No <?= h($rpTab) ?> available.</div><?php endif; ?>
             <?php if ($rpIsLocal): ?><div id="timeline-items" data-view="remote_profile" data-actor="<?= h($rpActor) ?>" data-tab="<?= h($rpTab) ?>" data-offset="<?= (int) $rpLocalNextOffset ?>" data-limit="<?= (int) $rpLocalPageLimit ?>" data-has-more="<?= $rpLocalHasMore ? '1' : '0' ?>" data-newest="0"<?= $rpAxumCache !== '' ? ' data-tl-cache="' . h($rpAxumCache) . '"' : '' ?>>
             <?php endif; ?>
+<?php } ?>
             <?php if ($rpAxumHtml !== null): ?>
               <?= $rpAxumHtml ?>
             <?php else: ?>
@@ -35386,8 +35410,10 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
               <?php endif; ?>
             <?php endforeach; ?>
             <?php endif; ?>
+<?php if (is_array($rpLocalNative ?? null) && is_string($rpLocalNative['feed_close'] ?? null)) { echo $rpLocalNative['feed_close']; } else { ?>
             <?php if ($rpIsLocal): ?></div><div id="timeline-status" class="meta" style="padding:.75rem 0;text-align:center"><?= $rpLocalHasMore ? 'Scroll for more…' : 'End of profile' ?></div><div id="timeline-sentinel" aria-hidden="true" style="height:1px"></div><button type="button" class="feed-top-btn" id="feed-top-btn" title="Back to top" aria-label="Back to top">↑</button>
             <?php endif; ?>
+<?php } ?>
           <?php elseif ($rpTabItems[$rpTab] === []): ?>
             <div class="empty">No <?= h($rpTab) ?> available<?= $rpIsLocal ? ' in the local outbox' : ' in the activity seen by this instance' ?>.</div>
           <?php else: ?>

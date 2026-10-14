@@ -3,7 +3,7 @@ declare(strict_types=1);
 /** Actual current first-paint placeholder/loader fragment, no card or header fixture. */
 $source=(string)file_get_contents(dirname(__DIR__).'/ap-admin.php');
 $start=strpos($source,'            <?php if ($rpTabItems[$rpTab] === [] && ($rpAxumHtml');
-$end=strpos($source,'            <?php if ($rpAxumHtml !== null): ?>',$start);
+$end=strpos($source,"<?php } ?>\n            <?php if (\$rpAxumHtml !== null): ?>",$start);
 if($start===false||$end===false)throw new RuntimeException('actual first-paint fragment boundary');
 $fragment=substr($source,$start,$end-$start);
 function h(string $value):string{return htmlspecialchars($value,ENT_QUOTES|ENT_SUBSTITUTE,'UTF-8');}

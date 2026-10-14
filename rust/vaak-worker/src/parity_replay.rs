@@ -56,6 +56,7 @@ fn produce(producer: &str, cases: &[InputCase]) -> Result<Vec<Value>> {
             "profile-remote-chrome" => profile_remote_chrome(&case.input)?,
             "timeline-cursor" => timeline_cursor(&case.input)?,
             "profile-bsky-chrome" => profile_bsky_chrome(&case.input)?,
+            "profile-guest-actions" => profile_guest_actions(&case.input)?,
             other => bail!("unknown producer {other}"),
         };
         Ok(json!({"id": case.id, "output": output}))
@@ -354,6 +355,32 @@ fn timeline_cursor(input: &Value) -> Result<Value> {
 fn profile_bsky_chrome(input: &Value) -> Result<Value> {
     let painted = crate::profile_bsky_chrome::paint_bsky(input).map_err(anyhow::Error::msg)?;
     Ok(json!({"chrome": painted.chrome, "secondary": painted.secondary}))
+}
+
+fn profile_guest_actions(input: &Value) -> Result<Value> {
+    let kind = input.get("kind").and_then(Value::as_str).unwrap_or("local");
+    let (chrome, page_back, header, secondary, feed_open, feed_close) = match kind {
+        "remote" => {
+            let painted = crate::profile_remote::paint_remote(input).map_err(anyhow::Error::msg)?;
+            (painted.chrome, painted.page_back, painted.header, painted.secondary, None, None)
+        }
+        "bsky" => {
+            let painted = crate::profile_bsky_chrome::paint_bsky(input).map_err(anyhow::Error::msg)?;
+            (painted.chrome, painted.page_back, painted.header, painted.secondary, None, None)
+        }
+        _ => {
+            let painted = crate::profile_local::paint_local(input).map_err(anyhow::Error::msg)?;
+            (painted.chrome, painted.page_back, painted.header, painted.secondary, painted.feed_open, painted.feed_close)
+        }
+    };
+    Ok(json!({
+        "chrome": chrome,
+        "page_back": page_back,
+        "header": header,
+        "secondary": secondary,
+        "feed_open": feed_open,
+        "feed_close": feed_close,
+    }))
 }
 
 fn settings_fields(id: &str) -> Result<Value> {
