@@ -1527,17 +1527,18 @@ function ap_masto_api(string $method, string $path): void
             $sinceId = (string) $_GET['min_id'];
         }
         [$types, $exclude] = ap_masto_parse_notification_type_filters();
-        ap_masto_json(ap_masto_notifications_fetch($limit, $maxId, $sinceId, $types, $exclude));
+        ap_masto_json(ap_masto_notifications_api_list(ap_masto_notifications_fetch($limit, $maxId, $sinceId, $types, $exclude)));
         return;
     }
 
     if (preg_match('#^/api/v1/notifications/(\d+)$#', $path, $nm) && $method === 'GET') {
         ap_masto_require_token('read');
         $n = ap_masto_notification_by_id($nm[1]);
-        if (!$n) {
+        $clean = is_array($n) ? ap_masto_api_notification($n) : null;
+        if ($clean === null) {
             ap_masto_json(['error' => 'Record not found'], 404);
         }
-        ap_masto_json($n);
+        ap_masto_json($clean);
         return;
     }
 
@@ -1604,7 +1605,8 @@ function ap_masto_api(string $method, string $path): void
             $sinceId = (string) $_GET['min_id'];
         }
         [$types, $exclude] = ap_masto_parse_notification_type_filters();
-        ap_masto_json(ap_masto_notifications_grouped_fetch($limit, $maxId, $sinceId, $types, $exclude));
+        $expand = isset($_GET['expand_accounts']) ? (string) $_GET['expand_accounts'] : 'full';
+        ap_masto_json(ap_masto_notifications_grouped_fetch($limit, $maxId, $sinceId, $types, $exclude, $expand));
         return;
     }
 
@@ -1640,52 +1642,23 @@ function ap_masto_api(string $method, string $path): void
         } elseif (ctype_digit($key)) {
             $nid = $key;
         }
-        $n = $nid !== null ? ap_masto_notification_by_id($nid) : null;
-        if ($n === null && $key !== '') {
-            foreach (ap_masto_notifications_grouped_fetch(80) ['notification_groups'] ?? [] as $candidate) {
-                if (is_array($candidate) && (string) ($candidate['group_key'] ?? '') === $key) {
-                    $n = null;
-                    // The detail route is primarily used to expand the group;
-                    // return the group metadata even when it contains several
-                    // underlying notifications.
-                    ap_masto_json([
-                        'accounts' => [],
-                        'statuses' => [],
-                        'notification_groups' => [$candidate],
-                    ]);
-                    return;
+        $expand = isset($_GET['expand_accounts']) ? (string) $_GET['expand_accounts'] : 'full';
+        if ($nid !== null) {
+            $n = ap_masto_notification_by_id($nid);
+            if (is_array($n)) {
+                $payload = ap_masto_notifications_grouped_from_items([$n], $expand);
+                if (($payload['notification_groups'] ?? []) !== []) {
+                    ap_masto_json($payload);
                 }
             }
         }
-        if (!$n) {
-            ap_masto_json(['error' => 'Record not found'], 404);
-            return;
+        if ($key !== '') {
+            $slice = ap_masto_notifications_grouped_slice(ap_masto_notifications_grouped_fetch(80, null, null, [], [], $expand), $key);
+            if ($slice !== null) {
+                ap_masto_json($slice);
+            }
         }
-        $acct = $n['account'] ?? null;
-        $status = $n['status'] ?? null;
-        $accounts = is_array($acct) ? [$acct] : [];
-        $statuses = is_array($status) ? [$status] : [];
-        $acctId = is_array($acct) && isset($acct['id']) ? (string) $acct['id'] : '';
-        $statusId = is_array($status) && isset($status['id']) ? (string) $status['id'] : null;
-        $idInt = (int) $n['id'];
-        $group = [
-            'group_key' => (string) ($n['group_key'] ?? ('ungrouped-' . $n['id'])),
-            'notifications_count' => 1,
-            'type' => (string) $n['type'],
-            'most_recent_notification_id' => $idInt,
-            'page_min_id' => (string) $n['id'],
-            'page_max_id' => (string) $n['id'],
-            'latest_page_notification_at' => (string) $n['created_at'],
-            'sample_account_ids' => $acctId !== '' ? [$acctId] : [],
-        ];
-        if (in_array($n['type'], ['mention', 'status', 'reblog', 'favourite', 'poll', 'update', 'quote', 'quoted_update'], true)) {
-            $group['status_id'] = $statusId;
-        }
-        ap_masto_json([
-            'accounts' => $accounts,
-            'statuses' => $statuses,
-            'notification_groups' => [$group],
-        ]);
+        ap_masto_json(['error' => 'Record not found'], 404);
         return;
     }
 

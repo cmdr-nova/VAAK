@@ -632,6 +632,10 @@ function ap_phyrian_notification_entities(int $ownerUserId): array
             $uname = (string) ($row['from_username'] ?? $row['from_actor_key'] ?? ('user' . $fromId));
             $actorKey = (string) ($row['from_actor_key'] ?? $uname);
             $actorId = 'https://mkultra.monster/users/' . preg_replace('/[^a-z0-9_]/', '', strtolower($actorKey));
+            $fallbackAvatar = function_exists('ap_masto_https_avatar_fallback')
+                ? ap_masto_https_avatar_fallback()
+                : 'https://mkultra.monster/img/avatar/default.webp';
+            $fallbackHeader = 'https://mkultra.monster/img/gifs/waves.gif';
             $account = [
                 'id' => (string) $fromId,
                 'username' => $uname,
@@ -639,8 +643,19 @@ function ap_phyrian_notification_entities(int $ownerUserId): array
                 'display_name' => $uname,
                 'url' => $actorId,
                 'uri' => $actorId,
-                'avatar' => '',
-                'avatar_static' => '',
+                'avatar' => $fallbackAvatar,
+                'avatar_static' => $fallbackAvatar,
+                'header' => $fallbackHeader,
+                'header_static' => $fallbackHeader,
+                'note' => '',
+                'created_at' => '2020-01-01T00:00:00.000Z',
+                'fields' => [],
+                'emojis' => [],
+                'locked' => false,
+                'bot' => false,
+                'followers_count' => 0,
+                'following_count' => 0,
+                'statuses_count' => 0,
             ];
         }
         $created = (string) ($row['created_at'] ?? '');

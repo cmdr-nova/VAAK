@@ -1323,6 +1323,7 @@ function ap_notification_projection_invalidate_owner(int $ownerUserId): void
             ap_redis_delete_pattern('vaak:notifications:v1:' . $ownerUserId . ':*');
             ap_redis_delete_pattern('vaak:notifications:v2:' . $ownerUserId . ':*');
             ap_redis_delete_pattern('vaak:notifications:v3:' . $ownerUserId . ':*');
+            ap_redis_delete_pattern('vaak:notifications:v4:' . $ownerUserId . ':*');
         }
     } catch (Throwable $e) {
         error_log('[ap-db] notification projection owner invalidation skipped: ' . $e->getMessage());
@@ -1348,6 +1349,7 @@ function ap_notification_projection_invalidate_all(): void
             ap_redis_delete_pattern('vaak:notifications:v1:*');
             ap_redis_delete_pattern('vaak:notifications:v2:*');
             ap_redis_delete_pattern('vaak:notifications:v3:*');
+            ap_redis_delete_pattern('vaak:notifications:v4:*');
         }
     } catch (Throwable $e) {
         error_log('[ap-db] notification projection global invalidation skipped: ' . $e->getMessage());

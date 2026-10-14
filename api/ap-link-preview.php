@@ -624,7 +624,9 @@ function ap_masto_preview_card(?array $card): ?array
         'html' => '',
         'width' => $isVideo ? 480 : 0,
         'height' => $isVideo ? 270 : 0,
-        'image' => isset($card['image']) && is_string($card['image']) ? $card['image'] : null,
+        'image' => function_exists('ap_masto_https_media_url')
+            ? ap_masto_https_media_url($card['image'] ?? null, null)
+            : (isset($card['image']) && is_string($card['image']) && str_starts_with($card['image'], 'https://') ? $card['image'] : null),
         'embed_url' => '',
         'blurhash' => null,
         'language' => null,
