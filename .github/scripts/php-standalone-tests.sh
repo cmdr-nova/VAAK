@@ -62,6 +62,7 @@ php_tests=(
   api/bin/recommendations-behavior-smoke.php
   api/bin/search-direct-undo-smoke.php
   api/bin/search-indexing-behavior-smoke.php
+  api/bin/schema-probe-cache-smoke.php
   api/bin/search-quote-preview-boundary-smoke.php
   api/bin/settings-parity-smoke.php
 )

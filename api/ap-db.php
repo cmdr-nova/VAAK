@@ -141,6 +141,10 @@ function ap_db(): PDO
         }
         $user = getenv('AP_DB_USER');
         $password = getenv('AP_DB_PASSWORD');
+        // Persistent connections are intentionally not used. A reused
+        // PostgreSQL session can keep an aborted transaction, a changed
+        // statement_timeout, or a prepared-statement name after a request
+        // dies. Schema probes are cached instead (see ap_schema_snapshot).
         $pdo = new PDO($postgresDsn, $user !== false && $user !== '' ? $user : null, $password !== false && $password !== '' ? $password : null, [
             PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
             PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
@@ -186,22 +190,436 @@ function ap_db(): PDO
 }
 
 /**
+ * Deploy revision mixed into schema-probe cache keys.
+ * Production deploys bump VAAK_VERSION, so the next request rechecks once.
+ */
+function ap_schema_cache_revision(): string
+{
+    static $rev = null;
+    if (is_string($rev)) {
+        return $rev;
+    }
+    if (!defined('VAAK_VERSION')) {
+        $versionFile = __DIR__ . '/ap-version.php';
+        if (is_file($versionFile)) {
+            require_once $versionFile;
+        }
+    }
+    $rev = defined('VAAK_VERSION') ? (string) VAAK_VERSION : 'dev';
+    return $rev;
+}
+
+function ap_schema_cache_key(string $schema): string
+{
+    return 'vaak:schema:v1:' . ap_schema_cache_revision() . ':' . $schema;
+}
+
+/**
+ * Process-local schema snapshot store. PHP-FPM keeps this for the worker
+ * lifetime; APCu and Redis cover the other workers. Only positive facts
+ * (table, column, or index exists) are published.
+ *
+ * @return array{local: array<int, string>, snap: array<string, array{tables: array<string, true>, columns: array<string, array<string, string|null>>, indexes: array<string, true>}>, published: array<string, true>, dirty: array<string, true>}
+ */
+function &ap_schema_store(): array
+{
+    static $store = [
+        'local' => [],
+        'snap' => [],
+        'published' => [],
+        'dirty' => [],
+    ];
+    return $store;
+}
+
+/** Drop the in-process snapshot. Shared APCu/Redis entries expire by revision. */
+function ap_schema_cache_reset(): void
+{
+    $store = &ap_schema_store();
+    $store['local'] = [];
+    $store['snap'] = [];
+    $store['published'] = [];
+    $store['dirty'] = [];
+}
+
+/**
+ * @param array<string, mixed> $raw
+ * @return array{tables: array<string, true>, columns: array<string, array<string, string|null>>, indexes: array<string, true>}
+ */
+function ap_schema_snapshot_normalize(array $raw): array
+{
+    $tables = [];
+    foreach ($raw['tables'] ?? [] as $key => $value) {
+        $name = is_string($key) ? $key : (string) $value;
+        if ($name !== '') {
+            $tables[$name] = true;
+        }
+    }
+    $indexes = [];
+    foreach ($raw['indexes'] ?? [] as $key => $value) {
+        $name = is_string($key) ? $key : (string) $value;
+        if ($name !== '') {
+            $indexes[$name] = true;
+        }
+    }
+    $columns = [];
+    if (isset($raw['columns']) && is_array($raw['columns'])) {
+        foreach ($raw['columns'] as $table => $cols) {
+            if (!is_string($table) || !is_array($cols)) {
+                continue;
+            }
+            foreach ($cols as $column => $default) {
+                if (!is_string($column) || $column === '') {
+                    continue;
+                }
+                if (is_string($default) || $default === null) {
+                    $columns[$table][$column] = $default;
+                }
+            }
+        }
+    }
+    return ['tables' => $tables, 'columns' => $columns, 'indexes' => $indexes];
+}
+
+/**
+ * @param array{tables: array<string, true>, columns: array<string, array<string, string|null>>, indexes: array<string, true>} $snap
+ * @return array{tables: list<string>, columns: array<string, array<string, string|null>>, indexes: list<string>}
+ */
+function ap_schema_snapshot_export(array $snap): array
+{
+    return [
+        'tables' => array_keys($snap['tables']),
+        'columns' => $snap['columns'],
+        'indexes' => array_keys($snap['indexes']),
+    ];
+}
+
+/**
+ * @param array{tables: array<string, true>, columns: array<string, array<string, string|null>>, indexes: array<string, true>} $base
+ * @param array<string, mixed>|null $extra
+ * @return array{tables: array<string, true>, columns: array<string, array<string, string|null>>, indexes: array<string, true>}
+ */
+function ap_schema_snapshot_merge(array $base, ?array $extra): array
+{
+    if ($extra === null) {
+        return $base;
+    }
+    $extra = ap_schema_snapshot_normalize($extra);
+    foreach ($extra['tables'] as $name => $_) {
+        $base['tables'][$name] = true;
+    }
+    foreach ($extra['indexes'] as $name => $_) {
+        $base['indexes'][$name] = true;
+    }
+    foreach ($extra['columns'] as $table => $cols) {
+        foreach ($cols as $column => $default) {
+            if (!isset($base['columns'][$table]) || !array_key_exists($column, $base['columns'][$table])) {
+                $base['columns'][$table][$column] = $default;
+            }
+        }
+    }
+    return $base;
+}
+
+function ap_schema_error_is_duplicate(Throwable $e): bool
+{
+    if ($e instanceof PDOException) {
+        $state = (string) ($e->errorInfo[0] ?? '');
+        if (in_array($state, ['42701', '42P07', '42710'], true)) {
+            return true;
+        }
+    }
+    return str_contains($e->getMessage(), 'already exists');
+}
+
+/** @param array<string, mixed> $snap */
+function ap_schema_cache_write_apcu(string $key, array $snap): void
+{
+    if (!function_exists('apcu_store')) {
+        return;
+    }
+    if (function_exists('apcu_enabled') && !apcu_enabled()) {
+        return;
+    }
+    try {
+        apcu_store($key, $snap, 604800);
+    } catch (Throwable $e) {
+        // APCu is an accelerator. A full cache must not change DDL behavior.
+    }
+}
+
+/** @return array<string, mixed>|null */
+function ap_schema_cache_read_shared(string $key): ?array
+{
+    if (function_exists('apcu_fetch') && (!function_exists('apcu_enabled') || apcu_enabled())) {
+        try {
+            $ok = false;
+            $value = apcu_fetch($key, $ok);
+            if ($ok && is_array($value) && isset($value['tables'], $value['columns'], $value['indexes'])) {
+                return $value;
+            }
+        } catch (Throwable $e) {
+            // Fall through to Redis, then the catalog.
+        }
+    }
+    if (function_exists('ap_redis_json_get')) {
+        $value = ap_redis_json_get($key);
+        if (is_array($value) && isset($value['tables'], $value['columns'], $value['indexes'])) {
+            ap_schema_cache_write_apcu($key, $value);
+            return $value;
+        }
+    }
+    return null;
+}
+
+/** @param array{tables: array<string, true>, columns: array<string, array<string, string|null>>, indexes: array<string, true>} $snap */
+function ap_schema_cache_write_shared(string $key, array $snap): void
+{
+    $exported = ap_schema_snapshot_export($snap);
+    ap_schema_cache_write_apcu($key, $exported);
+    if (function_exists('ap_redis_json_set')) {
+        ap_redis_json_set($key, $exported, 604800);
+    }
+}
+
+/**
+ * Publish the in-memory snapshot when this revision was already shared.
+ * Merge with the shared copy so two workers creating different objects
+ * do not erase each other's positive facts.
+ */
+function ap_schema_flush(string $key): void
+{
+    $store = &ap_schema_store();
+    if (!isset($store['snap'][$key])) {
+        return;
+    }
+    if (empty($store['published'][$key])) {
+        $store['dirty'][$key] = true;
+        return;
+    }
+    $merged = ap_schema_snapshot_merge($store['snap'][$key], ap_schema_cache_read_shared($key));
+    $store['snap'][$key] = $merged;
+    ap_schema_cache_write_shared($key, $merged);
+    unset($store['dirty'][$key]);
+}
+
+/**
+ * One catalog read for the whole schema: tables, columns (with defaults),
+ * and indexes. Later ensures in this process, and in other workers after
+ * publish, reuse it.
+ *
+ * @return array{tables: array<string, true>, columns: array<string, array<string, string|null>>, indexes: array<string, true>}
+ */
+function ap_schema_snapshot_query(PDO $db): array
+{
+    $tables = [];
+    $tableRows = $db->query('SELECT tablename FROM pg_tables WHERE schemaname = current_schema()');
+    foreach ($tableRows ? $tableRows->fetchAll(PDO::FETCH_COLUMN) : [] as $name) {
+        $name = (string) $name;
+        if ($name !== '') {
+            $tables[$name] = true;
+        }
+    }
+    $columns = [];
+    $columnRows = $db->query(
+        'SELECT table_name, column_name, column_default
+         FROM information_schema.columns
+         WHERE table_schema = current_schema()'
+    );
+    foreach ($columnRows ? $columnRows->fetchAll(PDO::FETCH_ASSOC) : [] as $row) {
+        if (!is_array($row)) {
+            continue;
+        }
+        $table = (string) ($row['table_name'] ?? '');
+        $column = (string) ($row['column_name'] ?? '');
+        if ($table === '' || $column === '') {
+            continue;
+        }
+        $default = $row['column_default'] ?? null;
+        $columns[$table][$column] = $default === null ? null : (string) $default;
+    }
+    $indexes = [];
+    $indexRows = $db->query('SELECT indexname FROM pg_indexes WHERE schemaname = current_schema()');
+    foreach ($indexRows ? $indexRows->fetchAll(PDO::FETCH_COLUMN) : [] as $name) {
+        $name = (string) $name;
+        if ($name !== '') {
+            $indexes[$name] = true;
+        }
+    }
+    return ['tables' => $tables, 'columns' => $columns, 'indexes' => $indexes];
+}
+
+/** Bind this connection to the cached snapshot for its current schema. */
+function ap_schema_bind(PDO $db): string
+{
+    $store = &ap_schema_store();
+    $conn = spl_object_id($db);
+    if (isset($store['local'][$conn], $store['snap'][$store['local'][$conn]])) {
+        return $store['local'][$conn];
+    }
+    // VAAK serves one schema per PHP worker. After the first load, later
+    // connections in this process reuse that snapshot and do not ask
+    // PostgreSQL again. A test that opens a second schema in the same
+    // process should call ap_schema_cache_reset() first.
+    if (count($store['snap']) === 1) {
+        $only = array_key_first($store['snap']);
+        if (is_string($only)) {
+            $store['local'][$conn] = $only;
+            return $only;
+        }
+    }
+    $schema = (string) $db->query('SELECT current_schema()')->fetchColumn();
+    $key = ap_schema_cache_key($schema);
+    if (!isset($store['snap'][$key])) {
+        $shared = ap_schema_cache_read_shared($key);
+        if ($shared !== null) {
+            $store['snap'][$key] = ap_schema_snapshot_normalize($shared);
+            $store['published'][$key] = true;
+        } else {
+            $store['snap'][$key] = ap_schema_snapshot_query($db);
+        }
+    }
+    $store['local'][$conn] = $key;
+    return $key;
+}
+
+/** @return array<string, true> */
+function ap_schema_tables(PDO $db): array
+{
+    $store = &ap_schema_store();
+    return $store['snap'][ap_schema_bind($db)]['tables'];
+}
+
+function ap_schema_has_table(PDO $db, string $table): bool
+{
+    $store = &ap_schema_store();
+    return isset($store['snap'][ap_schema_bind($db)]['tables'][$table]);
+}
+
+function ap_schema_has_column(PDO $db, string $table, string $column): bool
+{
+    $store = &ap_schema_store();
+    $columns = $store['snap'][ap_schema_bind($db)]['columns'][$table] ?? null;
+    return is_array($columns) && array_key_exists($column, $columns);
+}
+
+/** False when the column is absent. Null is a real SQL default of NULL. */
+function ap_schema_column_default(PDO $db, string $table, string $column): mixed
+{
+    $store = &ap_schema_store();
+    $columns = $store['snap'][ap_schema_bind($db)]['columns'][$table] ?? null;
+    if (!is_array($columns) || !array_key_exists($column, $columns)) {
+        return false;
+    }
+    return $columns[$column];
+}
+
+function ap_schema_has_index(PDO $db, string $index): bool
+{
+    $store = &ap_schema_store();
+    return isset($store['snap'][ap_schema_bind($db)]['indexes'][$index]);
+}
+
+function ap_schema_remember_table(PDO $db, string $table): void
+{
+    if ($table === '') {
+        return;
+    }
+    $store = &ap_schema_store();
+    $key = ap_schema_bind($db);
+    if (isset($store['snap'][$key]['tables'][$table])) {
+        return;
+    }
+    $store['snap'][$key]['tables'][$table] = true;
+    $store['dirty'][$key] = true;
+    ap_schema_flush($key);
+}
+
+function ap_schema_remember_column(PDO $db, string $table, string $column, ?string $default = null, bool $overwrite = false): void
+{
+    if ($table === '' || $column === '') {
+        return;
+    }
+    $store = &ap_schema_store();
+    $key = ap_schema_bind($db);
+    $known = isset($store['snap'][$key]['columns'][$table])
+        && array_key_exists($column, $store['snap'][$key]['columns'][$table]);
+    if ($known && (!$overwrite || $store['snap'][$key]['columns'][$table][$column] === $default)) {
+        return;
+    }
+    $store['snap'][$key]['tables'][$table] = true;
+    $store['snap'][$key]['columns'][$table][$column] = $default;
+    $store['dirty'][$key] = true;
+    ap_schema_flush($key);
+}
+
+function ap_schema_remember_index(PDO $db, string $index): void
+{
+    if ($index === '') {
+        return;
+    }
+    $store = &ap_schema_store();
+    $key = ap_schema_bind($db);
+    if (isset($store['snap'][$key]['indexes'][$index])) {
+        return;
+    }
+    $store['snap'][$key]['indexes'][$index] = true;
+    $store['dirty'][$key] = true;
+    ap_schema_flush($key);
+}
+
+/**
+ * Publish positive facts for this revision. A failed ensure is simply absent,
+ * so the next request still runs that DDL. Duplicate-object errors count as
+ * present so two workers racing a create do not retry forever.
+ */
+function ap_schema_publish(PDO $db): void
+{
+    $store = &ap_schema_store();
+    $conn = spl_object_id($db);
+    $key = $store['local'][$conn] ?? null;
+    if ($key === null || !isset($store['snap'][$key])) {
+        return;
+    }
+    if (!empty($store['published'][$key]) && empty($store['dirty'][$key])) {
+        return;
+    }
+    $store['published'][$key] = true;
+    $store['dirty'][$key] = true;
+    ap_schema_flush($key);
+}
+
+/** Forget an unpublished snapshot so the next request re-reads the catalog. */
+function ap_schema_drop_process_snapshot(PDO $db): void
+{
+    $store = &ap_schema_store();
+    $conn = spl_object_id($db);
+    $key = $store['local'][$conn] ?? null;
+    if (is_string($key)) {
+        unset($store['snap'][$key], $store['published'][$key], $store['dirty'][$key]);
+    }
+    unset($store['local'][$conn]);
+}
+
+/**
  * Staging-only PostgreSQL bootstrap. The full schema is currently imported
  * from SQLite by pgloader, then checked here before PHP is permitted to use it.
  * This prevents a typo in AP_DB_DSN from booting the app against an empty DB.
+ *
+ * Catalog probes (tables, columns, indexes) load once per schema revision
+ * and are reused from process memory, APCu, or Redis. DDL still runs when
+ * a required object is absent.
  */
 function ap_db_migrate_postgres(PDO $db): void
 {
     // Runtime connections validate the already-provisioned schema.  The
     // restricted www-data role intentionally cannot CREATE in public, and
     // PostgreSQL still checks that permission for CREATE TABLE IF NOT EXISTS
-    // even when the table exists.  Probe once so every request / cron run does
-    // not generate failed DDL transactions and error-log writes.
-    $loadPresentTables = static function () use ($db): array {
-        $st = $db->query('SELECT tablename FROM pg_tables WHERE schemaname = current_schema()');
-        return array_fill_keys(array_map('strval', $st->fetchAll(PDO::FETCH_COLUMN)), true);
-    };
-    $present = $loadPresentTables();
+    // even when the table exists.  The catalog snapshot is loaded once per
+    // schema revision (process memory, APCu, or Redis) so a warm request
+    // does not scan pg_tables / information_schema / pg_indexes at all.
+    // DDL still runs when an object is absent, including a fresh database.
+    $present = ap_schema_tables($db);
 
 // Verified Webmentions are public responses to local profile/post URLs.
 // Keep source records separate from ActivityPub content; post targets may
@@ -226,6 +644,9 @@ CREATE TABLE IF NOT EXISTS webmentions (
 SQL);
             $db->exec('CREATE INDEX IF NOT EXISTS idx_webmentions_target ON webmentions(target_url, verified_at DESC, id DESC)');
             $db->exec('CREATE INDEX IF NOT EXISTS idx_webmentions_source_host ON webmentions(source_host, verified_at DESC)');
+            ap_schema_remember_table($db, 'webmentions');
+            ap_schema_remember_index($db, 'idx_webmentions_target');
+            ap_schema_remember_index($db, 'idx_webmentions_source_host');
         }
     } catch (Throwable $e) {
         error_log('[ap-db] webmention table not provisioned: ' . $e->getMessage());
@@ -272,6 +693,11 @@ CREATE TABLE IF NOT EXISTS ap_notice_reads (
     last_read_at TEXT NOT NULL
 )
 SQL);
+        ap_schema_remember_table($db, 'ap_notices');
+        ap_schema_remember_table($db, 'ap_notice_replies');
+        ap_schema_remember_table($db, 'ap_notice_reads');
+        ap_schema_remember_index($db, 'idx_ap_notices_published');
+        ap_schema_remember_index($db, 'idx_ap_notice_replies_notice');
       } catch (Throwable $e) {
         // Production PHP roles may have DML but not public-schema DDL.
         // The required-table check below still fails safely if provisioning is incomplete.
@@ -303,16 +729,15 @@ CREATE TABLE IF NOT EXISTS vaak_blog_posts (
 )
 SQL);
             $db->exec('CREATE INDEX IF NOT EXISTS idx_vaak_blog_actor_published ON vaak_blog_posts(actor_key, status, published_at DESC, id DESC)');
+            ap_schema_remember_table($db, 'vaak_blog_posts');
+            ap_schema_remember_column($db, 'vaak_blog_posts', 'canonical_url', "''::text");
+            ap_schema_remember_index($db, 'idx_vaak_blog_actor_published');
         }
         // PHP-FPM roles often have DML but not ownership. Only ALTER when missing.
-        $hasCanonical = (bool) $db->query(
-            "SELECT 1 FROM information_schema.columns
-             WHERE table_schema = current_schema()
-               AND table_name = 'vaak_blog_posts'
-               AND column_name = 'canonical_url'"
-        )->fetchColumn();
+        $hasCanonical = ap_schema_has_column($db, 'vaak_blog_posts', 'canonical_url');
         if (!$hasCanonical) {
             $db->exec("ALTER TABLE vaak_blog_posts ADD COLUMN IF NOT EXISTS canonical_url TEXT NOT NULL DEFAULT ''");
+            ap_schema_remember_column($db, 'vaak_blog_posts', 'canonical_url', "''::text");
         }
     } catch (Throwable $e) {
         error_log('[ap-db] blog table not provisioned: ' . $e->getMessage());
@@ -326,6 +751,7 @@ CREATE TABLE IF NOT EXISTS ap_notice_reads (
     last_read_at TEXT NOT NULL
 )
 SQL);
+            ap_schema_remember_table($db, 'ap_notice_reads');
         }
     } catch (Throwable $e) {
         // ignore — postgres role may lack DDL; provisioned via migrate/ops
@@ -341,6 +767,7 @@ CREATE TABLE IF NOT EXISTS ap_deprioritized_actors (
     PRIMARY KEY (owner_user_id, actor_id)
 )
 SQL);
+            ap_schema_remember_table($db, 'ap_deprioritized_actors');
         }
     } catch (Throwable $e) {
         // ignore — provision via ops when runtime role lacks DDL
@@ -361,6 +788,7 @@ CREATE TABLE IF NOT EXISTS bsky_sessions (
     updated_at TEXT NOT NULL
 )
 SQL);
+            ap_schema_remember_table($db, 'bsky_sessions');
         }
     } catch (Throwable $e) {
         error_log('[ap-db] bsky_sessions not provisioned: ' . $e->getMessage());
@@ -385,6 +813,9 @@ CREATE TABLE IF NOT EXISTS remote_post_media_cache (
 SQL);
             $db->exec('CREATE INDEX IF NOT EXISTS idx_remote_post_media_used ON remote_post_media_cache(last_used_at)');
             $db->exec('CREATE INDEX IF NOT EXISTS idx_remote_post_media_size ON remote_post_media_cache(byte_size)');
+            ap_schema_remember_table($db, 'remote_post_media_cache');
+            ap_schema_remember_index($db, 'idx_remote_post_media_used');
+            ap_schema_remember_index($db, 'idx_remote_post_media_size');
         }
     } catch (Throwable $e) {
         error_log('[ap-db] remote_post_media_cache not provisioned: ' . $e->getMessage());
@@ -405,6 +836,7 @@ CREATE TABLE IF NOT EXISTS ap_user_2fa (
     updated_at TEXT NOT NULL
 )
 SQL);
+            ap_schema_remember_table($db, 'ap_user_2fa');
         }
     } catch (Throwable $e) {
         error_log('[ap-db] ap_user_2fa not provisioned: ' . $e->getMessage());
@@ -424,6 +856,8 @@ CREATE TABLE IF NOT EXISTS ap_pds_invites (
 )
 SQL);
             $db->exec('CREATE INDEX IF NOT EXISTS idx_ap_pds_invites_owner ON ap_pds_invites(owner_user_id, created_at DESC, id DESC)');
+            ap_schema_remember_table($db, 'ap_pds_invites');
+            ap_schema_remember_index($db, 'idx_ap_pds_invites_owner');
         }
     } catch (Throwable $e) {
         error_log('[ap-db] ap_pds_invites not provisioned: ' . $e->getMessage());
@@ -443,6 +877,7 @@ CREATE TABLE IF NOT EXISTS ap_wow_links (
     updated_at TEXT NOT NULL
 )
 SQL);
+            ap_schema_remember_table($db, 'ap_wow_links');
         }
     } catch (Throwable $e) {
         error_log('[ap-db] ap_wow_links not provisioned: ' . $e->getMessage());
@@ -461,6 +896,8 @@ CREATE TABLE IF NOT EXISTS ap_account_links (
 )
 SQL);
             $db->exec('CREATE INDEX IF NOT EXISTS idx_ap_account_links_linked ON ap_account_links(linked_user_id, owner_user_id)');
+            ap_schema_remember_table($db, 'ap_account_links');
+            ap_schema_remember_index($db, 'idx_ap_account_links_linked');
         }
     } catch (Throwable $e) {
         error_log('[ap-db] ap_account_links not provisioned: ' . $e->getMessage());
@@ -522,6 +959,13 @@ CREATE TABLE IF NOT EXISTS ap_discuss_reads (
 )
 SQL);
         $db->exec('CREATE INDEX IF NOT EXISTS idx_ap_discuss_reads_topic ON ap_discuss_reads(topic_id, last_read_at)');
+        ap_schema_remember_table($db, 'ap_discuss_categories');
+        ap_schema_remember_table($db, 'ap_discuss_topics');
+        ap_schema_remember_table($db, 'ap_discuss_posts');
+        ap_schema_remember_table($db, 'ap_discuss_reads');
+        ap_schema_remember_index($db, 'idx_ap_discuss_topics_category');
+        ap_schema_remember_index($db, 'idx_ap_discuss_posts_topic');
+        ap_schema_remember_index($db, 'idx_ap_discuss_reads_topic');
         $db->exec("INSERT INTO ap_discuss_categories (slug, name, description, position, created_at, updated_at) VALUES
             ('general', 'General', 'Open discussion for local VAAK users.', 10, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
             ('help', 'Help & support', 'Questions, troubleshooting, and practical help.', 20, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
@@ -549,46 +993,40 @@ SQL);
         'quote_authorizations', 'remote_actors', 'remote_custom_emojis', 'remote_emoji_host_meta', 'webmentions', 'ap_pds_invites',
         'remote_media_cache', 'ap_media_warm_queue', 'site_syndications',
     ];
-    // Refresh only when bootstrap may have created something above.  On the
-    // normal production path the first probe is authoritative and reusable.
-    if (!$noticeTablesReady || !$discussTablesReady || !isset($present['vaak_blog_posts'])
-        || !isset($present['webmentions'], $present['ap_deprioritized_actors'], $present['bsky_sessions'], $present['ap_user_2fa'], $present['ap_pds_invites'], $present['ap_account_links'])) {
-        $present = $loadPresentTables();
-    }
+    // In-memory refresh: CREATE above recorded the new tables. No second
+    // pg_tables scan. On the warm path the cached snapshot is already complete.
+    $present = ap_schema_tables($db);
     $missing = array_values(array_filter($requiredTables, static fn(string $table): bool => !isset($present[$table])));
     if ($missing) {
+        ap_schema_drop_process_snapshot($db);
         throw new RuntimeException('PostgreSQL staging schema is incomplete: ' . implode(', ', $missing));
     }
 
-    $searchReady = (bool) $db->query(
-        "SELECT EXISTS (
-             SELECT 1 FROM information_schema.columns
-             WHERE table_schema = current_schema()
-               AND table_name = 'ap_search_docs'
-               AND column_name = 'body_tsv'
-         )
-         AND to_regclass('idx_ap_search_docs_body_tsv') IS NOT NULL"
-    )->fetchColumn();
+    $searchReady = ap_schema_has_column($db, 'ap_search_docs', 'body_tsv')
+        && ap_schema_has_index($db, 'idx_ap_search_docs_body_tsv');
     if (!$searchReady) {
+        ap_schema_drop_process_snapshot($db);
         throw new RuntimeException('PostgreSQL search schema is incomplete; run the staging bootstrap first');
     }
 
     // Timeline queries constrain actor/type/action and then sort by recency.
     // Keep this best-effort because the PHP-FPM role may not own indexes.
     try {
-        $idx = $db->query("SELECT indexname FROM pg_indexes WHERE schemaname = current_schema() AND indexname IN ('idx_events_actor_type_action_created', 'idx_events_type_action_created', 'idx_events_timeline_actor_created', 'idx_events_timeline_created')")->fetchAll(PDO::FETCH_COLUMN);
-        $idx = array_fill_keys(array_map('strval', $idx), true);
-        if (empty($idx['idx_events_actor_type_action_created'])) {
+        if (!ap_schema_has_index($db, 'idx_events_actor_type_action_created')) {
             $db->exec('CREATE INDEX IF NOT EXISTS idx_events_actor_type_action_created ON events(actor_id, type, action_taken, created_at DESC, id DESC)');
+            ap_schema_remember_index($db, 'idx_events_actor_type_action_created');
         }
-        if (empty($idx['idx_events_type_action_created'])) {
+        if (!ap_schema_has_index($db, 'idx_events_type_action_created')) {
             $db->exec('CREATE INDEX IF NOT EXISTS idx_events_type_action_created ON events(type, action_taken, created_at DESC, id DESC)');
+            ap_schema_remember_index($db, 'idx_events_type_action_created');
         }
-        if (empty($idx['idx_events_timeline_actor_created'])) {
+        if (!ap_schema_has_index($db, 'idx_events_timeline_actor_created')) {
             $db->exec("CREATE INDEX IF NOT EXISTS idx_events_timeline_actor_created ON events(actor_id, created_at DESC, id DESC) WHERE type IN ('Create','Announce') AND action_taken IN ('log','local_observe')");
+            ap_schema_remember_index($db, 'idx_events_timeline_actor_created');
         }
-        if (empty($idx['idx_events_timeline_created'])) {
+        if (!ap_schema_has_index($db, 'idx_events_timeline_created')) {
             $db->exec("CREATE INDEX IF NOT EXISTS idx_events_timeline_created ON events(created_at DESC, id DESC) WHERE type IN ('Create','Announce') AND action_taken IN ('log','local_observe')");
+            ap_schema_remember_index($db, 'idx_events_timeline_created');
         }
     } catch (Throwable $e) {
         error_log('[ap-db] timeline indexes not provisioned: ' . $e->getMessage());
@@ -606,124 +1044,119 @@ SQL);
             'idx_masto_reblogs_owner_created' =>
                 'CREATE INDEX IF NOT EXISTS idx_masto_reblogs_owner_created ON masto_reblogs(owner_user_id, created_at DESC)',
         ];
-        $names = array_keys($interactionIndexes);
-        $ph = implode(',', array_fill(0, count($names), '?'));
-        $st = $db->prepare(
-            "SELECT indexname FROM pg_indexes
-             WHERE schemaname = current_schema() AND indexname IN ($ph)"
-        );
-        $st->execute($names);
-        $have = array_fill_keys(array_map('strval', $st->fetchAll(PDO::FETCH_COLUMN) ?: []), true);
         foreach ($interactionIndexes as $name => $sql) {
-            if (isset($have[$name])) {
+            if (ap_schema_has_index($db, $name)) {
                 continue;
             }
             $db->exec($sql);
+            ap_schema_remember_index($db, $name);
         }
     } catch (Throwable $e) {
         error_log('[ap-db] interaction indexes not provisioned: ' . $e->getMessage());
     }
     // Notification feeds filter by account and soft-delete state, then page by id.
     try {
-        $hasNotifIndex = (bool) $db->query(
-            "SELECT 1 FROM pg_indexes WHERE schemaname = current_schema() AND indexname = 'idx_mentions_owner_deleted_id'"
-        )->fetchColumn();
-        if (!$hasNotifIndex) {
+        if (!ap_schema_has_index($db, 'idx_mentions_owner_deleted_id')) {
             $db->exec('CREATE INDEX IF NOT EXISTS idx_mentions_owner_deleted_id ON mentions(owner_user_id, deleted_at, id DESC)');
+            ap_schema_remember_index($db, 'idx_mentions_owner_deleted_id');
         }
     } catch (Throwable $e) {
         error_log('[ap-db] notification index not provisioned: ' . $e->getMessage());
     }
     try {
-        $hasColumn = (bool) $db->query("SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'actor_profile' AND column_name = 'auto_unblur_sensitive'")->fetchColumn();
-        if (!$hasColumn) {
+        if (!ap_schema_has_column($db, 'actor_profile', 'auto_unblur_sensitive')) {
             $db->exec('ALTER TABLE actor_profile ADD COLUMN auto_unblur_sensitive INTEGER NOT NULL DEFAULT 0');
+            ap_schema_remember_column($db, 'actor_profile', 'auto_unblur_sensitive', '0');
         }
     } catch (Throwable $e) {
         error_log('[ap-db] auto-unblur profile column not provisioned: ' . $e->getMessage());
     }
     try {
-        $hasColumn = (bool) $db->query("SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'actor_profile' AND column_name = 'auto_delete_posts_7d'")->fetchColumn();
-        if (!$hasColumn) {
+        if (!ap_schema_has_column($db, 'actor_profile', 'auto_delete_posts_7d')) {
             $db->exec('ALTER TABLE actor_profile ADD COLUMN auto_delete_posts_7d INTEGER NOT NULL DEFAULT 0');
+            ap_schema_remember_column($db, 'actor_profile', 'auto_delete_posts_7d', '0');
         }
     } catch (Throwable $e) {
         error_log('[ap-db] retention profile column not provisioned: ' . $e->getMessage());
     }
     try {
-        $hasColumn = (bool) $db->query("SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'actor_profile' AND column_name = 'automated'")->fetchColumn();
-        if (!$hasColumn) {
+        if (!ap_schema_has_column($db, 'actor_profile', 'automated')) {
             $db->exec('ALTER TABLE actor_profile ADD COLUMN automated INTEGER NOT NULL DEFAULT 0');
+            ap_schema_remember_column($db, 'actor_profile', 'automated', '0');
         }
     } catch (Throwable $e) {
         error_log('[ap-db] automated profile column not provisioned: ' . $e->getMessage());
     }
     try {
-        $hasColumn = (bool) $db->query("SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'actor_profile' AND column_name = 'algorithm_enabled'")->fetchColumn();
-        if (!$hasColumn) {
+        if (!ap_schema_has_column($db, 'actor_profile', 'algorithm_enabled')) {
             $db->exec('ALTER TABLE actor_profile ADD COLUMN algorithm_enabled INTEGER NOT NULL DEFAULT 1');
+            ap_schema_remember_column($db, 'actor_profile', 'algorithm_enabled', '1');
         }
     } catch (Throwable $e) {
         error_log('[ap-db] algorithm preference column not provisioned: ' . $e->getMessage());
     }
     try {
-        $hasColumn = (bool) $db->query("SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'actor_profile' AND column_name = 'trending_enabled'")->fetchColumn();
-        if (!$hasColumn) {
+        if (!ap_schema_has_column($db, 'actor_profile', 'trending_enabled')) {
             $db->exec('ALTER TABLE actor_profile ADD COLUMN trending_enabled INTEGER NOT NULL DEFAULT 1');
+            ap_schema_remember_column($db, 'actor_profile', 'trending_enabled', '1');
         }
     } catch (Throwable $e) {
         error_log('[ap-db] trending display preference column not provisioned: ' . $e->getMessage());
     }
     try {
-        $hasColumn = (bool) $db->query("SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'actor_profile' AND column_name = 'downranking_enabled'")->fetchColumn();
-        if (!$hasColumn) {
+        if (!ap_schema_has_column($db, 'actor_profile', 'downranking_enabled')) {
             $db->exec('ALTER TABLE actor_profile ADD COLUMN downranking_enabled INTEGER NOT NULL DEFAULT 1');
+            ap_schema_remember_column($db, 'actor_profile', 'downranking_enabled', '1');
         }
     } catch (Throwable $e) {
         error_log('[ap-db] downranking preference column not provisioned: ' . $e->getMessage());
     }
     try {
-        $hasColumn = (bool) $db->query("SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'actor_profile' AND column_name = 'webmentions_enabled'")->fetchColumn();
-        if (!$hasColumn) $db->exec('ALTER TABLE actor_profile ADD COLUMN webmentions_enabled INTEGER NOT NULL DEFAULT 1');
+        if (!ap_schema_has_column($db, 'actor_profile', 'webmentions_enabled')) {
+            $db->exec('ALTER TABLE actor_profile ADD COLUMN webmentions_enabled INTEGER NOT NULL DEFAULT 1');
+            ap_schema_remember_column($db, 'actor_profile', 'webmentions_enabled', '1');
+        }
     } catch (Throwable $e) {
         error_log('[ap-db] webmention preference column not provisioned: ' . $e->getMessage());
     }
     foreach (['reply_policy', 'quote_policy'] as $policyColumn) {
         try {
-            $hasColumn = (bool) $db->query("SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'actor_profile' AND column_name = '{$policyColumn}'")->fetchColumn();
-            if (!$hasColumn) $db->exec("ALTER TABLE actor_profile ADD COLUMN {$policyColumn} TEXT NOT NULL DEFAULT 'anyone'");
+            if (!ap_schema_has_column($db, 'actor_profile', $policyColumn)) {
+                $db->exec("ALTER TABLE actor_profile ADD COLUMN {$policyColumn} TEXT NOT NULL DEFAULT 'anyone'");
+                ap_schema_remember_column($db, 'actor_profile', $policyColumn, "'anyone'::text");
+            }
         } catch (Throwable $e) { error_log('[ap-db] interaction policy column not provisioned: ' . $e->getMessage()); }
     }
     try {
-        $hasColumn = (bool) $db->query("SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'actor_profile' AND column_name = 'forum_signature'")->fetchColumn();
-        if (!$hasColumn) {
+        if (!ap_schema_has_column($db, 'actor_profile', 'forum_signature')) {
             $db->exec("ALTER TABLE actor_profile ADD COLUMN forum_signature TEXT NOT NULL DEFAULT ''");
+            ap_schema_remember_column($db, 'actor_profile', 'forum_signature', "''::text");
         }
     } catch (Throwable $e) {
         error_log('[ap-db] forum signature column not provisioned: ' . $e->getMessage());
     }
     try {
-        $hasColumn = (bool) $db->query("SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'actor_profile' AND column_name = 'profile_badges'")->fetchColumn();
-        if (!$hasColumn) {
+        if (!ap_schema_has_column($db, 'actor_profile', 'profile_badges')) {
             $db->exec("ALTER TABLE actor_profile ADD COLUMN profile_badges TEXT NOT NULL DEFAULT '[]'");
+            ap_schema_remember_column($db, 'actor_profile', 'profile_badges', "'[]'::text");
         }
     } catch (Throwable $e) {
         error_log('[ap-db] profile badges column not provisioned: ' . $e->getMessage());
     }
     foreach (['hide_profile_replies', 'hide_profile_boosts'] as $profileVisibilityColumn) {
         try {
-            $hasColumn = (bool) $db->query("SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'actor_profile' AND column_name = '{$profileVisibilityColumn}'")->fetchColumn();
-            if (!$hasColumn) {
+            if (!ap_schema_has_column($db, 'actor_profile', $profileVisibilityColumn)) {
                 $db->exec("ALTER TABLE actor_profile ADD COLUMN {$profileVisibilityColumn} INTEGER NOT NULL DEFAULT 0");
+                ap_schema_remember_column($db, 'actor_profile', $profileVisibilityColumn, '0');
             }
         } catch (Throwable $e) {
             error_log('[ap-db] profile visibility column not provisioned: ' . $e->getMessage());
         }
     }
     try {
-        $hasColumn = (bool) $db->query("SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'ap_reports' AND column_name = 'admin_notes'")->fetchColumn();
-        if (!$hasColumn) {
+        if (!ap_schema_has_column($db, 'ap_reports', 'admin_notes')) {
             $db->exec("ALTER TABLE ap_reports ADD COLUMN admin_notes TEXT NOT NULL DEFAULT ''");
+            ap_schema_remember_column($db, 'ap_reports', 'admin_notes', "''::text");
         }
     } catch (Throwable $e) {
         error_log('[ap-db] moderation report notes column not provisioned: ' . $e->getMessage());
@@ -733,21 +1166,37 @@ SQL);
     // serial/identity default that inserts rely on. Personal blocks omit id
     // deliberately, so ensure PostgreSQL can generate it after the cutover.
     try {
-        $idDefault = $db->query(
-            "SELECT column_default FROM information_schema.columns
-             WHERE table_schema = current_schema() AND table_name = 'ap_user_blocks' AND column_name = 'id'"
-        )->fetchColumn();
+        $idDefault = ap_schema_column_default($db, 'ap_user_blocks', 'id');
         if (!is_string($idDefault) || !str_contains($idDefault, 'ap_user_blocks_id_seq')) {
             $db->exec('CREATE SEQUENCE IF NOT EXISTS ap_user_blocks_id_seq');
             $db->exec("SELECT setval('ap_user_blocks_id_seq', GREATEST(COALESCE((SELECT MAX(id) FROM ap_user_blocks), 0) + 1, 1), false)");
             $db->exec("ALTER SEQUENCE ap_user_blocks_id_seq OWNED BY ap_user_blocks.id");
             $db->exec("ALTER TABLE ap_user_blocks ALTER COLUMN id SET DEFAULT nextval('ap_user_blocks_id_seq')");
+            ap_schema_remember_column($db, 'ap_user_blocks', 'id', "nextval('ap_user_blocks_id_seq'::regclass)", true);
         }
     } catch (Throwable $e) {
         // The application role may not have DDL privileges; provisioning can
         // apply this one-time sequence guard separately as the DB owner.
         error_log('[ap-db] personal-block id sequence not provisioned: ' . $e->getMessage());
     }
+    // Bluesky moderation alias lookup and mirror-segment flags. Production
+    // already has these; the existence check is a no-op once the snapshot
+    // is cached. Fresh databases get them when bsky_posts is present.
+    try {
+        if (ap_schema_has_table($db, 'bsky_posts')) {
+            if (!ap_schema_has_index($db, 'idx_bsky_posts_lower_handle')) {
+                $db->exec('CREATE INDEX IF NOT EXISTS idx_bsky_posts_lower_handle ON bsky_posts (lower(author_handle))');
+                ap_schema_remember_index($db, 'idx_bsky_posts_lower_handle');
+            }
+            if (!ap_schema_has_index($db, 'idx_bsky_posts_reply_root')) {
+                $db->exec('CREATE INDEX IF NOT EXISTS idx_bsky_posts_reply_root ON bsky_posts (reply_root)');
+                ap_schema_remember_index($db, 'idx_bsky_posts_reply_root');
+            }
+        }
+    } catch (Throwable $e) {
+        error_log('[ap-db] bsky post lookup indexes not provisioned: ' . $e->getMessage());
+    }
+    ap_schema_publish($db);
 }
 
 /**
@@ -8746,7 +9195,13 @@ function ap_block_normalize_actor(string $raw): ?string
 function ap_actor_moderation_aliases(?string $actorId, bool $refresh = false, bool $strict = false): array
 {
     static $memo = [];
-    if ($refresh) $memo = [];
+    // FPM keeps statics for the worker lifetime. Remember which request asked
+    // for a fresh read so later requests can use the short Redis copy again.
+    static $skipSharedAt = null;
+    if ($refresh) {
+        $memo = [];
+        $skipSharedAt = $_SERVER['REQUEST_TIME_FLOAT'] ?? microtime(true);
+    }
     $actorId = rtrim(trim((string) $actorId), '/');
     if ($actorId === '') {
         return [];
@@ -8770,7 +9225,26 @@ function ap_actor_moderation_aliases(?string $actorId, bool $refresh = false, bo
         $did = $m[1];
     }
     // Resolve missing DID/handle from local Bluesky caches only.
-    if (($did === null || $handle === null) && ($did !== null || $handle !== null)) {
+    $needsLookup = ($did === null || $handle === null) && ($did !== null || $handle !== null);
+    $requestMark = $_SERVER['REQUEST_TIME_FLOAT'] ?? null;
+    $skipShared = $skipSharedAt !== null && $requestMark !== null && $skipSharedAt === $requestMark;
+    $redisKey = 'vaak:modalias:v1:' . hash('sha256', $actorId);
+    if ($needsLookup && !$skipShared && !$strict && function_exists('ap_redis_json_get')) {
+        $cached = ap_redis_json_get($redisKey);
+        if (is_array($cached) && isset($cached['aliases']) && is_array($cached['aliases'])) {
+            $aliases = [];
+            foreach ($cached['aliases'] as $alias) {
+                if (is_string($alias) && $alias !== '') {
+                    $aliases[] = $alias;
+                }
+            }
+            if ($aliases !== []) {
+                return $memo[$actorId] = $aliases;
+            }
+        }
+    }
+    $lookupFailed = false;
+    if ($needsLookup) {
         try {
             if ($did !== null && $handle === null) {
                 $st = ap_db()->prepare(
@@ -8834,6 +9308,7 @@ function ap_actor_moderation_aliases(?string $actorId, bool $refresh = false, bo
                 }
             }
         } catch (Throwable $e) {
+            $lookupFailed = true;
             if ($strict) throw $e;
             // keep what we have
         }
@@ -8855,7 +9330,14 @@ function ap_actor_moderation_aliases(?string $actorId, bool $refresh = false, bo
             $uniq[$v] = true;
         }
     }
-    return $memo[$actorId] = array_keys($uniq);
+    $result = array_keys($uniq);
+    // Short shared copy of a successful local lookup. Strict callers still
+    // read the database so a down database stays fail-closed; a refresh in
+    // this request skips the shared copy and then replaces it.
+    if ($needsLookup && !$lookupFailed && function_exists('ap_redis_json_set')) {
+        ap_redis_json_set($redisKey, ['aliases' => $result], 120);
+    }
+    return $memo[$actorId] = $result;
 }
 
 /** True when two actor refs collide after Bluesky DID/handle alias expansion. */

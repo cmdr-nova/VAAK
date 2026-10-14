@@ -130,12 +130,14 @@ function ap_bsky_migrate(): void
     try {
         $driver = function_exists('ap_db_driver') ? ap_db_driver() : 'sqlite';
         if ($driver === 'pgsql') {
-            $tableReady = (bool) ap_db()->query(
-                "SELECT EXISTS (
-                    SELECT 1 FROM information_schema.tables
-                    WHERE table_schema = current_schema() AND table_name = 'bsky_sessions'
-                 )"
-            )->fetchColumn();
+            $tableReady = function_exists('ap_schema_has_table')
+                ? ap_schema_has_table(ap_db(), 'bsky_sessions')
+                : (bool) ap_db()->query(
+                    "SELECT EXISTS (
+                        SELECT 1 FROM information_schema.tables
+                        WHERE table_schema = current_schema() AND table_name = 'bsky_sessions'
+                     )"
+                )->fetchColumn();
         } else {
             $tableReady = (bool) ap_db()->query(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name='bsky_sessions' LIMIT 1"
@@ -160,6 +162,9 @@ CREATE TABLE IF NOT EXISTS bsky_sessions (
 )
 SQL);
             $tableReady = true;
+            if (function_exists('ap_schema_remember_table')) {
+                ap_schema_remember_table(ap_db(), 'bsky_sessions');
+            }
         } catch (Throwable $e) {
             // Runtime role may lack DDL — provision via ops.
             error_log('[ap-bsky] bsky_sessions migrate: ' . $e->getMessage());
@@ -172,16 +177,21 @@ SQL);
         try {
             $driver = function_exists('ap_db_driver') ? ap_db_driver() : 'sqlite';
             if ($driver === 'pgsql') {
-                $have = (bool) ap_db()->query(
-                    "SELECT EXISTS (
-                        SELECT 1 FROM information_schema.columns
-                        WHERE table_schema = current_schema()
-                          AND table_name = 'bsky_sessions'
-                          AND column_name = " . ap_db()->quote($col) . '
-                     )'
-                )->fetchColumn();
+                $have = function_exists('ap_schema_has_column')
+                    ? ap_schema_has_column(ap_db(), 'bsky_sessions', $col)
+                    : (bool) ap_db()->query(
+                        "SELECT EXISTS (
+                            SELECT 1 FROM information_schema.columns
+                            WHERE table_schema = current_schema()
+                              AND table_name = 'bsky_sessions'
+                              AND column_name = " . ap_db()->quote($col) . '
+                         )'
+                    )->fetchColumn();
                 if (!$have) {
                     ap_db()->exec("ALTER TABLE bsky_sessions ADD COLUMN IF NOT EXISTS {$col} TEXT");
+                    if (function_exists('ap_schema_remember_column')) {
+                        ap_schema_remember_column(ap_db(), 'bsky_sessions', $col, null);
+                    }
                 }
             } else {
                 $info = ap_db()->query('PRAGMA table_info(bsky_sessions)')->fetchAll();
@@ -222,12 +232,14 @@ function ap_bsky_crossposts_migrate(): void
     try {
         $driver = function_exists('ap_db_driver') ? ap_db_driver() : 'sqlite';
         if ($driver === 'pgsql') {
-            $have = (bool) ap_db()->query(
-                "SELECT EXISTS (
-                    SELECT 1 FROM information_schema.tables
-                    WHERE table_schema = current_schema() AND table_name = 'bsky_crossposts'
-                 )"
-            )->fetchColumn();
+            $have = function_exists('ap_schema_has_table')
+                ? ap_schema_has_table(ap_db(), 'bsky_crossposts')
+                : (bool) ap_db()->query(
+                    "SELECT EXISTS (
+                        SELECT 1 FROM information_schema.tables
+                        WHERE table_schema = current_schema() AND table_name = 'bsky_crossposts'
+                     )"
+                )->fetchColumn();
             if (!$have) {
                 ap_db()->exec(<<<'SQL'
 CREATE TABLE IF NOT EXISTS bsky_crossposts (
@@ -240,8 +252,14 @@ CREATE TABLE IF NOT EXISTS bsky_crossposts (
 SQL);
                 try {
                     ap_db()->exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_bsky_crossposts_uri ON bsky_crossposts (bsky_uri)');
+                    if (function_exists('ap_schema_remember_index')) {
+                        ap_schema_remember_index(ap_db(), 'idx_bsky_crossposts_uri');
+                    }
                 } catch (Throwable $e) {
                     // ignore
+                }
+                if (function_exists('ap_schema_remember_table')) {
+                    ap_schema_remember_table(ap_db(), 'bsky_crossposts');
                 }
             }
         } else {
@@ -274,12 +292,14 @@ function ap_bsky_crosspost_retries_migrate(): void
     try {
         $driver = function_exists('ap_db_driver') ? ap_db_driver() : 'sqlite';
         if ($driver === 'pgsql') {
-            $have = (bool) ap_db()->query(
-                "SELECT EXISTS (
-                    SELECT 1 FROM information_schema.tables
-                    WHERE table_schema = current_schema() AND table_name = 'bsky_crosspost_retries'
-                 )"
-            )->fetchColumn();
+            $have = function_exists('ap_schema_has_table')
+                ? ap_schema_has_table(ap_db(), 'bsky_crosspost_retries')
+                : (bool) ap_db()->query(
+                    "SELECT EXISTS (
+                        SELECT 1 FROM information_schema.tables
+                        WHERE table_schema = current_schema() AND table_name = 'bsky_crosspost_retries'
+                     )"
+                )->fetchColumn();
             if (!$have) {
                 ap_db()->exec(<<<'SQL'
 CREATE TABLE IF NOT EXISTS bsky_crosspost_retries (
@@ -297,23 +317,50 @@ CREATE TABLE IF NOT EXISTS bsky_crosspost_retries (
     updated_at TEXT NOT NULL
 )
 SQL);
+                if (function_exists('ap_schema_remember_table')) {
+                    ap_schema_remember_table(ap_db(), 'bsky_crosspost_retries');
+                    ap_schema_remember_column(ap_db(), 'bsky_crosspost_retries', 'claimed_at', null);
+                }
             }
-            try {
-                ap_db()->exec('ALTER TABLE bsky_crosspost_retries ADD COLUMN IF NOT EXISTS claimed_at TEXT');
-            } catch (Throwable $e) {
-                // Existing schema or a restricted runtime; the worker will degrade safely.
+            $claimedKnown = function_exists('ap_schema_has_column')
+                && ap_schema_has_column(ap_db(), 'bsky_crosspost_retries', 'claimed_at');
+            if (!$claimedKnown) {
+                try {
+                    ap_db()->exec('ALTER TABLE bsky_crosspost_retries ADD COLUMN IF NOT EXISTS claimed_at TEXT');
+                    if (function_exists('ap_schema_remember_column')) {
+                        ap_schema_remember_column(ap_db(), 'bsky_crosspost_retries', 'claimed_at', null);
+                    }
+                } catch (Throwable $e) {
+                    // Existing schema or a restricted runtime; the worker will degrade safely.
+                }
             }
-            try {
-                ap_db()->exec(
-                    'CREATE INDEX IF NOT EXISTS idx_bsky_crosspost_retries_due
-                     ON bsky_crosspost_retries (status, next_attempt_at)'
-                );
-                ap_db()->exec(
-                    'CREATE INDEX IF NOT EXISTS idx_bsky_crosspost_retries_lease
-                     ON bsky_crosspost_retries (status, claimed_at)'
-                );
-            } catch (Throwable $e) {
-                // Non-essential indexes may be installed by ops.
+            $dueKnown = function_exists('ap_schema_has_index')
+                && ap_schema_has_index(ap_db(), 'idx_bsky_crosspost_retries_due');
+            $leaseKnown = function_exists('ap_schema_has_index')
+                && ap_schema_has_index(ap_db(), 'idx_bsky_crosspost_retries_lease');
+            if (!$dueKnown || !$leaseKnown) {
+                try {
+                    if (!$dueKnown) {
+                        ap_db()->exec(
+                            'CREATE INDEX IF NOT EXISTS idx_bsky_crosspost_retries_due
+                             ON bsky_crosspost_retries (status, next_attempt_at)'
+                        );
+                        if (function_exists('ap_schema_remember_index')) {
+                            ap_schema_remember_index(ap_db(), 'idx_bsky_crosspost_retries_due');
+                        }
+                    }
+                    if (!$leaseKnown) {
+                        ap_db()->exec(
+                            'CREATE INDEX IF NOT EXISTS idx_bsky_crosspost_retries_lease
+                             ON bsky_crosspost_retries (status, claimed_at)'
+                        );
+                        if (function_exists('ap_schema_remember_index')) {
+                            ap_schema_remember_index(ap_db(), 'idx_bsky_crosspost_retries_lease');
+                        }
+                    }
+                } catch (Throwable $e) {
+                    // Non-essential indexes may be installed by ops.
+                }
             }
         } else {
             ap_db()->exec(<<<'SQL'
@@ -2636,12 +2683,14 @@ function ap_bsky_post_links_migrate(): void
     try {
         $driver = function_exists('ap_db_driver') ? ap_db_driver() : 'sqlite';
         if ($driver === 'pgsql') {
-            $have = (bool) ap_db()->query(
-                "SELECT EXISTS (
-                    SELECT 1 FROM information_schema.tables
-                    WHERE table_schema = current_schema() AND table_name = 'bsky_post_links'
-                 )"
-            )->fetchColumn();
+            $have = function_exists('ap_schema_has_table')
+                ? ap_schema_has_table(ap_db(), 'bsky_post_links')
+                : (bool) ap_db()->query(
+                    "SELECT EXISTS (
+                        SELECT 1 FROM information_schema.tables
+                        WHERE table_schema = current_schema() AND table_name = 'bsky_post_links'
+                     )"
+                )->fetchColumn();
             if (!$have) {
                 ap_db()->exec(<<<'SQL'
 CREATE TABLE IF NOT EXISTS bsky_post_links (
@@ -2654,8 +2703,14 @@ CREATE TABLE IF NOT EXISTS bsky_post_links (
 SQL);
                 try {
                     ap_db()->exec('CREATE INDEX IF NOT EXISTS idx_bsky_post_links_fedi ON bsky_post_links (fediverse_id)');
+                    if (function_exists('ap_schema_remember_index')) {
+                        ap_schema_remember_index(ap_db(), 'idx_bsky_post_links_fedi');
+                    }
                 } catch (Throwable $e) {
                     // ignore
+                }
+                if (function_exists('ap_schema_remember_table')) {
+                    ap_schema_remember_table(ap_db(), 'bsky_post_links');
                 }
             }
         } else {
@@ -2800,12 +2855,14 @@ function ap_bsky_posts_migrate(?PDO $db = null): void
     try {
         $driver = function_exists('ap_db_driver') ? ap_db_driver($db) : 'sqlite';
         if ($driver === 'pgsql') {
-            $have = (bool) $db->query(
-                "SELECT EXISTS (
-                    SELECT 1 FROM information_schema.tables
-                    WHERE table_schema = current_schema() AND table_name = 'bsky_posts'
-                 )"
-            )->fetchColumn();
+            $have = function_exists('ap_schema_has_table')
+                ? ap_schema_has_table($db, 'bsky_posts')
+                : (bool) $db->query(
+                    "SELECT EXISTS (
+                        SELECT 1 FROM information_schema.tables
+                        WHERE table_schema = current_schema() AND table_name = 'bsky_posts'
+                     )"
+                )->fetchColumn();
             if (!$have) {
                 $db->exec(<<<'SQL'
 CREATE TABLE IF NOT EXISTS bsky_posts (
@@ -2836,8 +2893,37 @@ SQL);
                     $db->exec('CREATE INDEX IF NOT EXISTS idx_bsky_posts_author_idx ON bsky_posts (author_did, indexed_at DESC)');
                     $db->exec('CREATE INDEX IF NOT EXISTS idx_bsky_posts_seen ON bsky_posts (seen_at)');
                     $db->exec('CREATE INDEX IF NOT EXISTS idx_bsky_posts_owner_idx ON bsky_posts (owner_user_id, indexed_at DESC)');
+                    $db->exec('CREATE INDEX IF NOT EXISTS idx_bsky_posts_lower_handle ON bsky_posts (lower(author_handle))');
+                    $db->exec('CREATE INDEX IF NOT EXISTS idx_bsky_posts_reply_root ON bsky_posts (reply_root)');
+                    if (function_exists('ap_schema_remember_index')) {
+                        ap_schema_remember_index($db, 'idx_bsky_posts_author_idx');
+                        ap_schema_remember_index($db, 'idx_bsky_posts_seen');
+                        ap_schema_remember_index($db, 'idx_bsky_posts_owner_idx');
+                        ap_schema_remember_index($db, 'idx_bsky_posts_lower_handle');
+                        ap_schema_remember_index($db, 'idx_bsky_posts_reply_root');
+                    }
                 } catch (Throwable $e) {
                     // ignore
+                }
+                if (function_exists('ap_schema_remember_table')) {
+                    ap_schema_remember_table($db, 'bsky_posts');
+                }
+            } else {
+                foreach ([
+                    'idx_bsky_posts_lower_handle' => 'CREATE INDEX IF NOT EXISTS idx_bsky_posts_lower_handle ON bsky_posts (lower(author_handle))',
+                    'idx_bsky_posts_reply_root' => 'CREATE INDEX IF NOT EXISTS idx_bsky_posts_reply_root ON bsky_posts (reply_root)',
+                ] as $indexName => $indexSql) {
+                    if (function_exists('ap_schema_has_index') && ap_schema_has_index($db, $indexName)) {
+                        continue;
+                    }
+                    try {
+                        $db->exec($indexSql);
+                        if (function_exists('ap_schema_remember_index')) {
+                            ap_schema_remember_index($db, $indexName);
+                        }
+                    } catch (Throwable $e) {
+                        // ignore
+                    }
                 }
             }
         } else {
@@ -2866,6 +2952,8 @@ CREATE TABLE IF NOT EXISTS bsky_posts (
     updated_at TEXT NOT NULL
 )
 SQL);
+            $db->exec('CREATE INDEX IF NOT EXISTS idx_bsky_posts_lower_handle ON bsky_posts (lower(author_handle))');
+            $db->exec('CREATE INDEX IF NOT EXISTS idx_bsky_posts_reply_root ON bsky_posts (reply_root)');
         }
         ap_bsky_post_observations_migrate($db);
     } catch (Throwable $e) {
@@ -2892,14 +2980,25 @@ function ap_bsky_post_observations_migrate(?PDO $db = null): void
     try {
         $driver = function_exists('ap_db_driver') ? ap_db_driver($db) : 'sqlite';
         $idType = $driver === 'pgsql' ? 'BIGINT' : 'INTEGER';
-        $db->exec("CREATE TABLE IF NOT EXISTS bsky_post_observations (
-            bsky_uri TEXT NOT NULL,
-            owner_user_id {$idType} NOT NULL,
-            first_seen_at TEXT NOT NULL,
-            last_seen_at TEXT NOT NULL,
-            PRIMARY KEY (bsky_uri, owner_user_id)
-        )");
-        $db->exec('CREATE INDEX IF NOT EXISTS idx_bsky_post_observations_owner_time ON bsky_post_observations (owner_user_id, last_seen_at DESC)');
+        $observationsReady = $driver === 'pgsql'
+            && function_exists('ap_schema_has_table')
+            && function_exists('ap_schema_has_index')
+            && ap_schema_has_table($db, 'bsky_post_observations')
+            && ap_schema_has_index($db, 'idx_bsky_post_observations_owner_time');
+        if (!$observationsReady) {
+            $db->exec("CREATE TABLE IF NOT EXISTS bsky_post_observations (
+                bsky_uri TEXT NOT NULL,
+                owner_user_id {$idType} NOT NULL,
+                first_seen_at TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL,
+                PRIMARY KEY (bsky_uri, owner_user_id)
+            )");
+            $db->exec('CREATE INDEX IF NOT EXISTS idx_bsky_post_observations_owner_time ON bsky_post_observations (owner_user_id, last_seen_at DESC)');
+            if ($driver === 'pgsql' && function_exists('ap_schema_remember_table')) {
+                ap_schema_remember_table($db, 'bsky_post_observations');
+                ap_schema_remember_index($db, 'idx_bsky_post_observations_owner_time');
+            }
+        }
         // The backfill reads every owned Bluesky row. A web profile was paying
         // that once per PHP-FPM worker (about 5s) before the header could paint.
         // Live ingest records new rows via ap_bsky_post_observation_touch.
@@ -6991,6 +7090,10 @@ function ap_bsky_bookmark_cache_migrate(?PDO $db = null): bool
     if (isset($readyByConnection[$key])) return $readyByConnection[$key];
     try {
         if (function_exists('ap_db_driver') && ap_db_driver($db) === 'pgsql') {
+            if (function_exists('ap_schema_has_table')) {
+                return $readyByConnection[$key] = ap_schema_has_table($db, 'bsky_bookmark_cache')
+                    && ap_schema_has_table($db, 'bsky_bookmark_sync_state');
+            }
             $st = $db->query("SELECT table_name FROM information_schema.tables WHERE table_schema = current_schema() AND table_name IN ('bsky_bookmark_cache', 'bsky_bookmark_sync_state')");
             $tables = array_fill_keys(array_map('strval', $st->fetchAll(PDO::FETCH_COLUMN)), true);
             return $readyByConnection[$key] = isset($tables['bsky_bookmark_cache'], $tables['bsky_bookmark_sync_state']);
@@ -7159,6 +7262,10 @@ function ap_bsky_favourite_cache_migrate(?PDO $db = null): bool
     }
     try {
         try {
+            if (function_exists('ap_schema_has_table') && function_exists('ap_db_driver') && ap_db_driver($db) === 'pgsql'
+                && ap_schema_has_table($db, 'bsky_favourite_cache') && ap_schema_has_table($db, 'bsky_favourite_sync_state')) {
+                return $ready[$key] = true;
+            }
             $db->query('SELECT 1 FROM bsky_favourite_cache LIMIT 1');
             $db->query('SELECT 1 FROM bsky_favourite_sync_state LIMIT 1');
             return $ready[$key] = true;
@@ -7775,8 +7882,17 @@ function ap_bsky_starter_pack_cache_ready(?PDO $db = null): bool
     if (isset($ready[$key])) return $ready[$key];
     try {
         if (function_exists('ap_db_driver') && ap_db_driver($db) === 'pgsql') {
+            if (function_exists('ap_schema_has_table')) {
+                $names = [];
+                foreach (['bsky_starter_pack_cache', 'bsky_starter_pack_sync_state'] as $starterTable) {
+                    if (ap_schema_has_table($db, $starterTable)) {
+                        $names[$starterTable] = true;
+                    }
+                }
+            } else {
             $st = $db->query("SELECT table_name FROM information_schema.tables WHERE table_schema = current_schema() AND table_name IN ('bsky_starter_pack_cache','bsky_starter_pack_sync_state')");
             $names = array_fill_keys(array_map('strval', $st->fetchAll(PDO::FETCH_COLUMN)), true);
+            }
             return $ready[$key] = isset($names['bsky_starter_pack_cache'], $names['bsky_starter_pack_sync_state']);
         }
         $db->exec(<<<'SQL'
@@ -8293,8 +8409,17 @@ function ap_bsky_actor_refresh_migrate(?PDO $db = null): bool
     if (isset($readyByConnection[$key])) return $readyByConnection[$key];
     try {
         if (function_exists('ap_db_driver') && ap_db_driver($db) === 'pgsql') {
+            if (function_exists('ap_schema_has_table')) {
+                $names = [];
+                foreach (['bsky_actor_profiles', 'bsky_actor_viewers', 'bsky_actor_refresh_queue'] as $actorTable) {
+                    if (ap_schema_has_table($db, $actorTable)) {
+                        $names[$actorTable] = true;
+                    }
+                }
+            } else {
             $st = $db->query("SELECT table_name FROM information_schema.tables WHERE table_schema = current_schema() AND table_name IN ('bsky_actor_profiles', 'bsky_actor_viewers', 'bsky_actor_refresh_queue')");
             $names = array_fill_keys(array_map('strval', $st->fetchAll(PDO::FETCH_COLUMN)), true);
+            }
             $ready = isset($names['bsky_actor_profiles'], $names['bsky_actor_viewers'], $names['bsky_actor_refresh_queue']);
             if (!$ready) error_log('[ap-bsky] actor refresh tables require owner provisioning; runtime role did not attempt DDL');
             return $readyByConnection[$key] = $ready;
