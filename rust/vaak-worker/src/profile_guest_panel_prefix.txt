@@ -1,0 +1,11 @@
+                          <div class="remote-profile-guest-follow">
+                <button type="button" class="btn btn-primary" id="rp-guest-follow-toggle" aria-expanded="false" aria-controls="rp-guest-follow-panel">Follow</button>
+                <div class="guest-follow-panel" id="rp-guest-follow-panel" hidden>
+                  <form id="rp-guest-follow-form" action="#" method="get">
+                    <label for="rp-guest-follow-handle">Follow from your fediverse account</label>
+                    <div class="guest-follow-row">
+                      <input id="rp-guest-follow-handle" name="handle" type="text" inputmode="email" autocomplete="username" spellcheck="false" placeholder="@you@your.instance" required>
+                      <button type="submit">Go</button>
+                    </div>
+                    <p class="guest-follow-hint" id="rp-guest-follow-hint">Opens your instance’s follow dialog (Mastodon, Akkoma, GoToSocial, etc.).</p>
+                  </form>
