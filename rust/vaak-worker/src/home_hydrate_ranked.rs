@@ -5163,6 +5163,119 @@ pub fn report_json(r: &WarmReport) -> Value {
     })
 }
 
+/// Materialize one keyset page with the same painters as the warm head.
+/// `vaak_tl_cursor` is the raw stored timestamp, not a reformatted display time.
+pub(crate) async fn statuses_for_older_hits(
+    db: &Client,
+    owner_user_id: i64,
+    view: &str,
+    hits: &[crate::timeline_older::OlderRow],
+) -> Result<Vec<Value>> {
+    let view = match view {
+        "local" => "local",
+        "feed" => "feed",
+        _ => "home",
+    };
+    let mut event_ids = Vec::new();
+    let mut outbox_ids = Vec::new();
+    let mut boost_ids = Vec::new();
+    let mut bsky_uris = Vec::new();
+    for hit in hits {
+        if !hit.keep {
+            continue;
+        }
+        match hit.source.as_str() {
+            "event" => {
+                if let Ok(id) = hit.id.parse::<i64>() {
+                    if id > 0 {
+                        event_ids.push(id);
+                    }
+                }
+            }
+            "outbox" => outbox_ids.push(hit.lookup.clone()),
+            "boost" => boost_ids.push(hit.lookup.clone()),
+            "bsky" => bsky_uris.push(hit.lookup.clone()),
+            _ => {}
+        }
+    }
+    let events_map = fetch_events_map(db, &event_ids).await.unwrap_or_default();
+    let mut actor_ids = Vec::new();
+    let mut create_objects = Vec::new();
+    for ev in events_map.values() {
+        if !ev.actor_id.is_empty() {
+            actor_ids.push(ev.actor_id.trim_end_matches('/').to_string());
+        }
+        if ev.event_type.eq_ignore_ascii_case("announce") && !ev.object_id.is_empty() {
+            create_objects.push(ev.object_id.clone());
+        }
+    }
+    let actors_map = fetch_actors_map(db, &actor_ids).await.unwrap_or_default();
+    let creates_map = fetch_creates_by_object(db, &create_objects).await.unwrap_or_default();
+    let outbox_map = fetch_outbox_map(db, &outbox_ids).await.unwrap_or_default();
+    let boosts_map = fetch_boosts_map(db, &boost_ids, owner_user_id).await.unwrap_or_default();
+    let bsky_map = fetch_bsky_map(db, &bsky_uris).await.unwrap_or_default();
+    let owner_username: String = db
+        .query_opt(
+            "SELECT COALESCE(username, '') FROM ap_users WHERE id = $1::bigint",
+            &[&owner_user_id],
+        )
+        .await
+        .ok()
+        .flatten()
+        .map(|row| row.get(0))
+        .unwrap_or_default();
+    let mut local_keys = Vec::new();
+    if let Some(user) = local_username_from_url(&format!("{LOCAL_ACTOR_PREFIX}{owner_username}")) {
+        local_keys.push(user);
+    }
+    for row in outbox_map.values() {
+        if let Some(user) = local_username_from_url(&row.id) {
+            local_keys.push(user);
+        }
+    }
+    let local_profiles = fetch_local_profiles_map(db, &local_keys).await.unwrap_or_default();
+    let hidden = crate::hidden::load_hidden_sets(db, owner_user_id)
+        .await
+        .unwrap_or_default();
+    use crate::timeline_cursor::CursorRow;
+    let mut statuses = Vec::new();
+    for hit in hits {
+        if !hit.keep {
+            continue;
+        }
+        let built = match hit.source.as_str() {
+            "event" => {
+                let id = hit.id.parse::<i64>().unwrap_or(0);
+                events_map.get(&id).and_then(|ev| {
+                    let actor = actors_map.get(ev.actor_id.trim_end_matches('/'));
+                    if ev.event_type.eq_ignore_ascii_case("announce") {
+                        let create = creates_map.get(ev.object_id.trim_end_matches('/'));
+                        Some(materialize_announce(ev, actor, create, &actors_map))
+                    } else {
+                        Some(materialize_event_create(ev, actor))
+                    }
+                })
+            }
+            "outbox" => outbox_map
+                .get(hit.lookup.trim_end_matches('/'))
+                .map(|row| materialize_outbox(row, &owner_username, &local_profiles)),
+            "boost" => boosts_map.get(&hit.lookup).and_then(|rb| {
+                let create = creates_map.get(rb.object_id.trim_end_matches('/'));
+                materialize_boost(rb, create, None, &actors_map, &local_profiles, owner_user_id)
+            }),
+            "bsky" => bsky_map.get(&hit.lookup).map(materialize_bsky),
+            _ => None,
+        };
+        let Some(mut st) = built else { continue };
+        if crate::hidden::ordinary_status_hidden(&st, &hidden) {
+            continue;
+        }
+        st["vaak_tl_cursor"] = json!(crate::timeline_cursor::pack(&hit.cursor()));
+        statuses.push(st);
+    }
+    Ok(statuses)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
