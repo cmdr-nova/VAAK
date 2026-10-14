@@ -119,6 +119,7 @@ node_tests=(
   api/bin/timeline-new-posts-poll-regression.js
   api/bin/notif-badge-poll-regression.js
   api/bin/reply-no-reload-regression.js
+  api/bin/home-notifications-view-switch-regression.js
 )
 for test in "${node_tests[@]}"; do
   echo "==> ${test}"

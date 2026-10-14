@@ -668,6 +668,61 @@ function check(ok, label) {
   await own.flush();
   check(own.newBtn().hidden === true && own.items.querySelectorAll('[data-status-id="777"]').length === 1, 'the following poll does not duplicate the own post');
 
+  // Parking the column for Notifications must stop the head poll and keep the
+  // pill. Coming back re-arms that same poll and still waits for a tap.
+  const parked = boot('home');
+  await parked.advance(5000);
+  parked.newer()[0].pending.resolve(parked.response('parked-post', 1100, { sort: 1100 }));
+  await parked.flush();
+  check(parked.newBtn().textContent === '1 new post' && parked.newBtn().hidden === false, 'park setup shows the new-posts pill');
+  const parkedItems = parked.items;
+  const pollsBeforePark = parked.newer().length;
+  const heldSnap = parked.win.vaakPauseTimelineForPark();
+  await parked.advance(120000);
+  check(parked.newer().length === pollsBeforePark, 'a parked timeline does not poll or open a stream');
+  check(parked.newBtn().textContent === '1 new post' && parked.items === parkedItems && parked.items.children.length === 0, 'parking keeps the pill and does not insert or rebuild the timeline');
+  check(heldSnap && heldSnap.pendingCount === 1 && String(heldSnap.pendingHtml).includes('parked-post'), 'pause keeps a copy of the posts the pill is holding');
+  // A later timeline boot clears the shared closure. The parked Home pill
+  // has to come back from the copy, not from whatever that boot left behind.
+  const homeFeed = parked.items.parentElement;
+  const homeBtn = parked.newBtn();
+  const homeTop = parked.doc.getElementById('feed-top-btn');
+  homeFeed.remove();
+  homeBtn.remove();
+  if (homeTop) homeTop.remove();
+  const localFeed = parked.doc.createElement('div');
+  localFeed.classList.add('feed');
+  const localItems = parked.doc.createElement('div');
+  localItems.id = 'timeline-items';
+  localItems.dataset.view = 'local';
+  localItems.dataset.offset = '0';
+  localItems.dataset.limit = '15';
+  localItems.dataset.hasMore = '0';
+  localItems.dataset.newest = '50';
+  const localSentinel = parked.doc.createElement('div');
+  localSentinel.id = 'timeline-sentinel';
+  const localStatus = parked.doc.createElement('div');
+  localStatus.id = 'timeline-status';
+  localFeed.appendChild(localItems);
+  localFeed.appendChild(localSentinel);
+  localFeed.appendChild(localStatus);
+  parked.doc.body.appendChild(localFeed);
+  check(parked.win.vaakBootTimeline('local') === true, 'opening another timeline boots a fresh column');
+  parked.win.vaakPauseTimelineForPark();
+  localFeed.remove();
+  parked.doc.body.appendChild(homeFeed);
+  parked.doc.body.appendChild(homeBtn);
+  if (homeTop) parked.doc.body.appendChild(homeTop);
+  const resumed = parked.win.vaakResumeParkedTimeline(heldSnap);
+  check(resumed === true, 'resume reattaches the same timeline');
+  check(parked.newBtn().textContent === '1 new post' && parked.newBtn().hidden === false && parked.items.children.length === 0, 'resume restores the held posts after another timeline boot');
+  await parked.advance(45000);
+  check(parked.newer().length === pollsBeforePark + 1, 'resume re-arms the existing poll instead of fetching immediately');
+  parked.newer().at(-1).pending.resolve(parked.response('parked-next', 1200, { sort: 1200 }));
+  await parked.flush();
+  check(parked.newBtn().textContent === '2 new posts', 'the held post is still counted after the parked timeline resumes');
+  check(parked.items === parkedItems && parked.items.children.length === 0, 'resuming still waits for a tap before inserting');
+
   console.log(JSON.stringify({ file, checks: result.length, passed: true, labels: result }, null, 2));
 })().catch((error) => {
   console.error(error && error.stack ? error.stack : error);
