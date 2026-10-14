@@ -4963,6 +4963,35 @@ $vaakAdminOnlyActions = [
                 $error = (string) ($momentRes['error'] ?? 'Could not post that moment.');
             }
         }
+    } elseif (in_array($action, ['phyrian_clan_create', 'phyrian_clan_join', 'phyrian_clan_leave'], true)) {
+        // Off unless VAAK_PHYRIAN_CLANS is on. Check that before loading the
+        // helper or touching clan tables. Not a player mutation.
+        $phyrianClansOn = getenv('VAAK_PHYRIAN_CLANS');
+        if (is_string($phyrianClansOn) && in_array(strtolower(trim($phyrianClansOn)), ['1', 'true', 'yes', 'on'], true)) {
+            require_once __DIR__ . '/ap-phyrian-clans.php';
+            $view = 'phyrian';
+            $_GET['page'] = 'clans';
+            $clanFile = $_FILES['emblem'] ?? [];
+            if (!is_array($clanFile)) {
+                $clanFile = [];
+            }
+            $clanRes = ap_phyrian_clans_mutate(
+                $action,
+                (int) $vaakOwnerId,
+                [
+                    'name' => (string) ($_POST['clan_name'] ?? ''),
+                    'description' => (string) ($_POST['clan_description'] ?? ''),
+                    'clan_id' => (int) ($_POST['clan_id'] ?? 0),
+                ],
+                $clanFile,
+                $csrfToken
+            );
+            if (!empty($clanRes['ok'])) {
+                $notice = (string) ($clanRes['notice'] ?? 'Saved.');
+            } else {
+                $error = (string) ($clanRes['error'] ?? 'Could not update that clan.');
+            }
+        }
     } elseif (in_array($action, [
         'phyrian_request', 'phyrian_accept', 'phyrian_deny', 'phyrian_checkin', 'phyrian_self_seed',
         'phyrian_bridge_start', 'phyrian_bridge_verify', 'phyrian_bridge_unlink',
@@ -35452,7 +35481,12 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
           };
           // Mafia Wars-style sub-pages inside the game shell.
           $phyPage = preg_replace('/[^a-z]/', '', strtolower((string) ($_GET['page'] ?? 'hub'))) ?: 'hub';
-          if (!in_array($phyPage, ['hub', 'dossier'], true)) {
+          $phyPages = ['hub', 'dossier'];
+          $phyrianClansOn = getenv('VAAK_PHYRIAN_CLANS');
+          if (is_string($phyrianClansOn) && in_array(strtolower(trim($phyrianClansOn)), ['1', 'true', 'yes', 'on'], true)) {
+              $phyPages[] = 'clans';
+          }
+          if (!in_array($phyPage, $phyPages, true)) {
               $phyPage = 'hub';
           }
           $phyDossierOwner = (int) ($_GET['owner'] ?? 0);
@@ -35480,7 +35514,13 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
 
           <nav class="phyrian-game-nav" aria-label="Phyrian Strains pages">
             <a class="<?= $phyPage === 'hub' ? 'is-active' : '' ?>" href="<?= h($phyHubHref) ?>" <?= $phyPage === 'hub' ? 'aria-current="page"' : '' ?>>Hub</a>
-            <a class="<?= $phyPage === 'dossier' && $phyDossierOwner === (int) $vaakOwnerId ? 'is-active' : '' ?>" href="<?= h($phyOwnDossierHref) ?>" <?= ($phyPage === 'dossier' && $phyDossierOwner === (int) $vaakOwnerId) ? 'aria-current="page"' : '' ?>>Your readout</a>
+            <a class="<?= $phyPage === 'dossier' && $phyDossierOwner === (int) $vaakOwnerId ? 'is-active' : '' ?>" href="<?= h($phyOwnDossierHref) ?>" <?= ($phyPage === 'dossier' && $phyDossierOwner === (int) $vaakOwnerId) ? 'aria-current="page"' : '' ?>>Your readout</a><?php
+              $phyrianClansOn = getenv('VAAK_PHYRIAN_CLANS');
+              if (is_string($phyrianClansOn) && in_array(strtolower(trim($phyrianClansOn)), ['1', 'true', 'yes', 'on'], true)) {
+                  require_once __DIR__ . '/ap-phyrian-clans.php';
+                  echo ap_phyrian_clans_nav_html((string) $phyPage);
+              }
+            ?>
           </nav>
 
           <?php if ($phyPage === 'hub'): ?>
@@ -35571,6 +35611,17 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
               </article>
             <?php endif; ?>
 
+          <?php elseif ($phyPage === 'clans'): ?>
+            <?php
+              $phyrianClansOn = getenv('VAAK_PHYRIAN_CLANS');
+              if (is_string($phyrianClansOn) && in_array(strtolower(trim($phyrianClansOn)), ['1', 'true', 'yes', 'on'], true)) {
+                  require_once __DIR__ . '/ap-phyrian-clans.php';
+                  echo ap_phyrian_clans_page_html(
+                      (int) $vaakOwnerId,
+                      function_exists('ap_auth_csrf_token') ? ap_auth_csrf_token() : ''
+                  );
+              }
+            ?>
           <?php else: /* hub */ ?>
 
           <div class="phyrian-hud">
