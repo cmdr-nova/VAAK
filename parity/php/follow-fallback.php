@@ -43,7 +43,7 @@ $samples = [
     ]]],
     ['id' => 'actor-same-host', 'input' => ['op' => 'actor_matches', 'activity_actor' => 'https://misskey.io/users/instance', 'followed_actor' => $remote]],
     ['id' => 'actor-other-host', 'input' => ['op' => 'actor_matches', 'activity_actor' => 'https://evil.test/users/ada', 'followed_actor' => $remote]],
-    ['id' => 'scrub', 'input' => ['op' => 'scrub', 'limit' => 120, 'text' => 'nope signature="abcDEF+/=" bearer SECRET digest: SHA-256=abcd -----BEGIN PRIVATE KEY-----secret-----END PRIVATE KEY-----']],
+    ['id' => 'scrub', 'input' => ['op' => 'scrub', 'limit' => 120, 'text' => 'nope signature="abcDEF+/=" bearer SECRET digest: sha-256= -----BEGIN PRIVATE KEY-----secret-----END PRIVATE KEY-----']],
     ['id' => 'log-failure', 'input' => ['op' => 'log_line', 'host' => 'misskey.io', 'type' => 'Create', 'status' => 403, 'ok' => false, 'path' => '/inbox?token=secret', 'body' => 'denied signature="abcDEF+/=" bearer SECRET']],
     ['id' => 'log-follow', 'input' => ['op' => 'log_line', 'host' => 'https://misskey.io/inbox', 'type' => 'Follow', 'status' => 202, 'ok' => true, 'path' => '/inbox', 'body' => 'signature="should-not-appear"']],
     ['id' => 'log-create-ok', 'input' => ['op' => 'should_log', 'ok' => true, 'type' => 'Create']],
