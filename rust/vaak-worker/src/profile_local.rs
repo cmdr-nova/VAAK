@@ -687,7 +687,7 @@ fn header(f: &Facts) -> String {
             let href = sl_url(&f.sl_agent);
             let name = esc(&f.sl_name);
             w.line(18, &format!("<a href=\"{}\" rel=\"noopener noreferrer me\" title=\"Open {name} in Second Life\" aria-label=\"Open {name} in Second Life\">", esc(&href)));
-            w.line(20, "<img src=\"/vaak/second-life.jpg\" alt=\"Second Life\" width=\"43\" height=\"34\" loading=\"lazy\">");
+            w.line(20, "<img src=\"/vaak/second-life.svg\" alt=\"Second Life\" width=\"43\" height=\"34\" loading=\"lazy\">");
             w.line(18, "</a>");
             w.line(18, &format!("<span class=\"meta\">{name}</span>"));
             w.indent(16);
@@ -999,6 +999,17 @@ mod tests {
         }
         for id in ["peer", "own", "follow_back", "following", "requested", "locked", "muted_blocked", "admin_target", "badges_fields", "tabs", "asks_empty", "asks_filled", "pins_filled", "wow_text"] {
             assert!(seen.iter().any(|seen| seen == id), "missing {id}");
+        }
+        let icon = "<img src=\"/vaak/second-life.svg\" alt=\"Second Life\" width=\"43\" height=\"34\" loading=\"lazy\">";
+        let asset = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vaak/second-life.svg");
+        assert!(asset.is_file(), "shipped Second Life icon missing");
+        for id in ["badges_fields", "wow_text"] {
+            let case = cases.iter().find(|case| text(case, "id") == id).unwrap_or_else(|| panic!("missing {id}"));
+            let chrome = text(case, "chrome");
+            assert!(chrome.contains(icon), "{id} php chrome");
+            assert!(!chrome.contains("second-life.jpg") && !chrome.contains("second-life.png"), "{id} stale icon");
+            let painted = paint_local(&case["input"]).unwrap();
+            assert!(painted.chrome.contains(icon), "{id} rust chrome");
         }
     }
 
