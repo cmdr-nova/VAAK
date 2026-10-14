@@ -23302,9 +23302,18 @@ if ($isPartial && $view === 'mentions') {
         exit;
     }
     $notifRenderT0 = microtime(true);
-    ob_start();
-    admin_render_notification_stream($adminNotifs, $followingIds, $followerIds);
-    $notifHtml = (string) ob_get_clean();
+    $GLOBALS['admin_notif_inline_cards'] = true;
+    if (function_exists('ap_visibility_notification_page_prefetch')) {
+        $audienceOwner = function_exists('ap_db_masto_owner_user_id') ? (int) ap_db_masto_owner_user_id() : 0;
+        ap_visibility_notification_page_prefetch($adminNotifs, $audienceOwner);
+    }
+    try {
+        ob_start();
+        admin_render_notification_stream($adminNotifs, $followingIds, $followerIds);
+        $notifHtml = (string) ob_get_clean();
+    } finally {
+        unset($GLOBALS['admin_notif_inline_cards'], $GLOBALS['ap_visibility_audience_memo']);
+    }
     $notifRenderMs = (int) round((microtime(true) - $notifRenderT0) * 1000);
     header('X-TL-Notif-Fetch-Ms: ' . (string) $notifFetchMs);
     header('X-TL-Notif-Prefetch-Ms: ' . (string) $notifPrefetchMs);
@@ -25142,6 +25151,12 @@ function admin_notif_status_requires_php_bsky_render(array $status): bool
     return false;
 }
 
+/** Mentions fill paints nested cards in this request. Other pages may still ask Axum. */
+function admin_notif_embed_uses_axum(): bool
+{
+    return empty($GLOBALS['admin_notif_inline_cards']);
+}
+
 function admin_notif_try_embed_status_card(?array $status, array $followingIds, bool $hideHeader = false): bool
 {
     if (!is_array($status) || $status === []) {
@@ -25192,7 +25207,7 @@ function admin_notif_try_embed_status_card(?array $status, array $followingIds, 
     // Prefer Axum fragment serve (0.6.90). '' = confirmed miss; null = try Redis.
     // Bluesky notification cards need the complete hydrated PHP PostView renderer
     // until the native renderer matches its identity, controls and full markup.
-    $axumHtml = admin_notif_status_requires_php_bsky_render($status)
+    $axumHtml = (admin_notif_status_requires_php_bsky_render($status) || !admin_notif_embed_uses_axum())
         ? null
         : admin_notif_embed_axum_fetch($ownerUserId, $uri, $hideHeader, $flagBits, $statusId);
     if (is_string($axumHtml) && $axumHtml !== '') {

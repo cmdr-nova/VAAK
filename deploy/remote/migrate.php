@@ -241,6 +241,116 @@ function vaak_migrate_additive_plan(array $statements, string $name): array
 }
 
 /**
+ * Notification read indexes on tables that already exist.
+ *
+ * Not part of vaak_migrate_deploy_sql_files(): that loop refuses indexes on
+ * existing tables and runs ordinary CREATE INDEX, which blocks writes for
+ * the whole build. CREATE INDEX CONCURRENTLY takes only a brief
+ * ShareUpdateExclusiveLock, so reads and writes on events continue. It
+ * cannot run inside a transaction. A valid index is left untouched. An
+ * invalid index left by a failed concurrent build is dropped and created
+ * again. Both steps are no-ops once the index is valid.
+ *
+ * @return array<string, array{table: string, create: string, drop: string}>
+ */
+function vaak_migrate_notification_index_specs(): array
+{
+    return [
+        'idx_events_object_key_id' => [
+            'table' => 'events',
+            'create' => "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_events_object_key_id ON events (rtrim(object_id, '/'), id DESC)",
+            'drop' => 'DROP INDEX CONCURRENTLY IF EXISTS idx_events_object_key_id',
+        ],
+        'idx_mentions_owner_live_id' => [
+            'table' => 'mentions',
+            'create' => 'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_mentions_owner_live_id ON mentions (owner_user_id, id DESC) WHERE deleted_at IS NULL',
+            'drop' => 'DROP INDEX CONCURRENTLY IF EXISTS idx_mentions_owner_live_id',
+        ],
+    ];
+}
+
+/** @return 'skip'|'create'|'rebuild'|'missing-table' */
+function vaak_migrate_notification_index_plan(bool $tableExists, ?bool $valid): string
+{
+    if (!$tableExists) {
+        return 'missing-table';
+    }
+    if ($valid === true) {
+        return 'skip';
+    }
+    if ($valid === false) {
+        return 'rebuild';
+    }
+    return 'create';
+}
+
+/** @return list<string> */
+function vaak_migrate_notification_index_statements(string $name, string $action): array
+{
+    $specs = vaak_migrate_notification_index_specs();
+    if (!isset($specs[$name])) {
+        throw new RuntimeException('unknown notification read index');
+    }
+    if ($action === 'skip') {
+        return [];
+    }
+    if ($action === 'create') {
+        return [$specs[$name]['create']];
+    }
+    if ($action === 'rebuild') {
+        return [$specs[$name]['drop'], $specs[$name]['create']];
+    }
+    throw new RuntimeException('notification read index was not created');
+}
+
+function vaak_migrate_pg_bool(mixed $value): ?bool
+{
+    if ($value === null) {
+        return null;
+    }
+    if (vaak_migrate_is_true($value)) {
+        return true;
+    }
+    if (in_array($value, [false, 0, '0', 'f', 'false'], true)) {
+        return false;
+    }
+    return null;
+}
+
+function vaak_migrate_notification_read_indexes(PDO $db): void
+{
+    if ($db->inTransaction()) {
+        throw new RuntimeException('notification read indexes must not run inside a transaction');
+    }
+    foreach (vaak_migrate_notification_index_specs() as $name => $spec) {
+        $table = $db->prepare(
+            'SELECT 1 FROM pg_tables WHERE schemaname = current_schema() AND tablename = ?'
+        );
+        $table->execute([$spec['table']]);
+        $tableExists = $table->fetchColumn() !== false;
+        $index = $db->prepare(
+            'SELECT i.indisvalid FROM pg_class c
+             JOIN pg_index i ON i.indexrelid = c.oid
+             JOIN pg_namespace n ON n.oid = c.relnamespace
+             WHERE n.nspname = current_schema() AND c.relname = ?'
+        );
+        $index->execute([$name]);
+        $row = $index->fetch();
+        $valid = is_array($row) ? vaak_migrate_pg_bool($row['indisvalid'] ?? null) : null;
+        if (is_array($row) && $valid === null) {
+            throw new RuntimeException('notification read index validity is unknown');
+        }
+        $action = vaak_migrate_notification_index_plan($tableExists, $valid);
+        if ($action === 'missing-table') {
+            throw new RuntimeException($spec['table'] . ' is missing; notification read index was not created');
+        }
+        foreach (vaak_migrate_notification_index_statements($name, $action) as $statement) {
+            $db->exec($statement);
+        }
+    }
+}
+
+/**
  * Apply one additive migration. The statement list is checked before any
  * SQL runs, so a rejected file leaves the schema untouched.
  *
@@ -352,6 +462,7 @@ function vaak_migrate_main(array $argv): void
         if ($tables < 1 || !$users) {
             vaak_migrate_fail('schema is missing ap_users after migration');
         }
+        vaak_migrate_notification_read_indexes($lock);
     } catch (Throwable $e) {
         vaak_migrate_fail(vaak_migrate_redact($e->getMessage(), $password));
     }
