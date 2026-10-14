@@ -375,7 +375,7 @@ pub struct HomeSinceReport {
     pub note: &'static str,
 }
 
-fn status_created_ts(st: &Value) -> i64 {
+pub(crate) fn status_created_ts(st: &Value) -> i64 {
     let raw = st
         .get("created_at")
         .and_then(|v| v.as_str())
@@ -472,8 +472,9 @@ fn keys_hit(keys: &[String], set: &std::collections::HashSet<String>) -> bool {
     keys.iter().any(|key| set.contains(key))
 }
 
-/// Newer cards in the ranker's order. `newest_ts` stays on `created_at` so
-/// the client cursor does not chase the affinity bonus.
+/// Newer Home cards. Rank aliases still drop a post the ranker already painted,
+/// but the returned slice is newest-first and `newest_ts` is only that slice.
+/// `created_at` stays the cursor so an affinity bonus cannot move it.
 pub(crate) fn select_newer_like_ranked(
     ranked: &[Value],
     statuses: Vec<Value>,
@@ -483,13 +484,9 @@ pub(crate) fn select_newer_like_ranked(
     let limit = limit.max(1);
     let mut painted = std::collections::HashSet::new();
     let mut newer = Vec::new();
-    let mut newest = since_ts;
     for st in statuses {
         let ts = status_created_ts(&st);
         if ts > since_ts {
-            if ts > newest {
-                newest = ts;
-            }
             newer.push(st);
         } else {
             for key in status_alias_keys(&st) {
@@ -544,14 +541,18 @@ pub(crate) fn select_newer_like_ranked(
             kept.push((usize::MAX, status_created_ts(&st), st));
         }
     }
-    kept.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
-    let items = kept.into_iter().take(limit).map(|row| row.2).collect();
+    // Newest first. Rank order filled the limit with posts already on screen
+    // and left the actual new post out, while `newest` still jumped to that
+    // excluded post and the client cursor skipped it.
+    kept.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    let items: Vec<Value> = kept.into_iter().take(limit).map(|row| row.2).collect();
+    let newest = items.iter().map(status_created_ts).max().unwrap_or(since_ts);
     (items, newest)
 }
 
-/// Newer cards in the envelope's existing order. Local and Federated are
-/// chronological, so this does not consult Home rank indexes. `newest_ts`
-/// still advances for a twin that is dropped, matching the Home cursor.
+/// Newer cards, newest first. Local and Federated do not consult Home rank
+/// indexes. `newest_ts` is the newest card actually returned. A twin that was
+/// dropped, and any older card cut by the limit, must not move the cursor.
 pub(crate) fn select_newer_chronological(
     statuses: Vec<Value>,
     since_ts: i64,
@@ -560,13 +561,9 @@ pub(crate) fn select_newer_chronological(
     let limit = limit.max(1);
     let mut painted = std::collections::HashSet::new();
     let mut newer = Vec::new();
-    let mut newest = since_ts;
     for st in statuses {
         let ts = status_created_ts(&st);
         if ts > since_ts {
-            if ts > newest {
-                newest = ts;
-            }
             newer.push(st);
         } else {
             for key in status_alias_keys(&st) {
@@ -574,6 +571,7 @@ pub(crate) fn select_newer_chronological(
             }
         }
     }
+    newer.sort_by(|a, b| status_created_ts(b).cmp(&status_created_ts(a)));
     let mut seen = std::collections::HashSet::new();
     let mut kept = Vec::new();
     for st in newer {
@@ -589,6 +587,7 @@ pub(crate) fn select_newer_chronological(
             break;
         }
     }
+    let newest = kept.iter().map(status_created_ts).max().unwrap_or(since_ts);
     (kept, newest)
 }
 
@@ -1112,11 +1111,21 @@ mod tests {
             }),
         ];
         let since = status_created_ts(&statuses[3]);
-        let (items, newest) = select_newer_like_ranked(&ranked, statuses, since, 20);
+        let twin_ts = status_created_ts(&statuses[2]);
+        let (items, newest) = select_newer_like_ranked(&ranked, statuses.clone(), since, 20);
         assert_eq!(items.len(), 2);
-        assert_eq!(items[0]["uri"], "https://example.test/notes/weighted");
-        assert_eq!(items[1]["uri"], "https://example.test/notes/cold");
-        assert!(newest > since);
+        // Cold is newer than the higher-ranked weighted post. The poll has to
+        // return it first or a short limit would hide it and skip its time.
+        assert_eq!(items[0]["uri"], "https://example.test/notes/cold");
+        assert_eq!(items[1]["uri"], "https://example.test/notes/weighted");
+        assert_eq!(newest, status_created_ts(&items[0]));
+        // The dropped twin is newer than every returned card. Its time must
+        // not become the client cursor.
+        assert!(twin_ts > newest);
+        let (limited, limited_newest) = select_newer_like_ranked(&ranked, statuses, since, 1);
+        assert_eq!(limited.len(), 1);
+        assert_eq!(limited[0]["uri"], "https://example.test/notes/cold");
+        assert_eq!(limited_newest, status_created_ts(&limited[0]));
     }
 
     #[test]
@@ -1149,7 +1158,7 @@ mod tests {
         assert_eq!(items[0]["uri"], "https://example.test/notes/new-a");
         assert_eq!(items[1]["uri"], "https://example.test/notes/new-b");
         assert_eq!(newest, 1791165460);
-        let (limited, _) = select_newer_chronological(
+        let (limited, limited_newest) = select_newer_chronological(
             vec![
                 serde_json::json!({"id":"a","uri":"https://example.test/a","created_at":"2026-10-05T01:57:40.000Z"}),
                 serde_json::json!({"id":"b","uri":"https://example.test/b","created_at":"2026-10-05T01:57:20.000Z"}),
@@ -1159,6 +1168,22 @@ mod tests {
         );
         assert_eq!(limited.len(), 1);
         assert_eq!(limited[0]["id"], "a");
+        assert_eq!(limited_newest, status_created_ts(&limited[0]));
+        // Oldest row is first in the envelope, and a newer twin of an
+        // already-painted post must not pull the cursor past the card we send.
+        let (reordered, reordered_newest) = select_newer_chronological(
+            vec![
+                serde_json::json!({"id":"old","uri":"https://example.test/notes/already","created_at":"2026-10-05T01:00:00.000Z"}),
+                serde_json::json!({"id":"older-new","uri":"https://example.test/notes/older","created_at":"2026-10-05T01:57:20.000Z"}),
+                serde_json::json!({"id":"twin","uri":"https://example.test/notes/already","created_at":"2026-10-05T01:57:50.000Z"}),
+                serde_json::json!({"id":"fresh","uri":"https://example.test/notes/fresh","created_at":"2026-10-05T01:57:40.000Z"}),
+            ],
+            since,
+            1,
+        );
+        assert_eq!(reordered.len(), 1);
+        assert_eq!(reordered[0]["id"], "fresh");
+        assert_eq!(reordered_newest, status_created_ts(&reordered[0]));
     }
 }
 
