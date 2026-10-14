@@ -1435,7 +1435,7 @@ function ap_auth_operator_follow_new_user(string $newActorKey): void
     $target = 'https://mkultra.monster/users/' . $newActorKey;
     try {
         // cmdr follows target
-        ap_following_upsert($target, $cmdr);
+        ap_following_upsert($target, $cmdr, 'accepted');
         // target's followers list includes cmdr (accepted local follow)
         ap_follower_upsert(
             $cmdr,
