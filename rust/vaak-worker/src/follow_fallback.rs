@@ -556,10 +556,10 @@ mod tests {
 
     #[test]
     fn scrub_drops_signature_material() {
-        let cleaned = scrub("nope signature=\"abcDEF+/=\" bearer SECRET digest: SHA-256=abcd", 120);
+        let cleaned = scrub("nope signature=\"abcDEF+/=\" bearer SECRET digest: sha-256=", 120);
         assert!(!cleaned.to_ascii_lowercase().contains("signature"));
         assert!(!cleaned.contains("SECRET"));
-        assert!(!cleaned.contains("abcd"));
+        assert!(!cleaned.to_ascii_lowercase().contains("sha-256"));
         assert!(cleaned.contains("nope"));
     }
 }
