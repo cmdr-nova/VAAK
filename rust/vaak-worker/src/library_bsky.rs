@@ -216,9 +216,14 @@ fn button(kind:&str,post:&Value,_facts:&CardFacts,b:&BskyFacts,object:&str,view:
 fn quote(target:&str,view:&str,number:i64,legacy:bool,own:bool)->String{
     format!("<a class=\"icon-btn{}\" href=\"?view={}&amp;compose=1&amp;quote_object={}{}\" {}=\"1\" data-eng-count=\"{number}\" title=\"Quote\" aria-label=\"Quote{}\"><i class=\"ph ph-quotes\" aria-hidden=\"true\"></i>{}</a>",if number>0{" has-count"}else{""},esc(view),query(target),if legacy{"&amp;feed=following"}else{""},if own{"data-own-eng"}else{"data-eng"},label_count(number),count(number))
 }
-pub(crate) fn normalized_attrs(status:&Value)->String{
+/// Bluesky open-tag attrs split so poll identity can sit between the AT uri
+/// and the rank attrs, matching `admin_render_masto_status_card`.
+pub(crate) fn normalized_attr_parts(status:&Value)->(String,String){
     let uri=s(status,"uri");let post=post_view(status);let did=s(&post["author"],"did");
-    format!(" data-bsky-uri=\"{}\" data-bsky-cid=\"{}\" data-rank-platform=\"bsky\" data-rank-key=\"{}\" data-rank-actor=\"{}\"",esc(uri),esc(s(post,"cid")),esc(uri),esc(did))
+    (
+        format!(" data-bsky-uri=\"{}\" data-bsky-cid=\"{}\"",esc(uri),esc(s(post,"cid"))),
+        format!(" data-rank-platform=\"bsky\" data-rank-key=\"{}\" data-rank-actor=\"{}\"",esc(uri),esc(did)),
+    )
 }
 /// Complete action subtree for the enabled normalized Bluesky branch.
 pub(crate) fn normalized_actions(status:&Value,facts:&CardFacts,show_open:bool)->Result<String>{
