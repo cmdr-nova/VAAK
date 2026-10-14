@@ -150,15 +150,34 @@ fn same_source_content(a:&Value,b:&Value)->bool{
 }
 
 fn require_source_authority(status: &Value) -> Result<()> {
-    if status.get("vaak_quote_preview").is_some_and(Value::is_object) {
-        bail!("PHP fallback: compact quote preview needs retained AS2/PostView/RSS authority and cached recovery (link budget 3)");
+    if let Some(preview)=status.get("vaak_quote_preview").filter(|preview| preview.is_object()) {
+        if !super::quote::paintable_preview(preview) {
+            bail!("PHP fallback: compact quote preview needs retained AS2/PostView/RSS authority and cached recovery (link budget 3)");
+        }
     }
     if let Some(quote)=status.get("quote").filter(|q|q.is_object()) {
         if s(quote,"state") == "accepted" && !quote.get("quoted_status").is_some_and(Value::is_object) {
             bail!("PHP fallback: accepted quote needs canonical cached/signed source recovery (fetch budget 3)");
         }
-        if let Some(child)=quote.get("quoted_status").filter(|v|v.is_object()) { require_source_authority(child)?; }
-        if s(quote,"state")=="pending"&&!s(status,"quote_url").is_empty()&&!quote.get("quoted_status").is_some_and(Value::is_object){bail!("PHP fallback: pending quote URL requires canonical current AS2 cache normalization before final admission");}
+        if let Some(child)=quote.get("quoted_status").filter(|v|v.is_object()) {
+            if super::quote::synthetic_quote(child) {
+                bail!("PHP fallback: synthetic quote needs canonical status lookup");
+            }
+            let quoted_uri = child.get("uri").or_else(|| child.get("url")).and_then(Value::as_str).unwrap_or("");
+            let quoted_plain = super::body::html_to_plain(s(child, "content"));
+            let quoted_text = super::card::php_trim(&quoted_plain);
+            let quoted_media = child.get("media_attachments").and_then(Value::as_array).is_some_and(|items| !items.is_empty());
+            if super::quote::quote_target_is_bluesky(quoted_uri) && !quoted_media && !child.get("card").is_some_and(Value::is_object) && quoted_text.is_empty() {
+                bail!("PHP fallback: compact quote preview needs retained AS2/PostView/RSS authority and cached recovery (link budget 3)");
+            }
+            require_source_authority(child)?;
+        } else if s(quote,"state")=="pending" {
+            let url = s(status, "quote_url");
+            let preview = status.get("vaak_quote_preview").filter(|preview| preview.is_object());
+            if url.is_empty() && preview.is_none_or(|preview| !super::quote::paintable_preview(preview)) {
+                bail!("PHP fallback: pending quote URL requires canonical current AS2 cache normalization before final admission");
+            }
+        }
     }
     if let Some(child)=status.get("reblog").filter(|v|v.is_object()) { require_source_authority(child)?; }
     Ok(())

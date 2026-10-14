@@ -1,6 +1,6 @@
 //! Structured, read-only Library projections.
-//! PHP still owns favourite and bookmark mutations. Native favourites and
-//! bookmark cards stay behind `VAAK_LIBRARY_NATIVE_RENDER`.
+//! PHP still owns favourite and bookmark mutations. Native favourites,
+//! bookmark cards, and quote/preview cards stay behind `VAAK_LIBRARY_NATIVE_RENDER`.
 
 use anyhow::{Context, Result};
 use serde::Serialize;
@@ -36,6 +36,8 @@ pub(crate) mod card;
 pub(crate) mod body;
 #[path = "library_preview.rs"]
 pub(crate) mod preview;
+#[path = "library_quote.rs"]
+pub(crate) mod quote;
 #[path = "library_selection.rs"]
 pub(crate) mod selection;
 
