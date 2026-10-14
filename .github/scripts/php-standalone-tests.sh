@@ -45,6 +45,7 @@ php_tests=(
   api/bin/bsky-thread-fragment-smoke.php
   api/bin/dm-ask-parity-smoke.php
   api/bin/library-deletion-smoke.php
+  api/bin/library-folder-capture.php
   api/bin/library-moderation-actions-smoke.php
   api/bin/library-native-bridge-test.php
   api/bin/library-own-cw-smoke.php
