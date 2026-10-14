@@ -63,6 +63,7 @@ php_tests=(
   api/bin/migration-php-reference-smoke.php
   api/bin/moderation-alias-cache-smoke.php
   api/bin/notif-grouped-schema-smoke.php
+  api/bin/notif-page-speed-smoke.php
   api/bin/notif-reply-content-smoke.php
   api/bin/notif-reply-preview-smoke.php
   api/bin/phyrian-parity-smoke.php

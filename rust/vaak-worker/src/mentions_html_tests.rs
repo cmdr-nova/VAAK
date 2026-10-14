@@ -413,6 +413,24 @@ fn scroll_slice_excludes_the_cursor_row() {
 }
 
 #[test]
+fn grouped_favourites_need_php_cards_before_any_lookup() {
+    let rows = vec![
+        fav("3", "a@ex", "https://ex/users/a", "https://mkultra.monster/users/you/notes/1"),
+        fav("2", "b@ex", "https://ex/users/b", "https://mkultra.monster/users/you/notes/1"),
+    ];
+    assert!(page_needs_php_grouped_cards(&rows));
+}
+
+#[test]
+fn distinct_statuses_stay_on_the_html_path() {
+    let rows = vec![
+        fav("3", "a@ex", "https://ex/users/a", "https://mkultra.monster/users/you/notes/1"),
+        fav("2", "b@ex", "https://ex/users/b", "https://mkultra.monster/users/you/notes/2"),
+    ];
+    assert!(!page_needs_php_grouped_cards(&rows));
+}
+
+#[test]
 fn warm_heads_are_tried_deepest_first() {
     assert_eq!(warm_head_limits(12), vec![40, 30, 20, 12]);
     assert_eq!(warm_head_limits(40), vec![40, 30, 20]);

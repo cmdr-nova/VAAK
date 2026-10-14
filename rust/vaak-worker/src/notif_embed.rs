@@ -4130,6 +4130,27 @@ pub async fn set_embed_html(
     Ok(())
 }
 
+/// One round trip for the fragments of a page that was actually returned.
+pub async fn set_embed_html_many(
+    redis: &mut redis::aio::MultiplexedConnection,
+    entries: &[(String, String)],
+) -> Result<()> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let mut pipe = redis::pipe();
+    for (key, html) in entries {
+        pipe.cmd("SET")
+            .arg(key)
+            .arg(html)
+            .arg("EX")
+            .arg(EMBED_TTL_SECS)
+            .ignore();
+    }
+    let _: () = pipe.query_async(redis).await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     #[test]

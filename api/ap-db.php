@@ -1128,6 +1128,9 @@ SQL);
     } catch (Throwable $e) {
         error_log('[ap-db] notification index not provisioned: ' . $e->getMessage());
     }
+    // idx_events_object_key_id and idx_mentions_owner_live_id are built by
+    // deploy/remote/migrate.php with CREATE INDEX CONCURRENTLY. A page load
+    // must not take a write lock on the live events table to build them.
     try {
         if (!ap_schema_has_column($db, 'actor_profile', 'auto_unblur_sensitive')) {
             $db->exec('ALTER TABLE actor_profile ADD COLUMN auto_unblur_sensitive INTEGER NOT NULL DEFAULT 0');

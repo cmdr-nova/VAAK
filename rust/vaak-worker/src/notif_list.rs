@@ -588,6 +588,104 @@ pub fn notifications_list_redis_key(
     )
 }
 
+struct NotificationEnvelope {
+    redis_key: String,
+    cache_hit: bool,
+    cache_ts: Option<i64>,
+    source: String,
+    items: Vec<Value>,
+}
+
+/// Raw Redis envelope. No audience SQL — callers filter after they know this
+/// head can fill the page.
+async fn read_notification_envelope(
+    redis: &mut redis::aio::MultiplexedConnection,
+    owner_user_id: i64,
+    limit: i64,
+    types: &[String],
+    max_id: Option<&str>,
+    since_id: Option<&str>,
+) -> Result<NotificationEnvelope> {
+    let redis_key = notifications_list_redis_key(owner_user_id, limit, max_id, since_id, types);
+    let cached = redis_util::json_get(redis, &redis_key).await?;
+    if let Some(payload) = cached {
+        let items = payload
+            .get("items")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let source = payload
+            .get("source")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        return Ok(NotificationEnvelope {
+            redis_key,
+            cache_hit: true,
+            cache_ts: payload.get("ts").and_then(|v| v.as_i64()),
+            source,
+            items,
+        });
+    }
+    Ok(NotificationEnvelope {
+        redis_key,
+        cache_hit: false,
+        cache_ts: None,
+        source: "miss".into(),
+        items: vec![],
+    })
+}
+
+fn hit_report(
+    owner_user_id: i64,
+    limit: i64,
+    types: Vec<String>,
+    env: &NotificationEnvelope,
+    now: i64,
+    items: Vec<Value>,
+) -> NotificationsShadowReport {
+    NotificationsShadowReport {
+        owner_user_id,
+        limit,
+        types,
+        redis_key: env.redis_key.clone(),
+        cache_hit: true,
+        cache_ts: env.cache_ts,
+        cache_age_secs: env.cache_ts.map(|t| (now - t).max(0)),
+        source: if env.source.is_empty() {
+            "redis".into()
+        } else {
+            env.source.clone()
+        },
+        count: items.len(),
+        items,
+        mode: "shadow",
+        note: "Axum reads warm Redis list only; PHP remains live /api/v1/notifications until cutover.",
+    }
+}
+
+fn miss_report(
+    owner_user_id: i64,
+    limit: i64,
+    types: Vec<String>,
+    redis_key: String,
+) -> NotificationsShadowReport {
+    NotificationsShadowReport {
+        owner_user_id,
+        limit,
+        types,
+        redis_key,
+        cache_hit: false,
+        cache_ts: None,
+        cache_age_secs: None,
+        source: "miss".into(),
+        count: 0,
+        items: vec![],
+        mode: "shadow",
+        note: "Cache miss — run notif-list warm or open Mentions in PHP; shadow does not hydrate.",
+    }
+}
+
 pub async fn notifications_shadow(
     cfg: &Config,
     owner_user_id: i64,
@@ -598,60 +696,24 @@ pub async fn notifications_shadow(
 ) -> Result<NotificationsShadowReport> {
     let limit = limit.clamp(1, 80);
     let want = expand_types(types);
-    let redis_key =
-        notifications_list_redis_key(owner_user_id, limit, max_id, since_id, &want);
     let mut redis = redis_util::connect(&cfg.redis_url).await?;
-    let cached = redis_util::json_get(&mut redis, &redis_key).await?;
-
-    let now = chrono::Utc::now().timestamp();
-    if let Some(payload) = cached {
-        let ts = payload.get("ts").and_then(|v| v.as_i64());
-        let mut items = payload
-            .get("items")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default();
-        let source = payload
-            .get("source")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let db = crate::db::connect(&cfg.database_url).await?;
-        crate::audience::filter_notifications(&db, owner_user_id, &mut items).await?;
-        return Ok(NotificationsShadowReport {
-            owner_user_id,
-            limit,
-            types: want,
-            redis_key,
-            cache_hit: true,
-            cache_ts: ts,
-            cache_age_secs: ts.map(|t| (now - t).max(0)),
-            source: if source.is_empty() {
-                "redis".into()
-            } else {
-                source
-            },
-            count: items.len(),
-            items,
-            mode: "shadow",
-            note: "Axum reads warm Redis list only; PHP remains live /api/v1/notifications until cutover.",
-        });
-    }
-
-    Ok(NotificationsShadowReport {
+    let env = read_notification_envelope(
+        &mut redis,
         owner_user_id,
         limit,
-        types: want,
-        redis_key,
-        cache_hit: false,
-        cache_ts: None,
-        cache_age_secs: None,
-        source: "miss".into(),
-        count: 0,
-        items: vec![],
-        mode: "shadow",
-        note: "Cache miss — run notif-list warm or open Mentions in PHP; shadow does not hydrate.",
-    })
+        &want,
+        max_id,
+        since_id,
+    )
+    .await?;
+    let now = chrono::Utc::now().timestamp();
+    if env.cache_hit {
+        let mut items = env.items.clone();
+        let db = crate::db::connect(&cfg.database_url).await?;
+        crate::audience::filter_notifications(&db, owner_user_id, &mut items).await?;
+        return Ok(hit_report(owner_user_id, limit, want, &env, now, items));
+    }
+    Ok(miss_report(owner_user_id, limit, want, env.redis_key))
 }
 
 pub(crate) fn notif_id_digits(item: &Value) -> String {
@@ -727,46 +789,101 @@ fn truncate_page(report: &mut NotificationsShadowReport, limit: i64) {
     }
 }
 
-/// Slice a no-`max_id` warm head past the scroll cursor.
-/// An exact paged Redis key is never written by notif-list.
-async fn warm_head_page_after(
-    cfg: &Config,
-    owner_user_id: i64,
-    types: &[String],
-    max_id: &str,
-    limit: i64,
-) -> Result<Option<NotificationsShadowReport>> {
-    let Some(cursor) = cursor_digits(Some(max_id)) else {
-        return Ok(None);
-    };
-    let limit = limit.clamp(1, 80);
-    for alt in warm_head_limits(limit) {
-        let mut head = notifications_shadow(cfg, owner_user_id, alt, types, None, None).await?;
-        if !head.cache_hit || head.items.is_empty() {
-            continue;
-        }
-        let Some(tail) = full_page_after_cursor(&head.items, &cursor, limit) else {
-            if items_after_cursor(&head.items, &cursor).is_some() {
-                // This head contains the cursor but cannot fill the page.
-                // Smaller heads are prefixes of the same list.
-                return Ok(None);
-            }
-            continue;
-        };
-        head.source = tag_source(&head.source, "max-slice");
-        head.items = tail;
-        head.count = head.items.len();
-        truncate_page(&mut head, limit);
-        return Ok(Some(head));
-    }
-    Ok(None)
+/// One warm Redis head, still unfiltered.
+pub(crate) struct WarmHead {
+    pub limit: i64,
+    pub items: Vec<Value>,
 }
 
-/// Exact warm key, then a slice of the warm head.
+/// Which single head to filter, and how to slice it afterwards.
+pub(crate) struct PagePlan {
+    pub index: usize,
+    pub suffix: &'static str,
+    pub cursor: Option<String>,
+    pub require_full: bool,
+}
+
+/// Pick at most one warm head. Raw selection does no audience SQL.
+///
+/// `max_id`: largest head that contains the cursor. A short raw tail is a miss
+/// immediately — smaller heads are prefixes of the same list. No cursor: the
+/// first head whose limit differs from the request and whose raw page is long
+/// enough. A later head is not a fallback when this one filters short.
+pub(crate) fn plan_warm_heads(
+    heads: &[WarmHead],
+    requested: i64,
+    max_id: Option<&str>,
+) -> Option<PagePlan> {
+    let requested = requested.clamp(1, 80);
+    if let Some(cursor) = cursor_digits(max_id) {
+        for (index, head) in heads.iter().enumerate() {
+            if head.items.is_empty() {
+                continue;
+            }
+            match items_after_cursor(&head.items, &cursor) {
+                None => continue,
+                Some(tail) if (tail.len() as i64) < requested => return None,
+                Some(_) => {
+                    return Some(PagePlan {
+                        index,
+                        suffix: "max-slice",
+                        cursor: Some(cursor),
+                        require_full: true,
+                    });
+                }
+            }
+        }
+        return None;
+    }
+    for (index, head) in heads.iter().enumerate() {
+        if head.limit == requested {
+            continue;
+        }
+        if head.items.len() >= requested as usize {
+            return Some(PagePlan {
+                index,
+                suffix: "head-slice",
+                cursor: None,
+                require_full: true,
+            });
+        }
+    }
+    None
+}
+
+/// Apply a filtered head to the plan. A removed cursor or a short page is a
+/// miss so Ice Cubes does not stop pagination on the warm cap.
+pub(crate) fn page_after_filter(
+    items: &[Value],
+    plan: &PagePlan,
+    limit: i64,
+) -> Option<Vec<Value>> {
+    let limit = limit.clamp(1, 80);
+    let mut page = if let Some(cursor) = plan.cursor.as_deref() {
+        let tail = items_after_cursor(items, cursor)?;
+        if plan.require_full && (tail.len() as i64) < limit {
+            return None;
+        }
+        tail
+    } else {
+        if plan.require_full && (items.len() as i64) < limit {
+            return None;
+        }
+        items.to_vec()
+    };
+    let cap = limit as usize;
+    if page.len() > cap {
+        page.truncate(cap);
+    }
+    Some(page)
+}
+
+/// Exact warm key, then one filtered slice of a raw warm head.
 ///
 /// `since_id` / `min_id` pulls stay a miss so pull-to-refresh still reads PHP.
 /// A short scroll tail stays a miss so a client does not treat the warm cap as
-/// the end of the notifications list.
+/// the end of the notifications list. Audience SQL runs on the exact key, or
+/// on the single head `plan_warm_heads` selects — not on every probed head.
 pub async fn notifications_shadow_resolved(
     cfg: &Config,
     owner_user_id: i64,
@@ -786,26 +903,39 @@ pub async fn notifications_shadow_resolved(
     if cursor_digits(since_id).is_some() {
         return Ok(report);
     }
-    if cursor_digits(max_id).is_some() {
-        if let Some(sliced) =
-            warm_head_page_after(cfg, owner_user_id, types, max_id.unwrap_or(""), limit).await?
-        {
-            return Ok(sliced);
-        }
-        return Ok(report);
-    }
+    let want = expand_types(types);
+    let mut redis = redis_util::connect(&cfg.redis_url).await?;
+    let mut heads: Vec<(NotificationEnvelope, i64)> = Vec::new();
+    let mut planned = Vec::new();
     for alt in warm_head_limits(limit) {
-        if alt == limit {
+        if cursor_digits(max_id).is_none() && alt == limit {
             continue;
         }
-        let mut head = notifications_shadow(cfg, owner_user_id, alt, types, None, None).await?;
-        if head.cache_hit && head.items.len() >= limit as usize {
-            head.source = tag_source(&head.source, "head-slice");
-            truncate_page(&mut head, limit);
-            return Ok(head);
+        let env =
+            read_notification_envelope(&mut redis, owner_user_id, alt, &want, None, None).await?;
+        if !env.cache_hit {
+            continue;
         }
+        planned.push(WarmHead {
+            limit: alt,
+            items: env.items.clone(),
+        });
+        heads.push((env, alt));
     }
-    Ok(report)
+    let Some(plan) = plan_warm_heads(&planned, limit, max_id) else {
+        return Ok(report);
+    };
+    let (env, head_limit) = &heads[plan.index];
+    let mut items = planned[plan.index].items.clone();
+    let db = crate::db::connect(&cfg.database_url).await?;
+    crate::audience::filter_notifications(&db, owner_user_id, &mut items).await?;
+    let Some(page) = page_after_filter(&items, &plan, limit) else {
+        return Ok(report);
+    };
+    let now = chrono::Utc::now().timestamp();
+    let mut sliced = hit_report(owner_user_id, *head_limit, want, env, now, page);
+    sliced.source = tag_source(&sliced.source, plan.suffix);
+    Ok(sliced)
 }
 
 pub async fn run_loop(cfg: &Config, owner_user_id: i64, interval_secs: u64, limit: i64) -> Result<()> {
@@ -875,5 +1005,190 @@ mod reply_preview_projection_regression {
         }
         let mut fresh = original.clone(); fresh["_vaak_reply_preview_version"] = serde_json::json!(3);
         assert_eq!(super::projection_item(fresh), Some(original));
+    }
+}
+
+#[cfg(test)]
+mod warm_page_plan_tests {
+    use super::{
+        full_page_after_cursor, items_after_cursor, notif_id_digits, page_after_filter,
+        plan_warm_heads, PagePlan, WarmHead,
+    };
+    use serde_json::{json, Value};
+    use std::collections::HashSet;
+
+    fn item(id: i64) -> Value {
+        json!({"id": id.to_string(), "type": "favourite"})
+    }
+
+    fn head(limit: i64, ids: &[i64]) -> WarmHead {
+        WarmHead {
+            limit,
+            items: ids.iter().copied().map(item).collect(),
+        }
+    }
+
+    fn ids(items: &[Value]) -> Vec<String> {
+        items.iter().map(notif_id_digits).collect()
+    }
+
+    fn drop_ids(items: &[Value], drop: &HashSet<i64>) -> Vec<Value> {
+        items
+            .iter()
+            .filter(|it| match notif_id_digits(it).parse::<i64>() {
+                Ok(n) => !drop.contains(&n),
+                Err(_) => true,
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Previous resolver: filter every probed head until one fills the page.
+    fn old_filtered_page(
+        heads: &[WarmHead],
+        requested: i64,
+        max_id: Option<&str>,
+        drop: &HashSet<i64>,
+    ) -> Option<(usize, Vec<String>)> {
+        let mut filters = 0usize;
+        if let Some(cursor) = max_id {
+            for head in heads {
+                filters += 1;
+                let filtered = drop_ids(&head.items, drop);
+                if filtered.is_empty() {
+                    continue;
+                }
+                if let Some(mut tail) = full_page_after_cursor(&filtered, cursor, requested) {
+                    let cap = requested.clamp(1, 80) as usize;
+                    if tail.len() > cap {
+                        tail.truncate(cap);
+                    }
+                    return Some((filters, ids(&tail)));
+                }
+                if items_after_cursor(&filtered, cursor).is_some() {
+                    return None;
+                }
+            }
+            return None;
+        }
+        for head in heads {
+            if head.limit == requested {
+                continue;
+            }
+            filters += 1;
+            let filtered = drop_ids(&head.items, drop);
+            if (filtered.len() as i64) >= requested {
+                let mut page = filtered;
+                page.truncate(requested.clamp(1, 80) as usize);
+                return Some((filters, ids(&page)));
+            }
+        }
+        let _ = filters;
+        None
+    }
+
+    fn new_filtered_page(
+        heads: &[WarmHead],
+        requested: i64,
+        max_id: Option<&str>,
+        drop: &HashSet<i64>,
+    ) -> Option<(usize, Vec<String>)> {
+        let plan: PagePlan = plan_warm_heads(heads, requested, max_id)?;
+        let filtered = drop_ids(&heads[plan.index].items, drop);
+        let page = page_after_filter(&filtered, &plan, requested)?;
+        Some((1, ids(&page)))
+    }
+
+    #[test]
+    fn prefix_heads_keep_the_same_page_with_one_filter() {
+        let all: Vec<i64> = (1..=40).rev().collect();
+        let heads = vec![
+            head(40, &all),
+            head(30, &all[..30]),
+            head(20, &all[..20]),
+            head(12, &all[..12]),
+        ];
+        let drop = HashSet::from([39_i64, 37, 11]);
+        let old = old_filtered_page(&heads, 12, Some("30"), &drop).expect("old page");
+        let new = new_filtered_page(&heads, 12, Some("30"), &drop).expect("new page");
+        assert_eq!(new.1, old.1);
+        assert_eq!(new.0, 1);
+        assert!(old.0 >= 1);
+        let plan = plan_warm_heads(&heads, 12, Some("30")).unwrap();
+        assert_eq!(plan.index, 0);
+        assert_eq!(plan.suffix, "max-slice");
+    }
+
+    #[test]
+    fn probed_heads_that_lack_the_cursor_are_not_filtered() {
+        let heads = vec![
+            head(40, &(51..=90).rev().collect::<Vec<_>>()),
+            head(30, &(21..=50).rev().collect::<Vec<_>>()),
+            head(20, &(1..=20).rev().collect::<Vec<_>>()),
+            head(12, &(1..=12).rev().collect::<Vec<_>>()),
+        ];
+        let drop = HashSet::new();
+        let old = old_filtered_page(&heads, 3, Some("25"), &drop).unwrap();
+        let new = new_filtered_page(&heads, 3, Some("25"), &drop).unwrap();
+        assert_eq!(new.1, old.1);
+        assert_eq!(old.0, 2, "the old scan filtered the head that missed the cursor");
+        assert_eq!(new.0, 1);
+        assert_eq!(plan_warm_heads(&heads, 3, Some("25")).unwrap().index, 1);
+        assert_eq!(new.1, vec!["24", "23", "22"]);
+    }
+
+    #[test]
+    fn short_filtered_tail_stays_a_miss() {
+        let heads = vec![head(40, &(1..=40).rev().collect::<Vec<_>>())];
+        let drop: HashSet<i64> = (1..=20).collect();
+        let plan = plan_warm_heads(&heads, 12, Some("30")).unwrap();
+        let filtered = drop_ids(&heads[0].items, &drop);
+        assert!(page_after_filter(&filtered, &plan, 12).is_none());
+        assert!(old_filtered_page(&heads, 12, Some("30"), &drop).is_none());
+        assert!(new_filtered_page(&heads, 12, Some("30"), &drop).is_none());
+    }
+
+    #[test]
+    fn removing_the_cursor_misses_instead_of_reading_the_next_head() {
+        let heads = vec![
+            head(40, &(1..=40).rev().collect::<Vec<_>>()),
+            head(20, &(16..=35).rev().collect::<Vec<_>>()),
+        ];
+        let plan = plan_warm_heads(&heads, 5, Some("30")).unwrap();
+        assert_eq!(plan.index, 0);
+        let filtered: Vec<Value> = heads[0]
+            .items
+            .iter()
+            .filter(|it| notif_id_digits(it) != "30")
+            .cloned()
+            .collect();
+        assert!(page_after_filter(&filtered, &plan, 5).is_none());
+        let older = full_page_after_cursor(&heads[1].items, "30", 5).unwrap();
+        assert_eq!(
+            ids(&older[..5]),
+            vec!["29", "28", "27", "26", "25"]
+        );
+    }
+
+    #[test]
+    fn head_slice_does_not_fall_through_a_short_filter() {
+        let heads = vec![
+            head(40, &(1..=40).rev().collect::<Vec<_>>()),
+            head(20, &(100..=119).rev().collect::<Vec<_>>()),
+        ];
+        let drop: HashSet<i64> = (1..=30).collect();
+        assert!(new_filtered_page(&heads, 12, None, &drop).is_none());
+        let old = old_filtered_page(&heads, 12, None, &drop).unwrap();
+        assert_eq!(old.0, 2);
+        assert_eq!(old.1.len(), 12);
+    }
+
+    #[test]
+    fn exact_short_raw_tail_does_not_scan_a_smaller_prefix() {
+        let all: Vec<i64> = (1..=40).rev().collect();
+        let heads = vec![head(40, &all), head(30, &all[..30])];
+        assert!(plan_warm_heads(&heads, 12, Some("10")).is_none());
+        assert!(new_filtered_page(&heads, 12, Some("10"), &HashSet::new()).is_none());
+        assert!(old_filtered_page(&heads, 12, Some("10"), &HashSet::new()).is_none());
     }
 }
