@@ -258,7 +258,7 @@ fn field_html(input:&str)->String{
 fn world_html(f:&HeaderFacts)->String{
  let sl=f.sl.as_ref().filter(|v|card::boolean(v,"sl_username"));let wow=f.wow.as_ref().filter(|v|card::boolean(v,"armory_url"));if sl.is_none()&&wow.is_none(){return String::new();}
  let mut out=String::from("<div class=\"profile-world-links\" style=\"display:flex;gap:.5rem;align-items:center;margin:.65rem 0 0;flex-wrap:wrap\">");
- if let Some(sl)=sl{let name=s(sl,"sl_username");let agent=card::php_trim(s(sl,"sl_agent_id")).to_ascii_lowercase();let url=if regex::Regex::new(r"^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$").unwrap().is_match(&agent){format!("secondlife:///app/agent/{agent}/about")}else{"https://secondlife.com/".into()};out.push_str(&format!("<a href=\"{}\" rel=\"noopener noreferrer me\" title=\"Open {} in Second Life\" aria-label=\"Open {} in Second Life\"><img src=\"/vaak/second-life.jpg\" alt=\"Second Life\" width=\"43\" height=\"34\" loading=\"lazy\"></a><span class=\"meta\">{}</span>",h(&url),h(name),h(name),h(name)));}
+ if let Some(sl)=sl{let name=s(sl,"sl_username");let agent=card::php_trim(s(sl,"sl_agent_id")).to_ascii_lowercase();let url=if regex::Regex::new(r"^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$").unwrap().is_match(&agent){format!("secondlife:///app/agent/{agent}/about")}else{"https://secondlife.com/".into()};out.push_str(&format!("<a href=\"{}\" rel=\"noopener noreferrer me\" title=\"Open {} in Second Life\" aria-label=\"Open {} in Second Life\"><img src=\"/vaak/second-life.svg\" alt=\"Second Life\" width=\"43\" height=\"34\" loading=\"lazy\"></a><span class=\"meta\">{}</span>",h(&url),h(name),h(name),h(name)));}
  if let Some(wow)=wow{let name=wow.get("character_name").and_then(Value::as_str).unwrap_or("World of Warcraft character");let realm=card::php_trim(s(wow,"realm"));let label=if realm.is_empty(){name.into()}else{format!("{name} · {realm}")};let portrait=card::php_trim(s(wow,"portrait_url"));let url=h(s(wow,"armory_url"));if portrait.is_empty(){out.push_str(&format!("<a class=\"btn btn-ghost\" href=\"{url}\" target=\"_blank\" rel=\"noopener noreferrer\">WoW Armory</a>"));}else{out.push_str(&format!("<a href=\"{url}\" target=\"_blank\" rel=\"noopener noreferrer\" title=\"Open {} Armory profile\" aria-label=\"Open {} Armory profile\"><img src=\"{}\" alt=\"World of Warcraft\" width=\"43\" height=\"34\" loading=\"lazy\" referrerpolicy=\"no-referrer\" style=\"object-fit:cover;border-radius:8px\"></a>",h(&label),h(&label),h(portrait)));}out.push_str(&format!("<span class=\"meta\">{}</span>",h(&label)));}
  out.push_str("</div>");out
 }
@@ -300,6 +300,35 @@ mod cache_fixture;
 #[cfg(test)]
 mod tests{
  use super::*;
+ fn blank_facts()->HeaderFacts{
+  HeaderFacts{
+   actor:String::new(),key:String::new(),profile:Value::Null,current_profile:Value::Null,owner:0,owner_actor:String::new(),csrf:String::new(),guest:false,is_own:false,
+   requested_tab:String::new(),effective_tab:String::new(),from:String::new(),blog_slug:String::new(),tab_href:String::new(),
+   following:false,follows_you:false,requested:false,locked:false,post_subscription:false,
+   moderation:ModerationContext{is_self:false,is_local:false,is_local_admin:false,is_wafrn:false,is_admin:false,personal_block_id:None,muted:false,deprioritized:false,global_kind:String::new(),global_id:0},
+   counts:HeaderCounts::default(),name:String::new(),bio:String::new(),avatar:None,banner:None,fallback_avatar:String::new(),
+   emoji:HashMap::new(),fields:vec![],badges:vec![],sl:None,wow:None,bridge:None,bsky_handle:String::new(),
+   pin_rows:vec![],featured_rows:vec![],blog_rows:vec![],blog_post:None,dependencies:Value::Null,
+  }
+ }
+ #[test]
+ fn second_life_icon_uses_shipped_svg(){
+  let icon="<img src=\"/vaak/second-life.svg\" alt=\"Second Life\" width=\"43\" height=\"34\" loading=\"lazy\">";
+  let asset=std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vaak/second-life.svg");
+  assert!(asset.is_file(),"shipped Second Life icon missing");
+  let mut linked=blank_facts();
+  linked.sl=Some(json!({"sl_username":"Ada Resident","sl_agent_id":"AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA"}));
+  let html=world_html(&linked);
+  assert!(html.contains(icon),"{html}");
+  assert!(html.contains("secondlife:///app/agent/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa/about"));
+  assert!(!html.contains("second-life.jpg")&&!html.contains("second-life.png"));
+  let mut fallback=blank_facts();
+  fallback.sl=Some(json!({"sl_username":"Bad Id","sl_agent_id":"not-a-uuid"}));
+  let html=world_html(&fallback);
+  assert!(html.contains(icon));
+  assert!(html.contains("https://secondlife.com/"));
+  assert!(!html.contains("second-life.jpg"));
+ }
  #[tokio::test]
  #[ignore="requires genuine PHP header current SQL corpus and isolated PostgreSQL"]
  async fn actual_local_header_pg_replay()->Result<()>{
