@@ -1,5 +1,6 @@
--- Local Phyrian clans. Apply as the PostgreSQL schema owner.
--- The game page does not create or alter tables on request.
+-- Local Phyrian clans. deploy/remote/migrate.php applies this file as the
+-- schema owner before the release goes live. Idempotent. The game page does
+-- not create or alter tables on request.
 CREATE TABLE IF NOT EXISTS phyrian_clans (
     id BIGSERIAL PRIMARY KEY,
     owner_user_id BIGINT NOT NULL UNIQUE,

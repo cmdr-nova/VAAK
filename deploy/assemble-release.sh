@@ -101,6 +101,7 @@ self_test() {
   [[ -f "${tmp}/out/vaak/index.php" ]]
   [[ -x "${tmp}/out/bin/vaak-worker" ]]
   [[ -f "${tmp}/out/migrate.php" ]]
+  [[ -f "${tmp}/out/api/migrations/20261014_phyrian_clans_postgres.sql" ]]
   [[ ! -e "${tmp}/out/docs" ]]
   echo "assemble_self_test_ok"
 }
