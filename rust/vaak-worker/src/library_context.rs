@@ -408,7 +408,11 @@ async fn admit_for_render_impl(db:&Client,session:&TrustedSession,statuses:Vec<V
         }
     }
     let incoming_sids=bound.iter().map(incoming_ap_boost_sid).collect::<Vec<_>>();
-    let hydrated = if session.return_view()=="bookmarks" {
+    // Each saved view has its own hydrator. The shared native-render switch
+    // stays off until activation; a favourites batch does not change bookmarks.
+    let hydrated = if session.return_view()=="favourites" {
+        super::source::hydrate_favourites(db, bound).await?
+    } else if session.return_view()=="bookmarks" {
         super::source::hydrate_bookmarks(db, bound).await?
     } else {
         super::source::hydrate(db, bound).await?
