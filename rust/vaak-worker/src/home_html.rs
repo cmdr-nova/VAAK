@@ -516,6 +516,28 @@ pub async fn tl_html_since(
 /// browser treats the boost as already on screen and drops the counter. The
 /// outer card's `data-sort` is the cursor the client is allowed to trust.
 fn stamp_poll_card(html: String, status: &serde_json::Value) -> String {
+    if let Some(boost_id) = poll_boost_id(status) {
+        let announce = status
+            .get("vaak_announce_event_id")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && *s != "0")
+            .map(str::to_string)
+            .or_else(|| {
+                status
+                    .get("vaak_announce_event_id")
+                    .and_then(|v| v.as_i64())
+                    .filter(|n| *n > 0)
+                    .map(|n| n.to_string())
+            })
+            .unwrap_or_default();
+        return crate::notif_embed::retarget_boost_card(
+            html,
+            &boost_id,
+            &announce,
+            timeline::status_created_ts(status),
+        );
+    }
     let Some(gt) = html.find("<article").and_then(|start| {
         html[start..].find('>').map(|rel| start + rel)
     }) else {
@@ -523,9 +545,6 @@ fn stamp_poll_card(html: String, status: &serde_json::Value) -> String {
     };
     let mut head = html[..gt].to_string();
     let rest = &html[gt..];
-    if let Some(boost_id) = poll_boost_id(status) {
-        head = rewrite_open_timeline_key(&head, &format!("boost:{boost_id}"));
-    }
     let ts = timeline::status_created_ts(status);
     if ts > 0 && !head.contains(" data-sort=\"") {
         head.push_str(&format!(" data-sort=\"{ts}\""));
@@ -543,8 +562,13 @@ fn poll_boost_id(status: &serde_json::Value) -> Option<String> {
     if !status.get("reblog").is_some_and(serde_json::Value::is_object) {
         return None;
     }
-    let id = status.get("id").and_then(|v| v.as_str()).unwrap_or("").trim().trim_end_matches('/');
-    if id.is_empty() { None } else { Some(id.to_string()) }
+    let id = status
+        .get("id")
+        .and_then(|v| v.as_str().map(|s| s.trim().trim_end_matches('/').to_string()).filter(|s| !s.is_empty()))
+        .or_else(|| status.get("id").and_then(|v| v.as_i64()).map(|n| n.to_string()))
+        .or_else(|| status.get("id").and_then(|v| v.as_u64()).map(|n| n.to_string()))
+        .unwrap_or_default();
+    if id.is_empty() { None } else { Some(id) }
 }
 
 fn content_is_empty(content: &str) -> bool {
@@ -559,19 +583,6 @@ fn content_is_empty(content: &str) -> bool {
         }
     }
     text.trim().is_empty()
-}
-
-fn rewrite_open_timeline_key(head: &str, key: &str) -> String {
-    let safe = key.replace(['"', '<', '>'], "");
-    let attr = format!(" data-timeline-key=\"{safe}\"");
-    if let Some(start) = head.find(" data-timeline-key=\"") {
-        let val_start = start + " data-timeline-key=\"".len();
-        if let Some(end_rel) = head[val_start..].find('"') {
-            let end = val_start + end_rel + 1;
-            return format!("{}{}{}", &head[..start], attr, &head[end..]);
-        }
-    }
-    format!("{head}{attr}")
 }
 
 #[cfg(test)]
@@ -644,6 +655,9 @@ mod tests {
         let head = &html[..open];
         assert!(head.contains("data-timeline-key=\"boost:boost-9\""), "{head}");
         assert!(!head.contains("data-timeline-key=\"inner1\""));
+        assert!(head.contains("data-status-id=\"boost-9\""), "{head}");
+        assert!(!head.contains("data-note-id="), "{head}");
+        assert!(!head.contains("data-status-id=\"inner1\""), "{head}");
         assert!(head.contains("data-sort=\"1791165460\""), "{head}");
         let plain = serde_json::json!({
             "id": "note-1",
@@ -652,10 +666,10 @@ mod tests {
             "uri": "https://example.com/users/a/statuses/1",
             "account": {"acct": "a", "display_name": "A", "uri": "https://example.com/users/a"}
         });
-        let note = super::stamp_poll_card(
-            "<article class=\"tweet\" data-timeline-key=\"note-1\"><p>hello</p></article>".to_string(),
-            &plain,
-        );
-        assert!(note.starts_with("<article class=\"tweet\" data-timeline-key=\"note-1\" data-sort=\"1791165428\">"));
+        let note = super::stamp_poll_card(paint_lean_feed_card(&plain), &plain);
+        assert!(note.contains("data-timeline-key=\"note-1\""), "{note}");
+        assert!(note.contains("data-status-id=\"note-1\""), "{note}");
+        assert!(note.contains("data-note-id=\"https://example.com/users/a/statuses/1\""), "{note}");
+        assert!(note.contains("data-sort=\"1791165428\""), "{note}");
     }
 }

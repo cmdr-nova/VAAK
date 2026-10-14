@@ -3642,6 +3642,111 @@ fn drop_leading_reply_bake_paragraph(html: &str) -> Option<String> {
     Some(rest.to_string())
 }
 
+fn json_id(value: &Value) -> String {
+    match value.get("id") {
+        Some(Value::String(s)) => {
+            let trimmed = s.trim().trim_end_matches('/');
+            if trimmed.is_empty() {
+                String::new()
+            } else {
+                trimmed.to_string()
+            }
+        }
+        Some(Value::Number(n)) => n.to_string(),
+        _ => String::new(),
+    }
+}
+
+fn announce_event_id(status: &Value) -> String {
+    match status.get("vaak_announce_event_id") {
+        Some(Value::String(s)) => {
+            let trimmed = s.trim().trim_end_matches('/');
+            if trimmed.is_empty() || trimmed == "0" {
+                String::new()
+            } else {
+                trimmed.to_string()
+            }
+        }
+        Some(Value::Number(n)) => {
+            let id = n.as_i64().unwrap_or(0);
+            if id > 0 {
+                id.to_string()
+            } else {
+                String::new()
+            }
+        }
+        _ => String::new(),
+    }
+}
+
+fn strip_open_attr(head: &str, name: &str) -> String {
+    let needle = format!(" {name}=\"");
+    let Some(start) = head.find(&needle) else {
+        return head.to_string();
+    };
+    let val_start = start + needle.len();
+    let Some(end_rel) = head[val_start..].find('"') else {
+        return head.to_string();
+    };
+    let end = val_start + end_rel + 1;
+    format!("{}{}", &head[..start], &head[end..])
+}
+
+fn rewrite_open_attr(head: &str, name: &str, value: &str) -> String {
+    let safe = value.replace(['"', '<', '>'], "");
+    let stripped = strip_open_attr(head, name);
+    if safe.is_empty() {
+        return stripped;
+    }
+    format!("{stripped} {name}=\"{safe}\"")
+}
+
+/// A boost card's identity is the boost, not the original post. PHP emits the
+/// same `boost:` key, status id, and announce id.
+pub(crate) fn retarget_boost_card(
+    html: String,
+    boost_id: &str,
+    announce_id: &str,
+    sort_ts: i64,
+) -> String {
+    let boost_id = boost_id.trim().trim_end_matches('/');
+    let announce_id = announce_id.trim().trim_end_matches('/');
+    if boost_id.is_empty() && announce_id.is_empty() {
+        return html;
+    }
+    let Some(start) = html.find("<article") else {
+        return html;
+    };
+    let Some(rel) = html[start..].find('>') else {
+        return html;
+    };
+    let gt = start + rel;
+    let key = if !boost_id.is_empty() {
+        format!("boost:{boost_id}")
+    } else {
+        format!("boost:{announce_id}")
+    };
+    let mut head = html[start..gt].to_string();
+    head = rewrite_open_attr(&head, "data-timeline-key", &key);
+    head = strip_open_attr(&head, "data-note-id");
+    if !boost_id.is_empty() {
+        head = rewrite_open_attr(&head, "data-status-id", boost_id);
+    } else {
+        head = strip_open_attr(&head, "data-status-id");
+    }
+    if !announce_id.is_empty() {
+        head = rewrite_open_attr(&head, "data-announce-id", announce_id);
+    }
+    if sort_ts > 0 {
+        head = rewrite_open_attr(&head, "data-sort", &sort_ts.to_string());
+    }
+    let mut out = String::with_capacity(html.len() + 32);
+    out.push_str(&html[..start]);
+    out.push_str(&head);
+    out.push_str(&html[gt..]);
+    out
+}
+
 /// Lean Mentions nest HTML — classes match PHP `notif-status-embed` chrome.
 /// Full post actions (reply, quote, boost, like, bookmark). Overflow needs a
 /// viewer actor; [`paint_lean_embed_from`] is the path that has one.
@@ -3766,15 +3871,33 @@ pub fn paint_lean_embed_from(
         }
         if uri.starts_with("at://") {
             article_attrs.push_str(&format!(" data-timeline-key=\"bsky:{}\"", esc(uri)));
-        } else if let Some(sid) = status.get("id").and_then(|v| v.as_str()).filter(|s| !s.is_empty())
-        {
-            article_attrs.push_str(&format!(" data-timeline-key=\"{}\"", esc(sid)));
-        } else if at.starts_with("at://") {
-            article_attrs.push_str(&format!(" data-timeline-key=\"bsky:{}\"", esc(&at)));
+        } else {
+            let sid = json_id(status);
+            if !sid.is_empty() {
+                article_attrs.push_str(&format!(" data-timeline-key=\"{}\"", esc(&sid)));
+            } else if at.starts_with("at://") {
+                article_attrs.push_str(&format!(" data-timeline-key=\"bsky:{}\"", esc(&at)));
+            }
         }
-    } else if let Some(sid) = status.get("id").and_then(|v| v.as_str()).filter(|s| !s.is_empty())
-    {
-        article_attrs.push_str(&format!(" data-timeline-key=\"{}\"", esc(sid)));
+    } else {
+        let sid = json_id(status);
+        if !sid.is_empty() {
+            article_attrs.push_str(&format!(" data-timeline-key=\"{}\"", esc(&sid)));
+        }
+    }
+    // The other painter may lead with the URI or the local id. Carry both so
+    // the browser can drop a poll row that is already on screen.
+    let sid = json_id(status);
+    if !sid.is_empty() && !article_attrs.contains(" data-status-id=\"") {
+        article_attrs.push_str(&format!(" data-status-id=\"{}\"", esc(&sid)));
+    }
+    let note_id = uri.trim().trim_end_matches('/');
+    if !note_id.is_empty() && !article_attrs.contains(" data-note-id=\"") {
+        article_attrs.push_str(&format!(" data-note-id=\"{}\"", esc(note_id)));
+    }
+    let sort_ts = crate::timeline::status_created_ts(status);
+    if sort_ts > 0 && !article_attrs.contains(" data-sort=\"") {
+        article_attrs.push_str(&format!(" data-sort=\"{sort_ts}\""));
     }
 
     let mut inner = String::new();
@@ -3994,6 +4117,9 @@ pub fn paint_lean_feed_card(status: &Value) -> String {
 pub fn paint_lean_feed_card_opts(status: &Value, from: &str, viewer_actor: &str) -> String {
     let from_q = if from.is_empty() { "home" } else { from };
     let mut st = status.clone();
+    let outer_id = json_id(&st);
+    let outer_announce = announce_event_id(&st);
+    let outer_sort = crate::timeline::status_created_ts(&st);
     let mut boost_header = String::new();
     let content_empty = {
         let c = st.get("content").and_then(|v| v.as_str()).unwrap_or("");
@@ -4076,7 +4202,7 @@ pub fn paint_lean_feed_card_opts(status: &Value, from: &str, viewer_actor: &str)
     } else {
         format!("<article class=\"tweet tweet-boost\">{article}</article>")
     };
-    if let Some(gt) = with_class.find('>') {
+    let boosted = if let Some(gt) = with_class.find('>') {
         let mut out = String::with_capacity(with_class.len() + boost_header.len());
         out.push_str(&with_class[..=gt]);
         out.push_str(&boost_header);
@@ -4084,7 +4210,8 @@ pub fn paint_lean_feed_card_opts(status: &Value, from: &str, viewer_actor: &str)
         out
     } else {
         format!("<article class=\"tweet tweet-boost\">{boost_header}{with_class}</article>")
-    }
+    };
+    retarget_boost_card(boosted, &outer_id, &outer_announce, outer_sort)
 }
 
 /// Minimal URL-encode for query values (uri / actor).

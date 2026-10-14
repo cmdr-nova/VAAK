@@ -243,6 +243,9 @@ fn copied_identity_attrs(painted: &str) -> String {
         "data-bsky-uri",
         "data-rss-item",
         "data-note-id",
+        "data-status-id",
+        "data-announce-id",
+        "data-sort",
     ] {
         if let Some(attr) = copy_attr(head, name) {
             out.push_str(&attr);
