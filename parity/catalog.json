@@ -76,6 +76,12 @@
       "area": "Profiles",
       "summary": "Remote ActivityPub profile header, relationship row, and tabs. PHP capture is api/bin/profile-remote-chrome-capture.php. Rust profile_remote paints the same chrome and does not open a database.",
       "php": {"script": "parity/php/profile-remote-chrome.php", "args": []}
+    },
+    {
+      "id": "profile-bsky-chrome",
+      "area": "Profiles",
+      "summary": "Bluesky profile header, relationship row, and tabs. PHP capture is api/bin/profile-bsky-chrome-capture.php. Rust profile_bsky_chrome paints the same chrome and does not open a database.",
+      "php": {"script": "parity/php/profile-bsky-chrome.php", "args": []}
     }
   ]
 }

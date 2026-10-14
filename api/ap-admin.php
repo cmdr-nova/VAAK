@@ -34643,6 +34643,71 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
                     'item_media' => count($rpTabItems['media'] ?? []),
                 ];
                 $rpLocalNative = ap_profile_native_render_remote($rpFacts);
+            } elseif (ap_profile_native_enabled()
+                && $rpIsBsky
+                && !$rpIsLocal
+                && empty($GLOBALS['vaak_guest_profile'])
+                && empty($rpContentBlocked)
+                && is_string($rpActor)
+                && ap_profile_native_bsky_actor(rtrim($rpActor, '/'))) {
+                $rpWhoName = (string) ((is_array($rpMeta) ? ($rpMeta['display_name'] ?? null) : null) ?: actor_handle($rpActor));
+                $rpWhoHtml = admin_emoji_html($rpWhoName, $rpActor);
+                $rpHandleText = $rpBskyHandle !== ''
+                    ? ('@' . $rpBskyHandle)
+                    : actor_handle($rpActor, is_array($rpMeta) ? ($rpMeta['username'] ?? null) : null);
+                $rpMenuOwner = (int) $vaakOwnerId;
+                $rpPersonalBlock = function_exists('ap_user_block_find')
+                    ? ap_user_block_find($rpActor, 'bsky.app', $rpMenuOwner)
+                    : null;
+                $rpBareSrc = null;
+                if (!is_string($rpAvatar) || $rpAvatar === '') {
+                    $rpBareSrc = admin_actor_avatar_url($rpActor);
+                }
+                $rpServerControl = (!empty($vaakIsAdmin) && function_exists('admin_global_actor_control'))
+                    ? admin_global_actor_control($rpActor)
+                    : null;
+                $rpFacts = [
+                    'actor' => rtrim($rpActor, '/'),
+                    'from' => (string) $rpFrom,
+                    'tab' => (string) $rpTab,
+                    'tab_href' => (string) ($rpTabHref ?? ''),
+                    'display_name' => (string) (is_array($rpMeta) ? ($rpMeta['display_name'] ?? '') : ''),
+                    'username' => (string) (is_array($rpMeta) ? ($rpMeta['username'] ?? '') : ''),
+                    'bsky_handle' => (string) $rpBskyHandle,
+                    'handle' => $rpHandleText,
+                    'bio' => (string) $rpBio,
+                    'avatar' => is_string($rpAvatar) && $rpAvatar !== '' ? $rpAvatar : null,
+                    'banner' => is_string($rpHeader) && $rpHeader !== '' ? $rpHeader : null,
+                    'fallback_avatar' => defined('AP_REMOTE_AVATAR_FALLBACK')
+                        ? AP_REMOTE_AVATAR_FALLBACK
+                        : 'https://mkultra.monster/img/avatar/default.jpg',
+                    'bare_src' => is_string($rpBareSrc) && $rpBareSrc !== '' ? $rpBareSrc : null,
+                    'display_html' => $rpWhoHtml,
+                    'is_own' => !empty($rpIsOwn),
+                    'following' => !empty($rpFollowing),
+                    'follows_you' => !empty($rpFollowsYou),
+                    'requested' => !empty($rpRequested),
+                    'locked' => !empty($rpLocked),
+                    'muted' => !empty($rpMuted),
+                    'blocked_personal' => !empty($rpBlockedPersonal),
+                    'blocked_server' => !empty($rpBlockedServer),
+                    'personal_block_id' => is_array($rpPersonalBlock) ? (int) ($rpPersonalBlock['id'] ?? 0) : null,
+                    'deprioritized' => function_exists('ap_is_deprioritized_actor') && ap_is_deprioritized_actor($rpActor, $rpMenuOwner),
+                    'target_is_admin' => function_exists('admin_is_local_admin_actor') && admin_is_local_admin_actor($rpActor),
+                    'viewer_is_admin' => !empty($vaakIsAdmin),
+                    'wafrn_known' => function_exists('ap_wafrn_actor_host_known') && ap_wafrn_actor_host_known($rpActor),
+                    'server_control' => is_array($rpServerControl) ? [
+                        'id' => (int) ($rpServerControl['id'] ?? 0),
+                        'kind' => (string) ($rpServerControl['kind'] ?? ''),
+                    ] : null,
+                    'csrf' => function_exists('ap_auth_csrf_token') ? (string) ap_auth_csrf_token() : '',
+                    'fields' => array_values(is_array($rpProfileFields) ? $rpProfileFields : []),
+                    'item_posts' => count($rpTabItems['posts'] ?? []),
+                    'item_replies' => count($rpTabItems['replies'] ?? []),
+                    'item_boosts' => count($rpTabItems['boosts'] ?? []),
+                    'item_media' => count($rpTabItems['media'] ?? []),
+                ];
+                $rpLocalNative = ap_profile_native_render_bsky($rpFacts);
             }
             if (is_array($rpLocalNative)) {
                 echo $rpLocalNative['page_back'];
