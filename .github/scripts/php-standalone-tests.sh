@@ -60,6 +60,7 @@ php_tests=(
   api/bin/phyrian-parity-smoke.php
   api/bin/phyrian-profile-card-smoke.php
   api/bin/phyrian-moments-smoke.php
+  api/bin/phyrian-clans-smoke.php
   api/bin/pin-federation-behavior-smoke.php
   api/bin/pluraldawn-decode-smoke.php
   api/bin/post-single-overflow-smoke.php
