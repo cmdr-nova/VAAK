@@ -27,6 +27,8 @@ if (!$vaakAdminLibOnly) {
 }
 
 require_once __DIR__ . '/ap-db.php';
+require_once __DIR__ . '/ap-timeline-cursor.php';
+require_once __DIR__ . '/ap-timeline-older.php';
 
 $vaakRequestStartedAt = microtime(true);
 register_shutdown_function(static function () use ($vaakRequestStartedAt): void {
@@ -7705,7 +7707,16 @@ if (
 ) {
     $fillLimit = max(1, min(40, (int) ($_GET['limit'] ?? $tlLimit)));
     $fillOffset = max(0, (int) ($_GET['offset'] ?? 0));
-    $axumFill = admin_tl_html_axum_fetch($view, $fillLimit, (int) $vaakOwnerId, $fillOffset);
+    $fillCursor = function_exists('vaak_tl_cursor_unpack')
+        ? vaak_tl_cursor_unpack(trim((string) ($_GET['max_id'] ?? '')))
+        : null;
+    $axumFill = admin_tl_html_axum_fetch(
+        $view,
+        $fillLimit,
+        (int) $vaakOwnerId,
+        $fillOffset,
+        $fillCursor !== null ? vaak_tl_cursor_pack($fillCursor) : ''
+    );
     if (is_array($axumFill) && (string) ($axumFill['html'] ?? '') !== '') {
         if (function_exists('ap_auth_session_write_close')) {
             ap_auth_session_write_close();
@@ -7713,16 +7724,24 @@ if (
             session_write_close();
         }
         $hasMore = !empty($axumFill['has_more']);
-        if ($adminTlFromCache && is_array($adminTlRankedCached)) {
-            $nextOff = (int) ($axumFill['next_offset'] ?? ($fillOffset + $fillLimit));
-            $hasMore = $hasMore || $nextOff < count($adminTlRankedCached);
+        // A warm head is not the end of stored posts. The first painted page
+        // stays scrollable; the keyset request is what discovers a real end.
+        if ($fillOffset === 0 && $fillCursor === null) {
+            $hasMore = true;
         }
         $nextOffset = (int) ($axumFill['next_offset'] ?? ($fillOffset + $fillLimit));
+        $nextCursor = (string) ($axumFill['next_cursor'] ?? '');
+        if ($nextCursor === '' && $adminTlFromCache && is_array($adminTlRankedCached) && $adminTlRankedCached !== []) {
+            $nextCursor = admin_tl_cursor_after_paint($adminTlRankedCached, max(1, $nextOffset));
+        }
         $tlCacheLabel = 'axum-' . $view . '-html';
         header('Content-Type: text/html; charset=utf-8');
         header('Cache-Control: no-store');
         header('X-Has-More: ' . ($hasMore ? '1' : '0'));
         header('X-Next-Offset: ' . (string) $nextOffset);
+        if ($nextCursor !== '') {
+            header('X-Next-Cursor: ' . $nextCursor);
+        }
         header('X-TL-Cache: ' . $tlCacheLabel);
         if ($view === 'home') {
             header('X-VAAK-Home-Html: 1');
@@ -7738,8 +7757,8 @@ if (
             ap_redis_unlock($adminTlStampedeLock);
             $adminTlStampedeLock = '';
         }
-        // Keep the next window warm so scroll page N+1 also hits Axum.
-        if ($hasMore) {
+        // Deep scroll reads stored rows. Do not spawn a hydrate worker per page.
+        if ($hasMore && $fillOffset === 0 && $fillCursor === null) {
             if ($view === 'home' && function_exists('ap_timeline_home_hydrate_warm_async')) {
                 ap_timeline_home_hydrate_warm_async((int) $vaakOwnerId, '15,40,50,80,160,240');
             } elseif ($view !== 'home' && function_exists('ap_timeline_public_hydrate_warm_async')) {
@@ -7749,13 +7768,22 @@ if (
         echo (string) $axumFill['html'];
         exit;
     }
-    // Miss (deep offset / cold envelope): prime deep warm heads for the next attempt.
-    if ($fillOffset > 0) {
-        if ($view === 'home' && function_exists('ap_timeline_home_hydrate_warm_async')) {
-            ap_timeline_home_hydrate_warm_async((int) $vaakOwnerId, '15,40,50,80,160,240');
-        } elseif ($view !== 'home' && function_exists('ap_timeline_public_hydrate_warm_async')) {
-            ap_timeline_public_hydrate_warm_async((int) $vaakOwnerId, $view, '15,40,50,80,160,240');
+    // Past the warm head: keyset already-stored posts. No worker, no remote fetch.
+    if ($fillOffset > 0 || $fillCursor !== null) {
+        $olderCursor = $fillCursor;
+        if ($olderCursor === null && is_array($adminTlRankedCached) && $adminTlRankedCached !== []) {
+            $olderCursor = vaak_tl_cursor_unpack(admin_tl_cursor_after_paint($adminTlRankedCached, max(1, $fillOffset)));
         }
+        $olderPage = admin_tl_older_page(
+            $view,
+            $olderCursor,
+            $fillLimit,
+            (int) $vaakOwnerId,
+            (string) ($vaakActorId ?? ''),
+            is_array($adminTlRankedCached) ? $adminTlRankedCached : []
+        );
+        admin_tl_echo_older_partial($view, $olderPage, $followingIds, $fillOffset + $fillLimit);
+        exit;
     }
 }
 
@@ -7824,6 +7852,7 @@ if (
     $shellBody = '';
     $shellHasMore = true;
     $shellNext = $shellLimit;
+    $shellCursor = '';
     $shellCache = 'miss';
     $shellFragmentKey = 'vaak:fragment:tl-shell:v1:' . (int) $vaakOwnerId . ':'
         . $view . ':' . $shellLimit . ':' . substr(hash('sha256', $adminTlCacheKey), 0, 16);
@@ -7835,6 +7864,9 @@ if (
             header('X-VAAK-View: ' . $view);
             header('X-Has-More: ' . (!empty($cachedShell['has_more']) ? '1' : '0'));
             header('X-Next-Offset: ' . (int) ($cachedShell['next'] ?? $shellLimit));
+            if (!empty($cachedShell['next_cursor'])) {
+                header('X-Next-Cursor: ' . (string) $cachedShell['next_cursor']);
+            }
             header('X-TL-Cache: shell');
             echo $cachedShell['html'];
             exit;
@@ -7868,11 +7900,10 @@ if (
         if (is_array($axumHtml) && (string) ($axumHtml['html'] ?? '') !== '') {
             $shellBody = (string) $axumHtml['html'];
             $shellAxumHit = true;
-            $shellHasMore = !empty($axumHtml['has_more']);
-            if ($adminTlFromCache && is_array($adminTlRankedCached)) {
-                $shellHasMore = count($adminTlRankedCached) > $shellLimit;
-            }
+            // The warm envelope is the head, not the stored history.
+            $shellHasMore = $shellBody !== '';
             $shellNext = max($shellLimit, (int) ($axumHtml['next_offset'] ?? $shellLimit));
+            $shellCursor = (string) ($axumHtml['next_cursor'] ?? '');
             $shellCache = 'axum-' . $view . '-html';
             if ($view === 'home') {
                 header('X-VAAK-Home-Html: 1');
@@ -7920,9 +7951,6 @@ if (
             if ($shellBody !== '') {
                 $shellAxumHit = true;
                 $shellHasMore = true;
-                if ($adminTlFromCache && is_array($adminTlRankedCached)) {
-                    $shellHasMore = count($adminTlRankedCached) > $shellLimit;
-                }
                 $shellNext = $shellLimit;
                 $shellCache = 'axum-shadow';
             }
@@ -7950,12 +7978,9 @@ if (
             admin_render_timeline_item($item, $followingIds, $view);
         }
         $shellBody = (string) ob_get_clean();
-        // Ranked length alone drives paging. Empty first paint still needs
-        // hasMore=1 so the client fill path can run (mutes/stale keys).
-        $shellHasMore = count($adminTlRankedCached) > $shellLimit;
-        if ($shellBody === '') {
-            $shellHasMore = true;
-        }
+        // Empty first paint still needs hasMore=1 so the client fill path can
+        // run. A short ranked cache is not the end of stored posts.
+        $shellHasMore = true;
         $shellNext = $shellLimit;
         $shellCache = 'hit';
     } elseif (!$shellAxumHit) {
@@ -7978,8 +8003,14 @@ if (
     header('Content-Type: text/html; charset=utf-8');
     header('Cache-Control: no-store');
     header('X-VAAK-View: ' . $view);
+    if ($shellCursor === '' && is_array($adminTlRankedCached) && $adminTlRankedCached !== []) {
+        $shellCursor = admin_tl_cursor_after_paint($adminTlRankedCached, max(1, (int) $shellNext));
+    }
     header('X-Has-More: ' . ($shellHasMore ? '1' : '0'));
     header('X-Next-Offset: ' . (int) $shellNext);
+    if ($shellCursor !== '') {
+        header('X-Next-Cursor: ' . $shellCursor);
+    }
     header('X-TL-Cache: ' . $shellCache);
     $shellTitles = ['home' => 'Home', 'local' => 'Local', 'feed' => 'Federation feed'];
     $title = $shellTitles[$view] ?? $view;
@@ -8001,6 +8032,7 @@ if (
     // client stable-key filter removes already-visible cards.
     echo '<div id="timeline-items" data-view="' . h($view) . '" data-offset="' . (int) $shellNext
         . '" data-limit="' . (int) $shellLimit . '" data-has-more="' . ($shellHasMore ? '1' : '0')
+        . '" data-before="' . h($shellCursor)
         . '" data-newest="' . (int) max(0, time() - 300) . '" data-needs-fill="' . ($shellBody === '' ? '1' : '0') . '">';
     echo $shellBody;
     echo '</div>';
@@ -8017,6 +8049,7 @@ if (
             'html' => $shellHtml,
             'has_more' => $shellHasMore,
             'next' => $shellNext,
+            'next_cursor' => $shellCursor,
         ], 5);
     }
     echo $shellHtml;
@@ -11711,11 +11744,7 @@ if (
             } else {
                 $adminTlAxumHtml = $axumTlHtml;
             }
-            if ($adminTlFromCache && is_array($adminTlRankedCached)) {
-                $adminTlCachedHasMore = count($adminTlRankedCached) > $tlLimit;
-            } else {
-                $adminTlCachedHasMore = !empty($axumTlHtml['has_more']);
-            }
+            $adminTlCachedHasMore = true;
             if (function_exists('ap_timing_record')) {
                 ap_timing_record($view . '.first_paint.axum_html_hit', (microtime(true) - $adminHomeFirstPaintStarted) * 1000.0);
             }
@@ -22828,6 +22857,9 @@ if ($isPartial && in_array($view, ['home', 'feed', 'local'], true)) {
             header('Cache-Control: no-store');
             header('X-Has-More: ' . (!empty($fragCached['has_more']) ? '1' : '0'));
             header('X-Next-Offset: ' . (string) (int) ($fragCached['next_offset'] ?? $tlLimit));
+            if (!empty($fragCached['next_cursor'])) {
+                header('X-Next-Cursor: ' . (string) $fragCached['next_cursor']);
+            }
             header('X-TL-Cache: fragment');
             header('X-TL-Hydrate-Ms: 0');
             header('X-TL-Flags-Ms: 0');
@@ -22938,6 +22970,13 @@ if ($isPartial && in_array($view, ['home', 'feed', 'local'], true)) {
         admin_render_timeline_item($item, $followingIds, $view);
     }
     $body = ob_get_clean();
+    $olderNextCursor = '';
+    if (in_array($view, ['home', 'local', 'feed'], true) && trim($body) !== '') {
+        $hasMore = true;
+        if (is_array($adminTlRankedCached) && $adminTlRankedCached !== []) {
+            $olderNextCursor = admin_tl_cursor_after_paint($adminTlRankedCached, max(1, (int) $nextOffset));
+        }
+    }
     $adminTlPerfRenderMs = (microtime(true) - $renderT0) * 1000.0;
     $adminTlPerfTotalMs = (microtime(true) - $adminTlPerfT0) * 1000.0;
     if (function_exists('ap_timing_record')) {
@@ -22948,6 +22987,7 @@ if ($isPartial && in_array($view, ['home', 'feed', 'local'], true)) {
             'html' => $body,
             'has_more' => $hasMore ? 1 : 0,
             'next_offset' => $nextOffset,
+            'next_cursor' => $olderNextCursor,
             'ts' => time(),
         ], 25);
     }
@@ -22955,6 +22995,9 @@ if ($isPartial && in_array($view, ['home', 'feed', 'local'], true)) {
     header('Cache-Control: no-store');
     header('X-Has-More: ' . ($hasMore ? '1' : '0'));
     header('X-Next-Offset: ' . $nextOffset);
+    if ($olderNextCursor !== '') {
+        header('X-Next-Cursor: ' . $olderNextCursor);
+    }
     header('X-TL-Cache: ' . ($adminTlFromCache ? 'hit' : 'miss'));
     header('X-TL-Hydrate-Ms: ' . (string) (int) round($adminTlPerfHydrateMs));
     header('X-TL-Flags-Ms: ' . (string) (int) round($adminTlPerfFlagsMs));
@@ -24667,9 +24710,9 @@ function admin_profile_html_axum_fetch(
  * Flags: VAAK_HOME_HTML_AXUM (home), VAAK_LOCAL_FEED_HTML_AXUM (local+feed). Default on.
  *
  * @param 'home'|'local'|'feed' $view
- * @return array{html:string,has_more:bool,next_offset:int,source:string,ms:int,view:string}|null
+ * @return array{html:string,has_more:bool,next_offset:int,next_cursor:string,source:string,ms:int,view:string}|null
  */
-function admin_tl_html_axum_fetch(string $view, int $limit, int $ownerUserId = 0, int $offset = 0): ?array
+function admin_tl_html_axum_fetch(string $view, int $limit, int $ownerUserId = 0, int $offset = 0, string $maxId = ''): ?array
 {
     $view = strtolower(trim($view));
     if (!in_array($view, ['home', 'local', 'feed'], true)) {
@@ -24708,6 +24751,10 @@ function admin_tl_html_axum_fetch(string $view, int $limit, int $ownerUserId = 0
     ];
     if ($offset > 0) {
         $query['offset'] = $offset;
+    }
+    $maxId = trim($maxId);
+    if ($maxId !== '') {
+        $query['max_id'] = $maxId;
     }
     $path = match ($view) {
         'local' => '/shadow/local-html',
@@ -24757,6 +24804,7 @@ function admin_tl_html_axum_fetch(string $view, int $limit, int $ownerUserId = 0
         'html' => $body,
         'has_more' => (($hdrs['x-has-more'] ?? '') === '1'),
         'next_offset' => max(0, (int) ($hdrs['x-next-offset'] ?? ($offset + $limit))),
+        'next_cursor' => (string) ($hdrs['x-next-cursor'] ?? ''),
         'newest' => max(0, (int) ($hdrs['x-newest'] ?? 0)),
         'source' => (string) ($hdrs['x-vaak-tl-source'] ?? ('axum-' . $view . '-html')),
         'newest' => max(0, (int) ($hdrs['x-newest'] ?? 0)),
@@ -29087,6 +29135,9 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
           } elseif ($homeFromAxum) {
               $homeHasMore = !empty($adminTlCachedHasMore) || count($adminHomeAxumStatuses) >= $tlLimit;
           }
+          if ($homeFromAxumHtml || $homeFromAxum || $homePage !== []) {
+              $homeHasMore = true;
+          }
           $homeNeedsFill = !$homeFromAxumHtml && !$homeFromAxum && (
               !empty($adminTlFullPageDefer) || ($homePage === [] && $homeHasMore)
           );
@@ -29158,6 +29209,13 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
           $homeTlCacheAttr = $homeFromAxumHtml
               ? 'axum-home-html'
               : ($homeFromAxum ? 'axum-shadow' : '');
+          $homeBefore = '';
+          if (is_array($adminTlRankedCached) && $adminTlRankedCached !== []) {
+              $homeBefore = admin_tl_cursor_after_paint($adminTlRankedCached, max(1, (int) $homePaintCount));
+          }
+          if ($homeBefore === '' && $homeFromAxumHtml) {
+              $homeBefore = (string) ($adminHomeAxumHtml['next_cursor'] ?? '');
+          }
         ?>
         <?php if (!empty($homeOnboard['active'])): ?>
           <div class="home-onboarding" role="status">
@@ -29181,7 +29239,7 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
         <?php if (!$homeFromAxumHtml && !$homeFromAxum && !$homeTimeline && empty($adminTlFullPageDefer)): ?>
           <div class="mascot-empty"><img src="/api/assets/mascot/vaak-neutral.png" alt=""><span>Nothing here yet. Follow people, <a href="?view=tags">follow hashtags</a>, or hit ＋ to post.</span></div>
         <?php endif; ?>
-        <div id="timeline-items" data-view="home" data-offset="<?= $homeNeedsFill ? '0' : (int) $homePaintCount ?>" data-limit="<?= (int) $tlLimit ?>" data-has-more="<?= $homeHasMore ? '1' : '0' ?>" data-newest="<?= (int) $homeNewest ?>"<?= $homeNeedsFill ? ' data-needs-fill="1"' : '' ?><?= $homeTlCacheAttr !== '' ? ' data-tl-cache="' . h($homeTlCacheAttr) . '"' : '' ?>>
+        <div id="timeline-items" data-view="home" data-offset="<?= $homeNeedsFill ? '0' : (int) $homePaintCount ?>" data-limit="<?= (int) $tlLimit ?>" data-has-more="<?= $homeHasMore ? '1' : '0' ?>" data-before="<?= h($homeBefore) ?>" data-newest="<?= (int) $homeNewest ?>"<?= $homeNeedsFill ? ' data-needs-fill="1"' : '' ?><?= $homeTlCacheAttr !== '' ? ' data-tl-cache="' . h($homeTlCacheAttr) . '"' : '' ?>>
           <?php if ($homeFromAxumHtml): ?>
             <?= $adminHomeAxumHtml['html'] ?>
             <?php if (empty($homeOnboard['active'])): ?>
@@ -29238,6 +29296,9 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
           if ($localFromAxumHtml) {
               $localHasMore = !empty($adminTlCachedHasMore) || !empty($adminTlAxumHtml['has_more']);
           }
+          if ($localFromAxumHtml || $localPage !== []) {
+              $localHasMore = true;
+          }
           $localNeedsFill = !$localFromAxumHtml && (!empty($adminTlFullPageDefer) || ($localPage === [] && $localHasMore));
           if ($localNeedsFill) {
               $localHasMore = true;
@@ -29246,6 +29307,13 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
               ? (int) ($adminTlAxumHtml['next_offset'] ?? $tlLimit)
               : count($localPage);
           $localTlCacheAttr = $localFromAxumHtml ? 'axum-local-html' : '';
+          $localBefore = '';
+          if (is_array($adminTlRankedCached) && $adminTlRankedCached !== []) {
+              $localBefore = admin_tl_cursor_after_paint($adminTlRankedCached, max(1, (int) $localPaintCount));
+          }
+          if ($localBefore === '' && $localFromAxumHtml) {
+              $localBefore = (string) ($adminTlAxumHtml['next_cursor'] ?? '');
+          }
           if (!$localFromAxumHtml && function_exists('ap_masto_status_flags_prefetch')) {
               ap_masto_status_flags_prefetch(admin_timeline_status_ids($localPage));
           }
@@ -29253,7 +29321,7 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
         <?php if (!$localFromAxumHtml && !$localTimeline && empty($adminTlFullPageDefer)): ?>
           <?= admin_mascot_empty('No local posts yet. When anyone on this instance posts, it shows up here.') ?>
         <?php endif; ?>
-        <div id="timeline-items" data-view="local" data-offset="<?= $localNeedsFill ? '0' : (int) $localPaintCount ?>" data-limit="<?= (int) $tlLimit ?>" data-has-more="<?= $localHasMore ? '1' : '0' ?>" data-newest="<?= (int) admin_tl_poll_since_cursor((int) ($localPage[0]['sort'] ?? 0), (int) ($adminTlAxumHtml['newest'] ?? 0), $localFromAxumHtml) ?>"<?= $localNeedsFill ? ' data-needs-fill="1"' : '' ?><?= $localTlCacheAttr !== '' ? ' data-tl-cache="' . h($localTlCacheAttr) . '"' : '' ?>>
+        <div id="timeline-items" data-view="local" data-offset="<?= $localNeedsFill ? '0' : (int) $localPaintCount ?>" data-limit="<?= (int) $tlLimit ?>" data-has-more="<?= $localHasMore ? '1' : '0' ?>" data-before="<?= h($localBefore) ?>" data-newest="<?= (int) admin_tl_poll_since_cursor((int) ($localPage[0]['sort'] ?? 0), (int) ($adminTlAxumHtml['newest'] ?? 0), $localFromAxumHtml) ?>"<?= $localNeedsFill ? ' data-needs-fill="1"' : '' ?><?= $localTlCacheAttr !== '' ? ' data-tl-cache="' . h($localTlCacheAttr) . '"' : '' ?>>
           <?php if ($localFromAxumHtml): ?>
             <?= $adminTlAxumHtml['html'] ?>
           <?php else: ?>
@@ -29281,6 +29349,9 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
           if ($feedFromAxumHtml) {
               $feedHasMore = !empty($adminTlCachedHasMore) || !empty($adminTlAxumHtml['has_more']);
           }
+          if ($feedFromAxumHtml || $feedPage !== []) {
+              $feedHasMore = true;
+          }
           $feedNeedsFill = !$feedFromAxumHtml && (!empty($adminTlFullPageDefer) || ($feedPage === [] && $feedHasMore));
           if ($feedNeedsFill) {
               $feedHasMore = true;
@@ -29289,12 +29360,19 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
               ? (int) ($adminTlAxumHtml['next_offset'] ?? $tlLimit)
               : count($feedPage);
           $feedTlCacheAttr = $feedFromAxumHtml ? 'axum-feed-html' : '';
+          $feedBefore = '';
+          if (is_array($adminTlRankedCached) && $adminTlRankedCached !== []) {
+              $feedBefore = admin_tl_cursor_after_paint($adminTlRankedCached, max(1, (int) $feedPaintCount));
+          }
+          if ($feedBefore === '' && $feedFromAxumHtml) {
+              $feedBefore = (string) ($adminTlAxumHtml['next_cursor'] ?? '');
+          }
           if (!$feedFromAxumHtml && function_exists('ap_masto_status_flags_prefetch')) {
               ap_masto_status_flags_prefetch(admin_timeline_status_ids($feedPage));
           }
         ?>
         <?php if (!$feedFromAxumHtml && !$feedTimeline && empty($adminTlFullPageDefer)): ?><?= admin_mascot_empty('No federation events yet.') ?><?php endif; ?>
-        <div id="timeline-items" data-view="feed" data-offset="<?= $feedNeedsFill ? '0' : (int) $feedPaintCount ?>" data-limit="<?= (int) $tlLimit ?>" data-has-more="<?= $feedHasMore ? '1' : '0' ?>" data-newest="<?= (int) admin_tl_poll_since_cursor((int) ($feedPage[0]['sort'] ?? 0), (int) ($adminTlAxumHtml['newest'] ?? 0), $feedFromAxumHtml) ?>"<?= $feedNeedsFill ? ' data-needs-fill="1"' : '' ?><?= $feedTlCacheAttr !== '' ? ' data-tl-cache="' . h($feedTlCacheAttr) . '"' : '' ?>>
+        <div id="timeline-items" data-view="feed" data-offset="<?= $feedNeedsFill ? '0' : (int) $feedPaintCount ?>" data-limit="<?= (int) $tlLimit ?>" data-has-more="<?= $feedHasMore ? '1' : '0' ?>" data-before="<?= h($feedBefore) ?>" data-newest="<?= (int) admin_tl_poll_since_cursor((int) ($feedPage[0]['sort'] ?? 0), (int) ($adminTlAxumHtml['newest'] ?? 0), $feedFromAxumHtml) ?>"<?= $feedNeedsFill ? ' data-needs-fill="1"' : '' ?><?= $feedTlCacheAttr !== '' ? ' data-tl-cache="' . h($feedTlCacheAttr) . '"' : '' ?>>
           <?php if ($feedFromAxumHtml): ?>
             <?= $adminTlAxumHtml['html'] ?>
           <?php else: ?>
@@ -39105,6 +39183,7 @@ window.vaakBootStatusThread();
   }
   let offset = parseInt(items.dataset.offset || '0', 10);
   let limit = parseInt(items.dataset.limit || '15', 10);
+  let tlBefore = (items && items.dataset && items.dataset.before) ? String(items.dataset.before) : '';
   let notifMaxId = items.dataset.maxId || '';
   let notifFilter = items.dataset.filter || 'all';
   let bskyCursor = items.dataset.cursor || '';
@@ -39641,6 +39720,9 @@ window.vaakBootStatusThread();
           const requestOffset = offset;
           url = '?view=' + encodeURIComponent(viewName)
             + '&partial=1&offset=' + requestOffset + '&limit=' + limit;
+          if (['home', 'local', 'feed'].includes(viewName) && tlBefore) {
+            url += '&max_id=' + encodeURIComponent(tlBefore);
+          }
           if (viewName === 'remote_profile') {
             url += '&actor=' + encodeURIComponent(items.dataset.actor || '')
               + '&tab=' + encodeURIComponent(items.dataset.tab || 'posts');
@@ -39686,6 +39768,17 @@ window.vaakBootStatusThread();
           // Guard against a broken cursor causing a tight request loop.
           offset = next > requestOffset ? next : requestOffset + limit;
           items.dataset.offset = String(offset);
+          if (['home', 'local', 'feed'].includes(viewName)) {
+            const nextCur = res.headers.get('X-Next-Cursor') || '';
+            if (nextCur) {
+              if (tlBefore && nextCur === tlBefore) {
+                hasMore = false;
+              } else {
+                tlBefore = nextCur;
+              }
+            }
+            items.dataset.before = tlBefore;
+          }
         }
         if (html.trim()) {
           // Ranked windows can change between the initial paint and an
@@ -39761,10 +39854,12 @@ window.vaakBootStatusThread();
 
   // Full-page account switch / cold shell: needs-fill must run even when
   // soft-nav boot did not (hard navigation after switch_account).
-  if (items && items.dataset.needsFill === '1') {
+    if (items && items.dataset.needsFill === '1') {
     items.dataset.needsFill = '0';
     offset = 0;
     items.dataset.offset = '0';
+    tlBefore = '';
+    items.dataset.before = '';
     hasMore = true;
     items.dataset.hasMore = '1';
     setTimeout(function () { try { loadMore(); } catch (e) {} }, 0);
@@ -40348,6 +40443,8 @@ window.vaakBootStatusThread();
       items.dataset.view = nextView;
       items.dataset.offset = String(offset);
       items.dataset.hasMore = hasMore ? '1' : '0';
+      tlBefore = res.headers.get('X-Next-Cursor') || '';
+      items.dataset.before = tlBefore;
       // The server's watermark is authoritative.  Resetting this to the
       // browser clock after a soft navigation made the Home poller skip the
       // posts that arrived while another page was open.
@@ -40365,6 +40462,8 @@ window.vaakBootStatusThread();
         items.dataset.needsFill = '0';
         offset = 0;
         items.dataset.offset = '0';
+        tlBefore = '';
+        items.dataset.before = '';
         items.dataset.hasMore = '1';
         if (status) status.textContent = 'Loading timeline…';
         setTimeout(function () { try { loadMore(); } catch (e) {} }, 0);
@@ -40493,6 +40592,7 @@ window.vaakBootStatusThread();
     syncTimelineKindFlags();
     offset = parseInt(items.dataset.offset || '0', 10) || 0;
     limit = parseInt(items.dataset.limit || '15', 10) || 15;
+    tlBefore = items.dataset.before ? String(items.dataset.before) : '';
     hasMore = items.dataset.hasMore === '1';
     newestTs = parseInt(items.dataset.newest || '0', 10) || Math.floor(Date.now() / 1000);
     loading = false;
@@ -40525,6 +40625,8 @@ window.vaakBootStatusThread();
       items.dataset.needsFill = '0';
       offset = 0;
       items.dataset.offset = '0';
+      tlBefore = '';
+      items.dataset.before = '';
       hasMore = true;
       items.dataset.hasMore = '1';
       setTimeout(function () { try { loadMore(); } catch (e) {} }, 0);

@@ -564,10 +564,11 @@ async fn shadow_tl_html(
             "home html cache miss",
         ),
     };
+    let before = q.max_id.as_deref().map(str::trim).filter(|s| !s.is_empty());
     let filled = if view == "home" {
-        crate::home_html::home_html_fill(&state.cfg, owner, limit, offset).await
+        crate::home_html::home_html_fill(&state.cfg, owner, limit, offset, before).await
     } else {
-        crate::home_html::tl_html_fill(&state.cfg, owner, view, limit, offset).await
+        crate::home_html::tl_html_fill(&state.cfg, owner, view, limit, offset, before).await
     };
     match filled {
         Ok(Some(report)) => {
@@ -586,6 +587,11 @@ async fn shadow_tl_html(
             );
             if let Ok(v) = axum::http::HeaderValue::from_str(&report.next_offset.to_string()) {
                 headers.insert(axum::http::HeaderName::from_static("x-next-offset"), v);
+            }
+            if !report.next_cursor.is_empty() {
+                if let Ok(v) = axum::http::HeaderValue::from_str(&report.next_cursor) {
+                    headers.insert(axum::http::HeaderName::from_static("x-next-cursor"), v);
+                }
             }
             if let Ok(v) = axum::http::HeaderValue::from_str(&report.source) {
                 headers.insert(axum::http::HeaderName::from_static("x-vaak-tl-source"), v);

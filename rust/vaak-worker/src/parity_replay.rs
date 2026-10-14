@@ -54,6 +54,7 @@ fn produce(producer: &str, cases: &[InputCase]) -> Result<Vec<Value>> {
             "follow-fallback" => follow_fallback(&case.input)?,
             "profile-local-chrome" => profile_local_chrome(&case.input)?,
             "profile-remote-chrome" => profile_remote_chrome(&case.input)?,
+            "timeline-cursor" => timeline_cursor(&case.input)?,
             other => bail!("unknown producer {other}"),
         };
         Ok(json!({"id": case.id, "output": output}))
@@ -275,6 +276,78 @@ fn profile_local_chrome(input: &Value) -> Result<Value> {
 fn profile_remote_chrome(input: &Value) -> Result<Value> {
     let painted = crate::profile_remote::paint_remote(input).map_err(anyhow::Error::msg)?;
     Ok(json!({"chrome": painted.chrome, "secondary": painted.secondary}))
+}
+
+fn timeline_cursor(input: &Value) -> Result<Value> {
+    use crate::timeline_cursor::{self, TlCursor, TlRow};
+    let op = input.get("op").and_then(Value::as_str).unwrap_or("");
+    match op {
+        "pack" => {
+            let Some(cursor) = input.get("cursor").filter(|v| !v.is_null()) else {
+                return Ok(Value::String(String::new()));
+            };
+            let cursor = TlCursor {
+                at: cursor.get("at").and_then(Value::as_str).unwrap_or("").to_string(),
+                source: cursor.get("source").and_then(Value::as_str).unwrap_or("").to_string(),
+                id: cursor.get("id").and_then(Value::as_str).unwrap_or("").to_string(),
+            };
+            Ok(Value::String(timeline_cursor::pack(&cursor)))
+        }
+        "unpack" => {
+            let token = input.get("token").and_then(Value::as_str).unwrap_or("");
+            Ok(match timeline_cursor::unpack(token) {
+                Some(cursor) => json!({"at": cursor.at, "source": cursor.source, "id": cursor.id}),
+                None => Value::Null,
+            })
+        }
+        "older" => {
+            let token = input.get("cursor").and_then(Value::as_str).unwrap_or("");
+            let cursor = timeline_cursor::unpack(token);
+            let row = input.get("row").cloned().unwrap_or(Value::Null);
+            Ok(Value::Bool(timeline_cursor::is_older(
+                row.get("at").and_then(Value::as_str).unwrap_or(""),
+                row.get("source").and_then(Value::as_str).unwrap_or(""),
+                row.get("id").and_then(Value::as_str).unwrap_or(""),
+                cursor.as_ref(),
+            )))
+        }
+        "bound" => {
+            let token = input.get("cursor").and_then(Value::as_str).unwrap_or("");
+            let cursor = timeline_cursor::unpack(token);
+            let source = input.get("source").and_then(Value::as_str).unwrap_or("");
+            let bound = timeline_cursor::source_bound(cursor.as_ref(), source);
+            Ok(json!({"op": bound.op, "at": bound.at, "id": bound.id}))
+        }
+        "collect" => {
+            let rows = input.get("rows").and_then(Value::as_array).cloned().unwrap_or_default();
+            let stored: Vec<TlRow> = rows
+                .iter()
+                .map(|row| TlRow {
+                    at: row.get("at").and_then(Value::as_str).unwrap_or("").to_string(),
+                    source: row.get("source").and_then(Value::as_str).unwrap_or("").to_string(),
+                    id: row.get("id").and_then(Value::as_str).unwrap_or("").to_string(),
+                    keep: row.get("keep").and_then(Value::as_bool).unwrap_or(false),
+                })
+                .collect();
+            let fetch = input.get("fetch").and_then(Value::as_u64).unwrap_or(10) as usize;
+            let limit = input.get("limit").and_then(Value::as_u64).unwrap_or(1) as usize;
+            let max_windows = input.get("max_windows").and_then(Value::as_u64).unwrap_or(5) as usize;
+            let page = timeline_cursor::collect(
+                |cursor| timeline_cursor::memory_window(&stored, cursor, fetch),
+                None,
+                limit,
+                max_windows,
+            );
+            let ids: Vec<String> = page.kept.iter().map(|row| row.id.clone()).collect();
+            Ok(json!({
+                "ids": ids,
+                "has_more": page.has_more,
+                "windows": page.windows,
+                "next": page.next.as_ref().map(timeline_cursor::pack).unwrap_or_default(),
+            }))
+        }
+        other => bail!("unsupported timeline cursor op {other}"),
+    }
 }
 
 fn settings_fields(id: &str) -> Result<Value> {
