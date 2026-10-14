@@ -21570,8 +21570,14 @@ function admin_bsky_thread_target_uri(string $object): ?string
     if($rkey==='.'||$rkey==='..')return null;
     if(str_starts_with($actor,'did:'))$did=$actor;
     else{
-        $q=ap_db()->prepare("SELECT bsky_uri FROM bsky_posts WHERE lower(author_handle)=lower(?) AND bsky_uri LIKE ? ESCAPE '\\' LIMIT 2");
-        $q->execute([$actor,'%/app.bsky.feed.post/'.admin_bsky_thread_like_literal($rkey)]);$matches=$q->fetchAll(PDO::FETCH_COLUMN);
+        if(ap_db()->getAttribute(PDO::ATTR_DRIVER_NAME)==='pgsql'){
+            $q=ap_db()->prepare("SELECT bsky_uri FROM bsky_posts WHERE split_part(bsky_uri, '/app.bsky.feed.post/', 2) = ? AND lower(author_handle)=lower(?) LIMIT 2");
+            $q->execute([$rkey,$actor]);
+        }else{
+            $q=ap_db()->prepare("SELECT bsky_uri FROM bsky_posts WHERE lower(author_handle)=lower(?) AND bsky_uri LIKE ? ESCAPE '\\' LIMIT 2");
+            $q->execute([$actor,'%/app.bsky.feed.post/'.admin_bsky_thread_like_literal($rkey)]);
+        }
+        $matches=$q->fetchAll(PDO::FETCH_COLUMN);
         if(count($matches)===1)return admin_bsky_thread_extract_at((string)$matches[0]);
         $r=ap_bsky_xrpc(AP_BSKY_PUBLIC_API,'com.atproto.identity.resolveHandle','GET',['handle'=>$actor],null,null,4);
         $did=!empty($r['ok'])?($r['json']['did']??null):null;

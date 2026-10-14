@@ -192,3 +192,23 @@ async fn fetch_appview_media(
     let s = post.to_string().to_ascii_lowercase();
     Ok((s.contains("fullsize"), s.contains("playlist")))
 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn thin_scans_match_the_embed_partial_index() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        for rel in [
+            "src/thin_media.rs",
+            "src/thin_media_warm.rs",
+            "src/jetstream/mod.rs",
+        ] {
+            let src = std::fs::read_to_string(root.join(rel)).unwrap_or_else(|e| panic!("{rel}: {e}"));
+            assert!(src.contains("embed_json IS NOT NULL"), "{rel}");
+            assert!(
+                src.contains("ORDER BY indexed_at DESC NULLS LAST"),
+                "{rel}"
+            );
+        }
+    }
+}

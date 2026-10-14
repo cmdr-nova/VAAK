@@ -2632,6 +2632,30 @@ pub(crate) async fn fetch_bsky_map(db: &Client, uris: &[String]) -> Result<HashM
     Ok(map)
 }
 
+/// Indexed by `idx_bsky_posts_post_rkey`. The delimiter and argument order
+/// must stay identical to that expression index or the planner will seq-scan.
+const BSKY_POST_RKEY_SQL: &str = "split_part(bsky_uri, '/app.bsky.feed.post/', 2)";
+
+fn bsky_posts_by_rkey_sql() -> String {
+    format!(
+        "SELECT bsky_uri, COALESCE(author_handle, '') \
+         FROM bsky_posts \
+         WHERE {BSKY_POST_RKEY_SQL} = ANY($1)"
+    )
+}
+
+fn bsky_link_facet_sql() -> String {
+    format!(
+        "SELECT bsky_uri, COALESCE(text,''), COALESCE(raw_json,'') \
+         FROM bsky_posts \
+         WHERE bsky_uri = ANY($1) \
+         UNION ALL \
+         SELECT bsky_uri, COALESCE(text,''), COALESCE(raw_json,'') \
+         FROM bsky_posts \
+         WHERE {BSKY_POST_RKEY_SQL} = ANY($2)"
+    )
+}
+
 fn bsky_post_rkey(url: &str) -> Option<String> {
     let url = url.trim().trim_end_matches('/');
     if url.is_empty() {
@@ -2753,14 +2777,10 @@ pub async fn attach_bsky_link_facets(db: &Client, statuses: &mut [Value]) -> Res
     if at_uris.is_empty() && rkeys.is_empty() {
         return Ok(());
     }
+    // Two indexable arms (primary key, then the rkey expression). An OR of
+    // those predicates was a sequential scan of bsky_posts on Home.
     let rows = db
-        .query(
-            "SELECT bsky_uri, COALESCE(text,''), COALESCE(raw_json,'')
-             FROM bsky_posts
-             WHERE bsky_uri = ANY($1)
-                OR split_part(bsky_uri, '/app.bsky.feed.post/', 2) = ANY($2)",
-            &[&at_uris, &rkeys],
-        )
+        .query(&bsky_link_facet_sql(), &[&at_uris, &rkeys])
         .await
         .context("select bsky link facets")?;
     let mut by_uri: HashMap<String, (String, Value)> = HashMap::new();
@@ -2871,12 +2891,7 @@ pub(crate) async fn fetch_bsky_map_for_targets(
     rkeys.sort();
     rkeys.dedup();
     let rows = db
-        .query(
-            "SELECT bsky_uri, COALESCE(author_handle, '')
-             FROM bsky_posts
-             WHERE split_part(bsky_uri, '/app.bsky.feed.post/', 2) = ANY($1)",
-            &[&rkeys],
-        )
+        .query(&bsky_posts_by_rkey_sql(), &[&rkeys])
         .await
         .context("select bsky posts by rkey")?;
     let mut by_rkey: HashMap<String, Vec<(String, String)>> = HashMap::new();
@@ -5356,6 +5371,28 @@ mod tests {
         }
         std::fs::write("/tmp/vaak-quote-media-hydration-audience-native.json",serde_json::to_vec_pretty(&json!({"checks":output.len(),"captures":output}))?)?;
         Ok(())
+    }
+
+    #[test]
+    fn bsky_rkey_lookups_use_the_indexed_expression_in_one_batch() {
+        let by_rkey = bsky_posts_by_rkey_sql();
+        assert_eq!(
+            BSKY_POST_RKEY_SQL,
+            "split_part(bsky_uri, '/app.bsky.feed.post/', 2)"
+        );
+        assert!(
+            by_rkey.contains("split_part(bsky_uri, '/app.bsky.feed.post/', 2) = ANY($1)"),
+            "{by_rkey}"
+        );
+        assert!(!by_rkey.contains("= $1\n") && !by_rkey.contains("LIKE"), "{by_rkey}");
+        let facets = bsky_link_facet_sql();
+        assert!(
+            facets.contains("WHERE bsky_uri = ANY($1)")
+                && facets.contains("split_part(bsky_uri, '/app.bsky.feed.post/', 2) = ANY($2)")
+                && facets.contains("UNION ALL")
+                && !facets.contains(" OR "),
+            "{facets}"
+        );
     }
 
     #[test]

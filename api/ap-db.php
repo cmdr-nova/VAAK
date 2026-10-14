@@ -1250,6 +1250,9 @@ SQL);
     // Bluesky moderation alias lookup and mirror-segment flags. Production
     // already has these; the existence check is a no-op once the snapshot
     // is cached. Fresh databases get them when bsky_posts is present.
+    // idx_bsky_posts_post_rkey and idx_bsky_posts_embed_indexed are built by
+    // deploy/remote/migrate.php with CREATE INDEX CONCURRENTLY. A page load
+    // must not take a write lock on the live bsky_posts table to build them.
     try {
         if (ap_schema_has_table($db, 'bsky_posts')) {
             if (!ap_schema_has_index($db, 'idx_bsky_posts_lower_handle')) {
