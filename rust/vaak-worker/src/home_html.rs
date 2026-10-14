@@ -24,6 +24,8 @@ pub struct HomeHtmlReport {
     pub hydrate_key: String,
     /// Max `created_at` the live poll considered. 0 on the fill path.
     pub newest_ts: i64,
+    /// Keyset token for the next older page. Empty when this response is not a cursor page.
+    pub next_cursor: String,
 }
 
 async fn load_self_thread_parents(
@@ -165,16 +167,22 @@ fn normalize_view(view: &str) -> &'static str {
 ///
 /// `offset` skips the head of a warm envelope so infinite-scroll pages can hit
 /// the same Axum lean paint path as first paint (0.7.9).
+/// `before` is a `v1|created_at|source|id` cursor. When set, the page is read
+/// with a keyset instead of slicing the warm head.
 pub async fn tl_html_fill(
     cfg: &Config,
     owner_user_id: i64,
     view: &str,
     limit: i64,
     offset: i64,
+    before: Option<&str>,
 ) -> Result<Option<HomeHtmlReport>> {
     let view = normalize_view(view);
     let limit = limit.clamp(1, 40) as usize;
     let offset = offset.max(0) as usize;
+    if let Some(token) = before.map(str::trim).filter(|token| !token.is_empty()) {
+        return tl_html_older(cfg, owner_user_id, view, limit, token).await;
+    }
     // Warm heads go to 240 (0.7.25). Past that → miss → PHP extend.
     const MAX_WARM: usize = 240;
     let need = (offset + limit).min(MAX_WARM);
@@ -261,13 +269,18 @@ pub async fn tl_html_fill(
     // Hydrate envelopes are warm heads, not the full timeline. Claiming
     // end-of-timeline at the tail of a known warm size blocked PHP extend
     // (0.7.25 — early "End of timeline" around ~80–160 posts).
-    const WARM_HEAD_SIZES: [usize; 6] = [15, 40, 50, 80, 160, 240];
-    let exhausted = end >= report.items.len();
-    let looks_like_warm_head = WARM_HEAD_SIZES.contains(&report.items.len());
+    // The warm envelope is a head, not the stored timeline. A painted page
+    // always has an older keyset page until that query comes back short.
+    let next_cursor = slice
+        .last()
+        .and_then(|st| st.get("vaak_tl_cursor"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
     Ok(Some(HomeHtmlReport {
         html,
         count: painted,
-        has_more: painted >= limit || !exhausted || looks_like_warm_head || report.filtered,
+        has_more: true,
         // A self-reply paints as one card but consumes the parent row too.
         // Advance by source rows. Advancing by painted cards repeats that
         // parent as the first post under the loading placeholder.
@@ -275,6 +288,98 @@ pub async fn tl_html_fill(
         source: format!("axum-{view}-html:{}", report.source),
         hydrate_key: report.redis_key,
         newest_ts: 0,
+        next_cursor,
+    }))
+}
+
+async fn tl_html_older(
+    cfg: &Config,
+    owner_user_id: i64,
+    view: &str,
+    limit: usize,
+    before: &str,
+) -> Result<Option<HomeHtmlReport>> {
+    let Some(cursor) = crate::timeline_cursor::unpack(before) else {
+        return Ok(None);
+    };
+    let Ok(db) = db::connect(&cfg.database_url).await else {
+        return Ok(None);
+    };
+    let owner_actor = load_viewer_actor(cfg, owner_user_id).await;
+    let actors = if view == "home" {
+        crate::timeline_older::followed_actor_ids(&db, &owner_actor).await
+    } else {
+        Vec::new()
+    };
+    let dids = if view == "home" {
+        crate::timeline_older::followed_bsky_dids(&db, owner_user_id).await
+    } else {
+        Vec::new()
+    };
+    let hidden = crate::hidden::load_hidden_sets(&db, owner_user_id)
+        .await
+        .unwrap_or_default();
+    let fetch_limit = (limit.saturating_mul(3).max(40)) as i64;
+    let page = crate::timeline_cursor::collect_async(
+        |next| {
+            let db = &db;
+            let actors = &actors;
+            let dids = &dids;
+            let hidden = &hidden;
+            let owner_actor = owner_actor.clone();
+            async move {
+                crate::timeline_older::raw_window(
+                    db,
+                    view,
+                    owner_user_id,
+                    &owner_actor,
+                    actors,
+                    dids,
+                    hidden,
+                    next,
+                    fetch_limit,
+                )
+                .await
+            }
+        },
+        Some(cursor),
+        limit,
+        crate::timeline_cursor::OLDER_MAX_WINDOWS,
+    )
+    .await;
+    let statuses = crate::home_hydrate_ranked::statuses_for_older_hits(
+        &db,
+        owner_user_id,
+        view,
+        &page.kept,
+    )
+    .await?;
+    if statuses.is_empty() {
+        return Ok(None);
+    }
+    let viewer_actor = owner_actor;
+    let units = plan_feed_paint_units(&statuses, &std::collections::HashMap::new());
+    let paint = |st: &serde_json::Value, from: &str, viewer: &str| {
+        paint_lean_feed_card_opts(st, from, viewer)
+    };
+    let (html, painted) = paint_feed_units(&units, view, &viewer_actor, &paint);
+    if painted == 0 || html.is_empty() {
+        return Ok(None);
+    }
+    let next_cursor = page
+        .next
+        .as_ref()
+        .map(crate::timeline_cursor::pack)
+        .unwrap_or_default();
+    Ok(Some(HomeHtmlReport {
+        html,
+        count: painted,
+        has_more: page.has_more,
+        next_offset: limit,
+        source: format!("axum-{view}-html:keyset"),
+        hydrate_key: String::new(),
+        newest_ts: 0,
+        next_cursor,
     }))
 }
 
@@ -284,8 +389,9 @@ pub async fn home_html_fill(
     owner_user_id: i64,
     limit: i64,
     offset: i64,
+    before: Option<&str>,
 ) -> Result<Option<HomeHtmlReport>> {
-    tl_html_fill(cfg, owner_user_id, "home", limit, offset).await
+    tl_html_fill(cfg, owner_user_id, "home", limit, offset, before).await
 }
 
 /// Build the Home live-poll fragment with the same lean Rust painter used by
@@ -337,6 +443,7 @@ pub async fn home_html_since(
         source: "axum-home-since-html".to_string(),
         hydrate_key: report.hydrate_key.unwrap_or_default(),
         newest_ts,
+        next_cursor: String::new(),
     }))
 }
 
@@ -401,6 +508,7 @@ pub async fn tl_html_since(
         source: format!("axum-{view}-since-html"),
         hydrate_key: report.hydrate_key.unwrap_or_default(),
         newest_ts: report.newest_ts,
+        next_cursor: String::new(),
     }))
 }
 

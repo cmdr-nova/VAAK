@@ -76,6 +76,12 @@
       "area": "Profiles",
       "summary": "Remote ActivityPub profile header, relationship row, and tabs. PHP capture is api/bin/profile-remote-chrome-capture.php. Rust profile_remote paints the same chrome and does not open a database.",
       "php": {"script": "parity/php/profile-remote-chrome.php", "args": []}
+    },
+    {
+      "id": "timeline-cursor",
+      "area": "Timelines",
+      "summary": "Home, Local, and Federated older-page cursors. Compares created_at + source + id boundaries, same-timestamp id ties, and filtered windows that must not be treated as the end of stored posts. No database.",
+      "php": {"script": "parity/php/timeline-cursor.php", "args": []}
     }
   ]
 }
