@@ -153,16 +153,28 @@ $check(ap_phyrian_moments_suggestion('level_up', $fresh, $profile) === null, 'le
 $check(ap_phyrian_moments_suggestion('win', $fresh, $profile) === null, 'low resonance with no exchange is not a win');
 $check(is_string(ap_phyrian_moments_suggestion('rare_find', $fresh, $profile)), 'an imprinted strain can be shared as a rare find');
 
-ap_phyrian_moments_cache_reset();
-$deliverCalls = [];
-$levelRefused = ap_phyrian_moments_publish(8, 'cmdr_nova', 'level_up', 'Level up', true, 'csrf-ok', $db, $recordingDeliver);
-$check($levelRefused['ok'] === false, 'unavailable level-up is refused from the synced row');
-$check(ap_phyrian_moments_lookup_count() === 1 && $db->prepares === 1, 'refusing an unavailable moment is still one lookup');
-$check($deliverCalls === [], 'unavailable moment does not publish');
+$ready = [
+    'status' => 'imprinted',
+    'strain' => 'Cosmic Alien <script>',
+    'level' => 12,
+    'resonance' => 40,
+    'resonance_exchanges' => 2,
+    'inductions_given' => 1,
+];
+$check(AP_PHYRIAN_MOMENTS_ALLOWED === ['card'], 'only the strains card is on the post allowlist');
+$check(is_string(ap_phyrian_moments_suggestion('level_up', $ready, $profile)), 'level-up copy stays available to turn back on');
+$check(is_string(ap_phyrian_moments_suggestion('rare_find', $ready, $profile)), 'rare-find copy stays available to turn back on');
+$check(is_string(ap_phyrian_moments_suggestion('win', $ready, $profile)), 'win copy stays available to turn back on');
 
-$winRefused = ap_phyrian_moments_publish(8, 'cmdr_nova', 'win', 'I won', true, 'csrf-ok', $db, $recordingDeliver);
-$check($winRefused['ok'] === false && $deliverCalls === [], 'unavailable win is refused');
-$check(ap_phyrian_moments_lookup_count() === 1 && $db->prepares === 1, 'second refusal uses the request memo');
+ap_phyrian_moments_cache_reset();
+$db->prepares = 0;
+$deliverCalls = [];
+foreach (['level_up', 'rare_find', 'win'] as $hiddenKind) {
+    $hiddenPost = ap_phyrian_moments_publish(9, 'cmdr_nova', $hiddenKind, 'Sharing this', true, 'csrf-ok', $db, $recordingDeliver);
+    $check($hiddenPost['ok'] === false, $hiddenKind . ' is refused while it is off the allowlist');
+}
+$check(ap_phyrian_moments_lookup_count() === 0 && $db->prepares === 0, 'hidden moments do no player lookup');
+$check($deliverCalls === [], 'hidden moments do not publish');
 
 ap_phyrian_moments_cache_reset();
 $db->prepares = 0;
@@ -231,22 +243,22 @@ $deliverCalls = [];
 $shared = ap_phyrian_moments_publish(
     9,
     'cmdr_nova',
-    'rare_find',
-    "Rare find: Cosmic Alien <script>\nhttps://mkultra.monster/users/cmdr_nova",
+    'card',
+    "My Phyrian Strains card. Cosmic Alien <script>\nhttps://mkultra.monster/users/cmdr_nova",
     true,
     'csrf-ok',
     $db,
     $recordingDeliver
 );
-$check(!empty($shared['ok']), 'imprinted rare find posts after confirmation');
+$check(!empty($shared['ok']), 'imprinted card posts after confirmation');
 $sharedText = (string) ($deliverCalls[0]['body'] ?? '');
 $sharedAlt = (string) ($deliverCalls[0]['alt'] ?? '');
 $check(str_contains($sharedText, 'Cosmic Alien') && !str_contains($sharedText, '<script>'), 'strain note is plain text');
 $check(str_contains($sharedAlt, 'Cosmic Alien <script>') && str_contains($sharedAlt, 'level 12') && str_contains($sharedAlt, '@cmdr_nova'), 'alt text is built from the synced stats');
 $check(substr_count($sharedText, $profile) === 1, 'profile link is not duplicated when the player already included it');
-$check(ap_phyrian_moments_lookup_count() === 1, 'rare find is one lookup');
+$check(ap_phyrian_moments_lookup_count() === 1, 'confirmed imprinted card is one lookup');
 
-$failed = ap_phyrian_moments_publish(9, 'cmdr_nova', 'win', 'Won a resonance exchange', true, 'csrf-ok', $db, static function (): array {
+$failed = ap_phyrian_moments_publish(9, 'cmdr_nova', 'card', 'Won a resonance exchange', true, 'csrf-ok', $db, static function (): array {
     return ['ok' => false, 'error' => 'storage down'];
 });
 $check($failed['ok'] === false && str_contains((string) ($failed['error'] ?? ''), 'storage down'), 'a failed image post does not pretend to succeed');
@@ -263,8 +275,11 @@ $hubOn = ap_phyrian_moments_hub_html([
 ], 'cmdr_nova', 'csrf-ok');
 $check(str_contains($hubOn, 'Share a moment') && str_contains($hubOn, 'Post this moment'), 'hub offers a confirm button');
 $check(str_contains($hubOn, 'name="confirm" value="1"') && str_contains($hubOn, 'name="action" value="phyrian_moment_post"'), 'hub posts only through the confirm action');
-$check(str_contains($hubOn, 'Cosmic Alien &lt;script&gt;') && !str_contains($hubOn, '<script>'), 'hub escapes the strain');
-$check(substr_count($hubOn, '<form') === 4, 'imprinted player sees level-up, rare find, win, and the card');
+$check(!str_contains($hubOn, '<script>') && !str_contains($hubOn, 'Cosmic Alien'), 'hub card form does not print the strain');
+$check(ap_phyrian_moments_h('Cosmic Alien <script>') === 'Cosmic Alien &lt;script&gt;', 'hub text is escaped before it is printed');
+$check(substr_count($hubOn, '<form') === 1 && str_contains($hubOn, 'value="card"'), 'imprinted hub offers only the strains card');
+$check(!str_contains($hubOn, 'value="level_up"') && !str_contains($hubOn, 'value="rare_find"') && !str_contains($hubOn, 'value="win"'), 'hub hides level-up, rare find, and win');
+$check(str_contains($hubOn, 'My Phyrian Strains card.'), 'card share keeps its suggested note');
 $check(ap_phyrian_moments_lookup_count() === $lookupsBeforeHub, 'hub form uses the player row it was given');
 
 $hubUnmarked = ap_phyrian_moments_hub_html($unmarkedPlayer, 'cmdr_nova', 'csrf-ok');
@@ -297,6 +312,10 @@ $check(str_contains($admin, '.phyrian-actions { display: flex; flex-wrap: wrap; 
 $check(!str_contains($admin, '.phyrian-moments {'), 'moments do not add a global stylesheet rule');
 
 $moments = (string) file_get_contents(dirname(__DIR__) . '/ap-phyrian-moments.php');
+$check(str_contains($moments, "const AP_PHYRIAN_MOMENTS_ALLOWED = ['card']"), 'allowlist names only the strains card');
+foreach (["'level_up' => 'Level-up'", "'rare_find' => 'Rare find'", "'win' => 'Win'", "'card' => 'Post my Strains card'"] as $keptLabel) {
+    $check(str_contains($moments, $keptLabel), 'moment label stays in the helper: ' . $keptLabel);
+}
 $check(substr_count($moments, 'FROM phyrian_players') === 1, 'moments helper has one player read');
 $check(str_contains($moments, 'WHERE owner_user_id = ?'), 'player read uses the primary key');
 foreach (['ap_phyrian_migrate', 'ap_phyrian_dossier', 'ap_phyrian_ensure_player', 'ap_phyrian_bridge_sync_from_opensim', 'ap_redis', 'UPDATE ', 'DELETE ', 'ALTER '] as $forbidden) {
