@@ -16405,8 +16405,140 @@ function ap_remote_actor_upsert(string $actorId, array $fields): void
 }
 
 /**
- * Ensure we have a human username for an actor (esp. Bridgy Fed Bluesky DIDs).
- * Fetches the AS2 actor doc when cache is missing or still a did:plc placeholder.
+ * https icon/header URL from an ActivityPub Image, Link, or a list of either.
+ * Works without ap-r2.php loaded (actor warm only includes the inbox library).
+ */
+function ap_remote_actor_as2_media_url(mixed $node): ?string
+{
+    if (is_array($node) && array_is_list($node)) {
+        foreach ($node as $item) {
+            $found = ap_remote_actor_as2_media_url($item);
+            if (is_string($found) && $found !== '') {
+                return $found;
+            }
+        }
+        return null;
+    }
+    if (is_string($node)) {
+        return ap_profile_sanitize_https_url($node);
+    }
+    if (!is_array($node)) {
+        return null;
+    }
+    if (isset($node['url'])) {
+        if (is_string($node['url']) || is_array($node['url'])) {
+            $found = ap_remote_actor_as2_media_url($node['url']);
+            if (is_string($found) && $found !== '') {
+                return $found;
+            }
+        }
+    }
+    if (isset($node['href']) && is_string($node['href'])) {
+        return ap_profile_sanitize_https_url($node['href']);
+    }
+    return null;
+}
+
+/**
+ * Whether a cached remote actor should be fetched again.
+ * A real username with a recent updated_at is not enough when the icon is missing:
+ * partial upserts stamp updated_at=now and then the 12h gate skips the avatar forever.
+ */
+function ap_remote_actor_needs_refresh(?array $row, int $now, bool $force, int $iconMissUntil): bool
+{
+    if ($force) {
+        return true;
+    }
+    if ($row === null) {
+        return $iconMissUntil <= $now;
+    }
+    $username = isset($row['username']) && is_string($row['username']) ? $row['username'] : null;
+    if (ap_remote_actor_username_is_placeholder($username)) {
+        return true;
+    }
+    $icon = isset($row['icon_source_url']) && is_string($row['icon_source_url'])
+        ? trim($row['icon_source_url']) : '';
+    if (!str_starts_with($icon, 'https://')) {
+        return $iconMissUntil <= $now;
+    }
+    $updatedAt = strtotime((string) ($row['updated_at'] ?? '')) ?: 0;
+    return $updatedAt < ($now - 12 * 3600);
+}
+
+function ap_remote_actor_icon_miss_path(string $actorId): string
+{
+    return sys_get_temp_dir() . '/vaak-actor-icon-miss-' . hash('sha256', $actorId);
+}
+
+function ap_remote_actor_icon_miss_until(string $actorId): int
+{
+    $path = ap_remote_actor_icon_miss_path($actorId);
+    if (!is_file($path)) {
+        return 0;
+    }
+    $until = (int) @file_get_contents($path);
+    if ($until <= time()) {
+        @unlink($path);
+        return 0;
+    }
+    return $until;
+}
+
+function ap_remote_actor_icon_miss_set(string $actorId, int $seconds): void
+{
+    @file_put_contents(ap_remote_actor_icon_miss_path($actorId), (string) (time() + max(1, $seconds)), LOCK_EX);
+}
+
+function ap_remote_actor_icon_miss_clear(string $actorId): void
+{
+    $path = ap_remote_actor_icon_miss_path($actorId);
+    if (is_file($path)) {
+        @unlink($path);
+    }
+}
+
+/**
+ * Per-host cap for signed actor fetches: 4 in this process, 6 per 30s on disk.
+ * A denied fetch must not write the icon-miss marker or the actor stays dark.
+ */
+function ap_remote_actor_host_fetch_allowed(string $actorId): bool
+{
+    if (!empty($GLOBALS['ap_remote_actor_skip_host_cap'])) {
+        return true;
+    }
+    static $requestCounts = [];
+    $host = strtolower((string) (parse_url($actorId, PHP_URL_HOST) ?: ''));
+    if ($host === '') {
+        return false;
+    }
+    $requestCounts[$host] = ($requestCounts[$host] ?? 0) + 1;
+    if ($requestCounts[$host] > 4) {
+        return false;
+    }
+    $path = sys_get_temp_dir() . '/vaak-actor-host-' . hash('sha256', $host);
+    $now = time();
+    $window = [];
+    if (is_file($path)) {
+        $decoded = json_decode((string) @file_get_contents($path), true);
+        if (is_array($decoded)) {
+            foreach ($decoded as $ts) {
+                if (is_int($ts) && $ts > $now - 30) {
+                    $window[] = $ts;
+                }
+            }
+        }
+    }
+    if (count($window) >= 6) {
+        return false;
+    }
+    $window[] = $now;
+    @file_put_contents($path, json_encode($window), LOCK_EX);
+    return true;
+}
+
+/**
+ * Ensure we have a human username and icon for an actor (esp. Bridgy Fed Bluesky DIDs).
+ * Fetches the AS2 actor doc when the cache is missing, still a placeholder, icon-less, or older than 12h.
  *
  * @return array{actor_id:string,username:?string,display_name:?string,host:?string,icon_source_url:?string,image_source_url:?string}|null
  */
@@ -16428,22 +16560,29 @@ function ap_remote_actor_ensure(string $actorId, bool $allowFetch = true): ?arra
     // Refresh profile metadata periodically even when a usable row exists.
     // Timeline requests pass allowFetch=false, while background warmers and
     // profile views can keep names/bios/media source URLs current.
-    $updatedAt = is_array($row) ? (strtotime((string) ($row['updated_at'] ?? '')) ?: 0) : 0;
-    $needsFetch = $allowFetch && (
-        $row === null
-        || ap_remote_actor_username_is_placeholder($row['username'] ?? null)
-        || (str_contains($actorId, 'bsky.brid.gy/ap/did:') && ap_remote_actor_username_is_placeholder($row['username'] ?? null))
-        || $updatedAt < (time() - 12 * 3600)
+    // Missing icons are not "fresh": a partial upsert stamps updated_at and
+    // used to suppress the refetch for 12 hours.
+    $force = !empty($GLOBALS['ap_remote_actor_force_refresh']);
+    $iconMissUntil = $force ? 0 : ap_remote_actor_icon_miss_until($actorId);
+    $needsFetch = $allowFetch && ap_remote_actor_needs_refresh(
+        is_array($row) ? $row : null,
+        time(),
+        $force,
+        $iconMissUntil
     );
     // A short negative cache prevents a broken or unavailable remote host from
     // being hammered repeatedly by profile cards during the same worker burst.
     // It is deliberately short and request-local so a transient outage never
-    // becomes authoritative actor state.
-    if ($needsFetch && $allowFetch && (($negativeUntil[$actorId] ?? 0) > time())) {
+    // becomes authoritative actor state. --force (broken URL repair) bypasses it.
+    if ($needsFetch && !$force && (($negativeUntil[$actorId] ?? 0) > time())) {
         $memo[$actorId] = $row;
         return $row;
     }
     if ($needsFetch && function_exists('ap_fetch_as2_object')) {
+        if (!$force && !ap_remote_actor_host_fetch_allowed($actorId)) {
+            $memo[$actorId] = $row;
+            return $row;
+        }
         try {
             $doc = ap_fetch_as2_object($actorId);
             if (is_array($doc)) {
@@ -16455,21 +16594,12 @@ function ap_remote_actor_ensure(string $actorId, bool $allowFetch = true): ?arra
                 if (!empty($doc['name']) && is_string($doc['name'])) {
                     $dname = trim($doc['name']);
                 }
-                $icon = null;
-                if (isset($doc['icon'])) {
-                    if (is_array($doc['icon']) && !empty($doc['icon']['url']) && is_string($doc['icon']['url'])) {
-                        $icon = $doc['icon']['url'];
-                    } elseif (is_string($doc['icon'])) {
-                        $icon = $doc['icon'];
-                    }
-                }
-                $image = null;
-                if (isset($doc['image'])) {
-                    if (is_array($doc['image']) && !empty($doc['image']['url']) && is_string($doc['image']['url'])) {
-                        $image = $doc['image']['url'];
-                    } elseif (is_string($doc['image'])) {
-                        $image = $doc['image'];
-                    }
+                $icon = ap_remote_actor_as2_media_url($doc['icon'] ?? null);
+                $image = ap_remote_actor_as2_media_url($doc['image'] ?? null);
+                if (is_string($icon) && $icon !== '') {
+                    ap_remote_actor_icon_miss_clear($actorId);
+                } else {
+                    ap_remote_actor_icon_miss_set($actorId, 6 * 3600);
                 }
                 $host = parse_url($actorId, PHP_URL_HOST);
                 $hostNorm = is_string($host) ? strtolower($host) : null;
@@ -16509,9 +16639,11 @@ function ap_remote_actor_ensure(string $actorId, bool $allowFetch = true): ?arra
                 $row = ap_remote_actor_get($actorId);
             } else {
                 $negativeUntil[$actorId] = time() + 300;
+                ap_remote_actor_icon_miss_set($actorId, 15 * 60);
             }
         } catch (Throwable $e) {
             $negativeUntil[$actorId] = time() + 300;
+            ap_remote_actor_icon_miss_set($actorId, 15 * 60);
             error_log('[ap-db] remote_actor_ensure: ' . $e->getMessage());
         }
     }
@@ -16602,7 +16734,7 @@ function ap_remote_actor_label(string $actorId, bool $allowFetch = false): array
 }
 
 /** Queue best-effort actor/profile enrichment without delaying timeline paint. */
-function ap_remote_actor_warm_async(string $actorId): void
+function ap_remote_actor_warm_async(string $actorId, bool $force = false): void
 {
     $actorId = rtrim(trim($actorId), '/');
     if ($actorId === '' || !str_starts_with(strtolower($actorId), 'https://') || !filter_var($actorId, FILTER_VALIDATE_URL)) {
@@ -16618,11 +16750,15 @@ function ap_remote_actor_warm_async(string $actorId): void
         $lockKey = 'ap-actor-warm:' . hash('sha256', $actorId);
         $locked = !function_exists('ap_redis_lock') || ap_redis_lock($lockKey, 45);
         if ($locked) {
-            $payload = json_encode([
+            $job = [
                 'actor_id' => $actorId,
                 'ts' => time(),
                 'source' => 'warm-async',
-            ], JSON_UNESCAPED_SLASHES);
+            ];
+            if ($force) {
+                $job['force'] = true;
+            }
+            $payload = json_encode($job, JSON_UNESCAPED_SLASHES);
             if (is_string($payload) && ap_redis_queue_push('ap_actor_warm', $payload)) {
                 return;
             }
@@ -16656,8 +16792,9 @@ function ap_remote_actor_warm_async(string $actorId): void
         : (defined('PHP_BINARY') && is_executable(PHP_BINARY) && !str_contains(PHP_BINARY, 'php-fpm')
             ? PHP_BINARY
             : '/usr/bin/php');
+    $warmArg = escapeshellarg($actorId) . ($force ? ' --force' : '');
     @exec('nohup ' . escapeshellarg($php) . ' ' . escapeshellarg($script) . ' '
-        . escapeshellarg($actorId) . ' >/dev/null 2>&1 </dev/null &');
+        . $warmArg . ' >/dev/null 2>&1 </dev/null &');
 }
 
 /* ----------------- Remote custom emojis (:shortcode: → image URL) ----------------- */

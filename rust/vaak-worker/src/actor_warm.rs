@@ -404,11 +404,7 @@ async fn upsert_and_cache(cfg: &Config, owner: i64, profile: &Value) -> Result<(
         .and_then(|h| h.as_str())
         .unwrap_or("")
         .to_string();
-    let avatar = profile
-        .get("avatar")
-        .and_then(|h| h.as_str())
-        .unwrap_or("")
-        .to_string();
+    let avatar = bsky_avatar_url(profile.get("avatar"), &did).unwrap_or_default();
     let now = chrono::Utc::now().to_rfc3339();
 
     // Strip viewer before durable public profile cache (owner-scoped elsewhere).
@@ -585,4 +581,167 @@ fn sha256_hex(s: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(s.as_bytes());
     hex::encode(hasher.finalize())
+}
+
+/// https avatar URL. Rejects userinfo, localhost, and private addresses the PHP sanitizer drops.
+pub(crate) fn https_public_url(raw: &str) -> Option<String> {
+    let url = raw.trim();
+    if url.len() > 800 || !url.starts_with("https://") {
+        return None;
+    }
+    if url.bytes().any(|b| b < 32 || b == 127) {
+        return None;
+    }
+    let authority = url[8..].split(['/', '?', '#']).next().unwrap_or("");
+    if authority.is_empty() || authority.contains('@') {
+        return None;
+    }
+    let host = authority
+        .rsplit_once(':')
+        .map(|(host, port)| if port.bytes().all(|b| b.is_ascii_digit()) { host } else { authority })
+        .unwrap_or(authority)
+        .trim_matches(|c| c == '[' || c == ']')
+        .to_ascii_lowercase();
+    if host.is_empty()
+        || host == "localhost"
+        || host == "127.0.0.1"
+        || host == "::1"
+        || host.starts_with("10.")
+        || host.starts_with("192.168.")
+        || host.starts_with("169.254.")
+        || host.starts_with("0.")
+    {
+        return None;
+    }
+    if let Some(rest) = host.strip_prefix("172.") {
+        if let Some(second) = rest.split('.').next().and_then(|n| n.parse::<u8>().ok()) {
+            if (16..=31).contains(&second) {
+                return None;
+            }
+        }
+    }
+    Some(url.to_string())
+}
+
+fn cid_ok(raw: &str) -> bool {
+    let raw = raw.trim();
+    (20..=128).contains(&raw.len()) && raw.bytes().all(|b| b.is_ascii_alphanumeric())
+}
+
+fn bsky_cdn(did: &str, cid: &str, ext: &str) -> Option<String> {
+    let did = did.trim();
+    if !did.starts_with("did:") || did.contains('%') || !cid_ok(cid) {
+        return None;
+    }
+    Some(format!("https://cdn.bsky.app/img/avatar/plain/{did}/{cid}@{ext}"))
+}
+
+/// AppView sends an https CDN string. Jetstream rows often send a blob ref.
+/// The DID is not percent-encoded; `did%3Aplc%3A` 404s on the CDN.
+pub(crate) fn bsky_avatar_url(avatar: Option<&Value>, did: &str) -> Option<String> {
+    let avatar = avatar?;
+    if let Some(raw) = avatar.as_str() {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            return None;
+        }
+        if raw.starts_with("https://") {
+            return https_public_url(raw);
+        }
+        return bsky_cdn(did, raw, "jpeg");
+    }
+    let obj = avatar.as_object()?;
+    let mime = obj
+        .get("mimeType")
+        .or_else(|| obj.get("mime"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let ext = if mime.contains("png") {
+        "png"
+    } else if mime.contains("webp") {
+        "webp"
+    } else if mime.contains("gif") {
+        "gif"
+    } else {
+        "jpeg"
+    };
+    let cid = obj
+        .get("ref")
+        .and_then(|r| r.get("$link").or_else(|| r.get("link")))
+        .and_then(|v| v.as_str())
+        .or_else(|| obj.get("ref").and_then(|v| v.as_str()))
+        .or_else(|| obj.get("cid").and_then(|v| v.as_str()))
+        .or_else(|| obj.get("$link").and_then(|v| v.as_str()))
+        .unwrap_or("")
+        .trim();
+    bsky_cdn(did, cid, ext)
+}
+
+/// ActivityPub icon/image: string, Link href, url object, or a list of those.
+pub(crate) fn activitypub_image_url(node: Option<&Value>) -> Option<String> {
+    let node = node?;
+    if let Some(items) = node.as_array() {
+        for item in items {
+            if let Some(url) = activitypub_image_url(Some(item)) {
+                return Some(url);
+            }
+        }
+        return None;
+    }
+    if let Some(raw) = node.as_str() {
+        return https_public_url(raw);
+    }
+    let obj = node.as_object()?;
+    if let Some(url) = obj.get("url") {
+        if let Some(found) = activitypub_image_url(Some(url)) {
+            return Some(found);
+        }
+    }
+    obj.get("href").and_then(|v| v.as_str()).and_then(https_public_url)
+}
+
+#[cfg(test)]
+mod avatar_url_tests {
+    use super::*;
+
+    #[test]
+    fn bsky_string_blob_and_did_encoding() {
+        let did = "did:plc:abc123actor";
+        let cdn = "https://cdn.bsky.app/img/avatar/plain/did:plc:abc123actor/bafkreightexamplecidvalue1@jpeg";
+        assert_eq!(bsky_avatar_url(Some(&json!(cdn)), did).as_deref(), Some(cdn));
+        let blob = json!({"$type":"blob","ref":{"$link":"bafkreightexamplecidvalue1"},"mimeType":"image/png"});
+        assert_eq!(
+            bsky_avatar_url(Some(&blob), did).as_deref(),
+            Some("https://cdn.bsky.app/img/avatar/plain/did:plc:abc123actor/bafkreightexamplecidvalue1@png")
+        );
+        assert_eq!(
+            bsky_avatar_url(Some(&json!("bafkreightexamplecidvalue1")), did).as_deref(),
+            Some("https://cdn.bsky.app/img/avatar/plain/did:plc:abc123actor/bafkreightexamplecidvalue1@jpeg")
+        );
+        assert_eq!(bsky_avatar_url(Some(&blob), "did%3Aplc%3Aabc"), None);
+        assert_eq!(bsky_avatar_url(Some(&blob), ""), None);
+        assert_eq!(bsky_avatar_url(Some(&json!("http://cdn.bsky.app/x")), did), None);
+    }
+
+    #[test]
+    fn activitypub_icon_shapes() {
+        assert_eq!(
+            activitypub_image_url(Some(&json!("https://cdn.example/a.png"))).as_deref(),
+            Some("https://cdn.example/a.png")
+        );
+        assert_eq!(
+            activitypub_image_url(Some(&json!({"type":"Image","url":"https://cdn.example/b.png"}))).as_deref(),
+            Some("https://cdn.example/b.png")
+        );
+        assert_eq!(
+            activitypub_image_url(Some(&json!({"url":{"href":"https://cdn.example/c.png"}}))).as_deref(),
+            Some("https://cdn.example/c.png")
+        );
+        assert_eq!(
+            activitypub_image_url(Some(&json!([{"type":"Image","url":"https://cdn.example/d.png"}]))).as_deref(),
+            Some("https://cdn.example/d.png")
+        );
+        assert_eq!(activitypub_image_url(Some(&json!("http://cdn.example/a.png"))), None);
+        assert_eq!(activitypub_image_url(Some(&json!("https://127.0.0.1/a.png"))), None);
+    }
 }

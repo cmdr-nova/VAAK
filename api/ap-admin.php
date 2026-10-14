@@ -913,7 +913,8 @@ if (
 }
 
 if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
-    if (!empty($GLOBALS['vaak_guest_profile'])) {
+    $vaakAvatarPoll = (string) ($_POST['action'] ?? '') === 'avatar_resolve';
+    if (!empty($GLOBALS['vaak_guest_profile']) && !$vaakAvatarPoll) {
         $wantJsonGuest = !empty($_POST['ajax'])
             || str_contains((string) ($_SERVER['HTTP_ACCEPT'] ?? ''), 'application/json')
             || strtolower((string) ($_SERVER['HTTP_X_REQUESTED_WITH'] ?? '')) === 'xmlhttprequest';
@@ -1160,6 +1161,39 @@ $vaakAdminOnlyActions = [
         $label = trim((string) ($_POST['label'] ?? ''));
         $payload = admin_profile_hover_payload($actor, $vaakOwnerId, $vaakActorId, $source, $label);
         echo json_encode($payload, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+        exit;
+    }
+    if ($action === 'avatar_resolve') {
+        header('Content-Type: application/json; charset=utf-8');
+        header('Cache-Control: no-store');
+        if (function_exists('ap_auth_session_write_close')) {
+            ap_auth_session_write_close();
+        } elseif (session_status() === PHP_SESSION_ACTIVE) {
+            session_write_close();
+        }
+        require_once __DIR__ . '/ap-avatar-refresh.php';
+        $collect = static function (mixed $raw): array {
+            if (is_string($raw)) {
+                $decoded = json_decode($raw, true);
+                $raw = is_array($decoded) ? $decoded : preg_split('/[\s,]+/', $raw);
+            }
+            if (!is_array($raw)) {
+                return [];
+            }
+            $out = [];
+            foreach ($raw as $item) {
+                if (is_string($item) && $item !== '') {
+                    $out[] = $item;
+                }
+            }
+            return $out;
+        };
+        $urls = ap_avatar_refresh_resolve(
+            $collect($_POST['actors'] ?? []),
+            $collect($_POST['broken'] ?? []),
+            (int) $vaakOwnerId
+        );
+        echo json_encode(['ok' => true, 'avatars' => $urls], JSON_UNESCAPED_SLASHES);
         exit;
     }
     if ($action === 'blog_save') {
@@ -17146,6 +17180,10 @@ function admin_actor_avatar_url(?string $actorId): string
         if (is_array($cached) && !empty($cached['public_url'])) {
             $u = ap_profile_sanitize_https_url($cached['public_url']);
             if ($u !== null) {
+                $fetchedAt = strtotime((string) ($cached['fetched_at'] ?? '')) ?: 0;
+                if ($fetchedAt > 0 && $fetchedAt < time() - 7 * 86400 && function_exists('ap_remote_media_warm_async')) {
+                    ap_remote_media_warm_async($actorId);
+                }
                 $memo[$actorId] = $u;
                 return $u;
             }
@@ -17163,6 +17201,10 @@ function admin_actor_avatar_url(?string $actorId): string
                 if (is_array($aliasCached) && !empty($aliasCached['public_url'])) {
                     $u = ap_profile_sanitize_https_url($aliasCached['public_url']);
                     if ($u !== null) {
+                        $fetchedAt = strtotime((string) ($aliasCached['fetched_at'] ?? '')) ?: 0;
+                        if ($fetchedAt > 0 && $fetchedAt < time() - 7 * 86400 && function_exists('ap_remote_media_warm_async')) {
+                            ap_remote_media_warm_async($alias);
+                        }
                         $memo[$actorId] = $u;
                         return $u;
                     }
@@ -17170,28 +17212,36 @@ function admin_actor_avatar_url(?string $actorId): string
             }
         }
     }
-    // Queue a background warm when we know a source URL, but still show fallback now.
-    // A cold actor may not have a remote_actors row yet. Queue the actor
-    // itself as well so the shared resolver can discover its avatar instead
-    // of leaving the default avatar permanently on the first render.
-    if (function_exists('ap_remote_actor_warm_async')) {
+    // No fresh R2 object. Show a known https icon immediately, and queue a
+    // refresh when the row, the icon, or the 12h metadata window is missing.
+    // bsky.app is not an ActivityPub actor; fetching that URL never yields an icon.
+    $ra = function_exists('ap_remote_actor_get') ? ap_remote_actor_get($actorId) : null;
+    $source = null;
+    if (is_array($ra) && !empty($ra['icon_source_url'])) {
+        $source = ap_profile_sanitize_https_url((string) $ra['icon_source_url']);
+    }
+    $updatedAt = is_array($ra) ? (strtotime((string) ($ra['updated_at'] ?? '')) ?: 0) : 0;
+    $needsActor = !is_array($ra) || $source === null || $updatedAt < time() - 12 * 3600;
+    if (is_file(__DIR__ . '/ap-avatar-refresh.php')) {
+        require_once __DIR__ . '/ap-avatar-refresh.php';
+    }
+    $bskyApp = function_exists('ap_avatar_is_bsky_app') && ap_avatar_is_bsky_app($actorId);
+    if (!$bskyApp && function_exists('ap_remote_media_warm_async')) {
+        ap_remote_media_warm_async($actorId);
+    }
+    if ($needsActor && !$bskyApp && function_exists('ap_remote_actor_warm_async')) {
         ap_remote_actor_warm_async($actorId);
     }
-    if (function_exists('ap_remote_media_warm_async')) {
-        $ra = function_exists('ap_remote_actor_get') ? ap_remote_actor_get($actorId) : null;
-        if (is_array($ra) && !empty($ra['icon_source_url'])) {
-            ap_remote_media_warm_async($actorId);
-        }
+    if (function_exists('ap_avatar_queue_bsky')
+        && function_exists('ap_bsky_is_profile_ref')
+        && ap_bsky_is_profile_ref($actorId)
+        && ($source === null || $needsActor)) {
+        $ownerId = function_exists('admin_owner_user_id') ? admin_owner_user_id() : 0;
+        ap_avatar_queue_bsky($actorId, $ownerId, false);
     }
-    // Until the async warm finishes, use the known remote icon rather than
-    // rendering the generic fallback. onerror still protects the UI if the
-    // remote host rejects the image request.
-    if (is_array($ra ?? null) && !empty($ra['icon_source_url'])) {
-        $source = ap_profile_sanitize_https_url((string) $ra['icon_source_url']);
-        if ($source !== null) {
-            $memo[$actorId] = $source;
-            return $source;
-        }
+    if ($source !== null) {
+        $memo[$actorId] = $source;
+        return $source;
     }
     $memo[$actorId] = $remoteFallback;
     return $remoteFallback;
@@ -17293,9 +17343,9 @@ function admin_profile_hover_payload(string $actorId, int $ownerUserId, string $
                     $stPost = ap_db()->prepare(
                         "SELECT author_did, author_handle, author_display, author_avatar
                          FROM bsky_posts
-                         WHERE lower(author_did) = lower(?)
+                         WHERE author_did = ?
                            AND author_handle IS NOT NULL AND author_handle <> ''
-                         ORDER BY indexed_at DESC NULLS LAST
+                         ORDER BY indexed_at DESC
                          LIMIT 1"
                     );
                 } else {
@@ -45204,6 +45254,139 @@ if (VIEW === 'analytics') loadAnalytics();
       link.removeAttribute('title');
     }
   }, true);
+})();
+</script>
+<script>
+// Swap a placeholder or broken timeline avatar once a background fetch lands.
+// Capture-phase errors see the original URL before onerror replaces it.
+(function () {
+  const fallback = <?= json_encode(defined('AP_REMOTE_AVATAR_FALLBACK') ? AP_REMOTE_AVATAR_FALLBACK : 'https://mkultra.monster/img/avatar/default.webp', JSON_UNESCAPED_SLASHES) ?>;
+  const pending = new Map();
+  const attempts = new Map();
+  const tried = new Map();
+  const resolved = new Set();
+  let timer = 0;
+  let flushing = false;
+  function isFallback(src) {
+    if (!src) return true;
+    if (src === fallback) return true;
+    return src.indexOf('/img/avatar/default.') !== -1 || src.indexOf('/img/avatar/local-default.') !== -1;
+  }
+  function actorOf(img) {
+    return (img && img.dataset && img.dataset.profileHoverActor) || '';
+  }
+  function note(img, broken) {
+    const actor = actorOf(img);
+    if (!actor || !/^https:\/\//i.test(actor)) return;
+    if (resolved.has(actor) && !broken) return;
+    if (broken) resolved.delete(actor);
+    const src = img.getAttribute('src') || '';
+    if (!broken && !isFallback(src)) return;
+    const prev = pending.get(actor);
+    pending.set(actor, { broken: !!(prev && prev.broken) || !!broken });
+    if (!timer) timer = setTimeout(flush, 250);
+  }
+  function scan(root) {
+    if (!root || !root.querySelectorAll) return;
+    root.querySelectorAll('img.tweet-av[data-profile-hover-actor]').forEach(function (img) {
+      if (isFallback(img.getAttribute('src') || '')) note(img, false);
+    });
+  }
+  function apply(actor, url) {
+    const seen = tried.get(actor) || new Set();
+    if (seen.has(url)) return false;
+    seen.add(url);
+    tried.set(actor, seen);
+    let swapped = false;
+    document.querySelectorAll('img.tweet-av[data-profile-hover-actor]').forEach(function (img) {
+      if (img.dataset.profileHoverActor !== actor) return;
+      if ((img.getAttribute('src') || '') === url) return;
+      img.onerror = function () {
+        this.onerror = null;
+        this.src = fallback;
+        note(this, true);
+      };
+      img.src = url;
+      swapped = true;
+    });
+    return swapped;
+  }
+  function retryLater(actor, broken) {
+    const n = attempts.get(actor) || 0;
+    const max = broken ? 3 : 2;
+    if (n >= max) return;
+    const delay = n === 0 ? 1500 : (n === 1 ? 6000 : 12000);
+    attempts.set(actor, n + 1);
+    setTimeout(function () {
+      if (resolved.has(actor)) return;
+      const prev = pending.get(actor);
+      pending.set(actor, { broken: broken || !!(prev && prev.broken) });
+      if (!timer) timer = setTimeout(flush, 250);
+    }, delay);
+  }
+  async function flush() {
+    timer = 0;
+    if (flushing || !pending.size || !window.VAAK_CSRF) return;
+    flushing = true;
+    const actors = [];
+    const broken = [];
+    pending.forEach(function (meta, actor) {
+      if (actors.length + broken.length >= 40) return;
+      pending.delete(actor);
+      if (meta.broken) broken.push(actor);
+      else actors.push(actor);
+    });
+    if (!actors.length && !broken.length) { flushing = false; return; }
+    try {
+      const fd = new FormData();
+      fd.set('action', 'avatar_resolve');
+      fd.set('csrf', window.VAAK_CSRF);
+      actors.forEach(function (actor) { fd.append('actors[]', actor); });
+      broken.forEach(function (actor) { fd.append('broken[]', actor); fd.append('actors[]', actor); });
+      const res = await fetch('/vaak/?view=home', {
+        method: 'POST', body: fd, credentials: 'same-origin',
+        headers: { 'Accept': 'application/json', 'X-Requested-With': 'XMLHttpRequest' }
+      });
+      const data = res.ok ? await res.json() : null;
+      const urls = data && data.avatars ? data.avatars : {};
+      actors.concat(broken).forEach(function (actor) {
+        const url = urls[actor];
+        const wasBroken = broken.indexOf(actor) !== -1;
+        if (typeof url === 'string' && /^https:\/\//i.test(url) && apply(actor, url)) {
+          resolved.add(actor);
+          return;
+        }
+        retryLater(actor, wasBroken);
+      });
+    } catch (_) {
+      actors.concat(broken).forEach(function (actor) { retryLater(actor, broken.indexOf(actor) !== -1); });
+    }
+    flushing = false;
+    if (pending.size && !timer) timer = setTimeout(flush, 250);
+  }
+  document.addEventListener('error', function (ev) {
+    const img = ev.target;
+    if (!(img instanceof HTMLImageElement) || !img.classList || !img.classList.contains('tweet-av')) return;
+    const src = img.currentSrc || img.src || '';
+    if (isFallback(src)) return;
+    note(img, true);
+  }, true);
+  scan(document);
+  if (typeof MutationObserver !== 'undefined' && document.body) {
+    const mo = new MutationObserver(function (records) {
+      records.forEach(function (rec) {
+        rec.addedNodes.forEach(function (node) {
+          if (!node || node.nodeType !== 1) return;
+          if (node.matches && node.matches('img.tweet-av[data-profile-hover-actor]')) {
+            if (isFallback(node.getAttribute('src') || '')) note(node, false);
+          } else {
+            scan(node);
+          }
+        });
+      });
+    });
+    mo.observe(document.body, { childList: true, subtree: true });
+  }
 })();
 </script>
 <script>

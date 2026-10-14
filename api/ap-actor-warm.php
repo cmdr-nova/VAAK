@@ -9,9 +9,22 @@ if (PHP_SAPI !== 'cli') {
     fwrite(STDERR, "CLI only\n");
     exit(1);
 }
-$actorId = rtrim(trim((string) ($argv[1] ?? '')), '/');
-if ($actorId === '' || !str_starts_with(strtolower($actorId), 'https://') || !filter_var($actorId, FILTER_VALIDATE_URL)) {
+$force = false;
+$actorId = '';
+foreach (array_slice($argv, 1) as $arg) {
+    if ($arg === '--force') {
+        $force = true;
+        continue;
+    }
+    if ($actorId === '' && is_string($arg) && str_starts_with(strtolower($arg), 'https://')) {
+        $actorId = rtrim(trim($arg), '/');
+    }
+}
+if ($actorId === '' || !filter_var($actorId, FILTER_VALIDATE_URL)) {
     exit(1);
+}
+if ($force) {
+    $GLOBALS['ap_remote_actor_force_refresh'] = true;
 }
 $lockPath = sys_get_temp_dir() . '/vaak-actor-' . hash('sha256', $actorId) . '.lock';
 $lock = @fopen($lockPath, 'c+');
