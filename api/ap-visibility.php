@@ -164,6 +164,193 @@ function ap_visibility_public_status(array $status, int $depth = 0): bool
     return true;
 }
 
+/**
+ * Batch the events, outbox, and mention reads for one notification page.
+ * The memo is only valid until the caller unsets it. A later request that
+ * does not prefetch must run the original per-status queries.
+ *
+ * @param list<array<string,mixed>> $statuses notification rows or status objects
+ */
+function ap_visibility_notification_page_prefetch(array $statuses, int $ownerUserId): void
+{
+    unset($GLOBALS['ap_visibility_audience_memo'][$ownerUserId]);
+    try {
+        $collected = [];
+        foreach ($statuses as $row) {
+            if (!is_array($row)) {
+                continue;
+            }
+            if (is_array($row['status'] ?? null) && !isset($row['visibility'])) {
+                ap_visibility_collect_audience_status($row['status'], $collected, 0);
+            } else {
+                ap_visibility_collect_audience_status($row, $collected, 0);
+            }
+        }
+        $uris = [];
+        foreach ($collected as $status) {
+            $uri = rtrim(explode('#', trim((string) ($status['uri'] ?? $status['url'] ?? '')), 2)[0], '/');
+            if ($uri !== '' && (str_starts_with($uri, 'https://') || str_starts_with($uri, 'http://'))) {
+                $uris[$uri] = true;
+            }
+        }
+        $uris = array_keys($uris);
+        if ($uris === []) {
+            $GLOBALS['ap_visibility_audience_memo'][$ownerUserId] = [];
+            return;
+        }
+        $forms = [];
+        foreach ($uris as $uri) {
+            $forms[] = $uri;
+            $forms[] = $uri . '/';
+        }
+        $marks = implode(',', array_fill(0, count($forms), '?'));
+        $db = ap_db();
+        $events = $db->prepare("SELECT id, object_id, visibility, actor_id, type FROM events
+            WHERE object_id IN ($marks)
+            AND type IN ('Create','Update','Quote','QuotePost')
+            AND action_taken IN ('log','local_observe','local_fav_update')
+            ORDER BY id DESC");
+        $events->execute($forms);
+        $eventRows = $events->fetchAll() ?: [];
+        $hasCreate = [];
+        foreach ($eventRows as $row) {
+            if (!is_array($row)) {
+                continue;
+            }
+            $key = rtrim((string) ($row['object_id'] ?? ''), '/');
+            if (in_array((string) ($row['type'] ?? ''), ['Create', 'Update'], true)) {
+                $hasCreate[$key] = true;
+            }
+        }
+        $bestEvent = [];
+        foreach ($eventRows as $row) {
+            if (!is_array($row)) {
+                continue;
+            }
+            $key = rtrim((string) ($row['object_id'] ?? ''), '/');
+            if ($key === '' || isset($bestEvent[$key])) {
+                continue;
+            }
+            $type = (string) ($row['type'] ?? '');
+            if (in_array($type, ['Quote', 'QuotePost'], true) && !empty($hasCreate[$key])) {
+                continue;
+            }
+            $bestEvent[$key] = $row;
+        }
+        $outbox = $db->prepare("SELECT id, visibility, to_json, cc_json FROM outbox_notes WHERE id IN ($marks)");
+        $outbox->execute($forms);
+        $outboxBy = [];
+        foreach ($outbox->fetchAll() ?: [] as $row) {
+            if (!is_array($row)) {
+                continue;
+            }
+            $key = rtrim((string) ($row['id'] ?? ''), '/');
+            if ($key === '') {
+                continue;
+            }
+            $outboxBy[$key][] = $row;
+        }
+        $memo = [];
+        $mentionUris = [];
+        foreach ($uris as $uri) {
+            $status = null;
+            foreach ($collected as $candidate) {
+                $candidateUri = rtrim(explode('#', trim((string) ($candidate['uri'] ?? $candidate['url'] ?? '')), 2)[0], '/');
+                if ($candidateUri === $uri) {
+                    $status = $candidate;
+                    break;
+                }
+            }
+            $visibility = strtolower((string) ($status['visibility'] ?? 'public'));
+            $author = rtrim((string) ($status['account']['uri'] ?? ''), '/');
+            $recipients = [];
+            if (isset($bestEvent[$uri])) {
+                $visibility = strtolower((string) ($bestEvent[$uri]['visibility'] ?? 'public'));
+                $author = rtrim((string) ($bestEvent[$uri]['actor_id'] ?? ''), '/');
+            }
+            $localRows = $outboxBy[$uri] ?? [];
+            if (count($localRows) > 1) {
+                $memo[$uri] = ['ready' => false, 'outbox_unbatched' => true];
+                continue;
+            }
+            if (count($localRows) === 1) {
+                $local = $localRows[0];
+                $visibility = strtolower((string) ($local['visibility'] ?? 'public'));
+                $author = explode('/notes/', $uri, 2)[0];
+                $recipients = array_merge(
+                    json_decode((string) ($local['to_json'] ?? '[]'), true) ?: [],
+                    json_decode((string) ($local['cc_json'] ?? '[]'), true) ?: []
+                );
+                $memo[$uri] = [
+                    'ready' => true,
+                    'visibility' => $visibility,
+                    'author' => $author,
+                    'recipients' => $recipients,
+                ];
+            } elseif (str_starts_with($uri, 'https://mkultra.monster/users/') && str_contains($uri, '/notes/')) {
+                $memo[$uri] = ['ready' => true, 'local_missing' => true];
+                continue;
+            } else {
+                $memo[$uri] = [
+                    'ready' => true,
+                    'visibility' => $visibility,
+                    'author' => $author,
+                    'recipients' => $recipients,
+                ];
+            }
+            if (!in_array($visibility, ['public', 'unlisted'], true)) {
+                $mentionUris[$uri] = true;
+            }
+        }
+        if ($mentionUris !== []) {
+            $mentionForms = [];
+            foreach (array_keys($mentionUris) as $uri) {
+                $mentionForms[] = $uri;
+                $mentionForms[] = $uri . '/';
+            }
+            $mentionMarks = implode(',', array_fill(0, count($mentionForms), '?'));
+            $mentioned = $db->prepare("SELECT object_id FROM mentions WHERE owner_user_id = ? AND deleted_at IS NULL
+                AND activity_type IN ('Create','Update','Quote','QuotePost') AND object_id IN ($mentionMarks)");
+            $mentioned->execute(array_merge([$ownerUserId], $mentionForms));
+            $hit = [];
+            foreach ($mentioned->fetchAll() ?: [] as $row) {
+                if (!is_array($row)) {
+                    continue;
+                }
+                $hit[rtrim((string) ($row['object_id'] ?? ''), '/')] = true;
+            }
+            foreach (array_keys($mentionUris) as $uri) {
+                if (!empty($memo[$uri]['ready'])) {
+                    $memo[$uri]['mentioned'] = !empty($hit[$uri]);
+                }
+            }
+        }
+        $GLOBALS['ap_visibility_audience_memo'][$ownerUserId] = $memo;
+    } catch (Throwable $e) {
+        unset($GLOBALS['ap_visibility_audience_memo'][$ownerUserId]);
+    }
+}
+
+/** @param array<string,mixed> $status @param list<array<string,mixed>> $out */
+function ap_visibility_collect_audience_status(array $status, array &$out, int $depth): void
+{
+    if ($depth > 16 || $status === []) {
+        return;
+    }
+    $out[] = $status;
+    foreach (['reblog', 'quote', 'vaak_quote_preview'] as $field) {
+        $child = $status[$field] ?? null;
+        if (!is_array($child)) {
+            continue;
+        }
+        $child = is_array($child['quoted_status'] ?? null) ? $child['quoted_status']
+            : (is_array($child['status'] ?? null) ? $child['status'] : $child);
+        if (is_array($child)) {
+            ap_visibility_collect_audience_status($child, $out, $depth + 1);
+        }
+    }
+}
+
 /** Recheck durable audiences when PHP must paint a cached notification. */
 function ap_visibility_status_audience_allowed(array $status, int $ownerUserId, int $depth = 0): bool
 {
@@ -175,7 +362,20 @@ function ap_visibility_status_audience_allowed(array $status, int $ownerUserId, 
         $visibility = strtolower((string) ($status['visibility'] ?? 'public'));
         $author = rtrim((string) ($status['account']['uri'] ?? ''), '/');
         $recipients = [];
-        if (str_starts_with($uri, 'https://') || str_starts_with($uri, 'http://')) {
+        $mentioned = null;
+        $memo = $GLOBALS['ap_visibility_audience_memo'][$ownerUserId][$uri] ?? null;
+        $useMemo = is_array($memo) && !empty($memo['ready']) && empty($memo['outbox_unbatched']);
+        if ($useMemo) {
+            if (!empty($memo['local_missing'])) {
+                return false;
+            }
+            $visibility = strtolower((string) ($memo['visibility'] ?? $visibility));
+            $author = rtrim((string) ($memo['author'] ?? $author), '/');
+            $recipients = is_array($memo['recipients'] ?? null) ? $memo['recipients'] : [];
+            if (array_key_exists('mentioned', $memo)) {
+                $mentioned = (bool) $memo['mentioned'];
+            }
+        } elseif (str_starts_with($uri, 'https://') || str_starts_with($uri, 'http://')) {
             $db = ap_db();
             $query = $db->prepare("SELECT visibility, actor_id FROM events WHERE object_id IN (?, ?)
                 AND (type IN ('Create','Update')
@@ -209,10 +409,14 @@ function ap_visibility_status_audience_allowed(array $status, int $ownerUserId, 
                 $allowed = str_starts_with($author, 'https://mkultra.monster/users/');
             }
             if (!$allowed) {
-                $query = ap_db()->prepare("SELECT 1 FROM mentions WHERE owner_user_id = ? AND deleted_at IS NULL
-                    AND activity_type IN ('Create','Update','Quote','QuotePost') AND object_id IN (?, ?) LIMIT 1");
-                $query->execute([$ownerUserId, $uri, $uri . '/']);
-                $allowed = (bool) $query->fetchColumn();
+                if ($mentioned !== null) {
+                    $allowed = $mentioned;
+                } else {
+                    $query = ap_db()->prepare("SELECT 1 FROM mentions WHERE owner_user_id = ? AND deleted_at IS NULL
+                        AND activity_type IN ('Create','Update','Quote','QuotePost') AND object_id IN (?, ?) LIMIT 1");
+                    $query->execute([$ownerUserId, $uri, $uri . '/']);
+                    $allowed = (bool) $query->fetchColumn();
+                }
             }
             if (!$allowed && in_array($visibility, ['private', 'followers', 'followers_only'], true)) {
                 $table = str_starts_with($author, 'https://mkultra.monster/users/') ? 'followers' : 'following';

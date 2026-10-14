@@ -1128,6 +1128,21 @@ SQL);
     } catch (Throwable $e) {
         error_log('[ap-db] notification index not provisioned: ' . $e->getMessage());
     }
+    // Audience checks compare rtrim(object_id, '/') and the mentions page
+    // reads live rows newest-first. migrate.php applies this block through
+    // ap_db(). The CONCURRENTLY file is not in the additive SQL loop.
+    try {
+        if (ap_schema_has_table($db, 'events') && !ap_schema_has_index($db, 'idx_events_object_key_id')) {
+            $db->exec("CREATE INDEX IF NOT EXISTS idx_events_object_key_id ON events (rtrim(object_id, '/'), id DESC)");
+            ap_schema_remember_index($db, 'idx_events_object_key_id');
+        }
+        if (ap_schema_has_table($db, 'mentions') && !ap_schema_has_index($db, 'idx_mentions_owner_live_id')) {
+            $db->exec('CREATE INDEX IF NOT EXISTS idx_mentions_owner_live_id ON mentions (owner_user_id, id DESC) WHERE deleted_at IS NULL');
+            ap_schema_remember_index($db, 'idx_mentions_owner_live_id');
+        }
+    } catch (Throwable $e) {
+        error_log('[ap-db] notification read indexes not provisioned: ' . $e->getMessage());
+    }
     try {
         if (!ap_schema_has_column($db, 'actor_profile', 'auto_unblur_sensitive')) {
             $db->exec('ALTER TABLE actor_profile ADD COLUMN auto_unblur_sensitive INTEGER NOT NULL DEFAULT 0');

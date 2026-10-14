@@ -517,17 +517,14 @@ fn same_actor(a: &str, b: &str) -> bool {
     a == b || follow_aliases(&a).iter().any(|alias| alias == &b)
 }
 
-/// Actor ids this viewer already follows. Empty on a database miss so the
-/// Follow back button still renders; a repeat follow is a no-op server-side.
-async fn load_viewer_follows(
-    cfg: &Config,
+/// Actor ids this viewer already follows. Query errors leave the set empty so
+/// the Follow back button still renders; a repeat follow is a no-op server-side.
+async fn load_viewer_follows_on(
+    db: &tokio_postgres::Client,
     owner_user_id: i64,
     viewer_actor: &str,
 ) -> HashSet<String> {
     let mut set = HashSet::new();
-    let Ok(db) = crate::db::connect(&cfg.database_url).await else {
-        return set;
-    };
     let owner = viewer_actor.trim().trim_end_matches('/').to_string();
     if owner.starts_with("https://") {
         let owner_slash = format!("{owner}/");
@@ -961,6 +958,14 @@ async fn final_page_admission(db: &tokio_postgres::Client, owner: i64, items: &m
     Ok(())
 }
 
+/// Raw favourite/reblog groups still need PHP's action forms. This uses only
+/// the envelope, before identity or status alias facts are loaded.
+fn page_needs_php_grouped_cards(items: &[Value]) -> bool {
+    group_notification_rows_with_facts(items, &GroupingFacts::default())
+        .iter()
+        .any(|grouped| grouped.count > 1 && grouped.row.get("status").is_some_and(Value::is_object))
+}
+
 /// Build Mentions fill HTML from the warm Redis list (404-equivalent via Result miss).
 pub async fn mentions_html_fill(
     cfg: &Config,
@@ -971,6 +976,11 @@ pub async fn mentions_html_fill(
 ) -> Result<Option<MentionsHtmlReport>> {
     let limit = limit.clamp(1, 60);
     let Some(mut report) = html_page_selected(cfg, owner_user_id, limit, types, max_id).await? else { return Ok(None); };
+    // Grouped like/boost cards still need PHP's CSRF forms. Decide that from
+    // the raw envelope before opening a database connection.
+    if page_needs_php_grouped_cards(&report.items) {
+        return Ok(None);
+    }
     let policy_db = crate::db::connect(&cfg.database_url).await?;
     require_active_owner(&policy_db, owner_user_id).await?;
     // A pending first-All Phyrian offer still needs the actual PHP producer.
@@ -982,89 +992,44 @@ pub async fn mentions_html_fill(
 
     // Replies and quote-boosts need the signed-in actor or the ⋯ menu is omitted.
     let viewer_actor = active_viewer_actor(&policy_db, owner_user_id).await?;
-    if let Ok(db) = crate::db::connect(&cfg.database_url).await {
-        if let Ok(moderation) = crate::hidden::load_viewer_moderation(&db, owner_user_id).await {
-            for item in report.items.iter_mut() {
-                if let Some(st) = item.get_mut("status") {
-                    notif_embed::stamp_viewer_moderation_tree(st, &moderation);
-                }
-            }
-        }
-        // Notification envelopes do not carry this viewer's fav/boost/bookmark.
-        let mut nested = Vec::new();
-        let mut nested_at = Vec::new();
-        for (idx, item) in report.items.iter().enumerate() {
-            if let Some(st) = item.get("status").filter(|v| v.is_object()) {
-                nested.push(st.clone());
-                nested_at.push(idx);
-            }
-        }
-        if !nested.is_empty() {
-            let _ = crate::interaction_flags::apply_to_statuses(
-                &db,
-                owner_user_id,
-                &mut nested,
-            )
-            .await;
-            let _ = crate::home_hydrate_ranked::attach_bsky_link_facets(&db, &mut nested).await;
-            let _ = crate::home_hydrate_ranked::attach_ask_identities(&db, &mut nested).await;
-            for (idx, st) in nested_at.into_iter().zip(nested) {
-                if let Some(slot) = report.items[idx].get_mut("status") {
-                    *slot = st;
-                }
+    if let Ok(moderation) = crate::hidden::load_viewer_moderation(&policy_db, owner_user_id).await {
+        for item in report.items.iter_mut() {
+            if let Some(st) = item.get_mut("status") {
+                notif_embed::stamp_viewer_moderation_tree(st, &moderation);
             }
         }
     }
-
-    // Also write nest fragment cache while painting so PHP/Axum embed path stays warm.
-    let mut redis = crate::redis_util::connect(&cfg.redis_url).await.ok();
+    // Notification envelopes do not carry this viewer's fav/boost/bookmark.
+    let mut nested = Vec::new();
+    let mut nested_at = Vec::new();
+    for (idx, item) in report.items.iter().enumerate() {
+        if let Some(st) = item.get("status").filter(|v| v.is_object()) {
+            nested.push(st.clone());
+            nested_at.push(idx);
+        }
+    }
+    if !nested.is_empty() {
+        let _ = crate::interaction_flags::apply_to_statuses(
+            &policy_db,
+            owner_user_id,
+            &mut nested,
+        )
+        .await;
+        let _ = crate::home_hydrate_ranked::attach_bsky_link_facets(&policy_db, &mut nested).await;
+        let _ = crate::home_hydrate_ranked::attach_ask_identities(&policy_db, &mut nested).await;
+        for (idx, st) in nested_at.into_iter().zip(nested) {
+            if let Some(slot) = report.items[idx].get_mut("status") {
+                *slot = st;
+            }
+        }
+    }
 
     let mut html = String::with_capacity(report.items.len() * 800);
     let next_max_id = report.next_max_id.clone();
 
-    // Fragment warming uses only initially admitted rows. The response is
-    // granted again below after the awaited writes; raw consumption is separate.
-    for item in &report.items {
-        if !item.is_object() {
-            continue;
-        }
-        // Warm nest fragment key when status present (hide_header for mention/quote).
-        if let Some(st) = item.get("status").filter(|v| v.is_object()) {
-            let n_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
-            let hide = matches!(n_type, "mention" | "quote");
-            let uri = st
-                .get("uri")
-                .and_then(|v| v.as_str())
-                .or_else(|| st.get("url").and_then(|v| v.as_str()))
-                .unwrap_or("")
-                .trim_end_matches('/');
-            let sid = st.get("id").and_then(|v| v.as_str()).unwrap_or("");
-            let fav = st
-                .get("favourited")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            let reblog = st
-                .get("reblogged")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            let bookmarked = st
-                .get("bookmarked")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            if !uri.is_empty() {
-                let key =
-                    notif_embed::frag_key(owner_user_id, uri, hide, fav, reblog, bookmarked, sid);
-                let frag = paint_lean_embed_from(st, hide, "mentions", &viewer_actor, true);
-                if let Some(ref mut r) = redis {
-                    let _ = notif_embed::set_embed_html(r, &key, &frag).await;
-                }
-            }
-        }
-    }
-
-    // All enrichment and Redis writes have finished. Facts are presentation-only;
-    // the last awaited operation grants both original and canonical sources.
-    let following = load_viewer_follows(cfg, owner_user_id, &viewer_actor).await;
+    // Facts are presentation-only. The last awaited grant covers both the
+    // original status and any canonical alias before HTML is returned.
+    let following = load_viewer_follows_on(&policy_db, owner_user_id, &viewer_actor).await;
     anyhow::ensure!(active_viewer_actor(&policy_db, owner_user_id).await? == viewer_actor, "notification owner actor changed");
     let facts = grouping_facts(&policy_db, &report.items).await?;
     final_page_admission(&policy_db, owner_user_id, &mut report.items, &facts).await?;
@@ -1081,6 +1046,36 @@ pub async fn mentions_html_fill(
     // Recover this whole fragment until that complete card contract is native.
     if grouped_rows.iter().any(|grouped| grouped.count > 1 && grouped.row.get("status").is_some_and(Value::is_object)) {
         return Ok(None);
+    }
+    // Fragment cache is a side effect of a page we actually return. A miss
+    // must not publish HTML that skipped the final audience grant.
+    if let Ok(mut redis) = crate::redis_util::connect(&cfg.redis_url).await {
+        let mut embeds = Vec::new();
+        for item in &report.items {
+            if !item.is_object() {
+                continue;
+            }
+            if let Some(st) = item.get("status").filter(|v| v.is_object()) {
+                let n_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                let hide = matches!(n_type, "mention" | "quote");
+                let uri = st
+                    .get("uri")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| st.get("url").and_then(|v| v.as_str()))
+                    .unwrap_or("")
+                    .trim_end_matches('/');
+                let sid = st.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                let fav = st.get("favourited").and_then(|v| v.as_bool()).unwrap_or(false);
+                let reblog = st.get("reblogged").and_then(|v| v.as_bool()).unwrap_or(false);
+                let bookmarked = st.get("bookmarked").and_then(|v| v.as_bool()).unwrap_or(false);
+                if !uri.is_empty() {
+                    let key = notif_embed::frag_key(owner_user_id, uri, hide, fav, reblog, bookmarked, sid);
+                    let frag = paint_lean_embed_from(st, hide, "mentions", &viewer_actor, true);
+                    embeds.push((key, frag));
+                }
+            }
+        }
+        let _ = notif_embed::set_embed_html_many(&mut redis, &embeds).await;
     }
     // Like/boost avatar-stack grouping (0.7.3) — parity with PHP stream.
     for grouped in grouped_rows {
