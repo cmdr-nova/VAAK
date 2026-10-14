@@ -1656,10 +1656,11 @@ fn quote_url_for_dedupe(st: &Value) -> String {
         .or_else(|| st.get("vaak_quote_preview").filter(|v| v.is_object()))
     {
         if let Some(qs) = q.get("quoted_status").filter(|v| v.is_object()) {
-            let u = qs
+            let displayed = crate::quote_media::displayed_quoted_status(qs);
+            let u = displayed
                 .get("url")
                 .and_then(|v| v.as_str())
-                .or_else(|| qs.get("uri").and_then(|v| v.as_str()))
+                .or_else(|| displayed.get("uri").and_then(|v| v.as_str()))
                 .unwrap_or("");
             if !u.is_empty() {
                 return u.to_string();
@@ -1690,7 +1691,7 @@ fn quote_preview_status<'a>(quote: &'a Value) -> &'a Value {
 }
 
 fn normalized_quote_preview(quote: &Value) -> Value {
-    let mut nested = quote_preview_status(quote).clone();
+    let mut nested = crate::quote_media::displayed_quoted_status(quote_preview_status(quote));
     // Some Wafrn/Mastodon bridges keep attachment previews on the envelope,
     // not on quoted_status.  PHP merges those before entity serialization;
     // do the same so quote media is not silently lost in Axum cards.
@@ -1921,6 +1922,30 @@ fn reply_cw_query(spoiler: &str, sensitive: bool) -> String {
         q.push_str("&sensitive=1");
     }
     q
+}
+
+fn resolvable_status_uri(status: &Value) -> String {
+    let raw = status
+        .get("uri")
+        .and_then(|v| v.as_str())
+        .or_else(|| status.get("url").and_then(|v| v.as_str()))
+        .unwrap_or("");
+    let trimmed = raw.trim();
+    let stripped = crate::library::actions::strip_announce_fragment(trimmed);
+    let base = if stripped.len() != trimmed.len() { stripped } else { trimmed };
+    base.trim_end_matches('/').to_string()
+}
+
+/// Status-view id for Open, timestamps, and Copy link.
+/// Boost fragments are already gone. Bluesky at:// ids become the DID web URL.
+fn status_open_ref(status: &Value, uri: &str) -> String {
+    if uri.starts_with("at://") || uri.starts_with("bsky:") {
+        let converted = bsky_https_object_ref(status, uri);
+        if converted.starts_with("https://") && converted != "https://bsky.app/" {
+            return converted.trim_end_matches('/').to_string();
+        }
+    }
+    uri.to_string()
 }
 
 fn bsky_https_object_ref(st: &Value, uri: &str) -> String {
@@ -2319,7 +2344,7 @@ fn paint_moderation_overflow(
         .get("_vaak_viewer_block_id")
         .and_then(|v| v.as_i64())
         .unwrap_or(0);
-    let object_raw = object_id.trim().trim_end_matches('/');
+    let object_raw = crate::library::actions::strip_announce_fragment(object_id.trim()).trim_end_matches('/');
     let object = if object_raw.starts_with("https://") {
         object_raw
     } else {
@@ -2327,8 +2352,9 @@ fn paint_moderation_overflow(
             .get("url")
             .and_then(|v| v.as_str())
             .filter(|u| u.starts_with("https://"))
+            .map(|u| crate::library::actions::strip_announce_fragment(u.trim()).trim_end_matches('/'))
+            .filter(|u| u.starts_with("https://"))
             .unwrap_or(object_raw)
-            .trim_end_matches('/')
     };
     let action_base = format!("/vaak/?view={}", urlencoding_encode(from_q));
     let is_bsky_object = object.to_ascii_lowercase().contains("bsky.app");
@@ -2367,16 +2393,11 @@ fn paint_moderation_overflow(
                     "Remote"
             }
         ));
-        let copy_href = format!(
-            "https://mkultra.monster/vaak/?view=status&object={}&from={}",
-            urlencoding_encode(object),
-            urlencoding_encode(from_q)
-        );
-        menu.push_str(&format!(
-            "<button type=\"button\" class=\"menu-action\" data-copy-value=\"{}\" title=\"Copy link to post\">Copy link</button>",
-            esc(&copy_href)
-        ));
     }
+        menu.push_str(&crate::library::actions::copy_link_button(object, from_q));
+    }
+    if !object.starts_with("https://") {
+        menu.push_str(&crate::library::actions::copy_link_button(object_id, from_q));
     }
 
     // Block for me
@@ -2570,6 +2591,7 @@ fn paint_own_post_controls(status: &Value, from_q: &str, uri: &str, sid: &str) -
         "<a class=\"menu-action\" href=\"{}\">Open</a>",
         esc(&open_href)
     ));
+    menu.push_str(&crate::library::actions::copy_link_button(uri, from_q));
     menu.push_str(&format!(
         "<a class=\"menu-action js-edit-post\" href=\"{href}\" data-note-id=\"{nid}\" \
          data-return-view=\"{rv}\" data-content-b64=\"{cb}\" data-spoiler-b64=\"{sb}\" data-sensitive=\"{sens}\">Edit</a>",
@@ -2620,12 +2642,8 @@ fn paint_lean_timeline_actions(status: &Value, from: &str, viewer_actor: &str) -
         .and_then(|v| v.as_str())
         .or_else(|| account.get("url").and_then(|v| v.as_str()))
         .unwrap_or("");
-    let uri = status
-        .get("uri")
-        .and_then(|v| v.as_str())
-        .or_else(|| status.get("url").and_then(|v| v.as_str()))
-        .unwrap_or("")
-        .trim_end_matches('/');
+    let uri_owned = resolvable_status_uri(status);
+    let uri = uri_owned.as_str();
     let url_hint = status.get("url").and_then(|v| v.as_str()).unwrap_or("");
     let sid = status
         .get("id")
@@ -2640,12 +2658,8 @@ fn paint_lean_timeline_actions(status: &Value, from: &str, viewer_actor: &str) -
         .get("reblog")
         .filter(|v| v.is_object())
         .unwrap_or(status);
-    let interaction_uri = interaction
-        .get("uri")
-        .and_then(|v| v.as_str())
-        .or_else(|| interaction.get("url").and_then(|v| v.as_str()))
-        .unwrap_or("")
-        .trim_end_matches('/');
+    let interaction_uri_owned = resolvable_status_uri(interaction);
+    let interaction_uri = if interaction_uri_owned.is_empty() { uri } else { interaction_uri_owned.as_str() };
     let interaction_sid = interaction
         .get("id")
         .and_then(|v| v.as_str())
@@ -2788,6 +2802,7 @@ fn paint_lean_timeline_actions(status: &Value, from: &str, viewer_actor: &str) -
                 "<a class=\"menu-action\" href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\">Open</a>",
                 esc(uri)
             ));
+            overflow.push_str(&crate::library::actions::copy_link_button(uri, from_q));
         }
         if rss_feed > 0 {
             overflow.push_str(&format!(
@@ -3062,18 +3077,20 @@ fn paint_lean_timeline_actions(status: &Value, from: &str, viewer_actor: &str) -
             actions.push_str(&paint_own_post_controls(status, from_q, uri, &sid));
         } else if !uri.is_empty() {
             // Personal Block / Mute / Report (+ Open / Remote) — PHP block_quick_actions.
+            let link_uri = status_open_ref(status, uri);
             let mod_menu =
-                paint_moderation_overflow(from_q, actor_ref, uri, viewer_actor, status);
+                paint_moderation_overflow(from_q, actor_ref, &link_uri, viewer_actor, status);
             if !mod_menu.is_empty() {
                 actions.push_str(&mod_menu);
             } else {
-                actions.push_str(&crate::library::actions::read_only_overflow(uri,from_q,&remote_object_href(uri,url_hint)));
+                actions.push_str(&crate::library::actions::read_only_overflow(&link_uri,from_q,&remote_object_href(&link_uri,url_hint)));
             }
         }
     }
 
     if actions.is_empty() {
-        return if uri.is_empty(){String::new()}else{format!("<div class=\"tweet-actions\">{}</div>",crate::library::actions::read_only_overflow(uri,from_q,&remote_object_href(uri,url_hint)))};
+        let link_uri = status_open_ref(status, uri);
+        return if link_uri.is_empty(){String::new()}else{format!("<div class=\"tweet-actions\">{}</div>",crate::library::actions::read_only_overflow(&link_uri,from_q,&remote_object_href(&link_uri,url_hint)))};
     }
 
     format!("<div class=\"tweet-actions\">{actions}</div>")
@@ -3680,12 +3697,8 @@ pub fn paint_lean_embed_from(
         .and_then(|v| v.as_str())
         .or_else(|| account.get("url").and_then(|v| v.as_str()))
         .unwrap_or("");
-    let uri = status
-        .get("uri")
-        .and_then(|v| v.as_str())
-        .or_else(|| status.get("url").and_then(|v| v.as_str()))
-        .unwrap_or("")
-        .trim_end_matches('/');
+    let uri_owned = resolvable_status_uri(status);
+    let uri = uri_owned.as_str();
     let created = status
         .get("created_at")
         .and_then(|v| v.as_str())
@@ -3837,7 +3850,7 @@ pub fn paint_lean_embed_from(
         } else if !uri.is_empty() {
             let status_href = format!(
                 "?view=status&object={}&from={}",
-                urlencoding_encode(uri),
+                urlencoding_encode(&status_open_ref(status, uri)),
                 urlencoding_encode(from_q)
             );
             format!(
@@ -3967,7 +3980,8 @@ pub fn paint_lean_embed_from(
         inner.push_str(&paint_lean_timeline_actions(status, from, viewer_actor));
     } else if show_actions && !uri.is_empty() {
         let from_q = if from.is_empty() { "mentions" } else { from };
-        inner.push_str(&format!("<div class=\"tweet-actions\">{}</div>",crate::library::actions::read_only_overflow(uri,from_q,&remote_object_href(uri,status.get("url").and_then(Value::as_str).unwrap_or("")))));
+        let link_uri = status_open_ref(status, uri);
+        inner.push_str(&format!("<div class=\"tweet-actions\">{}</div>",crate::library::actions::read_only_overflow(&link_uri,from_q,&remote_object_href(&link_uri,status.get("url").and_then(Value::as_str).unwrap_or("")))));
     }
 
     let wrap_class = if hide_header {
@@ -5456,6 +5470,248 @@ mod tests {
         assert!(html.contains("anonymous asked"), "{html}");
         assert!(!html.contains("ask-divider"), "{html}");
         assert!(html.find("ask-container").unwrap() < html.find("feed-body").unwrap(), "{html}");
+    }
+
+    fn account(acct: &str, uri: &str) -> serde_json::Value {
+        json!({"acct": acct, "display_name": acct, "uri": uri, "url": uri, "avatar": "https://example.test/a.png"})
+    }
+
+    fn image(url: &str) -> serde_json::Value {
+        json!({"type": "image", "url": url, "preview_url": url})
+    }
+
+    fn assert_quote_media_inside(html: &str, quoted: &str, parent: Option<&str>) {
+        let quote = html.find("class=\"quote-block\"").unwrap_or_else(|| panic!("missing quote: {html}"));
+        let media = html.find(quoted).unwrap_or_else(|| panic!("missing quoted media: {html}"));
+        assert!(media > quote, "quoted media rendered outside the quote: {html}");
+        assert!(!html[..quote].contains(quoted), "quoted media also rendered outside the quote: {html}");
+        if let Some(parent) = parent {
+            let at = html.find(parent).unwrap_or_else(|| panic!("missing parent media: {html}"));
+            assert!(at < quote, "parent media moved into the quote: {html}");
+        }
+    }
+
+    fn assert_copy(html: &str, object: &str, view: &str) {
+        let value = format!(
+            "data-copy-value=\"https://mkultra.monster/vaak/?view=status&amp;object={}&amp;from={}\"",
+            urlencoding_encode(object),
+            urlencoding_encode(view)
+        );
+        assert!(html.contains(&value), "copy link missing for {object} on {view}: {html}");
+        assert!(html.contains(">Copy link</button>"), "{html}");
+        assert!(!html.contains("%23announce-") && !html.contains("#announce-"), "boost wrapper id leaked: {html}");
+    }
+
+    #[test]
+    fn timeline_quote_boost_combinations_keep_media_links_and_copy() {
+        let viewer = "https://mkultra.monster/users/fixture";
+        let quote_post = "https://quoter.example/users/quoter/statuses/2";
+        let original = "https://origin.example/users/author/statuses/1";
+        let local_note = "https://mkultra.monster/users/alice/notes/abc";
+        let own_note = "https://mkultra.monster/users/fixture/notes/ownquote";
+        let bsky = "https://bsky.app/profile/did:plc:quoted/post/rkey";
+        let quoted_media = "https://media.test/quoted.jpg";
+        let parent_media = "https://media.test/parent.jpg";
+
+        let boost_of_quote = json!({
+            "id": "announce-wrapper",
+            "uri": format!("{quote_post}#announce-7"),
+            "url": format!("{quote_post}#announce-7"),
+            "content": "",
+            "account": account("booster@remote.example", "https://remote.example/users/booster"),
+            "media_attachments": [],
+            "reblog": {
+                "id": "2",
+                "uri": quote_post,
+                "url": quote_post,
+                "content": "<p>commentary from the quoter</p>",
+                "account": account("quoter@quoter.example", "https://quoter.example/users/quoter"),
+                "media_attachments": [image(parent_media), image(quoted_media)],
+                "quote": {"quoted_status": {
+                    "id": "1",
+                    "uri": original,
+                    "url": original,
+                    "content": "<p>original with media</p>",
+                    "account": account("author@origin.example", "https://origin.example/users/author"),
+                    "media_attachments": [image(quoted_media)]
+                }}
+            }
+        });
+        let quote_of_boost = json!({
+            "id": "quote-of-boost",
+            "uri": quote_post,
+            "url": quote_post,
+            "content": "<p>commentary from the quoter</p>",
+            "account": account("quoter@quoter.example", "https://quoter.example/users/quoter"),
+            "media_attachments": [image(quoted_media)],
+            "quote": {"quoted_status": {
+                "id": "announce-wrapper",
+                "uri": format!("{original}#announce-9"),
+                "url": format!("{original}#announce-9"),
+                "content": "",
+                "account": account("booster@remote.example", "https://remote.example/users/booster"),
+                "media_attachments": [],
+                "reblog": {
+                    "id": "1",
+                    "uri": original,
+                    "url": original,
+                    "content": "<p>original with media</p>",
+                    "account": account("author@origin.example", "https://origin.example/users/author"),
+                    "media_attachments": [image(quoted_media)]
+                }
+            }}
+        });
+        let plain_quote = json!({
+            "id": "plain-quote",
+            "uri": quote_post,
+            "url": quote_post,
+            "content": "<p>commentary from the quoter</p>",
+            "account": account("quoter@quoter.example", "https://quoter.example/users/quoter"),
+            "media_attachments": [],
+            "quote": {"quoted_status": {
+                "id": "1", "uri": original, "url": original, "content": "<p>original with media</p>",
+                "account": account("author@origin.example", "https://origin.example/users/author"),
+                "media_attachments": [image(quoted_media)]
+            }}
+        });
+        let bsky_quote = json!({
+            "id": "bsky-quote",
+            "uri": quote_post,
+            "url": quote_post,
+            "content": "<p>commentary from the quoter</p>",
+            "account": account("quoter@quoter.example", "https://quoter.example/users/quoter"),
+            "media_attachments": [],
+            "quote": {"quoted_status": {
+                "id": "bsky:rkey",
+                "uri": "at://did:plc:quoted/app.bsky.feed.post/rkey",
+                "url": bsky,
+                "source": "bluesky",
+                "content": "<p>bluesky original</p>",
+                "account": account("quoted.bsky.social", "https://bsky.app/profile/did:plc:quoted"),
+                "media_attachments": [image(quoted_media)]
+            }}
+        });
+        let bsky_boost_quote = json!({
+            "id": "quote-of-bsky-boost",
+            "uri": quote_post,
+            "url": quote_post,
+            "content": "<p>commentary from the quoter</p>",
+            "account": account("quoter@quoter.example", "https://quoter.example/users/quoter"),
+            "media_attachments": [image(quoted_media)],
+            "quote": {"quoted_status": {
+                "content": "",
+                "uri": "at://did:plc:booster/app.bsky.feed.post/boost#announce-4",
+                "url": "https://bsky.app/profile/did:plc:booster/post/boost#announce-4",
+                "media_attachments": [],
+                "account": account("booster.bsky.social", "https://bsky.app/profile/did:plc:booster"),
+                "reblog": {
+                    "uri": "at://did:plc:quoted/app.bsky.feed.post/rkey",
+                    "url": bsky,
+                    "content": "<p>bluesky original</p>",
+                    "account": account("quoted.bsky.social", "https://bsky.app/profile/did:plc:quoted"),
+                    "media_attachments": [image(quoted_media)]
+                }
+            }}
+        });
+        let local_quote = json!({
+            "id": "local-quote",
+            "uri": quote_post,
+            "url": quote_post,
+            "content": "<p>commentary from the quoter</p>",
+            "account": account("quoter@quoter.example", "https://quoter.example/users/quoter"),
+            "media_attachments": [],
+            "quote": {"quoted_status": {
+                "id": "abc", "uri": local_note, "url": local_note, "content": "<p>local original</p>",
+                "account": account("alice", "https://mkultra.monster/users/alice"),
+                "media_attachments": [image(quoted_media)]
+            }}
+        });
+        let own_boost = json!({
+            "id": "own-announce",
+            "uri": format!("{own_note}#announce-3"),
+            "content": "",
+            "account": account("fixture", viewer),
+            "reblog": {
+                "id": "8",
+                "uri": own_note,
+                "url": own_note,
+                "content": "<p>my quote</p>",
+                "account": account("fixture", viewer),
+                "media_attachments": [image(quoted_media)],
+                "quote": {"quoted_status": {
+                    "uri": original, "url": original, "content": "<p>original with media</p>",
+                    "account": account("author@origin.example", "https://origin.example/users/author"),
+                    "media_attachments": [image(quoted_media)]
+                }}
+            }
+        });
+
+        fn stamp_created(value: &mut serde_json::Value) {
+            if let Some(obj) = value.as_object_mut() {
+                if obj.contains_key("uri") {
+                    obj.entry("created_at").or_insert_with(|| json!("2026-10-05T05:00:00.000Z"));
+                }
+                for child in obj.values_mut() {
+                    stamp_created(child);
+                }
+            }
+        }
+        let mut fixtures = [
+            boost_of_quote, quote_of_boost, plain_quote, bsky_quote, bsky_boost_quote, local_quote, own_boost,
+        ];
+        for fixture in &mut fixtures {
+            stamp_created(fixture);
+        }
+        let boost_of_quote = &fixtures[0];
+        let quote_of_boost = &fixtures[1];
+        let plain_quote = &fixtures[2];
+        let bsky_quote = &fixtures[3];
+        let bsky_boost_quote = &fixtures[4];
+        let local_quote = &fixtures[5];
+        let own_boost = &fixtures[6];
+
+        for view in ["home", "local", "feed"] {
+            let boosted = paint_lean_feed_card_opts(&boost_of_quote, view, viewer);
+            assert_quote_media_inside(&boosted, quoted_media, Some(parent_media));
+            assert_copy(&boosted, quote_post, view);
+            assert!(boosted.contains("commentary from the quoter"), "{boosted}");
+            assert!(!boosted.contains("announce/"), "{boosted}");
+
+            let quoted_boost = paint_lean_feed_card_opts(&quote_of_boost, view, viewer);
+            assert_quote_media_inside(&quoted_boost, quoted_media, None);
+            assert_copy(&quoted_boost, quote_post, view);
+            assert!(quoted_boost.contains(&format!("object={}&amp;from={view}", urlencoding_encode(original))) || quoted_boost.contains(&format!("object={}&from={view}", urlencoding_encode(original))), "{quoted_boost}");
+
+            let plain = paint_lean_feed_card_opts(&plain_quote, view, viewer);
+            assert_quote_media_inside(&plain, quoted_media, None);
+            assert_copy(&plain, quote_post, view);
+
+            let bluesky = paint_lean_feed_card_opts(&bsky_quote, view, viewer);
+            assert_quote_media_inside(&bluesky, quoted_media, None);
+            assert_copy(&bluesky, quote_post, view);
+            assert!(bluesky.contains(&urlencoding_encode(bsky)), "bluesky quote did not open the original: {bluesky}");
+
+            let bluesky_boost = paint_lean_feed_card_opts(&bsky_boost_quote, view, viewer);
+            assert_quote_media_inside(&bluesky_boost, quoted_media, None);
+            assert_copy(&bluesky_boost, quote_post, view);
+            assert!(bluesky_boost.contains(&urlencoding_encode(bsky)), "{bluesky_boost}");
+
+            let local = paint_lean_feed_card_opts(&local_quote, view, viewer);
+            assert_quote_media_inside(&local, quoted_media, None);
+            assert_copy(&local, quote_post, view);
+            assert!(local.contains(&urlencoding_encode(local_note)), "{local}");
+
+            let own = paint_lean_feed_card_opts(&own_boost, view, viewer);
+            assert_quote_media_inside(&own, quoted_media, None);
+            assert_copy(&own, own_note, view);
+        }
+
+        let mut unresolved = plain_quote.clone();
+        unresolved["media_attachments"] = json!([image(parent_media), image(quoted_media)]);
+        unresolved["quote"]["quoted_status"]["media_attachments"] = json!([]);
+        let html = paint_lean_feed_card_opts(&unresolved, "home", viewer);
+        let quote = html.find("class=\"quote-block\"").unwrap();
+        assert!(html.find(quoted_media).unwrap() < quote, "unproved parent media moved inside: {html}");
     }
 
 }
