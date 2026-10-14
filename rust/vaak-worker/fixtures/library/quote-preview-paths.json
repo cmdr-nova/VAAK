@@ -1,0 +1,263 @@
+{
+  "cached_ap": {
+    "row": {
+      "status_id": "90",
+      "object_id": "https://remote.test/users/alice/statuses/parent",
+      "created_at": "2024-06-03T08:00:00Z",
+      "target_actor": "https://remote.test/users/alice"
+    },
+    "parent": {
+      "id": 11,
+      "type": "Create",
+      "object_id": "https://remote.test/users/alice/statuses/parent",
+      "actor_id": "https://remote.test/users/alice",
+      "summary": "See this\n↪ QT: https://quoted.test/users/bob/statuses/9",
+      "created_at": "2024-06-03T08:00:00Z",
+      "visibility": "public",
+      "sensitive": false,
+      "spoiler_text": ""
+    },
+    "target": {
+      "id": 12,
+      "type": "Create",
+      "object_id": "https://quoted.test/users/bob/statuses/9",
+      "actor_id": "https://quoted.test/users/bob",
+      "summary": "Actual current quote body",
+      "created_at": "2024-06-03T07:00:00Z",
+      "visibility": "public",
+      "sensitive": false,
+      "spoiler_text": ""
+    },
+    "actors": [
+      {"actor_id": "https://remote.test/users/alice", "username": "alice", "display_name": "Alice Remote", "host": "remote.test"},
+      {"actor_id": "https://quoted.test/users/bob", "username": "bob", "display_name": "Bob Quoted", "host": "quoted.test"}
+    ]
+  },
+  "local_media": {
+    "row": {
+      "status_id": "91",
+      "object_id": "https://remote.test/users/alice/statuses/media-parent",
+      "created_at": "2024-06-03T09:00:00Z",
+      "target_actor": "https://remote.test/users/alice"
+    },
+    "parent": {
+      "id": 13,
+      "type": "Create",
+      "object_id": "https://remote.test/users/alice/statuses/media-parent",
+      "actor_id": "https://remote.test/users/alice",
+      "summary": "Look\n↪ QT: https://mkultra.monster/users/peer/notes/quotedpic",
+      "created_at": "2024-06-03T09:00:00Z",
+      "visibility": "public",
+      "sensitive": false,
+      "spoiler_text": ""
+    },
+    "local": {
+      "local_id": 7,
+      "note_id": "https://mkultra.monster/users/peer/notes/quotedpic",
+      "content_text": "Quoted with a picture",
+      "published": "2024-06-03T08:30:00Z",
+      "visibility": "public",
+      "sensitive": false,
+      "spoiler_text": ""
+    },
+    "media": [
+      {"local_id": 7, "public_url": "https://media.test/quoted.jpg", "preview_url": "https://media.test/quoted.jpg", "media_type": "image"}
+    ],
+    "actors": [
+      {"actor_id": "https://remote.test/users/alice", "username": "alice", "display_name": "Alice Remote", "host": "remote.test"}
+    ]
+  },
+  "bluesky": {
+    "row": {
+      "status_id": "92",
+      "object_id": "https://remote.test/users/alice/statuses/bsky-parent",
+      "created_at": "2024-06-03T10:00:00Z",
+      "target_actor": "https://remote.test/users/alice"
+    },
+    "parent": {
+      "id": 14,
+      "type": "Create",
+      "object_id": "https://remote.test/users/alice/statuses/bsky-parent",
+      "actor_id": "https://remote.test/users/alice",
+      "summary": "From the other network\n↪ QT: https://bsky.app/profile/alice.test/post/abc123",
+      "created_at": "2024-06-03T10:00:00Z",
+      "visibility": "public",
+      "sensitive": false,
+      "spoiler_text": ""
+    },
+    "bsky": {
+      "handle": "alice.test",
+      "text": "Bluesky quoted line",
+      "url": "https://bsky.app/profile/alice.test/post/abc123",
+      "media": [{"type": "image", "url": "https://cdn.test/bsky-quote.jpg", "preview_url": "https://cdn.test/bsky-quote.jpg"}],
+      "sensitive": true
+    },
+    "actors": [
+      {"actor_id": "https://remote.test/users/alice", "username": "alice", "display_name": "Alice Remote", "host": "remote.test"}
+    ]
+  },
+  "cold_status": {
+    "row": {
+      "status_id": "93",
+      "object_id": "https://remote.test/users/alice/statuses/cold-parent",
+      "created_at": "2024-06-03T11:00:00Z",
+      "target_actor": "https://remote.test/users/alice"
+    },
+    "parent": {
+      "id": 15,
+      "type": "Create",
+      "object_id": "https://remote.test/users/alice/statuses/cold-parent",
+      "actor_id": "https://remote.test/users/alice",
+      "summary": "Still waiting\n↪ QT: https://quoted.test/users/bob/statuses/missing",
+      "created_at": "2024-06-03T11:00:00Z",
+      "visibility": "public",
+      "sensitive": false,
+      "spoiler_text": ""
+    },
+    "actors": [
+      {"actor_id": "https://remote.test/users/alice", "username": "alice", "display_name": "Alice Remote", "host": "remote.test"}
+    ]
+  },
+  "unavailable": {
+    "row": {
+      "status_id": "94",
+      "object_id": "https://remote.test/users/alice/statuses/article-parent",
+      "created_at": "2024-06-03T12:00:00Z",
+      "target_actor": "https://remote.test/users/alice"
+    },
+    "parent": {
+      "id": 16,
+      "type": "Create",
+      "object_id": "https://remote.test/users/alice/statuses/article-parent",
+      "actor_id": "https://remote.test/users/alice",
+      "summary": "Not a post\n↪ QT: https://www.youtube.com/watch?v=abcdefghijk",
+      "created_at": "2024-06-03T12:00:00Z",
+      "visibility": "public",
+      "sensitive": false,
+      "spoiler_text": ""
+    },
+    "actors": [
+      {"actor_id": "https://remote.test/users/alice", "username": "alice", "display_name": "Alice Remote", "host": "remote.test"}
+    ]
+  },
+  "deleted_target": {
+    "row": {
+      "status_id": "95",
+      "object_id": "https://remote.test/users/alice/statuses/deleted-parent",
+      "created_at": "2024-06-03T13:00:00Z",
+      "target_actor": "https://remote.test/users/alice"
+    },
+    "parent": {
+      "id": 17,
+      "type": "Create",
+      "object_id": "https://remote.test/users/alice/statuses/deleted-parent",
+      "actor_id": "https://remote.test/users/alice",
+      "summary": "Keep this commentary\n↪ QT: https://quoted.test/users/bob/statuses/gone",
+      "created_at": "2024-06-03T13:00:00Z",
+      "visibility": "public",
+      "sensitive": false,
+      "spoiler_text": ""
+    },
+    "target": {
+      "id": 18,
+      "type": "Delete",
+      "object_id": "https://quoted.test/users/bob/statuses/gone",
+      "actor_id": "https://quoted.test/users/bob",
+      "summary": "must not be revived secret",
+      "created_at": "2024-06-03T13:05:00Z",
+      "visibility": "public",
+      "sensitive": false,
+      "spoiler_text": ""
+    },
+    "actors": [
+      {"actor_id": "https://remote.test/users/alice", "username": "alice", "display_name": "Alice Remote", "host": "remote.test"}
+    ]
+  },
+  "glued": {
+    "row": {
+      "status_id": "96",
+      "object_id": "https://remote.test/users/alice/statuses/glued",
+      "created_at": "2024-06-03T14:00:00Z",
+      "target_actor": "https://remote.test/users/alice"
+    },
+    "parent": {
+      "id": 19,
+      "type": "Create",
+      "object_id": "https://remote.test/users/alice/statuses/glued",
+      "actor_id": "https://remote.test/users/alice",
+      "summary": "hello ↪ QT there",
+      "created_at": "2024-06-03T14:00:00Z",
+      "visibility": "public",
+      "sensitive": false,
+      "spoiler_text": ""
+    }
+  },
+  "private_quote": {
+    "row": {
+      "status_id": "97",
+      "object_id": "https://remote.test/users/alice/statuses/private-parent",
+      "created_at": "2024-06-03T15:00:00Z",
+      "target_actor": "https://remote.test/users/alice"
+    },
+    "parent": {
+      "id": 20,
+      "type": "Create",
+      "object_id": "https://remote.test/users/alice/statuses/private-parent",
+      "actor_id": "https://remote.test/users/alice",
+      "summary": "Public commentary\n↪ QT: https://quoted.test/users/bob/statuses/secret",
+      "created_at": "2024-06-03T15:00:00Z",
+      "visibility": "public",
+      "sensitive": false,
+      "spoiler_text": ""
+    },
+    "target": {
+      "id": 21,
+      "type": "Create",
+      "object_id": "https://quoted.test/users/bob/statuses/secret",
+      "actor_id": "https://quoted.test/users/bob",
+      "summary": "followers only quote",
+      "created_at": "2024-06-03T14:30:00Z",
+      "visibility": "private",
+      "sensitive": false,
+      "spoiler_text": ""
+    },
+    "actors": [
+      {"actor_id": "https://remote.test/users/alice", "username": "alice", "display_name": "Alice Remote", "host": "remote.test"},
+      {"actor_id": "https://quoted.test/users/bob", "username": "bob", "display_name": "Bob Quoted", "host": "quoted.test"}
+    ]
+  },
+  "direct_quote": {
+    "row": {
+      "status_id": "98",
+      "object_id": "https://remote.test/users/alice/statuses/direct-parent",
+      "created_at": "2024-06-03T16:00:00Z",
+      "target_actor": "https://remote.test/users/alice"
+    },
+    "parent": {
+      "id": 22,
+      "type": "Create",
+      "object_id": "https://remote.test/users/alice/statuses/direct-parent",
+      "actor_id": "https://remote.test/users/alice",
+      "summary": "Mentioned aside\n↪ QT: https://quoted.test/users/bob/statuses/direct",
+      "created_at": "2024-06-03T16:00:00Z",
+      "visibility": "public",
+      "sensitive": false,
+      "spoiler_text": ""
+    },
+    "target": {
+      "id": 23,
+      "type": "Create",
+      "object_id": "https://quoted.test/users/bob/statuses/direct",
+      "actor_id": "https://quoted.test/users/bob",
+      "summary": "only for the recipient",
+      "created_at": "2024-06-03T15:30:00Z",
+      "visibility": "direct",
+      "sensitive": false,
+      "spoiler_text": ""
+    },
+    "actors": [
+      {"actor_id": "https://remote.test/users/alice", "username": "alice", "display_name": "Alice Remote", "host": "remote.test"},
+      {"actor_id": "https://quoted.test/users/bob", "username": "bob", "display_name": "Bob Quoted", "host": "quoted.test"}
+    ]
+  }
+}

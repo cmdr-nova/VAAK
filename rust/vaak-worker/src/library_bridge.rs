@@ -18,6 +18,11 @@ struct Batch {
     #[serde(default)] canonical_saved_only:bool,
     protocol_version: u8,
     status_preview_budget: i64,
+    /// Absent means the PHP quote-preview global was unset. The painter's
+    /// first use starts at 2. A present integer, including 0 and negative, is
+    /// the caller's current remaining budget.
+    #[serde(default)]
+    quote_preview_budget: Option<i64>,
     #[serde(default)] bsky_budget_deadline:Option<f64>,
     owner_id: i64,
     csrf: String,
@@ -146,6 +151,7 @@ async fn render_request_with_warm_inner(database_url:&str,secret:Option<&str>,he
     let warm=warm.or_else(||cfg.map(|cfg|native_warm(cfg,batch.bsky_budget_deadline)));
     let result: anyhow::Result<Vec<u8>> = async {
         let initial=batch.status_preview_budget;
+        let quote_initial=batch.quote_preview_budget.unwrap_or(2);
         let db = std::sync::Arc::new(crate::db::connect(database_url).await?);
         let states = batch.bsky_bookmarks.into_iter().map(|s| (s.uri, s.did, s.bookmarked)).collect();
         let mut session = super::context::TrustedSession::from_php_session(
@@ -167,12 +173,15 @@ async fn render_request_with_warm_inner(database_url:&str,secret:Option<&str>,he
                 status["bookmarked"]=Value::Bool(true);sources.push(status);projections.push(projection);
             }
         }
-        let (mut statuses,remaining)=super::context::admit_for_render_with_preview(&db,&session,sources,initial,deps.dns).await?;
+        let (mut statuses,remaining,quote_state)=super::context::admit_for_render_with_quote_preview(&db,&session,sources,initial,quote_initial,deps.dns).await?;
         #[cfg(test)] if let Some(clock)=deps.render_clock{for token in &mut statuses{token.set_render_clock(clock);}}
         let cards=statuses.iter().map(|token|super::card::render_admitted(token).map(|html|json!({"source_index":token.source_index(),"html":html}))).collect::<anyhow::Result<Vec<_>>>()?;
         for projection in &projections{projection.require_current(&db).await?;}
         let state=crate::direct_preview::PreviewState::from_remaining(initial,remaining,source_count)?;
-        let bytes=serde_json::to_vec(&json!({"ok":true,"protocol_version":1,"source_count":source_count,"cards":cards,"status_preview_state":state}))?;
+        if quote_state.initial!=quote_initial || quote_state.attempts>source_count.saturating_mul(16) {
+            anyhow::bail!("invalid private quote preview state");
+        }
+        let bytes=serde_json::to_vec(&json!({"ok":true,"protocol_version":1,"source_count":source_count,"cards":cards,"status_preview_state":state,"quote_preview_state":quote_state}))?;
         if bytes.len()>8*1024*1024{anyhow::bail!("Library reply limit")}
         Ok(bytes)
     }.await;
@@ -215,6 +224,9 @@ pub(crate) async fn fixture_request_with_warm(database_url:&str,secret:&str,head
  #[test]fn preview_protocol_and_scalar_budgets_are_mandatory(){
   let mut value=json!({"protocol_version":1,"status_preview_budget":-4,"owner_id":1,"csrf":"canonical","return_view":"bookmarks","bsky_enabled":false,"statuses":[]});
   assert_eq!(decode(value.to_string().as_bytes()).unwrap().status_preview_budget,-4);
+  assert!(decode(value.to_string().as_bytes()).unwrap().quote_preview_budget.is_none());
+  value["quote_preview_budget"]=json!(2);assert_eq!(decode(value.to_string().as_bytes()).unwrap().quote_preview_budget,Some(2));
+  value["quote_preview_budget"]=json!(null);assert!(decode(value.to_string().as_bytes()).unwrap().quote_preview_budget.is_none());
   for key in ["protocol_version","status_preview_budget"]{let mut missing=value.clone();missing.as_object_mut().unwrap().remove(key);assert!(decode(missing.to_string().as_bytes()).is_err());}
   value["protocol_version"]=json!(2);assert!(decode(value.to_string().as_bytes()).is_err());value["protocol_version"]=json!(1);
   for invalid in [json!(null),json!("3"),json!(3.0)]{value["status_preview_budget"]=invalid;assert!(decode(value.to_string().as_bytes()).is_err());}
