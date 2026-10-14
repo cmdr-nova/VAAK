@@ -52,7 +52,7 @@ function ap_masto_interaction_row_to_status(array $row,string $flag):?array{
 putenv('ROOT_CAPTURE_FRESH=1');putenv('ROOT_LIBRARY_SEARCH_PRODUCER_BOOTSTRAP=1');
 $argv[1]='/tmp/vaak-library-saved-producer-bootstrap-'.getmypid().'.json';ob_start();require __DIR__.'/root-preview-callers-production-reference.php';$bootstrapOutput=ob_get_clean();unlink($argv[1]);
 if($networkProducer){
- reference_load(dirname(__DIR__).'/ap-db.php',['ap_masto_favourite_rows']);
+ reference_load(dirname(__DIR__).'/ap-db.php',['ap_masto_library_api_bounds','ap_masto_library_created_before','ap_masto_favourite_rows']);
  reference_load($entitiesPath,['ap_masto_favourites_list']);
  foreach(['ap_masto_favourite_rows'=>dirname(__DIR__).'/ap-db.php','ap_masto_favourites_list'=>$entitiesPath] as $name=>$path)saved_producer_alias($path,$name,'saved_unused_'.$name);
 }
