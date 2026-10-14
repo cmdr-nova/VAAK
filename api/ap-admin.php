@@ -27600,6 +27600,12 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       background: color-mix(in srgb, var(--panel-2) 42%, transparent);
       line-height: 1.45;
     }
+    /* Approvals only: center the open/close registration control between the status line and the list. */
+    .approvals-registration {
+      display: flex;
+      justify-content: center;
+      margin: .875rem 0;
+    }
     .empty + .empty,
     .meta.empty-state + .meta.empty-state { margin-top: .75rem; }
     .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .8rem; color: var(--muted); word-break: break-all; }
@@ -30414,7 +30420,7 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
         <?php else: ?>
           <?php $registrationAccepting = ap_registration_accepting(); ?>
           <p class="meta" role="status"><?= $registrationAccepting ? 'Registration open.' : 'Registration closed.' ?> <?= ap_registration_approvals_enabled() ? 'Applications require approval before an account is created.' : 'Public applications are disabled; invites are required when registration is open.' ?> Pending applications remain reviewable.</p>
-          <form method="post" action="?view=approvals">
+          <form class="approvals-registration" method="post" action="?view=approvals">
             <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
             <button class="btn" name="action" value="<?= $registrationAccepting ? 'registration_close' : 'registration_open' ?>"><?= $registrationAccepting ? 'Close registration' : 'Reopen registration' ?></button>
           </form>
