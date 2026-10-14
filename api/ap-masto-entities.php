@@ -229,7 +229,14 @@ function ap_masto_account(): array
     $avatar = function_exists('ap_local_avatar_url')
         ? ap_local_avatar_url($p['icon_url'] ?? null)
         : ((string) ($p['icon_url'] ?? '') ?: 'https://mkultra.monster/img/avatar/local-default.webp');
-    $header = $p['image_url'] ?: 'https://mkultra.monster/img/gifs/waves.gif';
+    if (function_exists('ap_masto_https_media_url')) {
+        $avatar = ap_masto_https_media_url($avatar, 'https://mkultra.monster/img/avatar/local-default.webp')
+            ?? 'https://mkultra.monster/img/avatar/local-default.webp';
+        $header = ap_masto_https_media_url($p['image_url'] ?? null, 'https://mkultra.monster/img/gifs/waves.gif')
+            ?? 'https://mkultra.monster/img/gifs/waves.gif';
+    } else {
+        $header = $p['image_url'] ?: 'https://mkultra.monster/img/gifs/waves.gif';
+    }
     $created = '2018-01-01T00:00:00.000Z';
     if (!empty($GLOBALS['vaak_user']['created_at']) && is_string($GLOBALS['vaak_user']['created_at'])) {
         try {
@@ -303,7 +310,14 @@ function ap_masto_account_from_user(array $user): array
     $avatar = function_exists('ap_local_avatar_url')
         ? ap_local_avatar_url($p['icon_url'] ?? null)
         : ((string) ($p['icon_url'] ?? '') ?: 'https://mkultra.monster/img/avatar/local-default.webp');
-    $header = $p['image_url'] ?: 'https://mkultra.monster/img/gifs/waves.gif';
+    if (function_exists('ap_masto_https_media_url')) {
+        $avatar = ap_masto_https_media_url($avatar, 'https://mkultra.monster/img/avatar/local-default.webp')
+            ?? 'https://mkultra.monster/img/avatar/local-default.webp';
+        $header = ap_masto_https_media_url($p['image_url'] ?? null, 'https://mkultra.monster/img/gifs/waves.gif')
+            ?? 'https://mkultra.monster/img/gifs/waves.gif';
+    } else {
+        $header = $p['image_url'] ?: 'https://mkultra.monster/img/gifs/waves.gif';
+    }
     $displayName = function_exists('ap_profile_display_name')
         ? ap_profile_display_name($actorKey, true)
         : ((string) ($p['name'] ?? '') ?: $username);
@@ -698,7 +712,9 @@ function ap_masto_status_from_row(array $row, bool $attachQuote = true, bool $al
         // Mastodon clients do not define a local-only enum. Keep VAAK's
         // internal value in web/local data, but expose it as unlisted through
         // the compatibility API rather than returning an invalid enum.
-        'visibility' => (($row['visibility'] ?? 'public') === 'local') ? 'unlisted' : (string) ($row['visibility'] ?? 'public'),
+        'visibility' => function_exists('ap_masto_api_visibility')
+            ? ap_masto_api_visibility($row['visibility'] ?? 'public')
+            : ((($row['visibility'] ?? 'public') === 'local') ? 'unlisted' : (string) ($row['visibility'] ?? 'public')),
         'language' => 'en',
         'uri' => $url,
         'url' => $url,
@@ -892,7 +908,7 @@ function ap_masto_bsky_preview_media_as_attachments(array $items, string $status
             'remote_url' => $url,
             'text_url' => $url,
             'description' => (string) ($item['alt'] ?? $item['description'] ?? ''),
-            'meta' => [],
+            'meta' => null,
             'blurhash' => null,
             'mediaType' => $mt !== '' ? $mt : null,
         ];
@@ -4314,6 +4330,10 @@ function ap_masto_remote_account(string $actorId, bool $allowFetch = false): arr
         && !(function_exists('ap_remote_actor_username_is_placeholder') && ap_remote_actor_username_is_placeholder($username))) {
         $webUrl = 'https://' . $host . '/@' . rawurlencode($username);
     }
+    if (function_exists('ap_masto_https_media_url')) {
+        $avatar = ap_masto_https_media_url($avatar, $fallback) ?? $fallback;
+        $header = ap_masto_https_media_url($header, $avatar) ?? $avatar;
+    }
     $account = [
         'id' => $id,
         'username' => $username,
@@ -5756,70 +5776,766 @@ function ap_masto_notification_entity(array $item): ?array
  * Repeated favourite/reblog events sharing a target are collapsed into one
  * opaque group key; unsupported or non-targeted events remain individual.
  * Account payloads are de-duplicated in the root `accounts` array; groups
- * carry only sampled account IDs. That root array is also the full-account
- * expansion path for clients that need actor details.
+ * carry only sampled account IDs.
+ *
+ * Ice Cubes decodes most_recent_notification_id as a JSON integer. Every
+ * other id in this payload is a JSON string. Non-standard types (Phyrian,
+ * and any other value outside the Mastodon notification enum) are dropped
+ * here so the web Mentions page can keep them while API clients do not.
  *
  * @param list<string> $types
  * @param list<string> $exclude
- * @return array{accounts:list<array>,statuses:list<array>,notification_groups:list<array>}
+ * @return array{accounts:list<array<string,mixed>>,statuses:list<array<string,mixed>>,notification_groups:list<array<string,mixed>>,partial_accounts?:list<array<string,mixed>>}
  */
-function ap_masto_notifications_grouped_fetch(int $limit = 40, ?string $maxId = null, ?string $sinceId = null, array $types = [], array $exclude = []): array
+function ap_masto_notifications_grouped_fetch(int $limit = 40, ?string $maxId = null, ?string $sinceId = null, array $types = [], array $exclude = [], string $expandAccounts = 'full'): array
 {
     $notifs = ap_masto_notifications_fetch($limit, $maxId, $sinceId, $types, $exclude);
-    $accounts = [];
-    $statuses = [];
-    $groups = [];
-    $groupIndex = [];
+    return ap_masto_notifications_grouped_from_items(is_array($notifs) ? $notifs : [], $expandAccounts);
+}
+
+function ap_masto_https_avatar_fallback(): string
+{
+    if (defined('AP_REMOTE_AVATAR_FALLBACK') && is_string(AP_REMOTE_AVATAR_FALLBACK) && str_starts_with(AP_REMOTE_AVATAR_FALLBACK, 'https://')) {
+        return AP_REMOTE_AVATAR_FALLBACK;
+    }
+    return 'https://mkultra.monster/img/avatar/default.webp';
+}
+
+function ap_masto_https_header_fallback(): string
+{
+    return 'https://mkultra.monster/img/gifs/waves.gif';
+}
+
+/**
+ * Absolute https URL, or $fallback when the value is missing, relative, or an ActivityPub image object.
+ */
+function ap_masto_https_media_url(mixed $value, ?string $fallback = null, int $depth = 0): ?string
+{
+    if ($depth > 4) {
+        return null;
+    }
+    $next = static function (?string $fallback, int $depth): ?string {
+        return $fallback === null ? null : ap_masto_https_media_url($fallback, null, $depth + 1);
+    };
+    if (is_array($value)) {
+        if (array_key_exists('url', $value) || array_key_exists('href', $value)) {
+            return ap_masto_https_media_url($value['url'] ?? $value['href'] ?? null, $fallback, $depth + 1);
+        }
+        if (array_is_list($value) && isset($value[0])) {
+            return ap_masto_https_media_url($value[0], $fallback, $depth + 1);
+        }
+        return $next($fallback, $depth);
+    }
+    if (!is_string($value)) {
+        return $next($fallback, $depth);
+    }
+    $value = trim($value);
+    $parts = $value === '' ? false : parse_url($value);
+    $ok = is_array($parts)
+        && ($parts['scheme'] ?? '') === 'https'
+        && ($parts['host'] ?? '') !== ''
+        && !isset($parts['user'])
+        && !isset($parts['pass'])
+        && preg_match('/\s/', $value) !== 1
+        && filter_var($value, FILTER_VALIDATE_URL) !== false;
+    if (!$ok) {
+        return $next($fallback, $depth);
+    }
+    return $value;
+}
+
+function ap_masto_api_visibility(mixed $value): string
+{
+    $visibility = is_string($value) ? strtolower(trim($value)) : '';
+    if ($visibility === 'local') {
+        return 'unlisted';
+    }
+    if (in_array($visibility, ['followers', 'followers_only', 'mutual', 'private'], true)) {
+        return 'private';
+    }
+    if (in_array($visibility, ['public', 'unlisted', 'direct'], true)) {
+        return $visibility;
+    }
+    return 'public';
+}
+
+function ap_masto_notification_api_type(string $type): ?string
+{
+    $type = strtolower(trim($type));
+    if ($type === 'bite') {
+        return 'favourite';
+    }
+    if (str_starts_with($type, 'phyrian')) {
+        return null;
+    }
+    $allowed = [
+        'follow', 'follow_request', 'favourite', 'reblog', 'mention', 'quote',
+        'poll', 'status', 'update', 'quoted_update', 'added_to_collection', 'collection_update',
+    ];
+    return in_array($type, $allowed, true) ? $type : null;
+}
+
+function ap_masto_api_time(mixed $value): string
+{
+    $iso = null;
+    if (is_int($value)) {
+        $iso = gmdate('c', $value);
+    } elseif (is_string($value) && trim($value) !== '') {
+        $iso = trim($value);
+    }
+    if ($iso !== null && function_exists('ap_masto_format_time')) {
+        $formatted = ap_masto_format_time($iso);
+        if (preg_match('/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/', $formatted) === 1) {
+            return $formatted;
+        }
+    }
+    return gmdate('Y-m-d\TH:i:s.000\Z');
+}
+
+function ap_masto_api_bool(mixed $value, bool $default = false): bool
+{
+    if (is_bool($value)) {
+        return $value;
+    }
+    if (is_int($value) || is_float($value)) {
+        return (int) $value !== 0;
+    }
+    if (is_string($value)) {
+        $lower = strtolower(trim($value));
+        if (in_array($lower, ['1', 'true', 'yes'], true)) {
+            return true;
+        }
+        if (in_array($lower, ['0', 'false', 'no', ''], true)) {
+            return false;
+        }
+    }
+    return $default;
+}
+
+function ap_masto_api_int(mixed $value, int $default = 0): int
+{
+    if (is_bool($value)) {
+        return $value ? 1 : 0;
+    }
+    if (is_int($value)) {
+        return $value;
+    }
+    if (is_float($value) || (is_string($value) && is_numeric($value))) {
+        return (int) $value;
+    }
+    return $default;
+}
+
+/** Notification ids must round-trip through a signed 64-bit integer for Ice Cubes. */
+function ap_masto_api_digit_id(mixed $value): ?string
+{
+    if (is_int($value)) {
+        return $value > 0 ? (string) $value : null;
+    }
+    if (!is_string($value)) {
+        return null;
+    }
+    $value = trim($value);
+    if ($value === '' || preg_match('/^[1-9]\d*$/', $value) !== 1) {
+        return null;
+    }
+    $asInt = (int) $value;
+    if ($asInt <= 0 || (string) $asInt !== $value) {
+        return null;
+    }
+    return $value;
+}
+
+function ap_masto_api_string_id(mixed $value): ?string
+{
+    if (is_int($value)) {
+        return (string) $value;
+    }
+    if (!is_string($value)) {
+        return null;
+    }
+    $value = trim($value);
+    return $value === '' ? null : $value;
+}
+
+function ap_masto_api_nullable_id(mixed $value): ?string
+{
+    if ($value === null) {
+        return null;
+    }
+    return ap_masto_api_string_id($value);
+}
+
+/**
+ * @return list<array{name:string,value:string,verified_at:?string}>
+ */
+function ap_masto_api_fields(mixed $fields): array
+{
+    if (!is_array($fields)) {
+        return [];
+    }
+    $out = [];
+    foreach ($fields as $field) {
+        if (!is_array($field)) {
+            continue;
+        }
+        $name = $field['name'] ?? '';
+        $value = $field['value'] ?? '';
+        if (!is_string($name)) {
+            $name = is_scalar($name) ? (string) $name : '';
+        }
+        if (!is_string($value)) {
+            $value = is_scalar($value) ? (string) $value : '';
+        }
+        $verified = $field['verified_at'] ?? null;
+        $out[] = [
+            'name' => $name,
+            'value' => $value,
+            'verified_at' => is_string($verified) && $verified !== '' ? $verified : null,
+        ];
+    }
+    return $out;
+}
+
+/**
+ * @return list<array<string,mixed>>
+ */
+function ap_masto_api_emojis(mixed $emojis): array
+{
+    if (!is_array($emojis)) {
+        return [];
+    }
+    $out = [];
+    foreach ($emojis as $emoji) {
+        if (!is_array($emoji)) {
+            continue;
+        }
+        $short = $emoji['shortcode'] ?? '';
+        if (!is_string($short) || $short === '') {
+            continue;
+        }
+        $url = ap_masto_https_media_url($emoji['url'] ?? null, null);
+        $static = ap_masto_https_media_url($emoji['static_url'] ?? null, $url);
+        if ($url === null || $static === null) {
+            continue;
+        }
+        $item = [
+            'shortcode' => $short,
+            'url' => $url,
+            'static_url' => $static,
+            'visible_in_picker' => ap_masto_api_bool($emoji['visible_in_picker'] ?? true, true),
+        ];
+        if (is_string($emoji['category'] ?? null)) {
+            $item['category'] = $emoji['category'];
+        }
+        $out[] = $item;
+    }
+    return $out;
+}
+
+function ap_masto_api_media_meta(mixed $meta): ?array
+{
+    if (!is_array($meta) || array_is_list($meta)) {
+        return null;
+    }
+    $original = $meta['original'] ?? null;
+    if (!is_array($original) || array_is_list($original)) {
+        return null;
+    }
+    $clean = [];
+    if (isset($original['width']) && is_numeric($original['width']) && !is_string($original['width'])) {
+        $clean['width'] = (int) $original['width'];
+    } elseif (isset($original['width']) && is_string($original['width']) && is_numeric($original['width'])) {
+        $clean['width'] = (int) $original['width'];
+    }
+    if (isset($original['height']) && is_numeric($original['height'])) {
+        $clean['height'] = (int) $original['height'];
+    }
+    return $clean === [] ? null : ['original' => $clean];
+}
+
+/**
+ * @return list<array<string,mixed>>
+ */
+function ap_masto_api_media_list(mixed $list): array
+{
+    if (!is_array($list)) {
+        return [];
+    }
+    $out = [];
+    foreach ($list as $media) {
+        if (!is_array($media)) {
+            continue;
+        }
+        $id = ap_masto_api_string_id($media['id'] ?? null);
+        if ($id === null) {
+            continue;
+        }
+        $type = is_string($media['type'] ?? null) ? $media['type'] : 'unknown';
+        if (!in_array($type, ['unknown', 'image', 'gifv', 'video', 'audio'], true)) {
+            $type = 'unknown';
+        }
+        $out[] = [
+            'id' => $id,
+            'type' => $type,
+            'url' => ap_masto_https_media_url($media['url'] ?? null, null),
+            'preview_url' => ap_masto_https_media_url($media['preview_url'] ?? null, null),
+            'remote_url' => ap_masto_https_media_url($media['remote_url'] ?? null, null),
+            'text_url' => ap_masto_https_media_url($media['text_url'] ?? null, null),
+            'meta' => ap_masto_api_media_meta($media['meta'] ?? null),
+            'description' => is_string($media['description'] ?? null) ? $media['description'] : null,
+            'blurhash' => is_string($media['blurhash'] ?? null) && $media['blurhash'] !== '' ? $media['blurhash'] : null,
+        ];
+    }
+    return $out;
+}
+
+/**
+ * @return list<array{id:string,username:string,acct:string,url:string}>
+ */
+function ap_masto_api_mentions(mixed $list): array
+{
+    if (!is_array($list)) {
+        return [];
+    }
+    $out = [];
+    foreach ($list as $mention) {
+        if (!is_array($mention)) {
+            continue;
+        }
+        $id = ap_masto_api_string_id($mention['id'] ?? null);
+        $username = is_string($mention['username'] ?? null) ? trim($mention['username']) : '';
+        $acct = is_string($mention['acct'] ?? null) ? trim($mention['acct']) : '';
+        $url = ap_masto_https_media_url($mention['url'] ?? null, null);
+        if ($id === null || $username === '' || $acct === '' || $url === null) {
+            continue;
+        }
+        $out[] = [
+            'id' => $id,
+            'username' => $username,
+            'acct' => $acct,
+            'url' => $url,
+        ];
+    }
+    return $out;
+}
+
+/**
+ * @return list<array{name:string,url:string}>
+ */
+function ap_masto_api_tags(mixed $list): array
+{
+    if (!is_array($list)) {
+        return [];
+    }
+    $out = [];
+    foreach ($list as $tag) {
+        if (!is_array($tag)) {
+            continue;
+        }
+        $name = is_string($tag['name'] ?? null) ? trim($tag['name']) : '';
+        if ($name === '') {
+            continue;
+        }
+        $url = is_string($tag['url'] ?? null) ? trim($tag['url']) : '';
+        if ($url === '') {
+            $url = 'https://mkultra.monster/tags/' . rawurlencode(ltrim($name, '#'));
+        }
+        $out[] = ['name' => $name, 'url' => $url];
+    }
+    return $out;
+}
+
+function ap_masto_api_card(mixed $card): ?array
+{
+    if (!is_array($card)) {
+        return null;
+    }
+    $url = is_string($card['url'] ?? null) ? trim($card['url']) : '';
+    if ($url === '') {
+        return null;
+    }
+    $type = is_string($card['type'] ?? null) ? $card['type'] : 'link';
+    if (!in_array($type, ['link', 'photo', 'video', 'rich'], true)) {
+        $type = 'link';
+    }
+    return [
+        'url' => $url,
+        'title' => is_string($card['title'] ?? null) ? $card['title'] : '',
+        'description' => is_string($card['description'] ?? null) ? $card['description'] : '',
+        'type' => $type,
+        'image' => ap_masto_https_media_url($card['image'] ?? null, null),
+        'width' => ap_masto_api_int($card['width'] ?? 0),
+        'height' => ap_masto_api_int($card['height'] ?? 0),
+    ];
+}
+
+function ap_masto_api_poll(mixed $poll): ?array
+{
+    if (!is_array($poll)) {
+        return null;
+    }
+    $id = ap_masto_api_string_id($poll['id'] ?? null);
+    if ($id === null) {
+        return null;
+    }
+    $options = [];
+    foreach (is_array($poll['options'] ?? null) ? $poll['options'] : [] as $opt) {
+        if (!is_array($opt)) {
+            continue;
+        }
+        $title = $opt['title'] ?? '';
+        if (!is_string($title)) {
+            $title = is_scalar($title) ? (string) $title : '';
+        }
+        $votes = $opt['votes_count'] ?? null;
+        $options[] = [
+            'title' => $title,
+            'votes_count' => is_numeric($votes) ? (int) $votes : null,
+        ];
+    }
+    $expires = $poll['expires_at'] ?? null;
+    return [
+        'id' => $id,
+        'expires_at' => is_string($expires) && trim($expires) !== '' ? ap_masto_api_time($expires) : null,
+        'expired' => ap_masto_api_bool($poll['expired'] ?? false),
+        'multiple' => ap_masto_api_bool($poll['multiple'] ?? false),
+        'votes_count' => ap_masto_api_int($poll['votes_count'] ?? 0),
+        'voters_count' => array_key_exists('voters_count', $poll) && $poll['voters_count'] !== null
+            ? ap_masto_api_int($poll['voters_count'])
+            : null,
+        'voted' => array_key_exists('voted', $poll) && $poll['voted'] !== null
+            ? ap_masto_api_bool($poll['voted'])
+            : null,
+        'options' => $options,
+    ];
+}
+
+/**
+ * @return array{current_user:string,automatic:list<string>,manual:list<string>}
+ */
+function ap_masto_api_quote_approval(mixed $value): array
+{
+    $current = 'automatic';
+    $automatic = [];
+    $manual = [];
+    if (is_array($value)) {
+        $raw = $value['current_user'] ?? '';
+        if (is_string($raw) && in_array($raw, ['automatic', 'manual', 'denied', 'unknown'], true)) {
+            $current = $raw;
+        }
+        foreach (['automatic' => 'automatic', 'manual' => 'manual'] as $key => $which) {
+            $list = [];
+            if (is_array($value[$key] ?? null)) {
+                foreach ($value[$key] as $item) {
+                    if (is_string($item) || is_int($item)) {
+                        $list[] = (string) $item;
+                    }
+                }
+            }
+            if ($which === 'automatic') {
+                $automatic = $list;
+            } else {
+                $manual = $list;
+            }
+        }
+    }
+    return [
+        'current_user' => $current,
+        'automatic' => $automatic,
+        'manual' => $manual,
+    ];
+}
+
+function ap_masto_api_quote(mixed $quote, int $depth): ?array
+{
+    if (!is_array($quote)) {
+        return null;
+    }
+    $state = is_string($quote['state'] ?? null) ? $quote['state'] : 'pending';
+    if (!in_array($state, ['accepted', 'pending', 'rejected', 'revoked', 'deleted', 'unauthorized'], true)) {
+        $state = 'pending';
+    }
+    $quoted = null;
+    if ($depth < 2 && is_array($quote['quoted_status'] ?? null)) {
+        $quoted = ap_masto_api_status($quote['quoted_status'], $depth + 1);
+    }
+    $qid = null;
+    if ($quoted !== null) {
+        $qid = (string) $quoted['id'];
+    } else {
+        $qid = ap_masto_api_nullable_id($quote['quoted_status_id'] ?? null);
+    }
+    return [
+        'state' => $state,
+        'quoted_status' => $quoted,
+        'quoted_status_id' => $qid,
+    ];
+}
+
+function ap_masto_api_application(mixed $app): ?array
+{
+    if (!is_array($app)) {
+        return null;
+    }
+    $name = $app['name'] ?? '';
+    if (!is_string($name)) {
+        $name = '';
+    }
+    return [
+        'name' => $name,
+        'website' => ap_masto_https_media_url($app['website'] ?? null, null),
+    ];
+}
+
+function ap_masto_api_account(?array $account, int $depth = 0): ?array
+{
+    if ($account === null || $depth > 2) {
+        return null;
+    }
+    $id = ap_masto_api_string_id($account['id'] ?? null);
+    if ($id === null) {
+        return null;
+    }
+    $username = is_string($account['username'] ?? null) ? trim($account['username']) : '';
+    if ($username === '') {
+        $username = 'user';
+    }
+    $acct = is_string($account['acct'] ?? null) ? trim($account['acct']) : '';
+    if ($acct === '') {
+        $acct = $username;
+    }
+    $display = $account['display_name'] ?? null;
+    if (!is_string($display)) {
+        $display = $username;
+    }
+    $avatar = ap_masto_https_media_url($account['avatar'] ?? null, ap_masto_https_avatar_fallback())
+        ?? ap_masto_https_avatar_fallback();
+    $header = ap_masto_https_media_url($account['header'] ?? null, ap_masto_https_header_fallback())
+        ?? ap_masto_https_header_fallback();
+    $out = [
+        'id' => $id,
+        'username' => $username,
+        'acct' => $acct,
+        'display_name' => $display,
+        'locked' => ap_masto_api_bool($account['locked'] ?? false),
+        'bot' => ap_masto_api_bool($account['bot'] ?? false),
+        'discoverable' => ap_masto_api_bool($account['discoverable'] ?? false),
+        'created_at' => ap_masto_api_time($account['created_at'] ?? null),
+        'note' => is_string($account['note'] ?? null) ? $account['note'] : '',
+        'url' => ap_masto_https_media_url($account['url'] ?? ($account['uri'] ?? null), null),
+        'avatar' => $avatar,
+        'avatar_static' => ap_masto_https_media_url($account['avatar_static'] ?? null, $avatar) ?? $avatar,
+        'header' => $header,
+        'header_static' => ap_masto_https_media_url($account['header_static'] ?? null, $header) ?? $header,
+        'followers_count' => ap_masto_api_int($account['followers_count'] ?? 0),
+        'following_count' => ap_masto_api_int($account['following_count'] ?? 0),
+        'statuses_count' => ap_masto_api_int($account['statuses_count'] ?? 0),
+        'last_status_at' => is_string($account['last_status_at'] ?? null) ? $account['last_status_at'] : null,
+        'emojis' => ap_masto_api_emojis($account['emojis'] ?? []),
+        'fields' => ap_masto_api_fields($account['fields'] ?? []),
+    ];
+    if ($depth < 2 && is_array($account['moved'] ?? null)) {
+        $moved = ap_masto_api_account($account['moved'], $depth + 1);
+        if ($moved !== null) {
+            $out['moved'] = $moved;
+        }
+    }
+    return $out;
+}
+
+/**
+ * @param array<string,mixed> $account
+ * @return array<string,mixed>
+ */
+function ap_masto_api_partial_account(array $account): array
+{
+    $avatar = ap_masto_https_media_url($account['avatar'] ?? null, ap_masto_https_avatar_fallback())
+        ?? ap_masto_https_avatar_fallback();
+    $url = ap_masto_https_media_url($account['url'] ?? null, null) ?? 'https://mkultra.monster/';
+    return [
+        'id' => (string) ($account['id'] ?? ''),
+        'acct' => (string) ($account['acct'] ?? $account['username'] ?? 'user'),
+        'url' => $url,
+        'avatar' => $avatar,
+        'avatar_static' => ap_masto_https_media_url($account['avatar_static'] ?? null, $avatar) ?? $avatar,
+        'locked' => ap_masto_api_bool($account['locked'] ?? false),
+        'bot' => ap_masto_api_bool($account['bot'] ?? false),
+    ];
+}
+
+function ap_masto_api_status(?array $status, int $depth = 0): ?array
+{
+    if ($status === null || $depth > 3) {
+        return null;
+    }
+    $id = ap_masto_api_string_id($status['id'] ?? null);
+    $account = ap_masto_api_account(is_array($status['account'] ?? null) ? $status['account'] : null);
+    if ($id === null || $account === null) {
+        return null;
+    }
+    $content = $status['content'] ?? '';
+    if (!is_string($content)) {
+        $content = '';
+    }
+    $spoiler = $status['spoiler_text'] ?? '';
+    if (!is_string($spoiler)) {
+        $spoiler = '';
+    }
+    $edited = $status['edited_at'] ?? null;
+    $reblog = null;
+    if ($depth < 1 && is_array($status['reblog'] ?? null)) {
+        $reblog = ap_masto_api_status($status['reblog'], $depth + 1);
+    }
+    $out = [
+        'id' => $id,
+        'created_at' => ap_masto_api_time($status['created_at'] ?? null),
+        'edited_at' => is_string($edited) && trim($edited) !== '' ? ap_masto_api_time($edited) : null,
+        'in_reply_to_id' => ap_masto_api_nullable_id($status['in_reply_to_id'] ?? null),
+        'in_reply_to_account_id' => ap_masto_api_nullable_id($status['in_reply_to_account_id'] ?? null),
+        'sensitive' => ap_masto_api_bool($status['sensitive'] ?? false),
+        'spoiler_text' => $spoiler,
+        'visibility' => ap_masto_api_visibility($status['visibility'] ?? 'public'),
+        'language' => is_string($status['language'] ?? null) && $status['language'] !== '' ? $status['language'] : null,
+        'uri' => is_string($status['uri'] ?? null) ? $status['uri'] : null,
+        'url' => is_string($status['url'] ?? null) ? $status['url'] : null,
+        'replies_count' => ap_masto_api_int($status['replies_count'] ?? 0),
+        'reblogs_count' => ap_masto_api_int($status['reblogs_count'] ?? 0),
+        'favourites_count' => ap_masto_api_int($status['favourites_count'] ?? 0),
+        'quotes_count' => ap_masto_api_int($status['quotes_count'] ?? 0),
+        'favourited' => ap_masto_api_bool($status['favourited'] ?? false),
+        'reblogged' => ap_masto_api_bool($status['reblogged'] ?? false),
+        'bookmarked' => ap_masto_api_bool($status['bookmarked'] ?? false),
+        'pinned' => ap_masto_api_bool($status['pinned'] ?? false),
+        'content' => $content,
+        'reblog' => $reblog,
+        'media_attachments' => ap_masto_api_media_list($status['media_attachments'] ?? []),
+        'mentions' => ap_masto_api_mentions($status['mentions'] ?? []),
+        'tags' => ap_masto_api_tags($status['tags'] ?? []),
+        'emojis' => ap_masto_api_emojis($status['emojis'] ?? []),
+        'card' => ap_masto_api_card($status['card'] ?? null),
+        'poll' => ap_masto_api_poll($status['poll'] ?? null),
+        'account' => $account,
+    ];
+    if (is_array($status['application'] ?? null)) {
+        $app = ap_masto_api_application($status['application']);
+        if ($app !== null) {
+            $out['application'] = $app;
+        }
+    }
+    if (is_array($status['quote'] ?? null)) {
+        $quote = ap_masto_api_quote($status['quote'], $depth);
+        if ($quote !== null) {
+            $out['quote'] = $quote;
+        }
+    }
+    if (is_array($status['quote_approval'] ?? null)) {
+        $out['quote_approval'] = ap_masto_api_quote_approval($status['quote_approval']);
+    }
+    return $out;
+}
+
+function ap_masto_api_notification(array $n): ?array
+{
+    $type = ap_masto_notification_api_type((string) ($n['type'] ?? ''));
+    if ($type === null) {
+        return null;
+    }
+    $id = ap_masto_api_digit_id($n['id'] ?? null);
+    if ($id === null) {
+        return null;
+    }
+    $account = ap_masto_api_account(is_array($n['account'] ?? null) ? $n['account'] : null);
+    if ($account === null) {
+        return null;
+    }
+    $status = ap_masto_api_status(is_array($n['status'] ?? null) ? $n['status'] : null);
+    $groupKey = isset($n['group_key']) && is_string($n['group_key']) && $n['group_key'] !== ''
+        ? $n['group_key']
+        : ('ungrouped-' . $id);
+    return [
+        'id' => $id,
+        'type' => $type,
+        'group_key' => $groupKey,
+        'created_at' => ap_masto_api_time($n['created_at'] ?? null),
+        'account' => $account,
+        'status' => $status,
+    ];
+}
+
+/**
+ * @param list<mixed> $notifs
+ * @return list<array<string,mixed>>
+ */
+function ap_masto_notifications_api_list(array $notifs): array
+{
+    $out = [];
     foreach ($notifs as $n) {
         if (!is_array($n)) {
             continue;
         }
-        $acct = $n['account'] ?? null;
-        $acctId = '';
-        if (is_array($acct) && isset($acct['id'])) {
-            $acctId = (string) $acct['id'];
-            $accounts[$acctId] = $acct;
+        $one = ap_masto_api_notification($n);
+        if ($one !== null) {
+            $out[] = $one;
         }
+    }
+    return $out;
+}
+
+/**
+ * @param list<mixed> $notifs
+ * @return array{accounts:list<array<string,mixed>>,statuses:list<array<string,mixed>>,notification_groups:list<array<string,mixed>>,partial_accounts?:list<array<string,mixed>>}
+ */
+function ap_masto_notifications_grouped_from_items(array $notifs, string $expandAccounts = 'full'): array
+{
+    $expand = $expandAccounts === 'partial_avatars' ? 'partial_avatars' : 'full';
+    $accounts = [];
+    $statuses = [];
+    $groups = [];
+    $groupIndex = [];
+    $statusTypes = ['mention', 'status', 'reblog', 'favourite', 'poll', 'update', 'quote', 'quoted_update'];
+    foreach ($notifs as $raw) {
+        if (!is_array($raw)) {
+            continue;
+        }
+        $n = ap_masto_api_notification($raw);
+        if ($n === null) {
+            continue;
+        }
+        $acct = $n['account'];
+        $acctId = (string) $acct['id'];
+        $accounts[$acctId] = $acct;
+        $status = $n['status'];
         $statusId = null;
-        $status = $n['status'] ?? null;
         if (is_array($status) && isset($status['id'])) {
             $statusId = (string) $status['id'];
             $statuses[$statusId] = $status;
         }
-        $nid = (string) ($n['id'] ?? '');
-        if ($nid === '') {
-            continue;
-        }
-        $groupKey = isset($n['group_key']) && is_string($n['group_key']) && $n['group_key'] !== ''
-            ? $n['group_key']
-            : ('ungrouped-' . $nid);
-        $type = (string) ($n['type'] ?? 'mention');
-        // Mastodon groups adjacent notifications that refer to the same
-        // actor/status.  Keep the key deterministic so clients can retain
-        // selection state between refreshes, while leaving the v1 endpoint
-        // (which returns one entity per notification) untouched.
-        if (str_starts_with($groupKey, 'ungrouped-') && ($acctId !== '' || $statusId !== null)) {
-            $groupKey = $type . ':' . ($acctId !== '' ? $acctId : '-') . ':' . ($statusId ?? '-');
-        }
-        // Mastodon returns most_recent_notification_id as an integer; Ice Cubes
-        // decoding can fail if this is a string.
+        $nid = (string) $n['id'];
         $nidInt = (int) $nid;
+        $groupKey = (string) $n['group_key'];
+        $type = (string) $n['type'];
+        if (str_starts_with($groupKey, 'ungrouped-')) {
+            $groupKey = $type . ':' . $acctId . ':' . ($statusId ?? '-');
+        }
+        $createdAt = (string) $n['created_at'];
         if (isset($groupIndex[$groupKey])) {
             $idx = $groupIndex[$groupKey];
             $existing = $groups[$idx];
-            $existing['notifications_count'] = (int) ($existing['notifications_count'] ?? 1) + 1;
-            $existing['page_min_id'] = (string) min((int) ($existing['page_min_id'] ?? $nidInt), $nidInt);
-            $existing['page_max_id'] = (string) max((int) ($existing['page_max_id'] ?? $nidInt), $nidInt);
-            $existing['most_recent_notification_id'] = max((int) ($existing['most_recent_notification_id'] ?? 0), $nidInt);
-            $existing['latest_page_notification_at'] = max(
-                strtotime((string) ($existing['latest_page_notification_at'] ?? '')) ?: 0,
-                strtotime((string) ($n['created_at'] ?? '')) ?: 0
-            ) > (strtotime((string) ($existing['latest_page_notification_at'] ?? '')) ?: 0)
-                ? (string) ($n['created_at'] ?? $existing['latest_page_notification_at'])
-                : $existing['latest_page_notification_at'];
-            if ($acctId !== '' && !in_array($acctId, $existing['sample_account_ids'] ?? [], true)
-                && count($existing['sample_account_ids'] ?? []) < 3) {
+            $existing['notifications_count'] = (int) $existing['notifications_count'] + 1;
+            $existingMin = (int) $existing['page_min_id'];
+            $existingMax = (int) $existing['page_max_id'];
+            $existing['page_min_id'] = (string) min($existingMin, $nidInt);
+            $existing['page_max_id'] = (string) max($existingMax, $nidInt);
+            if ($nidInt >= (int) $existing['most_recent_notification_id']) {
+                $existing['most_recent_notification_id'] = $nidInt;
+                $existing['latest_page_notification_at'] = $createdAt;
+            }
+            if (!in_array($acctId, $existing['sample_account_ids'], true) && count($existing['sample_account_ids']) < 3) {
                 $existing['sample_account_ids'][] = $acctId;
+            }
+            if ($statusId !== null && array_key_exists('status_id', $existing) && $existing['status_id'] === null) {
+                $existing['status_id'] = $statusId;
             }
             $groups[$idx] = $existing;
             continue;
@@ -5831,20 +6547,113 @@ function ap_masto_notifications_grouped_fetch(int $limit = 40, ?string $maxId = 
             'most_recent_notification_id' => $nidInt,
             'page_min_id' => $nid,
             'page_max_id' => $nid,
-            'latest_page_notification_at' => (string) ($n['created_at'] ?? gmdate('Y-m-d\TH:i:s.000\Z')),
-            'sample_account_ids' => $acctId !== '' ? [$acctId] : [],
+            'latest_page_notification_at' => $createdAt,
+            'sample_account_ids' => [$acctId],
         ];
-        if (in_array($type, ['mention', 'status', 'reblog', 'favourite', 'poll', 'update', 'quote', 'quoted_update'], true)) {
+        if (in_array($type, $statusTypes, true)) {
             $group['status_id'] = $statusId;
         }
         $groupIndex[$groupKey] = count($groups);
         $groups[] = $group;
     }
-    return [
-        'accounts' => array_values($accounts),
-        'statuses' => array_values($statuses),
+    $referencedAccounts = [];
+    $referencedStatuses = [];
+    foreach ($groups as $group) {
+        foreach ($group['sample_account_ids'] as $sampleId) {
+            $referencedAccounts[(string) $sampleId] = true;
+        }
+        if (isset($group['status_id']) && is_string($group['status_id']) && $group['status_id'] !== '') {
+            $referencedStatuses[$group['status_id']] = true;
+        }
+    }
+    $primary = [];
+    foreach ($groups as $group) {
+        $first = $group['sample_account_ids'][0] ?? '';
+        if ($first !== '') {
+            $primary[$first] = true;
+        }
+    }
+    $fullAccounts = [];
+    $partialAccounts = [];
+    foreach ($accounts as $id => $account) {
+        if (!isset($referencedAccounts[$id])) {
+            continue;
+        }
+        if ($expand === 'partial_avatars' && !isset($primary[$id])) {
+            $partialAccounts[] = ap_masto_api_partial_account($account);
+            continue;
+        }
+        $fullAccounts[] = $account;
+    }
+    $fullStatuses = [];
+    foreach ($statuses as $id => $status) {
+        if (isset($referencedStatuses[$id])) {
+            $fullStatuses[] = $status;
+        }
+    }
+    $out = [
+        'accounts' => $fullAccounts,
+        'statuses' => $fullStatuses,
         'notification_groups' => $groups,
     ];
+    if ($expand === 'partial_avatars') {
+        $out['partial_accounts'] = $partialAccounts;
+    }
+    return $out;
+}
+
+/**
+ * One group from an already-sanitized grouped payload, with only the accounts and statuses it references.
+ *
+ * @param array<string,mixed> $grouped
+ * @return array<string,mixed>|null
+ */
+function ap_masto_notifications_grouped_slice(array $grouped, string $key): ?array
+{
+    $match = null;
+    foreach (is_array($grouped['notification_groups'] ?? null) ? $grouped['notification_groups'] : [] as $group) {
+        if (is_array($group) && (string) ($group['group_key'] ?? '') === $key) {
+            $match = $group;
+            break;
+        }
+    }
+    if ($match === null) {
+        return null;
+    }
+    $want = [];
+    foreach (is_array($match['sample_account_ids'] ?? null) ? $match['sample_account_ids'] : [] as $id) {
+        $want[(string) $id] = true;
+    }
+    $accounts = [];
+    foreach (is_array($grouped['accounts'] ?? null) ? $grouped['accounts'] : [] as $account) {
+        if (is_array($account) && isset($want[(string) ($account['id'] ?? '')])) {
+            $accounts[] = $account;
+        }
+    }
+    $partial = [];
+    foreach (is_array($grouped['partial_accounts'] ?? null) ? $grouped['partial_accounts'] : [] as $account) {
+        if (is_array($account) && isset($want[(string) ($account['id'] ?? '')])) {
+            $partial[] = $account;
+        }
+    }
+    $statuses = [];
+    $statusId = $match['status_id'] ?? null;
+    if (is_string($statusId) && $statusId !== '') {
+        foreach (is_array($grouped['statuses'] ?? null) ? $grouped['statuses'] : [] as $status) {
+            if (is_array($status) && (string) ($status['id'] ?? '') === $statusId) {
+                $statuses[] = $status;
+            }
+        }
+    }
+    $out = [
+        'accounts' => $accounts,
+        'statuses' => $statuses,
+        'notification_groups' => [$match],
+    ];
+    if (array_key_exists('partial_accounts', $grouped)) {
+        $out['partial_accounts'] = $partial;
+    }
+    return $out;
 }
 
 /**
@@ -5979,7 +6788,7 @@ function ap_masto_notifications_list_redis_key(
     array $want,
     array $exclude = []
 ): string {
-    return 'vaak:notifications:v3:' . $ownerUserId . ':' . hash('sha256', json_encode([
+    return 'vaak:notifications:v4:' . $ownerUserId . ':' . hash('sha256', json_encode([
         // Include exclusions so an Ice Cubes request using exclude_types cannot
         // reuse a cache entry built for a different notification filter.
         'limit' => $limit, 'max' => $maxId, 'since' => $sinceId, 'types' => $want, 'exclude' => $exclude,
@@ -12499,7 +13308,7 @@ function ap_masto_bsky_media_attachments(array $post, string $statusId): array
             'remote_url' => $url,
             'text_url' => $url,
             'description' => (string) ($image['alt'] ?? ($anim['type'] === 'gifv' ? 'GIF' : '')),
-            'meta' => [],
+            'meta' => null,
             'blurhash' => null,
             'mediaType' => $anim['mediaType'],
         ];
@@ -12532,7 +13341,7 @@ function ap_masto_bsky_media_attachments(array $post, string $statusId): array
             'remote_url' => $uri,
             'text_url' => $uri,
             'description' => trim((string) ($ext['title'] ?? $ext['description'] ?? 'GIF')) ?: 'GIF',
-            'meta' => [],
+            'meta' => null,
             'blurhash' => null,
             'mediaType' => $anim['mediaType'] ?? 'image/gif',
         ];
@@ -12572,7 +13381,7 @@ function ap_masto_bsky_media_attachments(array $post, string $statusId): array
                 'remote_url' => $playlist,
                 'text_url' => $playlist,
                 'description' => '',
-                'meta' => [],
+                'meta' => null,
                 'blurhash' => null,
             ];
             if (count($out) >= 4) {

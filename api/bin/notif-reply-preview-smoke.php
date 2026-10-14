@@ -46,5 +46,5 @@ $GLOBALS['projection_rows']=[['payload_json'=>$serialized],['payload_json'=>json
 preview_check(ap_notification_projection_read(1,1,['mention'],[])===[],'later legacy row rejects whole mixed window before page-limit break');
 $GLOBALS['projection_rows']=[['payload_json'=>$serialized]];
 preview_check(ap_notification_projection_read(1,1,['mention'],[])===[$dto],'versioned projection returns exact public DTO');
-preview_check(str_starts_with(ap_masto_notifications_list_redis_key(1,30,null,null,['mention']),'vaak:notifications:v3:1:'),'actual PHP list namespace bypasses every legacy envelope');
+preview_check(str_starts_with(ap_masto_notifications_list_redis_key(1,30,null,null,['mention']),'vaak:notifications:v4:1:'),'actual PHP list namespace bypasses every legacy envelope');
 echo "notif-reply-preview-smoke PASS $checks; legacy multi-paragraph leak reproduced, actual new producer helper/formatter/stripper preserve exact authored HTML\n";

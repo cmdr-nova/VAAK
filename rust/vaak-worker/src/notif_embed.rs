@@ -47,7 +47,7 @@ pub async fn find_status_in_notif_envelopes(
     owner_id: i64,
     uri: &str,
 ) -> Result<Option<Value>> {
-    let pattern = format!("vaak:notifications:v3:{owner_id}:*");
+    let pattern = format!("vaak:notifications:v4:{owner_id}:*");
     // Owners keep a handful of Mentions keys — KEYS is fine at this scale.
     let keys: Vec<String> = redis::cmd("KEYS")
         .arg(&pattern)
