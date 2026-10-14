@@ -23,3 +23,8 @@ regexes = ['''^actor_id=excluded\.actor_id$''']
 description = "Browser localStorage key names for a notification-chime dedupe flag. Not credentials. Present only in historical revisions of api/ap-admin.php."
 regexTarget = "secret"
 regexes = ['''^vaak-notif-chime-v\d+$''']
+
+[[allowlists]]
+description = "Scrub-fixture digest sample from the first follow-fallback commit. Not a credential. Current fixtures no longer contain it."
+regexTarget = "secret"
+regexes = ['''^SHA-256=abcd$''']

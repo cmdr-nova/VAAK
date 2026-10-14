@@ -72,6 +72,7 @@ mod direct_render;
 mod search_bridge;
 mod search_components;
 mod cleanup;
+mod follow_fallback;
 mod parity_replay;
 
 use std::net::SocketAddr;

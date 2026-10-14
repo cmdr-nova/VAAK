@@ -51,6 +51,7 @@ fn produce(producer: &str, cases: &[InputCase]) -> Result<Vec<Value>> {
             "phyrian-opensim" => phyrian_opensim(&case.input)?,
             "phyrian-bridge" => phyrian_bridge(&case.input)?,
             "settings-fields" => settings_fields(&case.id)?,
+            "follow-fallback" => follow_fallback(&case.input)?,
             other => bail!("unknown producer {other}"),
         };
         Ok(json!({"id": case.id, "output": output}))
@@ -258,6 +259,10 @@ fn phyrian_bridge(input: &Value) -> Result<Value> {
         }
         other => bail!("unsupported phyrian bridge kind {other}"),
     }
+}
+
+fn follow_fallback(input: &Value) -> Result<Value> {
+    crate::follow_fallback::replay(input)
 }
 
 fn settings_fields(id: &str) -> Result<Value> {
