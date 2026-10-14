@@ -17,7 +17,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
   elif handle.startswith('fail'):code=int(handle[4:]);body=b'{"error":"FixtureFailure"}'
   elif handle=='budget_timeout':time.sleep(1.5)
   self.send_response(code)
-  if location:self.send_header('Location',location)
+  if location:self.send_header('Location',location.replace('\r','').replace('\n',''))
   self.send_header('Content-Length',str(len(body)));self.end_headers()
   try:self.wfile.write(body)
   except (BrokenPipeError,ConnectionResetError,ssl.SSLError):pass
@@ -26,7 +26,7 @@ with tempfile.TemporaryDirectory(prefix='vaak-handle-tls-') as temp:
  subprocess.run(['openssl','req','-x509','-newkey','rsa:2048','-nodes','-keyout',str(cakey),'-out',str(cert),'-days','1','-subj','/CN=public.test','-addext','subjectAltName=DNS:public.test'],check=True,capture_output=True)
  subprocess.run(['openssl','req','-new','-newkey','rsa:2048','-nodes','-keyout',str(key),'-out',str(csr),'-subj','/CN=public.test','-addext','subjectAltName=DNS:public.test','-addext','basicConstraints=critical,CA:FALSE'],check=True,capture_output=True)
  subprocess.run(['openssl','x509','-req','-in',str(csr),'-CA',str(cert),'-CAkey',str(cakey),'-CAcreateserial','-out',str(leaf),'-days','1','-copy_extensions','copy'],check=True,capture_output=True)
- server=http.server.ThreadingHTTPServer(('127.0.0.1',0),Handler);context=ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER);context.load_cert_chain(leaf,key);server.socket=context.wrap_socket(server.socket,server_side=True);server.requests=[];thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
+ server=http.server.ThreadingHTTPServer(('127.0.0.1',0),Handler);context=ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER);context.minimum_version=ssl.TLSVersion.TLSv1_2;context.load_cert_chain(leaf,key);server.socket=context.wrap_socket(server.socket,server_side=True);server.requests=[];thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
  env=os.environ.copy();env.update(PROFILE_QUOTE_HANDLE_PORT=str(server.server_port),PROFILE_QUOTE_HANDLE_CERT=str(cert),LD_LIBRARY_PATH='/usr/lib/rustlib/x86_64-unknown-linux-gnu/lib')
  try:
   with open('/tmp/vaak-profile-quote-handle-http-php.log','w') as out:php=subprocess.run([str(ROOT/'api/bin/php-policy-test'),'-d','extension=/tmp/vaak-php-curl-test/extracted/usr/lib/php/20230831/curl.so',str(ROOT/'api/bin/profile-quote-handle-http-reference.php')],cwd=ROOT,env=env,stdout=out,stderr=subprocess.STDOUT)
