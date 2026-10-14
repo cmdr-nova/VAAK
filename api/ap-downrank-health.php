@@ -23,7 +23,7 @@ try {
         if (!$exists || !$writable) $result['ok'] = false;
     }
     if (ap_db_driver($db) === 'pgsql') {
-        $result['checks']['downranking_enabled'] = (bool) $db->query("SELECT 1 FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='actor_profile' AND column_name='downranking_enabled'")->fetchColumn();
+        $result['checks']['downranking_enabled'] = ap_schema_has_column($db, 'actor_profile', 'downranking_enabled');
         if (!$result['checks']['downranking_enabled']) $result['ok'] = false;
     }
 } catch (Throwable $e) {

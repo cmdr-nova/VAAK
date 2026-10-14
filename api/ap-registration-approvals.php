@@ -125,9 +125,16 @@ function ap_registration_approvals_schema(PDO $db): void
         created_at TEXT NOT NULL, decided_at TEXT, decided_by BIGINT, user_id BIGINT, supporter_hash TEXT
     )");
     $has = ap_db_driver($db)==='pgsql'
-        ? $db->query("SELECT 1 FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='ap_registration_applications' AND column_name='supporter_hash'")->fetchColumn()
+        ? (function_exists('ap_schema_has_column')
+            ? ap_schema_has_column($db, 'ap_registration_applications', 'supporter_hash')
+            : $db->query("SELECT 1 FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='ap_registration_applications' AND column_name='supporter_hash'")->fetchColumn())
         : in_array('supporter_hash',array_column($db->query('PRAGMA table_info(ap_registration_applications)')->fetchAll(PDO::FETCH_ASSOC),'name'),true);
-    if (!$has) $db->exec('ALTER TABLE ap_registration_applications ADD COLUMN supporter_hash TEXT');
+    if (!$has) {
+        $db->exec('ALTER TABLE ap_registration_applications ADD COLUMN supporter_hash TEXT');
+        if (function_exists('ap_schema_remember_column')) {
+            ap_schema_remember_column($db, 'ap_registration_applications', 'supporter_hash', null);
+        }
+    }
     $db->exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_registration_pending_supporter ON ap_registration_applications(supporter_hash) WHERE status='pending' AND supporter_hash IS NOT NULL");
     $db->exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_registration_pending_username ON ap_registration_applications(lower(username)) WHERE status = 'pending'");
     $db->exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_registration_pending_email ON ap_registration_applications(lower(email)) WHERE status = 'pending' AND email IS NOT NULL");
