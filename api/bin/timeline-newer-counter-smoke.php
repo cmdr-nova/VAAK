@@ -3,6 +3,7 @@ declare(strict_types=1);
 /** Cursor and button contract for the timeline newer poll. No database. */
 require __DIR__ . '/migration-reference-functions.php';
 reference_load(dirname(__DIR__) . '/ap-admin.php', [
+    'admin_tl_card_identity_attrs',
     'admin_tl_newer_cursor',
     'admin_tl_status_created_ts',
     'admin_tl_poll_since_cursor',
@@ -17,6 +18,45 @@ function newer_check(bool $ok, string $label): void
     }
     $GLOBALS['checks']++;
 }
+
+$postAttrs = admin_tl_card_identity_attrs([
+    'status_id' => '555',
+    'note_id' => 'https://mkultra.monster/users/valerie/notes/local-1/',
+    'sort' => 1600,
+]);
+newer_check(
+    str_contains($postAttrs, 'data-timeline-key="555"')
+        && str_contains($postAttrs, 'data-status-id="555"')
+        && str_contains($postAttrs, 'data-note-id="https://mkultra.monster/users/valerie/notes/local-1"')
+        && str_contains($postAttrs, 'data-sort="1600"')
+        && !str_contains($postAttrs, 'notes/local-1/"'),
+    'a post carries the local id and the ActivityPub URI, without a trailing slash'
+);
+$boostAttrs = admin_tl_card_identity_attrs([
+    'boost' => true,
+    'status_id' => '999',
+    'note_id' => 'https://mkultra.monster/users/valerie/notes/local-1',
+    'announce_id' => '42',
+    'sort' => 1700,
+]);
+newer_check(
+    str_contains($boostAttrs, 'data-timeline-key="boost:999"')
+        && str_contains($boostAttrs, 'data-status-id="999"')
+        && str_contains($boostAttrs, 'data-announce-id="42"')
+        && str_contains($boostAttrs, 'data-sort="1700"')
+        && !str_contains($boostAttrs, 'data-note-id='),
+    'a boost is keyed by its own id and does not claim the original note'
+);
+$announceOnly = admin_tl_card_identity_attrs([
+    'boost' => true,
+    'announce_id' => '42',
+]);
+newer_check(
+    str_contains($announceOnly, 'data-timeline-key="boost:42"')
+        && str_contains($announceOnly, 'data-announce-id="42"')
+        && !str_contains($announceOnly, 'data-status-id='),
+    'a boost with only an announce id still has a stable key'
+);
 
 newer_check(admin_tl_newer_cursor(100, []) === 100, 'empty slice keeps the previous cursor');
 newer_check(admin_tl_newer_cursor(100, [90, 0, -4]) === 100, 'older or empty timestamps do not move the cursor');

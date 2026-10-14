@@ -588,6 +588,86 @@ function check(ok, label) {
   await drift.flush();
   const drifted = drift.newer().slice(1);
   check(drifted.length === 1 && drifted[0].url.includes('view=local') && drifted[0].url.includes('since=1000'), 'Local is polled from the live timeline view when the boot closure still says home');
+
+  // The latest local post is already painted (PHP note URI). The poll returns
+  // the Rust card for that same post (Mastodon id + URI). It must not arm the
+  // bar or insert a second copy, and the cursor still moves to that card.
+  const dup = boot('local');
+  dup.items.innerHTML = '<article class="tweet" data-note-id="https://mkultra.monster/users/valerie/notes/local-1" data-status-id="555"></article>';
+  await dup.advance(5000);
+  check(dup.newer()[0].url.includes('view=local') && dup.newer()[0].url.includes('since=1000'), 'local poll still starts from the painted cursor');
+  dup.newer()[0].pending.resolve(dup.response('', 99999, {
+    body: '<article class="tweet" data-timeline-key="555" data-status-id="555" data-note-id="https://mkultra.monster/users/valerie/notes/local-1/" data-sort="1600"></article>',
+  }));
+  await dup.flush();
+  check(dup.newBtn().hidden === true, 'a polled copy of the visible local post does not arm the bar');
+  check(dup.items.querySelectorAll('article.tweet').length === 1, 'clicking is unnecessary because the visible post was not queued');
+  check(dup.items.dataset.newest === '1600', 'the cursor advances to the newest rendered post even when it was already shown');
+
+  const rustPainted = boot('local');
+  rustPainted.items.innerHTML = '<article class="tweet" data-timeline-key="555" data-sort="1600"></article>';
+  await rustPainted.advance(5000);
+  rustPainted.newer()[0].pending.resolve(rustPainted.response('', 99999, {
+    body: '<article class="tweet" data-note-id="https://mkultra.monster/users/valerie/notes/local-1" data-status-id="555" data-sort="1600"></article>',
+  }));
+  await rustPainted.flush();
+  check(rustPainted.newBtn().hidden === true && rustPainted.items.querySelectorAll('article.tweet').length === 1, 'a PHP poll of a Rust-painted card is the same post');
+
+  const boost = boot('local');
+  boost.items.innerHTML = '<article class="tweet" data-timeline-key="555" data-note-id="https://mkultra.monster/users/valerie/notes/local-1" data-status-id="555"></article>';
+  await boost.advance(5000);
+  boost.newer()[0].pending.resolve(boost.response('', 1800, {
+    body: '<article class="tweet tweet-boost" data-timeline-key="boost:999" data-status-id="999" data-announce-id="42" data-sort="1700"></article>',
+  }));
+  await boost.flush();
+  check(boost.newBtn().textContent === '1 new post' && boost.items.querySelectorAll('article.tweet').length === 1, 'a new boost of a visible post still counts');
+  boost.newBtn().click();
+  check(boost.items.querySelector('[data-timeline-key="boost:999"]') && boost.items.querySelectorAll('article.tweet').length === 2, 'the boost is inserted beside the original, not instead of it');
+
+  const sameBoost = boot('local');
+  sameBoost.items.innerHTML = '<article class="tweet tweet-boost" data-timeline-key="boost:42" data-announce-id="42" data-sort="1700"></article>';
+  await sameBoost.advance(5000);
+  sameBoost.newer()[0].pending.resolve(sameBoost.response('', 1800, {
+    body: '<article class="tweet tweet-boost" data-timeline-key="boost:999" data-status-id="999" data-announce-id="42" data-sort="1700"></article>',
+  }));
+  await sameBoost.flush();
+  check(sameBoost.newBtn().hidden === true && sameBoost.items.querySelectorAll('article.tweet').length === 1, 'the same boost painted with a different status id is not counted again');
+
+  await dup.advance(85000);
+  check(dup.newer().at(-1).url.includes('since=1600'), 'the next poll starts at the post that was already on screen');
+  dup.newer().at(-1).pending.resolve(dup.response('', 2000, {
+    body: '<article class="tweet" data-timeline-key="556" data-status-id="556" data-note-id="https://mkultra.monster/users/someone/notes/fresh" data-sort="1800"></article>',
+  }));
+  await dup.flush();
+  check(dup.newBtn().textContent === '1 new post', 'a genuinely new post still arms the bar');
+  dup.newBtn().click();
+  check(dup.items.querySelector('[data-status-id="556"]') && dup.items.querySelectorAll('[data-status-id="555"]').length === 1, 'the new post is prepended and the visible post stays single');
+  check(dup.newBtn().hidden === true && dup.items.dataset.newest === '1800', 'inserting the new post clears the bar and moves the cursor');
+
+  const own = boot('local');
+  await own.advance(5000);
+  own.newer()[0].pending.resolve(own.response('', 1000));
+  await own.flush();
+  const ownInsert = own.win.novaRefreshTimelinePreservingPosition({ freshPost: true, published: '2026-10-05T01:57:08.000Z' });
+  await own.flush();
+  const ownCall = own.newer().at(-1);
+  check(ownCall.url.includes('fresh_post=1') && ownCall.url.includes('view=local'), 'an own post asks the timeline for that post without reloading');
+  ownCall.pending.resolve(own.response('', 1791165428, {
+    body: '<article class="tweet tweet-own" data-timeline-key="777" data-status-id="777" data-note-id="https://mkultra.monster/users/valerie/notes/new" data-sort="1791165428"></article>',
+  }));
+  await ownInsert;
+  check(own.items.querySelector('[data-note-id="https://mkultra.monster/users/valerie/notes/new"]'), 'the own post is inserted immediately');
+  check(own.newBtn().hidden === true, 'the immediate insert does not leave the new-posts bar up');
+  check(own.items.dataset.newest === '1791165428', 'the cursor moves to the inserted own post');
+  const ownAgain = own.win.novaPollTimeline();
+  await own.flush();
+  own.newer().at(-1).pending.resolve(own.response('', 1791165428, {
+    body: '<article class="tweet" data-note-id="https://mkultra.monster/users/valerie/notes/new/" data-status-id="777" data-sort="1791165428"></article>',
+  }));
+  await ownAgain;
+  await own.flush();
+  check(own.newBtn().hidden === true && own.items.querySelectorAll('[data-status-id="777"]').length === 1, 'the following poll does not duplicate the own post');
+
   console.log(JSON.stringify({ file, checks: result.length, passed: true, labels: result }, null, 2));
 })().catch((error) => {
   console.error(error && error.stack ? error.stack : error);
