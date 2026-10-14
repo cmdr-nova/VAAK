@@ -44288,6 +44288,87 @@ $showComposeFab = empty($GLOBALS['vaak_guest_profile'])
       }
     });
   }
+
+  // Replies must not rebuild the page they were posted from. These two
+  // helpers are the only decision the submit handler uses, and the regression
+  // harness extracts them by the markers below.
+  /* vaak-compose-followup:start */
+  function vaakNormalizePostRef(value) {
+    let raw = String(value || '').trim();
+    if (!raw) return '';
+    try { raw = decodeURIComponent(raw); } catch (e) {}
+    return raw.replace(/\/+$/, '');
+  }
+  function vaakPostRefsMatch(left, right) {
+    const a = vaakNormalizePostRef(left);
+    const b = vaakNormalizePostRef(right);
+    return a !== '' && a === b;
+  }
+  function vaakOpenThreadContainsPost(replyTo) {
+    const want = vaakNormalizePostRef(replyTo);
+    if (!want) return false;
+    const threadOpen = !!(document.querySelector('.status-back')
+      || document.getElementById('status-thread-descendants')
+      || document.getElementById('status-focus'));
+    if (!threadOpen) return false;
+    const roots = [];
+    const pushRoot = (node) => { if (node && roots.indexOf(node) < 0) roots.push(node); };
+    pushRoot(document.getElementById('status-thread-ancestors'));
+    pushRoot(document.getElementById('status-thread-descendants'));
+    pushRoot(document.getElementById('status-focus'));
+    pushRoot(document.querySelector('article.tweet-focus'));
+    pushRoot(document.querySelector('article#status-focus'));
+    if (document.querySelector('.status-back')) pushRoot(document.querySelector('section.main'));
+    try {
+      const focusObject = new URL(window.location.href).searchParams.get('object') || '';
+      if (vaakPostRefsMatch(focusObject, want)) return true;
+    } catch (e) {}
+    for (let i = 0; i < roots.length; i++) {
+      const root = roots[i];
+      const objectAttr = root.getAttribute && (root.getAttribute('data-object') || root.getAttribute('data-note-id') || root.getAttribute('data-object-id') || root.getAttribute('data-bsky-uri'));
+      if (vaakPostRefsMatch(objectAttr, want)) return true;
+      if (!root.querySelectorAll) continue;
+      const nodes = root.querySelectorAll('[data-note-id],[data-object-id],[data-bsky-uri],[data-object],a[href*="reply_to="],a[href*="object="]');
+      for (let n = 0; n < nodes.length; n++) {
+        const el = nodes[n];
+        if (vaakPostRefsMatch(el.getAttribute('data-note-id'), want)
+          || vaakPostRefsMatch(el.getAttribute('data-object-id'), want)
+          || vaakPostRefsMatch(el.getAttribute('data-bsky-uri'), want)
+          || vaakPostRefsMatch(el.getAttribute('data-object'), want)) return true;
+        const href = el.getAttribute('href') || '';
+        if (!href) continue;
+        try {
+          const url = new URL(href, window.location.href);
+          if (vaakPostRefsMatch(url.searchParams.get('reply_to'), want)
+            || vaakPostRefsMatch(url.searchParams.get('object'), want)) return true;
+        } catch (e) {}
+      }
+    }
+    return false;
+  }
+  function vaakDecideComposeFollowup(state) {
+    const mode = String((state && state.mode) || '');
+    if (mode === 'queue_post') return 'stay';
+    const isReply = !!(state && state.isReply) && mode !== 'edit_status';
+    if (isReply) {
+      if (state.threadContainsParent && state.noteId) return 'hydrate-thread';
+      return 'stay';
+    }
+    if (state && state.statusPage) {
+      if (mode === 'edit_status' && state.noteId) return 'hydrate-edit';
+      if (mode !== 'edit_status' && state.noteId) return 'hydrate-thread';
+      return 'stay';
+    }
+    if (mode !== 'edit_status' && state && state.poller) {
+      if (state.preservingRefresh === false) return 'poll-insert';
+      return 'refresh-timeline';
+    }
+    return 'reload';
+  }
+  window.vaakOpenThreadContainsPost = vaakOpenThreadContainsPost;
+  window.vaakDecideComposeFollowup = vaakDecideComposeFollowup;
+  /* vaak-compose-followup:end */
+
   document.addEventListener('submit', async (ev) => {
     const submitForm = ev.target;
     if (!(submitForm instanceof HTMLFormElement) || submitForm.id !== 'compose-form') return;
@@ -44369,6 +44450,9 @@ $showComposeFab = empty($GLOBALS['vaak_guest_profile'])
       // publication queue). Do not make the user wait for timeline hydration
       // or federation delivery before dismissing the page-level save marker.
       if (typeof window.vaakHideLoading === 'function') window.vaakHideLoading();
+      const replyFieldLive = form.querySelector('input[name="in_reply_to"]');
+      const submittedReplyTo = String((replyFieldLive && replyFieldLive.value) || '').trim();
+      const submittedIsReply = submittedReplyTo !== '' && actionName !== 'edit_status' && mode !== 'queue_post';
       if (window.apAdminToast) {
         const okMsg = actionName === 'queue_post'
           ? 'Added to queue.'
@@ -44428,42 +44512,51 @@ $showComposeFab = empty($GLOBALS['vaak_guest_profile'])
             })();
         window.history.replaceState({}, '', href);
       } catch (e) {}
-      if (mode === 'queue_post') {
-        // The queue is durable and the item is already accepted. Leave the
-        // current timeline/media surface in place so browsing can continue.
+      const followup = vaakDecideComposeFollowup({
+        mode: mode,
+        isReply: submittedIsReply,
+        threadContainsParent: submittedIsReply && vaakOpenThreadContainsPost(submittedReplyTo),
+        noteId: mode === 'edit_status' ? editingNoteId : String((data && data.note_id) || ''),
+        statusPage: !!document.querySelector('.status-back'),
+        poller: typeof window.novaPollTimeline === 'function',
+        preservingRefresh: typeof window.novaRefreshTimelinePreservingPosition === 'function',
+      });
+      if (followup === 'stay') {
+        // Reply, queued post, or a thread fragment that does not belong here.
+        // Leave the list, scroll position, and expanded rows alone.
         return;
       }
-      if (document.querySelector('.status-back')) {
-        if (mode === 'edit_status' && typeof window.vaakHydrateEditedThreadPost === 'function') {
-          Promise.resolve(window.vaakHydrateEditedThreadPost(editingNoteId)).catch(() => {});
-        }
-        if (mode !== 'edit_status' && data.note_id && typeof window.vaakHydratePublishedThreadReply === 'function') {
+      if (followup === 'hydrate-thread') {
+        // One published-reply fragment, and only when this open thread already
+        // shows the parent. A miss must not rebuild the page.
+        if (data.note_id && typeof window.vaakHydratePublishedThreadReply === 'function') {
           Promise.resolve(window.vaakHydratePublishedThreadReply(data.note_id)).catch(() => {});
         }
-        // The committed reply is reconciled within this thread; never rebuild
-        // the page or its rails when a fragment is unavailable.
         return;
       }
-      // Soft-insert posts, replies, and quote-posts into the live timeline.
-      // When the reader is down-feed, preserve the same visible content while
-      // adding the new card above it instead of jumping back to the feed head.
-      if (mode !== 'edit_status' && typeof window.novaPollTimeline === 'function') {
-        // Reconcile the local card in the background. The post is already
-        // committed locally and federation is durable-queued, so closing the
-        // composer must not wait for a timeline rebuild.
-        if (typeof window.novaRefreshTimelinePreservingPosition === 'function') {
-          Promise.resolve(window.novaRefreshTimelinePreservingPosition({ freshPost: true, published: data.published }))
-            .then((refreshed) => { if (refreshed === false) window.location.reload(); }).catch(() => {});
-        } else {
-          Promise.resolve(window.novaPollTimeline()).then(() => {
-            if (typeof window.novaInsertPendingTimeline === 'function') {
-              window.novaInsertPendingTimeline({ scrollToTop: false });
-            }
-          }).catch(() => {});
+      if (followup === 'hydrate-edit') {
+        if (typeof window.vaakHydrateEditedThreadPost === 'function') {
+          Promise.resolve(window.vaakHydrateEditedThreadPost(editingNoteId)).catch(() => {});
         }
-      } else {
-        window.location.reload();
+        return;
       }
+      // Original posts and quotes still join the live Home/Local/Federated
+      // head. Other surfaces keep their previous reload when that insert
+      // cannot run. Replies never reach this branch.
+      if (followup === 'refresh-timeline') {
+        Promise.resolve(window.novaRefreshTimelinePreservingPosition({ freshPost: true, published: data.published }))
+          .then((refreshed) => { if (refreshed === false) window.location.reload(); }).catch(() => {});
+        return;
+      }
+      if (followup === 'poll-insert') {
+        Promise.resolve(window.novaPollTimeline()).then(() => {
+          if (typeof window.novaInsertPendingTimeline === 'function') {
+            window.novaInsertPendingTimeline({ scrollToTop: false });
+          }
+        }).catch(() => {});
+        return;
+      }
+      window.location.reload();
     } catch (err) {
       if (window.apAdminToast) window.apAdminToast('Upload or network error — try again.', true);
       else alert('Upload or network error — try again.');
