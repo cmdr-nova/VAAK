@@ -4941,6 +4941,28 @@ $vaakAdminOnlyActions = [
                 }
             }
         }
+    } elseif ($action === 'phyrian_moment_post') {
+        // Off unless VAAK_PHYRIAN_MOMENTS is on. Check that before loading the
+        // helper or reading a player row. This is not a game mutation, so it
+        // stays off the ensure_player action list below.
+        $phyrianMomentsOn = getenv('VAAK_PHYRIAN_MOMENTS');
+        if (is_string($phyrianMomentsOn) && in_array(strtolower(trim($phyrianMomentsOn)), ['1', 'true', 'yes', 'on'], true)) {
+            require_once __DIR__ . '/ap-phyrian-moments.php';
+            $view = 'phyrian';
+            $momentRes = ap_phyrian_moments_publish(
+                (int) $vaakOwnerId,
+                (string) ($vaakActorKey ?? ''),
+                (string) ($_POST['moment_kind'] ?? ''),
+                (string) ($_POST['moment_text'] ?? ''),
+                ((string) ($_POST['confirm'] ?? '')) === '1',
+                $csrfToken
+            );
+            if (!empty($momentRes['ok'])) {
+                $notice = 'Posted your Phyrian moment.';
+            } else {
+                $error = (string) ($momentRes['error'] ?? 'Could not post that moment.');
+            }
+        }
     } elseif (in_array($action, [
         'phyrian_request', 'phyrian_accept', 'phyrian_deny', 'phyrian_checkin', 'phyrian_self_seed',
         'phyrian_bridge_start', 'phyrian_bridge_verify', 'phyrian_bridge_unlink',
@@ -35654,7 +35676,17 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
                 <?php else: ?>
                   <a class="btn btn-ghost" href="<?= h($phyOwnDossierHref) ?>">Your readout</a>
                 <?php endif; ?>
-              </div>
+              </div><?php
+                $phyrianMomentsOn = getenv('VAAK_PHYRIAN_MOMENTS');
+                if (is_string($phyrianMomentsOn) && in_array(strtolower(trim($phyrianMomentsOn)), ['1', 'true', 'yes', 'on'], true)) {
+                    require_once __DIR__ . '/ap-phyrian-moments.php';
+                    echo ap_phyrian_moments_hub_html(
+                        is_array($phyPlayer) ? $phyPlayer : [],
+                        (string) ($vaakActorKey ?? ''),
+                        function_exists('ap_auth_csrf_token') ? ap_auth_csrf_token() : ''
+                    );
+                }
+              ?>
             </div>
           </div>
 
