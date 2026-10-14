@@ -1,0 +1,5 @@
+name: "CodeQL config"
+
+# Test-only sources. Production Rust, including mentions_html.rs, stays scanned.
+paths-ignore:
+  - rust/vaak-worker/src/mentions_html_tests.rs
