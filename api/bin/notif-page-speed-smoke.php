@@ -204,19 +204,49 @@ speed_check(admin_notif_embed_uses_axum() === true, 'clearing the fill flag rest
 $admin = (string) file_get_contents($api . '/ap-admin.php');
 $visibility = (string) file_get_contents($api . '/ap-visibility.php');
 $schema = (string) file_get_contents($api . '/ap-db.php');
-$migrate = (string) file_get_contents(dirname($api) . '/deploy/remote/migrate.php');
+$migratePath = dirname($api) . '/deploy/remote/migrate.php';
+$migrate = (string) file_get_contents($migratePath);
 $indexSql = (string) file_get_contents($api . '/migrations/20261014_notification_read_indexes_postgres.sql');
 speed_check(str_contains($admin, "\$GLOBALS['admin_notif_inline_cards'] = true;"), 'mentions fill sets inline cards');
 speed_check(str_contains($admin, 'admin_notif_embed_uses_axum()'), 'embed path asks whether this fill is inline');
 speed_check(str_contains($admin, 'ap_visibility_notification_page_prefetch('), 'mentions fill prefetches audiences');
 speed_check(substr_count($visibility, 'ap_visibility_status_audience_allowed($child, $ownerUserId, $depth + 1)') === 1, 'nested audience recursion unchanged');
-speed_check(str_contains($schema, 'idx_events_object_key_id'), 'events expression index is created from ap_db');
-speed_check(str_contains($schema, 'idx_mentions_owner_live_id'), 'mentions partial index is created from ap_db');
-speed_check(str_contains($schema, 'notification read indexes not provisioned'), 'index failure fails the migrate log closed');
-speed_check(str_contains($migrate, 'ap_db()'), 'migrate.php reaches indexes through ap_db');
-speed_check(!str_contains($migrate, '20261014_notification_read_indexes_postgres.sql'), 'concurrent index file stays out of the additive loop');
-speed_check(str_contains($indexSql, 'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_events_object_key_id'), 'standalone events index is concurrent');
-speed_check(str_contains($indexSql, 'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_mentions_owner_live_id'), 'standalone mentions index is concurrent');
+speed_check(!preg_match('/CREATE\s+INDEX\b[^;]*idx_events_object_key_id/', $schema), 'a page load does not build the events expression index');
+speed_check(!preg_match('/CREATE\s+INDEX\b[^;]*idx_mentions_owner_live_id/', $schema), 'a page load does not build the mentions partial index');
+speed_check(str_contains($migrate, 'vaak_migrate_notification_read_indexes($lock)'), 'migrate.php builds the indexes on its autocommit connection');
+require_once $migratePath;
+$specs = vaak_migrate_notification_index_specs();
+speed_check(isset($specs['idx_events_object_key_id'], $specs['idx_mentions_owner_live_id']), 'deploy knows both notification read indexes');
+$flatSql = preg_replace('/\s+/', ' ', $indexSql) ?: '';
+foreach ($specs as $name => $spec) {
+    speed_check(str_starts_with($spec['create'], 'CREATE INDEX CONCURRENTLY '), $name . ' is created concurrently');
+    speed_check(str_starts_with($spec['drop'], 'DROP INDEX CONCURRENTLY '), $name . ' invalid rebuild does not take a blocking drop');
+    speed_check(str_contains($flatSql, preg_replace('/\s+/', ' ', $spec['create']) ?: $spec['create']), $name . ' matches the concurrent SQL file');
+    speed_check(vaak_migrate_notification_index_plan(true, true) === 'skip', $name . ' valid index is left untouched');
+    speed_check(vaak_migrate_notification_index_statements($name, 'skip') === [], $name . ' second deploy issues no DDL');
+    speed_check(vaak_migrate_notification_index_statements($name, 'create') === [$spec['create']], $name . ' first deploy only creates');
+    speed_check(
+        vaak_migrate_notification_index_statements($name, 'rebuild') === [$spec['drop'], $spec['create']],
+        $name . ' invalid index is rebuilt concurrently'
+    );
+}
+speed_check(vaak_migrate_notification_index_plan(false, null) === 'missing-table', 'missing events table does not pretend the index exists');
+$files = array_map('basename', vaak_migrate_deploy_sql_files($api));
+speed_check(!in_array('20261014_notification_read_indexes_postgres.sql', $files, true), 'concurrent index file stays out of the additive loop');
+final class NotifIndexTxPdo extends PDO
+{
+    public function inTransaction(): bool
+    {
+        return true;
+    }
+}
+$blocked = false;
+try {
+    vaak_migrate_notification_read_indexes(new NotifIndexTxPdo('sqlite::memory:'));
+} catch (RuntimeException $e) {
+    $blocked = str_contains($e->getMessage(), 'must not run inside a transaction');
+}
+speed_check($blocked, 'concurrent index build refuses an open transaction');
 speed_check(!str_contains($indexSql, 'password') && !str_contains($indexSql, 'postgres://'), 'index file has no credentials');
 
 echo "notif-page-speed-smoke ok checks={$checks} serial_public_prepares={$serialPublic} batched_public_prepares={$batchedPublic}\n";
