@@ -64,6 +64,12 @@
       "area": "ActivityPub follows",
       "summary": "Follow Accept/Reject state, delivery-log redaction, and quiet-host fallback selection. PHP ap_follow_state.php is the live decision code. Rust follow_fallback replays the same inputs and does not fetch or open a database.",
       "php": {"script": "parity/php/follow-fallback.php", "args": []}
+    },
+    {
+      "id": "profile-local-chrome",
+      "area": "Profiles",
+      "summary": "Local profile header, tabs, relationship row, and empty Pins or Asks bodies. PHP capture is api/bin/profile-local-chrome-capture.php. Rust profile_local paints the same chrome and does not open a database.",
+      "php": {"script": "parity/php/profile-local-chrome.php", "args": []}
     }
   ]
 }

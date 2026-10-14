@@ -39,6 +39,7 @@ require_once __DIR__ . '/ap-registration-approvals.php';
 require_once __DIR__ . '/ap-admin-native.php';
 require_once __DIR__ . '/ap-library-native.php';
 require_once __DIR__ . '/ap-search-native.php';
+require_once __DIR__ . '/ap-profile-local-native.php';
 require_once __DIR__ . '/ap-version.php';
 require_once __DIR__ . '/ap-collections.php'; // Library → Collections (starter packs)
 require_once __DIR__ . '/ap-lists.php'; // Library → Lists (private follow subsets)
@@ -34366,17 +34367,7 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
         <?php elseif ($rpActor === '' || !str_starts_with($rpActor, 'https://')): ?>
           <div class="empty">No actor URL.</div>
         <?php else: ?>
-          <?php if (empty($GLOBALS['vaak_guest_profile'])): ?>
-          <div class="page-back">
-            <a class="btn btn-ghost" href="<?= h($rpBackHref) ?>"<?= $rpBackView !== '' ? ' data-vaak-soft-nav="' . h($rpBackView) . '"' : '' ?>><?= h($rpBackLabel) ?></a>
-            <?php if ($rpIsLocal): ?>
-              <a class="btn btn-ghost" href="?view=remote_profile&amp;actor=<?= urlencode($rpActor) ?>&amp;from=<?= urlencode($rpFrom) ?>" title="Reload local profile">↻ Refresh</a>
-            <?php else: ?>
-              <a class="btn btn-ghost" href="?view=remote_profile&amp;actor=<?= urlencode($rpActor) ?>&amp;from=<?= urlencode($rpFrom) ?>&amp;refresh=1" title="Queue a background profile and post refresh">↻ Refresh profile</a>
-            <?php endif; ?>
-          </div>
-          <?php endif; ?>
-          <?php
+<?php
             if ($rpIsBsky) {
                 $rpRel = $rpBskyFollowing
                     ? ($rpBskyFollowsYou ? 'mutual' : 'following')
@@ -34434,7 +34425,121 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
             $rpPostSub = $rpIsLocal && !$rpIsOwn
                 && function_exists('ap_post_subscription_is')
                 && ap_post_subscription_is($rpActor, admin_owner_user_id());
-          ?>
+            $rpLocalNative = null;
+            if (ap_profile_native_enabled()
+                && $rpIsLocal
+                && !$rpIsBsky
+                && empty($GLOBALS['vaak_guest_profile'])
+                && empty($rpContentBlocked)
+                && is_string($rpLocalKey)
+                && $rpLocalKey !== ''
+                && preg_match('#^https://mkultra\\.monster/users/[A-Za-z0-9_]+$#', $rpActor)
+                // The opt-in Phyrian card is printed inside this header. Leave the
+                // whole paint on PHP while that flag is on; the check is env only.
+                && !in_array(strtolower(trim((string) getenv('VAAK_PHYRIAN_PROFILE_CARD'))), ['1', 'true', 'yes', 'on'], true)) {
+                $rpWhoName = (string) ((is_array($rpMeta) ? ($rpMeta['display_name'] ?? null) : null) ?: actor_handle($rpActor));
+                $rpWhoHtml = admin_emoji_html($rpWhoName, $rpActor);
+                $rpMenuOwner = (int) $vaakOwnerId;
+                $rpPersonalBlock = function_exists('ap_user_block_find')
+                    ? ap_user_block_find($rpActor, short_host($rpActor), $rpMenuOwner)
+                    : null;
+                $rpBareSrc = null;
+                if (!is_string($rpAvatar) || $rpAvatar === '') {
+                    $rpBareSrc = admin_actor_avatar_url($rpActor);
+                }
+                $rpFacts = [
+                    'actor' => $rpActor,
+                    'key' => (string) $rpLocalKey,
+                    'from' => (string) $rpFrom,
+                    'tab' => (string) $rpTab,
+                    'tab_href' => (string) ($rpTabHref ?? ''),
+                    'display_name' => (string) (is_array($rpMeta) ? ($rpMeta['display_name'] ?? '') : ''),
+                    'username' => (string) (is_array($rpMeta) ? ($rpMeta['username'] ?? '') : ''),
+                    'bio' => (string) $rpBio,
+                    'avatar' => is_string($rpAvatar) && $rpAvatar !== '' ? $rpAvatar : null,
+                    'banner' => is_string($rpHeader) && $rpHeader !== '' ? $rpHeader : null,
+                    'fallback_avatar' => defined('AP_REMOTE_AVATAR_FALLBACK')
+                        ? AP_REMOTE_AVATAR_FALLBACK
+                        : 'https://mkultra.monster/img/avatar/default.jpg',
+                    'bare_src' => is_string($rpBareSrc) && $rpBareSrc !== '' ? $rpBareSrc : null,
+                    'display_html' => $rpWhoHtml,
+                    'is_own' => !empty($rpIsOwn),
+                    'following' => !empty($rpFollowing),
+                    'follows_you' => !empty($rpFollowsYou),
+                    'requested' => !empty($rpRequested),
+                    'locked' => !empty($rpLocked),
+                    'muted' => !empty($rpMuted),
+                    'blocked_personal' => !empty($rpBlockedPersonal),
+                    'blocked_server' => !empty($rpBlockedServer),
+                    'subscribed' => !empty($rpPostSub),
+                    'personal_block_id' => is_array($rpPersonalBlock) ? (int) ($rpPersonalBlock['id'] ?? 0) : null,
+                    'deprioritized' => function_exists('ap_is_deprioritized_actor') && ap_is_deprioritized_actor($rpActor, $rpMenuOwner),
+                    'target_is_admin' => function_exists('admin_is_local_admin_actor') && admin_is_local_admin_actor($rpActor),
+                    'viewer_is_admin' => !empty($vaakIsAdmin),
+                    'csrf' => function_exists('ap_auth_csrf_token') ? (string) ap_auth_csrf_token() : '',
+                    'bridge' => is_array($rpPhyrianBridge) ? [
+                        'avatar_name' => (string) ($rpPhyrianBridge['avatar_name'] ?? ''),
+                        'strain_snapshot' => (string) ($rpPhyrianBridge['strain_snapshot'] ?? ''),
+                    ] : null,
+                    'sl' => is_array($rpSlLink) ? [
+                        'sl_username' => (string) ($rpSlLink['sl_username'] ?? ''),
+                        'sl_agent_id' => (string) ($rpSlLink['sl_agent_id'] ?? ''),
+                    ] : null,
+                    'wow' => is_array($rpWowLink) ? [
+                        'character_name' => (string) ($rpWowLink['character_name'] ?? ''),
+                        'realm' => (string) ($rpWowLink['realm'] ?? ''),
+                        'armory_url' => (string) ($rpWowLink['armory_url'] ?? ''),
+                        'portrait_url' => (string) ($rpWowLink['portrait_url'] ?? ''),
+                    ] : null,
+                    'fields' => array_values(is_array($rpProfileFields) ? $rpProfileFields : []),
+                    'badges' => array_values(is_array($rpProfileBadges) ? $rpProfileBadges : []),
+                    'stats_bsky' => !empty($rpBskyStatsHandle),
+                    'posts_stat' => (int) $rpPostsStat,
+                    'following_stat' => (int) $rpFollowingStat,
+                    'followers_stat' => (int) $rpFollowersStat,
+                    'item_posts' => count($rpTabItems['posts'] ?? []),
+                    'item_replies' => count($rpTabItems['replies'] ?? []),
+                    'item_boosts' => count($rpTabItems['boosts'] ?? []),
+                    'item_media' => count($rpTabItems['media'] ?? []),
+                    'item_asks' => count($rpTabItems['asks'] ?? []),
+                    'outbox_total' => (int) ($rpOutboxTotal ?? 0),
+                    'replies_total' => (int) ($rpOutboxRepliesTotal ?? 0),
+                    'boost_total' => (int) ($rpBoostTotal ?? 0),
+                    'hide_replies' => !empty($rpHideProfileReplies),
+                    'hide_boosts' => !empty($rpHideProfileBoosts),
+                    'bsky_posts' => (int) ($rpBskyPostCount ?? 0),
+                    'pin_rows' => count($rpPinnedStatuses),
+                    'pin_count' => (int) $rpPinnedCount,
+                    'featured_rows' => count($rpFeaturedCards),
+                    'featured_count' => (int) $rpFeaturedCount,
+                    'blog_rows' => count($rpBlogPosts),
+                    'blog_count' => (int) $rpBlogCount,
+                    'blog_open' => $rpBlogPost !== null,
+                ];
+                if (function_exists('ap_outbox_media_count')) {
+                    $rpOutboxMediaCount = ap_outbox_media_count((string) $rpLocalKey);
+                    $rpFacts['media_total'] = (int) $rpOutboxMediaCount;
+                }
+                $rpLocalNative = ap_profile_native_render_local($rpFacts);
+            }
+            if (is_array($rpLocalNative)) {
+                echo $rpLocalNative['page_back'];
+            } else {
+?>
+          <?php if (empty($GLOBALS['vaak_guest_profile'])): ?>
+          <div class="page-back">
+            <a class="btn btn-ghost" href="<?= h($rpBackHref) ?>"<?= $rpBackView !== '' ? ' data-vaak-soft-nav="' . h($rpBackView) . '"' : '' ?>><?= h($rpBackLabel) ?></a>
+            <?php if ($rpIsLocal): ?>
+              <a class="btn btn-ghost" href="?view=remote_profile&amp;actor=<?= urlencode($rpActor) ?>&amp;from=<?= urlencode($rpFrom) ?>" title="Reload local profile">↻ Refresh</a>
+            <?php else: ?>
+              <a class="btn btn-ghost" href="?view=remote_profile&amp;actor=<?= urlencode($rpActor) ?>&amp;from=<?= urlencode($rpFrom) ?>&amp;refresh=1" title="Queue a background profile and post refresh">↻ Refresh profile</a>
+            <?php endif; ?>
+          </div>
+          <?php endif; ?>
+<?php
+            } /* profile-page-back */
+?>
+          <?php /* profile-relationship-shell */ ?>
           <?php if ($rpContentBlocked): ?>
           <article class="tweet">
             <div class="tweet-hd" style="align-items:center;gap:.75rem">
@@ -34464,6 +34569,7 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
               Remote follow request — confirm with <b>Follow</b> below to follow this account from your VAAK actor.
             </div>
           <?php endif; ?>
+<?php if (is_array($rpLocalNative ?? null)) { echo $rpLocalNative['header']; } else { ?>
           <?php if ($rpHeader): ?>
             <div style="height:120px;border-radius:12px;overflow:hidden;margin-bottom:.75rem;background:#111">
               <img src="<?= h((string) $rpHeader) ?>" alt="" style="width:100%;height:100%;object-fit:cover" loading="lazy" referrerpolicy="no-referrer">
@@ -34484,7 +34590,7 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
                   <?= admin_avatar_img($rpActor) ?>
                 <?php endif; ?>
                 <div style="min-width:0">
-                  <div class="who"><?= admin_emoji_html((string) ((is_array($rpMeta) ? ($rpMeta['display_name'] ?? null) : null) ?: actor_handle($rpActor)), $rpActor) ?><?php
+                  <div class="who"><?= isset($rpWhoHtml) ? $rpWhoHtml : admin_emoji_html((string) ((is_array($rpMeta) ? ($rpMeta['display_name'] ?? null) : null) ?: actor_handle($rpActor)), $rpActor) ?><?php
                     if ($rpIsLocal && !empty($rpPhyrianBridge) && function_exists('ap_phyrian_bridge_resonant_badge_html')) {
                         echo ap_phyrian_bridge_resonant_badge_html(is_array($rpPhyrianBridge) ? $rpPhyrianBridge : null);
                     }
@@ -34836,7 +34942,9 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
                   if (isset($rpBoostTotal) && !$rpHideProfileBoosts) {
                       $rpTabCountBoosts = max($rpTabCountBoosts, (int) $rpBoostTotal);
                   }
-                  if (function_exists('ap_outbox_media_count')) {
+                  if (isset($rpOutboxMediaCount)) {
+                      $rpTabCountMedia = max($rpTabCountMedia, (int) $rpOutboxMediaCount);
+                  } elseif (function_exists('ap_outbox_media_count')) {
                       $rpTabCountMedia = max($rpTabCountMedia, ap_outbox_media_count((string) $rpLocalKey));
                   }
                   if ($rpBskyPostCount > 0) {
@@ -34881,8 +34989,10 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
             </div>
             <button type="button" class="remote-profile-tabs-scroll-btn" data-profile-tabs-scroll="right" aria-label="Scroll profile tabs right">&gt;</button>
           </nav>
+<?php } /* profile-header */ ?>
           <div class="remote-profile-posts">
           <?php if ($rpTab === 'asks'): ?>
+<?php if (is_array($rpLocalNative ?? null) && is_string($rpLocalNative['secondary'] ?? null) && $rpTabItems['asks'] === []) { echo substr($rpLocalNative['secondary'], 10); } else { ?>
             <?php if ($rpTabItems['asks'] === []): ?>
               <div class="empty">No answered Asks yet.</div>
             <?php else: ?>
@@ -34890,7 +35000,9 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
                 <?php if (is_array($askItem)) admin_render_outbox_card($askItem, 'remote_profile'); ?>
               <?php endforeach; ?>
             <?php endif; ?>
+<?php } ?>
           <?php elseif ($rpTab === 'pinned'): ?>
+<?php if (is_array($rpLocalNative ?? null) && is_string($rpLocalNative['secondary'] ?? null) && $rpPinnedStatuses === []) { echo substr($rpLocalNative['secondary'], 10); } else { ?>
             <?php if ($rpPinnedStatuses === []): ?>
               <div class="empty">No pinned posts.</div>
             <?php else: ?>
@@ -34906,6 +35018,7 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
               ?>
               </div>
             <?php endif; ?>
+<?php } ?>
           <?php elseif ($rpTab === 'featured'): ?>
             <?php
               $rpFeatFallback = defined('AP_REMOTE_AVATAR_FALLBACK')
