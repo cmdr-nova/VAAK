@@ -5622,6 +5622,12 @@ function ap_metrics_record(
                             ap_db()->prepare('UPDATE events SET summary = ? WHERE id = ?')
                                 ->execute([$summary, (int) $existing['id']]);
                         }
+                        ap_events_store_quote_targets(
+                            (int) $existing['id'],
+                            $type,
+                            is_string($objectId) ? $objectId : '',
+                            $summary
+                        );
                     } catch (Throwable $e) {
                         // non-fatal
                     }
@@ -5703,6 +5709,12 @@ function ap_metrics_record(
             ]);
         }
         if ($insertedId > 0) {
+            ap_events_store_quote_targets(
+                $insertedId,
+                $type,
+                is_string($objectId) ? $objectId : '',
+                $summary
+            );
             ap_timeline_notify($type, $actorId, $objectId, $when);
             // 0.6.70/0.6.71: Create/Announce/Quote* from a followed actor → followers' Home ranked.
             if (
@@ -14076,9 +14088,123 @@ function ap_masto_status_flags_prefetch(array $statusIds, array $objectIds = [])
 }
 
 /**
+ * Status-shaped HTTPS URL, matching ap_url_looks_like_status_object.
+ * Kept here so ingest and deploy backfill agree when the Mastodon helpers
+ * are not loaded.
+ */
+function ap_event_quote_target_is_status_url(string $url): bool
+{
+    $url = rtrim(trim($url), '/');
+    if ($url === '' || !str_starts_with($url, 'https://') || strlen($url) > 2000) {
+        return false;
+    }
+    if (str_starts_with($url, 'https://bsky.app/') || str_contains($url, 'bsky.brid.gy')) {
+        return true;
+    }
+    $host = strtolower((string) (parse_url($url, PHP_URL_HOST) ?: ''));
+    $path = (string) (parse_url($url, PHP_URL_PATH) ?: '');
+    if ($host === '' || $path === '' || $path === '/') {
+        return false;
+    }
+    if (($host === 'bsky.app' || str_ends_with($host, '.bsky.app'))
+        && preg_match('#/profile/[^/]+/post/[A-Za-z0-9_-]+#', $path)) {
+        return true;
+    }
+    if (preg_match(
+        '#(?:^|\.)(youtu\.be|youtube\.com|wikipedia\.org|bloomberg\.com|twitter\.com|x\.com|tiktok\.com|instagram\.com|facebook\.com|reddit\.com|twitch\.tv)$#',
+        $host
+    )) {
+        return false;
+    }
+    if (preg_match('#\.(?:jpe?g|png|gif|webp|mp4|webm|mp3|pdf|svg)(?:$|\?)#i', $path)) {
+        return false;
+    }
+    if (preg_match('#/(?:statuses|posts|notes|objects|notice|activity|videos/watch|w)/[A-Za-z0-9_-]+#i', $path)) {
+        return true;
+    }
+    if (preg_match('#/@[^/]+/[0-9A-Za-z_-]+$#', $path)) {
+        return true;
+    }
+    if (preg_match('#/post/[0-9]+#', $path)) {
+        return true;
+    }
+    return str_contains($host, 'threads.net') && str_contains($path, '/post/');
+}
+
+/**
+ * Status URLs embedded in a Create summary. Equality on these values replaces
+ * the leading-wildcard summary scan. Trailing slash and punctuation are
+ * removed so the key matches a trimmed note id.
+ *
+ * @return list<string>
+ */
+function ap_event_quote_targets_from_summary(?string $summary): array
+{
+    $summary = trim((string) $summary);
+    if ($summary === '' || !str_contains($summary, 'https://')) {
+        return [];
+    }
+    if (!preg_match_all('#https://[^\s"\'<>]+#i', $summary, $found)) {
+        return [];
+    }
+    $urls = [];
+    foreach ($found[0] as $raw) {
+        $url = html_entity_decode((string) $raw, ENT_QUOTES | ENT_HTML5, 'UTF-8');
+        $url = rtrim($url, ".,);]'\"!");
+        $url = rtrim($url, '/');
+        if (!ap_event_quote_target_is_status_url($url)) {
+            continue;
+        }
+        $urls[$url] = true;
+        if (count($urls) >= 16) {
+            break;
+        }
+    }
+    return array_keys($urls);
+}
+
+function ap_event_quote_target_count_sql(): string
+{
+    return 'SELECT COUNT(*) FROM event_quote_targets
+        WHERE quote_target = ?
+          AND object_id IS DISTINCT FROM ? AND object_id IS DISTINCT FROM ?';
+}
+
+/**
+ * Record summary quote targets for one Create. Missing table is ignored so
+ * ingest keeps working until deploy/remote/migrate.php creates it.
+ */
+function ap_events_store_quote_targets(int $eventId, string $type, string $objectId, ?string $summary): void
+{
+    if ($eventId < 1 || $type !== 'Create') {
+        return;
+    }
+    $targets = ap_event_quote_targets_from_summary($summary);
+    if ($targets === []) {
+        return;
+    }
+    try {
+        $db = ap_db();
+        $ins = $db->prepare(
+            'INSERT INTO event_quote_targets (event_id, quote_target, object_id)
+             SELECT ?, ?, ?
+             WHERE NOT EXISTS (
+               SELECT 1 FROM event_quote_targets WHERE event_id = ? AND quote_target = ?
+             )'
+        );
+        foreach ($targets as $target) {
+            $ins->execute([$eventId, $target, $objectId, $eventId, $target]);
+        }
+    } catch (Throwable $e) {
+        // event_quote_targets is created by deploy/remote/migrate.php.
+    }
+}
+
+/**
  * Engagement totals for a local VAAK note (own posts on Home / Your Posts / profile).
  * Fediverse likes/boosts come from the events ledger; local VAAK favourites /
- * bookmarks / boosts from masto_*; quotes from quote_object + quote_authorizations;
+ * bookmarks / boosts from masto_*; quotes from quote_object + quote_authorizations,
+ * then indexed event_quote_targets when those recorded sources are empty.
  * Bluesky crosspost counts from bsky_posts when a mirror exists (added, not maxed,
  * because AP and ATProto audiences do not overlap).
  *
@@ -14132,19 +14258,15 @@ function ap_local_note_engagement_counts(string $noteId, ?string $statusId = nul
             // quote_authorizations may be absent on older DBs
         }
 
-        // Fallback: Creates whose summary embeds this note as a QT target.
+        // Indexed replacement for the Create summary scan. Rows are written
+        // on ingest and backfilled by deploy/remote/migrate.php.
         if ($quotes < 1) {
             try {
-                $qtSum = $db->prepare(
-                    "SELECT COUNT(*) FROM events
-                     WHERE type = 'Create'
-                       AND summary IS NOT NULL AND summary LIKE ?
-                       AND object_id IS DISTINCT FROM ? AND object_id IS DISTINCT FROM ?"
-                );
-                $qtSum->execute(['%' . $noteId . '%', $noteId, $noteSlash]);
+                $qtSum = $db->prepare(ap_event_quote_target_count_sql());
+                $qtSum->execute([$noteId, $noteId, $noteSlash]);
                 $quotes = max($quotes, (int) $qtSum->fetchColumn());
             } catch (Throwable $e) {
-                // ignore
+                // event_quote_targets is absent until migrate.php runs
             }
         }
 

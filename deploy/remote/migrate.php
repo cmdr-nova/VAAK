@@ -108,6 +108,7 @@ function vaak_migrate_deploy_sql_files(string $apiRoot): array
     }
     $names = [
         '20261014_phyrian_clans_postgres.sql',
+        '20261014_event_quote_targets_postgres.sql',
     ];
     $files = [];
     $migrations = $root . DIRECTORY_SEPARATOR . 'migrations' . DIRECTORY_SEPARATOR;
@@ -456,6 +457,204 @@ function vaak_migrate_apply_additive_sql(PDO $db, string $path): array
     return $plan['tables'];
 }
 
+function vaak_migrate_quote_target_index_spec(): array
+{
+    return [
+        'table' => 'event_quote_targets',
+        'create' => 'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_event_quote_targets_target ON event_quote_targets (quote_target)',
+        'drop' => 'DROP INDEX CONCURRENTLY IF EXISTS idx_event_quote_targets_target',
+    ];
+}
+
+/** @return list<string> */
+function vaak_migrate_quote_target_index_statements(string $action): array
+{
+    $spec = vaak_migrate_quote_target_index_spec();
+    if ($action === 'skip') {
+        return [];
+    }
+    if ($action === 'create') {
+        return [$spec['create']];
+    }
+    if ($action === 'rebuild') {
+        return [$spec['drop'], $spec['create']];
+    }
+    throw new RuntimeException('quote target index was not created');
+}
+
+/**
+ * Create the quote-target table if the additive file has not run yet, plus
+ * the backfill cursor. Both statements are no-ops once the objects exist.
+ */
+function vaak_migrate_quote_target_ensure(PDO $db): void
+{
+    $db->exec(
+        "CREATE TABLE IF NOT EXISTS event_quote_targets (
+            event_id BIGINT NOT NULL,
+            quote_target TEXT NOT NULL,
+            object_id TEXT NOT NULL DEFAULT '',
+            PRIMARY KEY (event_id, quote_target)
+        )"
+    );
+    $db->exec(
+        'CREATE TABLE IF NOT EXISTS event_quote_target_backfill (
+            id SMALLINT PRIMARY KEY CHECK (id = 1),
+            last_event_id BIGINT NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL
+        )'
+    );
+    $db->exec(
+        "INSERT INTO event_quote_target_backfill (id, last_event_id, updated_at)
+         SELECT 1, 0, '1970-01-01T00:00:00Z'
+         WHERE NOT EXISTS (SELECT 1 FROM event_quote_target_backfill WHERE id = 1)"
+    );
+}
+
+/**
+ * One primary-key slice of historical Creates. The cursor commits with the
+ * inserts, so a re-run resumes after the last finished slice and does not
+ * lock the events table for the whole scan.
+ *
+ * @return array{scanned:int,stored:int,last_id:int,done:bool}
+ */
+function vaak_migrate_quote_target_backfill_batch(PDO $db, int $batchSize = 1000): array
+{
+    if (!function_exists('ap_event_quote_targets_from_summary')) {
+        throw new RuntimeException('quote target extractor is not loaded');
+    }
+    $batchSize = max(1, $batchSize);
+    vaak_migrate_quote_target_ensure($db);
+    $max = (int) $db->query('SELECT COALESCE(MAX(id), 0) FROM events')->fetchColumn();
+    $last = (int) $db->query('SELECT last_event_id FROM event_quote_target_backfill WHERE id = 1')->fetchColumn();
+    if ($last >= $max) {
+        return ['scanned' => 0, 'stored' => 0, 'last_id' => $last, 'done' => true];
+    }
+    $hi = min($max, $last + $batchSize);
+    $sel = $db->prepare(
+        "SELECT id, summary, object_id FROM events
+         WHERE id > ? AND id <= ? AND type = 'Create'
+           AND summary IS NOT NULL AND summary LIKE '%https://%'"
+    );
+    $sel->execute([$last, $hi]);
+    $rows = $sel->fetchAll();
+    if (!is_array($rows)) {
+        $rows = [];
+    }
+    $started = !$db->inTransaction();
+    if ($started) {
+        $db->beginTransaction();
+    }
+    $stored = 0;
+    try {
+        $ins = $db->prepare(
+            'INSERT INTO event_quote_targets (event_id, quote_target, object_id)
+             SELECT ?, ?, ?
+             WHERE NOT EXISTS (
+               SELECT 1 FROM event_quote_targets WHERE event_id = ? AND quote_target = ?
+             )'
+        );
+        foreach ($rows as $row) {
+            if (!is_array($row)) {
+                continue;
+            }
+            $eventId = (int) ($row['id'] ?? 0);
+            $objectId = trim((string) ($row['object_id'] ?? ''));
+            foreach (ap_event_quote_targets_from_summary((string) ($row['summary'] ?? '')) as $target) {
+                $ins->execute([$eventId, $target, $objectId, $eventId, $target]);
+                $changed = $ins->rowCount();
+                if ($changed > 0) {
+                    $stored += $changed;
+                }
+            }
+        }
+        $mark = $db->prepare('UPDATE event_quote_target_backfill SET last_event_id = ?, updated_at = ? WHERE id = 1');
+        $mark->execute([$hi, gmdate('c')]);
+        if ($started) {
+            $db->commit();
+        }
+    } catch (Throwable $e) {
+        if ($started && $db->inTransaction()) {
+            $db->rollBack();
+        }
+        throw $e;
+    }
+    return [
+        'scanned' => count($rows),
+        'stored' => $stored,
+        'last_id' => $hi,
+        'done' => $hi >= $max,
+    ];
+}
+
+/** @return array{scanned:int,stored:int,batches:int,last_id:int} */
+function vaak_migrate_quote_target_backfill(PDO $db, int $batchSize = 1000): array
+{
+    $totals = ['scanned' => 0, 'stored' => 0, 'batches' => 0, 'last_id' => 0];
+    for ($i = 0; $i < 100000; $i++) {
+        $batch = vaak_migrate_quote_target_backfill_batch($db, $batchSize);
+        $totals['scanned'] += $batch['scanned'];
+        $totals['stored'] += $batch['stored'];
+        $totals['batches']++;
+        $totals['last_id'] = $batch['last_id'];
+        if ($batch['done']) {
+            return $totals;
+        }
+    }
+    throw new RuntimeException('quote target backfill did not finish');
+}
+
+function vaak_migrate_quote_target_index(PDO $db): void
+{
+    if ($db->getAttribute(PDO::ATTR_DRIVER_NAME) !== 'pgsql') {
+        throw new RuntimeException('quote target index requires postgres');
+    }
+    if ($db->inTransaction()) {
+        throw new RuntimeException('quote target index must not run inside a transaction');
+    }
+    $spec = vaak_migrate_quote_target_index_spec();
+    $table = $db->prepare(
+        'SELECT 1 FROM pg_tables WHERE schemaname = current_schema() AND tablename = ?'
+    );
+    $table->execute([$spec['table']]);
+    $tableExists = $table->fetchColumn() !== false;
+    $index = $db->prepare(
+        'SELECT i.indisvalid FROM pg_class c
+         JOIN pg_index i ON i.indexrelid = c.oid
+         JOIN pg_namespace n ON n.oid = c.relnamespace
+         WHERE n.nspname = current_schema() AND c.relname = ?'
+    );
+    $index->execute(['idx_event_quote_targets_target']);
+    $row = $index->fetch();
+    $valid = is_array($row) ? vaak_migrate_pg_bool($row['indisvalid'] ?? null) : null;
+    if (is_array($row) && $valid === null) {
+        throw new RuntimeException('quote target index validity is unknown');
+    }
+    $action = vaak_migrate_notification_index_plan($tableExists, $valid);
+    if ($action === 'missing-table') {
+        throw new RuntimeException('event_quote_targets is missing; quote target index was not created');
+    }
+    foreach (vaak_migrate_quote_target_index_statements($action) as $statement) {
+        $db->exec($statement);
+    }
+}
+
+/**
+ * Backfill indexed quote targets, then build the read index concurrently.
+ * Returns how many target rows this run inserted.
+ */
+function vaak_migrate_event_quote_targets(PDO $db): int
+{
+    if ($db->inTransaction()) {
+        throw new RuntimeException('quote target backfill must not run inside a transaction');
+    }
+    if (!function_exists('ap_event_quote_targets_from_summary')) {
+        throw new RuntimeException('quote target extractor is not loaded');
+    }
+    $filled = vaak_migrate_quote_target_backfill($db);
+    vaak_migrate_quote_target_index($db);
+    return $filled['stored'];
+}
+
 function vaak_migrate_main(array $argv): void
 {
     $apiRoot = '';
@@ -547,6 +746,7 @@ function vaak_migrate_main(array $argv): void
         }
         vaak_migrate_notification_read_indexes($lock);
         vaak_migrate_home_bsky_indexes($lock);
+        $quoteTargets = vaak_migrate_event_quote_targets($lock);
     } catch (Throwable $e) {
         vaak_migrate_fail(vaak_migrate_redact($e->getMessage(), $password));
     }
@@ -564,7 +764,7 @@ function vaak_migrate_main(array $argv): void
         vaak_migrate_fail('pending schema changes were not applied');
     }
 
-    fwrite(STDOUT, "migrate_ok role={$role} tables={$tables} additive=" . count($applied) . "\n");
+    fwrite(STDOUT, "migrate_ok role={$role} tables={$tables} additive=" . count($applied) . " quote_targets={$quoteTargets}\n");
     exit(0);
 }
 
