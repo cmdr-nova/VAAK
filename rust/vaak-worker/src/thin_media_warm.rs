@@ -272,6 +272,12 @@ async fn upsert_from_appview(
         .await
         .context("upsert bsky_posts")?;
 
+    if owner > 0 && uri.starts_with("at://") {
+        if let Err(e) = crate::bsky_observations::touch(&db, uri, owner).await {
+            tracing::warn!(error = %e, %uri, "bsky observation touch skipped");
+        }
+    }
+
     let repaired = !embed.is_null()
         && (raw_s.to_ascii_lowercase().contains("fullsize")
             || raw_s.to_ascii_lowercase().contains("playlist")

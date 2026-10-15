@@ -3030,27 +3030,35 @@ function ap_bsky_post_observations_migrate(?PDO $db = null): void
                 ap_schema_remember_index($db, 'idx_bsky_post_observations_owner_time');
             }
         }
-        // The backfill reads every owned Bluesky row. A web profile was paying
-        // that once per PHP-FPM worker (about 5s) before the header could paint.
-        // Live ingest records new rows via ap_bsky_post_observation_touch.
-        // CLI maintenance can still fill historical rows.
+        // Live ingest records rows via ap_bsky_post_observation_touch. CLI
+        // maintenance only fills posts seen inside the fresh window, in batches,
+        // and does not rewrite an observation that was bumped recently.
         if (PHP_SAPI === 'cli') {
-            if ($driver === 'pgsql') {
-                $db->exec("INSERT INTO bsky_post_observations (bsky_uri, owner_user_id, first_seen_at, last_seen_at)
-                    SELECT bsky_uri, owner_user_id, COALESCE(seen_at, NOW()::text), COALESCE(seen_at, NOW()::text)
-                    FROM bsky_posts WHERE owner_user_id IS NOT NULL
-                    ON CONFLICT (bsky_uri, owner_user_id) DO NOTHING");
-            } else {
-                $db->exec("INSERT OR IGNORE INTO bsky_post_observations (bsky_uri, owner_user_id, first_seen_at, last_seen_at)
-                    SELECT bsky_uri, owner_user_id, COALESCE(seen_at, datetime('now')), COALESCE(seen_at, datetime('now'))
-                    FROM bsky_posts WHERE owner_user_id IS NOT NULL");
-            }
+            ap_bsky_post_observations_refresh($db);
         }
     } catch (Throwable $e) {
         error_log('[ap-bsky] post observations migration failed: ' . $e->getMessage());
     }
 }
 
+/** How long an observation stays fresh before last_seen_at may be rewritten. */
+function ap_bsky_observation_fresh_seconds(): int
+{
+    return 600;
+}
+
+function ap_bsky_observation_stamp(int $unix): string
+{
+    return gmdate('c', $unix);
+}
+
+/**
+ * Insert or bump one observation.
+ *
+ * Repeat ingest inside the fresh window does not rewrite the row, so the
+ * owner/time index is not maintained for a no-op touch. first_seen_at is
+ * kept on conflict.
+ */
 function ap_bsky_post_observation_touch(string $bskyUri, int $ownerUserId, ?PDO $db = null): void
 {
     if ($ownerUserId < 1 || !str_starts_with($bskyUri, 'at://')) {
@@ -3058,18 +3066,104 @@ function ap_bsky_post_observation_touch(string $bskyUri, int $ownerUserId, ?PDO 
     }
     $db ??= ap_db();
     ap_bsky_post_observations_migrate($db);
-    $now = gmdate('c');
+    $nowUnix = time();
+    $now = ap_bsky_observation_stamp($nowUnix);
+    $cutoff = ap_bsky_observation_stamp($nowUnix - ap_bsky_observation_fresh_seconds());
     try {
-        $driver = function_exists('ap_db_driver') ? ap_db_driver($db) : 'sqlite';
-        if ($driver === 'pgsql') {
-            $st = $db->prepare('INSERT INTO bsky_post_observations (bsky_uri, owner_user_id, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?) ON CONFLICT (bsky_uri, owner_user_id) DO UPDATE SET last_seen_at = EXCLUDED.last_seen_at');
-        } else {
-            $st = $db->prepare('INSERT INTO bsky_post_observations (bsky_uri, owner_user_id, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?) ON CONFLICT (bsky_uri, owner_user_id) DO UPDATE SET last_seen_at = excluded.last_seen_at');
-        }
-        $st->execute([$bskyUri, $ownerUserId, $now, $now]);
+        $st = $db->prepare(
+            'INSERT INTO bsky_post_observations (bsky_uri, owner_user_id, first_seen_at, last_seen_at)
+             VALUES (?, ?, ?, ?)
+             ON CONFLICT (bsky_uri, owner_user_id) DO UPDATE
+             SET last_seen_at = excluded.last_seen_at
+             WHERE bsky_post_observations.last_seen_at < ?'
+        );
+        $st->execute([$bskyUri, $ownerUserId, $now, $now, $cutoff]);
     } catch (Throwable $e) {
         error_log('[ap-bsky] post observation touch failed: ' . $e->getMessage());
     }
+}
+
+/**
+ * One batch of the owned-post observation sync.
+ *
+ * Only posts seen inside the fresh window are candidates. Rows whose
+ * last_seen_at is still inside that window are left alone. The conflict
+ * WHERE drops a write that lost the race and became fresh.
+ *
+ * @return array{written:int,scanned:int,cursor:string}
+ */
+function ap_bsky_post_observations_refresh_batch(PDO $db, string $afterUri, int $limit, ?int $nowUnix = null): array
+{
+    $nowUnix ??= time();
+    $limit = max(1, min(500, $limit));
+    $now = ap_bsky_observation_stamp($nowUnix);
+    $cutoff = ap_bsky_observation_stamp($nowUnix - ap_bsky_observation_fresh_seconds());
+    $sql = 'INSERT INTO bsky_post_observations (bsky_uri, owner_user_id, first_seen_at, last_seen_at)
+        SELECT p.bsky_uri, p.owner_user_id, COALESCE(p.seen_at, ?), COALESCE(p.seen_at, ?)
+        FROM bsky_posts p
+        WHERE p.owner_user_id IS NOT NULL
+          AND p.seen_at >= ?
+          AND p.bsky_uri > ?
+          AND NOT EXISTS (
+            SELECT 1 FROM bsky_post_observations o
+            WHERE o.bsky_uri = p.bsky_uri
+              AND o.owner_user_id = p.owner_user_id
+              AND o.last_seen_at >= ?
+          )
+        ORDER BY p.bsky_uri
+        LIMIT ?
+        ON CONFLICT (bsky_uri, owner_user_id) DO UPDATE
+        SET last_seen_at = excluded.last_seen_at
+        WHERE bsky_post_observations.last_seen_at < excluded.last_seen_at
+          AND bsky_post_observations.last_seen_at < ?
+        RETURNING bsky_uri';
+    $st = $db->prepare($sql);
+    $st->bindValue(1, $now);
+    $st->bindValue(2, $now);
+    $st->bindValue(3, $cutoff);
+    $st->bindValue(4, $afterUri);
+    $st->bindValue(5, $cutoff);
+    $st->bindValue(6, $limit, PDO::PARAM_INT);
+    $st->bindValue(7, $cutoff);
+    $st->execute();
+    $uris = [];
+    foreach ($st->fetchAll(PDO::FETCH_COLUMN) ?: [] as $uri) {
+        $uri = (string) $uri;
+        if ($uri !== '') {
+            $uris[] = $uri;
+        }
+    }
+    if ($uris === []) {
+        return ['written' => 0, 'scanned' => 0, 'cursor' => $afterUri];
+    }
+    sort($uris, SORT_STRING);
+    return [
+        'written' => count($uris),
+        'scanned' => count($uris),
+        'cursor' => $uris[count($uris) - 1],
+    ];
+}
+
+/**
+ * Walk recent owned posts in batches. Stops when a batch is short, so a quiet
+ * database is one small statement instead of a rewrite of every owned post.
+ */
+function ap_bsky_post_observations_refresh(?PDO $db = null, int $batchSize = 200, int $maxBatches = 5, ?int $nowUnix = null): int
+{
+    $db ??= ap_db();
+    $batchSize = max(1, min(500, $batchSize));
+    $maxBatches = max(1, min(20, $maxBatches));
+    $written = 0;
+    $cursor = '';
+    for ($i = 0; $i < $maxBatches; $i++) {
+        $step = ap_bsky_post_observations_refresh_batch($db, $cursor, $batchSize, $nowUnix);
+        $written += (int) $step['written'];
+        if ($step['scanned'] < $batchSize || $step['cursor'] === $cursor) {
+            break;
+        }
+        $cursor = (string) $step['cursor'];
+    }
+    return $written;
 }
 
 /** Return connected VAAK owners who follow or own a Bluesky DID. */
