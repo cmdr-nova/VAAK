@@ -14,9 +14,9 @@ declare(strict_types=1);
  * After 99 the middle component increments and the last resets to 00
  * (0.8.99 → 0.9.00). After 0.99.99 the next value is 1.0.00.
  */
-const VAAK_VERSION = '0.8.54';
+const VAAK_VERSION = '0.8.55';
 const VAAK_CHANNEL = 'alpha';
-const VAAK_VERSION_DATE = '2026-10-14';
+const VAAK_VERSION_DATE = '2026-10-15';
 
 /** e.g. "VAAK alpha 0.1.0 · 2026-09-10" */
 function vaak_version_label(): string
