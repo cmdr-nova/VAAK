@@ -175,6 +175,42 @@ impl ProcessWarmTransport {
             Err(_) => false,
         }
     }
+    /// flock(1) holds the lock until the worker exits. A busy lock returns
+    /// before PHP starts, so nudges do not stack.
+    async fn spawn_media_worker(&self) -> bool {
+        let script = self.api_root.join("ap-media-warm-worker.php");
+        if !script.is_file() { return false; }
+        let lock_path = std::env::var_os("VAAK_MEDIA_WARM_LOCK")
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| self.temp_root.join("vaak-media-warm-worker.lock"));
+        let mut child = match Command::new("flock")
+            .arg("-n")
+            .arg("-E")
+            .arg("2")
+            .arg(&lock_path)
+            .arg("env")
+            .arg("VAAK_MEDIA_WARM_LOCKED=1")
+            .arg(&self.php)
+            .arg(&script)
+            .arg("--limit=3")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(_) => return false,
+        };
+        match tokio::time::timeout(Duration::from_millis(250), child.wait()).await {
+            Ok(Ok(status)) => status.code() != Some(2) && status.success(),
+            Ok(Err(_)) => false,
+            Err(_) => {
+                tokio::spawn(async move { let _ = child.wait().await; });
+                true
+            }
+        }
+    }
 }
 impl WarmTransport for ProcessWarmTransport {
     fn actor_process<'a>(&'a self, actor: &'a str) -> EffectFuture<'a> { Box::pin(async move {
@@ -188,12 +224,7 @@ impl WarmTransport for ProcessWarmTransport {
         drop(lock); // PHP releases its actor lock before spawning.
         self.launch("ap-actor-warm.php", actor)
     }) }
-    fn media_process(&self) -> EffectFuture<'_> { Box::pin(async move {
-        if !self.api_root.join("ap-media-warm-worker.php").is_file() { return false; }
-        let Ok(lock) = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(self.temp_root.join("vaak-media-warm-worker.lock")) else { return false; };
-        if lock.try_lock().is_err() { return false; }
-        self.launch("ap-media-warm-worker.php", "--limit=3")
-    }) }
+    fn media_process(&self) -> EffectFuture<'_> { Box::pin(async move { self.spawn_media_worker().await }) }
 }
 
 #[cfg(test)] mod tests {
@@ -251,6 +282,38 @@ impl WarmTransport for ProcessWarmTransport {
         assert!(!transport.media_process().await);
         drop(actor_lock); drop(media_lock);
         std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+    #[tokio::test]
+    async fn media_worker_does_not_stack() -> anyhow::Result<()> {
+        let root = std::env::temp_dir().join(format!("profile-warm-media-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root)?;
+        let mark = root.join("mark");
+        let mark_lit = mark.display().to_string();
+        std::fs::write(
+            root.join("ap-media-warm-worker.php"),
+            format!("<?php file_put_contents('{mark_lit}', getmypid().\"\\n\", FILE_APPEND); sleep(2);"),
+        )?;
+        let transport = ProcessWarmTransport {
+            php: "/usr/bin/php".into(),
+            api_root: root.clone(),
+            temp_root: root.clone(),
+        };
+        let first = transport.media_process().await;
+        let second = transport.media_process().await;
+        assert!(first, "first media warm should hold the lock");
+        assert!(!second, "second media warm must not start");
+        let mut body = String::new();
+        for _ in 0..40 {
+            body = std::fs::read_to_string(&mark).unwrap_or_default();
+            if body.lines().any(|line| !line.is_empty()) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(body.lines().filter(|line| !line.is_empty()).count(), 1);
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        std::fs::remove_dir_all(&root)?;
         Ok(())
     }
     #[tokio::test]

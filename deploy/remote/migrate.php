@@ -435,6 +435,147 @@ function vaak_migrate_home_bsky_indexes(PDO $db): void
 }
 
 /**
+ * Indexes that make the hot Bluesky reads and the observation sync index
+ * range scans. Existing tables, so they are not part of
+ * vaak_migrate_deploy_sql_files(). CREATE INDEX CONCURRENTLY runs outside a
+ * transaction. A valid index is left untouched. An invalid leftover is
+ * dropped and created again.
+ *
+ * idx_bsky_posts_lower_author_did matches
+ * `WHERE lower(author_did) IN (...)` on bsky_posts.
+ * idx_bsky_posts_seen matches the observation sync's seen_at window.
+ * idx_bsky_post_observations_last_seen matches the fresh-window predicate.
+ *
+ * @return array<string, array{table: string, create: string, drop: string}>
+ */
+function vaak_migrate_cpu_index_specs(): array
+{
+    return [
+        'idx_bsky_posts_lower_author_did' => [
+            'table' => 'bsky_posts',
+            'create' => 'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_bsky_posts_lower_author_did ON bsky_posts (lower(author_did))',
+            'drop' => 'DROP INDEX CONCURRENTLY IF EXISTS idx_bsky_posts_lower_author_did',
+        ],
+        'idx_bsky_posts_seen' => [
+            'table' => 'bsky_posts',
+            'create' => 'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_bsky_posts_seen ON bsky_posts (seen_at)',
+            'drop' => 'DROP INDEX CONCURRENTLY IF EXISTS idx_bsky_posts_seen',
+        ],
+        'idx_bsky_post_observations_last_seen' => [
+            'table' => 'bsky_post_observations',
+            'create' => 'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_bsky_post_observations_last_seen ON bsky_post_observations (last_seen_at)',
+            'drop' => 'DROP INDEX CONCURRENTLY IF EXISTS idx_bsky_post_observations_last_seen',
+        ],
+    ];
+}
+
+/** @return list<string> */
+function vaak_migrate_cpu_index_statements(string $name, string $action): array
+{
+    $specs = vaak_migrate_cpu_index_specs();
+    if (!isset($specs[$name])) {
+        throw new RuntimeException('unknown cpu index');
+    }
+    if ($action === 'skip') {
+        return [];
+    }
+    if ($action === 'create') {
+        return [$specs[$name]['create']];
+    }
+    if ($action === 'rebuild') {
+        return [$specs[$name]['drop'], $specs[$name]['create']];
+    }
+    throw new RuntimeException('cpu index was not created');
+}
+
+function vaak_migrate_observation_unique_sql(): string
+{
+    return 'CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS uniq_bsky_post_observations_uri_owner ON bsky_post_observations (bsky_uri, owner_user_id)';
+}
+
+/**
+ * True when (bsky_uri, owner_user_id) already has a valid unique index or
+ * primary key. A second unique index would tax every observation write.
+ */
+function vaak_migrate_observation_unique_exists(PDO $db): bool
+{
+    $st = $db->query(
+        "SELECT 1
+         FROM pg_index i
+         JOIN pg_class t ON t.oid = i.indrelid
+         JOIN pg_namespace n ON n.oid = t.relnamespace
+         WHERE n.nspname = current_schema()
+           AND t.relname = 'bsky_post_observations'
+           AND i.indisunique
+           AND i.indisvalid
+           AND (
+             SELECT array_agg(a.attname::text ORDER BY k.ord)
+             FROM unnest(i.indkey) WITH ORDINALITY AS k(attnum, ord)
+             JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.attnum
+             WHERE k.attnum > 0
+           ) = ARRAY['bsky_uri', 'owner_user_id']::text[]"
+    );
+    return $st !== false && $st->fetchColumn() !== false;
+}
+
+/** @return list<string> */
+function vaak_migrate_observation_unique_statements(bool $tableExists, bool $uniqueExists): array
+{
+    if (!$tableExists || $uniqueExists) {
+        return [];
+    }
+    return [vaak_migrate_observation_unique_sql()];
+}
+
+function vaak_migrate_cpu_indexes(PDO $db): void
+{
+    if ($db->inTransaction()) {
+        throw new RuntimeException('cpu indexes must not run inside a transaction');
+    }
+    foreach (vaak_migrate_cpu_index_specs() as $name => $spec) {
+        $table = $db->prepare(
+            'SELECT 1 FROM pg_tables WHERE schemaname = current_schema() AND tablename = ?'
+        );
+        $table->execute([$spec['table']]);
+        $tableExists = $table->fetchColumn() !== false;
+        $index = $db->prepare(
+            'SELECT i.indisvalid FROM pg_class c
+             JOIN pg_index i ON i.indexrelid = c.oid
+             JOIN pg_namespace n ON n.oid = c.relnamespace
+             WHERE n.nspname = current_schema() AND c.relname = ?'
+        );
+        $index->execute([$name]);
+        $row = $index->fetch();
+        $valid = is_array($row) ? vaak_migrate_pg_bool($row['indisvalid'] ?? null) : null;
+        if (is_array($row) && $valid === null) {
+            throw new RuntimeException('cpu index validity is unknown');
+        }
+        $action = vaak_migrate_notification_index_plan($tableExists, $valid);
+        if ($action === 'missing-table') {
+            // bsky_posts is already required by the home Bluesky indexes.
+            // Observations are created on first Bluesky use; skip until then.
+            if ($spec['table'] === 'bsky_post_observations') {
+                continue;
+            }
+            throw new RuntimeException($spec['table'] . ' is missing; cpu index was not created');
+        }
+        foreach (vaak_migrate_cpu_index_statements($name, $action) as $statement) {
+            $db->exec($statement);
+        }
+    }
+    $observations = $db->query(
+        "SELECT 1 FROM pg_tables WHERE schemaname = current_schema() AND tablename = 'bsky_post_observations'"
+    );
+    $observationsExist = $observations !== false && $observations->fetchColumn() !== false;
+    if (!$observationsExist) {
+        return;
+    }
+    foreach (vaak_migrate_observation_unique_statements($observationsExist, vaak_migrate_observation_unique_exists($db)) as $statement) {
+        $db->exec($statement);
+    }
+}
+
+/**
  * Apply one additive migration. The statement list is checked before any
  * SQL runs, so a rejected file leaves the schema untouched.
  *
@@ -746,6 +887,7 @@ function vaak_migrate_main(array $argv): void
         }
         vaak_migrate_notification_read_indexes($lock);
         vaak_migrate_home_bsky_indexes($lock);
+        vaak_migrate_cpu_indexes($lock);
         $quoteTargets = vaak_migrate_event_quote_targets($lock);
     } catch (Throwable $e) {
         vaak_migrate_fail(vaak_migrate_redact($e->getMessage(), $password));
