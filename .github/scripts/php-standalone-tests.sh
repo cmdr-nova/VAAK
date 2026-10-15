@@ -79,6 +79,7 @@ php_tests=(
   api/bin/profile-native-first-paint-empty-test.php
   api/bin/profile-native-reply-test.php
   api/bin/quote-avatar-behavior-smoke.php
+  api/bin/quote-target-count-smoke.php
   api/bin/recommendations-behavior-smoke.php
   api/bin/search-direct-undo-smoke.php
   api/bin/search-indexing-behavior-smoke.php

@@ -36,11 +36,11 @@ $apiRoot = dirname(__DIR__);
 $files = vaak_migrate_deploy_sql_files($apiRoot);
 $names = array_map('basename', $files);
 $check(
-    $names === ['20261014_phyrian_clans_postgres.sql'],
-    'deploy runner picks up the clans migration and no other loose SQL file'
+    $names === ['20261014_phyrian_clans_postgres.sql', '20261014_event_quote_targets_postgres.sql'],
+    'deploy runner picks up the clans migration and the quote-target table'
 );
 $expectedPath = realpath($apiRoot . '/migrations/20261014_phyrian_clans_postgres.sql');
-$check($expectedPath !== false && $files === [$expectedPath], 'the picked-up path is the clans SQL file');
+$check($expectedPath !== false && ($files[0] ?? '') === $expectedPath, 'the picked-up path starts with the clans SQL file');
 
 $migration = (string) file_get_contents($files[0]);
 $check(substr_count($migration, 'CREATE TABLE IF NOT EXISTS') === 2, 'the file creates both tables only if they are missing');

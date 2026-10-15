@@ -13,10 +13,12 @@
 //!   parity. Flag `VAAK_RANKED_NATIVE_LOCAL_FEED=1` (default on; `0` skips).
 //! - Empty timelines soft-skip (no Redis write). PHP `bin/ranked-warm.php` is
 //!   retired; HTML soft-nav still uses in-process `admin_tl_lean_ranked_warm`.
+//! - The loop skips a view when a cheap max(id) / pg_stat watermark matches
+//!   the previous warm, and only refreshes Redis TTLs so idle ticks stay idle.
 //!
 //! Cache key parity with PHP `admin_tl_cache_key` (v13).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
@@ -2983,34 +2985,280 @@ pub async fn warm_feed_native(cfg: &Config, owner_user_id: i64) -> Result<String
     ))
 }
 
-pub async fn warm_owner(cfg: &Config, owner_user_id: i64, views: &str) -> Result<String> {
-    let wanted = parse_views(views);
-    let mut lines = Vec::new();
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TableTicks {
+    ins: i64,
+    upd: i64,
+    del: i64,
+}
 
-    for view in &wanted {
-        match *view {
-            "home" if native_home_enabled() => {
-                lines.push(warm_home_native(cfg, owner_user_id).await?)
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WarmInputs {
+    stats_readable: bool,
+    events_max_id: i64,
+    tables: BTreeMap<String, TableTicks>,
+}
+
+struct StoredWarm {
+    token: String,
+    logical: Option<String>,
+}
+
+fn view_input_tables(view: &str) -> &'static [&'static str] {
+    match view {
+        "local" => &["outbox_notes", "masto_reblogs"],
+        "feed" => &[
+            "events",
+            "following",
+            "ap_mutes",
+            "ap_user_blocks",
+            "ap_blocks",
+            "ap_muted_words",
+            "bsky_hide_dids",
+        ],
+        "home" => &[
+            "events",
+            "following",
+            "outbox_notes",
+            "actor_profile",
+            "ap_users",
+            "ap_mutes",
+            "ap_user_blocks",
+            "ap_blocks",
+            "ap_muted_words",
+            "bsky_hide_dids",
+            "masto_followed_tags",
+            "ap_deprioritized_actors",
+            "masto_favourites",
+            "ap_user_signals",
+            "bsky_posts",
+            "bsky_graph_sync",
+            "bsky_post_links",
+            "bsky_post_observations",
+            "bsky_crossposts",
+            "bsky_sessions",
+            "rss_items",
+            "rss_feeds",
+            "ap_home_downrank_terms",
+            "ap_home_suppression",
+            "masto_statuses",
+            "followers",
+        ],
+        _ => &[],
+    }
+}
+
+fn view_required_tables(view: &str) -> &'static [&'static str] {
+    match view {
+        "home" | "feed" => &["events"],
+        "local" => &["outbox_notes", "masto_reblogs"],
+        _ => &[],
+    }
+}
+
+fn all_warm_tables() -> Vec<String> {
+    let mut names = Vec::new();
+    for view in ["home", "local", "feed"] {
+        for name in view_input_tables(view) {
+            if !names.iter().any(|have: &String| have == name) {
+                names.push((*name).to_string());
             }
-            "home" => lines.push(format!(
-                "owner={owner_user_id} view=home skipped=flag-off flag=VAAK_RANKED_NATIVE_HOME"
-            )),
-            "local" if native_local_feed_enabled() => {
-                lines.push(warm_local_native(cfg, owner_user_id).await?)
-            }
-            "local" => lines.push(format!(
-                "owner={owner_user_id} view=local skipped=flag-off flag=VAAK_RANKED_NATIVE_LOCAL_FEED"
-            )),
-            "feed" if native_local_feed_enabled() => {
-                lines.push(warm_feed_native(cfg, owner_user_id).await?)
-            }
-            "feed" => lines.push(format!(
-                "owner={owner_user_id} view=feed skipped=flag-off flag=VAAK_RANKED_NATIVE_LOCAL_FEED"
-            )),
-            _ => {}
         }
     }
+    names.sort();
+    names
+}
 
+/// Stable fingerprint of the rows a view reads. None means "do not skip".
+fn view_warm_token(view: &str, inputs: &WarmInputs, hour_bucket: i64) -> Option<String> {
+    if !inputs.stats_readable || view_input_tables(view).is_empty() {
+        return None;
+    }
+    if view_required_tables(view)
+        .iter()
+        .any(|name| !inputs.tables.contains_key(*name))
+    {
+        return None;
+    }
+    let mut parts = Vec::new();
+    if view == "home" || view == "feed" {
+        parts.push(format!("events_max={}", inputs.events_max_id));
+    }
+    if view == "home" {
+        // Home ranking and the federated floor depend on the clock. An hour
+        // bucket keeps that freshness without rebuilding every idle minute.
+        parts.push(format!("hour={hour_bucket}"));
+    }
+    for name in view_input_tables(view) {
+        match inputs.tables.get(*name) {
+            Some(ticks) => parts.push(format!("{name}={}:{}:{}", ticks.ins, ticks.upd, ticks.del)),
+            None => parts.push(format!("{name}=-")),
+        }
+    }
+    Some(parts.join(";"))
+}
+
+fn warm_should_skip(previous: Option<&str>, token: Option<&str>) -> bool {
+    match (previous, token) {
+        (Some(prev), Some(next)) => !prev.is_empty() && prev == next,
+        _ => false,
+    }
+}
+
+fn summary_field(line: &str, name: &str) -> Option<String> {
+    let prefix = format!("{name}=");
+    line.split_whitespace()
+        .find_map(|part| part.strip_prefix(&prefix).map(str::to_string))
+}
+
+fn warm_line_logical(line: &str) -> Option<String> {
+    if line.contains("skipped=") {
+        return None;
+    }
+    let logical = summary_field(line, "key")?;
+    if logical.is_empty() { None } else { Some(logical) }
+}
+
+async fn load_warm_inputs(db: &Client) -> Result<WarmInputs> {
+    let names = all_warm_tables();
+    let rows = db
+        .query(
+            "SELECT relname, COALESCE(n_tup_ins, 0), COALESCE(n_tup_upd, 0), COALESCE(n_tup_del, 0)
+             FROM pg_stat_user_tables
+             WHERE schemaname = current_schema() AND relname = ANY($1::text[])",
+            &[&names],
+        )
+        .await
+        .context("ranked-warm change stats")?;
+    let mut tables = BTreeMap::new();
+    for row in rows {
+        let name: String = row.get(0);
+        tables.insert(
+            name,
+            TableTicks {
+                ins: row.get(1),
+                upd: row.get(2),
+                del: row.get(3),
+            },
+        );
+    }
+    let events_max_id: i64 = db
+        .query_one("SELECT COALESCE(MAX(id), 0) FROM events", &[])
+        .await
+        .context("ranked-warm events watermark")?
+        .get(0);
+    Ok(WarmInputs {
+        stats_readable: !tables.is_empty(),
+        events_max_id,
+        tables,
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WarmKeyKind {
+    /// Missing ranked JSON means the timeline aged out and must be rebuilt.
+    Ranked,
+    /// Owner index and rank weights. A miss does not force a rebuild.
+    Optional,
+    /// Hydrate envelopes are written asynchronously after the ranked key.
+    /// A miss should spawn that fill again, not rebuild the ranked timeline.
+    Hydrate,
+}
+
+struct WarmTouch {
+    rebuild_ranked: bool,
+    hydrate_missing: bool,
+}
+
+fn warm_touch_outcome(results: impl IntoIterator<Item = (WarmKeyKind, i64)>) -> WarmTouch {
+    let mut outcome = WarmTouch {
+        rebuild_ranked: false,
+        hydrate_missing: false,
+    };
+    for (kind, existed) in results {
+        if existed > 0 {
+            continue;
+        }
+        match kind {
+            WarmKeyKind::Ranked => outcome.rebuild_ranked = true,
+            WarmKeyKind::Optional => {}
+            WarmKeyKind::Hydrate => outcome.hydrate_missing = true,
+        }
+    }
+    outcome
+}
+
+/// (redis key, ttl seconds, how a miss is handled).
+fn warm_cache_keys(view: &str, owner: i64, logical: &str) -> Vec<(String, u64, WarmKeyKind)> {
+    let mut keys = vec![
+        (ranked_redis_key(logical), HOME_TTL_SECS, WarmKeyKind::Ranked),
+        (owner_index_key(owner), HOME_TTL_SECS, WarmKeyKind::Optional),
+    ];
+    if view == "home" {
+        keys.push((home_rank_weights_key(owner), HOME_TTL_SECS, WarmKeyKind::Optional));
+    }
+    let hydrate = match view {
+        "local" | "feed" => env_flag_default_true("VAAK_PUBLIC_HYDRATE_WARM"),
+        _ => env_flag_default_true("VAAK_HOME_HYDRATE_WARM"),
+    };
+    if hydrate {
+        for limit in crate::home_hydrate_ranked::DEFAULT_LIMITS {
+            keys.push((
+                crate::timeline::timeline_hydrate_redis_key(view, owner, limit, None),
+                crate::home_hydrate_ranked::HOME_HYDRATE_TTL_SECS,
+                WarmKeyKind::Hydrate,
+            ));
+        }
+    }
+    keys
+}
+
+/// Refresh TTLs for a view that did not change.
+async fn touch_warm_ttl(
+    conn: &mut redis::aio::MultiplexedConnection,
+    view: &str,
+    owner: i64,
+    logical: &str,
+) -> Result<WarmTouch> {
+    let mut results = Vec::new();
+    for (key, ttl, kind) in warm_cache_keys(view, owner, logical) {
+        let n: i64 = redis::cmd("EXPIRE")
+            .arg(&key)
+            .arg(ttl.max(1))
+            .query_async(conn)
+            .await
+            .with_context(|| format!("EXPIRE {key}"))?;
+        results.push((kind, n));
+    }
+    Ok(warm_touch_outcome(results))
+}
+
+async fn warm_one_view(cfg: &Config, owner_user_id: i64, view: &str) -> Result<String> {
+    match view {
+        "home" if native_home_enabled() => warm_home_native(cfg, owner_user_id).await,
+        "home" => Ok(format!(
+            "owner={owner_user_id} view=home skipped=flag-off flag=VAAK_RANKED_NATIVE_HOME"
+        )),
+        "local" if native_local_feed_enabled() => warm_local_native(cfg, owner_user_id).await,
+        "local" => Ok(format!(
+            "owner={owner_user_id} view=local skipped=flag-off flag=VAAK_RANKED_NATIVE_LOCAL_FEED"
+        )),
+        "feed" if native_local_feed_enabled() => warm_feed_native(cfg, owner_user_id).await,
+        "feed" => Ok(format!(
+            "owner={owner_user_id} view=feed skipped=flag-off flag=VAAK_RANKED_NATIVE_LOCAL_FEED"
+        )),
+        _ => Ok(String::new()),
+    }
+}
+
+pub async fn warm_owner(cfg: &Config, owner_user_id: i64, views: &str) -> Result<String> {
+    let mut lines = Vec::new();
+    for view in parse_views(views) {
+        let line = warm_one_view(cfg, owner_user_id, view).await?;
+        if !line.is_empty() {
+            lines.push(line);
+        }
+    }
     Ok(lines.join("\n"))
 }
 
@@ -3028,37 +3276,118 @@ pub async fn run_loop(
 ) -> Result<()> {
     let interval = Duration::from_secs(interval_secs.max(30));
     let views_owned = views.to_string();
+    let mut memory: HashMap<(i64, String), StoredWarm> = HashMap::new();
+    let mut warned_stats = false;
     loop {
-        let owners: Vec<i64> = if owner_user_id > 0 {
-            vec![owner_user_id]
-        } else {
-            match crate::db::connect(&cfg.database_url).await {
-                Ok(db) => match notif::list_local_owner_ids(&db).await {
-                    Ok(ids) if !ids.is_empty() => ids,
-                    Ok(_) => {
-                        tracing::warn!("ranked-warm loop: no local ap_users; sleeping");
-                        vec![]
-                    }
-                    Err(e) => {
-                        tracing::error!(error = %e, "ranked-warm loop: list owners failed");
-                        vec![]
-                    }
-                },
+        let (owners, inputs): (Vec<i64>, Option<WarmInputs>) = if owner_user_id > 0 {
+            let inputs = match crate::db::connect(&cfg.database_url).await {
+                Ok(db) => load_warm_inputs(&db).await.ok(),
                 Err(e) => {
                     tracing::error!(error = %e, "ranked-warm loop: db connect failed");
-                    vec![]
+                    None
+                }
+            };
+            (vec![owner_user_id], inputs)
+        } else {
+            match crate::db::connect(&cfg.database_url).await {
+                Ok(db) => {
+                    let owners = match notif::list_local_owner_ids(&db).await {
+                        Ok(ids) if !ids.is_empty() => ids,
+                        Ok(_) => {
+                            tracing::warn!("ranked-warm loop: no local ap_users; sleeping");
+                            vec![]
+                        }
+                        Err(e) => {
+                            tracing::error!(error = %e, "ranked-warm loop: list owners failed");
+                            vec![]
+                        }
+                    };
+                    let inputs = if owners.is_empty() {
+                        None
+                    } else {
+                        load_warm_inputs(&db).await.ok()
+                    };
+                    (owners, inputs)
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "ranked-warm loop: db connect failed");
+                    (vec![], None)
                 }
             }
         };
+        if inputs.is_none() && !owners.is_empty() && !warned_stats {
+            tracing::warn!("ranked-warm loop: change watermark unavailable; warming every view");
+            warned_stats = true;
+        }
+        let hour = chrono::Utc::now().timestamp().div_euclid(3600);
+        let mut skipped = 0usize;
+        let mut warmed = 0usize;
+        let mut redis = None;
         for owner in owners {
-            match warm_owner(cfg, owner, &views_owned).await {
-                Ok(body) => {
-                    for line in body.lines().filter(|l| !l.is_empty()) {
-                        tracing::info!(owner, summary = %line, "ranked-warm ok");
+            for view in parse_views(&views_owned) {
+                let token = inputs
+                    .as_ref()
+                    .and_then(|inputs| view_warm_token(view, inputs, hour));
+                let key = (owner, view.to_string());
+                let previous_token = memory.get(&key).map(|state| state.token.clone());
+                let previous_logical = memory.get(&key).and_then(|state| state.logical.clone());
+                if warm_should_skip(previous_token.as_deref(), token.as_deref()) {
+                    if let Some(logical) = previous_logical {
+                        if redis.is_none() {
+                            redis = redis_util::connect(&cfg.redis_url).await.ok();
+                        }
+                        let touch = match redis.as_mut() {
+                            Some(conn) => touch_warm_ttl(conn, view, owner, &logical).await.ok(),
+                            None => None,
+                        };
+                        if let Some(touch) = touch {
+                            if !touch.rebuild_ranked {
+                                if touch.hydrate_missing {
+                                    if let Some(conn) = redis.as_mut() {
+                                        let _ = home_hydrate_ranked::maybe_warm_after_ranked_view(
+                                            conn, cfg, owner, view,
+                                        )
+                                        .await;
+                                    }
+                                }
+                                skipped += 1;
+                                tracing::debug!(owner, view, "ranked-warm skipped unchanged");
+                                continue;
+                            }
+                        }
+                    } else {
+                        skipped += 1;
+                        tracing::debug!(owner, view, "ranked-warm skipped unchanged");
+                        continue;
                     }
                 }
-                Err(e) => tracing::error!(owner, error = %e, "ranked-warm failed"),
+                match warm_one_view(cfg, owner, view).await {
+                    Ok(line) => {
+                        if line.is_empty() {
+                            continue;
+                        }
+                        if line.contains("skipped=flag-off") {
+                            memory.remove(&key);
+                        } else if let Some(token) = token {
+                            memory.insert(
+                                key,
+                                StoredWarm {
+                                    token,
+                                    logical: warm_line_logical(&line),
+                                },
+                            );
+                        } else {
+                            memory.remove(&key);
+                        }
+                        warmed += 1;
+                        tracing::info!(owner, summary = %line, "ranked-warm ok");
+                    }
+                    Err(e) => tracing::error!(owner, view, error = %e, "ranked-warm failed"),
+                }
             }
+        }
+        if warmed == 0 && skipped > 0 {
+            tracing::info!(skipped, "ranked-warm idle");
         }
         tokio::time::sleep(interval).await;
     }
@@ -3067,6 +3396,80 @@ pub async fn run_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sample_inputs() -> WarmInputs {
+        let mut tables = BTreeMap::new();
+        for name in ["events", "outbox_notes", "masto_reblogs", "following"] {
+            tables.insert(name.to_string(), TableTicks { ins: 1, upd: 0, del: 0 });
+        }
+        WarmInputs {
+            stats_readable: true,
+            events_max_id: 10,
+            tables,
+        }
+    }
+
+    #[test]
+    fn unchanged_watermark_skips_only_that_view() {
+        let inputs = sample_inputs();
+        let home = view_warm_token("home", &inputs, 5);
+        let local = view_warm_token("local", &inputs, 5);
+        let feed = view_warm_token("feed", &inputs, 5);
+        assert!(warm_should_skip(home.as_deref(), home.as_deref()));
+        assert_ne!(home, local);
+        assert_ne!(home, feed);
+        let mut bumped = inputs.clone();
+        bumped.events_max_id = 11;
+        assert_ne!(view_warm_token("home", &bumped, 5), home);
+        assert_ne!(view_warm_token("feed", &bumped, 5), feed);
+        assert_eq!(view_warm_token("local", &bumped, 5), local);
+        bumped.tables.get_mut("masto_reblogs").unwrap().ins = 4;
+        assert_ne!(view_warm_token("local", &bumped, 5), local);
+        assert_ne!(view_warm_token("home", &inputs, 6), home);
+        assert_eq!(view_warm_token("local", &inputs, 6), local);
+        assert_eq!(view_warm_token("feed", &inputs, 6), feed);
+    }
+
+    #[test]
+    fn missing_events_stats_do_not_skip() {
+        let mut inputs = sample_inputs();
+        inputs.tables.remove("events");
+        assert!(view_warm_token("home", &inputs, 1).is_none());
+        assert!(view_warm_token("feed", &inputs, 1).is_none());
+        assert!(view_warm_token("local", &inputs, 1).is_some());
+        inputs.stats_readable = false;
+        assert!(view_warm_token("local", &inputs, 1).is_none());
+        assert!(!warm_should_skip(None, Some("x")));
+        assert!(!warm_should_skip(Some("x"), None));
+        assert!(!warm_should_skip(Some(""), Some("")));
+    }
+
+    #[test]
+    fn missing_hydrate_does_not_rebuild_ranked() {
+        let ranked_only = warm_touch_outcome([
+            (WarmKeyKind::Ranked, 1),
+            (WarmKeyKind::Optional, 0),
+            (WarmKeyKind::Hydrate, 0),
+        ]);
+        assert!(!ranked_only.rebuild_ranked);
+        assert!(ranked_only.hydrate_missing);
+        let aged_out = warm_touch_outcome([(WarmKeyKind::Ranked, 0), (WarmKeyKind::Hydrate, 1)]);
+        assert!(aged_out.rebuild_ranked);
+        let idle = warm_touch_outcome([
+            (WarmKeyKind::Ranked, 1),
+            (WarmKeyKind::Optional, 1),
+            (WarmKeyKind::Hydrate, 1),
+        ]);
+        assert!(!idle.rebuild_ranked && !idle.hydrate_missing);
+    }
+
+    #[test]
+    fn empty_warm_does_not_keep_a_redis_key() {
+        let empty = "owner=1 view=local key=v13_local_u1_ana_abc ranked=0 ms=3 source=vaak-worker-native skipped=empty";
+        assert!(warm_line_logical(empty).is_none());
+        let written = "owner=1 view=home key=v13_home_u1_aon_abc ranked=4 ms=8 source=vaak-worker-native algo=on";
+        assert_eq!(warm_line_logical(written).as_deref(), Some("v13_home_u1_aon_abc"));
+    }
 
     #[test]
     fn home_cache_key_shape() {

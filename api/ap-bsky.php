@@ -3938,6 +3938,34 @@ function ap_bsky_repair_imported_note_quote(string $noteId, array $post, int $ow
                      )"
                 );
                 $est->execute([$summary, $noteId]);
+                // The quote count reads event_quote_targets, not summary text.
+                // This rewrite can add the quoted URL after the Create was stored.
+                if (function_exists('ap_events_store_quote_targets')) {
+                    $idSt = ap_db()->prepare(
+                        "SELECT id, type, object_id FROM events
+                         WHERE object_id = ? AND action_taken = 'compose'
+                         ORDER BY id DESC LIMIT 1"
+                    );
+                    $idSt->execute([$noteId]);
+                    $row = $idSt->fetch();
+                    if (is_array($row)) {
+                        $eventId = (int) ($row['id'] ?? 0);
+                        if ($eventId > 0) {
+                            try {
+                                ap_db()->prepare('DELETE FROM event_quote_targets WHERE event_id = ?')
+                                    ->execute([$eventId]);
+                            } catch (Throwable $e) {
+                                // event_quote_targets is created by deploy/remote/migrate.php
+                            }
+                            ap_events_store_quote_targets(
+                                $eventId,
+                                (string) ($row['type'] ?? ''),
+                                (string) ($row['object_id'] ?? ''),
+                                $summary
+                            );
+                        }
+                    }
+                }
             } catch (Throwable $e) {
                 // ignore
             }
