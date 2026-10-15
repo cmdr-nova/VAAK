@@ -24,14 +24,14 @@ use crate::config::Config;
 use crate::redis_util;
 use crate::timeline;
 
-const HOME_HYDRATE_TTL_SECS: u64 = 300;
+pub(crate) const HOME_HYDRATE_TTL_SECS: u64 = 300;
 /// Remote / unknown fallback — `default.jpg` 404s on disk; use webp.
 const DEFAULT_AVATAR: &str = "https://mkultra.monster/img/avatar/default.webp";
 /// Local mkultra accounts without actor_profile.icon_url.
 const LOCAL_DEFAULT_AVATAR: &str = "https://mkultra.monster/img/avatar/local-default.webp";
 const LOCAL_ACTOR_PREFIX: &str = "https://mkultra.monster/users/";
 /// 50 = Ice Cubes (0.7.21); 160/240 = deep HTML scroll past the old 80-head (0.7.25).
-const DEFAULT_LIMITS: [i64; 6] = [15, 40, 50, 80, 160, 240];
+pub(crate) const DEFAULT_LIMITS: [i64; 6] = [15, 40, 50, 80, 160, 240];
 const MAX_HYDRATE_LIMIT: i64 = 240;
 
 #[derive(Debug, Clone)]

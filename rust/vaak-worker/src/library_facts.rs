@@ -28,6 +28,9 @@ impl<T:PresentationSession> PresentationSession for BoundPresentationSession<'_,
  fn bsky_bookmark_state(&self,status:&Value)->Option<bool>{self.session.bsky_bookmark_state(status)}
 }
 
+/// PHP `ap_event_quote_target_count_sql`.
+const QUOTE_TARGET_COUNT_SQL: &str = "SELECT count(*) FROM event_quote_targets WHERE quote_target=$1 AND object_id IS DISTINCT FROM $2 AND object_id IS DISTINCT FROM $3";
+
 fn s<'a>(v: &'a Value, key: &str) -> &'a str { v.get(key).and_then(Value::as_str).unwrap_or("") }
 fn n(v: &Value, key: &str) -> i64 { v.get(key).and_then(Value::as_i64).or_else(|| s(v,key).parse().ok()).unwrap_or(0) }
 fn flag(v: &Value, key: &str) -> bool { v.get(key).and_then(Value::as_bool).unwrap_or_else(|| n(v,key) != 0) }
@@ -142,7 +145,17 @@ async fn local_counts_mode(db:&Client,note:&str,sid:&str,include_bookmarks:bool)
         Err(error) => return Err(error).context("current local Library engagement"),
     };
     let mut counts = Counts { favourites:row.get(0), reblogs:row.get(1), quotes:row.get(2), bookmarks:row.get(3) };
-    if counts.quotes == 0 { counts.quotes = db.query_one("SELECT count(*) FROM events WHERE type='Create' AND summary LIKE $1 AND object_id IS DISTINCT FROM $2 AND object_id IS DISTINCT FROM $3", &[&format!("%{note}%"),&keys[0],&keys[1]]).await?.get(0); }
+    if counts.quotes == 0 {
+        // PHP ap_event_quote_target_count_sql. The summary LIKE scan is gone;
+        // ingest and deploy/remote/migrate.php fill event_quote_targets.
+        match db.query_one(QUOTE_TARGET_COUNT_SQL, &[&note, &keys[0], &keys[1]]).await {
+            Ok(row) => counts.quotes = row.get(0),
+            Err(error)
+                if error.code() == Some(&tokio_postgres::error::SqlState::UNDEFINED_TABLE)
+                    || error.code() == Some(&tokio_postgres::error::SqlState::UNDEFINED_COLUMN) => {}
+            Err(error) => return Err(error).context("indexed quote targets"),
+        }
+    }
     if let Some(row) = db.query_opt("SELECT p.like_count::bigint,p.repost_count::bigint,p.quote_count::bigint FROM bsky_crossposts c JOIN bsky_posts p ON p.bsky_uri=c.bsky_uri WHERE c.note_id=ANY($1) ORDER BY c.created_at DESC NULLS LAST LIMIT 1", &[&keys]).await? {
         counts.favourites += row.get::<_,i64>(0).max(0); counts.reblogs += row.get::<_,i64>(1).max(0); counts.quotes += row.get::<_,i64>(2).max(0);
     }
@@ -389,6 +402,15 @@ pub(crate) async fn resolve(db: &Client, owner_id: i64, owner_actor: &str, statu
         assert_eq!(output.len(),12);
     }
 
+    #[test]
+    fn quote_counts_read_indexed_targets() {
+        let sql = QUOTE_TARGET_COUNT_SQL.to_ascii_lowercase();
+        assert!(!sql.contains("like"), "{QUOTE_TARGET_COUNT_SQL}");
+        assert!(sql.contains("event_quote_targets"));
+        assert!(sql.contains("quote_target=$1"));
+        assert!(sql.contains("is distinct from $2"));
+        assert!(sql.contains("is distinct from $3"));
+    }
     #[test] fn own_action_ids_match_actual_php_snowflake_and_preserve_source() {
         let root=std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let code=r#"require $argv[1].'/api/bin/migration-reference-functions.php';reference_load($argv[1].'/api/ap-masto-entities.php',['ap_masto_snowflake_id']);echo json_encode([ap_masto_snowflake_id('2026-10-10T12:00:00Z',9,0),ap_masto_snowflake_id('2026-10-10T14:00:00+02:00',100000009,0)]);"#;

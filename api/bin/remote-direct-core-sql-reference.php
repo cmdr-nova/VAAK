@@ -126,6 +126,13 @@ foreach (['INTEGER','BIGINT'] as $width) {
         core_insert('events',['id'=>601,'type'=>'Create','object_id'=>'https://summary.test/notes/quote','summary'=>'QT: '.$note,'created_at'=>$published]);
         core_insert('events',['id'=>602,'type'=>'Create','object_id'=>$note,'summary'=>'Original refers '.$note,'created_at'=>$published]);
         core_insert('events',['id'=>603,'type'=>'Create','object_id'=>$note.'/','summary'=>'Original slash refers '.$note,'created_at'=>$published]);
+        if (!function_exists('vaak_migrate_quote_target_backfill')) {
+            require dirname(__DIR__, 2).'/deploy/remote/migrate.php';
+        }
+        $backfill = vaak_migrate_quote_target_backfill($pg, 2);
+        core_check($backfill['stored'] >= 1 && $backfill['done'] === true, 'summary quote targets backfill into the indexed table');
+        $again = vaak_migrate_quote_target_backfill($pg, 2);
+        core_check($again['stored'] === 0 && $again['done'] === true, 'quote target backfill is a no-op once the cursor is caught up');
         $summaryCounts=ap_local_note_engagement_counts($note,$sid);
         core_check($summaryCounts===['favourites'=>5,'reblogs'=>5,'quotes'=>1,'bookmarks'=>3],'summary fallback excludes original root/slash and no mirror');
         core_capture('quote_summary_fallback',['note_id'=>$note,'status_id'=>$sid],$summaryCounts);
