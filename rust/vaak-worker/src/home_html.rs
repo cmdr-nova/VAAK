@@ -116,6 +116,7 @@ async fn stamp_ask_identities(
     extra: &mut std::collections::HashMap<String, serde_json::Value>,
 ) {
     let _ = crate::home_hydrate_ranked::attach_ask_identities(db, slice).await;
+    let _ = crate::wafrn_crosspost::stamp_text_asks(db, slice).await;
     if extra.is_empty() {
         return;
     }
@@ -127,6 +128,7 @@ async fn stamp_ask_identities(
         }
     }
     let _ = crate::home_hydrate_ranked::attach_ask_identities(db, &mut vals).await;
+    let _ = crate::wafrn_crosspost::stamp_text_asks(db, &mut vals).await;
     for (key, value) in keys.into_iter().zip(vals) {
         extra.insert(key, value);
     }
@@ -347,7 +349,7 @@ async fn tl_html_older(
         crate::timeline_cursor::OLDER_MAX_WINDOWS,
     )
     .await;
-    let statuses = crate::home_hydrate_ranked::statuses_for_older_hits(
+    let mut statuses = crate::home_hydrate_ranked::statuses_for_older_hits(
         &db,
         owner_user_id,
         view,
@@ -357,6 +359,8 @@ async fn tl_html_older(
     if statuses.is_empty() {
         return Ok(None);
     }
+    let _ = crate::wafrn_crosspost::filter_statuses(&db, &mut statuses).await;
+    let _ = crate::wafrn_crosspost::stamp_text_asks(&db, &mut statuses).await;
     let viewer_actor = owner_actor;
     let units = plan_feed_paint_units(&statuses, &std::collections::HashMap::new());
     let paint = |st: &serde_json::Value, from: &str, viewer: &str| {

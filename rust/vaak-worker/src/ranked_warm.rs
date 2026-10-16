@@ -1151,14 +1151,17 @@ fn merge_bsky_ranked(
             continue;
         }
         if k == "event" || k == "outbox" {
-            seen_fedi.insert(id.trim_end_matches('/').to_string());
+            let id_key = crate::wafrn_crosspost::post_identity(id);
+            if !id_key.is_empty() {
+                seen_fedi.insert(id_key);
+            }
         } else if k == "bsky" {
             seen_bsky.insert(id.to_string());
         }
         if let Some(object) = row.get("o").and_then(|v| v.as_str()) {
-            let object = object.trim().trim_end_matches('/');
+            let object = crate::wafrn_crosspost::post_identity(object);
             if !object.is_empty() {
-                seen_fedi.insert(object.to_string());
+                seen_fedi.insert(object);
             }
         }
     }
@@ -1167,7 +1170,8 @@ fn merge_bsky_ranked(
         if seen_bsky.contains(&key.uri) {
             continue;
         }
-        if !key.fedi.is_empty() && seen_fedi.contains(&key.fedi) {
+        let fedi = crate::wafrn_crosspost::post_identity(&key.fedi);
+        if !fedi.is_empty() && seen_fedi.contains(&fedi) {
             continue;
         }
         if bsky_author_hidden(hidden, &key.author_did) {
@@ -1184,8 +1188,8 @@ fn merge_bsky_ranked(
         }
         queued.push(entry);
         seen_bsky.insert(key.uri.clone());
-        if !key.fedi.is_empty() {
-            seen_fedi.insert(key.fedi.clone());
+        if !fedi.is_empty() {
+            seen_fedi.insert(fedi);
         }
     }
     if queued.is_empty() {

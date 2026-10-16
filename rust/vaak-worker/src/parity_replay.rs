@@ -57,6 +57,7 @@ fn produce(producer: &str, cases: &[InputCase]) -> Result<Vec<Value>> {
             "timeline-cursor" => timeline_cursor(&case.input)?,
             "profile-bsky-chrome" => profile_bsky_chrome(&case.input)?,
             "profile-guest-actions" => profile_guest_actions(&case.input)?,
+            "wafrn-crosspost" => crate::wafrn_crosspost::replay(&case.input),
             other => bail!("unknown producer {other}"),
         };
         Ok(json!({"id": case.id, "output": output}))
