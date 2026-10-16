@@ -8326,6 +8326,10 @@ function admin_tl_rank_entry(array $item): ?array
             return null;
         }
         $entry = ['k' => 'event', 'id' => $id];
+        $object = rtrim((string) ($row['object_id'] ?? ''), '/');
+        if ($object !== '') {
+            $entry['o'] = $object;
+        }
         if (!empty($item['from_tag'])) {
             $entry['t'] = 1;
         }
@@ -8338,11 +8342,23 @@ function admin_tl_rank_entry(array $item): ?array
     }
     if ($kind === 'outbox') {
         $id = rtrim((string) ($row['id'] ?? ''), '/');
-        return $id !== '' ? $stamp(['k' => 'outbox', 'id' => $id, 's' => 'local']) : null;
+        if ($id === '') {
+            return null;
+        }
+        $entry = ['k' => 'outbox', 'id' => $id, 's' => 'local', 'o' => $id];
+        return $stamp($entry);
     }
     if ($kind === 'boost') {
         $id = (string) ($row['status_id'] ?? '');
-        return $id !== '' ? $stamp(['k' => 'boost', 'id' => $id, 's' => 'boost']) : null;
+        if ($id === '') {
+            return null;
+        }
+        $entry = ['k' => 'boost', 'id' => $id, 's' => 'boost'];
+        $object = rtrim((string) ($row['object_id'] ?? ''), '/');
+        if (str_starts_with($object, 'http')) {
+            $entry['o'] = $object;
+        }
+        return $stamp($entry);
     }
     if ($kind === 'bsky') {
         $id = (string) ($row['bsky_uri'] ?? ($row['post']['uri'] ?? ''));
@@ -9532,12 +9548,11 @@ function admin_home_merge_bsky_ranked(array $ranked, int $ownerUserId): array
             continue;
         }
         if ($k === 'event' || $k === 'outbox') {
-            $seenFedi[$id] = true;
-            $seenFedi[rtrim($id, '/')] = true;
+            $seenFedi[ap_wafrn_post_identity($id)] = true;
         } elseif ($k === 'bsky') {
             $seenBsky[$id] = true;
         }
-        $object = rtrim((string) ($row['o'] ?? ''), '/');
+        $object = ap_wafrn_post_identity((string) ($row['o'] ?? ''));
         if ($object !== '') {
             $seenFedi[$object] = true;
         }
@@ -9548,8 +9563,9 @@ function admin_home_merge_bsky_ranked(array $ranked, int $ownerUserId): array
         if ($uri === '' || isset($seenBsky[$uri])) {
             continue;
         }
-        $fedi = rtrim((string) ($row['fediverse_id'] ?? ''), '/');
-        if ($fedi !== '' && (isset($seenFedi[$fedi]) || isset($seenFedi[$fedi . '/']))) {
+        $fediRaw = rtrim((string) ($row['fediverse_id'] ?? ''), '/');
+        $fedi = ap_wafrn_post_identity($fediRaw);
+        if ($fedi !== '' && isset($seenFedi[$fedi])) {
             continue;
         }
         $authorDid = (string) ($row['author_did'] ?? '');
@@ -9565,8 +9581,8 @@ function admin_home_merge_bsky_ranked(array $ranked, int $ownerUserId): array
             's' => 'bluesky',
             'sort' => strtotime((string) ($row['indexed_at'] ?? '')) ?: 0,
         ];
-        if ($fedi !== '') {
-            $entry['o'] = $fedi;
+        if ($fediRaw !== '') {
+            $entry['o'] = $fediRaw;
         }
         $queued[] = $entry;
         $seenBsky[$uri] = true;
@@ -10689,6 +10705,9 @@ function admin_tl_hydrate(array $slice, string $view = ''): array
     $items = array_values(array_filter($items, static fn(array $item): bool =>
         ($item['home_source'] ?? '') !== 'recommendation' || !isset($consumed[rtrim((string) ($item['row']['object_id'] ?? ''), '/')])
     ));
+    if (function_exists('ap_wafrn_filter_timeline_items')) {
+        $items = ap_wafrn_filter_timeline_items($items);
+    }
     return $view === 'home' ? ap_bsky_home_filter_items($items, $ownerUserId) : $items;
 }
 
@@ -10935,6 +10954,7 @@ function admin_tl_extend_ranked(string $view, array $following, array $ranked, i
                     $ownDid !== '' ? $ownDid : null,
                     $beforeAt
                 );
+                $seenWafrnObjects = null;
                 foreach ($bskyOlder as $bItem) {
                     if (!is_array($bItem)) {
                         continue;
@@ -10942,6 +10962,27 @@ function admin_tl_extend_ranked(string $view, array $following, array $ranked, i
                     $bUri = (string) ($bItem['bsky_uri'] ?? ($bItem['post']['uri'] ?? ''));
                     if ($bUri === '' || isset($seenBsky[$bUri])) {
                         continue;
+                    }
+                    $fediTwin = (string) ($bItem['fediverse_id'] ?? '');
+                    if ($fediTwin !== '' && function_exists('ap_wafrn_post_identity')) {
+                        if ($seenWafrnObjects === null) {
+                            $seenWafrnObjects = function_exists('ap_wafrn_ranked_identities')
+                                ? ap_wafrn_ranked_identities($ranked)
+                                : [];
+                            foreach ($homeCand as $cand) {
+                                if (!is_array($cand)) {
+                                    continue;
+                                }
+                                $candRow = is_array($cand['row'] ?? null) ? $cand['row'] : [];
+                                $candObject = ap_wafrn_post_identity((string) ($candRow['object_id'] ?? ($candRow['id'] ?? '')));
+                                if ($candObject !== '') {
+                                    $seenWafrnObjects[$candObject] = true;
+                                }
+                            }
+                        }
+                        if (isset($seenWafrnObjects[ap_wafrn_post_identity($fediTwin)])) {
+                            continue;
+                        }
                     }
                     $authorDid = (string) ($bItem['post']['author']['did'] ?? '');
                     if ($authorDid !== '' && function_exists('ap_bsky_filter_hidden_authors')) {
@@ -11762,7 +11803,10 @@ if (
     ) {
         $axumHome = ap_masto_timeline_home_axum_fetch($tlLimit, (int) $vaakOwnerId);
         if (is_array($axumHome) && $axumHome !== []) {
-            $adminHomeAxumStatuses = ap_bsky_home_filter_items($axumHome, (int) $vaakOwnerId);
+            $adminHomeAxumStatuses = function_exists('ap_wafrn_filter_timeline_items')
+                ? ap_wafrn_filter_timeline_items($axumHome)
+                : $axumHome;
+            $adminHomeAxumStatuses = ap_bsky_home_filter_items($adminHomeAxumStatuses, (int) $vaakOwnerId);
             if ($adminTlFromCache && is_array($adminTlRankedCached)) {
                 $adminTlCachedHasMore = count($adminTlRankedCached) > $tlLimit;
             } else {
@@ -18330,6 +18374,16 @@ function admin_render_masto_status_card(
 
     // Ask answers (local + remote Wafrn): question via vaak_ask / ap_asks / mentions.
     // Always paint the canonical Ask card above the answer body.
+    // Wafrn's Bluesky copy is plain "Name asked: question" plus a blank line.
+    // Only a DID linked from that Wafrn actor gets this card. Content stays
+    // put; the card painter replaces the visible body with the answer.
+    if ($isBsky && function_exists('ap_wafrn_text_ask_for_linked') && function_exists('ap_wafrn_did_is_linked')) {
+        $askSource = $plain !== '' ? $plain : (string) ($st['content'] ?? '');
+        $linkedAsk = ap_wafrn_text_ask_for_linked($askSource, ap_wafrn_did_is_linked(ap_wafrn_status_did($st)));
+        if (is_array($linkedAsk)) {
+            $st['vaak_ask'] = $linkedAsk;
+        }
+    }
     $askCardHtml = '';
     $askRow = null;
     if (!empty($st['vaak_ask']) && is_array($st['vaak_ask'])) {
@@ -22104,6 +22158,12 @@ function admin_tl_fetch_newer(string $view, array $following, int $sinceTs, int 
             return;
         }
         $seen[$key] = true;
+        if ($oid !== '' && function_exists('ap_wafrn_post_identity')) {
+            $ident = ap_wafrn_post_identity($oid);
+            if ($ident !== '') {
+                $seen['o:' . $ident] = true;
+            }
+        }
         $out[] = $item;
     };
 
@@ -22139,6 +22199,12 @@ function admin_tl_fetch_newer(string $view, array $following, int $sinceTs, int 
                     continue;
                 }
                 $seen['o:' . $nid] = true;
+                if (function_exists('ap_wafrn_post_identity')) {
+                    $nidIdent = ap_wafrn_post_identity($nid);
+                    if ($nidIdent !== '') {
+                        $seen['o:' . $nidIdent] = true;
+                    }
+                }
                 $out[] = $item;
                 if (count($out) >= $limit) {
                     break;
@@ -22268,6 +22334,12 @@ function admin_tl_fetch_newer(string $view, array $following, int $sinceTs, int 
                         continue;
                     }
                     $seen['o:' . $nid] = true;
+                    if (function_exists('ap_wafrn_post_identity')) {
+                        $nidIdent = ap_wafrn_post_identity($nid);
+                        if ($nidIdent !== '') {
+                            $seen['o:' . $nidIdent] = true;
+                        }
+                    }
                     $out[] = $item;
                 }
             }
@@ -22301,7 +22373,10 @@ function admin_tl_fetch_newer(string $view, array $following, int $sinceTs, int 
                         continue;
                     }
                     $fediTwin = rtrim((string) ($bItem['fediverse_id'] ?? ''), '/');
-                    if ($fediTwin !== '' && (isset($seen['o:' . $fediTwin]) || isset($seen['o:' . $fediTwin . '/']))) {
+                    $fediIdent = function_exists('ap_wafrn_post_identity')
+                        ? ap_wafrn_post_identity($fediTwin)
+                        : $fediTwin;
+                    if ($fediIdent !== '' && (isset($seen['o:' . $fediIdent]) || isset($seen['o:' . $fediTwin]) || isset($seen['o:' . $fediTwin . '/']))) {
                         continue;
                     }
                     $authorDid = (string) ($bItem['post']['author']['did'] ?? '');
@@ -22322,6 +22397,9 @@ function admin_tl_fetch_newer(string $view, array $following, int $sinceTs, int 
                     $seen['bsky:' . $bUri] = true;
                     if ($fediTwin !== '') {
                         $seen['o:' . $fediTwin] = true;
+                    }
+                    if ($fediIdent !== '') {
+                        $seen['o:' . $fediIdent] = true;
                     }
                     $out[] = $item;
                 }
@@ -22369,6 +22447,9 @@ function admin_tl_fetch_newer(string $view, array $following, int $sinceTs, int 
     }
 
     usort($out, static fn($a, $b) => $b['sort'] <=> $a['sort']);
+    if (function_exists('ap_wafrn_filter_timeline_items')) {
+        $out = ap_wafrn_filter_timeline_items($out);
+    }
     if ($view === 'home') $out = ap_bsky_home_filter_items($out, $ownerId);
     return array_slice($out, 0, $limit);
 }

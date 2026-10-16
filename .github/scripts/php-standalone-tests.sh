@@ -94,6 +94,7 @@ php_tests=(
   api/bin/timeline-newer-counter-smoke.php
   api/bin/timeline-cursor-smoke.php
   api/bin/timeline-quote-boost-smoke.php
+  api/bin/wafrn-crosspost-smoke.php
 )
 
 # Drivers for isolated PHP fixtures. They do not open Postgres or a worker.
