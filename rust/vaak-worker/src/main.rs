@@ -15,6 +15,7 @@ mod admin_read;
 mod home_html;
 mod home_bsky_mirrors;
 mod wafrn_crosspost;
+mod ap_public_doc;
 mod home_hydrate_ranked;
 mod interaction_flags;
 mod link_preview;

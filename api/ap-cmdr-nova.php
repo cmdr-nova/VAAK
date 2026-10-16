@@ -225,15 +225,19 @@ if (preg_match('#^/users/cmdr_nova/(outbox|followers|following)$#', $path, $m)) 
 
 // Mastodon-style pinned posts (featured collection of Notes)
 if ($path === '/users/cmdr_nova/collections/featured' || $path === '/users/cmdr_nova/featured') {
+    $cacheId = CMDR_ACTOR_ID . '/collections/featured';
+    if (ap_public_doc_respond_if_cached($cacheId, $accept)) {
+        exit;
+    }
     $items = ap_masto_featured_note_ids('cmdr_nova');
     $doc = [
         '@context' => 'https://www.w3.org/ns/activitystreams',
-        'id' => CMDR_ACTOR_ID . '/collections/featured',
+        'id' => $cacheId,
         'type' => 'OrderedCollection',
         'totalItems' => count($items),
         'orderedItems' => $items,
     ];
-    ap_cmdr_json($doc, $accept);
+    ap_public_doc_emit($doc, $accept, $cacheId, true);
     exit;
 }
 
@@ -421,6 +425,9 @@ if (preg_match('#^/users/cmdr_nova/(notes|creates)/([a-f0-9]+)$#', $path, $nm)) 
     $kind = $nm[1];
     $hex = $nm[2];
     $objectId = CMDR_ACTOR_ID . '/' . $kind . '/' . $hex;
+    if ($wantsAp && ap_public_doc_respond_if_cached($objectId, $accept)) {
+        exit;
+    }
     $row = null;
     if ($kind === 'notes') {
         $st = ap_db()->prepare('SELECT * FROM outbox_notes WHERE id = ?');
@@ -485,12 +492,14 @@ if (preg_match('#^/users/cmdr_nova/(notes|creates)/([a-f0-9]+)$#', $path, $nm)) 
             // Standalone Note: quote policy + top-level @context only (no nested ctx)
             $note = ap_note_ensure_quote_policy($note);
             $note = ap_as2_ensure_top_context($note);
-            ap_cmdr_json($note, $accept);
+            $shared = ap_public_doc_is_shared_visibility((string) ($row['visibility'] ?? 'public'));
+            ap_public_doc_emit($note, $accept, $objectId, $shared);
         } else {
             // Create: context only on the activity; object must not nest @context
             // (nested @context made Bridgy Fed see content/published/url as arrays)
             $create = ap_create_finalize($create);
-            ap_cmdr_json($create, $accept);
+            $shared = ap_public_doc_is_shared_visibility((string) ($row['visibility'] ?? 'public'));
+            ap_public_doc_emit($create, $accept, $objectId, $shared);
         }
         exit;
     }
@@ -516,8 +525,12 @@ if (!$wantsAp) {
     exit;
 }
 
+if (ap_public_doc_respond_if_cached(CMDR_ACTOR_ID, $accept)) {
+    exit;
+}
 $actor = ap_cmdr_actor_document($pem);
-ap_cmdr_json($actor, $accept);
+ap_public_doc_emit($actor, $accept, CMDR_ACTOR_ID, true);
+exit;
 
 /**
  * True when the client explicitly wants ActivityPub JSON.

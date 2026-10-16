@@ -100,6 +100,12 @@
       "area": "Timelines",
       "summary": "Wafrn ActivityPub/Bluesky post identity, alsoKnownAs DID extraction, text ask cards, linkage dedupe, and the 10 minute text fallback. Fixture api/fixtures/wafrn-crosspost.json. Both sides call the pure planner and do not open a database.",
       "php": {"script": "parity/php/wafrn-crosspost.php", "args": []}
+    },
+    {
+      "id": "ap-public-doc",
+      "area": "ActivityPub",
+      "summary": "Pleroma-safe public Note, actor, and featured documents. url is a single http(s) string, at:// stays on blueskyUri, alsoKnownAs is left alone, and empty media text becomes a zero-width space. No database.",
+      "php": {"script": "parity/php/ap-public-doc.php", "args": []}
     }
   ]
 }

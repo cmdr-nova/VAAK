@@ -4970,6 +4970,9 @@ function ap_deliver_signed_json(string $inboxUrl, array $activity, string $keyId
         $path .= '?' . $parts['query'];
     }
 
+    if (function_exists('ap_as2_pleroma_document')) {
+        $activity = ap_as2_pleroma_document($activity);
+    }
     $body = json_encode($activity, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
     if (!is_string($body)) {
         $GLOBALS['ap_delivery_last_error'] = 'Activity JSON encoding failed';
@@ -6842,6 +6845,13 @@ function ap_update_local_status(
         json_encode($cc, JSON_UNESCAPED_SLASHES),
         $noteId,
     ]);
+    if (function_exists('ap_public_doc_invalidate_note')) {
+        $storedCreate = is_array($obRow) ? trim((string) ($obRow['create_id'] ?? '')) : '';
+        ap_public_doc_invalidate_note($noteId, $createId);
+        if ($storedCreate !== '' && $storedCreate !== $createId) {
+            ap_public_doc_cache_forget($storedCreate);
+        }
+    }
     ap_db()->prepare(
         'UPDATE masto_statuses SET content_text = ?, spoiler_text = ?, sensitive = ?, edited_at = ? WHERE local_id = ?'
     )->execute([
@@ -7044,7 +7054,7 @@ function ap_delete_local_status(int $localId): array
     $cc = [$actor . '/followers'];
 
     // Prefer original audience from outbox when present
-    $ob = ap_db()->prepare('SELECT to_json, cc_json FROM outbox_notes WHERE id = ?');
+    $ob = ap_db()->prepare('SELECT to_json, cc_json, create_id FROM outbox_notes WHERE id = ?');
     $ob->execute([$noteId]);
     $obRow = $ob->fetch();
     if (is_array($obRow)) {
@@ -7074,6 +7084,10 @@ function ap_delete_local_status(int $localId): array
         ],
     ];
 
+    $deletedCreateId = is_array($obRow) ? (string) ($obRow['create_id'] ?? '') : '';
+    if (function_exists('ap_public_doc_invalidate_note')) {
+        ap_public_doc_invalidate_note($noteId, $deletedCreateId !== '' ? $deletedCreateId : null);
+    }
     // Remove local copies first so UI/API stop showing the post even if delivery is slow
     ap_db()->prepare('DELETE FROM outbox_notes WHERE id = ?')->execute([$noteId]);
     ap_db()->prepare('DELETE FROM masto_pins WHERE status_local_id = ?')->execute([$localId]);

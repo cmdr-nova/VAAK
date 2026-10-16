@@ -11801,8 +11801,9 @@ function ap_bsky_create_post(
 
 /**
  * Attach dual-publish markers onto the canonical AS2 Note (AP = "actually me").
- * - FEP-fffd proxy Link (rel=alternate, href=at://…) → Bluesky mirror
- * - Wafrn-compatible blueskyUri / blueskyCid fields
+ * Bluesky stays on blueskyUri / blueskyCid. `url` stays a single https string.
+ * Pleroma/Soapbox rejects a url list and any non-http(s) value, which made
+ * pinned mirrors refetch forever. Wafrn reads blueskyUri, not the url Link.
  *
  * @param array<string,mixed> $note
  * @return array<string,mixed>
@@ -11830,20 +11831,14 @@ function ap_note_attach_bsky_proxy(array $note, string $bskyUri, ?string $bskyCi
             }
         }
     }
-    if ($htmlUrl === '' && isset($note['id']) && is_string($note['id'])) {
+    if ($htmlUrl === '' && isset($note['id']) && is_string($note['id']) && str_starts_with($note['id'], 'https://')) {
         $htmlUrl = $note['id'];
     }
-    $proxyLink = [
-        'type' => 'Link',
-        'rel' => 'alternate',
-        'href' => $bskyUri,
-    ];
-    $urls = [];
     if ($htmlUrl !== '') {
-        $urls[] = $htmlUrl;
+        $note['url'] = $htmlUrl;
+    } else {
+        unset($note['url']);
     }
-    $urls[] = $proxyLink;
-    $note['url'] = $urls;
     $note['blueskyUri'] = $bskyUri;
     if (is_string($bskyCid) && $bskyCid !== '') {
         $note['blueskyCid'] = $bskyCid;
@@ -13340,6 +13335,9 @@ function ap_bsky_ingest_follow_notification(
         );
     } else {
         return ['inserted' => false, 'pushed' => false];
+    }
+    if (function_exists('ap_events_distinct_actor_ids_invalidate')) {
+        ap_events_distinct_actor_ids_invalidate(AP_BSKY_FOLLOW_ACTION);
     }
 
     $pushed = false;
