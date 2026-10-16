@@ -8,6 +8,7 @@ declare(strict_types=1);
 require_once __DIR__ . '/ap-redis.php';
 require_once __DIR__ . '/ap-recommendations.php';
 require_once __DIR__ . '/ap-follow-state.php';
+require_once __DIR__ . '/ap-wafrn-crosspost.php';
 
 /**
  * Runtime feature switches. Values come from the process environment so an
@@ -16765,6 +16766,9 @@ function ap_remote_actor_ensure(string $actorId, bool $allowFetch = true): ?arra
                 }
                 if (function_exists('ap_remote_emoji_ingest_actor_doc')) {
                     ap_remote_emoji_ingest_actor_doc($actorId, $doc);
+                }
+                if (function_exists('ap_wafrn_remember_actor_document')) {
+                    ap_wafrn_remember_actor_document($actorId, $doc);
                 }
                 $row = ap_remote_actor_get($actorId);
             } else {

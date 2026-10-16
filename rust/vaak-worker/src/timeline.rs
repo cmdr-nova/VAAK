@@ -336,6 +336,7 @@ pub async fn view_hydrate(
         if view == "home" {
             crate::home_bsky_mirrors::filter_statuses(&moderation_db, owner_user_id, &mut report.items).await?;
         }
+        let _ = crate::wafrn_crosspost::filter_statuses(&moderation_db, &mut report.items).await;
         report.filtered = report.items.len() != before;
         report.n = report.items.len();
     }
