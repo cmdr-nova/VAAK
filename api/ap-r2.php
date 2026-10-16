@@ -1442,15 +1442,19 @@ function ap_media_warm_worker_nudge(): void
 {
     $script = __DIR__ . '/ap-media-warm-worker.php';
     if (!is_file($script)) return;
-    $lockPath = sys_get_temp_dir() . '/vaak-media-warm-worker.lock';
-    $lock = @fopen($lockPath, 'c+');
-    if ($lock === false || !flock($lock, LOCK_EX | LOCK_NB)) {
-        if (is_resource($lock)) fclose($lock);
-        return;
-    }
+    // flock(1) holds the lock for the worker's whole life. A second nudge
+    // exits immediately and does not start another PHP process. Do not take
+    // the lock in this process: releasing it before the child starts is what
+    // let copies stack.
+    $override = getenv('VAAK_MEDIA_WARM_LOCK');
+    $lockPath = is_string($override) && $override !== ''
+        ? $override
+        : sys_get_temp_dir() . '/vaak-media-warm-worker.lock';
     $php = function_exists('ap_php_cli_binary') ? ap_php_cli_binary() : '/usr/bin/php';
-    @exec('nohup ' . escapeshellarg($php) . ' ' . escapeshellarg($script) . ' --limit=3 >/dev/null 2>&1 </dev/null &');
-    flock($lock, LOCK_UN); fclose($lock);
+    $cmd = 'flock -n -E 2 ' . escapeshellarg($lockPath)
+        . ' env VAAK_MEDIA_WARM_LOCKED=1 '
+        . escapeshellarg($php) . ' ' . escapeshellarg($script) . ' --limit=3';
+    @exec('nohup ' . $cmd . ' >/dev/null 2>&1 </dev/null &');
 }
 
 /**
@@ -1469,14 +1473,33 @@ function ap_remote_media_warm_async(string $actorId): void
     ap_media_warm_worker_nudge();
 }
 
+if (!function_exists('ap_media_warm_lock_path')) {
+    function ap_media_warm_lock_path(): string
+    {
+        $override = getenv('VAAK_MEDIA_WARM_LOCK');
+        if (is_string($override) && $override !== '') {
+            return $override;
+        }
+        return sys_get_temp_dir() . '/vaak-media-warm-worker.lock';
+    }
+}
+
 /** Run a bounded batch of durable remote actor-media jobs. */
 function ap_media_warm_worker_run(int $limit = 3): array
 {
     $stats = ['claimed' => 0, 'succeeded' => 0, 'retried' => 0, 'failed' => 0];
     $limit = max(1, min(10, $limit));
-    $lock = @fopen(sys_get_temp_dir() . '/vaak-media-warm-worker.lock', 'c+');
-    if ($lock === false || !flock($lock, LOCK_EX | LOCK_NB)) {
-        return $stats + ['busy' => 1];
+    // The CLI entry holds this lock with flock(1) before any of this file is
+    // loaded. Take it here only for an in-process caller that did not.
+    $lock = null;
+    if (getenv('VAAK_MEDIA_WARM_LOCKED') !== '1') {
+        $lock = @fopen(ap_media_warm_lock_path(), 'c+');
+        if ($lock === false || !flock($lock, LOCK_EX | LOCK_NB)) {
+            if (is_resource($lock)) {
+                fclose($lock);
+            }
+            return $stats + ['busy' => 1];
+        }
     }
     try {
         $db = ap_db();
@@ -1542,8 +1565,10 @@ function ap_media_warm_worker_run(int $limit = 3): array
             }
         }
     } finally {
-        flock($lock, LOCK_UN);
-        fclose($lock);
+        if (is_resource($lock)) {
+            flock($lock, LOCK_UN);
+            fclose($lock);
+        }
     }
     return $stats;
 }
