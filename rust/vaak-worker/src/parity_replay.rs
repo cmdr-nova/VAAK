@@ -52,6 +52,7 @@ fn produce(producer: &str, cases: &[InputCase]) -> Result<Vec<Value>> {
             "phyrian-bridge" => phyrian_bridge(&case.input)?,
             "settings-fields" => settings_fields(&case.id)?,
             "follow-fallback" => follow_fallback(&case.input)?,
+            "inbox-origin" => crate::inbox_origin::replay(&case.input)?,
             "profile-local-chrome" => profile_local_chrome(&case.input)?,
             "profile-remote-chrome" => profile_remote_chrome(&case.input)?,
             "timeline-cursor" => timeline_cursor(&case.input)?,
