@@ -1,0 +1,310 @@
+{
+  "cases": [
+    {
+      "id": "identity-activity-url",
+      "op": "identity",
+      "value": "http://App.Wafrn.net/fediverse/activity/post/AbC/",
+      "expect": {"identity": "https://app.wafrn.net/fediverse/post/AbC"}
+    },
+    {
+      "id": "identity-note-url",
+      "op": "identity",
+      "value": "https://example.com/notes/1",
+      "expect": {"identity": "https://example.com/notes/1"}
+    },
+    {
+      "id": "identity-numeric",
+      "op": "identity",
+      "value": "9",
+      "expect": {"identity": "9"}
+    },
+    {
+      "id": "dids-from-also-known-as",
+      "op": "dids",
+      "also_known_as": [
+        "at://did:plc:abc123",
+        "https://app.wafrn.net/blog/admin",
+        "https://bsky.app/profile/did:plc:def456"
+      ],
+      "expect": {"dids": ["did:plc:abc123", "did:plc:def456"]}
+    },
+    {
+      "id": "normalize-asked-prefix",
+      "op": "normalize",
+      "value": "Anonymous asked: hi\n\nthere",
+      "expect": {"text": "hithere"}
+    },
+    {
+      "id": "normalize-whitespace",
+      "op": "normalize",
+      "value": "Hello  world",
+      "expect": {"text": "Helloworld"}
+    },
+    {
+      "id": "ask-linked",
+      "op": "ask",
+      "linked": true,
+      "text": "Anonymous asked: what is VAAK?\n\nA social bridge.",
+      "expect": {
+        "card": {
+          "question": "what is VAAK?",
+          "asker_label": "Anonymous",
+          "answer": "A social bridge.",
+          "asker_actor": ""
+        }
+      }
+    },
+    {
+      "id": "ask-named",
+      "op": "ask",
+      "linked": true,
+      "text": "Alice asked: how are you?\n\nI am well.",
+      "expect": {
+        "card": {
+          "question": "how are you?",
+          "asker_label": "Alice",
+          "answer": "I am well.",
+          "asker_actor": ""
+        }
+      }
+    },
+    {
+      "id": "ask-unlinked",
+      "op": "ask",
+      "linked": false,
+      "text": "Anonymous asked: what is VAAK?\n\nA social bridge.",
+      "expect": {"card": null}
+    },
+    {
+      "id": "ask-no-blank-line",
+      "op": "ask",
+      "linked": true,
+      "text": "Anonymous asked: what is VAAK?\nA social bridge.",
+      "expect": {"card": null}
+    },
+    {
+      "id": "ask-html-breaks",
+      "op": "ask",
+      "linked": true,
+      "text": "<p>Anonymous asked: what is VAAK?<br><br>A social bridge.</p>",
+      "expect": {
+        "card": {
+          "question": "what is VAAK?",
+          "asker_label": "Anonymous",
+          "answer": "A social bridge.",
+          "asker_actor": ""
+        }
+      }
+    },
+    {
+      "id": "linkage-drops-bluesky",
+      "op": "plan",
+      "did_to_actors": {},
+      "posts": [
+        {
+          "id": "event:1",
+          "network": "ap",
+          "object_id": "https://app.wafrn.net/fediverse/activity/post/abc",
+          "actor_id": "https://app.wafrn.net/blog/admin",
+          "created_at": 1700000000,
+          "text": "Anonymous asked: hi\n\nthere"
+        },
+        {
+          "id": "at://did:plc:wafrn/app.bsky.feed.post/1",
+          "network": "bsky",
+          "fediverse_id": "http://app.wafrn.net/fediverse/post/abc/",
+          "author_did": "did:plc:wafrn",
+          "created_at": 1700000010,
+          "text": "Anonymous asked: hi\n\nthere"
+        }
+      ],
+      "expect": {
+        "drop": ["at://did:plc:wafrn/app.bsky.feed.post/1"],
+        "learn": [{"actor_id": "https://app.wafrn.net/blog/admin", "bsky_did": "did:plc:wafrn"}]
+      }
+    },
+    {
+      "id": "linkage-keeps-bluesky-when-ap-absent",
+      "op": "plan",
+      "did_to_actors": {
+        "did:plc:wafrn": ["https://app.wafrn.net/blog/admin"]
+      },
+      "posts": [
+        {
+          "id": "at://did:plc:wafrn/app.bsky.feed.post/2",
+          "network": "bsky",
+          "fediverse_id": "https://app.wafrn.net/fediverse/post/missing",
+          "author_did": "did:plc:wafrn",
+          "created_at": 1700000000,
+          "text": "same words"
+        }
+      ],
+      "expect": {"drop": [], "learn": []}
+    },
+    {
+      "id": "fallback-within-ten-minutes",
+      "op": "plan",
+      "did_to_actors": {
+        "did:plc:wafrn": ["https://app.wafrn.net/blog/admin"]
+      },
+      "posts": [
+        {
+          "id": "event:2",
+          "network": "ap",
+          "object_id": "https://app.wafrn.net/fediverse/post/no-link",
+          "actor_id": "https://app.wafrn.net/blog/admin",
+          "created_at": 1700000000,
+          "text": "Anonymous asked: hi\n\nthere"
+        },
+        {
+          "id": "at://did:plc:wafrn/app.bsky.feed.post/3",
+          "network": "bsky",
+          "fediverse_id": "",
+          "author_did": "did:plc:wafrn",
+          "created_at": 1700000500,
+          "text": "Anonymous asked: hi there"
+        }
+      ],
+      "expect": {
+        "drop": ["at://did:plc:wafrn/app.bsky.feed.post/3"],
+        "learn": []
+      }
+    },
+    {
+      "id": "fallback-outside-window",
+      "op": "plan",
+      "did_to_actors": {
+        "did:plc:wafrn": ["https://app.wafrn.net/blog/admin"]
+      },
+      "posts": [
+        {
+          "id": "event:3",
+          "network": "ap",
+          "object_id": "https://app.wafrn.net/fediverse/post/old",
+          "actor_id": "https://app.wafrn.net/blog/admin",
+          "created_at": 1700000000,
+          "text": "same words"
+        },
+        {
+          "id": "at://did:plc:wafrn/app.bsky.feed.post/4",
+          "network": "bsky",
+          "fediverse_id": "",
+          "author_did": "did:plc:wafrn",
+          "created_at": 1700000601,
+          "text": "same words"
+        }
+      ],
+      "expect": {"drop": [], "learn": []}
+    },
+    {
+      "id": "fallback-different-text",
+      "op": "plan",
+      "did_to_actors": {
+        "did:plc:wafrn": ["https://app.wafrn.net/blog/admin"]
+      },
+      "posts": [
+        {
+          "id": "event:4",
+          "network": "ap",
+          "object_id": "https://app.wafrn.net/fediverse/post/other",
+          "actor_id": "https://app.wafrn.net/blog/admin",
+          "created_at": 1700000000,
+          "text": "one post"
+        },
+        {
+          "id": "at://did:plc:wafrn/app.bsky.feed.post/5",
+          "network": "bsky",
+          "fediverse_id": "",
+          "author_did": "did:plc:wafrn",
+          "created_at": 1700000010,
+          "text": "another post"
+        }
+      ],
+      "expect": {"drop": [], "learn": []}
+    },
+    {
+      "id": "fallback-ambiguous",
+      "op": "plan",
+      "did_to_actors": {
+        "did:plc:wafrn": ["https://app.wafrn.net/blog/admin"]
+      },
+      "posts": [
+        {
+          "id": "event:5",
+          "network": "ap",
+          "object_id": "https://app.wafrn.net/fediverse/post/a",
+          "actor_id": "https://app.wafrn.net/blog/admin",
+          "created_at": 1700000000,
+          "text": "same words"
+        },
+        {
+          "id": "event:6",
+          "network": "ap",
+          "object_id": "https://app.wafrn.net/fediverse/post/b",
+          "actor_id": "https://app.wafrn.net/blog/admin",
+          "created_at": 1700000020,
+          "text": "same words"
+        },
+        {
+          "id": "at://did:plc:wafrn/app.bsky.feed.post/6",
+          "network": "bsky",
+          "fediverse_id": "",
+          "author_did": "did:plc:wafrn",
+          "created_at": 1700000010,
+          "text": "same words"
+        }
+      ],
+      "expect": {"drop": [], "learn": []}
+    },
+    {
+      "id": "fallback-zero-timestamp",
+      "op": "plan",
+      "did_to_actors": {
+        "did:plc:wafrn": ["https://app.wafrn.net/blog/admin"]
+      },
+      "posts": [
+        {
+          "id": "event:7",
+          "network": "ap",
+          "object_id": "https://app.wafrn.net/fediverse/post/notime",
+          "actor_id": "https://app.wafrn.net/blog/admin",
+          "created_at": 0,
+          "text": "same words"
+        },
+        {
+          "id": "at://did:plc:wafrn/app.bsky.feed.post/7",
+          "network": "bsky",
+          "fediverse_id": "",
+          "author_did": "did:plc:wafrn",
+          "created_at": 1700000000,
+          "text": "same words"
+        }
+      ],
+      "expect": {"drop": [], "learn": []}
+    },
+    {
+      "id": "non-wafrn-unchanged",
+      "op": "plan",
+      "did_to_actors": {},
+      "posts": [
+        {
+          "id": "event:8",
+          "network": "ap",
+          "object_id": "https://example.com/users/ada/statuses/1",
+          "actor_id": "https://example.com/users/ada",
+          "created_at": 1700000000,
+          "text": "hello from ada"
+        },
+        {
+          "id": "at://did:plc:other/app.bsky.feed.post/1",
+          "network": "bsky",
+          "fediverse_id": "",
+          "author_did": "did:plc:other",
+          "created_at": 1700000010,
+          "text": "hello from ada"
+        }
+      ],
+      "expect": {"drop": [], "learn": []}
+    }
+  ]
+}

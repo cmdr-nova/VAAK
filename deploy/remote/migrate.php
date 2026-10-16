@@ -109,6 +109,7 @@ function vaak_migrate_deploy_sql_files(string $apiRoot): array
     $names = [
         '20261014_phyrian_clans_postgres.sql',
         '20261014_event_quote_targets_postgres.sql',
+        '20261016_wafrn_bsky_actors_postgres.sql',
     ];
     $files = [];
     $migrations = $root . DIRECTORY_SEPARATOR . 'migrations' . DIRECTORY_SEPARATOR;
@@ -527,6 +528,68 @@ function vaak_migrate_observation_unique_statements(bool $tableExists, bool $uni
     return [vaak_migrate_observation_unique_sql()];
 }
 
+function vaak_migrate_wafrn_crosspost_index_spec(): array
+{
+    return [
+        'table' => 'wafrn_bsky_actors',
+        'create' => 'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_wafrn_bsky_actors_did ON wafrn_bsky_actors (bsky_did)',
+        'drop' => 'DROP INDEX CONCURRENTLY IF EXISTS idx_wafrn_bsky_actors_did',
+    ];
+}
+
+/** @return list<string> */
+function vaak_migrate_wafrn_crosspost_index_statements(string $action): array
+{
+    $spec = vaak_migrate_wafrn_crosspost_index_spec();
+    if ($action === 'skip' || $action === 'missing-table') {
+        return [];
+    }
+    if ($action === 'create') {
+        return [$spec['create']];
+    }
+    if ($action === 'rebuild') {
+        return [$spec['drop'], $spec['create']];
+    }
+    throw new RuntimeException('wafrn actor index was not created');
+}
+
+/**
+ * DID lookup for Wafrn alsoKnownAs links. The table is created by the
+ * additive file. This index is concurrent so deploy does not block reads
+ * of wafrn_bsky_actors, and a page load never builds it.
+ */
+function vaak_migrate_wafrn_crosspost_indexes(PDO $db): void
+{
+    if ($db->inTransaction()) {
+        throw new RuntimeException('wafrn actor index must not run inside a transaction');
+    }
+    $spec = vaak_migrate_wafrn_crosspost_index_spec();
+    $table = $db->prepare(
+        'SELECT 1 FROM pg_tables WHERE schemaname = current_schema() AND tablename = ?'
+    );
+    $table->execute([$spec['table']]);
+    $tableExists = $table->fetchColumn() !== false;
+    $index = $db->prepare(
+        'SELECT i.indisvalid FROM pg_class c
+         JOIN pg_index i ON i.indexrelid = c.oid
+         JOIN pg_namespace n ON n.oid = c.relnamespace
+         WHERE n.nspname = current_schema() AND c.relname = ?'
+    );
+    $index->execute(['idx_wafrn_bsky_actors_did']);
+    $row = $index->fetch();
+    $valid = is_array($row) ? vaak_migrate_pg_bool($row['indisvalid'] ?? null) : null;
+    if (is_array($row) && $valid === null) {
+        throw new RuntimeException('wafrn actor index validity is unknown');
+    }
+    $action = vaak_migrate_notification_index_plan($tableExists, $valid);
+    if ($action === 'missing-table') {
+        return;
+    }
+    foreach (vaak_migrate_wafrn_crosspost_index_statements($action) as $statement) {
+        $db->exec($statement);
+    }
+}
+
 function vaak_migrate_cpu_indexes(PDO $db): void
 {
     if ($db->inTransaction()) {
@@ -888,6 +951,7 @@ function vaak_migrate_main(array $argv): void
         vaak_migrate_notification_read_indexes($lock);
         vaak_migrate_home_bsky_indexes($lock);
         vaak_migrate_cpu_indexes($lock);
+        vaak_migrate_wafrn_crosspost_indexes($lock);
         $quoteTargets = vaak_migrate_event_quote_targets($lock);
     } catch (Throwable $e) {
         vaak_migrate_fail(vaak_migrate_redact($e->getMessage(), $password));

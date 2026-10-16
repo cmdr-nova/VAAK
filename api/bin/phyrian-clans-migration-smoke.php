@@ -36,7 +36,11 @@ $apiRoot = dirname(__DIR__);
 $files = vaak_migrate_deploy_sql_files($apiRoot);
 $names = array_map('basename', $files);
 $check(
-    $names === ['20261014_phyrian_clans_postgres.sql', '20261014_event_quote_targets_postgres.sql'],
+    $names === [
+        '20261014_phyrian_clans_postgres.sql',
+        '20261014_event_quote_targets_postgres.sql',
+        '20261016_wafrn_bsky_actors_postgres.sql',
+    ],
     'deploy runner picks up the clans migration and the quote-target table'
 );
 $expectedPath = realpath($apiRoot . '/migrations/20261014_phyrian_clans_postgres.sql');

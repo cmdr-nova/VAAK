@@ -94,6 +94,12 @@
       "area": "Profiles",
       "summary": "Guest profile follow panel and action row, cold avatar facts, and the local pagination shell. PHP capture is api/bin/profile-guest-actions-capture.php. Rust paints the same chrome and does not open a database or warm media.",
       "php": {"script": "parity/php/profile-guest-actions.php", "args": []}
+    },
+    {
+      "id": "wafrn-crosspost",
+      "area": "Timelines",
+      "summary": "Wafrn ActivityPub/Bluesky post identity, alsoKnownAs DID extraction, text ask cards, linkage dedupe, and the 10 minute text fallback. Fixture api/fixtures/wafrn-crosspost.json. Both sides call the pure planner and do not open a database.",
+      "php": {"script": "parity/php/wafrn-crosspost.php", "args": []}
     }
   ]
 }
