@@ -73,6 +73,24 @@ if ($username === 'cmdr_nova') {
     exit;
 }
 
+$methodEarly = strtoupper((string) ($_SERVER['REQUEST_METHOD'] ?? 'GET'));
+if ($methodEarly === 'GET' || $methodEarly === 'HEAD') {
+    $actorUrl = ap_public_doc_local_actor_id($username);
+    if ($sub === '' && $wantsApEarly && ap_public_doc_respond_if_cached($actorUrl, $acceptEarly)) {
+        exit;
+    }
+    if (($sub === 'collections/featured' || $sub === 'featured')
+        && ap_public_doc_respond_if_cached($actorUrl . '/collections/featured', $acceptEarly)) {
+        exit;
+    }
+    if ($wantsApEarly && preg_match('#^(notes|creates)/([a-f0-9]+)$#', $sub, $earlyNote)) {
+        $earlyId = $actorUrl . '/' . $earlyNote[1] . '/' . $earlyNote[2];
+        if (ap_public_doc_respond_if_cached($earlyId, $acceptEarly)) {
+            exit;
+        }
+    }
+}
+
 $user = ap_local_user_by_username($username);
 if ($user === null) {
     http_response_code(404);
@@ -161,6 +179,10 @@ if (in_array($sub, ['outbox', 'followers', 'following'], true)) {
 
 // Featured pins, scoped to this actor and public/unlisted discovery.
 if ($sub === 'collections/featured' || $sub === 'featured') {
+    $cacheId = ap_public_doc_local_actor_id($actorKey) . '/collections/featured';
+    if (ap_public_doc_respond_if_cached($cacheId, $accept)) {
+        exit;
+    }
     $items = ap_masto_featured_note_ids($actorKey);
     $doc = [
         '@context' => 'https://www.w3.org/ns/activitystreams',
@@ -169,7 +191,7 @@ if ($sub === 'collections/featured' || $sub === 'featured') {
         'totalItems' => count($items),
         'orderedItems' => $items,
     ];
-    ap_user_json($doc, $accept);
+    ap_public_doc_emit($doc, $accept, $cacheId, true);
     exit;
 }
 
@@ -275,6 +297,10 @@ if (preg_match('#^collections/(\d+)$#', $sub, $cm)) {
 if (preg_match('#^(notes|creates)/([a-f0-9]+)$#', $sub, $nm)) {
     $kind = $nm[1];
     $objectId = $actorId . '/' . $kind . '/' . $nm[2];
+    $noteCacheId = ap_public_doc_local_actor_id($actorKey) . '/' . $kind . '/' . $nm[2];
+    if ($wantsAp && ap_public_doc_respond_if_cached($noteCacheId, $accept)) {
+        exit;
+    }
     $row = null;
     if ($kind === 'notes') {
         $st = ap_db()->prepare('SELECT * FROM outbox_notes WHERE id = ?');
@@ -345,12 +371,14 @@ if (preg_match('#^(notes|creates)/([a-f0-9]+)$#', $sub, $nm)) {
             if (function_exists('ap_as2_ensure_top_context')) {
                 $note = ap_as2_ensure_top_context($note);
             }
-            ap_user_json($note, $accept);
+            $shared = ap_public_doc_is_shared_visibility((string) ($row['visibility'] ?? 'public'));
+            ap_public_doc_emit($note, $accept, $noteCacheId, $shared);
         } else {
             if (function_exists('ap_create_finalize')) {
                 $create = ap_create_finalize($create);
             }
-            ap_user_json($create, $accept);
+            $shared = ap_public_doc_is_shared_visibility((string) ($row['visibility'] ?? 'public'));
+            ap_public_doc_emit($create, $accept, $noteCacheId, $shared);
         }
         exit;
     }
@@ -373,8 +401,12 @@ if ($sub !== '') {
 }
 
 if ($wantsAp) {
+    $actorCacheId = ap_public_doc_local_actor_id($actorKey);
+    if (ap_public_doc_respond_if_cached($actorCacheId, $accept)) {
+        exit;
+    }
     $actor = ap_actor_as2_document($actorKey, $pem, false);
-    ap_user_json($actor, $accept);
+    ap_public_doc_emit($actor, $accept, $actorCacheId, true);
     exit;
 }
 

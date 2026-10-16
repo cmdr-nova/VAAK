@@ -14069,12 +14069,22 @@ function ap_masto_suggestions_v2_uncached(int $limit = 40): array
         }
         try {
             $bskyAction = defined('AP_BSKY_FOLLOW_ACTION') ? AP_BSKY_FOLLOW_ACTION : 'bsky_follow';
-            $est = ap_db()->prepare(
-                'SELECT DISTINCT actor_id FROM events WHERE action_taken = ? AND actor_id IS NOT NULL'
-            );
-            $est->execute([$bskyAction]);
-            foreach ($est->fetchAll() as $erow) {
-                $aid = rtrim((string) ($erow['actor_id'] ?? ''), '/');
+            if (function_exists('ap_events_distinct_actor_ids')) {
+                $actorRows = ap_events_distinct_actor_ids($bskyAction);
+            } else {
+                $est = ap_db()->prepare(
+                    'SELECT DISTINCT actor_id FROM events WHERE action_taken = ? AND actor_id IS NOT NULL'
+                );
+                $est->execute([$bskyAction]);
+                $actorRows = [];
+                foreach ($est->fetchAll() as $erow) {
+                    if (is_array($erow)) {
+                        $actorRows[] = (string) ($erow['actor_id'] ?? '');
+                    }
+                }
+            }
+            foreach ($actorRows as $rawAid) {
+                $aid = rtrim((string) $rawAid, '/');
                 if ($aid === '') {
                     continue;
                 }
