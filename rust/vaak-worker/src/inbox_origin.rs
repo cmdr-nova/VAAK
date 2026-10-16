@@ -315,6 +315,34 @@ pub fn origin_decision(posted: Option<&Value>, fetches: &Map<String, Value>) -> 
     Value::Null
 }
 
+fn url_host(url: &str) -> String {
+    parse_https(url)
+        .map(|parts| parts.host.to_ascii_lowercase())
+        .unwrap_or_default()
+}
+
+/// Signed delivery whose key host is not the activity actor.
+/// A trusted relay or followed forwarder keeps the posted document.
+/// Otherwise only an origin document may be returned.
+pub fn reconcile_decision(posted: Option<&Value>, key_id: &str, trusted: bool, fetches: &Map<String, Value>) -> Value {
+    let Some(posted_value) = posted else {
+        return Value::Null;
+    };
+    if !posted_value.is_object() {
+        return Value::Null;
+    }
+    let claimed = posted_value.get("actor").and_then(https_id);
+    let matches = claimed.as_deref().is_some_and(|actor| {
+        let actor_host = url_host(actor);
+        let key_host = url_host(key_id);
+        !actor_host.is_empty() && actor_host == key_host
+    });
+    if claimed.is_none() || trusted || matches {
+        return posted_value.clone();
+    }
+    origin_decision(posted, fetches)
+}
+
 pub fn replay(input: &Value) -> anyhow::Result<Value> {
     let op = input.get("op").and_then(Value::as_str).unwrap_or("");
     let posted = input.get("posted");
@@ -327,6 +355,16 @@ pub fn replay(input: &Value) -> anyhow::Result<Value> {
                 .cloned()
                 .unwrap_or_default();
             Ok(origin_decision(posted, &fetches))
+        }
+        "reconcile" => {
+            let fetches = input
+                .get("fetches")
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default();
+            let key_id = input.get("keyId").and_then(Value::as_str).unwrap_or("");
+            let trusted = input.get("trusted").and_then(Value::as_bool).unwrap_or(false);
+            Ok(reconcile_decision(posted, key_id, trusted, &fetches))
         }
         other => Err(anyhow!("unsupported inbox origin op {other}")),
     }
