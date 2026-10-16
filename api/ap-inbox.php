@@ -88,6 +88,7 @@ if (!ap_rate_limit($ip, $rateMax)) {
 }
 
 $raw = file_get_contents('php://input', false, null, 0, AP_INBOX_MAX_BODY + 1);
+$GLOBALS['ap_inbox_body_len'] = is_string($raw) ? strlen($raw) : 0;
 if ($raw === false) {
     ap_fail('Empty body', 400);
 }
@@ -176,13 +177,35 @@ if (is_array($json)) {
                 ap_short($claimedActor)
             ));
         } else {
+            // The HTTP signature proves who delivered the POST, not that they
+            // are the activity actor. Mastodon inbox-forwarding (and relays
+            // we do not explicitly trust) re-sign someone else's Create.
+            // Do not accept that body. Fetch the claimed actor's copy.
+            $keyHostMismatch = parse_url($sig['keyId'], PHP_URL_HOST);
+            $actorHostMismatch = parse_url($claimedActor, PHP_URL_HOST);
+            $GLOBALS['ap_inbox_reject_detail'] = 'key_host=' . (is_string($keyHostMismatch) ? $keyHostMismatch : '')
+                . ' actor_host=' . (is_string($actorHostMismatch) ? $actorHostMismatch : '');
+            $recovered = ap_inbox_recover_unverified($json);
+            if ($recovered === null) {
+                ap_log(sprintf(
+                    'actor_key_mismatch type=%s keyId=%s actor=%s',
+                    $type,
+                    ap_short($sig['keyId']),
+                    ap_short($claimedActor)
+                ));
+                ap_fail('Signature key does not match activity actor', 401);
+            }
+            $json = $recovered;
+            $viaOrigin = true;
+            if (isset($json['type']) && is_string($json['type'])) {
+                $type = preg_replace('/[^A-Za-z0-9._-]/', '', $json['type']) ?: 'unknown';
+            }
             ap_log(sprintf(
-                'actor_key_mismatch type=%s keyId=%s actor=%s',
+                'origin_accept reason=actor_mismatch type=%s keyId=%s actor=%s',
                 $type,
                 ap_short($sig['keyId']),
                 ap_short($claimedActor)
             ));
-            ap_fail('Signature key does not match activity actor', 401);
         }
     }
     if (is_string($keyHost) && $keyHost !== '' && function_exists('ap_inbox_host_seen_note')) {
@@ -201,6 +224,30 @@ exit;
 
 function ap_fail(string $message, int $code): void
 {
+    $detail = (string) ($GLOBALS['ap_inbox_reject_detail'] ?? '');
+    $uri = (string) ($_SERVER['REQUEST_URI'] ?? '');
+    $host = (string) ($_SERVER['HTTP_HOST'] ?? ap_header('Host'));
+    $ua = ap_header('User-Agent');
+    $safe = static function (string $value, int $max = 80): string {
+        $value = preg_replace('/[^A-Za-z0-9 ._:\/~?&=+-]+/', '_', $value) ?? '';
+        return strlen($value) <= $max ? $value : substr($value, 0, $max);
+    };
+    // php-fpm stderr (journal). The file log is not always writable.
+    error_log(sprintf(
+        'ap-inbox reject code=%d reason=%s bytes=%d host=%s uri=%s digest=%d content_digest=%d signature=%d signature_input=%d content_type=%d detail=%s ua=%s',
+        $code,
+        $safe($message, 120),
+        (int) ($GLOBALS['ap_inbox_body_len'] ?? 0),
+        $safe($host, 80),
+        $safe($uri, 80),
+        ap_header('Digest') !== '' ? 1 : 0,
+        ap_header('Content-Digest') !== '' ? 1 : 0,
+        ap_header('Signature') !== '' ? 1 : 0,
+        ap_header('Signature-Input') !== '' ? 1 : 0,
+        ap_header('Content-Type') !== '' ? 1 : 0,
+        $safe($detail, 160),
+        $safe($ua, 80)
+    ));
     ap_log(sprintf('reject code=%d ip=%s msg=%s', $code, ap_client_ip(), $message));
     http_response_code($code);
     header('Content-Type: application/json');
@@ -977,6 +1024,27 @@ function ap_inbox_origin_decision(?array $posted, array $fetches): ?array
         return $activity;
     }
     return null;
+}
+
+/**
+ * A verified delivery whose key host is not the activity actor.
+ * Relays and followed forwarders may keep the signed body. Everyone else
+ * must be replaced by an origin document, or rejected.
+ *
+ * @param array<string,mixed>|null $posted
+ * @param array<string,array{status?:int,doc?:mixed}> $fetches
+ * @return array<string,mixed>|null
+ */
+function ap_inbox_reconcile_decision(?array $posted, string $keyId, bool $trusted, array $fetches): ?array
+{
+    if ($posted === null) {
+        return null;
+    }
+    $claimed = ap_as_id($posted['actor'] ?? null);
+    if ($claimed === null || $trusted || ap_inbox_actor_matches_key($keyId, $claimed)) {
+        return $posted;
+    }
+    return ap_inbox_origin_decision($posted, $fetches);
 }
 
 /**
