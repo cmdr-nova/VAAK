@@ -67,15 +67,42 @@ $samples = [
     ['id' => 'follow-none', 'input' => ['op' => 'decide', 'posted' => [
         'type' => 'Accept', 'actor' => $actor, 'object' => 'https://mkultra.monster/users/cmdr_nova/follows/1',
     ], 'fetches' => []]],
+    ['id' => 'reconcile-match', 'input' => ['op' => 'reconcile', 'keyId' => $actor . '#main-key', 'trusted' => false, 'posted' => [
+        'id' => $activity, 'type' => 'Create', 'actor' => $actor, 'object' => $object,
+    ], 'fetches' => []]],
+    ['id' => 'reconcile-trusted', 'input' => ['op' => 'reconcile', 'keyId' => 'https://other.test/users/bob#main-key', 'trusted' => true, 'posted' => [
+        'id' => $activity, 'type' => 'Create', 'actor' => $actor, 'object' => $object,
+    ], 'fetches' => []]],
+    ['id' => 'reconcile-forward', 'input' => ['op' => 'reconcile', 'keyId' => 'https://other.test/users/bob#main-key', 'trusted' => false, 'posted' => [
+        'id' => $activity, 'type' => 'Create', 'actor' => $actor,
+        'object' => ['id' => $object, 'type' => 'Note', 'attributedTo' => $actor, 'content' => 'spoofed-body'],
+    ], 'fetches' => [
+        $activity => ['status' => 404, 'doc' => null],
+        $object => ['status' => 200, 'doc' => $note],
+    ]]],
+    ['id' => 'reconcile-spoof', 'input' => ['op' => 'reconcile', 'keyId' => 'https://other.test/users/bob#main-key', 'trusted' => false, 'posted' => [
+        'id' => $activity, 'type' => 'Create', 'actor' => $actor, 'object' => $object,
+    ], 'fetches' => [
+        $activity => ['status' => 200, 'doc' => [
+            'id' => $activity, 'type' => 'Create', 'actor' => 'https://example.com/users/bob',
+            'object' => ['id' => $object, 'type' => 'Note', 'attributedTo' => 'https://example.com/users/bob', 'content' => 'bob'],
+        ]],
+    ]]],
 ];
 
 $cases = [];
 foreach ($samples as $sample) {
     $input = $sample['input'];
-    $posted = $input['posted'] ?? null;
-    $output = ($input['op'] ?? '') === 'urls'
-        ? ap_inbox_origin_urls(is_array($posted) ? $posted : null)
-        : ap_inbox_origin_decision(is_array($posted) ? $posted : null, is_array($input['fetches'] ?? null) ? $input['fetches'] : []);
+    $posted = is_array($input['posted'] ?? null) ? $input['posted'] : null;
+    $fetches = is_array($input['fetches'] ?? null) ? $input['fetches'] : [];
+    $op = (string) ($input['op'] ?? '');
+    if ($op === 'urls') {
+        $output = ap_inbox_origin_urls($posted);
+    } elseif ($op === 'reconcile') {
+        $output = ap_inbox_reconcile_decision($posted, (string) ($input['keyId'] ?? ''), !empty($input['trusted']), $fetches);
+    } else {
+        $output = ap_inbox_origin_decision($posted, $fetches);
+    }
     $cases[] = ['id' => $sample['id'], 'input' => $input, 'output' => $output];
 }
 echo json_encode(['cases' => $cases], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE), "\n";
