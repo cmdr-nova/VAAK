@@ -52,6 +52,7 @@ mod recommendations;
 mod redis_util;
 mod self_thread;
 mod actor_warm;
+mod bsky_observations;
 mod thin_media;
 mod thin_media_warm;
 mod timeline;

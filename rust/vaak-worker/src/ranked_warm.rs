@@ -13,8 +13,11 @@
 //!   parity. Flag `VAAK_RANKED_NATIVE_LOCAL_FEED=1` (default on; `0` skips).
 //! - Empty timelines soft-skip (no Redis write). PHP `bin/ranked-warm.php` is
 //!   retired; HTML soft-nav still uses in-process `admin_tl_lean_ranked_warm`.
-//! - The loop skips a view when a cheap max(id) / pg_stat watermark matches
-//!   the previous warm, and only refreshes Redis TTLs so idle ticks stay idle.
+//! - The loop skips a view when that owner's inputs are unchanged. Home uses a
+//!   watermark over followed actors and the owner's own posts, not the global
+//!   events id, so a remote firehose insert does not rebuild every Home.
+//!   Local and Federated still follow the tables they actually read. Idle
+//!   ticks only refresh Redis TTLs.
 //!
 //! Cache key parity with PHP `admin_tl_cache_key` (v13).
 
@@ -2993,10 +2996,54 @@ struct TableTicks {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+struct OwnerWarmMark {
+    /// Newest timeline event id from this owner or someone they follow.
+    follow_event_id: i64,
+    /// `max(published):count` of this owner's own outbox notes.
+    own_post_stamp: String,
+    /// Followed tags, or fewer than the Home floor of fresh follow posts.
+    /// Public events outside the follow graph can change that Home.
+    global_events_relevant: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct WarmInputs {
     stats_readable: bool,
-    events_max_id: i64,
+    /// Newest event id. Federated uses it. Home uses it only when
+    /// [`OwnerWarmMark::global_events_relevant`] is set.
+    feed_event_id: i64,
     tables: BTreeMap<String, TableTicks>,
+    owners: BTreeMap<i64, OwnerWarmMark>,
+}
+
+/// Home mixes the public floor until a follow graph has this many recent posts,
+/// and followed tags read the public window. Either one makes a remote event
+/// relevant to that owner.
+fn home_global_events_relevant(fresh_follow_events: i64, followed_tags: bool) -> bool {
+    followed_tags || fresh_follow_events < HOME_FLOOR_MIN_FRESH as i64
+}
+
+fn observation_actor_keys(self_actor: &str, following: &[String]) -> Vec<String> {
+    let mut keys = Vec::new();
+    let mut seen = HashSet::new();
+    let mut push = |raw: &str| {
+        let trimmed = raw.trim().trim_end_matches('/').to_string();
+        if trimmed.is_empty() {
+            return;
+        }
+        if seen.insert(trimmed.clone()) {
+            keys.push(trimmed.clone());
+        }
+        let slashed = format!("{trimmed}/");
+        if seen.insert(slashed.clone()) {
+            keys.push(slashed);
+        }
+    };
+    push(self_actor);
+    for actor in ap_following_for_events(following) {
+        push(&actor);
+    }
+    keys
 }
 
 struct StoredWarm {
@@ -3069,8 +3116,22 @@ fn all_warm_tables() -> Vec<String> {
     names
 }
 
+fn events_token_part(view: &str, inputs: &WarmInputs, global_events_relevant: bool) -> Option<String> {
+    let ticks = inputs.tables.get("events")?;
+    if view == "home" && !global_events_relevant {
+        // Inserts of other people's events move n_tup_ins and the global max
+        // id. Edits and deletes are rarer and can change a followed row
+        // without a new id, so they still invalidate Home.
+        return Some(format!("events_maint={}:{}", ticks.upd, ticks.del));
+    }
+    Some(format!(
+        "events={}:{}:{}",
+        ticks.ins, ticks.upd, ticks.del
+    ))
+}
+
 /// Stable fingerprint of the rows a view reads. None means "do not skip".
-fn view_warm_token(view: &str, inputs: &WarmInputs, hour_bucket: i64) -> Option<String> {
+fn view_warm_token(view: &str, inputs: &WarmInputs, owner: i64, hour_bucket: i64) -> Option<String> {
     if !inputs.stats_readable || view_input_tables(view).is_empty() {
         return None;
     }
@@ -3081,15 +3142,29 @@ fn view_warm_token(view: &str, inputs: &WarmInputs, hour_bucket: i64) -> Option<
         return None;
     }
     let mut parts = Vec::new();
-    if view == "home" || view == "feed" {
-        parts.push(format!("events_max={}", inputs.events_max_id));
-    }
+    let mut home_global = false;
     if view == "home" {
+        let mark = inputs.owners.get(&owner)?;
+        home_global = mark.global_events_relevant;
+        parts.push(format!("follow_events={}", mark.follow_event_id));
+        parts.push(format!("own_posts={}", mark.own_post_stamp));
+        if home_global {
+            parts.push(format!("feed_events={}", inputs.feed_event_id));
+        }
         // Home ranking and the federated floor depend on the clock. An hour
         // bucket keeps that freshness without rebuilding every idle minute.
         parts.push(format!("hour={hour_bucket}"));
     }
+    if view == "feed" {
+        parts.push(format!("feed_events={}", inputs.feed_event_id));
+    }
+    if view == "home" || view == "feed" {
+        parts.push(events_token_part(view, inputs, home_global)?);
+    }
     for name in view_input_tables(view) {
+        if *name == "events" {
+            continue;
+        }
         match inputs.tables.get(*name) {
             Some(ticks) => parts.push(format!("{name}={}:{}:{}", ticks.ins, ticks.upd, ticks.del)),
             None => parts.push(format!("{name}=-")),
@@ -3142,16 +3217,99 @@ async fn load_warm_inputs(db: &Client) -> Result<WarmInputs> {
             },
         );
     }
-    let events_max_id: i64 = db
+    let feed_event_id: i64 = db
         .query_one("SELECT COALESCE(MAX(id), 0) FROM events", &[])
         .await
         .context("ranked-warm events watermark")?
         .get(0);
     Ok(WarmInputs {
         stats_readable: !tables.is_empty(),
-        events_max_id,
+        feed_event_id,
         tables,
+        owners: BTreeMap::new(),
     })
+}
+
+async fn load_one_owner_mark(db: &Client, owner: i64) -> Result<OwnerWarmMark> {
+    let (actor_id, _) = load_owner(db, owner).await?;
+    let following = load_following_actor_ids(db, &actor_id).await?;
+    let keys = observation_actor_keys(&actor_id, &following);
+    let follow_event_id: i64 = if keys.is_empty() {
+        0
+    } else {
+        db.query_one(
+            "SELECT COALESCE(MAX(id), 0) FROM events
+             WHERE actor_id = ANY($1::text[])
+               AND type = ANY(ARRAY['Create','Announce','Quote','QuotePost'])
+               AND action_taken = ANY(ARRAY['log','local_observe'])",
+            &[&keys],
+        )
+        .await
+        .context("ranked-warm follow watermark")?
+        .get(0)
+    };
+    let cutoff = (chrono::Utc::now() - chrono::Duration::seconds(HOME_FLOOR_FRESH_SECS)).to_rfc3339();
+    let fresh_limit = HOME_FLOOR_MIN_FRESH as i64;
+    let fresh_follow_events: i64 = if keys.is_empty() {
+        0
+    } else {
+        db.query_one(
+            "SELECT COUNT(*) FROM (
+                SELECT 1 FROM events
+                WHERE actor_id = ANY($1::text[])
+                  AND type = ANY(ARRAY['Create','Announce','Quote','QuotePost'])
+                  AND action_taken = ANY(ARRAY['log','local_observe'])
+                  AND created_at >= $2
+                LIMIT $3
+            ) fresh",
+            &[&keys, &cutoff, &fresh_limit],
+        )
+        .await
+        .context("ranked-warm fresh follow count")?
+        .get(0)
+    };
+    let like = format!("{}/notes/%", actor_id.trim_end_matches('/'));
+    let own = db
+        .query_one(
+            "SELECT COALESCE(MAX(published), ''), COUNT(*) FROM outbox_notes WHERE id LIKE $1",
+            &[&like],
+        )
+        .await
+        .context("ranked-warm own posts watermark")?;
+    let published: String = own.get(0);
+    let count: i64 = own.get(1);
+    let followed_tags = match db
+        .query_one(
+            "SELECT COUNT(*) FROM masto_followed_tags WHERE owner_user_id = $1",
+            &[&owner],
+        )
+        .await
+    {
+        Ok(row) => row.get::<_, i64>(0) > 0,
+        // Unknown tags can still change Home. Keep the public watermark.
+        Err(_) => true,
+    };
+    Ok(OwnerWarmMark {
+        follow_event_id,
+        own_post_stamp: format!("{published}:{count}"),
+        global_events_relevant: home_global_events_relevant(fresh_follow_events, followed_tags),
+    })
+}
+
+async fn load_owner_marks(db: &Client, owners: &[i64]) -> BTreeMap<i64, OwnerWarmMark> {
+    let mut out = BTreeMap::new();
+    for &owner in owners {
+        if owner < 1 {
+            continue;
+        }
+        match load_one_owner_mark(db, owner).await {
+            Ok(mark) => {
+                out.insert(owner, mark);
+            }
+            Err(e) => tracing::debug!(owner, error = %e, "ranked-warm owner watermark skipped"),
+        }
+    }
+    out
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3278,16 +3436,22 @@ pub async fn run_loop(
     let views_owned = views.to_string();
     let mut memory: HashMap<(i64, String), StoredWarm> = HashMap::new();
     let mut warned_stats = false;
+    let mut warned_owner = false;
     loop {
         let (owners, inputs): (Vec<i64>, Option<WarmInputs>) = if owner_user_id > 0 {
-            let inputs = match crate::db::connect(&cfg.database_url).await {
-                Ok(db) => load_warm_inputs(&db).await.ok(),
+            match crate::db::connect(&cfg.database_url).await {
+                Ok(db) => {
+                    let mut inputs = load_warm_inputs(&db).await.ok();
+                    if let Some(inputs) = inputs.as_mut() {
+                        inputs.owners = load_owner_marks(&db, &[owner_user_id]).await;
+                    }
+                    (vec![owner_user_id], inputs)
+                }
                 Err(e) => {
                     tracing::error!(error = %e, "ranked-warm loop: db connect failed");
-                    None
+                    (vec![owner_user_id], None)
                 }
-            };
-            (vec![owner_user_id], inputs)
+            }
         } else {
             match crate::db::connect(&cfg.database_url).await {
                 Ok(db) => {
@@ -3305,7 +3469,13 @@ pub async fn run_loop(
                     let inputs = if owners.is_empty() {
                         None
                     } else {
-                        load_warm_inputs(&db).await.ok()
+                        match load_warm_inputs(&db).await {
+                            Ok(mut inputs) => {
+                                inputs.owners = load_owner_marks(&db, &owners).await;
+                                Some(inputs)
+                            }
+                            Err(_) => None,
+                        }
                     };
                     (owners, inputs)
                 }
@@ -3319,6 +3489,14 @@ pub async fn run_loop(
             tracing::warn!("ranked-warm loop: change watermark unavailable; warming every view");
             warned_stats = true;
         }
+        if inputs.as_ref().is_some_and(|inputs| inputs.owners.is_empty())
+            && !owners.is_empty()
+            && parse_views(&views_owned).iter().any(|view| *view == "home")
+            && !warned_owner
+        {
+            tracing::warn!("ranked-warm loop: owner watermark unavailable; warming home");
+            warned_owner = true;
+        }
         let hour = chrono::Utc::now().timestamp().div_euclid(3600);
         let mut skipped = 0usize;
         let mut warmed = 0usize;
@@ -3327,7 +3505,7 @@ pub async fn run_loop(
             for view in parse_views(&views_owned) {
                 let token = inputs
                     .as_ref()
-                    .and_then(|inputs| view_warm_token(view, inputs, hour));
+                    .and_then(|inputs| view_warm_token(view, inputs, owner, hour));
                 let key = (owner, view.to_string());
                 let previous_token = memory.get(&key).map(|state| state.token.clone());
                 let previous_logical = memory.get(&key).and_then(|state| state.logical.clone());
@@ -3397,48 +3575,104 @@ pub async fn run_loop(
 mod tests {
     use super::*;
 
+    fn sample_mark(global: bool) -> OwnerWarmMark {
+        OwnerWarmMark {
+            follow_event_id: 10,
+            own_post_stamp: "2026-10-15T00:00:00+00:00:2".into(),
+            global_events_relevant: global,
+        }
+    }
+
     fn sample_inputs() -> WarmInputs {
         let mut tables = BTreeMap::new();
         for name in ["events", "outbox_notes", "masto_reblogs", "following"] {
             tables.insert(name.to_string(), TableTicks { ins: 1, upd: 0, del: 0 });
         }
+        let mut owners = BTreeMap::new();
+        owners.insert(1, sample_mark(false));
+        owners.insert(2, sample_mark(false));
         WarmInputs {
             stats_readable: true,
-            events_max_id: 10,
+            feed_event_id: 10,
             tables,
+            owners,
         }
     }
 
     #[test]
     fn unchanged_watermark_skips_only_that_view() {
         let inputs = sample_inputs();
-        let home = view_warm_token("home", &inputs, 5);
-        let local = view_warm_token("local", &inputs, 5);
-        let feed = view_warm_token("feed", &inputs, 5);
+        let home = view_warm_token("home", &inputs, 1, 5);
+        let local = view_warm_token("local", &inputs, 1, 5);
+        let feed = view_warm_token("feed", &inputs, 1, 5);
         assert!(warm_should_skip(home.as_deref(), home.as_deref()));
         assert_ne!(home, local);
         assert_ne!(home, feed);
         let mut bumped = inputs.clone();
-        bumped.events_max_id = 11;
-        assert_ne!(view_warm_token("home", &bumped, 5), home);
-        assert_ne!(view_warm_token("feed", &bumped, 5), feed);
-        assert_eq!(view_warm_token("local", &bumped, 5), local);
+        bumped.feed_event_id = 11;
+        bumped.tables.get_mut("events").unwrap().ins = 50;
+        assert_eq!(view_warm_token("home", &bumped, 1, 5), home);
+        assert_eq!(view_warm_token("home", &bumped, 2, 5), view_warm_token("home", &inputs, 2, 5));
+        assert_ne!(view_warm_token("feed", &bumped, 1, 5), feed);
+        assert_eq!(view_warm_token("local", &bumped, 1, 5), local);
+        bumped.owners.get_mut(&1).unwrap().follow_event_id = 11;
+        assert_ne!(view_warm_token("home", &bumped, 1, 5), home);
+        assert_eq!(view_warm_token("home", &bumped, 2, 5), view_warm_token("home", &inputs, 2, 5));
+        bumped.owners.get_mut(&2).unwrap().own_post_stamp = "2026-10-15T01:00:00+00:00:3".into();
+        assert_ne!(view_warm_token("home", &bumped, 2, 5), view_warm_token("home", &inputs, 2, 5));
+        assert_eq!(view_warm_token("feed", &inputs, 2, 5), feed);
+        let before_delete = view_warm_token("home", &bumped, 1, 5);
+        bumped.tables.get_mut("events").unwrap().del = 1;
+        assert_ne!(view_warm_token("home", &bumped, 1, 5), before_delete);
         bumped.tables.get_mut("masto_reblogs").unwrap().ins = 4;
-        assert_ne!(view_warm_token("local", &bumped, 5), local);
-        assert_ne!(view_warm_token("home", &inputs, 6), home);
-        assert_eq!(view_warm_token("local", &inputs, 6), local);
-        assert_eq!(view_warm_token("feed", &inputs, 6), feed);
+        assert_ne!(view_warm_token("local", &bumped, 1, 5), local);
+        assert_ne!(view_warm_token("home", &inputs, 1, 6), home);
+        assert_eq!(view_warm_token("local", &inputs, 1, 6), local);
+        assert_eq!(view_warm_token("feed", &inputs, 1, 6), feed);
+    }
+
+    #[test]
+    fn quiet_home_still_tracks_public_events() {
+        let mut inputs = sample_inputs();
+        inputs.owners.get_mut(&1).unwrap().global_events_relevant = true;
+        let home = view_warm_token("home", &inputs, 1, 5);
+        inputs.feed_event_id = 12;
+        assert_ne!(view_warm_token("home", &inputs, 1, 5), home);
+        assert_eq!(view_warm_token("home", &inputs, 2, 5), view_warm_token("home", &sample_inputs(), 2, 5));
+        assert!(home_global_events_relevant(39, false));
+        assert!(!home_global_events_relevant(40, false));
+        assert!(home_global_events_relevant(40, true));
+    }
+
+    #[test]
+    fn missing_owner_mark_does_not_skip_home() {
+        let mut inputs = sample_inputs();
+        inputs.owners.remove(&1);
+        assert!(view_warm_token("home", &inputs, 1, 5).is_none());
+        assert!(view_warm_token("feed", &inputs, 1, 5).is_some());
+        assert!(view_warm_token("local", &inputs, 1, 5).is_some());
+        let keys = observation_actor_keys(
+            "https://mkultra.monster/users/ada/",
+            &[
+                "https://remote.example/users/bob".into(),
+                "https://bsky.app/profile/skip.bsky.social".into(),
+            ],
+        );
+        assert!(keys.contains(&"https://mkultra.monster/users/ada".to_string()));
+        assert!(keys.contains(&"https://mkultra.monster/users/ada/".to_string()));
+        assert!(keys.contains(&"https://remote.example/users/bob".to_string()));
+        assert!(!keys.iter().any(|key| key.contains("bsky.app")));
     }
 
     #[test]
     fn missing_events_stats_do_not_skip() {
         let mut inputs = sample_inputs();
         inputs.tables.remove("events");
-        assert!(view_warm_token("home", &inputs, 1).is_none());
-        assert!(view_warm_token("feed", &inputs, 1).is_none());
-        assert!(view_warm_token("local", &inputs, 1).is_some());
+        assert!(view_warm_token("home", &inputs, 1, 1).is_none());
+        assert!(view_warm_token("feed", &inputs, 1, 1).is_none());
+        assert!(view_warm_token("local", &inputs, 1, 1).is_some());
         inputs.stats_readable = false;
-        assert!(view_warm_token("local", &inputs, 1).is_none());
+        assert!(view_warm_token("local", &inputs, 1, 1).is_none());
         assert!(!warm_should_skip(None, Some("x")));
         assert!(!warm_should_skip(Some("x"), None));
         assert!(!warm_should_skip(Some(""), Some("")));
