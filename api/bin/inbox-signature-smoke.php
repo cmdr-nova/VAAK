@@ -207,4 +207,82 @@ $blocked = ap_inbox_origin_fetch_live('https://example.com/users/alice/statuses/
 check($blocked['status'] === 0 && $blocked['doc'] === null, 'open circuit skips the origin fetch');
 @unlink($circuit);
 
+// Valid signature from a different host must not keep the posted body.
+// Origin confirmation of the claimed actor replaces it.
+$GLOBALS['ap_inbox_origin_mem'] = [];
+$GLOBALS['ap_inbox_origin_cache_dir'] = sys_get_temp_dir() . '/ap-inbox-origin-forward-' . bin2hex(random_bytes(4));
+$GLOBALS['ap_inbox_origin_fetch'] = static function (string $url) use ($objectId, $actor): array {
+    if ($url === $objectId) {
+        return ['status' => 200, 'doc' => [
+            'id' => $objectId,
+            'type' => 'Note',
+            'attributedTo' => $actor,
+            'content' => 'origin-body',
+        ]];
+    }
+    return ['status' => 404, 'doc' => null];
+};
+$forwarded = [
+    'id' => $activityId,
+    'type' => 'Create',
+    'actor' => $actor,
+    'object' => [
+        'id' => $objectId,
+        'type' => 'Note',
+        'attributedTo' => $actor,
+        'content' => 'spoofed-by-forwarder',
+    ],
+];
+$reconciled = ap_inbox_reconcile_decision($forwarded, 'https://other.test/users/bob#main-key', false, [
+    $activityId => ['status' => 404, 'doc' => null],
+    $objectId => ['status' => 200, 'doc' => [
+        'id' => $objectId,
+        'type' => 'Note',
+        'attributedTo' => $actor,
+        'content' => 'origin-body',
+    ]],
+]);
+check(is_array($reconciled) && ($reconciled['object']['content'] ?? '') === 'origin-body', 'forwarded Create is replaced by the origin note');
+check(($reconciled['actor'] ?? '') === $actor, 'forwarded Create keeps the claimed actor');
+$spoofForward = ap_inbox_reconcile_decision($forwarded, 'https://other.test/users/bob#main-key', false, [
+    $activityId => ['status' => 200, 'doc' => [
+        'id' => $activityId,
+        'type' => 'Create',
+        'actor' => 'https://example.com/users/bob',
+        'object' => ['id' => $objectId, 'type' => 'Note', 'attributedTo' => 'https://example.com/users/bob', 'content' => 'bob'],
+    ]],
+]);
+check($spoofForward === null, 'forwarded Create whose origin actor differs is rejected');
+$trusted = ap_inbox_reconcile_decision($forwarded, 'https://other.test/users/bob#main-key', true, []);
+check(is_array($trusted) && ($trusted['object']['content'] ?? '') === 'spoofed-by-forwarder', 'trusted forwarder keeps the signed body');
+
+// Captured production 401s. Signatures and public keys are public.
+$fixturePath = dirname(__DIR__) . '/fixtures/inbox-401-signatures.json';
+$fixture = json_decode((string) file_get_contents($fixturePath), true);
+check(is_array($fixture), 'load captured signature fixture');
+foreach (['peertube', 'sauropods', 'foone'] as $id) {
+    $case = $fixture[$id];
+    $_SERVER = $case['server'];
+    $rawSig = base64_decode($case['signature'], true);
+    $path = is_string($rawSig) ? ap_verify_http_signature($case['headers'], '', $rawSig, $case['pem'], ['created' => null, 'expires' => null]) : null;
+    check($path === '/inbox', $case['name'] . ' verifies for /inbox');
+}
+$rfc = $fixture['rfc'];
+$_SERVER = [
+    'REQUEST_METHOD' => 'POST',
+    'HTTP_HOST' => 'mkultra.monster',
+    'REQUEST_URI' => '/inbox',
+    'HTTP_CONTENT_DIGEST' => $rfc['digest'],
+    'HTTP_SIGNATURE' => $rfc['signature'],
+    'HTTP_SIGNATURE_INPUT' => $rfc['input'],
+];
+$rfcParsed = ap_inbox_parse_signature_input($rfc['input']);
+check(is_array($rfcParsed) && !isset($rfcParsed['params']['alg']), 'Mastodon RFC 9421 Signature-Input omits alg');
+if (!is_array($rfcParsed) || !preg_match('/sig1\s*=\s*:([A-Za-z0-9+\/=]+):/', $rfc['signature'], $rfcMatch)) {
+    check(false, 'RFC signature bytes');
+} else {
+    $rfcPath = ap_inbox_verify_rfc9421_base($rfcParsed, base64_decode($rfcMatch[1], true) ?: '', $rfc['pem'], $rfc['digest']);
+    check($rfcPath === '/inbox', 'Mastodon RFC 9421 double-knock verifies for https://mkultra.monster/inbox');
+}
+
 echo "inbox-signature: {$GLOBALS['n']} checks passed\n";

@@ -1,0 +1,49 @@
+{
+  "peertube": {
+    "name": "PeerTube (request-target) host date digest",
+    "pem": "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAyem2T7YAR22GF/OPujpM\nDlOTgWtvA7GbjxZqDn1QExtheaC3d5MsSORbp8aHTJOZPU/AEd1o0Bb4L7iHowyw\nSm1tb0+r0DaPUVHRl1ZvNZcBQ2MtViDrEKIT7upxTw12ed4EE5ak7zE8ZlAihJii\n7IWMTNIXiWa1EJIcuM2mjDayCEWm/xnP7p2EHekRYCmWQM3lVidjhGSncOwznBb3\nhhQUrRVLnbt58VbankA53tkIIrEsJOx+HIcqfLQksLh5QNxkZgKwF33nayYJM0I+\nIzQGiK5otRaIVJAfAophBZuUbMkkbCPAkYyoyvOZ57xuAv3kdrxakfBfKIHNmkFf\njwIDAQAB\n-----END PUBLIC KEY-----\n",
+    "headers": "(request-target) host date digest",
+    "signature": "U4GhlWc60CVO9keBSeJUmDHbAIZrB9UzMyH5+j2mTzrxSBZK4+4RxQPQKSdGy1xJWxOdhGHfjp+DLNFhGzWqyiOpcCU0s1wnmeVSLwLErWvPIhIu4EOi18yMX5sqUVgHx5pk4NF3tmKMUQlDicSLgzArAshph1r5QJal5k2+ZyatpRlbX/ZP055Z2YXXe29rzGsL3QLWAIRYXncrBthAZm9KT0sDPpob1YMdXUeKIUYbwfmxK35m/+MqxSs1vSGxOscIxlC7TGdUN9JhEfDtzA5eKRJeTPrWc+4u0QeNLLHJjzjqEjUdHUPcx0c117qInw9Asb5jeFfniTz5n9iSSw==",
+    "server": {
+      "REQUEST_METHOD": "POST",
+      "HTTP_HOST": "mkultra.monster",
+      "HTTP_DATE": "Fri, 16 Oct 2026 15:26:23 GMT",
+      "HTTP_DIGEST": "SHA-256=FqKDZbsQT/kYoL9uoQuqHvgIHO5Gi3qOgWPiESJGapo=",
+      "REQUEST_URI": "/inbox"
+    }
+  },
+  "sauropods": {
+    "name": "Mastodon 4.7.3 host date content-type digest (request-target)",
+    "pem": "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAxu2F5XuVdKSgnxDGx21b\nLleoIzgsE62zS9XRz/adLluAh0aCtlQnjLHXdD1mFKsM9+VhcvDwg5An7lQpRl0x\n/ykTBKhlHBuxrb1bjsR+Zrtp23nUT8MBhTEhv4ekDz7omZmG52Z6xfAyno0BbDxB\nOSCldUmTYabxCpM3mUJcQB8NvBo0H/pSmb/EofPBC+ny8vmQ91jDHAnEfPigeBZP\nJqvVjAThGQhA/JEUe51pUctDl6pzIdk11XoZgZWANEof7ObEbJ/eudly+tG5CLrH\nQa26i4IHTG2oFfUPVeh7FVwgLQ/b+j7SCYk/KkUFAuCDrB/1BY/WhXbgYMSxwPmJ\nBQIDAQAB\n-----END PUBLIC KEY-----\n",
+    "headers": "host date content-type digest (request-target)",
+    "signature": "o5gvKZ1bV1uc5umbdi+Jx1lbCg/tEYeVixwwxoMpA6+dh9eiAPAgd+UXM23sDvrmKPY7+ET+HYwsgNVHUTzNgzy/SSsFGMYEJcy+Ix0F/N5kZMADrTSUKnGZTS91NctsKfOKP2mk+js0NIavr397B3u9fizpgjqABQgWIcvEdMerNgYT1usrI5mlSEsHzC3z8vD5CLAkH8Uh25FuQOMrXx7Zih4OPjE9sXU4AZKVw0b//u+OZY9MK9FzDMI3cpa4LcXmddYnONOZO9QL3YaQLJhrF9m5qEiFuHMZxaWwiQNW2cjO/oRKo1RMohmMyPbPa8Wji5g3GsgAoLZ1QWEZkA==",
+    "server": {
+      "REQUEST_METHOD": "POST",
+      "HTTP_HOST": "mkultra.monster",
+      "HTTP_DATE": "Fri, 16 Oct 2026 15:26:34 GMT",
+      "HTTP_DIGEST": "SHA-256=veSs4ee5sAxIwYiC2mXHDq9jCkEY38EaCHEorneMU58=",
+      "CONTENT_TYPE": "application/activity+json",
+      "REQUEST_URI": "/api/ap-inbox.php"
+    }
+  },
+  "foone": {
+    "name": "Mastodon 4.6.9 host date digest content-type (request-target)",
+    "pem": "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEArpuS/Vd4ylRLpDp8MdA4\n4LNwGeyymwJ6Ryg/u2rbtLAoN2yEG1KSAJPCp0m3gCrdhs1cxY9UkwjDPvujrZmL\nN/UcGSD5jHSPRR08JrFJf+g85JUp4xxLgUkRxcqeBsnluBboTRNjnzafWrZaaYQM\n7I89oAh9f2NVP3tVBxqpFIdXDM5n/srWX7GVzV7jqKmKcprDHqU7jlkVMVUUyNlK\nqgmxWQhMCJmLZ1ohcH6NRfmtWGASs/pYNfL4UrfTZIJU9Uzrw19NUk02DsR9Zm4u\n5BQGeQO2FZMIFgQcbIRgasRGj5/aw+pXjCTz33oUe8gVwGjUHOZOEqD8GJbMajOW\nkQIDAQAB\n-----END PUBLIC KEY-----\n",
+    "headers": "host date digest content-type (request-target)",
+    "signature": "OXZMoeaOCuGv3xqHyJR5Qx7Ph0V84hy0xID6qZ2BCfrYgeIljbiAB0VEJmColqKA4mvFTGkh4pJeQFPescQ0JRfciFvjCo7PY8yrDd+AVdUlJraClMoCCg1bukaqD6j09kFv0FIv5ZTbpiBHy10vrliVDMVUbMJqcAX53LQgSoqmTGGLdMCcDMrjJ6WduwiDYzy5uz/UGZT5+m4tthb71phXLfZc+uny7L3EEvp8Zw+rQ0FT4liAYFv0H7ZYo22t4XLIeXTzP5Nib6OORHQNOPCHbsxPzaC0drXaheU8HpvGa/OqQrhYKFndbD1eWK1c0HTgeGI8KYeNDrkgYBGTrg==",
+    "server": {
+      "REQUEST_METHOD": "POST",
+      "HTTP_HOST": "mkultra.monster",
+      "HTTP_DATE": "Fri, 16 Oct 2026 15:26:37 GMT",
+      "HTTP_DIGEST": "SHA-256=tehVWfC+Fb6KUfva4a4LTAbSoaJ+COvqnLU975RnBno=",
+      "CONTENT_TYPE": "application/activity+json",
+      "REQUEST_URI": "/inbox"
+    }
+  },
+  "rfc": {
+    "pem": "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAxu2F5XuVdKSgnxDGx21b\nLleoIzgsE62zS9XRz/adLluAh0aCtlQnjLHXdD1mFKsM9+VhcvDwg5An7lQpRl0x\n/ykTBKhlHBuxrb1bjsR+Zrtp23nUT8MBhTEhv4ekDz7omZmG52Z6xfAyno0BbDxB\nOSCldUmTYabxCpM3mUJcQB8NvBo0H/pSmb/EofPBC+ny8vmQ91jDHAnEfPigeBZP\nJqvVjAThGQhA/JEUe51pUctDl6pzIdk11XoZgZWANEof7ObEbJ/eudly+tG5CLrH\nQa26i4IHTG2oFfUPVeh7FVwgLQ/b+j7SCYk/KkUFAuCDrB/1BY/WhXbgYMSxwPmJ\nBQIDAQAB\n-----END PUBLIC KEY-----\n",
+    "input": "sig1=(\"@method\" \"@target-uri\" \"content-digest\");created=1792164394;keyid=\"https://sauropods.win/users/futurebird#main-key\"",
+    "signature": "sig1=:hQe9DiDXpGKsVPW8ZEVnT2eg2ZdoHIF1gdqSWQORLHxPFUE0jtXJNaJplxSAxMN8rITamZrJnlKD+fTxciBqpOIYF06Q27Co+tBA31t1DLsT3gigUUOkpZ5AnA5/70CSjn7ukGFC5rZ5WVpsXEGRSjnI/M0s5JHlLawJTD0hxFdThaBhSmgtSG62rZyb05yNH0bk04RXG2I2l3yxwil0H/hW9ES51kCONn8r6rl2ehbgkTPygVLG2bNjSpGRPeZZValN4Tj8tfBLh6v5yEG6oLTC0IrMohTIPpZOX/EaTMyHwWmf7nAKgDfoQtbhSycg3HJ2vxaO4+GF6XNEy7Iflw==:",
+    "digest": "sha-256=:veSs4ee5sAxIwYiC2mXHDq9jCkEY38EaCHEorneMU58=:"
+  }
+}

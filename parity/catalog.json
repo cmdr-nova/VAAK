@@ -98,7 +98,7 @@
     {
       "id": "inbox-origin",
       "area": "ActivityPub inbox",
-      "summary": "Unverified inbox fallback. Same-host fetch URLs, origin actor match, spoof rejection, and Delete 404/410 versus a live object. Pure decision; no network and no database.",
+      "summary": "Unverified inbox fallback and actor/key mismatch. Same-host fetch URLs, origin actor match, spoof rejection, Delete 404/410 versus a live object, and forwarded Creates kept only when the signer is trusted or the origin matches. Pure decision; no network and no database.",
       "php": {"script": "parity/php/inbox-origin.php", "args": []}
     },
     {
