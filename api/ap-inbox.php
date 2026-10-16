@@ -9,7 +9,7 @@
 declare(strict_types=1);
 
 const AP_INBOX_MAX_BODY = 262144;          // 256 KiB
-const AP_INBOX_DATE_SKEW = 600;            // ±10 minutes
+const AP_INBOX_DATE_SKEW = 3600;           // ±1 hour, same clock-skew margin Mastodon uses
 const AP_INBOX_RATE_MAX = 600;             // requests / window / IP (normal peers; 120 starved active instances)
 /** Accepted ActivityPub relays forward a firehose — low caps cause 429 retry-storms. */
 const AP_INBOX_RATE_MAX_RELAY = 12000;     // requests / window / IP for accepted relay hosts
@@ -98,63 +98,38 @@ if ($raw === '') {
     ap_fail('Empty body', 400);
 }
 
-$digestHdr = ap_header('Digest');
-$dateHdr = ap_header('Date');
-$sigHdr = ap_header('Signature');
-if ($digestHdr === '' || $dateHdr === '' || $sigHdr === '') {
-    ap_fail('Missing Digest, Date, or Signature', 401);
+$selected = ap_inbox_select($raw);
+if ($selected === null) {
+    $verifyCode = (int) ($GLOBALS['ap_inbox_verify_code'] ?? 401);
+    $verifyError = (string) ($GLOBALS['ap_inbox_verify_error'] ?? 'Invalid signature');
+    ap_fail($verifyError, $verifyCode === 403 ? 403 : 401);
 }
-
-if (!ap_valid_date($dateHdr)) {
-    ap_fail('Date out of range', 401);
-}
-
-if (!ap_valid_digest($digestHdr, $raw)) {
-    ap_fail('Digest mismatch', 401);
-}
-
-$sig = ap_parse_signature($sigHdr);
-if ($sig === null) {
-    ap_log('signature_parse_fail len=' . strlen($sigHdr) . ' sample=' . ap_short($sigHdr, 160));
-    ap_fail('Malformed Signature', 401);
-}
-
-$algo = strtolower($sig['algorithm'] ?? 'rsa-sha256');
-if ($algo !== 'rsa-sha256' && $algo !== 'hs2019') {
-    // Mastodon uses rsa-sha256; reject exotic algorithms.
-    ap_fail('Unsupported signature algorithm', 401);
-}
-
-// Server-wide instance block: reject before key fetch / crypto.
-$keyHostEarly = parse_url($sig['keyId'], PHP_URL_HOST);
-if (is_string($keyHostEarly) && ap_is_blocked_host(strtolower($keyHostEarly))) {
+$json = $selected['activity'];
+$sig = $selected['sig'];
+$viaOrigin = $selected['via'] === 'origin';
+if ($viaOrigin) {
+    $type = 'unknown';
+    if (isset($json['type']) && is_string($json['type'])) {
+        $type = preg_replace('/[^A-Za-z0-9._-]/', '', $json['type']) ?: 'unknown';
+    }
     ap_log(sprintf(
-        'blocked_reject_keyhost ip=%s keyId=%s',
+        'origin_accept ip=%s type=%s actor=%s',
         $ip,
-        ap_short($sig['keyId'])
+        $type,
+        ap_short((string) ($sig['keyId'] ?? ''))
     ));
-    ap_fail('Instance blocked', 403);
+} elseif (($selected['path'] ?? '/inbox') !== '/inbox') {
+    ap_log('sig_ok path=' . $selected['path'] . ' keyId=' . ap_short((string) ($sig['keyId'] ?? '')));
 }
 
-$pem = ap_fetch_actor_pubkey($sig['keyId']);
-if ($pem === null) {
-    ap_fail('Unable to fetch key', 401);
-}
-
-$sigRaw = base64_decode($sig['signature'], true) ?: '';
-$okPath = ap_verify_http_signature($sig['headers'], $raw, $sigRaw, $pem);
-if ($okPath === null) {
-    ap_fail('Invalid signature', 401);
-}
-if ($okPath !== '/inbox') {
-    ap_log('sig_ok path=' . $okPath . ' keyId=' . ap_short($sig['keyId']));
-}
-
-// Verified — optionally handle tombstone Follows; never store activity bodies.
-$type = 'unknown';
-$json = json_decode($raw, true);
-if (is_array($json) && isset($json['type']) && is_string($json['type'])) {
-    $type = preg_replace('/[^A-Za-z0-9._-]/', '', $json['type']) ?: 'unknown';
+// Signature path decodes the posted body. Origin recovery already replaced it
+// with the document fetched from the actor's host.
+if (!$viaOrigin) {
+    $type = 'unknown';
+    $json = json_decode($raw, true);
+    if (is_array($json) && isset($json['type']) && is_string($json['type'])) {
+        $type = preg_replace('/[^A-Za-z0-9._-]/', '', $json['type']) ?: 'unknown';
+    }
 }
 
 // Defense in depth (post-verify): signing key host still blocked → hard reject.
@@ -181,7 +156,9 @@ ap_log(sprintf(
 $action = 'log';
 if (is_array($json)) {
     $claimedActor = ap_as_id($json['actor'] ?? null);
-    if ($claimedActor !== null && !ap_inbox_actor_matches_key($sig['keyId'], $claimedActor)) {
+    // Origin recovery already required actor/attributedTo to match the claimed
+    // actor. There is no verified keyId to compare.
+    if (!$viaOrigin && $claimedActor !== null && !ap_inbox_actor_matches_key($sig['keyId'], $claimedActor)) {
         // 1) Accepted relays re-sign the firehose as themselves.
         // 2) Followed actors forward reply Creates (Mastodon inbox forwarding)
         //    signed as the followee while activity.actor is the reply author.
@@ -236,9 +213,22 @@ function ap_header(string $name): string
     $want = strtolower($name);
     if (function_exists('getallheaders')) {
         foreach (getallheaders() ?: [] as $k => $v) {
-            if (strtolower((string) $k) === $want && is_string($v)) {
+            if (strtolower((string) $k) === $want && is_string($v) && trim($v) !== '') {
                 return trim($v);
             }
+        }
+    }
+    // php-fpm exposes these as CONTENT_* rather than HTTP_*.
+    if ($want === 'content-type') {
+        $ct = $_SERVER['CONTENT_TYPE'] ?? '';
+        if (is_string($ct) && trim($ct) !== '') {
+            return trim($ct);
+        }
+    }
+    if ($want === 'content-length') {
+        $cl = $_SERVER['CONTENT_LENGTH'] ?? '';
+        if (is_string($cl) && trim($cl) !== '') {
+            return trim($cl);
         }
     }
     $key = 'HTTP_' . strtoupper(str_replace('-', '_', $name));
@@ -297,24 +287,33 @@ function ap_valid_digest(string $digestHdr, string $body): bool
 }
 
 /**
- * @return array{keyId:string,algorithm:?string,headers:string,signature:string}|null
+ * @return array{keyId:string,algorithm:?string,headers:string,signature:string,created:?string,expires:?string}|null
  */
 function ap_parse_signature(string $hdr): ?array
 {
+    $hdr = trim($hdr);
+    if (str_starts_with($hdr, 'Signature ')) {
+        $hdr = trim(substr($hdr, strlen('Signature ')));
+    }
     $out = [
         'keyId' => null,
         'algorithm' => null,
         'headers' => null,
         'signature' => null,
+        'created' => null,
+        'expires' => null,
     ];
     $aliases = [
         'keyid' => 'keyId',
         'algorithm' => 'algorithm',
         'headers' => 'headers',
         'signature' => 'signature',
+        'created' => 'created',
+        'expires' => 'expires',
     ];
-    // keyId="...",algorithm="rsa-sha256",headers="...",signature="..."
-    if (!preg_match_all('/([a-zA-Z]+)=(?:"([^"]*)"|([^,]*))/', $hdr, $matches, PREG_SET_ORDER)) {
+    // keyId="...",algorithm="rsa-sha256",headers="...",signature="...",created=123
+    // Whitespace around "=" is legal. Unquoted tokens stop at the next comma.
+    if (!preg_match_all('/([a-zA-Z]+)\s*=\s*(?:"([^"]*)"|([^,\s]*))/', $hdr, $matches, PREG_SET_ORDER)) {
         return null;
     }
     foreach ($matches as $m) {
@@ -327,7 +326,7 @@ function ap_parse_signature(string $hdr): ?array
     if (empty($out['keyId']) || empty($out['headers']) || empty($out['signature'])) {
         return null;
     }
-    /** @var array{keyId:string,algorithm:?string,headers:string,signature:string} $out */
+    /** @var array{keyId:string,algorithm:?string,headers:string,signature:string,created:?string,expires:?string} $out */
     return $out;
 }
 
@@ -346,13 +345,33 @@ function ap_request_target_path_candidates(): array
         if ($p === '' || !str_starts_with($p, '/')) {
             return;
         }
-        $p = strtok($p, '?') ?: $p;
+        $query = '';
+        $qpos = strpos($p, '?');
+        if ($qpos !== false) {
+            $query = substr($p, $qpos);
+            $p = substr($p, 0, $qpos);
+        }
         // Ignore rewritten PHP script path
-        if (str_contains($p, '.php')) {
+        if ($p === '' || str_contains($p, '.php')) {
             return;
         }
-        if (!in_array($p, $paths, true)) {
-            $paths[] = $p;
+        $variants = [$p];
+        if ($p !== '/') {
+            $variants[] = str_ends_with($p, '/') ? rtrim($p, '/') : ($p . '/');
+        }
+        foreach ($variants as $variant) {
+            if ($variant === '') {
+                continue;
+            }
+            if (!in_array($variant, $paths, true)) {
+                $paths[] = $variant;
+            }
+            if ($query !== '') {
+                $withQuery = $variant . $query;
+                if (!in_array($withQuery, $paths, true)) {
+                    $paths[] = $withQuery;
+                }
+            }
         }
     };
 
@@ -380,8 +399,10 @@ function ap_request_target_path_candidates(): array
         }
     }
 
-    // Always try shared + personal inboxes our Caddy routes expose
+    // Always try shared + personal inboxes our Caddy routes expose.
+    // Mastodon signs the path it was given, including a trailing slash.
     $add('/inbox');
+    $add('/inbox/');
     $add('/users/cmdr_nova/inbox');
     $add('/users/cmdr_nova/inbox/');
     $reqActor = function_exists('ap_request_actor_get') ? ap_request_actor_get() : null;
@@ -394,20 +415,30 @@ function ap_request_target_path_candidates(): array
     return $paths;
 }
 
-function ap_signing_string_for_path(string $headersList, string $requestPath): ?string
+/**
+ * @param array{host?:string,created?:?string,expires?:?string,header_overrides?:array<string,string>} $sigParams
+ */
+function ap_signing_string_for_path(string $headersList, string $requestPath, array $sigParams = []): ?string
 {
     $parts = [];
     $method = strtolower($_SERVER['REQUEST_METHOD'] ?? 'post');
+    $overrides = is_array($sigParams['header_overrides'] ?? null) ? $sigParams['header_overrides'] : [];
     foreach (preg_split('/\s+/', trim($headersList)) ?: [] as $h) {
         $h = strtolower($h);
         if ($h === '(request-target)') {
             $parts[] = '(request-target): ' . $method . ' ' . $requestPath;
             continue;
         }
-        if ($h === 'digest') {
+        if ($h === '(created)') {
+            $val = (string) ($sigParams['created'] ?? '');
+        } elseif ($h === '(expires)') {
+            $val = (string) ($sigParams['expires'] ?? '');
+        } elseif (isset($overrides[$h]) && is_string($overrides[$h])) {
+            $val = $overrides[$h];
+        } elseif ($h === 'digest') {
             $val = ap_header('Digest');
         } elseif ($h === 'host') {
-            $val = $_SERVER['HTTP_HOST'] ?? 'mkultra.monster';
+            $val = (string) ($sigParams['host'] ?? ($_SERVER['HTTP_HOST'] ?? 'mkultra.monster'));
         } else {
             $val = ap_header($h);
         }
@@ -426,22 +457,803 @@ function ap_signing_string(string $headersList, string $body): ?string
 }
 
 /**
- * Verify HTTP Signature trying each plausible request-target path.
+ * Host values that may have been signed. Caddy/Cloudflare can present
+ * `host:443` or an internal host while Mastodon signed the public name.
+ *
+ * @return list<string>
+ */
+function ap_inbox_host_candidates(): array
+{
+    $out = [];
+    $add = static function (string $raw) use (&$out): void {
+        $raw = trim(explode(',', $raw)[0] ?? '');
+        if ($raw === '' || str_contains($raw, ' ') || str_contains($raw, '/')) {
+            return;
+        }
+        $forms = [$raw];
+        if (!str_starts_with($raw, '[')) {
+            $colon = strrpos($raw, ':');
+            $stripped = $raw;
+            if ($colon !== false && ($raw !== '' )) {
+                $port = substr($raw, $colon + 1);
+                if ($port === '443' || $port === '80') {
+                    $stripped = substr($raw, 0, $colon);
+                }
+            }
+            $forms[] = $stripped;
+            $forms[] = strtolower($raw);
+            $forms[] = strtolower($stripped);
+        }
+        foreach ($forms as $form) {
+            if ($form !== '' && !in_array($form, $out, true)) {
+                $out[] = $form;
+            }
+        }
+    };
+    $add(ap_header('Host'));
+    $add((string) ($_SERVER['HTTP_HOST'] ?? ''));
+    $add((string) ($_SERVER['HTTP_X_FORWARDED_HOST'] ?? ''));
+    $add((string) ($_SERVER['SERVER_NAME'] ?? ''));
+    if ($out === []) {
+        $out[] = 'mkultra.monster';
+    }
+    return $out;
+}
+
+/**
+ * Verify draft-cavage HTTP signatures (rsa-sha256 and hs2019).
+ * Tries each plausible request-target and each host the proxy may have rewritten.
+ *
+ * @param array{created?:?string,expires?:?string} $sigParams
  * @return string|null matched path on success
  */
-function ap_verify_http_signature(string $headersList, string $body, string $sigRaw, $pem): ?string
+function ap_verify_http_signature(string $headersList, string $body, string $sigRaw, $pem, array $sigParams = []): ?string
 {
+    if ($sigRaw === '' || $pem === null || $pem === false) {
+        return null;
+    }
+    $hosts = ap_inbox_host_candidates();
+    $contentType = ap_header('Content-Type');
+    $strippedType = trim((string) (preg_replace('/\s*;\s*charset\s*=\s*[^;]+/i', '', $contentType) ?? $contentType));
     foreach (ap_request_target_path_candidates() as $path) {
-        $signingString = ap_signing_string_for_path($headersList, $path);
-        if ($signingString === null) {
-            continue;
-        }
-        $ok = openssl_verify($signingString, $sigRaw, $pem, OPENSSL_ALGO_SHA256);
-        if ($ok === 1) {
-            return $path;
+        foreach ($hosts as $host) {
+            $params = $sigParams;
+            $params['host'] = $host;
+            $signingString = ap_signing_string_for_path($headersList, $path, $params);
+            if ($signingString !== null && openssl_verify($signingString, $sigRaw, $pem, OPENSSL_ALGO_SHA256) === 1) {
+                return $path;
+            }
+            if ($strippedType !== '' && $strippedType !== $contentType && str_contains($headersList, 'content-type')) {
+                $params['header_overrides'] = ['content-type' => $strippedType];
+                $signingString = ap_signing_string_for_path($headersList, $path, $params);
+                if ($signingString !== null && openssl_verify($signingString, $sigRaw, $pem, OPENSSL_ALGO_SHA256) === 1) {
+                    return $path;
+                }
+            }
         }
     }
     return null;
+}
+
+/**
+ * Verified signature keeps the posted activity and does not fetch.
+ * A failed signature is replaced only by an origin document (or a Delete
+ * whose object is gone). Otherwise null, and the verify error globals say why.
+ *
+ * @return array{activity:array<string,mixed>,sig:array{keyId:string,algorithm:?string,headers:string,signature:string},via:string,path:string}|null
+ */
+function ap_inbox_select(string $raw): ?array
+{
+    $verified = ap_inbox_try_verify($raw);
+    if ($verified !== null) {
+        $json = json_decode($raw, true);
+        if (!is_array($json)) {
+            return ap_inbox_verify_fail('Invalid signature');
+        }
+        return [
+            'activity' => $json,
+            'sig' => $verified['sig'],
+            'via' => 'signature',
+            'path' => $verified['path'],
+        ];
+    }
+    if ((int) ($GLOBALS['ap_inbox_verify_code'] ?? 401) === 403) {
+        return null;
+    }
+    $verifyError = (string) ($GLOBALS['ap_inbox_verify_error'] ?? 'Invalid signature');
+    ap_log('verify_fail msg=' . preg_replace('/[^A-Za-z0-9 ._-]+/', '_', $verifyError));
+    $posted = json_decode($raw, true);
+    $recovered = ap_inbox_recover_unverified(is_array($posted) ? $posted : null);
+    if ($recovered === null) {
+        return null;
+    }
+    return [
+        'activity' => $recovered,
+        'sig' => [
+            'keyId' => ap_as_id($recovered['actor'] ?? null) ?? '',
+            'algorithm' => null,
+            'headers' => '',
+            'signature' => '',
+        ],
+        'via' => 'origin',
+        'path' => '',
+    ];
+}
+
+function ap_inbox_verify_fail(string $message, int $code = 401): null
+{
+    $GLOBALS['ap_inbox_verify_error'] = $message;
+    $GLOBALS['ap_inbox_verify_code'] = $code;
+    return null;
+}
+
+/**
+ * Draft-cavage or RFC 9421 verification of the posted body.
+ * Does not exit. On failure the caller may recover from the origin.
+ *
+ * @return array{sig:array{keyId:string,algorithm:?string,headers:string,signature:string,created:?string,expires:?string},path:string}|null
+ */
+function ap_inbox_try_verify(string $raw): ?array
+{
+    $GLOBALS['ap_inbox_verify_error'] = 'Invalid signature';
+    $GLOBALS['ap_inbox_verify_code'] = 401;
+    $digestHdr = ap_header('Digest');
+    $contentDigest = ap_header('Content-Digest');
+    $dateHdr = ap_header('Date');
+    $sigHdr = ap_header('Signature');
+    $sigInput = ap_header('Signature-Input');
+
+    if ($sigInput !== '') {
+        return ap_inbox_try_verify_rfc9421($raw, $sigHdr, $sigInput, $contentDigest, $dateHdr);
+    }
+    if ($digestHdr === '' || $dateHdr === '' || $sigHdr === '') {
+        return ap_inbox_verify_fail('Missing Digest, Date, or Signature');
+    }
+    if (!ap_valid_date($dateHdr)) {
+        return ap_inbox_verify_fail('Date out of range');
+    }
+    if (!ap_valid_digest($digestHdr, $raw)) {
+        return ap_inbox_verify_fail('Digest mismatch');
+    }
+    $sig = ap_parse_signature($sigHdr);
+    if ($sig === null) {
+        ap_log('signature_parse_fail len=' . strlen($sigHdr) . ' sample=' . ap_short($sigHdr, 160));
+        return ap_inbox_verify_fail('Malformed Signature');
+    }
+    $algo = strtolower((string) ($sig['algorithm'] ?? 'hs2019'));
+    if ($algo === '') {
+        $algo = 'hs2019';
+    }
+    if ($algo !== 'rsa-sha256' && $algo !== 'hs2019') {
+        return ap_inbox_verify_fail('Unsupported signature algorithm');
+    }
+    if ($algo === 'hs2019' && !ap_inbox_hs2019_time_ok($sig)) {
+        return ap_inbox_verify_fail('Signature created/expires out of range');
+    }
+    $keyHostEarly = parse_url($sig['keyId'], PHP_URL_HOST);
+    if (is_string($keyHostEarly) && ap_is_blocked_host(strtolower($keyHostEarly))) {
+        ap_log(sprintf('blocked_reject_keyhost ip=%s keyId=%s', ap_client_ip(), ap_short($sig['keyId'])));
+        return ap_inbox_verify_fail('Instance blocked', 403);
+    }
+    $pem = ap_fetch_actor_pubkey($sig['keyId']);
+    $sigRaw = base64_decode($sig['signature'], true) ?: '';
+    $okPath = ($pem !== null) ? ap_verify_http_signature($sig['headers'], $raw, $sigRaw, $pem, $sig) : null;
+    if ($okPath === null && $pem !== null) {
+        ap_inbox_forget_actor_pubkey($sig['keyId']);
+        $pem = ap_fetch_actor_pubkey($sig['keyId'], true);
+        $okPath = ($pem !== null) ? ap_verify_http_signature($sig['headers'], $raw, $sigRaw, $pem, $sig) : null;
+    }
+    if ($pem === null) {
+        return ap_inbox_verify_fail('Unable to fetch key');
+    }
+    if ($okPath === null) {
+        return ap_inbox_verify_fail('Invalid signature');
+    }
+    return ['sig' => $sig, 'path' => $okPath];
+}
+
+/**
+ * hs2019 signs (created)/(expires) instead of, or in addition to, Date.
+ * Window matches Mastodon: created may be up to an hour ahead, and an
+ * explicit expires may be up to an hour in the past.
+ *
+ * @param array{created?:?string,expires?:?string,headers?:string} $sig
+ */
+function ap_inbox_hs2019_time_ok(array $sig): bool
+{
+    $headers = strtolower((string) ($sig['headers'] ?? ''));
+    $needsCreated = str_contains($headers, '(created)');
+    $createdRaw = $sig['created'] ?? null;
+    if ($needsCreated && (!is_string($createdRaw) || !preg_match('/^[0-9]{1,12}$/', $createdRaw))) {
+        return false;
+    }
+    $now = time();
+    if (is_string($createdRaw) && $createdRaw !== '') {
+        $created = (int) $createdRaw;
+        if ($created > $now + AP_INBOX_DATE_SKEW) {
+            return false;
+        }
+        $expiresRaw = $sig['expires'] ?? null;
+        if (is_string($expiresRaw) && preg_match('/^[0-9]{1,12}$/', $expiresRaw)) {
+            if ($now > ((int) $expiresRaw) + AP_INBOX_DATE_SKEW) {
+                return false;
+            }
+        } elseif ($now > $created + AP_INBOX_DATE_SKEW) {
+            // No expires: treat created as the signed time, same skew as Date.
+            return false;
+        }
+    }
+    $needsExpires = str_contains($headers, '(expires)');
+    if ($needsExpires && (!is_string($sig['expires'] ?? null) || !preg_match('/^[0-9]{1,12}$/', (string) $sig['expires']))) {
+        return false;
+    }
+    return true;
+}
+
+/**
+ * Mastodon 4.7 retries a 401 with one RFC 9421 signature:
+ * Signature-Input covers @method, @target-uri, and content-digest.
+ *
+ * @return array{sig:array{keyId:string,algorithm:?string,headers:string,signature:string,created:?string,expires:?string},path:string}|null
+ */
+function ap_inbox_try_verify_rfc9421(string $raw, string $sigHdr, string $sigInput, string $contentDigest, string $dateHdr): ?array
+{
+    $parsed = ap_inbox_parse_signature_input($sigInput);
+    if ($parsed === null || $sigHdr === '') {
+        return ap_inbox_verify_fail('Malformed Signature');
+    }
+    $params = $parsed['params'];
+    $alg = strtolower((string) ($params['alg'] ?? 'rsa-v1_5-sha256'));
+    if (!in_array($alg, ['rsa-v1_5-sha256', 'rsa-sha256', 'hs2019'], true)) {
+        return ap_inbox_verify_fail('Unsupported signature algorithm');
+    }
+    $createdRaw = (string) ($params['created'] ?? '');
+    if ($createdRaw === '' || !preg_match('/^[0-9]{1,12}$/', $createdRaw)) {
+        return ap_inbox_verify_fail('Signature created/expires out of range');
+    }
+    $now = time();
+    $created = (int) $createdRaw;
+    if ($created > $now + AP_INBOX_DATE_SKEW) {
+        return ap_inbox_verify_fail('Signature created/expires out of range');
+    }
+    $expiresRaw = (string) ($params['expires'] ?? '');
+    if ($expiresRaw !== '' && preg_match('/^[0-9]{1,12}$/', $expiresRaw)) {
+        if ($now > ((int) $expiresRaw) + AP_INBOX_DATE_SKEW) {
+            return ap_inbox_verify_fail('Signature created/expires out of range');
+        }
+    } elseif ($now > $created + AP_INBOX_DATE_SKEW) {
+        return ap_inbox_verify_fail('Signature created/expires out of range');
+    }
+    if ($dateHdr !== '' && !ap_valid_date($dateHdr) && abs($now - $created) > AP_INBOX_DATE_SKEW) {
+        return ap_inbox_verify_fail('Date out of range');
+    }
+    $signsDigest = in_array('content-digest', $parsed['components'], true) || in_array('digest', $parsed['components'], true);
+    if ($signsDigest) {
+        $digestOk = ($contentDigest !== '' && ap_valid_content_digest($contentDigest, $raw))
+            || (ap_header('Digest') !== '' && ap_valid_digest(ap_header('Digest'), $raw));
+        if (!$digestOk) {
+            return ap_inbox_verify_fail('Digest mismatch');
+        }
+    }
+    $keyId = (string) ($params['keyid'] ?? '');
+    if ($keyId === '' || !str_starts_with($keyId, 'https://')) {
+        return ap_inbox_verify_fail('Malformed Signature');
+    }
+    $keyHost = parse_url($keyId, PHP_URL_HOST);
+    if (is_string($keyHost) && ap_is_blocked_host(strtolower($keyHost))) {
+        return ap_inbox_verify_fail('Instance blocked', 403);
+    }
+    $label = preg_quote($parsed['label'], '/');
+    if (!preg_match('/' . $label . '\s*=\s*:([A-Za-z0-9+\/=]+):/', $sigHdr, $sm)) {
+        return ap_inbox_verify_fail('Malformed Signature');
+    }
+    $sigRaw = base64_decode($sm[1], true) ?: '';
+    $pem = ap_fetch_actor_pubkey($keyId);
+    $okPath = ($pem !== null) ? ap_inbox_verify_rfc9421_base($parsed, $sigRaw, $pem, $contentDigest) : null;
+    if ($okPath === null && $pem !== null) {
+        ap_inbox_forget_actor_pubkey($keyId);
+        $pem = ap_fetch_actor_pubkey($keyId, true);
+        $okPath = ($pem !== null) ? ap_inbox_verify_rfc9421_base($parsed, $sigRaw, $pem, $contentDigest) : null;
+    }
+    if ($pem === null) {
+        return ap_inbox_verify_fail('Unable to fetch key');
+    }
+    if ($okPath === null) {
+        return ap_inbox_verify_fail('Invalid signature');
+    }
+    return [
+        'sig' => [
+            'keyId' => $keyId,
+            'algorithm' => $alg,
+            'headers' => implode(' ', $parsed['components']),
+            'signature' => $sm[1],
+            'created' => $createdRaw,
+            'expires' => isset($params['expires']) ? (string) $params['expires'] : null,
+        ],
+        'path' => $okPath,
+    ];
+}
+
+/**
+ * @return array{label:string,components:list<string>,params:array<string,string>,params_raw:string}|null
+ */
+function ap_inbox_parse_signature_input(string $header): ?array
+{
+    $header = trim($header);
+    $eq = strpos($header, '=');
+    if ($eq === false || $eq < 1) {
+        return null;
+    }
+    $label = substr($header, 0, $eq);
+    if (!preg_match('/^[A-Za-z0-9_-]+$/', $label)) {
+        return null;
+    }
+    $paramsRaw = substr($header, $eq + 1);
+    if (!preg_match('/^\(([^)]*)\)/', $paramsRaw, $list)) {
+        return null;
+    }
+    $components = [];
+    if (preg_match_all('/"([^"]+)"/', $list[1], $cm)) {
+        $components = $cm[1];
+    }
+    if ($components === []) {
+        return null;
+    }
+    $params = [];
+    if (preg_match_all('/;\s*([A-Za-z0-9_-]+)=("([^"]*)"|([^\s,;]+))/', $paramsRaw, $pm, PREG_SET_ORDER)) {
+        foreach ($pm as $p) {
+            $params[strtolower($p[1])] = ($p[3] ?? '') !== '' ? $p[3] : (string) ($p[4] ?? '');
+        }
+    }
+    return [
+        'label' => $label,
+        'components' => $components,
+        'params' => $params,
+        'params_raw' => $paramsRaw,
+    ];
+}
+
+function ap_valid_content_digest(string $header, string $body): bool
+{
+    if (!preg_match('/sha-256=:([A-Za-z0-9+\/=]+):/i', $header, $m)) {
+        return false;
+    }
+    return hash_equals(base64_encode(hash('sha256', $body, true)), $m[1]);
+}
+
+/**
+ * @param array{components:list<string>,params_raw:string} $parsed
+ */
+function ap_inbox_verify_rfc9421_base(array $parsed, string $sigRaw, $pem, string $contentDigest): ?string
+{
+    if ($sigRaw === '') {
+        return null;
+    }
+    $method = strtoupper((string) ($_SERVER['REQUEST_METHOD'] ?? 'POST'));
+    foreach (ap_inbox_host_candidates() as $host) {
+        $authority = $host;
+        foreach (ap_request_target_path_candidates() as $path) {
+            $target = 'https://' . $host . $path;
+            $lines = [];
+            $ok = true;
+            foreach ($parsed['components'] as $component) {
+                $name = strtolower($component);
+                if ($name === '@method') {
+                    $lines[] = '"@method": ' . $method;
+                } elseif ($name === '@target-uri') {
+                    $lines[] = '"@target-uri": ' . $target;
+                } elseif ($name === '@authority') {
+                    $lines[] = '"@authority": ' . $authority;
+                } elseif ($name === '@path' || $name === '@request-target') {
+                    $lines[] = '"' . $name . '": ' . $path;
+                } elseif ($name === 'content-digest') {
+                    if ($contentDigest === '') {
+                        $ok = false;
+                        break;
+                    }
+                    $lines[] = '"content-digest": ' . $contentDigest;
+                } else {
+                    $val = $name === 'host' ? $host : ap_header($name);
+                    if ($val === '') {
+                        $ok = false;
+                        break;
+                    }
+                    $lines[] = '"' . $name . '": ' . $val;
+                }
+            }
+            if (!$ok) {
+                continue;
+            }
+            $lines[] = '"@signature-params": ' . $parsed['params_raw'];
+            $base = implode("\n", $lines);
+            if (openssl_verify($base, $sigRaw, $pem, OPENSSL_ALGO_SHA256) === 1) {
+                return $path;
+            }
+        }
+    }
+    return null;
+}
+
+/**
+ * URLs an unverified activity may be re-fetched from. Only https URLs on the
+ * claimed actor host. Delete prefers the object, which is what disappears.
+ *
+ * @param array<string,mixed>|null $posted
+ * @return list<string>
+ */
+function ap_inbox_origin_urls(?array $posted): array
+{
+    if ($posted === null) {
+        return [];
+    }
+    $claimed = ap_inbox_https_id($posted['actor'] ?? null);
+    if ($claimed === null) {
+        return [];
+    }
+    $actorHost = strtolower((string) parse_url($claimed, PHP_URL_HOST));
+    if ($actorHost === '') {
+        return [];
+    }
+    $type = is_string($posted['type'] ?? null) ? $posted['type'] : '';
+    $objectId = ap_inbox_https_id($posted['object'] ?? null);
+    $activityId = ap_inbox_https_id($posted['id'] ?? null);
+    $ordered = strcasecmp($type, 'Delete') === 0 ? [$objectId, $activityId] : [$activityId, $objectId];
+    $urls = [];
+    foreach ($ordered as $id) {
+        $fetch = ap_inbox_fetch_url($id);
+        if ($fetch === null || !ap_inbox_same_host($fetch, $actorHost) || in_array($fetch, $urls, true)) {
+            continue;
+        }
+        $urls[] = $fetch;
+    }
+    return $urls;
+}
+
+/**
+ * Choose the activity to process after signature verification failed.
+ * $fetches is keyed by the normalized fetch URL.
+ *
+ * @param array<string,mixed>|null $posted
+ * @param array<string,array{status?:int,doc?:mixed}> $fetches
+ * @return array<string,mixed>|null
+ */
+function ap_inbox_origin_decision(?array $posted, array $fetches): ?array
+{
+    if ($posted === null) {
+        return null;
+    }
+    $claimed = ap_inbox_https_id($posted['actor'] ?? null);
+    if ($claimed === null) {
+        return null;
+    }
+    $actorHost = strtolower((string) parse_url($claimed, PHP_URL_HOST));
+    if ($actorHost === '') {
+        return null;
+    }
+    $type = is_string($posted['type'] ?? null) ? $posted['type'] : '';
+    $objectId = ap_inbox_https_id($posted['object'] ?? null);
+    $activityId = ap_inbox_https_id($posted['id'] ?? null);
+    $objectFetch = ap_inbox_fetch_url($objectId);
+    $sawGoneObject = false;
+    foreach (ap_inbox_origin_urls($posted) as $url) {
+        $res = $fetches[$url] ?? null;
+        if (!is_array($res)) {
+            continue;
+        }
+        $status = (int) ($res['status'] ?? 0);
+        $doc = is_array($res['doc'] ?? null) ? $res['doc'] : null;
+        $objectGone = strcasecmp($type, 'Delete') === 0
+            && $objectFetch !== null
+            && ap_inbox_same_url($url, $objectFetch)
+            && ($status === 404 || $status === 410);
+        if ($objectGone) {
+            $sawGoneObject = true;
+            continue;
+        }
+        if ($doc === null || !ap_inbox_origin_doc_matches($doc, $claimed, $actorHost)) {
+            continue;
+        }
+        if (strcasecmp($type, 'Delete') === 0) {
+            $docType = is_string($doc['type'] ?? null) ? $doc['type'] : '';
+            if (strcasecmp($docType, 'Delete') !== 0) {
+                return null;
+            }
+        }
+        $activity = ap_inbox_activity_from_fetched($doc, $claimed, $type, $activityId, $actorHost);
+        if ($activity !== null) {
+            return $activity;
+        }
+    }
+    if ($sawGoneObject && $objectId !== null) {
+        $activity = [
+            '@context' => 'https://www.w3.org/ns/activitystreams',
+            'type' => 'Delete',
+            'actor' => $claimed,
+            'object' => $objectId,
+        ];
+        if ($activityId !== null && ap_inbox_same_host($activityId, $actorHost)) {
+            $activity['id'] = $activityId;
+        }
+        return $activity;
+    }
+    return null;
+}
+
+/**
+ * Fetch-and-decide for an unverified inbox body. Does not trust the body.
+ *
+ * @param array<string,mixed>|null $posted
+ * @return array<string,mixed>|null
+ */
+function ap_inbox_recover_unverified(?array $posted): ?array
+{
+    if ($posted === null) {
+        return null;
+    }
+    $claimed = ap_inbox_https_id($posted['actor'] ?? null);
+    if ($claimed === null) {
+        return null;
+    }
+    $actorHost = strtolower((string) parse_url($claimed, PHP_URL_HOST));
+    if ($actorHost === '' || (function_exists('ap_host_resolves_public') && !ap_host_resolves_public($actorHost))) {
+        return null;
+    }
+    try {
+        if (function_exists('ap_is_blocked_host') && ap_is_blocked_host($actorHost)) {
+            return null;
+        }
+    } catch (Throwable $e) {
+        return null;
+    }
+    $urls = ap_inbox_origin_urls($posted);
+    if ($urls === []) {
+        return null;
+    }
+    $fetches = [];
+    foreach ($urls as $url) {
+        $fetches[$url] = ap_inbox_origin_fetch($url);
+    }
+    return ap_inbox_origin_decision($posted, $fetches);
+}
+
+/**
+ * @param array<string,mixed> $doc
+ * @return array<string,mixed>|null
+ */
+function ap_inbox_activity_from_fetched(array $doc, string $claimed, string $postedType, ?string $activityId, string $actorHost): ?array
+{
+    $actor = ap_inbox_https_id($doc['actor'] ?? null);
+    if ($actor !== null) {
+        return $doc;
+    }
+    $wrap = '';
+    if (strcasecmp($postedType, 'Create') === 0 || strcasecmp($postedType, 'Update') === 0) {
+        $wrap = strcasecmp($postedType, 'Update') === 0 ? 'Update' : 'Create';
+    }
+    if ($wrap === '') {
+        return null;
+    }
+    $activity = [
+        '@context' => 'https://www.w3.org/ns/activitystreams',
+        'type' => $wrap,
+        'actor' => $claimed,
+        'object' => $doc,
+    ];
+    if ($activityId !== null && ap_inbox_same_host($activityId, $actorHost) && ap_inbox_fetch_url($activityId) !== ap_inbox_fetch_url(ap_inbox_https_id($doc['id'] ?? null))) {
+        $activity['id'] = $activityId;
+    }
+    return $activity;
+}
+
+/**
+ * @param array<string,mixed> $doc
+ */
+function ap_inbox_origin_doc_matches(array $doc, string $claimed, string $actorHost): bool
+{
+    $claimedNorm = ap_inbox_norm_id($claimed);
+    $ids = [];
+    $actor = ap_inbox_https_id($doc['actor'] ?? null);
+    $attr = ap_inbox_https_id($doc['attributedTo'] ?? null);
+    if ($actor !== null) {
+        $ids[] = $actor;
+    }
+    if ($attr !== null) {
+        $ids[] = $attr;
+    }
+    if ($ids === []) {
+        return false;
+    }
+    foreach ($ids as $id) {
+        if (ap_inbox_norm_id($id) !== $claimedNorm || !ap_inbox_same_host($id, $actorHost)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+function ap_inbox_https_id($value): ?string
+{
+    $id = ap_as_id($value);
+    if (!is_string($id) || !str_starts_with($id, 'https://')) {
+        return null;
+    }
+    return $id;
+}
+
+function ap_inbox_fetch_url(?string $id): ?string
+{
+    if ($id === null || !str_starts_with($id, 'https://')) {
+        return null;
+    }
+    $parts = parse_url($id);
+    if (!is_array($parts) || ($parts['scheme'] ?? '') !== 'https' || isset($parts['user']) || isset($parts['pass'])) {
+        return null;
+    }
+    $host = strtolower((string) ($parts['host'] ?? ''));
+    if ($host === '' || str_contains($host, ':')) {
+        return null;
+    }
+    $path = (string) ($parts['path'] ?? '/');
+    if ($path === '') {
+        $path = '/';
+    }
+    $url = 'https://' . $host . $path;
+    if (!empty($parts['query'])) {
+        $url .= '?' . $parts['query'];
+    }
+    return $url;
+}
+
+function ap_inbox_same_host(string $url, string $host): bool
+{
+    $urlHost = parse_url($url, PHP_URL_HOST);
+    return is_string($urlHost) && strtolower($urlHost) === strtolower($host);
+}
+
+function ap_inbox_same_url(string $a, string $b): bool
+{
+    return ap_inbox_norm_id($a) === ap_inbox_norm_id($b);
+}
+
+function ap_inbox_norm_id(string $id): string
+{
+    $parts = parse_url(trim($id));
+    if (!is_array($parts)) {
+        return rtrim(strtolower($id), '/');
+    }
+    $host = strtolower((string) ($parts['host'] ?? ''));
+    $path = rtrim((string) ($parts['path'] ?? ''), '/');
+    return 'https://' . $host . $path;
+}
+
+/**
+ * Signed GET of an origin document, deduped by URL and bounded by the
+ * existing remote-fetch circuit breaker. A test may set
+ * $GLOBALS['ap_inbox_origin_fetch'] to a callable.
+ *
+ * @return array{status:int,doc:?array}
+ */
+function ap_inbox_origin_fetch(string $url): array
+{
+    $url = ap_inbox_fetch_url($url) ?? '';
+    if ($url === '') {
+        return ['status' => 0, 'doc' => null];
+    }
+    if (!isset($GLOBALS['ap_inbox_origin_mem']) || !is_array($GLOBALS['ap_inbox_origin_mem'])) {
+        $GLOBALS['ap_inbox_origin_mem'] = [];
+    }
+    if (isset($GLOBALS['ap_inbox_origin_mem'][$url]) && is_array($GLOBALS['ap_inbox_origin_mem'][$url])) {
+        return $GLOBALS['ap_inbox_origin_mem'][$url];
+    }
+    $cached = ap_inbox_origin_cache_read($url);
+    if ($cached !== null) {
+        $GLOBALS['ap_inbox_origin_mem'][$url] = $cached;
+        return $cached;
+    }
+    $hook = $GLOBALS['ap_inbox_origin_fetch'] ?? null;
+    if (is_callable($hook)) {
+        $res = $hook($url);
+        $normalized = ap_inbox_origin_normalize_fetch(is_array($res) ? $res : []);
+    } else {
+        $normalized = ap_inbox_origin_fetch_live($url);
+    }
+    if (in_array($normalized['status'], [200, 201, 202, 404, 410], true)) {
+        ap_inbox_origin_cache_write($url, $normalized);
+    }
+    $GLOBALS['ap_inbox_origin_mem'][$url] = $normalized;
+    return $normalized;
+}
+
+/**
+ * @param array<string,mixed> $res
+ * @return array{status:int,doc:?array}
+ */
+function ap_inbox_origin_normalize_fetch(array $res): array
+{
+    $status = (int) ($res['status'] ?? 0);
+    $doc = $res['doc'] ?? null;
+    if (!is_array($doc) && is_string($res['body'] ?? null)) {
+        $decoded = json_decode((string) $res['body'], true);
+        $doc = is_array($decoded) ? $decoded : null;
+    }
+    if (!is_array($doc)) {
+        $doc = null;
+    }
+    return ['status' => $status, 'doc' => $doc];
+}
+
+/**
+ * @return array{status:int,doc:?array}
+ */
+function ap_inbox_origin_fetch_live(string $url): array
+{
+    $host = strtolower((string) parse_url($url, PHP_URL_HOST));
+    if ($host === '' || !ap_host_resolves_public($host)) {
+        return ['status' => 0, 'doc' => null];
+    }
+    if (ap_remote_fetch_circuit_open($host) > time()) {
+        return ['status' => 0, 'doc' => null];
+    }
+    $res = ap_signed_get_ex($url);
+    $status = (int) ($res['status'] ?? 0);
+    $body = is_string($res['body'] ?? null) ? $res['body'] : null;
+    $doc = null;
+    if (is_string($body) && $body !== '') {
+        $decoded = json_decode($body, true);
+        if (is_array($decoded) && (isset($decoded['type']) || isset($decoded['id']) || isset($decoded['actor']))) {
+            $doc = $decoded;
+        }
+    }
+    if (($status >= 200 && $status < 300 && $doc !== null) || $status === 404 || $status === 410) {
+        ap_remote_fetch_circuit_success($host);
+    } else {
+        ap_remote_fetch_circuit_failure($host);
+    }
+    return ['status' => $status, 'doc' => $doc];
+}
+
+function ap_inbox_origin_cache_path(string $url): string
+{
+    $dir = $GLOBALS['ap_inbox_origin_cache_dir'] ?? (sys_get_temp_dir() . '/ap-inbox-origin');
+    if (!is_string($dir) || $dir === '') {
+        $dir = sys_get_temp_dir() . '/ap-inbox-origin';
+    }
+    if (!is_dir($dir)) {
+        @mkdir($dir, 0750, true);
+    }
+    return rtrim($dir, '/') . '/' . hash('sha256', $url) . '.json';
+}
+
+/**
+ * @return array{status:int,doc:?array}|null
+ */
+function ap_inbox_origin_cache_read(string $url): ?array
+{
+    $path = ap_inbox_origin_cache_path($url);
+    if (!is_file($path) || (time() - (int) filemtime($path)) > 120) {
+        return null;
+    }
+    $raw = @file_get_contents($path);
+    $data = is_string($raw) ? json_decode($raw, true) : null;
+    if (!is_array($data)) {
+        return null;
+    }
+    return ap_inbox_origin_normalize_fetch($data);
+}
+
+/**
+ * @param array{status:int,doc:?array} $res
+ */
+function ap_inbox_origin_cache_write(string $url, array $res): void
+{
+    $payload = json_encode([
+        'status' => $res['status'],
+        'doc' => $res['doc'],
+        'at' => time(),
+    ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+    if (is_string($payload)) {
+        @file_put_contents(ap_inbox_origin_cache_path($url), $payload, LOCK_EX);
+    }
 }
 
 function ap_rate_limit(string $ip, int $max = AP_INBOX_RATE_MAX): bool
@@ -831,9 +1643,28 @@ function ap_key_neg_cache_set(string $keyId, string $reason, int $httpStatus = 0
     }
 }
 
-function ap_fetch_actor_pubkey(string $keyId): ?string
+function ap_inbox_forget_actor_pubkey(string $keyId): void
 {
     $keyId = trim($keyId);
+    if ($keyId === '') {
+        return;
+    }
+    $cacheFile = AP_INBOX_KEY_CACHE_DIR . '/' . hash('sha256', $keyId) . '.pem';
+    if (is_file($cacheFile)) {
+        @unlink($cacheFile);
+    }
+}
+
+function ap_fetch_actor_pubkey(string $keyId, bool $bypassCache = false): ?string
+{
+    $keyId = trim($keyId);
+    $override = $GLOBALS['ap_inbox_pubkey_override'] ?? null;
+    if (is_callable($override)) {
+        $injected = $override($keyId);
+        if (is_string($injected) && str_contains($injected, 'BEGIN')) {
+            return $injected;
+        }
+    }
     if ($keyId === '' || strlen($keyId) > 500) {
         return null;
     }
@@ -850,15 +1681,16 @@ function ap_fetch_actor_pubkey(string $keyId): ?string
         @mkdir(AP_INBOX_KEY_CACHE_DIR, 0750, true);
     }
     $cacheFile = AP_INBOX_KEY_CACHE_DIR . '/' . hash('sha256', $keyId) . '.pem';
-    if (is_file($cacheFile) && (time() - filemtime($cacheFile) < AP_INBOX_KEY_CACHE_TTL)) {
+    if (!$bypassCache && is_file($cacheFile) && (time() - filemtime($cacheFile) < AP_INBOX_KEY_CACHE_TTL)) {
         $cached = file_get_contents($cacheFile);
         if (is_string($cached) && str_contains($cached, 'BEGIN')) {
             return $cached;
         }
     }
 
-    // Negative cache: skip hammering Threads/Meta for dead / non-federated actors
-    $neg = ap_key_neg_cache_get($keyId);
+    // Negative cache: skip hammering Threads/Meta for dead / non-federated actors.
+    // A verify failure bypasses this so a just-rotated key can be fetched once.
+    $neg = $bypassCache ? null : ap_key_neg_cache_get($keyId);
     if ($neg !== null) {
         ap_log(
             'key_fetch_neg_hit keyId=' . ap_short($keyId)

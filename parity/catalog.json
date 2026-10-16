@@ -96,6 +96,12 @@
       "php": {"script": "parity/php/profile-guest-actions.php", "args": []}
     },
     {
+      "id": "inbox-origin",
+      "area": "ActivityPub inbox",
+      "summary": "Unverified inbox fallback. Same-host fetch URLs, origin actor match, spoof rejection, and Delete 404/410 versus a live object. Pure decision; no network and no database.",
+      "php": {"script": "parity/php/inbox-origin.php", "args": []}
+    },
+    {
       "id": "wafrn-crosspost",
       "area": "Timelines",
       "summary": "Wafrn ActivityPub/Bluesky post identity, alsoKnownAs DID extraction, text ask cards, linkage dedupe, and the 10 minute text fallback. Fixture api/fixtures/wafrn-crosspost.json. Both sides call the pure planner and do not open a database.",
