@@ -76,6 +76,7 @@ php_tests=(
   api/bin/phyrian-clans-smoke.php
   api/bin/phyrian-clans-migration-smoke.php
   api/bin/pin-federation-behavior-smoke.php
+  api/bin/public-doc-cache-smoke.php
   api/bin/pluraldawn-decode-smoke.php
   api/bin/post-single-overflow-smoke.php
   api/bin/privacy-moderation-smoke.php

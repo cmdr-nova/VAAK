@@ -6,6 +6,7 @@
 declare(strict_types=1);
 
 require_once __DIR__ . '/ap-redis.php';
+require_once __DIR__ . '/ap-public-doc.php';
 require_once __DIR__ . '/ap-recommendations.php';
 require_once __DIR__ . '/ap-follow-state.php';
 require_once __DIR__ . '/ap-wafrn-crosspost.php';
@@ -130,6 +131,45 @@ function ap_local_avatar_url(?string $iconUrl = null): string
         : 'https://mkultra.monster/img/avatar/local-default.webp';
 }
 
+function ap_db_postgres_persistent_enabled(): bool
+{
+    $raw = getenv('AP_DB_PERSISTENT');
+    if ($raw === false || trim((string) $raw) === '') {
+        return true;
+    }
+    return !in_array(strtolower(trim((string) $raw)), ['0', 'false', 'off', 'no'], true);
+}
+
+function ap_db_postgres_connect(string $dsn, ?string $user, ?string $password, bool $persistent): PDO
+{
+    return new PDO($dsn, $user, $password, [
+        PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+        PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+        PDO::ATTR_EMULATE_PREPARES => false,
+        PDO::ATTR_PERSISTENT => $persistent,
+    ]);
+}
+
+/**
+ * Make a reused PostgreSQL session safe for this request.
+ * SET client_min_messages hides the warning from ROLLBACK when no
+ * transaction is open. An aborted transaction rejects that SET, so the
+ * catch path rolls back first. DISCARD ALL then drops prepared statements,
+ * advisory locks, and any previous timeout.
+ */
+function ap_db_postgres_reset_session(PDO $pdo): void
+{
+    try {
+        $pdo->exec("SET client_min_messages TO error");
+        $pdo->exec('ROLLBACK');
+    } catch (Throwable $e) {
+        $pdo->exec('ROLLBACK');
+    }
+    $pdo->exec('DISCARD ALL');
+    $pdo->exec("SET lock_timeout = '3s'");
+    $pdo->exec("SET statement_timeout = '30s'");
+}
+
 function ap_db(): PDO
 {
     static $pdo = null;
@@ -143,17 +183,26 @@ function ap_db(): PDO
         }
         $user = getenv('AP_DB_USER');
         $password = getenv('AP_DB_PASSWORD');
-        // Persistent connections are intentionally not used. A reused
-        // PostgreSQL session can keep an aborted transaction, a changed
-        // statement_timeout, or a prepared-statement name after a request
-        // dies. Schema probes are cached instead (see ap_schema_snapshot).
-        $pdo = new PDO($postgresDsn, $user !== false && $user !== '' ? $user : null, $password !== false && $password !== '' ? $password : null, [
-            PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
-            PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
-            PDO::ATTR_EMULATE_PREPARES => false,
-        ]);
-        $pdo->exec("SET lock_timeout = '3s'");
-        $pdo->exec("SET statement_timeout = '30s'");
+        $user = $user !== false && $user !== '' ? $user : null;
+        $password = $password !== false && $password !== '' ? $password : null;
+        // Reuse the PostgreSQL backend across FPM requests. Each request
+        // rolls back a leftover transaction, DISCARD ALL drops prepared
+        // names, timeouts, and advisory locks, then restores the timeouts.
+        // AP_DB_PERSISTENT=0 opens a fresh connection. SQLite stays
+        // non-persistent. Schema probes stay cached (ap_schema_snapshot).
+        $persistent = ap_db_postgres_persistent_enabled();
+        try {
+            $pdo = ap_db_postgres_connect($postgresDsn, $user, $password, $persistent);
+            ap_db_postgres_reset_session($pdo);
+        } catch (Throwable $e) {
+            if (!$persistent) {
+                throw $e;
+            }
+            error_log('[ap-db] persistent session reset failed, opening a fresh connection');
+            $pdo = ap_db_postgres_connect($postgresDsn, $user, $password, false);
+            $pdo->exec("SET lock_timeout = '3s'");
+            $pdo->exec("SET statement_timeout = '30s'");
+        }
         ap_db_migrate_postgres($pdo);
         return $pdo;
     }
@@ -3842,6 +3891,9 @@ function ap_profile_save_unlocked(array $fields, string $actorKey = 'cmdr_nova')
     }
     // Export only after invalidating the old profile snapshot.
     ap_profile_export_public_cache($actorKey);
+    if (function_exists('ap_public_doc_invalidate_actor')) {
+        ap_public_doc_invalidate_actor($actorKey);
+    }
 
     return ['ok' => true];
 }
@@ -4167,6 +4219,9 @@ function ap_profile_reverify_fields(string $actorKey = 'cmdr_nova'): array
         return ['ok' => false, 'verified' => 0, 'checked' => $checked, 'error' => $e->getMessage()];
     }
     ap_profile_export_public_cache($actorKey);
+    if (function_exists('ap_public_doc_invalidate_actor')) {
+        ap_public_doc_invalidate_actor($actorKey);
+    }
     return ['ok' => true, 'verified' => $verified, 'checked' => $checked];
 }
 
@@ -13818,6 +13873,10 @@ function ap_masto_status_pin(int $localId): array
         return ['ok' => false, 'error' => 'Could not pin'];
     }
     ap_masto_pin_federate($row, true);
+    if (function_exists('ap_public_doc_invalidate_featured')
+        && preg_match('#^https://mkultra\.monster/users/([A-Za-z0-9_]+)/notes/#', $noteId, $pinActor)) {
+        ap_public_doc_invalidate_featured($pinActor[1]);
+    }
     return ['ok' => true];
 }
 
@@ -13833,7 +13892,14 @@ function ap_masto_status_unpin(int $localId): array
     $row = ap_masto_status_by_local_id($localId);
     $st = ap_db()->prepare('DELETE FROM masto_pins WHERE status_local_id = ? AND owner_user_id = ?');
     $st->execute([$localId, $ownerUserId]);
-    if ($st->rowCount() > 0 && is_array($row)) ap_masto_pin_federate($row, false);
+    if ($st->rowCount() > 0 && is_array($row)) {
+        ap_masto_pin_federate($row, false);
+        $unpinNote = (string) ($row['note_id'] ?? '');
+        if (function_exists('ap_public_doc_invalidate_featured')
+            && preg_match('#^https://mkultra\.monster/users/([A-Za-z0-9_]+)/notes/#', $unpinNote, $unpinActor)) {
+            ap_public_doc_invalidate_featured($unpinActor[1]);
+        }
+    }
     return ['ok' => true];
 }
 
