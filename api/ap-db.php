@@ -7595,7 +7595,9 @@ function ap_outbox_profile_reply_predicate(bool $replies): string
 function ap_outbox_posts_list_page(string $actorKey, int $limit = 40, int $offset = 0): array
 {
     $actorKey = strtolower(trim($actorKey));
-    $limit = max(1, min(200, $limit));
+    // The public HTML Posts tab loads a prefix and slices the merged page.
+    // A 200-row cap made every page after that prefix empty.
+    $limit = max(1, min(5000, $limit));
     $offset = max(0, $offset);
     if ($actorKey === '') {
         return [];
@@ -7800,6 +7802,7 @@ function ap_outbox_drop_profile_note_caches(array $note): void
         ap_redis_delete(
             'vaak:profile:outbox-count:v2:' . $storedKey,
             'vaak:profile:outbox-count:v1:' . $storedKey,
+            'vaak:profile:outbox-shared-count:v1:' . $storedKey,
             'vaak:profile:reply-count:v2:' . $storedKey,
             'vaak:profile:media-count:v2:' . $storedKey,
             'vaak:profile:media-count:v1:' . $storedKey
@@ -7812,6 +7815,44 @@ function ap_outbox_drop_profile_note_caches(array $note): void
     if (function_exists('ap_public_doc_invalidate_actor')) {
         ap_public_doc_invalidate_actor($storedKey);
     }
+}
+
+/**
+ * ActivityPub outbox and RSS/Atom. Public and unlisted notes only.
+ * NULL visibility counts as public. Private, local, and direct notes stay out,
+ * and LIMIT applies after that predicate so they cannot hide a public note.
+ *
+ * @return list<array<string,mixed>>
+ */
+function ap_outbox_shared_list_page(string $actorKey, int $limit = 50, int $offset = 0): array
+{
+    $actorKey = strtolower(trim($actorKey));
+    $limit = max(1, min(200, $limit));
+    $offset = max(0, $offset);
+    if ($actorKey === '') {
+        return [];
+    }
+    $prefix = 'https://mkultra.monster/users/' . rawurlencode($actorKey) . '/';
+    try {
+        $st = ap_db()->prepare(
+            "SELECT * FROM outbox_notes
+             WHERE id LIKE ? AND COALESCE(visibility, 'public') IN ('public', 'unlisted')
+             ORDER BY published DESC LIMIT ? OFFSET ?"
+        );
+        $st->execute([$prefix . '%', $limit, $offset]);
+        return $st->fetchAll() ?: [];
+    } catch (Throwable $e) {
+        return [];
+    }
+}
+
+function ap_outbox_shared_count(string $actorKey): int
+{
+    return ap_outbox_cached_count(
+        $actorKey,
+        'vaak:profile:outbox-shared-count:v1:',
+        "SELECT COUNT(*) FROM outbox_notes WHERE id LIKE ? AND COALESCE(visibility, 'public') IN ('public', 'unlisted')"
+    );
 }
 
 /**

@@ -4,8 +4,12 @@ declare(strict_types=1);
 
 function ap_feed_public_rows(string $actorKey, int $limit = 40): array
 {
+    $limit = max(1, min($limit, 100));
+    if (function_exists('ap_outbox_shared_list_page')) {
+        return ap_outbox_shared_list_page($actorKey, $limit, 0);
+    }
     $rows = [];
-    foreach (ap_outbox_list(max(1, min($limit, 100)), $actorKey) as $row) {
+    foreach (ap_outbox_list($limit, $actorKey) as $row) {
         $visibility = (string) ($row['visibility'] ?? 'public');
         if (function_exists('ap_visibility_in_ap_outbox') && !ap_visibility_in_ap_outbox($visibility)) {
             continue;

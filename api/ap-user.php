@@ -469,11 +469,19 @@ function ap_user_json(array $doc, string $accept): void
 function ap_user_serve_collection_as2(string $actorKey, string $actorId, string $col, string $accept): void
 {
     if ($col === 'outbox') {
+        $pageSize = 50;
+        $page = max(1, (int) ($_GET['page'] ?? 1));
+        $total = function_exists('ap_outbox_shared_count') ? ap_outbox_shared_count($actorKey) : 0;
+        $rows = function_exists('ap_outbox_shared_list_page')
+            ? ap_outbox_shared_list_page($actorKey, $pageSize, ($page - 1) * $pageSize)
+            : ap_outbox_list($pageSize, $actorKey);
         $items = [];
-        foreach (ap_outbox_list(50, $actorKey) as $n) {
-            $vis = (string) ($n['visibility'] ?? 'public');
-            if (function_exists('ap_visibility_in_ap_outbox') && !ap_visibility_in_ap_outbox($vis)) {
-                continue;
+        foreach ($rows as $n) {
+            if (!function_exists('ap_outbox_shared_list_page')) {
+                $vis = (string) ($n['visibility'] ?? 'public');
+                if (function_exists('ap_visibility_in_ap_outbox') && !ap_visibility_in_ap_outbox($vis)) {
+                    continue;
+                }
             }
             $decoded = json_decode((string) ($n['raw_create_json'] ?? ''), true);
             if (!is_array($decoded)) {
@@ -484,17 +492,21 @@ function ap_user_serve_collection_as2(string $actorKey, string $actorId, string 
             }
             unset($decoded['@context']);
             $items[] = $decoded;
-            if (count($items) >= 50) {
-                break;
-            }
         }
         $doc = [
             '@context' => 'https://www.w3.org/ns/activitystreams',
-            'id' => $actorId . '/outbox',
-            'type' => 'OrderedCollection',
-            'totalItems' => count($items),
+            'id' => $actorId . '/outbox' . ($page > 1 ? '?page=' . $page : ''),
+            'type' => $page > 1 ? 'OrderedCollectionPage' : 'OrderedCollection',
+            'totalItems' => $total > 0 ? $total : count($items),
             'orderedItems' => $items,
         ];
+        if ($page > 1) {
+            $doc['partOf'] = $actorId . '/outbox';
+            $doc['prev'] = $actorId . '/outbox' . ($page > 2 ? '?page=' . ($page - 1) : '');
+        }
+        if ($page * $pageSize < $total) {
+            $doc['next'] = $actorId . '/outbox?page=' . ($page + 1);
+        }
     } elseif ($col === 'followers') {
         $items = [];
         foreach (ap_followers_list($actorId) as $r) {
@@ -820,7 +832,7 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
         // Filtering replies after a mixed LIMIT stops once replies fill the window.
         $notes = ap_outbox_posts_list_page(
             $actorKey,
-            min(200, max($profilePerPage, $profilePage * $profilePerPage)),
+            $profileFetchLimit,
             0
         );
     } elseif (function_exists('ap_outbox_list_page')) {
@@ -1099,7 +1111,7 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
         ap_profile_order_tabs([
             'pinned' => $pinnedCount > 0 ? ['Pinned', $pinnedCount] : null,
             'posts' => ['Posts', $profileTotal + $profileBskyCount + $profileBoostTotal],
-            'replies' => $hideProfileReplies ? null : ['Replies', count($profileReplyNotes) + count($profileBskyReplies)],
+            'replies' => $hideProfileReplies ? null : ['Replies', (function_exists('ap_outbox_replies_count') ? ap_outbox_replies_count($actorKey) : count($profileReplyNotes)) + count($profileBskyReplies)],
             'boosts' => $hideProfileBoosts ? null : ['Boosts', $profileBoostTotal],
             'media' => [
                 'Media',
