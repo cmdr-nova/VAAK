@@ -804,9 +804,8 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
     $profileTotal = function_exists('ap_outbox_count_for_actor')
         ? ap_outbox_count_for_actor($actorKey)
         : 0;
-    // Replies and direct mentions belong exclusively in the Replies tab. The
-    // latter do not necessarily carry in_reply_to, so use the same durable
-    // ActivityPub tag-aware classifier used by the replies query.
+    // A note is a reply only when in_reply_to is set. Top-level @mentions and
+    // hashtags stay in Posts. The total already counts only public notes.
     if ($profileTotal > 0 && function_exists('ap_outbox_replies_count')) {
         $profileTotal = max(0, $profileTotal - ap_outbox_replies_count($actorKey));
     }
@@ -825,7 +824,7 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
         if (function_exists('ap_visibility_on_html_profile') && !ap_visibility_on_html_profile($vis)) {
             continue;
         }
-        if (function_exists('ap_outbox_note_is_reply_or_mention') && ap_outbox_note_is_reply_or_mention($n)) {
+        if (function_exists('ap_outbox_note_is_reply') && ap_outbox_note_is_reply($n)) {
             continue;
         }
         $publicNotes[] = $n;
@@ -977,8 +976,8 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
             ? ap_outbox_replies_list_page($actorKey, $profilePerPage, ($profilePage - 1) * $profilePerPage)
             : array_values(array_filter(
                 ap_outbox_list($profilePerPage, $actorKey),
-                static fn(array $replyNote): bool => function_exists('ap_outbox_note_is_reply_or_mention')
-                    ? ap_outbox_note_is_reply_or_mention($replyNote)
+                static fn(array $replyNote): bool => function_exists('ap_outbox_note_is_reply')
+                    ? ap_outbox_note_is_reply($replyNote)
                     : trim((string) ($replyNote['in_reply_to'] ?? '')) !== ''
             ));
     }
