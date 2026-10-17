@@ -599,8 +599,12 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
     $profileLastModifiedTs = strtotime((string) ($p['updated'] ?? $p['updated_at'] ?? '')) ?: 0;
     try {
         $db = ap_db();
-        $st = $db->prepare('SELECT COALESCE(MAX(published), \'\') FROM outbox_notes WHERE actor_key = ?');
-        $st->execute([$actorKey]);
+        // outbox_notes is keyed by note id, not actor_key. A failed lookup used
+        // to leave this seed empty, so If-None-Match kept a page from before
+        // newer posts. published may be timestamptz; do not COALESCE it with ''.
+        $notePrefix = 'https://mkultra.monster/users/' . rawurlencode(strtolower(trim($actorKey))) . '/%';
+        $st = $db->prepare('SELECT MAX(published) FROM outbox_notes WHERE id LIKE ?');
+        $st->execute([$notePrefix]);
         $latestOutbox = (string) ($st->fetchColumn() ?: '');
         if ($latestOutbox !== '') {
             $profileRevisionParts[] = $latestOutbox;

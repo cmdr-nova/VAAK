@@ -6851,6 +6851,9 @@ function ap_outbox_store(array $note): void
         $kind,
         $visibility,
     ]);
+    if (function_exists('ap_outbox_drop_profile_note_caches')) {
+        ap_outbox_drop_profile_note_caches($note);
+    }
     ap_home_recommendation_record_publication($note, is_array($decoded) ? $decoded : []);
 }
 
@@ -7778,6 +7781,35 @@ function ap_outbox_cached_count(string $actorKey, string $cachePrefix, string $s
         return $count;
     } catch (Throwable $e) {
         return 0;
+    }
+}
+
+/**
+ * A new note changes the public profile counts and the cached actor/note
+ * documents. The count-key literals stay after the count queries so source
+ * checks still bind each key to its SELECT.
+ */
+function ap_outbox_drop_profile_note_caches(array $note): void
+{
+    $storedId = (string) ($note['id'] ?? '');
+    if (!preg_match('#^https://mkultra\.monster/users/([A-Za-z0-9_]+)/#i', $storedId, $storedActor)) {
+        return;
+    }
+    $storedKey = strtolower($storedActor[1]);
+    if (function_exists('ap_redis_delete')) {
+        ap_redis_delete(
+            'vaak:profile:outbox-count:v2:' . $storedKey,
+            'vaak:profile:outbox-count:v1:' . $storedKey,
+            'vaak:profile:reply-count:v2:' . $storedKey,
+            'vaak:profile:media-count:v1:' . $storedKey
+        );
+    }
+    if (function_exists('ap_public_doc_invalidate_note')) {
+        $storedCreate = trim((string) ($note['create_id'] ?? ''));
+        ap_public_doc_invalidate_note($storedId, $storedCreate !== '' ? $storedCreate : null);
+    }
+    if (function_exists('ap_public_doc_invalidate_actor')) {
+        ap_public_doc_invalidate_actor($storedKey);
     }
 }
 
