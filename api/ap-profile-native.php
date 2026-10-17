@@ -137,6 +137,7 @@ function ap_profile_full_fetch(string $actor, string $tab, string $from, string 
     $status = ap_native_preview_effective_budget(); $rawQuote = $GLOBALS['admin_quote_link_preview_budget'] ?? null; $quote = is_int($rawQuote) ? $rawQuote : 2;
     if ($status < 0 || $status > 100) return null;
     $request = ['protocol_version'=>1, 'viewer'=>$guest ? ['kind'=>'guest'] : ['kind'=>'authenticated','owner_id'=>$owner,'csrf'=>$csrf]] + $binding + ['lazy_media'=>!empty($GLOBALS['admin_bookmark_lazy_media']), 'status_preview_budget'=>$status, 'quote_preview_budget'=>$quote];
+    $request['page'] = max(1, min(10000, (int) ($_GET['page'] ?? 1)));
     if (!$guest) $request['viewer']['bsky'] = ap_profile_complete_bsky_provenance($owner);
     $remaining = function_exists('ap_bsky_budget_remaining') ? ap_bsky_budget_remaining() : null;
     if ($remaining !== null && (!is_float($remaining) && !is_int($remaining) || !is_finite((float)$remaining))) return null;
