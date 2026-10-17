@@ -576,7 +576,7 @@ fn feed_markup(f: &Facts) -> (Option<String>, Option<String>) {
     open.push_str(&open_div);
     open.push('\n');
     open.push_str("            ");
-    let status = if f.feed_has_more { "Scroll for more…" } else { "End of profile" };
+    let status = crate::profile_source::profile_scroll_status(f.feed_has_more);
     let close = format!("            </div><div id=\"timeline-status\" class=\"meta\" style=\"padding:.75rem 0;text-align:center\">{status}</div><div id=\"timeline-sentinel\" aria-hidden=\"true\" style=\"height:1px\"></div><button type=\"button\" class=\"feed-top-btn\" id=\"feed-top-btn\" title=\"Back to top\" aria-label=\"Back to top\">↑</button>\n            ");
     (Some(open), Some(close))
 }

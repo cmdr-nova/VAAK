@@ -59,6 +59,9 @@ reference_load($root . '/api/ap-db.php', [
     'ap_outbox_shared_list_page',
     'ap_outbox_shared_count',
     'ap_local_profile_tab_page',
+    'ap_profile_page_has_more',
+    'ap_profile_scroll_has_more',
+    'ap_profile_tab_total',
     'ap_blog_tags_decode',
     'ap_blog_posts_list',
     'ap_blog_posts_count',
@@ -292,6 +295,13 @@ $tenPage = ap_local_profile_tab_page($ten, 'https://mkultra.monster/users/' . $t
 $tenIds = array_map(static fn(array $row): string => (string) $row['id'], $tenPage['items']);
 $check($tenIds === $tenPosts, 'one page of only posts starts at the newest and includes all ten');
 $check($tenPage['has_more'] === false && $tenPage['next_offset'] === 10, 'a short first page of posts is the end');
+$check(ap_profile_tab_total($ten, 'posts') === 10, 'posts tab total is the ten public posts');
+$check(ap_profile_page_has_more(true, 12, 12, 10), 'a page that already has more stays open');
+$check(!ap_profile_scroll_has_more(false, 0, 10, 10), 'ten posts in a twelve-row first page are the end');
+$check(ap_profile_scroll_has_more(false, 0, 7, 10), 'a first page whose cursor stopped at 7 still has the last posts');
+$check(!ap_profile_scroll_has_more(false, 7, 7, 10), 'an empty follow-up page does not invent items from a high total');
+$check(ap_profile_page_has_more(false, 12, 12, 15), 'a full page whose cursor is behind the tab total still has more');
+$check(!ap_profile_page_has_more(false, 10, 10, 0), 'a missing tab total does not invent another page');
 $tenShifted = ap_local_profile_tab_page($ten, 'https://mkultra.monster/users/' . $ten, 'posts', 12, 2);
 $tenShiftedIds = array_map(static fn(array $row): string => (string) $row['id'], $tenShifted['items']);
 $check($tenShiftedIds === array_slice($tenPosts, 2), 'offset 2 is a later page, not the first page');
@@ -624,6 +634,9 @@ $guestPostTotal = max(0, $guestPublicTotal - $guestReplyTotal);
 $check($guestPostTotal === count($guestPosts), 'guest Posts header counts public notes minus real replies');
 $check($guestReplyTotal === count($guestReplies), 'guest Replies header counts only public notes with in_reply_to');
 $check(ap_outbox_media_count($guest) === count($guestMedia), 'guest Media header counts public attachments, including a reply');
+$check(ap_profile_tab_total($guest, 'posts') === $guestPostTotal, 'guest posts end marker uses the posts header total');
+$check(ap_profile_tab_total($guest, 'replies') === $guestReplyTotal, 'guest replies end marker uses the replies header total');
+$check(ap_profile_tab_total($guest, 'media') === count($guestMedia), 'guest media end marker uses the media header total');
 $check(ap_outbox_shared_count($guest) === count($guestShared), 'public outbox total counts public and unlisted notes');
 $check($guestPostTotal === 8 && $guestReplyTotal === 4, 'guest counts leave hashtags and mentions on Posts');
 
@@ -753,6 +766,7 @@ while (count($guestBoostSeen) < 20) {
     $guestBoostOffset += 2;
 }
 $check($guestBoostSeen === $guestBoostExpected, 'guest boosts walk every public boost, newest first');
+$check(ap_profile_tab_total($guest, 'boosts') === count($guestBoostExpected), 'guest boosts end marker uses the boost header total');
 
 $guestPinInsert = $GLOBALS['db']->prepare('INSERT INTO masto_pins (status_local_id, owner_user_id, pinned_at) VALUES (?, 9, ?)');
 for ($i = 0; $i < 7; $i++) {
@@ -827,6 +841,13 @@ $check(str_contains($index, "\$GLOBALS['vaak_guest_profile'] = true") && str_con
 $check(str_contains($route, "\$GLOBALS['vaak_guest_profile'] = true"), 'logged-out profile route paints the guest profile');
 $check(str_contains($admin, 'ap_local_profile_tab_page('), 'guest and signed-in tabs share the paged profile query');
 $check(str_contains($headerRs, 'fn resolve_guest') && str_contains($headerRs, 'resolve_local('), 'Rust guest header uses the signed-in public counts');
+$check(str_contains($admin, 'function profileScrollStatus(more)'), 'profile end marker text comes from one status function');
+$check(str_contains($admin, "if (moreHeader === '1' || moreHeader === '0')"), 'profile scroll sets the end only from an explicit has-more header');
+$check(substr_count($admin, 'ap_profile_scroll_has_more(') >= 3, 'first paint and scroll append share the end-marker decision');
+$check(str_contains($admin, '$rpLocalPageLimit = 12'), 'profile first paint page size is 12');
+$check(str_contains($rustSource, 'fn profile_page_has_more'), 'Rust decides the profile end marker with the same rule');
+$check(str_contains((string) file_get_contents($root . '/rust/vaak-worker/src/profile_context.rs'), 'profile_page_has_more('), 'native first paint asks that rule before printing the end marker');
+$check(str_contains((string) file_get_contents($root . '/rust/vaak-worker/src/profile_local.rs'), 'profile_scroll_status('), 'native profile shell uses the shared status text');
 
 if ($failures !== []) {
     fwrite(STDERR, implode("\n", $failures) . "\n");
