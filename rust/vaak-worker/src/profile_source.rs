@@ -53,6 +53,10 @@ impl SourceLedger {
         Ok(())
     }
 }
+/// Same rule as the public reply count: NULL and blank `in_reply_to` are posts.
+pub(crate) const PROFILE_POSTS_REPLY_SQL: &str = "TRIM(COALESCE(in_reply_to, '')) = ''";
+/// Any other `in_reply_to` is a reply, including whitespace-padded URLs.
+pub(crate) const PROFILE_REPLIES_REPLY_SQL: &str = "TRIM(COALESCE(in_reply_to, '')) <> ''";
 pub(crate) async fn select(db:&Client,key:&str,actor:&str,tab:&str,limit:i64,offset:i64)->Result<SelectedProfilePage>{
     let normalized_key=key.trim().to_ascii_lowercase();let key=normalized_key.as_str();
     if key.is_empty()||!key.bytes().all(|b|b.is_ascii_lowercase()||b.is_ascii_digit()||b==b'_'){bail!("invalid canonical profile source key")}
@@ -63,7 +67,7 @@ pub(crate) async fn select(db:&Client,key:&str,actor:&str,tab:&str,limit:i64,off
         let canonical=format!("https://mkultra.monster/users/{key}");let requested=actor.trim().trim_end_matches('/');let actor=if requested.is_empty(){canonical.as_str()}else{requested};let slash=format!("{actor}/");
         db.query("SELECT to_jsonb(e) FROM (SELECT DISTINCT ON(object_id) * FROM events WHERE type='Announce' AND actor_id IN ($1,$2) ORDER BY object_id,CASE WHEN action_taken='boost_ok' THEN 0 ELSE 1 END,created_at DESC,id DESC) e ORDER BY created_at DESC,id DESC LIMIT $3 OFFSET $4",&[&actor,&slash,&(limit+1),&offset]).await?
     }else{
-        let predicate=match tab{"posts"=>"(in_reply_to IS NULL OR btrim(in_reply_to)='')","replies"=>"in_reply_to IS NOT NULL AND btrim(in_reply_to)<>''","media"=>"raw_create_json LIKE '%\"attachment\"%'",_=>bail!("invalid canonical profile tab")};
+        let predicate=match tab{"posts"=>PROFILE_POSTS_REPLY_SQL,"replies"=>PROFILE_REPLIES_REPLY_SQL,"media"=>"raw_create_json LIKE '%\"attachment\"%'",_=>bail!("invalid canonical profile tab")};
         let prefix=format!("https://mkultra.monster/users/{key}/%");
         db.query(&format!("SELECT to_jsonb(n) FROM outbox_notes n WHERE id LIKE $1 AND COALESCE(visibility,'public')='public' AND {predicate} ORDER BY published DESC LIMIT $2 OFFSET $3"),&[&prefix,&(limit+1),&offset]).await?
     }.into_iter().map(|row|row.get(0)).collect();
@@ -88,6 +92,13 @@ pub(crate) async fn select_secondary(db:&Client,key:&str,actor:&str,kind:&'stati
 #[cfg(test)]
 mod tests {
  use super::*;
+ #[test]
+ fn profile_reply_predicates_match_the_count_rule() {
+  assert_eq!(PROFILE_POSTS_REPLY_SQL, "TRIM(COALESCE(in_reply_to, '')) = ''");
+  assert_eq!(PROFILE_REPLIES_REPLY_SQL, "TRIM(COALESCE(in_reply_to, '')) <> ''");
+  let html = include_str!("profile_html.rs");
+  assert!(html.contains(PROFILE_POSTS_REPLY_SQL) && html.contains(PROFILE_REPLIES_REPLY_SQL));
+ }
  #[tokio::test]
  #[ignore = "opt-in disposable PostgreSQL genuine Boost source ledger and omitted-row mutation replay"]
  async fn actual_profile_selected_ledger_replay(){

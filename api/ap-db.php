@@ -7571,6 +7571,47 @@ function ap_outbox_note_on_public_profile(array $row): bool
     return (string) $row['visibility'] === 'public';
 }
 
+/**
+ * Public profile Posts/Replies share the reply-count rule.
+ * NULL and blank in_reply_to are posts. Any other value is a reply.
+ * Filtering happens in SQL so a page of replies cannot end the Posts cursor.
+ */
+function ap_outbox_profile_reply_predicate(bool $replies): string
+{
+    return $replies
+        ? "TRIM(COALESCE(in_reply_to, '')) <> ''"
+        : "TRIM(COALESCE(in_reply_to, '')) = ''";
+}
+
+/**
+ * One public Posts page. LIMIT/OFFSET apply after the reply-count predicate,
+ * so replies between posts do not shorten the page or end the cursor.
+ *
+ * @return list<array<string,mixed>>
+ */
+function ap_outbox_posts_list_page(string $actorKey, int $limit = 40, int $offset = 0): array
+{
+    $actorKey = strtolower(trim($actorKey));
+    $limit = max(1, min(200, $limit));
+    $offset = max(0, $offset);
+    if ($actorKey === '') {
+        return [];
+    }
+    $prefix = 'https://mkultra.monster/users/' . rawurlencode($actorKey) . '/';
+    try {
+        $st = ap_db()->prepare(
+            "SELECT * FROM outbox_notes
+             WHERE id LIKE ? AND COALESCE(visibility, 'public') = 'public'
+               AND TRIM(COALESCE(in_reply_to, '')) = ''
+             ORDER BY published DESC LIMIT ? OFFSET ?"
+        );
+        $st->execute([$prefix . '%', $limit, $offset]);
+        return $st->fetchAll() ?: [];
+    } catch (Throwable $e) {
+        return [];
+    }
+}
+
 /** @return list<array<string,mixed>> */
 function ap_outbox_replies_list_page(string $actorKey, int $limit = 40, int $offset = 0): array
 {
@@ -7796,7 +7837,7 @@ function ap_local_profile_tab_page(
             $st = $db->prepare(
                 "SELECT * FROM outbox_notes
                  WHERE id LIKE ? AND COALESCE(visibility, 'public') = 'public'
-                   AND in_reply_to IS NOT NULL AND btrim(in_reply_to) <> ''
+                   AND TRIM(COALESCE(in_reply_to, '')) <> ''
                  ORDER BY published DESC LIMIT ? OFFSET ?"
             );
             $st->execute([$prefix . '%', $limit + 1, $offset]);
@@ -7805,7 +7846,7 @@ function ap_local_profile_tab_page(
             $st = $db->prepare(
                 "SELECT * FROM outbox_notes
                  WHERE id LIKE ? AND COALESCE(visibility, 'public') = 'public'
-                   AND (in_reply_to IS NULL OR btrim(in_reply_to) = '')
+                   AND TRIM(COALESCE(in_reply_to, '')) = ''
                  ORDER BY published DESC LIMIT ? OFFSET ?"
             );
             $st->execute([$prefix . '%', $limit + 1, $offset]);

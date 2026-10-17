@@ -394,8 +394,9 @@ async fn fetch_outbox_tab(
     offset: i64,
 ) -> Result<Vec<OutboxPaintRow>> {
     let like = format!("{prefix}%");
-    // Match the PHP profile page provider: every nonempty reply, including
-    // a self-reply, belongs to Replies rather than Posts.
+    // Match the PHP profile page provider and the public reply count.
+    // NULL and blank in_reply_to are posts. Every other value, including a
+    // self-reply, belongs to Replies. LIMIT/OFFSET apply after that predicate.
     let rows = match tab {
         "media" => {
             db.query(
@@ -411,12 +412,16 @@ async fn fetch_outbox_tab(
             .context("select outbox media tab")?
         }
         "replies" => {
+            debug_assert_eq!(
+                crate::profile_source::PROFILE_REPLIES_REPLY_SQL,
+                "TRIM(COALESCE(in_reply_to, '')) <> ''"
+            );
             db.query(
                 "SELECT id, COALESCE(published::text, ''), COALESCE(content, ''),
                         COALESCE(raw_create_json, ''), COALESCE(in_reply_to, '')
                  FROM outbox_notes
                  WHERE id LIKE $1 AND COALESCE(visibility, 'public') = 'public'
-                   AND in_reply_to IS NOT NULL AND btrim(in_reply_to) <> ''
+                   AND TRIM(COALESCE(in_reply_to, '')) <> ''
                  ORDER BY published DESC
                  LIMIT $2 OFFSET $3",
                 &[&like, &limit, &offset],
@@ -425,12 +430,16 @@ async fn fetch_outbox_tab(
             .context("select outbox replies tab")?
         }
         _ => {
+            debug_assert_eq!(
+                crate::profile_source::PROFILE_POSTS_REPLY_SQL,
+                "TRIM(COALESCE(in_reply_to, '')) = ''"
+            );
             db.query(
                 "SELECT id, COALESCE(published::text, ''), COALESCE(content, ''),
                         COALESCE(raw_create_json, ''), COALESCE(in_reply_to, '')
                  FROM outbox_notes
                  WHERE id LIKE $1 AND COALESCE(visibility, 'public') = 'public'
-                   AND (in_reply_to IS NULL OR btrim(in_reply_to) = '')
+                   AND TRIM(COALESCE(in_reply_to, '')) = ''
                  ORDER BY published DESC
                  LIMIT $2 OFFSET $3",
                 &[&like, &limit, &offset],

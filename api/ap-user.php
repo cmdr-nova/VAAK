@@ -809,15 +809,25 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
     if ($profileTotal > 0 && function_exists('ap_outbox_replies_count')) {
         $profileTotal = max(0, $profileTotal - ap_outbox_replies_count($actorKey));
     }
-    $notes = $tab === 'media' && function_exists('ap_outbox_media_list_page')
-        ? ap_outbox_media_list_page($actorKey, $profilePerPage, ($profilePage - 1) * $profilePerPage)
-        : (function_exists('ap_outbox_list_page')
-        ? ap_outbox_list_page(
-            $profileFetchLimit,
-            $tab === 'posts' ? 0 : (($profilePage - 1) * $profilePerPage),
+    if ($tab === 'media' && function_exists('ap_outbox_media_list_page')) {
+        $notes = ap_outbox_media_list_page($actorKey, $profilePerPage, ($profilePage - 1) * $profilePerPage);
+    } elseif ($tab === 'posts' && function_exists('ap_outbox_posts_list_page')) {
+        // Keep the combined Posts slice, but fill it from top-level notes only.
+        // Filtering replies after a mixed LIMIT stops once replies fill the window.
+        $notes = ap_outbox_posts_list_page(
+            $actorKey,
+            min(200, max($profilePerPage, $profilePage * $profilePerPage)),
+            0
+        );
+    } elseif (function_exists('ap_outbox_list_page')) {
+        $notes = ap_outbox_list_page(
+            $profilePerPage,
+            ($profilePage - 1) * $profilePerPage,
             $actorKey
-        )
-        : ap_outbox_list($profileFetchLimit, $actorKey));
+        );
+    } else {
+        $notes = ap_outbox_list($profileFetchLimit, $actorKey);
+    }
     $publicNotes = [];
     foreach ($notes as $n) {
         $vis = (string) ($n['visibility'] ?? 'public');
