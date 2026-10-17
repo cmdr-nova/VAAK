@@ -83,6 +83,7 @@ php_tests=(
   api/bin/privacy-moderation-smoke.php
   api/bin/profile-native-first-paint-empty-test.php
   api/bin/profile-native-reply-test.php
+  api/bin/profile-reply-split-smoke.php
   api/bin/quote-avatar-behavior-smoke.php
   api/bin/quote-target-count-smoke.php
   api/bin/recommendations-behavior-smoke.php

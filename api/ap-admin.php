@@ -22568,7 +22568,7 @@ function admin_outbox_page(int $ownerId, string $actorKey, int $offset, int $lim
     }
     usort($items, static fn(array $a, array $b): int => (int) ($b['sort'] ?? 0) <=> (int) ($a['sort'] ?? 0));
 
-    $fediCount = function_exists('ap_outbox_count_for_actor') ? ap_outbox_count_for_actor($actorKey) : count($outbox);
+    $fediCount = function_exists('ap_outbox_count_all_for_actor') ? ap_outbox_count_all_for_actor($actorKey) : count($outbox);
     $bskyCount = 0;
     if ($bskyDid !== '') {
         try {
@@ -36699,8 +36699,8 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
                   $outboxBskyCount = (int) $st->fetchColumn();
               } catch (Throwable $e) { $outboxBskyCount = count($yourBskyPosts); }
           }
-          $outboxFediCount = function_exists('ap_outbox_count_for_actor')
-              ? ap_outbox_count_for_actor((string) $vaakActorKey) : count($outbox);
+          $outboxFediCount = function_exists('ap_outbox_count_all_for_actor')
+              ? ap_outbox_count_all_for_actor((string) $vaakActorKey) : count($outbox);
           $outboxHasMore = ($tlOffset + 40) < max($outboxFediCount, $outboxBskyCount);
           // Each source is fetched in a bounded window; render only one
           // combined page so the next offset cannot repeat the second half of
