@@ -838,7 +838,9 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
         if (function_exists('ap_visibility_on_html_profile') && !ap_visibility_on_html_profile($vis)) {
             continue;
         }
-        if (function_exists('ap_outbox_note_is_reply') && ap_outbox_note_is_reply($n)) {
+        // Media is already the public attachment page. Dropping replies after
+        // LIMIT skips those attachments and never shows them on a later page.
+        if ($tab !== 'media' && function_exists('ap_outbox_note_is_reply') && ap_outbox_note_is_reply($n)) {
             continue;
         }
         $publicNotes[] = $n;
@@ -1006,7 +1008,7 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
     $blogSlug = trim((string) ($_GET['post'] ?? ''));
     $blogPost = $blogSlug !== '' ? ap_blog_post_get($actorKey, $blogSlug, true) : null;
     $blogRows = $needsBlogRows
-        ? ap_blog_posts_list($actorKey, true, 20, max(0, ($profilePage - 1) * 20))
+        ? ap_blog_posts_list($actorKey, true, $profilePerPage, max(0, ($profilePage - 1) * $profilePerPage))
         : [];
     $blogCount = function_exists('ap_blog_posts_count')
         ? ap_blog_posts_count($actorKey, true)
@@ -1015,6 +1017,12 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
     foreach ($publicNotes as $mediaNote) {
         $create = json_decode((string) ($mediaNote['raw_create_json'] ?? ''), true);
         $noteObj = is_array($create) && is_array($create['object'] ?? null) ? $create['object'] : [];
+        if ($tab === 'media') {
+            // Keep every SQL row. An attachment that does not render still
+            // belongs on this page; skipping it would hide the note forever.
+            $mediaNotes[] = [$mediaNote, $noteObj];
+            continue;
+        }
         if ($noteObj && ap_user_note_media_html($noteObj, false) !== '') {
             $mediaNotes[] = [$mediaNote, $noteObj];
         }
@@ -1147,7 +1155,12 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
             echo '<p class="muted">No public media posts yet.</p>';
         } else {
             foreach ($mediaNotes as [$mediaRow, $mediaObj]) {
-                echo '<article class="profile-media-item">' . ap_user_note_media_html($mediaObj, true);
+                $mediaHtml = is_array($mediaObj) ? ap_user_note_media_html($mediaObj, true) : '';
+                if ($mediaHtml === '') {
+                    echo ap_user_post_preview_html($actorKey, $mediaRow);
+                    continue;
+                }
+                echo '<article class="profile-media-item">' . $mediaHtml;
                 $mediaText = trim(strip_tags((string) ($mediaObj['content'] ?? $mediaRow['content'] ?? '')));
                 if ($mediaText !== '') {
                     echo '<div class="profile-media-caption">' . htmlspecialchars($mediaText, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '</div>';

@@ -31,17 +31,39 @@ function ap_redis_json_set(string $key, array $value, int $ttlSeconds): bool
     return true;
 }
 
+function ap_db_driver(PDO $db): string
+{
+    return (string) $db->getAttribute(PDO::ATTR_DRIVER_NAME);
+}
+function ap_db_owner_user_id_for_actor(string $actorKey): int
+{
+    return strtolower($actorKey) === 'pinwalk' ? 7 : 0;
+}
+
 reference_load($root . '/api/ap-db.php', [
     'ap_outbox_note_is_reply',
     'ap_outbox_note_on_public_profile',
     'ap_outbox_profile_reply_predicate',
     'ap_outbox_posts_list_page',
     'ap_outbox_replies_list_page',
+    'ap_outbox_media_list_page',
+    'ap_outbox_media_count',
     'ap_outbox_replies_count',
     'ap_outbox_count_for_actor',
     'ap_outbox_cached_count',
     'ap_outbox_drop_profile_note_caches',
     'ap_local_profile_tab_page',
+    'ap_blog_tags_decode',
+    'ap_blog_posts_list',
+    'ap_blog_posts_count',
+    'ap_masto_pinned_statuses',
+    'ap_masto_reblog_rows_for_html_profile',
+    'ap_masto_reblog_count_for_html_profile',
+]);
+reference_load($root . '/api/ap-featured.php', [
+    'ap_featured_schema_ensure',
+    'ap_featured_list',
+    'ap_featured_count',
 ]);
 
 $postsPredicate = ap_outbox_profile_reply_predicate(false);
@@ -79,6 +101,7 @@ $dropEnd = strpos($php, 'function ap_local_profile_tab_page');
 $drop = ($dropStart !== false && $dropEnd !== false) ? substr($php, $dropStart, $dropEnd - $dropStart) : '';
 $check(str_contains($store, "function_exists('ap_outbox_drop_profile_note_caches')"), 'storing a note drops profile caches when that helper is loaded');
 $check(str_contains($drop, 'vaak:profile:outbox-count:v2:') && str_contains($drop, 'vaak:profile:reply-count:v2:'), 'a stored note drops the public profile count caches');
+$check(str_contains($drop, 'vaak:profile:media-count:v2:') && str_contains($drop, 'vaak:profile:media-count:v1:'), 'a stored note drops the current and previous media counts');
 $check(str_contains($drop, 'ap_public_doc_invalidate_note') && str_contains($drop, 'ap_public_doc_invalidate_actor'), 'a stored note drops the public note and actor documents');
 $check(str_contains($drop, "function_exists('ap_redis_delete')") && str_contains($drop, "function_exists('ap_public_doc_invalidate_note')"), 'cache drops are optional so isolated stores still insert');
 
@@ -298,9 +321,243 @@ $check(in_array('vaak:profile:outbox-count:v2:' . $head, $GLOBALS['dropped'], tr
 $check(in_array('vaak:profile:reply-count:v2:' . $head, $GLOBALS['dropped'], true), 'a new post drops the reply count');
 $check(in_array('note:' . $headPrefix . 'new-post-0:' . $headPrefix . 'new-post-0/activity', $GLOBALS['dropped'], true), 'a new post drops its public document');
 $check(in_array('actor:' . $head, $GLOBALS['dropped'], true), 'a new post drops the actor document');
+$check(in_array('vaak:profile:media-count:v2:' . $head, $GLOBALS['dropped'], true), 'a new post drops the public media count');
 $beforeRemote = count($GLOBALS['dropped']);
 ap_outbox_drop_profile_note_caches(['id' => 'https://remote.test/notes/1']);
 $check(count($GLOBALS['dropped']) === $beforeRemote, 'a remote note does not drop local profile caches');
+
+$mediaActor = 'mediawalk';
+$mediaPrefix = 'https://mkultra.monster/users/' . $mediaActor . '/notes/';
+$attach = '{"object":{"attachment":[{"type":"Image","mediaType":"image/jpeg","url":"https://files.example/a.jpg"}]}}';
+$mediaExpected = [];
+$mediaTime = 90;
+$insert->execute([$mediaPrefix . 'private-new', 'hidden media', null, 'private', $attach, $stamp($mediaTime)]);
+$mediaTime--;
+$id = $mediaPrefix . 'reply-new';
+$insert->execute([$id, 'reply media', $replyTo('media-parent'), 'public', $attach, $stamp($mediaTime)]);
+$mediaExpected[] = $id;
+$mediaTime--;
+$id = $mediaPrefix . 'post-new';
+$insert->execute([$id, 'post media', null, 'public', $attach, $stamp($mediaTime)]);
+$mediaExpected[] = $id;
+$mediaTime--;
+$insert->execute([$mediaPrefix . 'plain', 'no attachment', null, 'public', '{}', $stamp($mediaTime)]);
+$mediaTime--;
+$insert->execute([$mediaPrefix . 'local-media', 'local media', null, 'local', $attach, $stamp($mediaTime)]);
+$mediaTime--;
+for ($i = 0; $i < 3; $i++) {
+    $id = $mediaPrefix . 'post-old-' . $i;
+    $insert->execute([$id, 'older media ' . $i, '', 'public', $attach, $stamp($mediaTime)]);
+    $mediaExpected[] = $id;
+    $mediaTime--;
+}
+$mediaPageSize = 2;
+$mediaFirst = ap_local_profile_tab_page($mediaActor, 'https://mkultra.monster/users/' . $mediaActor, 'media', $mediaPageSize, 0);
+$mediaFirstIds = array_map(static fn(array $row): string => (string) $row['id'], $mediaFirst['items']);
+$mediaListed = array_map(
+    static fn(array $row): string => (string) $row['id'],
+    ap_outbox_media_list_page($mediaActor, $mediaPageSize, 0)
+);
+$check($mediaFirstIds === array_slice($mediaExpected, 0, $mediaPageSize), 'media first page starts at the newest public attachment');
+$check($mediaFirstIds === $mediaListed, 'classic media list matches the in-app media page');
+$check($mediaFirstIds !== array_slice($mediaExpected, $mediaPageSize, $mediaPageSize), 'media first page is not shifted by the page size');
+$check(!in_array($mediaPrefix . 'private-new', $mediaFirstIds, true), 'a newer private attachment does not take the first media slot');
+$check($mediaFirstIds[0] === $mediaPrefix . 'reply-new', 'a newer public reply attachment stays on the first media page');
+$mediaSeen = $walk('media', $mediaPageSize, $mediaActor);
+$mediaOffset = 0;
+$mediaClassic = [];
+while ($mediaOffset < 20) {
+    $pageIds = array_map(
+        static fn(array $row): string => (string) $row['id'],
+        ap_outbox_media_list_page($mediaActor, $mediaPageSize, $mediaOffset)
+    );
+    foreach ($pageIds as $pageId) {
+        $check(!in_array($pageId, $mediaClassic, true), 'classic media page does not repeat ' . $pageId);
+        $mediaClassic[] = $pageId;
+    }
+    if (count($pageIds) < $mediaPageSize) {
+        break;
+    }
+    $mediaOffset += $mediaPageSize;
+}
+$check($mediaSeen === $mediaExpected, 'walking media returns every public attachment once, newest first');
+$check($mediaClassic === $mediaExpected, 'walking the classic media list returns the same attachments');
+$check(ap_outbox_media_count($mediaActor) === count($mediaExpected), 'media count matches the walked public attachments');
+$check(substr_count($php, "COALESCE(visibility, \\'public\\') = \\'public\\' AND raw_create_json LIKE \\'%\"attachment\"%\\'") === 2, 'media count and list share the public attachment predicate');
+$check(str_contains($user, "\$tab !== 'media' && function_exists('ap_outbox_note_is_reply')"), 'classic media does not drop replies after the page is fetched');
+$check(str_contains($user, 'ap_user_post_preview_html($actorKey, $mediaRow)'), 'a media row with no gallery still renders on its page');
+$admin = (string) file_get_contents($root . '/api/ap-admin.php');
+$headerRust = (string) file_get_contents($root . '/rust/vaak-worker/src/profile_header.rs');
+$check(str_contains($headerRust, 'vaak:profile:media-count:v2:') && !str_contains($headerRust, 'media-count:v1:'), 'Rust media count uses the public v2 cache key');
+$check(str_contains((string) file_get_contents($root . '/api/bin/local-profile-header-reference.php'), 'vaak:profile:media-count:v2:fixture'), 'header fixture seeds the v2 media count');
+
+$blogActor = 'blogwalk';
+$GLOBALS['db']->exec('CREATE TABLE vaak_blog_posts (
+    id INTEGER PRIMARY KEY,
+    actor_key TEXT,
+    slug TEXT,
+    title TEXT,
+    status TEXT,
+    published_at TEXT,
+    updated_at TEXT,
+    excerpt TEXT,
+    tags_json TEXT,
+    body_markdown TEXT
+)');
+$blogInsert = $GLOBALS['db']->prepare('INSERT INTO vaak_blog_posts (id, actor_key, slug, title, status, published_at, updated_at, excerpt, tags_json, body_markdown) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)');
+$blogExpected = [];
+for ($i = 0; $i < 7; $i++) {
+    $slug = 'entry-' . $i;
+    $blogInsert->execute([$i + 1, $blogActor, $slug, 'Entry ' . $i, 'published', $stamp(80 - $i), $stamp(80 - $i), 'excerpt', '[]', 'body']);
+    $blogExpected[] = $slug;
+}
+$blogInsert->execute([90, $blogActor, 'draft-new', 'Draft', 'draft', $stamp(99), $stamp(99), '', '[]', '']);
+$blogInsert->execute([91, 'otherblog', 'other', 'Other', 'published', $stamp(98), $stamp(98), '', '[]', '']);
+$blogPageSize = 3;
+$blogSeen = [];
+$blogOffset = 0;
+$blogPages = 0;
+while ($blogPages < 10) {
+    $rows = ap_blog_posts_list($blogActor, true, $blogPageSize, $blogOffset);
+    $blogPages++;
+    $slugs = array_map(static fn(array $row): string => (string) $row['slug'], $rows);
+    $check(count($slugs) === count(array_unique($slugs)), 'blog page has no duplicate slugs');
+    foreach ($slugs as $slug) {
+        $check(!in_array($slug, $blogSeen, true), 'blog cursor does not repeat ' . $slug);
+        $blogSeen[] = $slug;
+    }
+    if (count($slugs) < $blogPageSize) {
+        break;
+    }
+    $blogOffset += $blogPageSize;
+}
+$check($blogPages >= 2, 'blog needs more than one page');
+$check($blogSeen === $blogExpected, 'walking blog returns every published post once, newest first');
+$check(array_slice($blogSeen, 0, $blogPageSize) === array_slice($blogExpected, 0, $blogPageSize), 'blog first page is not shifted by the page size');
+$check(ap_blog_posts_count($blogActor, true) === count($blogExpected), 'blog count matches the walked posts');
+$check(str_contains($user, 'ap_blog_posts_list($actorKey, true, $profilePerPage, max(0, ($profilePage - 1) * $profilePerPage))'), 'classic blog uses one page size for the limit and the offset');
+$check(!str_contains($user, 'ap_blog_posts_list($actorKey, true, 20,'), 'classic blog no longer pages 20 rows against a 40-row page count');
+$check(str_contains($admin, '($rpBlogPage - 1) * $rpBlogPerPage'), 'in-app blog offsets by the same page size it fetches');
+$check(str_contains($admin, 'Older blog posts'), 'in-app blog links to the next page when the count continues');
+$check(substr_count($headerRust, 'PROFILE_BLOG_PAGE_SQL,&[') === 2, 'Rust blog select and revalidation share the offset query');
+$check(str_contains((string) file_get_contents($root . '/api/ap-profile-native.php'), "\$request['page']"), 'native profile fetch passes the blog page');
+$native = (string) file_get_contents($root . '/api/ap-profile-native.php');
+$check(str_contains($native, "\$page===['source_count'=>0,'next_offset'=>0,'has_more'=>false]"), 'blog fragment source page stays the capped contract');
+
+$boostOwner = 4;
+$GLOBALS['db']->exec('CREATE TABLE masto_reblogs (
+    id INTEGER PRIMARY KEY,
+    owner_user_id INTEGER,
+    object_id TEXT,
+    status_id TEXT,
+    created_at TEXT
+)');
+$boostInsert = $GLOBALS['db']->prepare('INSERT INTO masto_reblogs (id, owner_user_id, object_id, status_id, created_at) VALUES (?, ?, ?, ?, ?)');
+$boostExpected = [];
+for ($i = 0; $i < 8; $i++) {
+    $object = 'https://remote.test/boost-' . $i;
+    $boostInsert->execute([$i + 1, $boostOwner, $object, 'status-' . $i, $stamp(60 - $i)]);
+    $boostExpected[] = $object;
+}
+$boostInsert->execute([50, 9, 'https://remote.test/other', 'other', $stamp(70)]);
+$boostPageSize = 3;
+$boostSeen = [];
+$boostOffset = 0;
+$boostPages = 0;
+while ($boostPages < 10) {
+    $rows = ap_masto_reblog_rows_for_html_profile($boostOwner, $boostPageSize, $boostOffset);
+    $boostPages++;
+    $objects = array_map(static fn(array $row): string => (string) $row['object_id'], $rows);
+    $check(count($objects) === count(array_unique($objects)), 'boost page has no duplicate objects');
+    foreach ($objects as $object) {
+        $check(!in_array($object, $boostSeen, true), 'boost cursor does not repeat ' . $object);
+        $boostSeen[] = $object;
+    }
+    if (count($objects) < $boostPageSize) {
+        break;
+    }
+    $boostOffset += $boostPageSize;
+}
+$check($boostPages >= 2, 'boosts need more than one page');
+$check($boostSeen === $boostExpected, 'walking boosts returns every row once, newest first');
+$check(array_slice($boostSeen, 0, $boostPageSize) !== array_slice($boostExpected, $boostPageSize, $boostPageSize), 'boost first page is not shifted by the page size');
+$check(ap_masto_reblog_count_for_html_profile($boostOwner) === count($boostExpected), 'boost count matches the walked rows');
+$check(str_contains($user, 'ap_masto_reblog_rows_for_html_profile($ownerId, $profilePerPage, ($profilePage - 1) * $profilePerPage)'), 'classic boosts offset with the profile page size');
+$check(str_contains($php, 'SELECT DISTINCT ON (object_id)'), 'in-app boosts collapse one object before the page offset');
+$check(str_contains($admin, '$profileOffset = max(0, (int) ($_GET[\'offset\'] ?? 0));'), 'profile scroll starts at offset 0 when the request omits it');
+
+$GLOBALS['db']->exec('CREATE TABLE masto_pins (status_local_id INTEGER, owner_user_id INTEGER, pinned_at TEXT)');
+$GLOBALS['db']->exec('CREATE TABLE masto_statuses (local_id INTEGER PRIMARY KEY, note_id TEXT, content TEXT)');
+$pinInsert = $GLOBALS['db']->prepare('INSERT INTO masto_pins (status_local_id, owner_user_id, pinned_at) VALUES (?, 7, ?)');
+$statusInsert = $GLOBALS['db']->prepare('INSERT INTO masto_statuses (local_id, note_id, content) VALUES (?, ?, ?)');
+$pinExpected = [];
+for ($i = 0; $i < 7; $i++) {
+    $note = 'https://mkultra.monster/users/pinwalk/notes/pin-' . $i;
+    $pinInsert->execute([$i + 1, $stamp(50 - $i)]);
+    $statusInsert->execute([$i + 1, $note, 'pin ' . $i]);
+    if ($i < 5) {
+        $pinExpected[] = $note;
+    }
+}
+$pins = array_map(
+    static fn(array $row): string => (string) $row['note_id'],
+    ap_masto_pinned_statuses(40, 'pinwalk')
+);
+$check($pins === $pinExpected, 'pinned tab is the five newest pins and does not start later');
+$check(count($pins) === count(array_unique($pins)), 'pinned tab has no duplicate notes');
+$check(ap_masto_pinned_statuses(5, 'pinwalk') === ap_masto_pinned_statuses(40, 'pinwalk'), 'the profile pin cap is the whole pinned list');
+
+$featuredOwner = 11;
+$featured = ap_featured_list($featuredOwner);
+$check($featured === [], 'featured list is empty before accounts are saved');
+$featInsert = $GLOBALS['db']->prepare('INSERT INTO ap_featured_accounts (owner_user_id, target_actor_id, position, created_at) VALUES (?, ?, ?, ?)');
+$featuredExpected = [];
+for ($i = 0; $i < 45; $i++) {
+    $actorId = 'https://remote.test/users/feat-' . $i;
+    $featInsert->execute([$featuredOwner, $actorId, $i, $stamp(10)]);
+    if ($i < 40) {
+        $featuredExpected[] = $actorId;
+    }
+}
+$featuredIds = array_map(
+    static fn(array $row): string => (string) $row['target_actor_id'],
+    ap_featured_list($featuredOwner)
+);
+$check($featuredIds === $featuredExpected, 'featured tab is the first 40 by position and does not skip the front');
+$check(count($featuredIds) === count(array_unique($featuredIds)), 'featured tab has no duplicate accounts');
+$check(ap_featured_count($featuredOwner) === count($featuredIds), 'featured count is the loaded list');
+
+$GLOBALS['db']->exec('CREATE TABLE ap_asks (
+    id INTEGER PRIMARY KEY,
+    owner_user_id INTEGER,
+    answered INTEGER,
+    answer_note_id TEXT,
+    question TEXT,
+    asker_actor TEXT,
+    created_at TEXT
+)');
+$askSql = "SELECT answer_note_id, question, asker_actor, created_at FROM ap_asks WHERE owner_user_id = ? AND answered = 1 AND answer_note_id IS NOT NULL AND answer_note_id <> '' ORDER BY created_at DESC LIMIT 200";
+$check(str_contains($admin, "answer_note_id <> \\'\\' ORDER BY created_at DESC LIMIT 200"), 'asks tab uses the newest 200 answers');
+$check(!preg_match('/FROM ap_asks WHERE owner_user_id = \? AND answered = 1[\s\S]{0,180}OFFSET/', $admin), 'asks window has no offset');
+$askInsert = $GLOBALS['db']->prepare('INSERT INTO ap_asks (id, owner_user_id, answered, answer_note_id, question, asker_actor, created_at) VALUES (?, 3, 1, ?, ?, ?, ?)');
+$askExpected = [];
+for ($i = 0; $i < 205; $i++) {
+    $note = 'https://mkultra.monster/users/askwalk/notes/ask-' . $i;
+    $askInsert->execute([$i + 1, $note, 'q' . $i, 'https://remote.test/users/asker', $stamp(100) . sprintf('%03d', 204 - $i)]);
+    if ($i < 200) {
+        $askExpected[] = $note;
+    }
+}
+$askRows = $GLOBALS['db']->prepare($askSql);
+$askRows->execute([3]);
+$askSeen = array_map(static fn(array $row): string => (string) $row['answer_note_id'], $askRows->fetchAll());
+$check($askSeen === $askExpected, 'asks window starts at the newest answer and stops at 200');
+$check(count($askSeen) === count(array_unique($askSeen)), 'asks window has no duplicate answers');
+
+$order = (string) file_get_contents($root . '/api/ap-profile-html.php');
+$check(str_contains($order, "['pinned', 'posts', 'replies', 'boosts', 'media', 'featured', 'blog']"), 'shared profile tab order has no likes tab');
+$check(str_contains($user, "['pinned', 'posts', 'media', 'replies', 'boosts', 'featured', 'blog']"), 'classic profile has no likes tab');
+$check(str_contains($admin, "['pinned', 'posts', 'replies', 'boosts', 'media', 'asks', 'featured', 'blog']"), 'in-app profile adds asks and has no likes tab');
 
 if ($failures !== []) {
     fwrite(STDERR, implode("\n", $failures) . "\n");

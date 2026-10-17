@@ -33962,6 +33962,8 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
           $rpBlogPost = null;
           $rpBlogSlug = '';
           $rpBlogCount = 0;
+          $rpBlogPage = 1;
+          $rpBlogPerPage = 40;
           $rpPostsStat = 0;
           $rpFollowingStat = 0;
           $rpFollowersStat = 0;
@@ -34171,9 +34173,17 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
                   if ($rpBlogSlug !== '' && function_exists('ap_blog_post_get')) {
                       $rpBlogPost = ap_blog_post_get((string) $rpLocalKey, $rpBlogSlug, true);
                   }
-                  // The posts tab only needs a badge count. The full list is the blog tab.
+                  // The posts tab only needs a badge count. The blog tab pages
+                  // with the same size the page count uses, or the tail never loads.
+                  $rpBlogPage = max(1, (int) ($_GET['page'] ?? 1));
+                  $rpBlogPerPage = 40;
                   if ($rpRequestedTab === 'blog' && $rpBlogSlug === '' && function_exists('ap_blog_posts_list')) {
-                      $rpBlogPosts = ap_blog_posts_list((string) $rpLocalKey, true, 40);
+                      $rpBlogPosts = ap_blog_posts_list(
+                          (string) $rpLocalKey,
+                          true,
+                          $rpBlogPerPage,
+                          ($rpBlogPage - 1) * $rpBlogPerPage
+                      );
                   }
                   if (function_exists('ap_blog_posts_count')) {
                       $rpBlogCount = ap_blog_posts_count((string) $rpLocalKey, true);
@@ -35617,6 +35627,12 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
                   <p><a class="btn btn-ghost" href="<?= h($rpTabHref . 'blog&post=' . rawurlencode((string) ($bp['slug'] ?? ''))) ?>">Read</a></p>
                 </article>
               <?php endforeach; ?>
+            <?php endif; ?>
+            <?php if (!is_array($rpBlogPost) && $rpBlogPage > 1): ?>
+              <p class="composer-actions"><a class="btn btn-ghost" href="<?= h($rpTabHref . 'blog' . ($rpBlogPage > 2 ? '&page=' . ($rpBlogPage - 1) : '')) ?>">Newer blog posts</a></p>
+            <?php endif; ?>
+            <?php if (!is_array($rpBlogPost) && $rpBlogCount > $rpBlogPage * $rpBlogPerPage): ?>
+              <p class="composer-actions"><a class="btn btn-ghost" href="<?= h($rpTabHref . 'blog&page=' . ($rpBlogPage + 1)) ?>">Older blog posts</a></p>
             <?php endif; ?>
           <?php elseif ($rpIsBsky): ?>
             <?php if ($rpTabItems[$rpTab] === []): ?>
