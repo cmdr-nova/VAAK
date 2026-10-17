@@ -469,11 +469,19 @@ function ap_user_json(array $doc, string $accept): void
 function ap_user_serve_collection_as2(string $actorKey, string $actorId, string $col, string $accept): void
 {
     if ($col === 'outbox') {
+        $pageSize = 50;
+        $page = max(1, (int) ($_GET['page'] ?? 1));
+        $total = function_exists('ap_outbox_shared_count') ? ap_outbox_shared_count($actorKey) : 0;
+        $rows = function_exists('ap_outbox_shared_list_page')
+            ? ap_outbox_shared_list_page($actorKey, $pageSize, ($page - 1) * $pageSize)
+            : ap_outbox_list($pageSize, $actorKey);
         $items = [];
-        foreach (ap_outbox_list(50, $actorKey) as $n) {
-            $vis = (string) ($n['visibility'] ?? 'public');
-            if (function_exists('ap_visibility_in_ap_outbox') && !ap_visibility_in_ap_outbox($vis)) {
-                continue;
+        foreach ($rows as $n) {
+            if (!function_exists('ap_outbox_shared_list_page')) {
+                $vis = (string) ($n['visibility'] ?? 'public');
+                if (function_exists('ap_visibility_in_ap_outbox') && !ap_visibility_in_ap_outbox($vis)) {
+                    continue;
+                }
             }
             $decoded = json_decode((string) ($n['raw_create_json'] ?? ''), true);
             if (!is_array($decoded)) {
@@ -484,17 +492,21 @@ function ap_user_serve_collection_as2(string $actorKey, string $actorId, string 
             }
             unset($decoded['@context']);
             $items[] = $decoded;
-            if (count($items) >= 50) {
-                break;
-            }
         }
         $doc = [
             '@context' => 'https://www.w3.org/ns/activitystreams',
-            'id' => $actorId . '/outbox',
-            'type' => 'OrderedCollection',
-            'totalItems' => count($items),
+            'id' => $actorId . '/outbox' . ($page > 1 ? '?page=' . $page : ''),
+            'type' => $page > 1 ? 'OrderedCollectionPage' : 'OrderedCollection',
+            'totalItems' => $total > 0 ? $total : count($items),
             'orderedItems' => $items,
         ];
+        if ($page > 1) {
+            $doc['partOf'] = $actorId . '/outbox';
+            $doc['prev'] = $actorId . '/outbox' . ($page > 2 ? '?page=' . ($page - 1) : '');
+        }
+        if ($page * $pageSize < $total) {
+            $doc['next'] = $actorId . '/outbox?page=' . ($page + 1);
+        }
     } elseif ($col === 'followers') {
         $items = [];
         foreach (ap_followers_list($actorId) as $r) {
@@ -599,8 +611,12 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
     $profileLastModifiedTs = strtotime((string) ($p['updated'] ?? $p['updated_at'] ?? '')) ?: 0;
     try {
         $db = ap_db();
-        $st = $db->prepare('SELECT COALESCE(MAX(published), \'\') FROM outbox_notes WHERE actor_key = ?');
-        $st->execute([$actorKey]);
+        // outbox_notes is keyed by note id, not actor_key. A failed lookup used
+        // to leave this seed empty, so If-None-Match kept a page from before
+        // newer posts. published may be timestamptz; do not COALESCE it with ''.
+        $notePrefix = 'https://mkultra.monster/users/' . rawurlencode(strtolower(trim($actorKey))) . '/%';
+        $st = $db->prepare('SELECT MAX(published) FROM outbox_notes WHERE id LIKE ?');
+        $st->execute([$notePrefix]);
         $latestOutbox = (string) ($st->fetchColumn() ?: '');
         if ($latestOutbox !== '') {
             $profileRevisionParts[] = $latestOutbox;
@@ -816,7 +832,7 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
         // Filtering replies after a mixed LIMIT stops once replies fill the window.
         $notes = ap_outbox_posts_list_page(
             $actorKey,
-            min(200, max($profilePerPage, $profilePage * $profilePerPage)),
+            $profileFetchLimit,
             0
         );
     } elseif (function_exists('ap_outbox_list_page')) {
@@ -834,7 +850,9 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
         if (function_exists('ap_visibility_on_html_profile') && !ap_visibility_on_html_profile($vis)) {
             continue;
         }
-        if (function_exists('ap_outbox_note_is_reply') && ap_outbox_note_is_reply($n)) {
+        // Media is already the public attachment page. Dropping replies after
+        // LIMIT skips those attachments and never shows them on a later page.
+        if ($tab !== 'media' && function_exists('ap_outbox_note_is_reply') && ap_outbox_note_is_reply($n)) {
             continue;
         }
         $publicNotes[] = $n;
@@ -1002,7 +1020,7 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
     $blogSlug = trim((string) ($_GET['post'] ?? ''));
     $blogPost = $blogSlug !== '' ? ap_blog_post_get($actorKey, $blogSlug, true) : null;
     $blogRows = $needsBlogRows
-        ? ap_blog_posts_list($actorKey, true, 20, max(0, ($profilePage - 1) * 20))
+        ? ap_blog_posts_list($actorKey, true, $profilePerPage, max(0, ($profilePage - 1) * $profilePerPage))
         : [];
     $blogCount = function_exists('ap_blog_posts_count')
         ? ap_blog_posts_count($actorKey, true)
@@ -1011,6 +1029,12 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
     foreach ($publicNotes as $mediaNote) {
         $create = json_decode((string) ($mediaNote['raw_create_json'] ?? ''), true);
         $noteObj = is_array($create) && is_array($create['object'] ?? null) ? $create['object'] : [];
+        if ($tab === 'media') {
+            // Keep every SQL row. An attachment that does not render still
+            // belongs on this page; skipping it would hide the note forever.
+            $mediaNotes[] = [$mediaNote, $noteObj];
+            continue;
+        }
         if ($noteObj && ap_user_note_media_html($noteObj, false) !== '') {
             $mediaNotes[] = [$mediaNote, $noteObj];
         }
@@ -1087,7 +1111,7 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
         ap_profile_order_tabs([
             'pinned' => $pinnedCount > 0 ? ['Pinned', $pinnedCount] : null,
             'posts' => ['Posts', $profileTotal + $profileBskyCount + $profileBoostTotal],
-            'replies' => $hideProfileReplies ? null : ['Replies', count($profileReplyNotes) + count($profileBskyReplies)],
+            'replies' => $hideProfileReplies ? null : ['Replies', (function_exists('ap_outbox_replies_count') ? ap_outbox_replies_count($actorKey) : count($profileReplyNotes)) + count($profileBskyReplies)],
             'boosts' => $hideProfileBoosts ? null : ['Boosts', $profileBoostTotal],
             'media' => [
                 'Media',
@@ -1143,7 +1167,12 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
             echo '<p class="muted">No public media posts yet.</p>';
         } else {
             foreach ($mediaNotes as [$mediaRow, $mediaObj]) {
-                echo '<article class="profile-media-item">' . ap_user_note_media_html($mediaObj, true);
+                $mediaHtml = is_array($mediaObj) ? ap_user_note_media_html($mediaObj, true) : '';
+                if ($mediaHtml === '') {
+                    echo ap_user_post_preview_html($actorKey, $mediaRow);
+                    continue;
+                }
+                echo '<article class="profile-media-item">' . $mediaHtml;
                 $mediaText = trim(strip_tags((string) ($mediaObj['content'] ?? $mediaRow['content'] ?? '')));
                 if ($mediaText !== '') {
                     echo '<div class="profile-media-caption">' . htmlspecialchars($mediaText, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '</div>';

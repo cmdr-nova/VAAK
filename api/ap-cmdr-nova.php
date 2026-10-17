@@ -137,10 +137,15 @@ if (preg_match('#^/users/cmdr_nova/(outbox|followers|following)$#', $path, $m)) 
         // Include public + unlisted; exclude followers-only (private).
         $merged = [];
         // Only this actor's notes — shared outbox_notes table also holds invitee posts
-        foreach (ap_outbox_list(80, 'cmdr_nova') as $n) {
-            $vis = (string) ($n['visibility'] ?? 'public');
-            if (function_exists('ap_visibility_in_ap_outbox') && !ap_visibility_in_ap_outbox($vis)) {
-                continue;
+        $cmdrOutboxRows = function_exists('ap_outbox_shared_list_page')
+            ? ap_outbox_shared_list_page('cmdr_nova', 80, 0)
+            : ap_outbox_list(80, 'cmdr_nova');
+        foreach ($cmdrOutboxRows as $n) {
+            if (!function_exists('ap_outbox_shared_list_page')) {
+                $vis = (string) ($n['visibility'] ?? 'public');
+                if (function_exists('ap_visibility_in_ap_outbox') && !ap_visibility_in_ap_outbox($vis)) {
+                    continue;
+                }
             }
             $decoded = json_decode((string) ($n['raw_create_json'] ?? ''), true);
             if (!is_array($decoded)) {

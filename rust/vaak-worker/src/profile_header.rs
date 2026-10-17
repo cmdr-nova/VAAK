@@ -16,7 +16,10 @@ fn h(v:&str)->String{actions::esc(v)}
 fn q(v:&str)->String{actions::query(v)}
 fn form_query(v:&str)->String{q(v).replace("%20","+").replace('~',"%7E")}
 #[derive(Clone,Default)]
-pub(crate) struct HeaderRequest{pub(crate) tab:String,pub(crate) from:String,pub(crate) post:String}
+pub(crate) struct HeaderRequest{pub(crate) tab:String,pub(crate) from:String,pub(crate) post:String,pub(crate) page:i64}
+const PROFILE_BLOG_PAGE:i64=40;
+const PROFILE_BLOG_PAGE_SQL:&str="SELECT to_jsonb(b) FROM vaak_blog_posts b WHERE actor_key=$1 AND status='published' ORDER BY COALESCE(published_at,updated_at) DESC,id DESC LIMIT 40 OFFSET $2";
+fn blog_list_offset(page:i64)->i64{(page.max(1)-1).saturating_mul(PROFILE_BLOG_PAGE)}
 #[derive(Clone,Default)]
 struct HeaderCounts{posts:i64,replies:i64,boosts:i64,media:i64,asks:i64,pinned:i64,featured:i64,blog:i64,following:i64,followers:i64}
 pub(crate) struct HeaderFacts{
@@ -25,7 +28,7 @@ pub(crate) struct HeaderFacts{
  following:bool,follows_you:bool,requested:bool,locked:bool,post_subscription:bool,
  moderation:ModerationContext,counts:HeaderCounts,name:String,bio:String,avatar:Option<String>,banner:Option<String>,fallback_avatar:String,
  emoji:HashMap<String,String>,fields:Vec<Value>,badges:Vec<String>,sl:Option<Value>,wow:Option<Value>,bridge:Option<Value>,bsky_handle:String,
- pin_rows:Vec<Value>,featured_rows:Vec<Value>,blog_rows:Vec<Value>,blog_post:Option<Value>,
+ pin_rows:Vec<Value>,featured_rows:Vec<Value>,blog_rows:Vec<Value>,blog_post:Option<Value>,blog_offset:i64,
  dependencies:Value,
 }
 impl HeaderFacts{
@@ -113,7 +116,7 @@ async fn resolve_local(db:&Client,key:&str,actor:&str,owner:i64,owner_actor:Stri
  let cfg=warm.map(|w|w.cfg());let mut counts=HeaderCounts::default();let prefix=format!("{canonical}/%");
  let total=cache::count(db,cfg,&format!("vaak:profile:outbox-count:v2:{key}"),60,"SELECT COUNT(*) FROM outbox_notes WHERE id LIKE $1 AND COALESCE(visibility, 'public') = 'public'",&[&prefix]).await?;
  if total>0{counts.replies=cache::count(db,cfg,&format!("vaak:profile:reply-count:v2:{key}"),60,"SELECT COUNT(*) FROM outbox_notes WHERE id LIKE $1 AND COALESCE(visibility, 'public') = 'public' AND TRIM(COALESCE(in_reply_to, '')) <> ''",&[&prefix]).await?;}
- counts.posts=(total-counts.replies).max(0);counts.media=cache::count(db,cfg,&format!("vaak:profile:media-count:v1:{key}"),60,"SELECT COUNT(*) FROM outbox_notes WHERE id LIKE $1 AND raw_create_json LIKE '%\"attachment\"%'",&[&prefix]).await?;
+ counts.posts=(total-counts.replies).max(0);counts.media=cache::count(db,cfg,&format!("vaak:profile:media-count:v2:{key}"),60,"SELECT COUNT(*) FROM outbox_notes WHERE id LIKE $1 AND COALESCE(visibility, 'public') = 'public' AND raw_create_json LIKE '%\"attachment\"%'",&[&prefix]).await?;
  if target_id>0&&!card::boolean(&profile,"hide_profile_boosts"){counts.boosts=cache::count(db,cfg,&format!("vaak:profile:boost-count:v1:{target_id}"),60,"SELECT COUNT(*) FROM masto_reblogs WHERE owner_user_id::bigint=$1",&[&target_id]).await?;}
  let pin_rows=db.query("SELECT to_jsonb(s) FROM masto_pins p INNER JOIN masto_statuses s ON s.local_id=p.status_local_id WHERE p.owner_user_id::bigint=$1 AND s.note_id LIKE $2 ORDER BY p.pinned_at DESC LIMIT 5",&[&target_id,&format!("{canonical}/notes/%")]).await?.iter().map(|r|r.get::<_,Value>(0)).collect::<Vec<_>>();counts.pinned=pin_rows.len()as i64;
  counts.asks=db.query_one("SELECT COUNT(*) FROM ap_asks WHERE owner_user_id::bigint=$1 AND answered::bigint=1 AND answer_note_id IS NOT NULL AND answer_note_id<>''",&[&target_id]).await?.get(0);
@@ -123,7 +126,8 @@ async fn resolve_local(db:&Client,key:&str,actor:&str,owner:i64,owner_actor:Stri
  let blog_post=if raw_slug.is_empty(){None}else{optional_rows(db,"vaak_blog_posts","SELECT to_jsonb(b) FROM vaak_blog_posts b WHERE actor_key=$1 AND slug=$2 AND status='published' LIMIT 1",&[&key,&raw_slug]).await?.into_iter().next()};
  let(requested_tab,effective_tab,from,blog_slug)=selection(request,&profile,&counts,blog_post.is_some());
  if effective_tab=="asks"{counts.asks=counts.asks.min(200);}
- let blog_rows=if requested_tab=="blog"&&blog_slug.is_empty(){optional_rows(db,"vaak_blog_posts","SELECT to_jsonb(b) FROM vaak_blog_posts b WHERE actor_key=$1 AND status='published' ORDER BY COALESCE(published_at,updated_at) DESC,id DESC LIMIT 40",&[&key]).await?}else{vec![]};
+ let blog_offset=if requested_tab=="blog"&&blog_slug.is_empty(){blog_list_offset(request.page)}else{0};
+ let blog_rows=if requested_tab=="blog"&&blog_slug.is_empty(){optional_rows(db,"vaak_blog_posts",PROFILE_BLOG_PAGE_SQL,&[&key,&blog_offset]).await?}else{vec![]};
  let mut following=false;let mut follows_you=false;let mut requested=false;let mut post_subscription=false;
  if !guest{
   let viewer=owner_actor.trim_end_matches('/');let viewers=vec![viewer.to_owned(),format!("{viewer}/")];let targets=vec![actor.to_owned(),slash];
@@ -150,7 +154,7 @@ async fn resolve_local(db:&Client,key:&str,actor:&str,owner:i64,owner_actor:Stri
  let locked=card::boolean(&profile,"manually_approves");let bio=crate::library::body::html_to_plain(s(&profile,"summary"));
  let fallback_avatar=facts::avatar(db,&Value::Null,actor).await?;
  anyhow::ensure!(dependencies==header_dependencies(db,key,actor,owner,&owner_actor,target_id,false).await?,"header dependencies changed during enrichment");
- Ok(HeaderFacts{dependencies,actor:actor.into(),key:key.into(),profile,current_profile,owner,owner_actor,csrf:csrf.into(),guest,is_own,requested_tab,effective_tab,from,blog_slug,tab_href,following,follows_you,requested,locked,post_subscription,moderation,counts,name,bio,avatar,banner,fallback_avatar,emoji,fields,badges,sl:links[0].take(),wow:links[1].take(),bridge:links[2].take(),bsky_handle:combined.handle,pin_rows,featured_rows,blog_rows,blog_post})
+ Ok(HeaderFacts{dependencies,actor:actor.into(),key:key.into(),profile,current_profile,owner,owner_actor,csrf:csrf.into(),guest,is_own,requested_tab,effective_tab,from,blog_slug,tab_href,following,follows_you,requested,locked,post_subscription,moderation,counts,name,bio,avatar,banner,fallback_avatar,emoji,fields,badges,sl:links[0].take(),wow:links[1].take(),bridge:links[2].take(),bsky_handle:combined.handle,pin_rows,featured_rows,blog_rows,blog_post,blog_offset})
 }
 pub(crate) struct BlockedHeaderFacts{actions:HeaderFacts,personal:bool,server:bool}
 impl BlockedHeaderFacts{pub(crate) async fn require_actions_current(&self,db:&Client)->Result<()>{self.actions.require_secondary_current(db).await}}
@@ -172,7 +176,7 @@ async fn resolve_blocked_local(db:&Client,key:&str,actor:&str,owner:i64,owner_ac
  // Cache-only identity; denied roots never enter profile/emoji/count/preview or warming helpers.
  let avatar=facts::avatar(db,&Value::Null,actor).await?;
  anyhow::ensure!(dependencies==header_dependencies(db,key,actor,owner,&owner_actor,card::integer(&target,"id"),true).await?,"blocked action dependencies changed during presentation");
- let actions=HeaderFacts{dependencies,actor:actor.into(),key:key.into(),profile:Value::Null,current_profile:Value::Null,owner,owner_actor,csrf:csrf.into(),guest,is_own,requested_tab:String::new(),effective_tab:String::new(),from,blog_slug:String::new(),tab_href:String::new(),following:false,follows_you:false,requested:false,locked:false,post_subscription:false,moderation,counts:HeaderCounts::default(),name:String::new(),bio:String::new(),avatar:None,banner:None,fallback_avatar:avatar,emoji:HashMap::new(),fields:vec![],badges:vec![],sl:None,wow:None,bridge:None,bsky_handle:String::new(),pin_rows:vec![],featured_rows:vec![],blog_rows:vec![],blog_post:None};
+ let actions=HeaderFacts{dependencies,actor:actor.into(),key:key.into(),profile:Value::Null,current_profile:Value::Null,owner,owner_actor,csrf:csrf.into(),guest,is_own,requested_tab:String::new(),effective_tab:String::new(),from,blog_slug:String::new(),tab_href:String::new(),following:false,follows_you:false,requested:false,locked:false,post_subscription:false,moderation,counts:HeaderCounts::default(),name:String::new(),bio:String::new(),avatar:None,banner:None,fallback_avatar:avatar,emoji:HashMap::new(),fields:vec![],badges:vec![],sl:None,wow:None,bridge:None,bsky_handle:String::new(),pin_rows:vec![],featured_rows:vec![],blog_rows:vec![],blog_post:None,blog_offset:0};
  Ok(BlockedHeaderFacts{actions,personal,server})
 }
 pub(crate) fn render_blocked(token:&crate::profile_context::AdmittedBlockedProfileHeader)->Result<String>{render_blocked_core(token.facts())}
@@ -185,7 +189,7 @@ impl HeaderFacts{
  pub(crate) async fn require_secondary_current(&self,db:&Client)->Result<()>{
   let target=self.current_target_snapshot(db).await?;
   anyhow::ensure!(self.dependencies==header_dependencies(db,&self.key,&self.actor,self.owner,&self.owner_actor,card::integer(&target,"id"),self.requested_tab.is_empty()).await?,"header durable dependencies changed before publication");
-  if self.requested_tab=="blog"&&self.blog_slug.is_empty(){let rows=optional_rows(db,"vaak_blog_posts","SELECT to_jsonb(b) FROM vaak_blog_posts b WHERE actor_key=$1 AND status='published' ORDER BY COALESCE(published_at,updated_at) DESC,id DESC LIMIT 40",&[&self.key]).await?;if rows!=self.blog_rows{bail!("published blog selection changed before publication")}}
+  if self.requested_tab=="blog"&&self.blog_slug.is_empty(){let rows=optional_rows(db,"vaak_blog_posts",PROFILE_BLOG_PAGE_SQL,&[&self.key,&self.blog_offset]).await?;if rows!=self.blog_rows{bail!("published blog selection changed before publication")}}
   if !self.blog_slug.is_empty(){let row=optional_rows(db,"vaak_blog_posts","SELECT to_jsonb(b) FROM vaak_blog_posts b WHERE actor_key=$1 AND slug=$2 AND status='published' LIMIT 1",&[&self.key,&self.blog_slug]).await?.into_iter().next();if row!=self.blog_post{bail!("published blog detail changed before publication")}}
   if self.requested_tab=="featured"{let rows=optional_rows(db,"ap_featured_accounts","SELECT to_jsonb(f) FROM ap_featured_accounts f WHERE owner_user_id::bigint=$1 ORDER BY position ASC,id ASC LIMIT 40",&[&card::integer(&self.current_target_snapshot(db).await?,"id")]).await?;if rows!=self.featured_rows{bail!("featured selection changed before publication")}}
   Ok(())
@@ -323,7 +327,7 @@ mod tests{
    moderation:ModerationContext{is_self:false,is_local:false,is_local_admin:false,is_wafrn:false,is_admin:false,personal_block_id:None,muted:false,deprioritized:false,global_kind:String::new(),global_id:0},
    counts:HeaderCounts::default(),name:String::new(),bio:String::new(),avatar:None,banner:None,fallback_avatar:String::new(),
    emoji:HashMap::new(),fields:vec![],badges:vec![],sl:None,wow:None,bridge:None,bsky_handle:String::new(),
-   pin_rows:vec![],featured_rows:vec![],blog_rows:vec![],blog_post:None,dependencies:Value::Null,
+   pin_rows:vec![],featured_rows:vec![],blog_rows:vec![],blog_post:None,blog_offset:0,dependencies:Value::Null,
   }
  }
  #[test]
@@ -352,6 +356,15 @@ mod tests{
   assert!(!counts.contains("\"type\":\"Mention\""));
   assert!(!counts.contains("class=\"%mention"));
   assert!(!counts.contains("class=''%mention"));
+ }
+ #[test]
+ fn media_count_and_blog_pages_stay_on_the_first_row(){
+  let source=include_str!("profile_header.rs");
+  assert!(source.contains("vaak:profile:media-count:v2:"));
+  assert!(!source.contains(&format!("media-count:v{}:", 1)));
+  assert!(source.contains("COALESCE(visibility, 'public') = 'public' AND raw_create_json LIKE"));
+  assert!(source.contains("LIMIT 40 OFFSET $2"));
+  assert!(!source.contains(&format!("{} DESC LIMIT 40\"", "id")));
  }
  #[test]
  fn second_life_icon_uses_shipped_svg(){
@@ -388,7 +401,7 @@ mod tests{
      let warm=std::env::var("PROFILE_HEADER_WARM").as_deref()==Ok("1");
      struct NoProcesses;impl crate::profile_warm::WarmTransport for NoProcesses{fn actor_process<'a>(&'a self,_:&'a str)->std::pin::Pin<Box<dyn std::future::Future<Output=bool>+Send+'a>>{Box::pin(async{panic!("local header must not warm remote actors")})}fn media_process(&self)->std::pin::Pin<Box<dyn std::future::Future<Output=bool>+Send+'_>>{Box::pin(async{panic!("local header must not warm remote media")})}}
      let mut cfg=crate::config::Config{database_url:String::new(),redis_url:"redis://127.0.0.1:1/0".into(),redis_queue_url:"redis://127.0.0.1:1/1".into(),jetstream_state:std::path::PathBuf::new(),default_owner_id:1,bsky_public_api:String::new(),notif_cache_dir:std::path::PathBuf::new(),phyrian_mutation_token:None,phyrian_bridge_url:String::new(),phyrian_bridge_secret:None};let redis_fixture=if !capture["redis_transport_input"].is_null(){let f=cache_fixture::RedisFixture::start(&capture["redis_transport_input"]).await?;cfg.redis_url=f.url.clone();Some(f)}else{None};let warm_context=std::sync::Arc::new(crate::profile_enrichment::WarmContext::new(cfg,std::sync::Arc::new(NoProcesses)));
-     let ctx=&capture["context"];let input=&capture["request"];let request=HeaderRequest{tab:s(input,"tab").into(),from:s(input,"from").into(),post:s(input,"post").into()};let owner=card::integer(ctx,"owner");
+     let ctx=&capture["context"];let input=&capture["request"];let request=HeaderRequest{tab:s(input,"tab").into(),from:s(input,"from").into(),post:s(input,"post").into(),page:input.get("page").and_then(Value::as_i64).unwrap_or(0)};let owner=card::integer(ctx,"owner");
      if card::boolean(ctx,"blocked"){
       let result=if owner>0{let mut session=AuthenticatedProfileSession::from_php_session(owner,s(ctx,"csrf").into(),s(ctx,"key").into(),s(ctx,"actor").into(),false,0)?;if warm{session=session.with_warm_context(warm_context.clone());}resolve_blocked_authenticated(&db,&session,&request).await}else{let mut session=GuestProfileSession::from_php_guest_profile(s(ctx,"key").into(),s(ctx,"actor").into(),false,0)?;if warm{session=session.with_warm_context(warm_context.clone());}resolve_blocked_guest(&db,&session,&request).await};
       match result{Ok(f)=>output.push(json!({"width":width,"case":capture["case"],"html":render_blocked_core(&f)?,"blocked":true})),Err(e)=>output.push(json!({"width":width,"case":capture["case"],"error":format!("{e:#}"),"html":""}))}if let Some(fixture)=&redis_fixture{if let Some(row)=output.last_mut(){row["redis_transport_effects"]=json!(*fixture.effects.lock().unwrap());}}continue;

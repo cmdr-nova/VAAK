@@ -6,7 +6,7 @@ use anyhow::Context;
 #[serde(deny_unknown_fields)]
 struct FullRequest {
  protocol_version:u8,viewer:Viewer,actor_key:String,actor:String,tab:String,
- from:String,post:String,shell:bool,lazy_media:bool,status_preview_budget:i64,
+ from:String,post:String,#[serde(default)]page:i64,shell:bool,lazy_media:bool,status_preview_budget:i64,
  quote_preview_budget:i64,#[serde(default)]bsky_budget_deadline:Option<f64>,
 }
 #[derive(Serialize)]
@@ -20,7 +20,7 @@ struct FullReply<'a>{protocol_version:u8,ok:bool,request_binding:FullBinding<'a>
 fn decode_full(bytes:&[u8])->Result<FullRequest>{
  if bytes.is_empty()||bytes.len()>MAX_BYTES{bail!("full profile request size")}
  let request:FullRequest=serde_json::from_slice(bytes)?;
- if !matches!(request.tab.as_str(),"posts"|"replies"|"boosts"|"media"|"pinned"|"asks"|"featured"|"blog")||request.protocol_version!=1||request.actor.len()>2048||request.actor_key.len()>80||request.tab.len()>32||request.from.len()>80||request.post.len()>256||!(0..=100).contains(&request.status_preview_budget)||request.bsky_budget_deadline.is_some_and(|value|!value.is_finite()){bail!("full profile request envelope")}
+ if !matches!(request.tab.as_str(),"posts"|"replies"|"boosts"|"media"|"pinned"|"asks"|"featured"|"blog")||request.protocol_version!=1||request.actor.len()>2048||request.actor_key.len()>80||request.tab.len()>32||request.from.len()>80||request.post.len()>256||!(0..=10_000).contains(&request.page)||!(0..=100).contains(&request.status_preview_budget)||request.bsky_budget_deadline.is_some_and(|value|!value.is_finite()){bail!("full profile request envelope")}
  if let Viewer::Authenticated{owner_id,csrf,..}=&request.viewer{if *owner_id<1||csrf.is_empty()||csrf.len()>4096{bail!("invalid full profile viewer")}}
  Ok(request)
 }
@@ -34,7 +34,7 @@ async fn paint_full_with_warm(db:&tokio_postgres::Client,request:&FullRequest,de
   Viewer::Guest{}=>{guest=crate::profile_context::GuestProfileSession::from_php_guest_profile(request.actor_key.clone(),request.actor.clone(),request.lazy_media,request.status_preview_budget)?.with_quote_preview_budget(request.quote_preview_budget).with_warm_context(warm);crate::profile_materialize::ProfileViewer::Guest(&guest)},
   Viewer::Authenticated{owner_id,csrf,bsky}=>{let mut session=crate::profile_context::AuthenticatedProfileSession::from_php_session(*owner_id,csrf.clone(),request.actor_key.clone(),request.actor.clone(),request.lazy_media,request.status_preview_budget)?.with_quote_preview_budget(request.quote_preview_budget).with_warm_context(warm);if let Some(bsky)=bsky{session=session.with_php_bsky(db,bsky.clone()).await?}authenticated=session;crate::profile_materialize::ProfileViewer::Auth(&authenticated)}
  };
- let header_request=crate::profile_header::HeaderRequest{tab:request.tab.clone(),from:request.from.clone(),post:request.post.clone()};
+ let header_request=crate::profile_header::HeaderRequest{tab:request.tab.clone(),from:request.from.clone(),post:request.post.clone(),page:request.page};
  let mut prepared=crate::profile_context::prepare_local_profile_first_paint(db,&viewer,&header_request,deps.dns).await?;
  #[cfg(test)] if let (Some(clock),crate::profile_context::LocalProfileFirstPaint::Timeline{body,..}|crate::profile_context::LocalProfileFirstPaint::Secondary{body,..})=(clock,&mut prepared){body.set_render_clock_for_fixture(clock)?;}
  #[cfg(not(test))] let _=clock;
