@@ -7696,7 +7696,7 @@ function ap_outbox_media_list_page(string $actorKey, int $limit = 40, int $offse
     try {
         $st = ap_db()->prepare(
             'SELECT * FROM outbox_notes
-             WHERE id LIKE ? AND raw_create_json LIKE \'%"attachment"%\'
+             WHERE id LIKE ? AND COALESCE(visibility, \'public\') = \'public\' AND raw_create_json LIKE \'%"attachment"%\'
              ORDER BY published DESC LIMIT ? OFFSET ?'
         );
         $st->execute([$prefix . '%', $limit, $offset]);
@@ -7712,7 +7712,7 @@ function ap_outbox_media_count(string $actorKey): int
     if ($actorKey === '') {
         return 0;
     }
-    $key = 'vaak:profile:media-count:v1:' . $actorKey;
+    $key = 'vaak:profile:media-count:v2:' . $actorKey;
     if (function_exists('ap_redis_json_get')) {
         $cached = ap_redis_json_get($key);
         if (is_array($cached) && isset($cached['count'])) {
@@ -7723,7 +7723,7 @@ function ap_outbox_media_count(string $actorKey): int
     try {
         $st = ap_db()->prepare(
             'SELECT COUNT(*) FROM outbox_notes
-             WHERE id LIKE ? AND raw_create_json LIKE \'%"attachment"%\''
+             WHERE id LIKE ? AND COALESCE(visibility, \'public\') = \'public\' AND raw_create_json LIKE \'%"attachment"%\''
         );
         $st->execute([$prefix . '%']);
         $count = max(0, (int) $st->fetchColumn());
@@ -7801,6 +7801,7 @@ function ap_outbox_drop_profile_note_caches(array $note): void
             'vaak:profile:outbox-count:v2:' . $storedKey,
             'vaak:profile:outbox-count:v1:' . $storedKey,
             'vaak:profile:reply-count:v2:' . $storedKey,
+            'vaak:profile:media-count:v2:' . $storedKey,
             'vaak:profile:media-count:v1:' . $storedKey
         );
     }
