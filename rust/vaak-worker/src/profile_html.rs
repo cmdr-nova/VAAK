@@ -412,34 +412,40 @@ async fn fetch_outbox_tab(
             .context("select outbox media tab")?
         }
         "replies" => {
-            let predicate = crate::profile_source::PROFILE_REPLIES_REPLY_SQL;
-            let sql = format!(
+            debug_assert_eq!(
+                crate::profile_source::PROFILE_REPLIES_REPLY_SQL,
+                "TRIM(COALESCE(in_reply_to, '')) <> ''"
+            );
+            db.query(
                 "SELECT id, COALESCE(published::text, ''), COALESCE(content, ''),
                         COALESCE(raw_create_json, ''), COALESCE(in_reply_to, '')
                  FROM outbox_notes
                  WHERE id LIKE $1 AND COALESCE(visibility, 'public') = 'public'
-                   AND {predicate}
+                   AND TRIM(COALESCE(in_reply_to, '')) <> ''
                  ORDER BY published DESC
-                 LIMIT $2 OFFSET $3"
-            );
-            db.query(&sql, &[&like, &limit, &offset])
-                .await
-                .context("select outbox replies tab")?
+                 LIMIT $2 OFFSET $3",
+                &[&like, &limit, &offset],
+            )
+            .await
+            .context("select outbox replies tab")?
         }
         _ => {
-            let predicate = crate::profile_source::PROFILE_POSTS_REPLY_SQL;
-            let sql = format!(
+            debug_assert_eq!(
+                crate::profile_source::PROFILE_POSTS_REPLY_SQL,
+                "TRIM(COALESCE(in_reply_to, '')) = ''"
+            );
+            db.query(
                 "SELECT id, COALESCE(published::text, ''), COALESCE(content, ''),
                         COALESCE(raw_create_json, ''), COALESCE(in_reply_to, '')
                  FROM outbox_notes
                  WHERE id LIKE $1 AND COALESCE(visibility, 'public') = 'public'
-                   AND {predicate}
+                   AND TRIM(COALESCE(in_reply_to, '')) = ''
                  ORDER BY published DESC
-                 LIMIT $2 OFFSET $3"
-            );
-            db.query(&sql, &[&like, &limit, &offset])
-                .await
-                .context("select outbox posts tab")?
+                 LIMIT $2 OFFSET $3",
+                &[&like, &limit, &offset],
+            )
+            .await
+            .context("select outbox posts tab")?
         }
     };
 
