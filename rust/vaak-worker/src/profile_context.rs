@@ -96,9 +96,10 @@ impl LocalProfileFirstPaint {
   Self::Timeline{header,body,actor,tab,..}=>{
    let h=crate::library::actions::esc;let mut html=crate::profile_header::render(header)?;html.push_str("<div class=\"remote-profile-posts\">");
    if body.page().source_count()==0{html.push_str(&format!("<div class=\"empty\">No {} available.</div>",h(tab)));}
-   html.push_str(&format!("<div id=\"timeline-items\" data-view=\"remote_profile\" data-actor=\"{}\" data-tab=\"{}\" data-offset=\"{}\" data-limit=\"12\" data-has-more=\"{}\" data-newest=\"0\">",h(actor),h(tab),body.page().next_offset(),u8::from(body.page().has_more())));
+   let more=crate::profile_source::profile_page_has_more(body.page().has_more(),body.page().next_offset(),body.page().source_count() as i64,header.facts().timeline_tab_total(tab));
+   html.push_str(&format!("<div id=\"timeline-items\" data-view=\"remote_profile\" data-actor=\"{}\" data-tab=\"{}\" data-offset=\"{}\" data-limit=\"12\" data-has-more=\"{}\" data-newest=\"0\">",h(actor),h(tab),body.page().next_offset(),u8::from(more)));
    for(_,card)in body.cards(){html.push_str(card);}
-   html.push_str(&format!("</div><div id=\"timeline-status\" class=\"meta\" style=\"padding:.75rem 0;text-align:center\">{}</div><div id=\"timeline-sentinel\" aria-hidden=\"true\" style=\"height:1px\"></div><button type=\"button\" class=\"feed-top-btn\" id=\"feed-top-btn\" title=\"Back to top\" aria-label=\"Back to top\">↑</button></div>",if body.page().has_more(){"Scroll for more…"}else{"End of profile"}));Ok(html)
+   html.push_str(&format!("</div><div id=\"timeline-status\" class=\"meta\" style=\"padding:.75rem 0;text-align:center\">{}</div><div id=\"timeline-sentinel\" aria-hidden=\"true\" style=\"height:1px\"></div><button type=\"button\" class=\"feed-top-btn\" id=\"feed-top-btn\" title=\"Back to top\" aria-label=\"Back to top\">↑</button></div>",crate::profile_source::profile_scroll_status(more)));Ok(html)
   }
  }}
 }
