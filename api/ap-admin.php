@@ -39360,12 +39360,6 @@ window.vaakBootStatusThread();
 
 <script>
 (function () {
-  /** Profile end marker. More items keep the scroll prompt; only an explicit end says so. */
-  function profileScrollStatus(more) {
-    return more ? 'Scroll for more…' : 'End of profile';
-  }
-  window.vaakProfileScrollStatus = profileScrollStatus;
-
   /** Replace a timeline card in place without jumping scroll to the top. */
   function replaceCardInPlace(oldEl, html) {
     const wrap = document.createElement('div');
@@ -39384,6 +39378,12 @@ window.vaakBootStatusThread();
     }
     return neu;
   }
+
+  /** Profile end marker. More items keep the scroll prompt; only an explicit end says so. */
+  function profileScrollStatus(more) {
+    return more ? 'Scroll for more…' : 'End of profile';
+  }
+  window.vaakProfileScrollStatus = profileScrollStatus;
 
   // Progressive boost / empty-Create hydration: signed remote fetch while you
   // scroll, swapping each card in place (never reloads / never jumps to top).
