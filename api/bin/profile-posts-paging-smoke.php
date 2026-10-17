@@ -37,7 +37,11 @@ function ap_db_driver(PDO $db): string
 }
 function ap_db_owner_user_id_for_actor(string $actorKey): int
 {
-    return strtolower($actorKey) === 'pinwalk' ? 7 : 0;
+    return match (strtolower($actorKey)) {
+        'pinwalk' => 7,
+        'guestflux' => 9,
+        default => 0,
+    };
 }
 
 reference_load($root . '/api/ap-db.php', [
@@ -52,6 +56,8 @@ reference_load($root . '/api/ap-db.php', [
     'ap_outbox_count_for_actor',
     'ap_outbox_cached_count',
     'ap_outbox_drop_profile_note_caches',
+    'ap_outbox_shared_list_page',
+    'ap_outbox_shared_count',
     'ap_local_profile_tab_page',
     'ap_blog_tags_decode',
     'ap_blog_posts_list',
@@ -59,6 +65,9 @@ reference_load($root . '/api/ap-db.php', [
     'ap_masto_pinned_statuses',
     'ap_masto_reblog_rows_for_html_profile',
     'ap_masto_reblog_count_for_html_profile',
+]);
+reference_load($root . '/api/ap-feeds.php', [
+    'ap_feed_public_rows',
 ]);
 reference_load($root . '/api/ap-featured.php', [
     'ap_featured_schema_ensure',
@@ -102,6 +111,7 @@ $drop = ($dropStart !== false && $dropEnd !== false) ? substr($php, $dropStart, 
 $check(str_contains($store, "function_exists('ap_outbox_drop_profile_note_caches')"), 'storing a note drops profile caches when that helper is loaded');
 $check(str_contains($drop, 'vaak:profile:outbox-count:v2:') && str_contains($drop, 'vaak:profile:reply-count:v2:'), 'a stored note drops the public profile count caches');
 $check(str_contains($drop, 'vaak:profile:media-count:v2:') && str_contains($drop, 'vaak:profile:media-count:v1:'), 'a stored note drops the current and previous media counts');
+$check(str_contains($drop, 'vaak:profile:outbox-shared-count:v1:'), 'a stored note drops the public outbox collection count');
 $check(str_contains($drop, 'ap_public_doc_invalidate_note') && str_contains($drop, 'ap_public_doc_invalidate_actor'), 'a stored note drops the public note and actor documents');
 $check(str_contains($drop, "function_exists('ap_redis_delete')") && str_contains($drop, "function_exists('ap_public_doc_invalidate_note')"), 'cache drops are optional so isolated stores still insert');
 
@@ -558,6 +568,265 @@ $order = (string) file_get_contents($root . '/api/ap-profile-html.php');
 $check(str_contains($order, "['pinned', 'posts', 'replies', 'boosts', 'media', 'featured', 'blog']"), 'shared profile tab order has no likes tab');
 $check(str_contains($user, "['pinned', 'posts', 'media', 'replies', 'boosts', 'featured', 'blog']"), 'classic profile has no likes tab');
 $check(str_contains($admin, "['pinned', 'posts', 'replies', 'boosts', 'media', 'asks', 'featured', 'blog']"), 'in-app profile adds asks and has no likes tab');
+
+// Guest and other logged-out profile surfaces. The in-app guest view paints
+// the same remote_profile page, so its tabs use the same SQL. The classic
+// HTML page, ActivityPub outbox, and RSS/Atom feed are separate readers.
+$guest = 'guestflux';
+$guestPrefix = 'https://mkultra.monster/users/' . $guest . '/notes/';
+$guestPosts = [];
+$guestReplies = [];
+$guestMedia = [];
+$guestShared = [];
+$guestTime = 80;
+for ($i = 0; $i < 3; $i++) {
+    $insert->execute([$guestPrefix . 'private-' . $i, 'private ' . $i, null, 'private', '{}', $stamp($guestTime)]);
+    $guestTime--;
+}
+for ($i = 0; $i < 2; $i++) {
+    $id = $guestPrefix . 'unlisted-' . $i;
+    $insert->execute([$id, 'unlisted ' . $i, null, 'unlisted', '{}', $stamp($guestTime)]);
+    $guestShared[] = $id;
+    $guestTime--;
+}
+for ($i = 0; $i < 2; $i++) {
+    $insert->execute([$guestPrefix . 'local-' . $i, 'local ' . $i, '', 'local', '{}', $stamp($guestTime)]);
+    $guestTime--;
+}
+for ($i = 0; $i < 8; $i++) {
+    $id = $guestPrefix . 'post-' . $i;
+    $content = $i === 1
+        ? '<p><a class="mention hashtag" href="https://mkultra.monster/tags/flux">#flux</a></p>'
+        : ($i === 2 ? '<p><a class="mention" href="https://mkultra.monster/users/ada">@ada</a></p>' : 'guest post ' . $i);
+    $raw = $i < 2 ? '{"attachment":[{"type":"Image"}]}' : '{}';
+    $insert->execute([$id, $content, $i % 2 === 0 ? null : '', 'public', $raw, $stamp($guestTime)]);
+    $guestPosts[] = $id;
+    $guestShared[] = $id;
+    if ($i < 2) {
+        $guestMedia[] = $id;
+    }
+    $guestTime--;
+}
+for ($i = 0; $i < 4; $i++) {
+    $id = $guestPrefix . 'reply-' . $i;
+    $raw = $i === 0 ? '{"attachment":[{"type":"Image"}]}' : '{}';
+    $insert->execute([$id, 'guest reply ' . $i, $replyTo('guest-' . $i), 'public', $raw, $stamp($guestTime)]);
+    $guestReplies[] = $id;
+    $guestShared[] = $id;
+    if ($i === 0) {
+        $guestMedia[] = $id;
+    }
+    $guestTime--;
+}
+$guestPublicTotal = ap_outbox_count_for_actor($guest);
+$guestReplyTotal = ap_outbox_replies_count($guest);
+$guestPostTotal = max(0, $guestPublicTotal - $guestReplyTotal);
+$check($guestPostTotal === count($guestPosts), 'guest Posts header counts public notes minus real replies');
+$check($guestReplyTotal === count($guestReplies), 'guest Replies header counts only public notes with in_reply_to');
+$check(ap_outbox_media_count($guest) === count($guestMedia), 'guest Media header counts public attachments, including a reply');
+$check(ap_outbox_shared_count($guest) === count($guestShared), 'public outbox total counts public and unlisted notes');
+$check($guestPostTotal === 8 && $guestReplyTotal === 4, 'guest counts leave hashtags and mentions on Posts');
+
+$guestWalk = static function (string $tab, array $expected, int $pageSize) use ($check, $guest): array {
+    $seen = [];
+    $offset = 0;
+    $pages = 0;
+    while ($pages < 12) {
+        $page = ap_local_profile_tab_page($guest, 'https://mkultra.monster/users/' . $guest, $tab, $pageSize, $offset);
+        $pages++;
+        $ids = array_map(static fn(array $row): string => (string) $row['id'], $page['items']);
+        $check(count($ids) === count(array_unique($ids)), 'guest ' . $tab . ' page has no duplicates');
+        foreach ($ids as $id) {
+            $check(!in_array($id, $seen, true), 'guest ' . $tab . ' cursor does not repeat an item');
+            $seen[] = $id;
+        }
+        $check((int) $page['next_offset'] === $offset + count($ids), 'guest ' . $tab . ' next offset follows the rows just returned');
+        if (empty($page['has_more'])) {
+            break;
+        }
+        $offset = (int) $page['next_offset'];
+    }
+    $check($seen === $expected, 'guest ' . $tab . ' walk returns every public row, newest first');
+    $check($pages > 1, 'guest ' . $tab . ' walk crosses a page boundary');
+    return $seen;
+};
+$guestWalk('posts', $guestPosts, 3);
+$guestWalk('replies', $guestReplies, 2);
+$guestWalk('media', $guestMedia, 2);
+$check(array_slice($guestWalk('posts', $guestPosts, 3), 0, 1) === [$guestPosts[0]], 'guest posts first page starts at the newest public post');
+
+$classicPage = 40;
+$classicActor = 'publichtml';
+$classicPrefix = 'https://mkultra.monster/users/' . $classicActor . '/notes/';
+$classicExpected = [];
+for ($i = 0; $i < 210; $i++) {
+    $id = $classicPrefix . 'post-' . $i;
+    $insert->execute([$id, 'html ' . $i, null, 'public', '{}', sprintf('2026-10-16T00:%02d:%02dZ', intdiv(209 - $i, 60), (209 - $i) % 60)]);
+    $classicExpected[] = $id;
+}
+$insert->execute([$classicPrefix . 'reply-hidden', 'reply', $replyTo('html'), 'public', '{}', '2026-10-16T23:59:59Z']);
+$insert->execute([$classicPrefix . 'private-hidden', 'private', null, 'private', '{}', '2026-10-16T23:59:58Z']);
+$classicSeen = [];
+$classicPageNo = 1;
+while ($classicPageNo < 20) {
+    $window = min(5000, max($classicPage, $classicPageNo * $classicPage));
+    $rows = ap_outbox_posts_list_page($classicActor, $window, 0);
+    $slice = array_slice($rows, ($classicPageNo - 1) * $classicPage, $classicPage);
+    $ids = array_map(static fn(array $row): string => (string) $row['id'], $slice);
+    foreach ($ids as $id) {
+        $check(!in_array($id, $classicSeen, true), 'public HTML posts page does not repeat ' . $id);
+        $classicSeen[] = $id;
+    }
+    if (count($ids) < $classicPage) {
+        break;
+    }
+    $classicPageNo++;
+}
+$check($classicSeen === $classicExpected, 'public HTML posts walk passes the old 200-row cap');
+$check($classicPageNo > 5, 'public HTML posts walk uses more than five pages');
+$check(str_contains($user, 'ap_outbox_posts_list_page(' . "\n" . '            $actorKey,' . "\n" . '            $profileFetchLimit,'), 'public HTML posts uses the merged profile prefix');
+$check(!str_contains($user, 'min(200, max($profilePerPage, $profilePage * $profilePerPage))'), 'public HTML posts is not capped at 200 rows');
+$check(str_contains($user, "['Replies', (function_exists('ap_outbox_replies_count') ? ap_outbox_replies_count(\$actorKey)"), 'public HTML Replies badge uses the reply count');
+
+$classicReplies = [];
+$classicReplyOffset = 0;
+while (count($classicReplies) < 20) {
+    $rows = ap_outbox_replies_list_page($guest, 2, $classicReplyOffset);
+    if ($rows === []) {
+        break;
+    }
+    foreach ($rows as $row) {
+        $classicReplies[] = (string) $row['id'];
+    }
+    $classicReplyOffset += 2;
+}
+$check($classicReplies === $guestReplies, 'public HTML replies walk matches the guest reply count');
+$classicMedia = [];
+$classicMediaOffset = 0;
+while (count($classicMedia) < 20) {
+    $rows = ap_outbox_media_list_page($guest, 2, $classicMediaOffset);
+    if ($rows === []) {
+        break;
+    }
+    foreach ($rows as $row) {
+        $classicMedia[] = (string) $row['id'];
+    }
+    $classicMediaOffset += 2;
+}
+$check($classicMedia === $guestMedia, 'public HTML media walk keeps the reply attachment');
+
+$sharedSeen = [];
+$sharedOffset = 0;
+while (count($sharedSeen) < 40) {
+    $rows = ap_outbox_shared_list_page($guest, 4, $sharedOffset);
+    if ($rows === []) {
+        break;
+    }
+    foreach ($rows as $row) {
+        $sharedSeen[] = (string) $row['id'];
+    }
+    $sharedOffset += 4;
+}
+$check($sharedSeen === $guestShared, 'public outbox walk skips private and local notes and keeps unlisted notes');
+$check(array_map(static fn(array $row): string => (string) $row['id'], ap_feed_public_rows($guest, 4)) === array_slice($guestShared, 0, 4), 'public RSS and Atom start at the newest shared note');
+$check(str_contains((string) file_get_contents($root . '/api/ap-feeds.php'), 'ap_outbox_shared_list_page'), 'RSS and Atom filter visibility in the query');
+$check(str_contains($user, 'ap_outbox_shared_list_page'), 'ActivityPub outbox pages the shared query');
+$check(str_contains((string) file_get_contents($root . '/api/ap-cmdr-nova.php'), 'ap_outbox_shared_list_page'), 'cmdr outbox pages the shared query');
+
+$guestBoosts = [];
+for ($i = 0; $i < 5; $i++) {
+    $object = 'https://remote.test/guest-boost-' . $i;
+    $boostInsert->execute([60 + $i, 9, $object, 'guest-' . $i, $stamp(40 - $i)]);
+    $guestBoosts[] = $object;
+}
+$guestBoostExpected = array_merge(['https://remote.test/other'], $guestBoosts);
+$guestBoostSeen = [];
+$guestBoostOffset = 0;
+while (count($guestBoostSeen) < 20) {
+    $rows = ap_masto_reblog_rows_for_html_profile(9, 2, $guestBoostOffset);
+    if ($rows === []) {
+        break;
+    }
+    foreach ($rows as $row) {
+        $guestBoostSeen[] = (string) $row['object_id'];
+    }
+    $guestBoostOffset += 2;
+}
+$check($guestBoostSeen === $guestBoostExpected, 'guest boosts walk every public boost, newest first');
+
+$guestPinInsert = $GLOBALS['db']->prepare('INSERT INTO masto_pins (status_local_id, owner_user_id, pinned_at) VALUES (?, 9, ?)');
+for ($i = 0; $i < 7; $i++) {
+    $note = $guestPrefix . 'pin-' . $i;
+    $statusInsert->execute([100 + $i, $note, 'guest pin ' . $i]);
+    $guestPinInsert->execute([100 + $i, $stamp(30 - $i)]);
+}
+$guestPins = array_map(
+    static fn(array $row): string => (string) $row['note_id'],
+    ap_masto_pinned_statuses(40, $guest)
+);
+$check($guestPins === [
+    $guestPrefix . 'pin-0',
+    $guestPrefix . 'pin-1',
+    $guestPrefix . 'pin-2',
+    $guestPrefix . 'pin-3',
+    $guestPrefix . 'pin-4',
+], 'guest pinned tab is the five newest pins');
+
+$guestFeaturedExpected = [];
+for ($i = 0; $i < 42; $i++) {
+    $actorId = 'https://remote.test/users/guest-feat-' . $i;
+    $featInsert->execute([12, $actorId, $i, $stamp(10)]);
+    if ($i < 40) {
+        $guestFeaturedExpected[] = $actorId;
+    }
+}
+$guestFeatured = array_map(
+    static fn(array $row): string => (string) $row['target_actor_id'],
+    ap_featured_list(12)
+);
+$check($guestFeatured === $guestFeaturedExpected, 'guest featured tab walks the first page of 40');
+
+$guestBlogExpected = [];
+for ($i = 0; $i < 5; $i++) {
+    $slug = 'guest-' . $i;
+    $blogInsert->execute([200 + $i, $guest, $slug, 'Guest ' . $i, 'published', $stamp(20 - $i), $stamp(20 - $i), '', '[]', '']);
+    $guestBlogExpected[] = $slug;
+}
+$blogInsert->execute([230, $guest, 'guest-draft', 'Draft', 'draft', $stamp(29), $stamp(29), '', '[]', '']);
+$guestBlogSeen = [];
+$guestBlogOffset = 0;
+while (count($guestBlogSeen) < 20) {
+    $rows = ap_blog_posts_list($guest, true, 2, $guestBlogOffset);
+    if ($rows === []) {
+        break;
+    }
+    foreach ($rows as $row) {
+        $guestBlogSeen[] = (string) $row['slug'];
+    }
+    $guestBlogOffset += 2;
+}
+$check($guestBlogSeen === $guestBlogExpected, 'guest blog walk returns every published post');
+$check(ap_blog_posts_count($guest, true) === count($guestBlogExpected), 'guest blog count matches the walked posts');
+
+$guestAskExpected = [];
+$guestAskInsert = $GLOBALS['db']->prepare('INSERT INTO ap_asks (id, owner_user_id, answered, answer_note_id, question, asker_actor, created_at) VALUES (?, 9, 1, ?, ?, ?, ?)');
+for ($i = 0; $i < 4; $i++) {
+    $note = $guestPrefix . 'ask-' . $i;
+    $guestAskInsert->execute([300 + $i, $note, 'guest q' . $i, 'https://remote.test/users/asker', $stamp(15) . sprintf('%03d', 3 - $i)]);
+    $guestAskExpected[] = $note;
+}
+$guestAskRows = $GLOBALS['db']->prepare($askSql);
+$guestAskRows->execute([9]);
+$guestAsks = array_map(static fn(array $row): string => (string) $row['answer_note_id'], $guestAskRows->fetchAll());
+$check($guestAsks === $guestAskExpected, 'guest asks window starts at the newest answer');
+
+$index = (string) file_get_contents($root . '/vaak/index.php');
+$route = (string) file_get_contents($root . '/api/ap-vaak-profile-route.php');
+$headerRs = (string) file_get_contents($root . '/rust/vaak-worker/src/profile_header.rs');
+$check(str_contains($index, "\$GLOBALS['vaak_guest_profile'] = true") && str_contains($index, 'remote_profile'), 'logged-out scroll fetches the guest profile');
+$check(str_contains($route, "\$GLOBALS['vaak_guest_profile'] = true"), 'logged-out profile route paints the guest profile');
+$check(str_contains($admin, 'ap_local_profile_tab_page('), 'guest and signed-in tabs share the paged profile query');
+$check(str_contains($headerRs, 'fn resolve_guest') && str_contains($headerRs, 'resolve_local('), 'Rust guest header uses the signed-in public counts');
 
 if ($failures !== []) {
     fwrite(STDERR, implode("\n", $failures) . "\n");
