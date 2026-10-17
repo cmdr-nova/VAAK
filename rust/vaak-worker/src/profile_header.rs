@@ -111,8 +111,8 @@ async fn resolve_local(db:&Client,key:&str,actor:&str,owner:i64,owner_actor:Stri
  let profile=cache::profile(warm.map(|w|w.cfg()),key,&current_profile).await;
  let is_own=actor.trim_end_matches('/')==owner_actor.trim_end_matches('/')&&!guest;
  let cfg=warm.map(|w|w.cfg());let mut counts=HeaderCounts::default();let prefix=format!("{canonical}/%");
- let total=cache::count(db,cfg,&format!("vaak:profile:outbox-count:v1:{key}"),60,"SELECT COUNT(*) FROM outbox_notes WHERE id LIKE $1",&[&prefix]).await?;
- if total>0{counts.replies=cache::count(db,cfg,&format!("vaak:profile:reply-count:v1:{key}"),60,"SELECT COUNT(*) FROM outbox_notes WHERE id LIKE $1 AND (TRIM(COALESCE(in_reply_to,''))<>'' OR raw_create_json LIKE '%\"type\":\"Mention\"%' OR raw_create_json LIKE '%\"type\": \"Mention\"%' OR content LIKE '%class=\"%mention%' OR content LIKE '%class=''%mention%')",&[&prefix]).await?;}
+ let total=cache::count(db,cfg,&format!("vaak:profile:outbox-count:v2:{key}"),60,"SELECT COUNT(*) FROM outbox_notes WHERE id LIKE $1 AND COALESCE(visibility, 'public') = 'public'",&[&prefix]).await?;
+ if total>0{counts.replies=cache::count(db,cfg,&format!("vaak:profile:reply-count:v2:{key}"),60,"SELECT COUNT(*) FROM outbox_notes WHERE id LIKE $1 AND COALESCE(visibility, 'public') = 'public' AND TRIM(COALESCE(in_reply_to, '')) <> ''",&[&prefix]).await?;}
  counts.posts=(total-counts.replies).max(0);counts.media=cache::count(db,cfg,&format!("vaak:profile:media-count:v1:{key}"),60,"SELECT COUNT(*) FROM outbox_notes WHERE id LIKE $1 AND raw_create_json LIKE '%\"attachment\"%'",&[&prefix]).await?;
  if target_id>0&&!card::boolean(&profile,"hide_profile_boosts"){counts.boosts=cache::count(db,cfg,&format!("vaak:profile:boost-count:v1:{target_id}"),60,"SELECT COUNT(*) FROM masto_reblogs WHERE owner_user_id::bigint=$1",&[&target_id]).await?;}
  let pin_rows=db.query("SELECT to_jsonb(s) FROM masto_pins p INNER JOIN masto_statuses s ON s.local_id=p.status_local_id WHERE p.owner_user_id::bigint=$1 AND s.note_id LIKE $2 ORDER BY p.pinned_at DESC LIMIT 5",&[&target_id,&format!("{canonical}/notes/%")]).await?.iter().map(|r|r.get::<_,Value>(0)).collect::<Vec<_>>();counts.pinned=pin_rows.len()as i64;
@@ -294,6 +294,21 @@ fn render_core(f:&HeaderFacts)->Result<String>{
  }out.push_str("</div></article>");out.push_str(&tabs_html(f));Ok(out)
 }
 pub(crate) fn render(token:&crate::profile_context::AdmittedProfileHeader)->Result<String>{render_core(token.facts())}
+/// Tab placement shared with PHP `ap_outbox_note_is_reply`.
+/// A reply needs `in_reply_to`. Hashtags and top-level mentions stay posts.
+/// Hashtags or mentions on a real reply do not move it to Posts.
+/// Only public notes (NULL visibility counts as public) appear on those tabs.
+pub(crate) fn profile_reply_split(row:&Value)->Value{
+ let reply=profile_note_is_reply(row);let public=profile_note_on_public_profile(row);
+ json!({"reply":reply,"public_profile":public,"posts":public&&!reply,"replies":public&&reply})
+}
+fn profile_note_is_reply(row:&Value)->bool{
+ let raw=match row.get("in_reply_to"){Some(Value::String(text))=>text.as_str(),Some(Value::Null)|None=>"",_=>return false};
+ !card::php_trim(raw).is_empty()
+}
+fn profile_note_on_public_profile(row:&Value)->bool{
+ match row.get("visibility"){None|Some(Value::Null)=>true,Some(Value::String(text))=>text=="public",_=>false}
+}
 #[cfg(test)]
 #[path="profile_header_cache_fixture.rs"]
 mod cache_fixture;
@@ -310,6 +325,33 @@ mod tests{
    emoji:HashMap::new(),fields:vec![],badges:vec![],sl:None,wow:None,bridge:None,bsky_handle:String::new(),
    pin_rows:vec![],featured_rows:vec![],blog_rows:vec![],blog_post:None,dependencies:Value::Null,
   }
+ }
+ #[test]
+ fn public_profile_counts_only_real_replies(){
+  let hashtag=json!({"in_reply_to":null,"visibility":"public","content":"<p><a class=\"mention hashtag\" href=\"https://mkultra.monster/tags/flux\">#flux</a></p>","raw_create_json":"{\"tag\":[{\"type\":\"Hashtag\"}]}"});
+  let mention=json!({"in_reply_to":"","visibility":"public","content":"<p><a class=\"mention\" href=\"https://mkultra.monster/users/ada\">@ada</a></p>","raw_create_json":"{\"type\":\"Mention\"} {\"type\": \"Mention\"}"});
+  let reply=json!({"in_reply_to":" https://mkultra.monster/users/ada/notes/parent ","visibility":"public","content":"A plain reply"});
+  let reply_hashtag=json!({"in_reply_to":"https://mkultra.monster/users/ada/notes/parent","visibility":"public","content":"<p><a class=\"mention hashtag\" href=\"https://mkultra.monster/tags/flux\">#flux</a></p>","raw_create_json":"{\"tag\":[{\"type\":\"Hashtag\"},{\"type\": \"Hashtag\"}]}"});
+  let reply_mention=json!({"in_reply_to":"https://mkultra.monster/users/ada/notes/parent","visibility":"public","content":"<p><a class=\"mention\" href=\"https://mkultra.monster/users/ada\">@ada</a> <a class='mention'>@bea</a></p>","raw_create_json":"{\"type\":\"Mention\"} {\"type\": \"Mention\"}"});
+  let local=json!({"in_reply_to":null,"visibility":"local","content":"<p><a class=\"mention hashtag\">#local</a> <a class=\"mention\">@ada</a></p>","raw_create_json":"{\"type\":\"Mention\"}"});
+  assert_eq!(profile_reply_split(&hashtag),json!({"reply":false,"public_profile":true,"posts":true,"replies":false}));
+  assert_eq!(profile_reply_split(&mention),json!({"reply":false,"public_profile":true,"posts":true,"replies":false}));
+  assert_eq!(profile_reply_split(&reply),json!({"reply":true,"public_profile":true,"posts":false,"replies":true}));
+  assert_eq!(profile_reply_split(&reply_hashtag),json!({"reply":true,"public_profile":true,"posts":false,"replies":true}));
+  assert_eq!(profile_reply_split(&reply_mention),json!({"reply":true,"public_profile":true,"posts":false,"replies":true}));
+  assert_eq!(profile_reply_split(&local),json!({"reply":false,"public_profile":false,"posts":false,"replies":false}));
+  assert_eq!(profile_reply_split(&json!({"in_reply_to":"https://mkultra.monster/users/ada/notes/parent","visibility":"private"})),json!({"reply":true,"public_profile":false,"posts":false,"replies":false}));
+  assert_eq!(profile_reply_split(&json!({})),json!({"reply":false,"public_profile":true,"posts":true,"replies":false}));
+  let source=include_str!("profile_header.rs");
+  let counts=source.split("pub(crate) fn profile_reply_split").next().unwrap();
+  assert!(counts.contains("vaak:profile:reply-count:v2:"));
+  assert!(counts.contains("vaak:profile:outbox-count:v2:"));
+  assert!(counts.contains("COALESCE(visibility, 'public') = 'public'"));
+  assert!(counts.contains("TRIM(COALESCE(in_reply_to, '')) <> ''"));
+  assert!(!counts.contains("reply-count:v1"));
+  assert!(!counts.contains("\"type\":\"Mention\""));
+  assert!(!counts.contains("class=\"%mention"));
+  assert!(!counts.contains("class=''%mention"));
  }
  #[test]
  fn second_life_icon_uses_shipped_svg(){

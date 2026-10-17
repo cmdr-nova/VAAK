@@ -72,6 +72,12 @@
       "php": {"script": "parity/php/profile-local-chrome.php", "args": []}
     },
     {
+      "id": "profile-reply-split",
+      "area": "Profiles",
+      "summary": "Local profile Posts versus Replies. A note is a reply only when in_reply_to is set. Hashtag posts and top-level @mentions stay posts. A real reply that also has hashtags or @mentions stays a reply. Local-only and private notes stay off both public tabs. PHP helpers are ap_outbox_note_is_reply and ap_outbox_note_on_public_profile. Rust profile_reply_split uses the same rule and does not open a database.",
+      "php": {"script": "parity/php/profile-reply-split.php", "args": []}
+    },
+    {
       "id": "profile-remote-chrome",
       "area": "Profiles",
       "summary": "Remote ActivityPub profile header, relationship row, and tabs. PHP capture is api/bin/profile-remote-chrome-capture.php. Rust profile_remote paints the same chrome and does not open a database.",

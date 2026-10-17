@@ -7549,28 +7549,26 @@ function ap_outbox_list_page(int $limit = 40, int $offset = 0, ?string $actorKey
     return $stmt->fetchAll() ?: [];
 }
 
-/** @return list<array<string,mixed>> */
-function ap_outbox_note_is_reply_or_mention(array $row): bool
+/**
+ * A profile reply is a note that actually replies to something.
+ * Top-level posts that @mention someone or carry a hashtag are posts.
+ * Hashtags or @mentions on a real reply do not move it to Posts.
+ */
+function ap_outbox_note_is_reply(array $row): bool
 {
-    if (trim((string) ($row['in_reply_to'] ?? '')) !== '') {
+    return trim((string) ($row['in_reply_to'] ?? '')) !== '';
+}
+
+/**
+ * Same visibility as the public profile tabs: NULL counts as public.
+ * local, private, unlisted, and direct notes stay off those tabs.
+ */
+function ap_outbox_note_on_public_profile(array $row): bool
+{
+    if (!array_key_exists('visibility', $row) || $row['visibility'] === null) {
         return true;
     }
-    $raw = json_decode((string) ($row['raw_create_json'] ?? ''), true);
-    $object = is_array($raw) && is_array($raw['object'] ?? null) ? $raw['object'] : [];
-    $tags = is_array($object['tag'] ?? null) ? $object['tag'] : [];
-    foreach ($tags as $tag) {
-        if (!is_array($tag)) {
-            continue;
-        }
-        $type = strtolower((string) ($tag['type'] ?? $tag['$type'] ?? ''));
-        if ($type === 'mention' || str_ends_with($type, '#mention')) {
-            return true;
-        }
-    }
-    // Older rows may have lost the ActivityPub tag array but retain the
-    // mention anchor in their HTML body.
-    $content = (string) ($object['content'] ?? $row['content'] ?? '');
-    return (bool) preg_match('/<a\b[^>]*\bclass=["\'][^"\']*\bmention\b[^"\']*["\'][^>]*>/i', $content);
+    return (string) $row['visibility'] === 'public';
 }
 
 /** @return list<array<string,mixed>> */
@@ -7584,10 +7582,14 @@ function ap_outbox_replies_list_page(string $actorKey, int $limit = 40, int $off
     }
     $prefix = 'https://mkultra.monster/users/' . rawurlencode($actorKey) . '/';
     try {
-        $st = ap_db()->prepare('SELECT * FROM outbox_notes WHERE id LIKE ? ORDER BY published DESC LIMIT 5000');
-        $st->execute([$prefix . '%']);
-        $rows = array_values(array_filter($st->fetchAll() ?: [], 'ap_outbox_note_is_reply_or_mention'));
-        return array_slice($rows, $offset, $limit);
+        $st = ap_db()->prepare(
+            "SELECT * FROM outbox_notes
+             WHERE id LIKE ? AND COALESCE(visibility, 'public') = 'public'
+               AND TRIM(COALESCE(in_reply_to, '')) <> ''
+             ORDER BY published DESC LIMIT ? OFFSET ?"
+        );
+        $st->execute([$prefix . '%', $limit, $offset]);
+        return $st->fetchAll() ?: [];
     } catch (Throwable $e) {
         return [];
     }
@@ -7599,7 +7601,7 @@ function ap_outbox_replies_count(string $actorKey): int
     if ($actorKey === '') {
         return 0;
     }
-    $key = 'vaak:profile:reply-count:v1:' . $actorKey;
+    $key = 'vaak:profile:reply-count:v2:' . $actorKey;
     if (function_exists('ap_redis_json_get')) {
         $cached = ap_redis_json_get($key);
         if (is_array($cached) && isset($cached['count'])) {
@@ -7608,19 +7610,10 @@ function ap_outbox_replies_count(string $actorKey): int
     }
     $prefix = 'https://mkultra.monster/users/' . rawurlencode($actorKey) . '/';
     try {
-        // Keep the profile header cheap: the old path loaded and JSON-decoded
-        // up to 5,000 notes just to compute one badge. These indexed/text
-        // predicates cover replies and the persisted mention markers; the
-        // fallback below preserves compatibility with legacy rows.
+        // Public profile tabs list only public notes with a real in_reply_to.
+        // Hashtag and top-level @mention markup are not replies.
         $st = ap_db()->prepare(
-            "SELECT COUNT(*) FROM outbox_notes
-             WHERE id LIKE ? AND (
-                 TRIM(COALESCE(in_reply_to, '')) <> ''
-                 OR raw_create_json LIKE '%\"type\":\"Mention\"%'
-                 OR raw_create_json LIKE '%\"type\": \"Mention\"%'
-                 OR content LIKE '%class=\"%mention%'
-                 OR content LIKE '%class=''%mention%'
-             )"
+            "SELECT COUNT(*) FROM outbox_notes WHERE id LIKE ? AND COALESCE(visibility, 'public') = 'public' AND TRIM(COALESCE(in_reply_to, '')) <> ''"
         );
         $st->execute([$prefix . '%']);
         $count = max(0, (int) $st->fetchColumn());
@@ -7630,9 +7623,16 @@ function ap_outbox_replies_count(string $actorKey): int
         return $count;
     } catch (Throwable $e) {
         try {
-            $st = ap_db()->prepare('SELECT * FROM outbox_notes WHERE id LIKE ? ORDER BY published DESC LIMIT 5000');
+            $st = ap_db()->prepare('SELECT in_reply_to, visibility FROM outbox_notes WHERE id LIKE ?');
             $st->execute([$prefix . '%']);
-            return count(array_filter($st->fetchAll() ?: [], 'ap_outbox_note_is_reply_or_mention'));
+            $count = 0;
+            foreach ($st->fetchAll() ?: [] as $row) {
+                if (!is_array($row) || !ap_outbox_note_is_reply($row) || !ap_outbox_note_on_public_profile($row)) {
+                    continue;
+                }
+                $count++;
+            }
+            return $count;
         } catch (Throwable $e2) {
             return 0;
         }
@@ -7694,12 +7694,32 @@ function ap_outbox_media_count(string $actorKey): int
 
 function ap_outbox_count_for_actor(string $actorKey): int
 {
+    // Profile badges use the same public visibility as the tab lists.
+    // Local-only and private notes stay out of Posts = total - replies.
+    return ap_outbox_cached_count(
+        $actorKey,
+        'vaak:profile:outbox-count:v2:',
+        "SELECT COUNT(*) FROM outbox_notes WHERE id LIKE ? AND COALESCE(visibility, 'public') = 'public'"
+    );
+}
+
+/** Every stored note, including local-only and private. Your Posts pagination. */
+function ap_outbox_count_all_for_actor(string $actorKey): int
+{
+    return ap_outbox_cached_count(
+        $actorKey,
+        'vaak:profile:outbox-count:v1:',
+        'SELECT COUNT(*) FROM outbox_notes WHERE id LIKE ?'
+    );
+}
+
+function ap_outbox_cached_count(string $actorKey, string $cachePrefix, string $sql): int
+{
     $actorKey = strtolower(trim($actorKey));
     if ($actorKey === '') {
         return 0;
     }
-    // Profile badges call this on every tab. Same 60s window as media/reply counts.
-    $key = 'vaak:profile:outbox-count:v1:' . $actorKey;
+    $key = $cachePrefix . $actorKey;
     if (function_exists('ap_redis_json_get')) {
         $cached = ap_redis_json_get($key);
         if (is_array($cached) && isset($cached['count'])) {
@@ -7708,7 +7728,7 @@ function ap_outbox_count_for_actor(string $actorKey): int
     }
     $prefix = 'https://mkultra.monster/users/' . rawurlencode($actorKey) . '/';
     try {
-        $st = ap_db()->prepare('SELECT COUNT(*) FROM outbox_notes WHERE id LIKE ?');
+        $st = ap_db()->prepare($sql);
         $st->execute([$prefix . '%']);
         $count = max(0, (int) $st->fetchColumn());
         if (function_exists('ap_redis_json_set')) {

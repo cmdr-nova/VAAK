@@ -54,6 +54,7 @@ fn produce(producer: &str, cases: &[InputCase]) -> Result<Vec<Value>> {
             "follow-fallback" => follow_fallback(&case.input)?,
             "inbox-origin" => crate::inbox_origin::replay(&case.input)?,
             "profile-local-chrome" => profile_local_chrome(&case.input)?,
+            "profile-reply-split" => crate::profile_header::profile_reply_split(&case.input),
             "profile-remote-chrome" => profile_remote_chrome(&case.input)?,
             "timeline-cursor" => timeline_cursor(&case.input)?,
             "profile-bsky-chrome" => profile_bsky_chrome(&case.input)?,
