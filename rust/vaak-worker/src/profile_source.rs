@@ -96,6 +96,8 @@ mod tests {
  fn profile_reply_predicates_match_the_count_rule() {
   assert_eq!(PROFILE_POSTS_REPLY_SQL, "TRIM(COALESCE(in_reply_to, '')) = ''");
   assert_eq!(PROFILE_REPLIES_REPLY_SQL, "TRIM(COALESCE(in_reply_to, '')) <> ''");
+  let html = include_str!("profile_html.rs");
+  assert!(html.contains(PROFILE_POSTS_REPLY_SQL) && html.contains(PROFILE_REPLIES_REPLY_SQL));
  }
  #[tokio::test]
  #[ignore = "opt-in disposable PostgreSQL genuine Boost source ledger and omitted-row mutation replay"]
