@@ -35,6 +35,7 @@ impl HeaderFacts{
  pub(crate) fn actor(&self)->&str{&self.actor}
  pub(crate) fn actor_key(&self)->&str{&self.key}
  pub(crate) fn effective_tab(&self)->&str{&self.effective_tab}
+ pub(crate) fn timeline_tab_total(&self, tab:&str)->i64{match tab{"replies"=>self.counts.replies,"boosts"=>self.counts.boosts,"media"=>self.counts.media,"posts"=>self.counts.posts,_=>0}}
  pub(crate) fn requested_tab(&self)->&str{&self.requested_tab}
  pub(crate) fn raw_skip_timeline_preload(&self)->bool{matches!(self.requested_tab.as_str(),"posts"|"replies"|"boosts"|"media")}
  pub(crate) fn blog_slug(&self)->&str{&self.blog_slug}

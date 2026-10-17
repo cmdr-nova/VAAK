@@ -7941,6 +7941,58 @@ function ap_local_profile_tab_page(
     }
 }
 
+/**
+ * End-of-profile is allowed only when this page is the last one.
+ * First paint asks for 12 rows. A shorter page is not a smaller page size:
+ * it still has items when the cursor has not reached the tab total.
+ * An empty page must not invent another page from a stale high count.
+ */
+function ap_profile_page_has_more(bool $pageHasMore, int $nextOffset, int $returned, int $tabTotal): bool
+{
+    if ($pageHasMore) {
+        return true;
+    }
+    if ($returned < 1 || $tabTotal < 1) {
+        return false;
+    }
+    return $tabTotal > $nextOffset;
+}
+
+/** Cursor delta for one profile page. Offset is the start of this page. */
+function ap_profile_scroll_has_more(bool $pageHasMore, int $offset, int $nextOffset, int $tabTotal): bool
+{
+    return ap_profile_page_has_more($pageHasMore, $nextOffset, max(0, $nextOffset - max(0, $offset)), $tabTotal);
+}
+
+/**
+ * Header total for a timeline tab. Cached reads only; the count SQL stays
+ * in the existing count functions.
+ */
+function ap_profile_tab_total(string $actorKey, string $tab): int
+{
+    $actorKey = strtolower(trim($actorKey));
+    $tab = strtolower(trim($tab));
+    if ($actorKey === '') {
+        return 0;
+    }
+    if ($tab === 'replies') {
+        return function_exists('ap_outbox_replies_count') ? ap_outbox_replies_count($actorKey) : 0;
+    }
+    if ($tab === 'media') {
+        return function_exists('ap_outbox_media_count') ? ap_outbox_media_count($actorKey) : 0;
+    }
+    if ($tab === 'boosts') {
+        if (!function_exists('ap_db_owner_user_id_for_actor') || !function_exists('ap_masto_reblog_count_for_html_profile')) {
+            return 0;
+        }
+        $owner = (int) ap_db_owner_user_id_for_actor($actorKey);
+        return $owner > 0 ? ap_masto_reblog_count_for_html_profile($owner) : 0;
+    }
+    $total = function_exists('ap_outbox_count_for_actor') ? ap_outbox_count_for_actor($actorKey) : 0;
+    $replies = ($total > 0 && function_exists('ap_outbox_replies_count')) ? ap_outbox_replies_count($actorKey) : 0;
+    return max(0, $total - $replies);
+}
+
 function ap_follow_lists_cache_gen(bool $bump = false): int
 {
     static $gen = 0;

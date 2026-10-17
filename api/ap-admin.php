@@ -22696,8 +22696,17 @@ if ($isPartial && $view === 'remote_profile') {
             (int) ($vaakOwnerId ?? 0)
         );
         if (is_array($axumProfile) && (!empty($axumProfile['complete_native']) || (string) ($axumProfile['html'] ?? '') !== '')) {
-            header('X-Has-More: ' . (!empty($axumProfile['has_more']) ? '1' : '0'));
-            header('X-Next-Offset: ' . (int) ($axumProfile['next_offset'] ?? ($profileOffset + $profileLimit)));
+            $profileNext = (int) ($axumProfile['next_offset'] ?? ($profileOffset + $profileLimit));
+            $profileMore = function_exists('ap_profile_scroll_has_more')
+                ? ap_profile_scroll_has_more(
+                    !empty($axumProfile['has_more']),
+                    $profileOffset,
+                    $profileNext,
+                    ap_profile_tab_total($profileKey, $profileTab)
+                )
+                : !empty($axumProfile['has_more']);
+            header('X-Has-More: ' . ($profileMore ? '1' : '0'));
+            header('X-Next-Offset: ' . $profileNext);
             header('X-TL-Cache: axum-profile-html');
             header('X-VAAK-Profile-Html: 1');
             header('X-TL-Render-Ms: ' . (string) (int) ($axumProfile['ms'] ?? 0));
@@ -22709,8 +22718,17 @@ if ($isPartial && $view === 'remote_profile') {
         ? ap_local_profile_tab_page($profileKey, $profileActor, $profileTab, $profileLimit, $profileOffset)
         : ['items' => [], 'has_more' => false, 'next_offset' => $profileOffset];
     $rows = is_array($page['items'] ?? null) ? $page['items'] : [];
-    header('X-Has-More: ' . (!empty($page['has_more']) ? '1' : '0'));
-    header('X-Next-Offset: ' . (int) ($page['next_offset'] ?? ($profileOffset + count($rows))));
+    $profileNext = (int) ($page['next_offset'] ?? ($profileOffset + count($rows)));
+    $profileMore = function_exists('ap_profile_scroll_has_more')
+        ? ap_profile_scroll_has_more(
+            !empty($page['has_more']),
+            $profileOffset,
+            $profileNext,
+            ap_profile_tab_total($profileKey, $profileTab)
+        )
+        : !empty($page['has_more']);
+    header('X-Has-More: ' . ($profileMore ? '1' : '0'));
+    header('X-Next-Offset: ' . $profileNext);
     foreach ($rows as $row) {
         if (!is_array($row)) {
             continue;
@@ -34747,6 +34765,26 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
               $rpLocalHasMore = false;
               $rpLocalNextOffset = 0;
           }
+          // A page shorter than 12 is still mid-tab when its cursor is behind
+          // the header total. The end marker waits for has_more false.
+          if ($rpIsLocal && in_array((string) $rpTab, $rpTimelineTabs, true) && function_exists('ap_profile_scroll_has_more')) {
+              $rpTabTotal = 0;
+              if ($rpTab === 'posts') {
+                  $rpTabTotal = (int) ($rpOutboxTotal ?? 0);
+              } elseif ($rpTab === 'replies') {
+                  $rpTabTotal = (int) ($rpOutboxRepliesTotal ?? 0);
+              } elseif ($rpTab === 'boosts') {
+                  $rpTabTotal = (int) ($rpBoostTotal ?? 0);
+              } elseif ($rpTab === 'media' && is_string($rpLocalKey) && $rpLocalKey !== '' && function_exists('ap_outbox_media_count')) {
+                  $rpTabTotal = ap_outbox_media_count((string) $rpLocalKey);
+              }
+              $rpLocalHasMore = ap_profile_scroll_has_more(
+                  !empty($rpLocalHasMore),
+                  0,
+                  (int) ($rpLocalNextOffset ?? 0),
+                  $rpTabTotal
+              );
+          }
         ?>
         <?php if ($rpError): ?>
           <div class="empty" style="color:var(--danger)">Couldn’t load this profile (database busy). Retry shortly.</div>
@@ -39341,6 +39379,12 @@ window.vaakBootStatusThread();
     return neu;
   }
 
+  /** Profile end marker. More items keep the scroll prompt; only an explicit end says so. */
+  function profileScrollStatus(more) {
+    return more ? 'Scroll for more…' : 'End of profile';
+  }
+  window.vaakProfileScrollStatus = profileScrollStatus;
+
   // Progressive boost / empty-Create hydration: signed remote fetch while you
   // scroll, swapping each card in place (never reloads / never jumps to top).
   const boostQueue = [];
@@ -39502,6 +39546,9 @@ window.vaakBootStatusThread();
   if (!root || !items || !sentinel) return false;
   viewName = items.dataset.view || viewName || 'home';
   hasMore = items.dataset.hasMore === '1';
+  if (viewName === 'remote_profile' && status) {
+    status.textContent = profileScrollStatus(hasMore);
+  }
 
   // Desktop: .feed is the scroll container. Mobile: body/window scrolls and
   // .feed is overflow:visible — IntersectionObserver must use the viewport.
@@ -40169,7 +40216,15 @@ window.vaakBootStatusThread();
           window.vaakRedirectToLogin('loadMore-html');
           return;
         }
-        hasMore = res.headers.get('X-Has-More') === '1';
+        const moreHeader = res.headers.get('X-Has-More');
+        if (viewName === 'remote_profile') {
+          // A missing header must not turn a profile that still has items into the end.
+          if (moreHeader === '1' || moreHeader === '0') {
+            hasMore = moreHeader === '1';
+          }
+        } else {
+          hasMore = moreHeader === '1';
+        }
         if (isNotifTimeline) {
           const nextMax = (res.headers.get('X-Next-Max-Id') || '').replace(/\D+/g, '');
           if (!nextMax || nextMax === notifMaxId) {
@@ -40241,11 +40296,11 @@ window.vaakBootStatusThread();
       }
       items.dataset.hasMore = hasMore ? '1' : '0';
       if (status) {
-        if (hasMore) status.textContent = 'Scroll for more…';
+        if (viewName === 'remote_profile') status.textContent = profileScrollStatus(hasMore);
+        else if (hasMore) status.textContent = 'Scroll for more…';
         else if (isNotifTimeline) status.textContent = 'End of notifications';
         else if (isBskyTimeline) status.textContent = 'End of Bluesky feed';
         else if (isOutboxTimeline) status.textContent = 'End of Your Posts';
-        else if (viewName === 'remote_profile') status.textContent = 'End of profile';
         else status.textContent = 'End of timeline';
       }
     } catch (e) {
@@ -41027,6 +41082,9 @@ window.vaakBootStatusThread();
     limit = parseInt(items.dataset.limit || '15', 10) || 15;
     tlBefore = items.dataset.before ? String(items.dataset.before) : '';
     hasMore = items.dataset.hasMore === '1';
+    if (viewName === 'remote_profile' && status) {
+      status.textContent = profileScrollStatus(hasMore);
+    }
     newestTs = parseInt(items.dataset.newest || '0', 10) || Math.floor(Date.now() / 1000);
     loading = false;
     pollBusy = false;
@@ -41676,7 +41734,10 @@ window.vaakBootStatusThread();
         }
         if (!res.ok) throw new Error('HTTP ' + res.status);
         const html = await res.text();
-        hasMore = res.headers.get('X-Has-More') === '1';
+        const moreHeader = res.headers.get('X-Has-More');
+        if (moreHeader === '1' || moreHeader === '0') {
+          hasMore = moreHeader === '1';
+        }
         const next = parseInt(res.headers.get('X-Next-Offset') || String(requestOffset), 10);
         offset = next > requestOffset ? next : requestOffset + limit;
         items.dataset.offset = String(offset);
@@ -41685,7 +41746,11 @@ window.vaakBootStatusThread();
           items.insertAdjacentHTML('beforeend', html);
           if (typeof window.novaEnhanceTweetFolds === 'function') window.novaEnhanceTweetFolds(items);
         }
-        if (status) status.textContent = hasMore ? 'Scroll for more…' : 'End of profile';
+        if (status) {
+          status.textContent = (typeof window.vaakProfileScrollStatus === 'function')
+            ? window.vaakProfileScrollStatus(hasMore)
+            : (hasMore ? 'Scroll for more…' : 'End of profile');
+        }
       } catch (e) {
         hasMore = false;
         if (status) status.textContent = 'Could not load more';

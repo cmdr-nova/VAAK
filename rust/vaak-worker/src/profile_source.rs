@@ -53,6 +53,28 @@ impl SourceLedger {
         Ok(())
     }
 }
+/// End marker only when this page is the last one.
+/// A short page is not a smaller page size: first paint asks for 12 rows.
+/// An empty page must not invent another page from a stale high total.
+pub(crate) fn profile_page_has_more(page_has_more: bool, next_offset: i64, returned: i64, tab_total: i64) -> bool {
+    if page_has_more {
+        return true;
+    }
+    if returned < 1 || tab_total < 1 {
+        return false;
+    }
+    tab_total > next_offset
+}
+
+/// Scroll status for a profile timeline. Callers pass the page cursor delta as `returned`.
+pub(crate) fn profile_scroll_has_more(page_has_more: bool, offset: i64, next_offset: i64, tab_total: i64) -> bool {
+    profile_page_has_more(page_has_more, next_offset, next_offset.saturating_sub(offset.max(0)), tab_total)
+}
+
+pub(crate) fn profile_scroll_status(has_more: bool) -> &'static str {
+    if has_more { "Scroll for more…" } else { "End of profile" }
+}
+
 /// Same rule as the public reply count: NULL and blank `in_reply_to` are posts.
 pub(crate) const PROFILE_POSTS_REPLY_SQL: &str = "TRIM(COALESCE(in_reply_to, '')) = ''";
 /// Any other `in_reply_to` is a reply, including whitespace-padded URLs.
@@ -92,6 +114,18 @@ pub(crate) async fn select_secondary(db:&Client,key:&str,actor:&str,kind:&'stati
 #[cfg(test)]
 mod tests {
  use super::*;
+ #[test]
+ fn profile_end_marker_follows_has_more_and_the_tab_total() {
+  assert!(profile_page_has_more(true, 12, 12, 10));
+  assert!(!profile_page_has_more(false, 10, 10, 10));
+  assert!(profile_page_has_more(false, 7, 7, 10));
+  assert!(!profile_scroll_has_more(false, 7, 7, 10));
+  assert!(profile_page_has_more(false, 12, 12, 15));
+  assert!(!profile_page_has_more(false, 7, 0, 10));
+  assert!(!profile_page_has_more(false, 10, 10, 0));
+  assert_eq!(profile_scroll_status(true), "Scroll for more…");
+  assert_eq!(profile_scroll_status(false), "End of profile");
+ }
  #[test]
  fn profile_reply_predicates_match_the_count_rule() {
   assert_eq!(PROFILE_POSTS_REPLY_SQL, "TRIM(COALESCE(in_reply_to, '')) = ''");
