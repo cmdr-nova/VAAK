@@ -51,6 +51,7 @@ php_tests=(
   api/bin/cpu-index-smoke.php
   api/bin/downrank-search-trends-smoke.php
   api/bin/media-warm-lock-smoke.php
+  api/bin/media-magick-coder-smoke.php
   api/bin/dm-ask-parity-smoke.php
   api/bin/follow-fallback-smoke.php
   api/bin/home-bsky-index-smoke.php
