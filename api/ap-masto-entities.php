@@ -2784,8 +2784,10 @@ function ap_masto_content_with_mentions(string $plainText, array $extraActorIds 
         }
     }
 
-    // Bluesky-style @handle.domain (Bridgy / ATProto)
-    if (preg_match_all('/(^|[^A-Za-z0-9_@])@([A-Za-z0-9][A-Za-z0-9.-]*\.[A-Za-z]{2,})(?![A-Za-z0-9.@])/u', $plainText, $bb, PREG_SET_ORDER)) {
+    // Bluesky-style @handle.domain (Bridgy / ATProto). The lookahead rejects a
+    // partial handle ("@kevinr.free" out of "@kevinr.free-dissociation.com")
+    // but still allows a sentence-ending period.
+    if (preg_match_all('/(^|[^A-Za-z0-9_@])@([A-Za-z0-9][A-Za-z0-9.-]*\.[A-Za-z]{2,})(?![A-Za-z0-9@-]|\.[A-Za-z0-9])/u', $plainText, $bb, PREG_SET_ORDER)) {
         foreach ($bb as $hit) {
             $handle = strtolower($hit[2]);
             if (isset($byAcct[$handle])) {
@@ -2808,8 +2810,10 @@ function ap_masto_content_with_mentions(string $plainText, array $extraActorIds 
         }
     }
 
-    // Bare @user at start / after whitespace — resolve via known actors or recent events
-    if (preg_match_all('/(^|[^A-Za-z0-9_@])@([A-Za-z0-9_]{2,32})(?![A-Za-z0-9_@])/u', $plainText, $bm, PREG_SET_ORDER)) {
+    // Bare @user at start / after whitespace — resolve via known actors or recent events.
+    // Never treat the first label of a dotted Bluesky handle as a bare username:
+    // "@kevinr.free-dissociation.com" must not resolve to some fediverse @kevinr.
+    if (preg_match_all('/(^|[^A-Za-z0-9_@])@([A-Za-z0-9_]{2,32})(?![A-Za-z0-9_@-]|\.[A-Za-z0-9])/u', $plainText, $bm, PREG_SET_ORDER)) {
         foreach ($bm as $hit) {
             $user = $hit[2];
             $userKey = strtolower($user);
