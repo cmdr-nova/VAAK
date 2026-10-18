@@ -905,6 +905,11 @@ pub async fn fetch_outbox_statuses_by_uris(
             quote_object: String::new(),
         });
     }
+    // Same quote target the profile loader reads; without it a self-thread
+    // parent that quoted a post painted as a plain note.
+    for r in &mut paint_rows {
+        r.quote_object = quote_target_from_raw_create(&r.raw_create_json);
+    }
     let mut note_ids = Vec::new();
     for r in &paint_rows {
         note_ids.push(r.id.trim_end_matches('/').to_string());
@@ -947,6 +952,8 @@ pub async fn fetch_outbox_statuses_by_uris(
             }
         }
     }
+    let mut keys = Vec::with_capacity(paint_rows.len());
+    let mut vals = Vec::with_capacity(paint_rows.len());
     for r in &paint_rows {
         let key = r.id.trim_end_matches('/').to_string();
         let username = key
@@ -955,7 +962,12 @@ pub async fn fetch_outbox_statuses_by_uris(
             .unwrap_or("unknown");
         let actor = format!("{LOCAL_ACTOR_PREFIX}{username}");
         let account = load_profile_account(db, username, &actor).await;
-        map.insert(key, materialize_outbox_status(r, &account));
+        keys.push(key);
+        vals.push(materialize_outbox_status(r, &account));
+    }
+    let _ = hydrate_local_quote_targets(db, &mut vals).await;
+    for (key, val) in keys.into_iter().zip(vals) {
+        map.insert(key, val);
     }
     Ok(map)
 }
@@ -1202,6 +1214,37 @@ mod tests {
         assert_eq!(st["spoiler_text"], json!("cw"));
         assert_eq!(st["pinned"], json!(true));
         assert_eq!(st["sensitive"], json!(true));
+    }
+
+    #[test]
+    fn self_thread_parent_keeps_quote_from_raw_create() {
+        let account = empty_account(
+            "https://mkultra.monster/users/cmdr_nova",
+            "cmdr_nova",
+            "Nova",
+            DEFAULT_AVATAR,
+        );
+        let raw = r#"{"object":{"quote":"https://example.test/posts/42"}}"#;
+        let row = OutboxPaintRow {
+            id: "https://mkultra.monster/users/cmdr_nova/notes/n2".into(),
+            published: "2026-10-05 12:00:00".into(),
+            content: "<p>look</p>".into(),
+            raw_create_json: raw.into(),
+            in_reply_to: String::new(),
+            local_id: Some(1),
+            spoiler_text: String::new(),
+            sensitive: false,
+            visibility: "public".into(),
+            content_text: String::new(),
+            pinned: false,
+            ask_actor: String::new(),
+            ask_question: String::new(),
+            ask_answer: String::new(),
+            quote_object: quote_target_from_raw_create(raw),
+        };
+        let st = materialize_outbox_status(&row, &account);
+        assert_eq!(st["quote"]["quoted_status_id"], json!("https://example.test/posts/42"));
+        assert!(st.get("vaak_quote_preview").is_some());
     }
 
     #[test]
