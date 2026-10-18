@@ -28,7 +28,8 @@ function ap_action_queue_enqueue(
     int $raceRetry = 1
 ): array {
     if ($ownerUserId < 1 || !in_array($platform, ['fedi', 'bsky'], true)
-        || !in_array($kind, ['like', 'boost', 'bookmark', 'follow'], true)
+        || !in_array($kind, ['like', 'boost', 'bookmark', 'follow', 'bite'], true)
+        || ($kind === 'bite' && $platform !== 'fedi')
         || $targetKey === '' || strlen($targetKey) > 2048) {
         return ['ok' => false, 'error' => 'Invalid queued action.'];
     }
@@ -93,7 +94,10 @@ function ap_action_queue_enqueue(
         if (function_exists('ap_redis_queue_push')) {
             ap_redis_queue_push('actions', $id);
         }
-        ap_signal_record($ownerUserId, $platform, $kind, $targetKey, $desired, $payload);
+        if ($kind !== 'bite') {
+            // Bite rows are one-shot (nonce target keys), not ranking signals.
+            ap_signal_record($ownerUserId, $platform, $kind, $targetKey, $desired, $payload);
+        }
         return ['ok' => true, 'id' => $id, 'revision' => $revision, 'status' => $status, 'coalesced' => false];
     } catch (Throwable $e) {
         if ($db->inTransaction()) $db->rollBack();
@@ -305,6 +309,16 @@ function ap_action_queue_execute(array $row, array $payload, array $receipt): ar
             }
         } else {
             require_once __DIR__ . '/ap-masto-entities.php';
+            if ($kind === 'bite') {
+                // One-shot Wafrn Bite: actor fetch + signed deliveries happen
+                // here instead of on the click request.
+                require_once __DIR__ . '/ap-inbox.php';
+                require_once __DIR__ . '/ap-bites.php';
+                $res = ap_bite_send((string) ($payload['target'] ?? ''), (string) ($payload['bite_kind'] ?? 'auto'));
+                return !empty($res['ok'])
+                    ? ['ok' => true, 'receipt' => ['activity_id' => (string) ($res['activity_id'] ?? ''), 'delivered' => (int) ($res['delivered'] ?? 0)]]
+                    : ['ok' => false, 'error' => (string) ($res['error'] ?? 'Bite delivery failed.')];
+            }
             if ($kind === 'like') {
                 require_once __DIR__ . '/ap-inbox.php';
                 $sid = (string) ($payload['status_id'] ?? '');

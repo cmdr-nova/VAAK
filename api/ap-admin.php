@@ -3381,8 +3381,47 @@ $vaakAdminOnlyActions = [
         $kind = trim((string) ($_POST['bite_kind'] ?? 'auto'));
         $returnActor = trim((string) ($_POST['return_actor'] ?? ''));
         $returnFrom = preg_replace('/[^a-z_]/', '', (string) ($_POST['return_from'] ?? '')) ?: '';
-        $res = ap_bite_send($target, $kind !== '' ? $kind : 'auto');
-        if (!empty($res['ok'])) {
+        $kind = $kind !== '' ? $kind : 'auto';
+        $wantJson = !empty($_POST['ajax'])
+            || str_contains((string) ($_SERVER['HTTP_ACCEPT'] ?? ''), 'application/json')
+            || strtolower((string) ($_SERVER['HTTP_X_REQUESTED_WITH'] ?? '')) === 'xmlhttprequest';
+        // Like the other action buttons, a Bite goes to the durable action
+        // queue; the actor fetch and inbox deliveries run in the worker.
+        $res = null;
+        $biteError = ap_bite_precheck($target, $kind);
+        if ($biteError === null && (int) ($vaakOwnerId ?? 0) > 0) {
+            $queue = ap_action_queue_enqueue(
+                (int) $vaakOwnerId, 'fedi', 'bite',
+                rtrim($target, '/') . '#bite-' . bin2hex(random_bytes(6)),
+                true, ['target' => rtrim($target, '/'), 'bite_kind' => $kind]
+            );
+            if (!empty($queue['ok'])) {
+                $res = ['ok' => true, 'queued' => true, 'queue_id' => (int) $queue['id'], 'revision' => (int) $queue['revision']];
+            }
+        }
+        if ($biteError !== null) {
+            $res = ['ok' => false, 'error' => $biteError];
+        } elseif ($res === null) {
+            // Queue unavailable: keep the established synchronous path.
+            $res = ap_bite_send($target, $kind);
+        }
+        if ($wantJson) {
+            header('Content-Type: application/json; charset=utf-8');
+            header('Cache-Control: no-store');
+            http_response_code(!empty($res['queued']) ? 202 : (!empty($res['ok']) ? 200 : 422));
+            echo json_encode([
+                'ok' => !empty($res['ok']),
+                'queued' => !empty($res['queued']),
+                'queue_id' => $res['queue_id'] ?? null,
+                'revision' => $res['revision'] ?? null,
+                'notice' => !empty($res['ok']) ? '🦷 Bite sent.' : '',
+                'error' => !empty($res['ok']) ? null : (string) ($res['error'] ?? 'Bite failed.'),
+            ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+            exit;
+        }
+        if (!empty($res['queued'])) {
+            $notice = '🦷 Bite sent.';
+        } elseif (!empty($res['ok'])) {
             $notice = '🦷 Bite sent'
                 . (isset($res['delivered']) ? (' (delivered to ' . (int) $res['delivered'] . ' inbox' . ((int) $res['delivered'] === 1 ? '' : 'es') . ')') : '')
                 . '.';
@@ -38418,6 +38457,39 @@ window.apAdminToast = function (msg, isErr) {
     }
   }
 
+  // Bite: queue in the background like Like/Boost instead of a full page POST.
+  document.addEventListener('submit', async (ev) => {
+    const form = ev.target;
+    if (!(form instanceof HTMLFormElement) || ev.defaultPrevented) return;
+    const actionInput = form.querySelector('input[name="action"]');
+    if (!actionInput || actionInput.value !== 'bite_remote') return;
+    ev.preventDefault();
+    if (typeof window.vaakHideLoading === 'function') window.vaakHideLoading();
+    window.__vaakNavigationPending = false;
+    if (form.dataset.busy === '1') return;
+    form.dataset.busy = '1';
+    const fd = new FormData(form);
+    fd.set('ajax', '1');
+    if (window.VAAK_CSRF && !fd.has('csrf')) fd.set('csrf', window.VAAK_CSRF);
+    if (window.vaakHaptic) window.vaakHaptic(5);
+    try {
+      const res = await fetch(form.getAttribute('action') || (window.location.pathname + window.location.search), {
+        method: 'POST', body: fd, credentials: 'same-origin',
+        headers: { 'Accept': 'application/json', 'X-Requested-With': 'XMLHttpRequest' }
+      });
+      const data = await res.json().catch(() => null);
+      if (data && data.ok) {
+        window.apAdminToast(data.notice || '🦷 Bite sent.', false);
+      } else {
+        window.apAdminToast((data && data.error) || 'Bite failed.', true);
+      }
+    } catch (e) {
+      window.apAdminToast('Bite failed. Check your connection and try again.', true);
+    } finally {
+      delete form.dataset.busy;
+    }
+  });
+
   document.addEventListener('submit', async (ev) => {
     const form = ev.target;
     if (!(form instanceof HTMLFormElement)) return;
@@ -46846,6 +46918,7 @@ if (VIEW === 'analytics') loadAnalytics();
       'rss_favourite', 'rss_bookmark',
       'poll_vote', 'action_queue_status',
       'delete_status', 'delete_bsky_post',
+      'bite_remote',
     ].includes(action)) {
       return;
     }
