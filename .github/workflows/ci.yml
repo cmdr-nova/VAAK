@@ -5,7 +5,8 @@
 #   rust            — cargo build, clippy, and cargo test (including vaak-types
 #                     fixture_roundtrip). Many Rust tests shell out to
 #                     api/bin/php-policy-test, so this job installs PHP too.
-#   deploy-scripts  — version counter, release-commit gate, and restart plan
+#   deploy-scripts  — version counter, release-commit gate, restart plan, and
+#                     the production runner job guard
 #   php-rust-parity — replay fixtures through both sides
 #                     (`.github/scripts/php-rust-parity.py`, catalog in
 #                     `parity/catalog.json`). Rust is the source of truth.
@@ -64,6 +65,7 @@ jobs:
           python3 deploy/test_jetstream_spool.py
           python3 deploy/bump_version.py --check
           bash deploy/assemble-release.sh --self-test
+          bash deploy/test_runner_job_guard.sh
 
   php:
     name: PHP syntax and standalone tests
