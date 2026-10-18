@@ -67,6 +67,7 @@ php_tests=(
   api/bin/library-own-cw-smoke.php
   api/bin/migration-php-reference-smoke.php
   api/bin/moderation-alias-cache-smoke.php
+  api/bin/notif-bsky-subject-hydrate-smoke.php
   api/bin/notif-grouped-schema-smoke.php
   api/bin/notif-page-speed-smoke.php
   api/bin/notif-reply-content-smoke.php

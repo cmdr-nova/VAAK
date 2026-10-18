@@ -5793,6 +5793,15 @@ function ap_masto_notification_entity(array $item): ?array
                 $status['content'] = '<p>Bluesky post</p>';
             }
         }
+        // Quote posts and media posts: carry the post's own media and the
+        // quoted post (with its media) from the Bluesky cache.
+        if ($status !== null && $isBsky) {
+            $status = ap_masto_notif_bsky_subject_enrich(
+                $status,
+                ap_masto_mention_target_object_id((string) ($row['object_id'] ?? '')),
+                (int) ($row['owner_user_id'] ?? 0)
+            );
+        }
         // Liked/boosted post gone (deleted) → drop the notification entirely
         if ($status === null) {
             return null;
@@ -13325,6 +13334,85 @@ function ap_masto_animated_media_from_url(string $url, string $preview = ''): ar
         'type' => $type,
         'mediaType' => $mediaType,
     ];
+}
+
+/**
+ * Add media and the quoted post to a Bluesky like/repost notification status
+ * from the durable bsky_posts cache (no AppView call at paint time). A like on
+ * a quote post then shows the quote post's media and the quoted post with its
+ * media, like the timeline card does.
+ *
+ * @param array<string,mixed> $status
+ * @return array<string,mixed>
+ */
+function ap_masto_notif_bsky_subject_enrich(array $status, string $subjectUrl, int $ownerUserId = 0): array
+{
+    $hasMedia = is_array($status['media_attachments'] ?? null) && $status['media_attachments'] !== [];
+    $hasQuote = is_array($status['quote'] ?? null) && $status['quote'] !== [];
+    if (($hasMedia && $hasQuote) || $subjectUrl === '') {
+        return $status;
+    }
+    if (!function_exists('ap_bsky_post_item_by_uri')) {
+        $bskyLib = __DIR__ . '/ap-bsky.php';
+        if (!is_file($bskyLib)) {
+            return $status;
+        }
+        require_once $bskyLib;
+    }
+    $at = null;
+    if (str_starts_with($subjectUrl, 'https://mkultra.monster/') && function_exists('ap_bsky_crosspost_by_note_id')) {
+        $map = ap_bsky_crosspost_by_note_id(rtrim($subjectUrl, '/'));
+        $at = is_array($map) ? (string) ($map['bsky_uri'] ?? '') : null;
+    } elseif (function_exists('ap_bsky_cached_at_uri_for_web_url')) {
+        $at = ap_bsky_cached_at_uri_for_web_url($subjectUrl);
+    }
+    if (!is_string($at) || !str_starts_with($at, 'at://')) {
+        return $status;
+    }
+    $item = ap_bsky_post_item_by_uri($at);
+    $post = is_array($item['post'] ?? null) ? $item['post'] : null;
+    if ($post === null) {
+        return $status;
+    }
+    if (!$hasMedia) {
+        $media = ap_masto_bsky_media_attachments($post, (string) ($status['id'] ?? $at));
+        if ($media !== []) {
+            $status['media_attachments'] = $media;
+        }
+    }
+    if (!$hasQuote) {
+        $embed = is_array($post['embed'] ?? null) ? $post['embed'] : [];
+        $embedType = (string) ($embed['$type'] ?? '');
+        $rec = null;
+        if (str_contains($embedType, 'recordWithMedia')) {
+            $rec = is_array($embed['record']['record'] ?? null) ? $embed['record']['record'] : null;
+        } elseif (str_contains($embedType, 'embed.record') || str_contains($embedType, 'record#view')) {
+            $rec = is_array($embed['record'] ?? null) ? $embed['record'] : null;
+        }
+        $qUri = is_array($rec) ? trim((string) ($rec['uri'] ?? '')) : '';
+        if ($qUri !== '' && str_starts_with($qUri, 'at://')) {
+            // Prefer the full cached quoted post; fall back to the embedded view.
+            $qItem = ap_bsky_post_item_by_uri($qUri);
+            $qPost = is_array($qItem['post'] ?? null) ? $qItem['post'] : null;
+            if ($qPost === null) {
+                $value = is_array($rec['value'] ?? null) ? $rec['value'] : [];
+                $qEmbeds = is_array($rec['embeds'] ?? null) ? $rec['embeds'] : [];
+                $qPost = [
+                    'uri' => $qUri,
+                    'cid' => (string) ($rec['cid'] ?? ''),
+                    'author' => is_array($rec['author'] ?? null) ? $rec['author'] : [],
+                    'record' => $value,
+                    'embed' => is_array($qEmbeds[0] ?? null) ? $qEmbeds[0] : null,
+                    'indexedAt' => (string) ($value['createdAt'] ?? ''),
+                ];
+            }
+            $quoted = ap_masto_bsky_trend_status($qPost);
+            if (is_array($quoted)) {
+                $status['quote'] = ['state' => 'accepted', 'quoted_status' => $quoted];
+            }
+        }
+    }
+    return $status;
 }
 
 function ap_masto_bsky_media_attachments(array $post, string $statusId): array
