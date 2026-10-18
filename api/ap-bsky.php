@@ -1238,6 +1238,38 @@ function ap_bsky_crosspost_by_uri(string $bskyUri, bool $allowOutboxScan = false
 }
 
 /**
+ * Cache-only https://bsky.app/profile/{actor}/post/{rkey} → AT-URI for paint
+ * paths: DID in the URL, else the indexed bsky_posts rkey lookup. Never scans
+ * bsky_crossposts and never resolves a handle over the network.
+ */
+function ap_bsky_cached_at_uri_for_web_url(string $url): ?string
+{
+    if (str_starts_with($url, 'at://')) {
+        return $url;
+    }
+    if (!preg_match('~^https://bsky\.app/profile/([^/]+)/post/([^/?#]+)~i', trim($url), $m)) {
+        return null;
+    }
+    $actor = rawurldecode($m[1]);
+    $rkey = rawurldecode($m[2]);
+    if (str_starts_with($actor, 'did:')) {
+        return 'at://' . $actor . '/app.bsky.feed.post/' . $rkey;
+    }
+    try {
+        $pg = ap_db()->getAttribute(PDO::ATTR_DRIVER_NAME) === 'pgsql';
+        $st = ap_db()->prepare($pg
+            ? "SELECT bsky_uri FROM bsky_posts
+               WHERE split_part(bsky_uri, '/app.bsky.feed.post/', 2) = ? AND lower(author_handle) = lower(?) LIMIT 1"
+            : 'SELECT bsky_uri FROM bsky_posts WHERE bsky_uri LIKE ? AND lower(author_handle) = lower(?) LIMIT 1');
+        $st->execute([$pg ? $rkey : ('%/app.bsky.feed.post/' . $rkey), $actor]);
+        $uri = $st->fetchColumn();
+        return is_string($uri) && str_starts_with($uri, 'at://') ? $uri : null;
+    } catch (Throwable $e) {
+        return null;
+    }
+}
+
+/**
  * Convert https://bsky.app/profile/{actor}/post/{rkey} → at://did…/app.bsky.feed.post/{rkey}.
  * Resolves handles via identity.resolveHandle when needed.
  */
@@ -13370,6 +13402,116 @@ function ap_bsky_ingest_follow_notification(
 }
 
 /**
+ * Before notification rows are built, make sure every liked / reposted /
+ * quoted / replied-to subject post is in the durable bsky_posts cache, and that
+ * the owner's own appview-only posts are imported as local notes. Without
+ * this, an interaction on a post VAAK never saw (e.g. a like on a reply made
+ * in the Bluesky app) stored "liked your Bluesky post" and painted the
+ * "Bluesky post" placeholder, or no post at all.
+ *
+ * Runs in the notification poller only (list paint stays cache-only). One
+ * indexed lookup for the page, then at most two public getPosts calls for
+ * the subjects that are missing; cached subjects cost nothing on later polls.
+ *
+ * @param list<array> $notifs
+ * @return int Subjects fetched from AppView
+ */
+function ap_bsky_notification_subjects_warm(int $ownerUserId, array $notifs): int
+{
+    $want = [];
+    foreach ($notifs as $notif) {
+        if (!is_array($notif)) {
+            continue;
+        }
+        $reason = strtolower(trim((string) ($notif['reason'] ?? '')));
+        if (!in_array($reason, ['like', 'repost', 'quote', 'reply'], true)) {
+            continue;
+        }
+        $subject = trim((string) ($notif['reasonSubject'] ?? ''));
+        if (str_starts_with($subject, 'at://') && str_contains($subject, '/app.bsky.feed.post/')) {
+            $want[$subject] = true;
+        }
+    }
+    if ($want === [] || $ownerUserId < 1) {
+        return 0;
+    }
+    ap_bsky_posts_migrate();
+    $uris = array_keys($want);
+    try {
+        $ph = implode(',', array_fill(0, count($uris), '?'));
+        $st = ap_db()->prepare("SELECT bsky_uri FROM bsky_posts WHERE bsky_uri IN ($ph)");
+        $st->execute($uris);
+        foreach ($st->fetchAll(PDO::FETCH_COLUMN) ?: [] as $cached) {
+            unset($want[(string) $cached]);
+        }
+    } catch (Throwable $e) {
+        return 0;
+    }
+    $session = ap_bsky_session_row($ownerUserId);
+    $selfDid = is_array($session) ? trim((string) ($session['did'] ?? '')) : '';
+    // Own posts already cached (seen on Home) but not yet copied to the VAAK
+    // profile by the backfill queue: import them now from the cache.
+    if ($selfDid !== '') {
+        foreach ($uris as $uri) {
+            if (isset($want[$uri]) || !str_starts_with($uri, 'at://' . $selfDid . '/')) {
+                continue;
+            }
+            $twin = ap_bsky_local_note_id_for_at_uri($uri, $ownerUserId, false);
+            if (is_string($twin) && $twin !== '') {
+                continue;
+            }
+            $item = ap_bsky_post_item_by_uri($uri);
+            if (is_array($item['post'] ?? null)) {
+                try {
+                    ap_bsky_import_own_post_as_local($ownerUserId, $item['post']);
+                } catch (Throwable $e) {
+                    error_log('[ap-bsky] notification subject import: ' . $e->getMessage());
+                }
+            }
+        }
+    }
+    // Do not retry the same missing (deleted / blocked) subject within a worker run.
+    static $tried = [];
+    $missing = [];
+    foreach (array_keys($want) as $uri) {
+        if (!isset($tried[$uri])) {
+            $tried[$uri] = true;
+            $missing[] = $uri;
+        }
+    }
+    if ($missing === []) {
+        return 0;
+    }
+    $fetched = 0;
+    foreach (array_slice(array_chunk($missing, 25), 0, 2) as $chunk) {
+        $got = ap_bsky_xrpc(AP_BSKY_PUBLIC_API, 'app.bsky.feed.getPosts', 'GET', [
+            'uris' => implode(',', $chunk),
+        ], null, null, 8);
+        if (empty($got['ok']) || !is_array($got['json']['posts'] ?? null)) {
+            continue;
+        }
+        foreach ($got['json']['posts'] as $post) {
+            if (!is_array($post) || trim((string) ($post['uri'] ?? '')) === '') {
+                continue;
+            }
+            try {
+                ap_bsky_post_upsert_from_feed_item($post, $ownerUserId);
+                $fetched++;
+                // Own appview-only post: copy it to the VAAK profile now (no
+                // federation) so the notification can open the local twin.
+                $authorDid = trim((string) ($post['author']['did'] ?? ''));
+                if ($selfDid !== '' && $authorDid === $selfDid) {
+                    ap_bsky_import_own_post_as_local($ownerUserId, $post);
+                }
+            } catch (Throwable $e) {
+                error_log('[ap-bsky] notification subject warm: ' . $e->getMessage());
+            }
+        }
+    }
+    return $fetched;
+}
+
+/**
  * @param list<array> $notifs
  * @return array{ok:bool,inserted:int,skipped:int,pushed:int,errors:list<string>}
  */
@@ -13387,6 +13529,11 @@ function ap_bsky_ingest_notifications(int $ownerUserId, array $notifs, bool $pus
         : '';
     if ($ownerActorId === '' && function_exists('ap_local_actor_id')) {
         $ownerActorId = (string) ap_local_actor_id();
+    }
+    try {
+        ap_bsky_notification_subjects_warm($ownerUserId, $notifs);
+    } catch (Throwable $e) {
+        error_log('[ap-bsky] notification subjects warm: ' . $e->getMessage());
     }
 
     foreach ($notifs as $notif) {
