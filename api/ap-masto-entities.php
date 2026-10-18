@@ -6544,6 +6544,44 @@ function ap_masto_notifications_api_list(array $notifs): array
 }
 
 /**
+ * v2 group key for a like or boost: the post's canonical key, so Fedi and
+ * Bluesky twins of one post land in one group. Null keeps the item's own key.
+ * Hashed so the key stays URL-safe for /api/v2/notifications/{group_key}.
+ */
+function ap_masto_notification_v2_group_key(string $type, array $status): ?string
+{
+    if (!in_array($type, ['favourite', 'reblog'], true)) {
+        return null;
+    }
+    $statusKey = rtrim((string) ($status['uri'] ?? $status['url'] ?? ''), '/');
+    if ($statusKey === '') {
+        return null;
+    }
+    if (function_exists('ap_masto_notif_canonical_status_key')) {
+        $ownerHint = 0;
+        $owner = $status['account']['uri'] ?? null;
+        if (is_string($owner) && $owner !== '' && function_exists('ap_db_owner_user_id_for_actor')) {
+            $ownerHint = (int) ap_db_owner_user_id_for_actor($owner);
+        }
+        $canonical = ap_masto_notif_canonical_status_key($statusKey, $ownerHint);
+        if ($canonical !== '') {
+            $statusKey = $canonical;
+        }
+    }
+    return $type . '-' . substr(hash('sha256', $statusKey), 0, 24);
+}
+
+/** One key per person, so a linked Fedi/Bluesky pair counts once in a group. */
+function ap_masto_notification_v2_identity_key(array $account): string
+{
+    $ref = rtrim((string) ($account['uri'] ?? $account['url'] ?? ''), '/');
+    if ($ref !== '' && function_exists('ap_masto_notif_actor_identity_key')) {
+        return ap_masto_notif_actor_identity_key($ref);
+    }
+    return (string) ($account['id'] ?? $ref);
+}
+
+/**
  * @param list<mixed> $notifs
  * @return array{accounts:list<array<string,mixed>>,statuses:list<array<string,mixed>>,notification_groups:list<array<string,mixed>>,partial_accounts?:list<array<string,mixed>>}
  */
@@ -6554,6 +6592,7 @@ function ap_masto_notifications_grouped_from_items(array $notifs, string $expand
     $statuses = [];
     $groups = [];
     $groupIndex = [];
+    $groupIdents = [];
     $statusTypes = ['mention', 'status', 'reblog', 'favourite', 'poll', 'update', 'quote', 'quoted_update'];
     foreach ($notifs as $raw) {
         if (!is_array($raw)) {
@@ -6574,15 +6613,25 @@ function ap_masto_notifications_grouped_from_items(array $notifs, string $expand
         }
         $nid = (string) $n['id'];
         $nidInt = (int) $nid;
-        $groupKey = (string) $n['group_key'];
         $type = (string) $n['type'];
-        if (str_starts_with($groupKey, 'ungrouped-')) {
-            $groupKey = $type . ':' . $acctId . ':' . ($statusId ?? '-');
-        }
+        // Same collapse as the web Notifications view: likes and boosts of one
+        // post share a group across accounts and Fedi/Bluesky twins. Every
+        // other type keeps its own key, which clients can fetch back by id.
+        $groupKey = ap_masto_notification_v2_group_key($type, is_array($status) ? $status : [])
+            ?? (string) $n['group_key'];
+        $ident = ap_masto_notification_v2_identity_key($acct);
         $createdAt = (string) $n['created_at'];
         if (isset($groupIndex[$groupKey])) {
             $idx = $groupIndex[$groupKey];
             $existing = $groups[$idx];
+            // A linked Fedi/Bluesky pair is one person, as on the web.
+            if (isset($groupIdents[$idx][$ident])) {
+                $existing['page_min_id'] = (string) min((int) $existing['page_min_id'], $nidInt);
+                $existing['page_max_id'] = (string) max((int) $existing['page_max_id'], $nidInt);
+                $groups[$idx] = $existing;
+                continue;
+            }
+            $groupIdents[$idx][$ident] = true;
             $existing['notifications_count'] = (int) $existing['notifications_count'] + 1;
             $existingMin = (int) $existing['page_min_id'];
             $existingMax = (int) $existing['page_max_id'];
@@ -6615,6 +6664,7 @@ function ap_masto_notifications_grouped_from_items(array $notifs, string $expand
             $group['status_id'] = $statusId;
         }
         $groupIndex[$groupKey] = count($groups);
+        $groupIdents[count($groups)] = [$ident => true];
         $groups[] = $group;
     }
     $referencedAccounts = [];
