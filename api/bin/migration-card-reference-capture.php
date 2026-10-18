@@ -22,6 +22,8 @@ function ap_masto_lookup_status_by_object_url(string $url,int $owner=0,bool $fet
 function ap_db_now(): string { return gmdate('c'); }
 function ap_link_preview_http_get(string $url,int $timeoutSec=4,int $maxBytes=524288): ?string { $GLOBALS['preview_http_requests'][]=$url; return null; }
 function ap_link_preview_warm_async(string $url): void { $GLOBALS['preview_warm_requests'][]=$url; }
+// DNS transport: fixture hosts (*.test) never resolve. Literal addresses use the real guard.
+function ap_net_host_is_public(string $host): bool { $h=strtolower(trim($host,'[]')); return filter_var($h,FILTER_VALIDATE_IP) ? ap_net_ip_is_public($h) : !in_array($h,['localhost'],true) && !str_ends_with($h,'.localhost') && !str_ends_with($h,'.local'); }
 function ap_block_list_cached(bool $refresh=false): array { return ap_db()->query('SELECT * FROM fixture_server_blocks')->fetchAll(); }
 function ap_server_blocked_actors_set(bool $refresh=false): array { $out=[]; foreach(ap_block_list_cached() as $b) if($b['scope']==='actor' && $b['kind']!=='mute') foreach(ap_moderation_syntactic_refs($b['value']) as $ref) $out[$ref]=true; return $out; }
 function ap_user_blocks_list_cached(int $owner,bool $refresh=false): array { $q=ap_db()->prepare('SELECT * FROM fixture_blocks WHERE owner_user_id=?');$q->execute([$owner]);return $q->fetchAll(); }
@@ -62,6 +64,7 @@ reference_load($api.'/ap-db.php',['ap_db_owner_actor_id_for_user_id','ap_user_is
 reference_load($api.'/ap-db.php',['ap_ordinary_note_owned','ap_ordinary_ask_questions_muted','ap_visibility_ordinary_status_hidden']);
 reference_load($api.'/ap-visibility.php',['ap_visibility_actor_hidden','ap_visibility_status_hidden','ap_visibility_status_audience_allowed']);
 reference_load($api.'/ap-asks.php',['ap_ask_card_html','ap_ask_card_html_from_row','ap_ask_parse_compact_text','ap_ask_context_for_object']);
+reference_load($api.'/ap-net-guard.php',['ap_net_ip_is_public']);
 reference_load($api.'/ap-link-preview.php',['ap_masto_preview_card','ap_link_preview_html','ap_link_preview_youtube_id','ap_link_preview_normalize_url','ap_link_preview_extract_url','ap_link_preview_extract_all_urls','ap_link_preview_canonicalize_url','ap_link_preview_card_for_status_text','ap_link_preview_for_url','ap_link_preview_url_allowed','ap_link_preview_cache_get','ap_link_preview_cache_put','ap_link_preview_youtube_fallback','ap_link_preview_fetch_og']);
 reference_load($api.'/ap-normalize.php',['ap_normalize_attach_ask','ap_normalize_apply_bsky_sensitivity','ap_normalize_scrub_quote_pollution','ap_normalize_status','ap_normalize_status_has_visible_body']);
 foreach(['masto_favourites','masto_bookmarks','masto_reblogs'] as $table) ap_db()->exec('CREATE TABLE '.$table.'(owner_user_id INTEGER,status_id TEXT,object_id TEXT)');

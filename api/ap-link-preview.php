@@ -178,26 +178,15 @@ function ap_link_preview_url_allowed(string $url): bool
     if (!is_array($parts) || empty($parts['host']) || !is_string($parts['host'])) {
         return false;
     }
-    $host = strtolower($parts['host']);
-    if ($host === 'localhost' || str_ends_with($host, '.localhost') || str_ends_with($host, '.local')) {
+    $port = isset($parts['port']) ? (int) $parts['port'] : null;
+    if ($port !== null && $port !== 80 && $port !== 443) {
         return false;
     }
-    // Block literal IPs that are private / link-local
-    if (filter_var($host, FILTER_VALIDATE_IP)) {
-        if (!filter_var($host, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE)) {
-            return false;
-        }
-    } else {
-        $ips = @gethostbynamel($host);
-        if (is_array($ips)) {
-            foreach ($ips as $ip) {
-                if (!filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE)) {
-                    return false;
-                }
-            }
-        }
+    if (!empty($parts['user']) || !empty($parts['pass'])) {
+        return false;
     }
-    return true;
+    // Every A and AAAA answer must be public; unresolvable hosts are refused.
+    return ap_net_host_is_public(strtolower($parts['host']));
 }
 
 /**
