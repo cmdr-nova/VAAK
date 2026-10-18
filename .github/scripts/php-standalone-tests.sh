@@ -52,6 +52,7 @@ php_tests=(
   api/bin/downrank-search-trends-smoke.php
   api/bin/bsky-notif-subject-backfill-smoke.php
   api/bin/media-warm-lock-smoke.php
+  api/bin/net-guard-smoke.php
   api/bin/masto-status-audience-smoke.php
   api/bin/dm-ask-parity-smoke.php
   api/bin/follow-fallback-smoke.php
