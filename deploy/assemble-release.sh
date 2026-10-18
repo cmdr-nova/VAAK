@@ -27,6 +27,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 BIN_ALLOW=(
+  bsky-notif-subject-backfill.php
   home-timeline-warm.php
   notif-projection-fill.php
   phyrian-decay.php
@@ -95,6 +96,8 @@ self_test() {
   assemble "$binary" "$sha" "${tmp}/out"
   [[ -f "${tmp}/out/api/ap-version.php" ]]
   [[ -f "${tmp}/out/api/bin/notif-projection-fill.php" ]]
+  [[ -f "${tmp}/out/api/bin/bsky-notif-subject-backfill.php" ]]
+  [[ ! -e "${tmp}/out/api/bin/bsky-notif-subject-backfill-smoke.php" ]]
   [[ ! -e "${tmp}/out/api/bin/library-client-smoke.php" ]]
   [[ ! -e "${tmp}/out/api/fixtures" ]]
   [[ -f "${tmp}/out/api/deploy/ap-bsky-jetstream.py" ]]
