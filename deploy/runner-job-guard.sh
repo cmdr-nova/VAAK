@@ -6,10 +6,10 @@
 # unless it is the manual production deploy on main of cmdr-nova/VAAK.
 #
 # Install on the production host (as root), then restart the runner service:
-#   install -m 0755 -o root -g root deploy/runner-job-guard.sh /usr/local/sbin/vaak-runner-job-guard
-#   echo 'ACTIONS_RUNNER_HOOK_JOB_STARTED=/usr/local/sbin/vaak-runner-job-guard' >> <runner dir>/.env
+#   install -m 0755 -o root -g root deploy/runner-job-guard.sh /usr/local/sbin/vaak-runner-job-guard.sh
+#   echo 'ACTIONS_RUNNER_HOOK_JOB_STARTED=/usr/local/sbin/vaak-runner-job-guard.sh' >> <runner dir>/.env
 #
-# Keep it root-owned so the vaak-deploy user that runs jobs cannot rewrite it.
+# The runner only accepts hook paths ending in .sh, .ps1 or .js. Keep it root-owned so the vaak-deploy user that runs jobs cannot rewrite it.
 set -euo pipefail
 
 allowed_repo="cmdr-nova/VAAK"
