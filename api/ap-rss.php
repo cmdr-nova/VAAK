@@ -5,6 +5,8 @@
  */
 declare(strict_types=1);
 
+require_once __DIR__ . '/ap-net-guard.php';
+
 function ap_rss_migrate(): void
 {
     static $done = false;
@@ -1313,6 +1315,9 @@ function ap_rss_normalize_url(string $raw): ?string
     if (!is_array($parts) || empty($parts['host'])) {
         return null;
     }
+    if (!ap_net_host_is_public((string) $parts['host'])) {
+        return null;
+    }
     return $raw;
 }
 
@@ -1512,6 +1517,9 @@ function ap_rss_http_get(string $url, string $etag = '', string $lastModified = 
     ];
     while ($attempt < $maxAttempts) {
         $attempt++;
+        if (!ap_net_host_is_public((string) (parse_url($url, PHP_URL_HOST) ?: ''))) {
+            return ['ok' => false, 'status' => 0, 'body' => '', 'etag' => '', 'last_modified' => '', 'error' => 'Feed host is not public'];
+        }
         $ch = curl_init($url);
         curl_setopt_array($ch, [
             CURLOPT_RETURNTRANSFER => true,
@@ -1520,6 +1528,7 @@ function ap_rss_http_get(string $url, string $etag = '', string $lastModified = 
             CURLOPT_CONNECTTIMEOUT => 8,
             CURLOPT_TIMEOUT => 18,
             CURLOPT_PROTOCOLS => CURLPROTO_HTTPS,
+            CURLOPT_REDIR_PROTOCOLS => CURLPROTO_HTTPS,
             CURLOPT_HTTPHEADER => $headers,
             CURLOPT_HEADER => true,
             CURLOPT_ENCODING => '', // accept gzip/br when available
