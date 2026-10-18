@@ -21,3 +21,13 @@ the user-level `vaak-disc3-backup.timer`. It runs daily at 03:15 (and on the
 next wake/boot when a scheduled run was missed), verifies the PostgreSQL
 checksum manifest, and retains 180 days. This is a local second tier, not a
 replacement for an independent off-box copy.
+
+The pull connects as the `vaak-backup` user, whose only key is restricted on the
+VPS with `restrict,command="/usr/bin/rrsync -ro /var/backups/mkultra/vaak/"`.
+It cannot get a shell or write. `vaak-postgres-backup.sh` writes dumps as
+`root:vaak-backup 0640` in a `0750` directory so that user can read them. Note
+the config archive includes `/etc/mkultra` and `/etc/caddy`.
+
+Root cron jobs take their `flock` in `/run/vaak-lock` (root-owned, created by
+`deploy/vaak-lock.tmpfiles.conf` -> `/etc/tmpfiles.d/vaak-lock.conf`), not
+`/tmp`, where `www-data` could hold the lock and block backups.
