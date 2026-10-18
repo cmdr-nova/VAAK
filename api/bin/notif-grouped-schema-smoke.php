@@ -44,6 +44,8 @@ reference_load($api . '/ap-masto-entities.php', [
     'ap_masto_api_status',
     'ap_masto_api_notification',
     'ap_masto_notifications_api_list',
+    'ap_masto_notification_v2_group_key',
+    'ap_masto_notification_v2_identity_key',
     'ap_masto_notifications_grouped_from_items',
     'ap_masto_notifications_grouped_slice',
     'ap_masto_notifications_list_redis_key',
@@ -472,6 +474,25 @@ schema_check($quoteStatus['visibility'] === 'private', 'followers visibility map
 $slice = ap_masto_notifications_grouped_slice($full, 'favourite-shared');
 schema_check(is_array($slice) && count($slice['notification_groups']) === 1 && count($slice['accounts']) === 3 && count($slice['statuses']) === 1, 'group detail carries referenced accounts and the status');
 schema_grouped(schema_roundtrip($slice), false);
+
+// Likes from different people on one post share a group, like the web view.
+$postUri = 'https://mkultra.monster/users/cmdr_nova/notes/abc';
+$crossItems = [
+    ['id' => $nid(40), 'type' => 'favourite', 'group_key' => 'favourite-actor-one', 'created_at' => '2026-10-14 07:00:00', 'account' => $badAccount('acct-x'), 'status' => $statusShell('status-cross', $badAccount('author-cross'), ['uri' => $postUri])],
+    ['id' => $nid(41), 'type' => 'favourite', 'group_key' => 'favourite-actor-two', 'created_at' => '2026-10-14 07:01:00', 'account' => $badAccount('acct-y'), 'status' => $statusShell('status-cross', $badAccount('author-cross'), ['uri' => $postUri . '/'])],
+    ['id' => $nid(42), 'type' => 'reblog', 'group_key' => 'reblog-actor-one', 'created_at' => '2026-10-14 07:02:00', 'account' => $badAccount('acct-x'), 'status' => $statusShell('status-cross', $badAccount('author-cross'), ['uri' => $postUri])],
+    ['id' => $nid(43), 'type' => 'mention', 'group_key' => 'mention-one', 'created_at' => '2026-10-14 07:03:00', 'account' => $badAccount('acct-x'), 'status' => $statusShell('status-m1', $badAccount('author-cross'), ['uri' => $postUri . '/m1'])],
+    ['id' => $nid(44), 'type' => 'mention', 'group_key' => 'mention-two', 'created_at' => '2026-10-14 07:04:00', 'account' => $badAccount('acct-y'), 'status' => $statusShell('status-m2', $badAccount('author-cross'), ['uri' => $postUri . '/m2'])],
+];
+$cross = schema_roundtrip(ap_masto_notifications_grouped_from_items($crossItems, 'full'));
+schema_grouped($cross, false);
+$crossGroups = $cross['notification_groups'];
+schema_check(count($crossGroups) === 4, 'two likes merge; reblog and mentions stay apart');
+$likeGroup = $crossGroups[0];
+schema_check($likeGroup['type'] === 'favourite' && $likeGroup['notifications_count'] === 2 && $likeGroup['sample_account_ids'] === ['acct-x', 'acct-y'], 'like group counts both accounts');
+schema_check(preg_match('/^[A-Za-z0-9_-]+$/', (string) $likeGroup['group_key']) === 1, 'group key is safe for the single-group route');
+schema_check(is_array(ap_masto_notifications_grouped_slice($cross, (string) $likeGroup['group_key'])), 'like group can be fetched back by key');
+schema_check($crossGroups[1]['type'] === 'reblog' && $crossGroups[1]['group_key'] !== $likeGroup['group_key'], 'reblog has its own group');
 
 $entities = (string) file_get_contents($api . '/ap-masto-entities.php');
 schema_check(!str_contains($entities, "'meta' => []"), 'producers do not emit empty media meta arrays');
