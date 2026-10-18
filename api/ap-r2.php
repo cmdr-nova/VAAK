@@ -221,13 +221,13 @@ function ap_media_ingest_upload(array $file, ?string $description = null): array
     if (str_starts_with($mime, 'image/') || in_array($mime, ['image/heic', 'image/heif', 'image/heic-sequence'], true)) {
         $kind = 'image';
         $max = 25 * 1024 * 1024;
-        $allowedImg = ['image/jpeg', 'image/png', 'image/gif', 'image/webp', 'image/heic', 'image/heif', 'image/heic-sequence'];
+        $allowedImg = ['image/jpeg', 'image/png', 'image/gif', 'image/webp', 'image/heic', 'image/heif', 'image/heic-sequence', 'image/heif-sequence', 'image/avif'];
         // Some iPhones send HEIC as application/octet-stream; sniff by extension
         $origName = strtolower((string) ($file['name'] ?? ''));
         if ($mime === 'application/octet-stream' && preg_match('/\.(heic|heif)$/', $origName)) {
             $mime = 'image/heic';
         }
-        if (!in_array($mime, $allowedImg, true) && !str_starts_with($mime, 'image/')) {
+        if (!in_array($mime, $allowedImg, true)) {
             return ['ok' => false, 'error' => 'Unsupported image type (' . $mime . ')'];
         }
         if (!in_array($mime, ['image/jpeg', 'image/png', 'image/gif', 'image/webp'], true)) {
@@ -437,6 +437,31 @@ function ap_media_video_poster_body(string $path): ?string
 }
 
 /**
+ * ImageMagick input argument with the decoder pinned to the sniffed raster type.
+ *
+ * Without a coder prefix ImageMagick picks the decoder from the file's bytes, so a
+ * file that only claims to be an image can reach SVG, MVG, MSL, PostScript, or text
+ * coders and their external delegates. Anything outside this list returns null.
+ */
+function ap_media_magick_input(string $path): ?string
+{
+    $mime = strtolower((string) ((new finfo(FILEINFO_MIME_TYPE))->file($path) ?: ''));
+    $coder = match ($mime) {
+        'image/jpeg' => 'jpeg',
+        'image/png' => 'png',
+        'image/gif' => 'gif',
+        'image/webp' => 'webp',
+        'image/heic', 'image/heif', 'image/heic-sequence', 'image/heif-sequence' => 'heic',
+        'image/avif' => 'avif',
+        default => null,
+    };
+    if ($coder === null) {
+        return null;
+    }
+    return escapeshellarg($coder . ':' . $path . '[0]');
+}
+
+/**
  * Best-effort convert HEIC/other to JPEG. Returns null if unsupported.
  * @return array{path:string,body:string}|null
  */
@@ -449,10 +474,14 @@ function ap_media_convert_to_jpeg(string $path): ?array
     }
     @unlink($out);
     $out .= '.jpg';
-    $cmd = 'magick ' . escapeshellarg($path) . '[0] -auto-orient -quality 88 ' . escapeshellarg($out)
+    $input = ap_media_magick_input($path);
+    if ($input === null) {
+        return null;
+    }
+    $cmd = 'magick ' . $input . ' -auto-orient -quality 88 ' . escapeshellarg($out)
         . ' 2>/dev/null';
     if (trim((string) shell_exec('command -v magick')) === '') {
-        $cmd = 'convert ' . escapeshellarg($path) . '[0] -auto-orient -quality 88 ' . escapeshellarg($out)
+        $cmd = 'convert ' . $input . ' -auto-orient -quality 88 ' . escapeshellarg($out)
             . ' 2>/dev/null';
         if (trim((string) shell_exec('command -v convert')) === '') {
             return null;
@@ -525,9 +554,10 @@ function ap_media_convert_to_webp(string $path): ?array
     $magick = trim((string) shell_exec('command -v magick'));
     $convert = $magick !== '' ? 'magick' : trim((string) shell_exec('command -v convert'));
     $best = null;
-    if ($convert !== '') {
+    $input = ap_media_magick_input($path);
+    if ($convert !== '' && $input !== null) {
         foreach ([80, 72, 62, 52] as $q) {
-            $cmd = $convert . ' ' . escapeshellarg($path) . '[0] -auto-orient -resize '
+            $cmd = $convert . ' ' . $input . ' -auto-orient -resize '
                 . escapeshellarg($maxEdge . 'x' . $maxEdge . '>')
                 . ' -quality ' . (int) $q . ' ' . escapeshellarg($out) . ' 2>/dev/null';
             exec($cmd, $unused, $code);
