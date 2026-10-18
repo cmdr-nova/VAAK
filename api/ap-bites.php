@@ -20,6 +20,29 @@ if (PHP_SAPI !== 'cli'
 const AP_BITE_NS = 'https://ns.mia.jetzt/as#Bite';
 
 /**
+ * Cheap request-path checks before a Bite is queued (no network). Returns
+ * null when the bite can be queued, or the error the user should see.
+ */
+function ap_bite_precheck(string $targetRef, string $kind = 'auto'): ?string
+{
+    $targetRef = rtrim(trim($targetRef), '/');
+    if ($targetRef === '' || !str_starts_with($targetRef, 'https://')) {
+        return 'Need @user@host, actor URL, or post URL';
+    }
+    $kind = strtolower(trim($kind));
+    if (!in_array($kind, ['auto', 'user', 'post'], true)) {
+        return 'Invalid bite kind';
+    }
+    $selfActor = function_exists('ap_local_actor_id') ? rtrim(ap_local_actor_id(), '/') : '';
+    if ($selfActor !== '' && ($targetRef === $selfActor || str_starts_with($targetRef, $selfActor . '/'))) {
+        return (str_contains($targetRef, '/notes/') || str_contains($targetRef, '/statuses/'))
+            ? "You can't bite your own post"
+            : "You can't bite yourself";
+    }
+    return null;
+}
+
+/**
  * @return array{ok:bool,error?:string,id?:int,activity_id?:string,delivered?:int}
  */
 function ap_bite_send(string $targetRef, string $kind = 'auto'): array
