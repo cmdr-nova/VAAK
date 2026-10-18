@@ -12012,6 +12012,8 @@ function ap_masto_trend_downrank_ref_set(int $ownerUserId): array
     $preference = ap_db()->prepare('SELECT COALESCE(p.downranking_enabled, 1) FROM ap_users u LEFT JOIN actor_profile p ON p.actor_key = u.actor_key WHERE u.id = ?');
     $preference->execute([$ownerUserId]);
     $temporaryEnabled = (bool) $preference->fetchColumn();
+    // Same switch as Home: posts that match a downrank term drop out too.
+    if ($temporaryEnabled) $set['__terms'] = true;
     foreach ($temporaryEnabled ? ap_masto_trend_suppression_map($ownerUserId) : [] as $actor => $row) {
         if ((int) ($row['until'] ?? 0) <= $now) {
             continue;
@@ -12059,6 +12061,10 @@ function ap_masto_trend_status_is_downranked(array $item, array $refs): bool
         $raw[] = (string) ($item[$nest]['author_did'] ?? '');
     }
     $raw[] = (string) ($item['author_did'] ?? '');
+    if (!empty($refs['__terms']) && function_exists('ap_downrank_status_text_matches')
+        && ap_downrank_status_text_matches($item)) {
+        return true;
+    }
     foreach ($raw as $actor) {
         $actor = trim((string) $actor);
         if ($actor === '' || ctype_digit(rtrim($actor, '/'))) {
@@ -12745,6 +12751,7 @@ function ap_masto_trend_source_downrank_ref_set(int $ownerUserId): ?array
     $preference = ap_db()->prepare('SELECT COALESCE(p.downranking_enabled, 1) FROM ap_users u LEFT JOIN actor_profile p ON p.actor_key = u.actor_key WHERE u.id = ?');
     $preference->execute([$ownerUserId]);
     $temporaryEnabled = (bool) $preference->fetchColumn();
+    if ($temporaryEnabled) $set['__terms'] = true;
     $temporary=[];
     if($temporaryEnabled){$query=ap_db()->prepare('SELECT actor_id,suppressed_until FROM ap_home_suppression WHERE owner_user_id=?');$query->execute([$ownerUserId]);foreach($query->fetchAll()?:[] as $item)$temporary[(string)$item['actor_id']]=['until'=>strtotime((string)$item['suppressed_until'])?:0];}
     foreach ($temporary as $actor => $row) {
@@ -12850,7 +12857,7 @@ function ap_masto_trend_tags_recount(array $sources, int $ownerUserId = 0): arra
         $sourceActor=$source==='outbox'?$actor:(string)($row['actor_id']??$row['author_did']??$actor);
         // World moderation remains strict even for the viewer's own contribution.
         if(ap_masto_trend_tag_actor_hidden($actor,$policy,$ownerUserId)||ap_masto_trend_tag_actor_hidden($sourceActor,$policy,$ownerUserId))continue;
-        $contributor = ['account' => ['uri' => $actor], 'trend_actors' => [$actor,$sourceActor]];
+        $contributor = ['account' => ['uri' => $actor], 'content' => $text, 'spoiler_text' => (string) ($row['spoiler_text'] ?? ''), 'trend_actors' => [$actor,$sourceActor]];
         if ($ownerUserId > 0 && ap_masto_trend_status_is_downranked($contributor, $downrankRefs)) continue;
         $ts = strtotime((string) ($row[$source === 'outbox' ? 'published' : ($source === 'bsky' ? 'published_at' : 'created_at')] ?? '')) ?: 0;
         $ingest($text,$ts,ap_search_canonical_actor($sourceActor));
@@ -13059,7 +13066,7 @@ function ap_masto_trend_links_recount(array $sources,int $ownerUserId=0,bool $al
         $sourceActor=$source==='outbox'?$actor:(string)($row['actor_id']??$row['author_did']??$actor);
         // World moderation remains strict even for the viewer's own contribution.
         if(ap_masto_trend_tag_actor_hidden($actor,$policy,$ownerUserId)||ap_masto_trend_tag_actor_hidden($sourceActor,$policy,$ownerUserId))continue;
-        $contributor = ['account' => ['uri' => $actor], 'trend_actors' => [$actor,$sourceActor]];
+        $contributor = ['account' => ['uri' => $actor], 'content' => $text, 'spoiler_text' => (string) ($row['spoiler_text'] ?? ''), 'trend_actors' => [$actor,$sourceActor]];
         if ($ownerUserId > 0 && ap_masto_trend_status_is_downranked($contributor, $downrankRefs)) continue;
         $ts = strtotime((string) ($row[$source === 'outbox' ? 'published' : ($source === 'bsky' ? 'published_at' : 'created_at')] ?? '')) ?: 0;
         $ingest($text,$ts,ap_search_canonical_actor($sourceActor));
