@@ -81,6 +81,10 @@ unit_installed() {
   [[ "$out" == "$unit "* || "$out" == "$unit" ]]
 }
 
+unit_enabled() {
+  systemctl_bin is-enabled --quiet "$1" 2>/dev/null
+}
+
 require_real_dir() {
   local path="$1"
   [[ -d "$path" && ! -L "$path" ]] || die "${path} must stay a real directory, not a symlink"
@@ -169,7 +173,9 @@ restart_units() {
     fi
     sudo_restart "$unit" || return 1
   done
-  if want_optional shadow "$old" "$new"; then
+  if ! unit_enabled vaak-worker-shadow.service; then
+    echo "vaak-release: skip vaak-worker-shadow.service (unit is not enabled)"
+  elif want_optional shadow "$old" "$new"; then
     restart_if_installed vaak-worker-shadow.service || return 1
   else
     echo "vaak-release: skip vaak-worker-shadow.service (diff does not touch the shadow worker)"
@@ -423,6 +429,9 @@ fi
 if [ "$1" = "is-active" ]; then
   exit 0
 fi
+if [ "$1" = "is-enabled" ] && [ "$3" = "vaak-worker-shadow.service" ] && [ -e "${SHADOW_DISABLED_FLAG}" ]; then
+  exit 1
+fi
 exit 0
 CTL
   chmod 0755 "${tmp}/php" "${tmp}/curl" "${tmp}/systemctl"
@@ -470,6 +479,7 @@ PY
   export VAAK_CURL="${tmp}/curl"
   export VAAK_SYSTEMCTL="${tmp}/systemctl"
   export SYSTEMCTL_LOG="${tmp}/systemctl.log"
+  export SHADOW_DISABLED_FLAG="${tmp}/shadow-disabled"
   export VAAK_DEPLOY_RELAX_PERMS=1
   export VAAK_RELEASE_KEEP=5
   export VAAK_HEALTH_ATTEMPTS=2
@@ -549,7 +559,11 @@ CURL
 echo '{"ok":true}'
 CURL
   chmod 0755 "${tmp}/curl"
-  bash "$0" rollback "$sha_old"
+  : > "${SHADOW_DISABLED_FLAG}"
+  shadow_before="$(grep -c -F 'restart vaak-worker-shadow.service' "${SYSTEMCTL_LOG}")"
+  VAAK_RESTART_SHADOW=1 bash "$0" rollback "$sha_old"
+  [[ "$(grep -c -F 'restart vaak-worker-shadow.service' "${SYSTEMCTL_LOG}")" == "$shadow_before" ]]
+  rm -f "${SHADOW_DISABLED_FLAG}"
   [[ "$(cat "${tmp}/root/live-revision")" == "$sha_old" ]]
   [[ "$(cat "${tmp}/html/api/stale.php")" == "only-old" ]]
   [[ "$(cat "${tmp}/html/vaak/index.php")" == "vaak-old" ]]
