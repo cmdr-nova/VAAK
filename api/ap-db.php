@@ -6,6 +6,7 @@
 declare(strict_types=1);
 
 require_once __DIR__ . '/ap-redis.php';
+require_once __DIR__ . '/ap-net-guard.php';
 require_once __DIR__ . '/ap-public-doc.php';
 require_once __DIR__ . '/ap-recommendations.php';
 require_once __DIR__ . '/ap-follow-state.php';
@@ -17422,6 +17423,9 @@ function ap_remote_emoji_map_for_host(string $host, bool $refresh = false): arra
 function ap_remote_emoji_http_json(string $url): ?array
 {
     if (!str_starts_with($url, 'https://') || !function_exists('curl_init')) {
+        return null;
+    }
+    if (!ap_net_host_is_public((string) (parse_url($url, PHP_URL_HOST) ?: ''))) {
         return null;
     }
     $ch = curl_init($url);
