@@ -32,7 +32,7 @@ function ap_vaak_is_mkultra_host(): bool
 /** Normalize a local actor_key or empty string. */
 function ap_vaak_normalize_actor_key(string $raw): string
 {
-    return strtolower(preg_replace('/[^a-z0-9_]/', '', $raw) ?? '');
+    return preg_replace('/[^a-z0-9_]/', '', strtolower($raw)) ?? '';
 }
 
 /**
@@ -130,6 +130,19 @@ function ap_vaak_safe_next_path(?string $raw): ?string
         return $raw;
     }
     return null;
+}
+
+/**
+ * The classic HTML profile pages (profile shell and its outbox / followers /
+ * following lists) are deprecated. Browsers that still reach them (query
+ * variants, subpaths) are sent to the in-app profile instead. Does not return.
+ */
+function ap_vaak_redirect_classic_profile(string $actorKey): void
+{
+    header('Location: ' . ap_vaak_pretty_profile_path($actorKey), true, 302);
+    header('Cache-Control: no-store');
+    header('Vary: Accept');
+    exit;
 }
 
 /**
