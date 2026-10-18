@@ -119,16 +119,9 @@ if (!$wantsAp && strtolower((string) ($_GET['format'] ?? '')) === 'jekyll') {
 if (preg_match('#^/users/cmdr_nova/(outbox|followers|following)$#', $path, $m)) {
     $col = $m[1];
 
-    // Browser HTML for followers / following / outbox
+    // Classic HTML followers / following / outbox pages are deprecated.
     if (!$wantsAp) {
-        if ($col === 'followers' || $col === 'following') {
-            ap_cmdr_collection_html($col);
-            exit;
-        }
-        if ($col === 'outbox') {
-            ap_cmdr_outbox_html();
-            exit;
-        }
+        ap_vaak_redirect_classic_profile('cmdr_nova');
     }
 
     if ($col === 'outbox') {
@@ -526,8 +519,8 @@ if ($path !== '/users/cmdr_nova') {
 }
 
 if (!$wantsAp) {
-    ap_cmdr_html();
-    exit;
+    // Classic HTML profile is deprecated; the in-app profile is public.
+    ap_vaak_redirect_classic_profile('cmdr_nova');
 }
 
 if (ap_public_doc_respond_if_cached(CMDR_ACTOR_ID, $accept)) {
