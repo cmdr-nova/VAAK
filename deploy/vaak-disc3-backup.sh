@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-REMOTE="${VAAK_BACKUP_REMOTE:-root@<prod-host>:/var/backups/mkultra/vaak/}"
+# Read-only pull: "vaak-prod-backup" is an ~/.ssh/config alias for vaak-backup@<prod-host> with
+# its own key, which the VPS restricts to `rrsync -ro /var/backups/mkultra/vaak/`.
+REMOTE="${VAAK_BACKUP_REMOTE:-vaak-prod-backup:./}"
 DEST="${VAAK_DISC3_BACKUP_DIR:-/mnt/disc3/Backups/VAAK}"
 RETENTION_DAYS="${VAAK_DISC3_RETENTION_DAYS:-180}"
 SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=30 -o ServerAliveCountMax=3)
