@@ -49,6 +49,7 @@ php_tests=(
   api/bin/classic-profile-redirect-smoke.php
   api/bin/bsky-thread-no-federation-smoke.php
   api/bin/cpu-index-smoke.php
+  api/bin/downrank-search-trends-smoke.php
   api/bin/media-warm-lock-smoke.php
   api/bin/dm-ask-parity-smoke.php
   api/bin/follow-fallback-smoke.php
