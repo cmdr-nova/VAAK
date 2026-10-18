@@ -172,7 +172,8 @@ if (in_array($sub, ['outbox', 'followers', 'following'], true)) {
     if ($wantsAp) {
         ap_user_serve_collection_as2($actorKey, $actorId, $sub, $accept);
     } else {
-        ap_user_serve_collection_html($actorKey, $actorId, $sub);
+        // Classic HTML collection pages are deprecated.
+        ap_vaak_redirect_classic_profile($actorKey);
     }
     exit;
 }
@@ -410,8 +411,8 @@ if ($wantsAp) {
     exit;
 }
 
-ap_user_profile_html($actorKey, $actorId);
-exit;
+// Classic HTML profile is deprecated; the in-app profile is public.
+ap_vaak_redirect_classic_profile($actorKey);
 
 /* ----------------- helpers ----------------- */
 
