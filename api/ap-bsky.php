@@ -9,6 +9,7 @@
 declare(strict_types=1);
 
 require_once __DIR__ . '/ap-bsky-urls.php';
+require_once __DIR__ . '/ap-net-guard.php';
 
 const AP_BSKY_DEFAULT_PDS = 'https://bsky.social';
 const AP_BSKY_VAAK_PDS = 'https://bsky.mkultra.monster';
@@ -1861,6 +1862,10 @@ function ap_bsky_xrpc(
     if ($base === '' || !str_starts_with($base, 'https://')) {
         return ['ok' => false, 'error' => 'Invalid API host'];
     }
+    // The PDS host is user-supplied. Never let it point at this server or a private network.
+    if (!ap_net_host_is_public((string) (parse_url($base, PHP_URL_HOST) ?: ''))) {
+        return ['ok' => false, 'error' => 'Invalid API host'];
+    }
     $nsid = trim($nsid);
     if ($nsid === '' || !preg_match('/^[a-z0-9.-]+$/i', $nsid)) {
         return ['ok' => false, 'error' => 'Invalid XRPC method'];
@@ -1900,6 +1905,8 @@ function ap_bsky_xrpc(
         CURLOPT_RETURNTRANSFER => true,
         CURLOPT_FOLLOWLOCATION => true,
         CURLOPT_MAXREDIRS => 3,
+        CURLOPT_PROTOCOLS => CURLPROTO_HTTPS,
+        CURLOPT_REDIR_PROTOCOLS => CURLPROTO_HTTPS,
         CURLOPT_CONNECTTIMEOUT => $connectTimeout,
         CURLOPT_TIMEOUT => $timeoutSec,
         CURLOPT_HTTPHEADER => $headers,
@@ -2116,6 +2123,9 @@ function ap_bsky_connect(int $ownerUserId, string $identifier, string $appPasswo
     }
     if (!str_starts_with($pdsHost, 'https://')) {
         return ['ok' => false, 'error' => 'PDS host must be https://…'];
+    }
+    if (!ap_net_host_is_public((string) (parse_url($pdsHost, PHP_URL_HOST) ?: ''))) {
+        return ['ok' => false, 'error' => 'PDS host must be a public server'];
     }
     ap_bsky_migrate();
     $res = ap_bsky_xrpc($pdsHost, 'com.atproto.server.createSession', 'POST', null, [

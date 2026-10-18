@@ -1365,14 +1365,7 @@ function ap_rate_limit(string $ip, int $max = AP_INBOX_RATE_MAX): bool
 
 function ap_is_public_ip(string $ip): bool
 {
-    if (!filter_var($ip, FILTER_VALIDATE_IP)) {
-        return false;
-    }
-    return (bool) filter_var(
-        $ip,
-        FILTER_VALIDATE_IP,
-        FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE
-    );
+    return ap_net_ip_is_public($ip);
 }
 
 /**
@@ -1835,25 +1828,7 @@ function ap_fetch_actor_pubkey(string $keyId, bool $bypassCache = false): ?strin
 
 function ap_host_resolves_public(string $host): bool
 {
-    if (filter_var($host, FILTER_VALIDATE_IP)) {
-        return ap_is_public_ip($host);
-    }
-    $records = @dns_get_record($host, DNS_A + DNS_AAAA);
-    if (!is_array($records) || $records === []) {
-        // Fallback gethostbyname
-        $ip = gethostbyname($host);
-        if ($ip === $host) {
-            return false;
-        }
-        return ap_is_public_ip($ip);
-    }
-    foreach ($records as $rec) {
-        $ip = $rec['ip'] ?? $rec['ipv6'] ?? null;
-        if (!is_string($ip) || !ap_is_public_ip($ip)) {
-            return false;
-        }
-    }
-    return true;
+    return ap_net_host_is_public($host);
 }
 
 function ap_as_id($value): ?string
@@ -4446,6 +4421,7 @@ function ap_resolve_actor_ref(string $input): ?string
                     'http' => [
                         'method' => 'GET',
                         'timeout' => 5,
+                        'follow_location' => 0,
                         'header' => "Accept: application/jrd+json, application/json\r\nUser-Agent: " . ap_http_user_agent() . "\r\n",
                         'ignore_errors' => true,
                     ],
