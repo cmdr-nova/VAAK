@@ -5298,13 +5298,15 @@ function ap_acct_from_actor_href(string $href, ?string $fallbackUser = null): ?s
 }
 
 /**
- * Normalize mangled Bridgy plain-text mentions for display/linkify.
+ * Normalize mangled Bluesky plain-text mentions for display/linkify.
  * "@alice.bsky.social@bsky.brid.gy" → "@alice.bsky.social"
+ * "@alice.bsky.social@bsky.app" → "@alice.bsky.social" (reply composer seed;
+ * bsky.app is not an ActivityPub host, so the suffix only confuses parsers)
  */
 function ap_normalize_bridgy_plain_mentions(string $plain): string
 {
     return preg_replace(
-        '/@([A-Za-z0-9][A-Za-z0-9.-]*\.[A-Za-z]{2,})@bsky\.brid\.gy\b/u',
+        '/@([A-Za-z0-9][A-Za-z0-9.-]*\.[A-Za-z]{2,})@(?:bsky\.brid\.gy|bsky\.app)\b/u',
         '@$1',
         $plain
     ) ?? $plain;
