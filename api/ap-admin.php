@@ -39396,6 +39396,33 @@ window.vaakBootStatusThread();
   }
   window.vaakProfileScrollStatus = profileScrollStatus;
 
+  /**
+   * First paint of a finished profile: hold the end label until the reader
+   * reaches the bottom. Off-screen cards paint late (content-visibility), so
+   * an early "End of profile" sat under the first few posts.
+   */
+  let profileEndObserver = null;
+  function profileBootStatus(status, sentinel, more, scrollRoot) {
+    if (profileEndObserver) {
+      try { profileEndObserver.disconnect(); } catch (e) {}
+      profileEndObserver = null;
+    }
+    if (!status) return;
+    if (more || !sentinel || typeof IntersectionObserver !== 'function') {
+      status.textContent = profileScrollStatus(more);
+      return;
+    }
+    status.textContent = '';
+    const io = new IntersectionObserver((entries) => {
+      if (!entries.some((en) => en.isIntersecting)) return;
+      if (!status.textContent) status.textContent = profileScrollStatus(false);
+      io.disconnect();
+      if (profileEndObserver === io) profileEndObserver = null;
+    }, { root: scrollRoot || null, threshold: 0 });
+    profileEndObserver = io;
+    io.observe(sentinel);
+  }
+
   // Progressive boost / empty-Create hydration: signed remote fetch while you
   // scroll, swapping each card in place (never reloads / never jumps to top).
   const boostQueue = [];
@@ -39558,7 +39585,9 @@ window.vaakBootStatusThread();
   viewName = items.dataset.view || viewName || 'home';
   hasMore = items.dataset.hasMore === '1';
   if (viewName === 'remote_profile' && status) {
-    status.textContent = profileScrollStatus(hasMore);
+    const rootStyle = window.getComputedStyle(root);
+    profileBootStatus(status, sentinel, hasMore,
+      (rootStyle.overflowY === 'auto' || rootStyle.overflowY === 'scroll') ? root : null);
   }
 
   // Desktop: .feed is the scroll container. Mobile: body/window scrolls and
@@ -41094,7 +41123,10 @@ window.vaakBootStatusThread();
     tlBefore = items.dataset.before ? String(items.dataset.before) : '';
     hasMore = items.dataset.hasMore === '1';
     if (viewName === 'remote_profile' && status) {
-      status.textContent = profileScrollStatus(hasMore);
+      const feedEl = document.querySelector('.feed');
+      const feedStyle = feedEl ? window.getComputedStyle(feedEl) : null;
+      profileBootStatus(status, sentinel, hasMore,
+        feedStyle && (feedStyle.overflowY === 'auto' || feedStyle.overflowY === 'scroll') ? feedEl : null);
     }
     newestTs = parseInt(items.dataset.newest || '0', 10) || Math.floor(Date.now() / 1000);
     loading = false;
