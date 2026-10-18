@@ -2323,10 +2323,10 @@ function ap_masto_api(string $method, string $path): void
         ap_masto_require_token('read');
         $sid = (int) $hm[1];
         $row = ap_masto_local_row_from_public_id($sid) ?? (($sid < 2000000) ? ap_masto_status_by_local_id($sid) : null);
-        if (!$row) {
+        $status = $row ? ap_masto_status_from_row($row) : null;
+        if (!$row || !ap_masto_viewer_can_see_status($status, (int) ap_db_masto_owner_user_id())) {
             ap_masto_json(['error' => 'Record not found'], 404);
         }
-        $status = ap_masto_status_from_row($row);
         // Mastodon returns an array of StatusEdit objects; current-only is enough for Ice Cubes.
         ap_masto_json([[
             'content' => (string) ($status['content'] ?? ''),
@@ -2396,7 +2396,8 @@ function ap_masto_api(string $method, string $path): void
         if ($row) {
             // Detail view may sync-fetch a missing quote target; timelines never do.
             $status = ap_masto_status_from_row($row, true, true);
-            if ($hideBlockedStatus(is_array($status) ? $status : null)) {
+            if ($hideBlockedStatus(is_array($status) ? $status : null)
+                || !ap_masto_viewer_can_see_status(is_array($status) ? $status : null, $ownerId)) {
                 ap_masto_json(['error' => 'Record not found'], 404);
                 return;
             }
@@ -2406,8 +2407,8 @@ function ap_masto_api(string $method, string $path): void
         // Remote mention statuses
         $mentionId = ap_masto_mention_id_from_status_id($sid);
         if ($mentionId !== null) {
-            $st = ap_db()->prepare('SELECT * FROM mentions WHERE id = ? AND deleted_at IS NULL');
-            $st->execute([$mentionId]);
+            $st = ap_db()->prepare('SELECT * FROM mentions WHERE id = ? AND owner_user_id = ? AND deleted_at IS NULL');
+            $st->execute([$mentionId, $ownerId]);
             $mrow = $st->fetch();
             if (is_array($mrow)) {
                 $status = ap_masto_status_from_mention($mrow);

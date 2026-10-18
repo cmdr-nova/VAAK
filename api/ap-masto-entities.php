@@ -3653,6 +3653,9 @@ function ap_masto_status_context(int $statusId, array $opts = []): array
     // Local public reply chain (best-effort via in_reply_to_local_id)
     $row = ap_masto_local_row_from_public_id($statusId)
         ?? (($statusId < 2000000) ? ap_masto_status_by_local_id($statusId) : null);
+    if ($row && !ap_masto_viewer_can_see_status(ap_masto_status_from_row($row), ap_db_masto_owner_user_id())) {
+        return ['ancestors' => [], 'descendants' => []];
+    }
     if ($row) {
         $localId = (int) ($row['local_id'] ?? 0);
         $noteId = rtrim((string) ($row['note_id'] ?? ''), '/');
@@ -3709,8 +3712,8 @@ function ap_masto_status_context(int $statusId, array $opts = []): array
     // Mention statuses (inbound)
     $mentionId = ap_masto_mention_id_from_status_id($statusId);
     if ($mentionId !== null) {
-        $st = ap_db()->prepare('SELECT * FROM mentions WHERE id = ? AND deleted_at IS NULL');
-        $st->execute([$mentionId]);
+        $st = ap_db()->prepare('SELECT * FROM mentions WHERE id = ? AND owner_user_id = ? AND deleted_at IS NULL');
+        $st->execute([$mentionId, ap_db_masto_owner_user_id()]);
         $mrow = $st->fetch();
         if (is_array($mrow)) {
             $parentUrl = rtrim((string) ($mrow['in_reply_to'] ?? ''), '/');
@@ -9832,6 +9835,32 @@ function ap_masto_status_created_at_by_id(int $statusId): ?string
 }
 
 /** Resolve any public status id to a local masto_statuses row when applicable. */
+/**
+ * Whether the signed-in owner may read a local status looked up by id.
+ * Ids are sequential, so the lookup alone must not hand out followers-only or
+ * direct posts of other local accounts. Authors always see their own posts.
+ */
+function ap_masto_viewer_can_see_status(?array $status, int $ownerUserId): bool
+{
+    if (!is_array($status)) {
+        return false;
+    }
+    $visibility = strtolower((string) ($status['visibility'] ?? 'public'));
+    if (in_array($visibility, ['public', 'unlisted'], true)) {
+        return true;
+    }
+    if ($ownerUserId < 1) {
+        return false;
+    }
+    $viewer = rtrim(ap_db_owner_actor_id_for_user_id($ownerUserId), '/');
+    $author = rtrim((string) ($status['account']['uri'] ?? ''), '/');
+    $uri = (string) ($status['uri'] ?? '');
+    if ($viewer !== '' && ($author === $viewer || str_starts_with($uri, $viewer . '/'))) {
+        return true;
+    }
+    return ap_visibility_status_audience_allowed($status, $ownerUserId);
+}
+
 function ap_masto_local_row_from_public_id(int $statusId): ?array
 {
     $p = ap_masto_parse_public_status_id($statusId);
@@ -15512,6 +15541,9 @@ function ap_masto_resolve_status_interaction(int $statusId): ?array
         ?? (($statusId < 2000000) ? ap_masto_status_by_local_id($statusId) : null);
     if ($row) {
         $status = ap_masto_status_from_row($row);
+        if (!ap_masto_viewer_can_see_status($status, ap_db_masto_owner_user_id())) {
+            return null;
+        }
         $noteId = (string) ($row['note_id'] ?? '');
         $noteActor = null;
         if ($noteId !== '' && preg_match('#^(https://mkultra\.monster/users/[A-Za-z0-9_]+)/#', $noteId, $nm)) {
@@ -15522,8 +15554,8 @@ function ap_masto_resolve_status_interaction(int $statusId): ?array
 
     $mentionId = ap_masto_mention_id_from_status_id($statusId);
     if ($mentionId !== null) {
-        $st = ap_db()->prepare('SELECT * FROM mentions WHERE id = ? AND deleted_at IS NULL');
-        $st->execute([$mentionId]);
+        $st = ap_db()->prepare('SELECT * FROM mentions WHERE id = ? AND owner_user_id = ? AND deleted_at IS NULL');
+        $st->execute([$mentionId, ap_db_masto_owner_user_id()]);
         $mrow = $st->fetch();
         if (is_array($mrow)) {
             $status = ap_masto_status_from_mention($mrow);
