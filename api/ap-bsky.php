@@ -13522,6 +13522,83 @@ function ap_bsky_notification_subjects_warm(int $ownerUserId, array $notifs): in
 }
 
 /**
+ * Repair Bluesky like / repost notifications stored before subjects were
+ * warmed at ingest. The poller only re-reads the newest page, so an older row
+ * whose subject never reached bsky_posts keeps painting "Bluesky post" (or
+ * nothing). Opt-in only: api/bin/bsky-notif-subject-backfill.php.
+ *
+ * @return array{rows:int,subjects:int,cached_before:int,fetched:int,text_updated:int,still_missing:list<int>,dry_run:bool}
+ */
+function ap_bsky_notification_subjects_backfill(int $ownerUserId, int $days, int $limit, bool $dryRun): array
+{
+    $out = ['rows' => 0, 'subjects' => 0, 'cached_before' => 0, 'fetched' => 0,
+        'text_updated' => 0, 'still_missing' => [], 'dry_run' => $dryRun];
+    if ($ownerUserId < 1) {
+        return $out;
+    }
+    ap_bsky_posts_migrate();
+    $st = ap_db()->prepare(
+        "SELECT id, object_id, activity_type, content FROM mentions
+         WHERE owner_user_id = ? AND deleted_at IS NULL AND created_at >= ?
+           AND activity_type IN ('Like', 'Announce') AND object_id LIKE 'https://bsky.app/profile/%'
+         ORDER BY id DESC LIMIT ?"
+    );
+    $st->bindValue(1, $ownerUserId, PDO::PARAM_INT);
+    $st->bindValue(2, gmdate('Y-m-d\TH:i:s', time() - max(1, $days) * 86400));
+    $st->bindValue(3, max(1, $limit), PDO::PARAM_INT);
+    $st->execute();
+    $rows = [];
+    $want = [];
+    foreach ($st->fetchAll() ?: [] as $row) {
+        $url = preg_replace('~#(like|reblog)-[a-z0-9]+$~i', '', (string) ($row['object_id'] ?? ''));
+        $at = ap_bsky_at_uri_from_any_url((string) $url);
+        if (!is_string($at) || !str_starts_with($at, 'at://')) {
+            $out['still_missing'][] = (int) $row['id'];
+            continue;
+        }
+        $rows[] = ['id' => (int) $row['id'], 'at' => $at, 'content' => (string) ($row['content'] ?? '')];
+        $want[$at] = (string) ($row['activity_type'] ?? '') === 'Announce' ? 'repost' : 'like';
+    }
+    $out['rows'] = count($rows) + count($out['still_missing']);
+    $out['subjects'] = count($want);
+    if ($want === []) {
+        return $out;
+    }
+    $uris = array_keys($want);
+    $ph = implode(',', array_fill(0, count($uris), '?'));
+    $cached = ap_db()->prepare("SELECT bsky_uri FROM bsky_posts WHERE bsky_uri IN ($ph)");
+    $cached->execute($uris);
+    $out['cached_before'] = count($cached->fetchAll(PDO::FETCH_COLUMN) ?: []);
+    if ($dryRun) {
+        return $out;
+    }
+    // The warm helper fetches at most 50 subjects per call; feed it in pages.
+    foreach (array_chunk($uris, 50) as $chunk) {
+        $notifs = [];
+        foreach ($chunk as $at) {
+            $notifs[] = ['reason' => $want[$at], 'reasonSubject' => $at];
+        }
+        $out['fetched'] += ap_bsky_notification_subjects_warm($ownerUserId, $notifs);
+    }
+    $upd = ap_db()->prepare('UPDATE mentions SET content = ? WHERE id = ? AND owner_user_id = ?');
+    foreach ($rows as $row) {
+        $preview = ap_bsky_subject_post_preview_text($row['at'], $ownerUserId);
+        if ($preview === '') {
+            $out['still_missing'][] = $row['id'];
+            continue;
+        }
+        if (in_array($row['content'], ['liked your Bluesky post', 'boosted your Bluesky post', ''], true)) {
+            $upd->execute([$preview, $row['id'], $ownerUserId]);
+            $out['text_updated']++;
+        }
+    }
+    // Cached notification pages still hold the empty paint.
+    ap_notification_projection_invalidate_owner($ownerUserId);
+    sort($out['still_missing']);
+    return $out;
+}
+
+/**
  * @param list<array> $notifs
  * @return array{ok:bool,inserted:int,skipped:int,pushed:int,errors:list<string>}
  */

@@ -50,12 +50,15 @@ php_tests=(
   api/bin/bsky-thread-no-federation-smoke.php
   api/bin/cpu-index-smoke.php
   api/bin/downrank-search-trends-smoke.php
+  api/bin/bsky-notif-subject-backfill-smoke.php
   api/bin/media-warm-lock-smoke.php
   api/bin/net-guard-smoke.php
+  api/bin/masto-status-audience-smoke.php
   api/bin/dm-ask-parity-smoke.php
   api/bin/follow-fallback-smoke.php
   api/bin/home-bsky-index-smoke.php
   api/bin/inbox-signature-smoke.php
+  api/bin/inbox-ownership-smoke.php
   api/bin/library-deletion-smoke.php
   api/bin/library-folder-capture.php
   api/bin/library-page-capture.php
