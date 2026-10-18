@@ -55,7 +55,9 @@ function ap_publish_delivery_execute(array $row, array $payload): array
     $priority = [];
     $priorityActors = [];
     $replyTo = (string) ($payload['in_reply_to'] ?? '');
-    if ($replyTo !== '') {
+    // Bluesky-thread replies (decided at compose) never reach ActivityPub.
+    $skipFedi = !empty($payload['skip_fedi']);
+    if ($replyTo !== '' && !$skipFedi) {
         $parent = ap_fetch_as2_object($replyTo);
         if (is_array($parent)) {
             $parentActor = ap_as_id($parent['attributedTo'] ?? null) ?: ap_as_id($parent['actor'] ?? null);
@@ -110,7 +112,7 @@ function ap_publish_delivery_execute(array $row, array $payload): array
         json_encode($create['cc'] ?? [], JSON_UNESCAPED_SLASHES),
         (string) $row['note_id'], rtrim((string) $row['note_id'], '/') . '/',
     ]);
-    foreach (array_slice(array_unique($priorityActors), 0, 8) as $targetActor) {
+    foreach (($skipFedi ? [] : array_slice(array_unique($priorityActors), 0, 8)) as $targetActor) {
         if ($targetActor === $actor || ap_is_blocked_actor($targetActor)) continue;
         $doc = ap_fetch_actor_doc($targetActor);
         if (!$doc) continue;
@@ -122,7 +124,7 @@ function ap_publish_delivery_execute(array $row, array $payload): array
     }
 
     if (empty($payload['fedi_done'])) {
-        $fan = ($visibility === 'local')
+        $fan = ($visibility === 'local' || $skipFedi)
             ? ['delivered' => 0, 'queued' => 0]
             : (($visibility === 'public')
             ? ap_deliver_public_activity($create, $priority, $pendingQuote)
@@ -130,7 +132,8 @@ function ap_publish_delivery_execute(array $row, array $payload): array
         $payload['fedi_done'] = true;
         $db->prepare('UPDATE ap_publish_delivery_queue SET payload_json = ?, updated_at = ? WHERE id = ?')
             ->execute([json_encode($payload, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE), gmdate('c'), (int) $row['id']]);
-        ap_log('publish_delivery fedi note=' . $row['note_id'] . ' delivered=' . (int) ($fan['delivered'] ?? 0) . ' queued=' . (int) ($fan['queued'] ?? 0));
+        ap_log('publish_delivery fedi note=' . $row['note_id'] . ' delivered=' . (int) ($fan['delivered'] ?? 0) . ' queued=' . (int) ($fan['queued'] ?? 0)
+            . ($skipFedi ? ' skip_fedi=bsky_thread' : ''));
     }
     $quoteId = (string) ($payload['quote_object_id'] ?? '');
     if ($quoteId !== '' && $pendingQuote && $visibility !== 'local' && empty($payload['quote_request_done'])) {
@@ -185,7 +188,7 @@ function ap_publish_delivery_execute(array $row, array $payload): array
                 json_encode($create, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE),
                 (string) $row['note_id'], rtrim((string) $row['note_id'], '/') . '/',
             ]);
-            if (in_array($visibility, ['public', 'unlisted'], true)) {
+            if (!$skipFedi && in_array($visibility, ['public', 'unlisted'], true)) {
                 $update = ['@context' => 'https://www.w3.org/ns/activitystreams', 'id' => $actor . '/updates/' . bin2hex(random_bytes(8)),
                     'type' => 'Update', 'actor' => $actor, 'published' => gmdate('c'), 'to' => $create['to'] ?? [],
                     'cc' => $create['cc'] ?? [], 'object' => $note];

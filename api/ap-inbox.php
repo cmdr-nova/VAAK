@@ -6517,6 +6517,62 @@ function ap_quote_target_is_bluesky(string $quoteObjectId): bool
         || str_contains($quoteObjectId, 'bsky.brid.gy');
 }
 
+/**
+ * True when a reply belongs to a thread that started on Bluesky, so it must
+ * stay Bluesky-side: no ActivityPub Create, no AP Mention tags, no inbox hits.
+ *
+ * - bsky.app / at:// parents are Bluesky-native unless they map to a VAAK note
+ *   (a VAAK→Bluesky mirror), in which case that note decides.
+ * - Local notes imported from the Bluesky appview (vaakOrigin=bluesky) and
+ *   local replies further down such a thread are Bluesky-side too.
+ * - Bridgy Fed (bsky.brid.gy) parents are ActivityPub objects and federate.
+ *
+ * DB/cache only on the compose path (no XRPC record fetch).
+ */
+function ap_reply_parent_is_bluesky_side(string $inReplyTo, int $depth = 0): bool
+{
+    $inReplyTo = rtrim(trim($inReplyTo), '/');
+    if ($inReplyTo === '' || $depth > 8 || str_contains($inReplyTo, 'bsky.brid.gy')) {
+        return false;
+    }
+    static $memo = [];
+    if (array_key_exists($inReplyTo, $memo)) {
+        return $memo[$inReplyTo];
+    }
+    if (str_starts_with($inReplyTo, 'https://bsky.app/') || str_starts_with($inReplyTo, 'at://')) {
+        if (!function_exists('ap_bsky_local_note_id_for_at_uri') && is_file(__DIR__ . '/ap-bsky.php')) {
+            require_once __DIR__ . '/ap-bsky.php';
+        }
+        $local = function_exists('ap_bsky_local_note_id_for_at_uri')
+            ? ap_bsky_local_note_id_for_at_uri($inReplyTo, 0, false)
+            : null;
+        if (is_string($local) && str_starts_with($local, 'https://mkultra.monster/users/')) {
+            return $memo[$inReplyTo] = ap_reply_parent_is_bluesky_side($local, $depth + 1);
+        }
+        return $memo[$inReplyTo] = true;
+    }
+    if (!preg_match('#^https://mkultra\.monster/users/[A-Za-z0-9_]+/notes/#', $inReplyTo)) {
+        return $memo[$inReplyTo] = false;
+    }
+    try {
+        $st = ap_db()->prepare('SELECT in_reply_to, raw_create_json FROM outbox_notes WHERE id = ? OR id = ? LIMIT 1');
+        $st->execute([$inReplyTo, $inReplyTo . '/']);
+        $row = $st->fetch(PDO::FETCH_ASSOC);
+    } catch (Throwable $e) {
+        return $memo[$inReplyTo] = false;
+    }
+    if (!is_array($row)) {
+        return $memo[$inReplyTo] = false;
+    }
+    $raw = json_decode((string) ($row['raw_create_json'] ?? ''), true);
+    if (is_array($raw) && is_array($raw['object'] ?? null)
+        && (($raw['object']['vaakOrigin'] ?? '') === 'bluesky')) {
+        return $memo[$inReplyTo] = true;
+    }
+    $parent = trim((string) ($row['in_reply_to'] ?? ''));
+    return $memo[$inReplyTo] = ($parent !== '' && ap_reply_parent_is_bluesky_side($parent, $depth + 1));
+}
+
 /** True when we already have the quoted object cached locally (events / outbox). */
 function ap_quote_target_locally_known(string $quoteObjectId): bool
 {
@@ -6907,6 +6963,13 @@ function ap_publish_status_text(
         }
     }
 
+    // Replies inside a thread that started on Bluesky stay Bluesky-side. The
+    // note is still stored locally and mirrored to Bluesky, but is never sent
+    // to ActivityPub inboxes and carries no AP Mention tags (a Bluesky handle
+    // like @kevinr.example.com must never notify a same-named fediverse actor).
+    $bskySide = $inReplyTo !== '' && $visibility !== 'local'
+        && ap_reply_parent_is_bluesky_side($inReplyTo);
+
     // Mastodon-compatible addressing
     $publicId = 'https://www.w3.org/ns/activitystreams#Public';
     $followersId = $actor . '/followers';
@@ -6958,7 +7021,7 @@ function ap_publish_status_text(
     $as2MentionSeen = [];
     if ($content !== '' && function_exists('ap_masto_content_with_mentions')) {
         $mentionPack = ap_masto_content_with_mentions($content, $extraMentionActors);
-        foreach ($mentionPack['mentions'] ?? [] as $m) {
+        foreach (($bskySide ? [] : ($mentionPack['mentions'] ?? [])) as $m) {
             $mUrl = rtrim((string) ($m['url'] ?? ''), '/');
             if ($mUrl === '' || !str_starts_with($mUrl, 'https://')) {
                 continue;
@@ -7257,6 +7320,7 @@ function ap_publish_status_text(
             'quote_object_id' => $quoteObjectId,
             'quote_approval_pending' => $quoteApprovalPending,
             'skip_bsky' => $pollNorm !== null,
+            'skip_fedi' => $bskySide,
         ];
         if (ap_publish_delivery_enqueue($deliveryOwnerId, $noteId, $deliveryPayload)) {
             // Best effort immediate wake; the scheduled worker is the durable
@@ -7270,7 +7334,8 @@ function ap_publish_status_text(
                 } catch (Throwable $e) { /* preview warming is optional */ }
             }
             ap_log("publish_status queued create=$createId local_id=$localId visibility=$visibility"
-                . ($pollNorm !== null ? ' skip_bsky=poll' : ''));
+                . ($pollNorm !== null ? ' skip_bsky=poll' : '')
+                . ($bskySide ? ' skip_fedi=bsky_thread' : ''));
             return [
                 'ok' => true, 'note_id' => $noteId, 'create_id' => $createId,
                 'local_id' => $localId, 'published' => $published,
@@ -7330,8 +7395,11 @@ function ap_publish_status_text(
         }
     }
 
+    if ($bskySide) {
+        $priorityExtra = [];
+    }
     // Public: Bridgy + followers + shared inboxes. Unlisted/private: followers only.
-    $fan = ($visibility === 'local')
+    $fan = ($visibility === 'local' || $bskySide)
         ? ['delivered' => 0, 'queued' => 0, 'bridgy' => false]
         : (($visibility === 'public')
         ? ap_deliver_public_activity($create, $priorityExtra, $quoteApprovalPending)
@@ -7435,7 +7503,7 @@ function ap_publish_status_text(
                         error_log('[ap-inbox] bsky stamp outbox: ' . $e->getMessage());
                     }
                     // Best-effort Update so remotes that already stored Create learn the proxy link.
-                    if (in_array($visibility, ['public', 'unlisted'], true)) {
+                    if (!$bskySide && in_array($visibility, ['public', 'unlisted'], true)) {
                         try {
                             $update = [
                                 '@context' => 'https://www.w3.org/ns/activitystreams',
