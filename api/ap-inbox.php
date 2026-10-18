@@ -166,8 +166,12 @@ if (is_array($json)) {
         if (!function_exists('ap_relay_is_accepted_key')) {
             require_once __DIR__ . '/ap-relays.php';
         }
-        $relayOk = function_exists('ap_relay_is_accepted_key') && ap_relay_is_accepted_key($sig['keyId']);
-        $followFwd = !$relayOk && ap_inbox_signer_is_followed($sig['keyId']);
+        // Forwarding only ever carries someone else's Create or Announce. Delete,
+        // Update, Undo, Follow and the rest must come from the actor's own key,
+        // or they fall through to origin recovery below.
+        $forwardable = in_array($type, ['Create', 'Announce'], true);
+        $relayOk = $forwardable && function_exists('ap_relay_is_accepted_key') && ap_relay_is_accepted_key($sig['keyId']);
+        $followFwd = $forwardable && !$relayOk && ap_inbox_signer_is_followed($sig['keyId']);
         if ($relayOk || $followFwd) {
             ap_log(sprintf(
                 '%s type=%s keyId=%s actor=%s',
@@ -1814,6 +1818,12 @@ function ap_fetch_actor_pubkey(string $keyId, bool $bypassCache = false): ?strin
         }
 
         @file_put_contents($cacheFile, $pem);
+        $owner = ap_extract_pubkey_owner($data);
+        if ($owner !== null) {
+            @file_put_contents(ap_key_owner_cache_path($keyId), $owner);
+        } else {
+            @unlink(ap_key_owner_cache_path($keyId));
+        }
         // Clear any stale negative cache on success
         $negPath = ap_key_neg_cache_path($keyId);
         if (is_file($negPath)) {
@@ -1995,7 +2005,9 @@ function ap_route_verified_activity(array $activity, int $bytes): string
             $undoTarget = ap_resolve_local_follow_target($innerObj);
             if ($undoTarget !== null) {
                 ap_request_actor_set((string) $undoTarget['actor_key']);
-                $who = ap_as_id($inner['actor'] ?? $activity['actor'] ?? null);
+                // Only the verified sender can undo its own Follow.
+                $innerActor = ap_as_id($inner['actor'] ?? null);
+                $who = ($innerActor === null || $innerActor === $actorId) ? $actorId : null;
                 if ($who) {
                     ap_follower_remove($who, ap_local_actor_id());
                 }
@@ -2005,14 +2017,15 @@ function ap_route_verified_activity(array $activity, int $bytes): string
             }
         }
         if (in_array($innerType, ['Like', 'EmojiReact', 'Announce', 'Quote', 'QuotePost'], true)) {
-            $who = ap_as_id(is_array($inner) ? ($inner['actor'] ?? $activity['actor'] ?? null) : ($activity['actor'] ?? null));
+            $innerActor = is_array($inner) ? ap_as_id($inner['actor'] ?? null) : null;
+            $who = ($innerActor === null || $innerActor === $actorId) ? $actorId : null;
             $target = ap_as_id($innerObj);
             $kind = ($innerType === 'Announce') ? 'reblog' : (($innerType === 'Like' || $innerType === 'EmojiReact') ? 'like' : 'quote');
             $n = 0;
             if (function_exists('ap_mention_soft_delete_interaction') && $who && $target) {
                 $n = ap_mention_soft_delete_interaction($who, $target, $kind, $innerActId);
-            } elseif (function_exists('ap_mention_soft_delete_interaction') && $innerActId) {
-                $n = ap_mention_soft_delete_interaction((string) ($who ?: ''), '', $kind, $innerActId);
+            } elseif (function_exists('ap_mention_soft_delete_interaction') && $who && $innerActId) {
+                $n = ap_mention_soft_delete_interaction((string) $who, '', $kind, $innerActId);
             }
             if ($who && function_exists('ap_events_mark_interaction_undone')) {
                 ap_events_mark_interaction_undone($innerType, $who, $target, $innerActId);
@@ -2050,6 +2063,10 @@ function ap_route_verified_activity(array $activity, int $bytes): string
         $deletedMentions = 0;
         $deletedEvents = 0;
         foreach (array_values(array_unique($deleteIds)) as $did) {
+            if (!ap_inbox_object_owned_by_actor((string) $did, is_string($actorId) ? $actorId : null)) {
+                ap_log('delete_foreign_object actor=' . ap_short((string) $actorId) . ' object=' . ap_short((string) $did));
+                continue;
+            }
             // A deleted remote status may have projection rows even when no
             // local mention/event row was materialized. Invalidate by status
             // unconditionally before applying the row-level tombstones.
@@ -2292,7 +2309,7 @@ function ap_route_verified_activity(array $activity, int $bytes): string
                 }
                 ap_local_observe($activity);
                 $vis = ap_visibility_from_activity($activity);
-                if ($type === 'Update' && is_string($objectId) && $objectId !== '' && function_exists('ap_events_refresh_create_from_update')) {
+                if ($type === 'Update' && is_string($objectId) && $objectId !== '' && ap_inbox_object_owned_by_actor($objectId, is_string($actorId) ? $actorId : null) && function_exists('ap_events_refresh_create_from_update')) {
                     ap_events_refresh_create_from_update(
                         $objectId,
                         $sum,
@@ -2320,7 +2337,7 @@ function ap_route_verified_activity(array $activity, int $bytes): string
         }
         ap_local_observe($activity);
         $vis = ap_visibility_from_activity($activity);
-        if ($type === 'Update' && is_string($objectId) && $objectId !== '' && function_exists('ap_events_refresh_create_from_update')) {
+        if ($type === 'Update' && is_string($objectId) && $objectId !== '' && ap_inbox_object_owned_by_actor($objectId, is_string($actorId) ? $actorId : null) && function_exists('ap_events_refresh_create_from_update')) {
             ap_events_refresh_create_from_update(
                 $objectId,
                 $summaryForEvent,
@@ -5720,7 +5737,7 @@ function ap_local_observe(array $activity): void
             }
         }
     }
-    if ($type === 'Delete' && $objectId) {
+    if ($type === 'Delete' && $objectId && ap_inbox_object_owned_by_actor((string) $objectId, is_string($actorId) ? $actorId : null)) {
         ap_mention_soft_delete($objectId);
     }
 }
@@ -5791,7 +5808,75 @@ function ap_inbox_actor_matches_key(string $keyId, ?string $actorId): bool
     if (strtolower($keyHost) !== strtolower($actorHost)) {
         return false;
     }
-    return true;
+    // Same host is not enough: on a shared instance any account could sign as
+    // any other. Prefer the owner the key document named; otherwise the keyId
+    // must be the actor's own (actor#main-key, or actor/main-key on GoToSocial).
+    $actor = rtrim($actorId, '/');
+    $owner = ap_key_owner_cached($keyId);
+    if ($owner !== null) {
+        return rtrim($owner, '/') === $actor;
+    }
+    $keyBase = rtrim(preg_replace('/#.*$/', '', $keyId) ?? $keyId, '/');
+    return $keyBase === $actor || str_starts_with($keyBase, $actor . '/');
+}
+
+function ap_key_owner_cache_path(string $keyId): string
+{
+    return AP_INBOX_KEY_CACHE_DIR . '/' . hash('sha256', trim($keyId)) . '.owner';
+}
+
+/**
+ * Actor that the fetched key document says owns this keyId, when known.
+ */
+function ap_key_owner_cached(string $keyId): ?string
+{
+    $path = ap_key_owner_cache_path($keyId);
+    if (!is_file($path)) {
+        return null;
+    }
+    $owner = trim((string) @file_get_contents($path));
+    return str_starts_with($owner, 'https://') ? $owner : null;
+}
+
+/**
+ * Owner named by a fetched key or actor document: publicKey.owner, else the
+ * actor's own id when the document embeds the key.
+ *
+ * @param array<string,mixed> $data
+ */
+function ap_extract_pubkey_owner(array $data): ?string
+{
+    $pk = $data['publicKey'] ?? null;
+    if (is_array($pk) && array_is_list($pk)) {
+        $pk = $pk[0] ?? null;
+    }
+    if (is_array($pk) && is_string($pk['owner'] ?? null) && str_starts_with($pk['owner'], 'https://')) {
+        return $pk['owner'];
+    }
+    if (is_string($data['owner'] ?? null) && str_starts_with($data['owner'], 'https://')) {
+        return $data['owner'];
+    }
+    if (is_array($pk) && is_string($data['id'] ?? null) && str_starts_with($data['id'], 'https://')) {
+        return $data['id'];
+    }
+    return null;
+}
+
+/**
+ * A remote actor may only change objects that live on its own host, and never
+ * objects on this server.
+ */
+function ap_inbox_object_owned_by_actor(string $objectId, ?string $actorId): bool
+{
+    if ($actorId === null || $actorId === '' || !str_starts_with($objectId, 'https://')) {
+        return false;
+    }
+    $objectHost = strtolower((string) parse_url($objectId, PHP_URL_HOST));
+    $actorHost = strtolower((string) parse_url($actorId, PHP_URL_HOST));
+    if ($objectHost === '' || $objectHost !== $actorHost) {
+        return false;
+    }
+    return !in_array($objectHost, ['mkultra.monster', 'www.mkultra.monster', 'vaak.monster', 'www.vaak.monster'], true);
 }
 
 /**

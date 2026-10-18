@@ -6561,17 +6561,20 @@ function ap_mentions_list(int $limit = 120, ?int $ownerUserId = null): array
 function ap_mention_soft_delete(string $objectId): int
 {
     $objectId = rtrim($objectId, '/');
-    if ($objectId === '') {
+    if ($objectId === '' || !str_starts_with($objectId, 'https://')) {
         return 0;
     }
     $now = ap_db_now();
+    // The id comes from remote Deletes. Escape LIKE wildcards so it can only
+    // match its own #suffix rows.
+    $escape = ap_db()->getAttribute(PDO::ATTR_DRIVER_NAME) === 'pgsql' ? "ESCAPE E'\\\\'" : "ESCAPE '\\'";
     $st = ap_db()->prepare(
         'UPDATE mentions SET deleted_at = ?
          WHERE deleted_at IS NULL AND (
-           object_id = ? OR object_id = ? OR object_id LIKE ?
+           object_id = ? OR object_id = ? OR object_id LIKE ? ' . $escape . '
          )'
     );
-    $st->execute([$now, $objectId, $objectId . '/', $objectId . '#%']);
+    $st->execute([$now, $objectId, $objectId . '/', addcslashes($objectId, '\\%_') . '#%']);
     $n = (int) $st->rowCount();
     if ($n > 0 && function_exists('ap_search_fts_delete_object')) {
         ap_search_fts_delete_object($objectId);
