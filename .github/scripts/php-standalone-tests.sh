@@ -57,6 +57,7 @@ php_tests=(
   api/bin/follow-fallback-smoke.php
   api/bin/home-bsky-index-smoke.php
   api/bin/inbox-signature-smoke.php
+  api/bin/inbox-ownership-smoke.php
   api/bin/library-deletion-smoke.php
   api/bin/library-folder-capture.php
   api/bin/library-page-capture.php
