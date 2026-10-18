@@ -46,6 +46,7 @@ php_tests=(
   api/bin/bsky-thread-fragment-smoke.php
   api/bin/bsky-observation-refresh-smoke.php
   api/bin/classic-profile-redirect-smoke.php
+  api/bin/bsky-thread-no-federation-smoke.php
   api/bin/cpu-index-smoke.php
   api/bin/media-warm-lock-smoke.php
   api/bin/dm-ask-parity-smoke.php
