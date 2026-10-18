@@ -76,6 +76,13 @@ async fn load_self_thread_parents(
         }
     }
     crate::audience::filter_parents(db, owner, crate::audience::Surface::timeline(view), &mut extra).await?;
+    // Parents loaded off-page skip the slice's quote resolver. Run it here so a
+    // quoted post stays on the parent card once a self-reply groups under it.
+    if !extra.is_empty() {
+        let (keys, mut vals): (Vec<String>, Vec<serde_json::Value>) = extra.drain().unzip();
+        let _ = crate::home_hydrate_ranked::hydrate_local_quote_targets(db, &mut vals).await;
+        extra = keys.into_iter().zip(vals).collect();
+    }
     Ok(extra)
 }
 
