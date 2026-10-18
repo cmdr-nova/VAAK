@@ -12673,6 +12673,131 @@ function ap_search_tag_row_allowed(array $row,string $source,int $ownerUserId, ?
         &&ap_visibility_status_audience_allowed($status,$ownerUserId);
 }
 
+function ap_downrank_phrase_matches_text(string $text, string $phrase): bool
+{
+    $phrase = trim(preg_replace('/\s+/u', ' ', strip_tags($phrase)));
+    if ($phrase === '') return false;
+    // Hashtags are labels, not reliable evidence of harassment. Ignore the
+    // complete hashtag token so terms such as `slut` do not fire merely on a
+    // self-applied `#slut` tag.
+    $searchText = preg_replace('/(?<![\pL\pN_])#[\pL\pN_]+/u', ' ', strip_tags($text));
+    if (!is_string($searchText)) {
+        $searchText = strip_tags($text);
+    }
+    // Whole word or phrase only. Letters, numbers, and underscores continue
+    // one token, so a listed word does not fire inside a longer word.
+    $pattern = '/(?<![\pL\pN_])' . preg_quote($phrase, '/') . '(?![\pL\pN_])/iu';
+    return preg_match($pattern, $searchText) === 1;
+}
+
+/** @return list<string> */
+function ap_downrank_text_categories(string $text): array
+{
+    $text = strtolower(trim(strip_tags($text)));
+    if ($text === '') return [];
+    $patterns = [
+        'direct_abuse' => '/\b(?:fuck\s+you|suck\s+my\s+dick|go\s+fuck\s+yourself)\b/i',
+        'ai_slogan' => '/\b(?:slop|ai\s+trash|clanker)\b/i',
+        'misogyny' => '/\b(?:women\s+belong\s+in\s+the\s+kitchen|women\s+are\s+property|go\s+back\s+to\s+the\s+kitchen)\b/i',
+    ];
+    $matches = [];
+    foreach ($patterns as $category => $pattern) {
+        if (preg_match($pattern, $text)) $matches[] = $category;
+    }
+    // Admin-managed terms are exact phrase matches. They are read once per
+    // request and never alter visibility, federation, blocks, or mutes.
+    static $adminTerms = null;
+    if ($adminTerms === null) {
+        $adminTerms = [];
+        try {
+            $st = ap_db()->query('SELECT phrase, category FROM ap_home_downrank_terms WHERE enabled = 1 ORDER BY id ASC LIMIT 500');
+            foreach ($st->fetchAll() ?: [] as $term) {
+                $phrase = trim(preg_replace('/\s+/u', ' ', (string) ($term['phrase'] ?? '')));
+                if ($phrase === '' || mb_strlen($phrase) > 120) continue;
+                $category = preg_replace('/[^a-z0-9_-]/i', '', (string) ($term['category'] ?? 'custom')) ?: 'custom';
+                $adminTerms[] = [$phrase, $category];
+            }
+        } catch (Throwable $e) {
+            $adminTerms = [];
+        }
+    }
+    foreach ($adminTerms as [$phrase, $category]) {
+        if (ap_downrank_phrase_matches_text($text, $phrase)) $matches[] = $category;
+    }
+    return array_values(array_unique($matches));
+}
+
+function ap_downrank_actor_exempt(string $actorId): bool
+{
+    $actorId = rtrim(trim($actorId), '/');
+    if ($actorId === '') {
+        return true;
+    }
+    $lower = strtolower($actorId);
+    if (str_starts_with($lower, 'https://mkultra.monster/users/')) {
+        return true;
+    }
+    if (str_starts_with($lower, 'https://mkultra.monster/@')) {
+        return true;
+    }
+    // Admin especially: catch handle/path forms even if host shape drifts.
+    if (preg_match('#/(?:users/|@)cmdr_nova$#i', $actorId) === 1) {
+        return true;
+    }
+    if ($lower === 'cmdr_nova' || $lower === 'cmdr_nova@mkultra.monster') {
+        return true;
+    }
+    return false;
+}
+
+/**
+ * Text and author of one status, when that author can be term-downranked.
+ * Local accounts stay exempt, the same as Home.
+ */
+function ap_downrank_status_text_matches(array $st): bool
+{
+    $account = is_array($st['account'] ?? null) ? $st['account'] : [];
+    $actor = (string) ($account['uri'] ?? $account['url'] ?? $st['author_did'] ?? '');
+    if (ap_downrank_actor_exempt($actor)) {
+        return false;
+    }
+    $text = trim((string) ($st['spoiler_text'] ?? '') . "\n" . (string) ($st['content'] ?? $st['text'] ?? ''));
+    return $text !== '' && ap_downrank_text_categories($text) !== [];
+}
+
+/**
+ * Search keeps downranked posts but moves them below the rest, the way Home
+ * pushes them down instead of hiding them.
+ *
+ * @param list<array<string,mixed>> $statuses
+ * @return list<array<string,mixed>>
+ */
+function ap_search_downrank_statuses(array $statuses, int $ownerUserId): array
+{
+    if ($ownerUserId < 1 || count($statuses) < 2 || !function_exists('ap_masto_trend_downrank_ref_set')
+        || !function_exists('ap_masto_trend_status_is_downranked')) {
+        return $statuses;
+    }
+    try {
+        $refs = ap_masto_trend_downrank_ref_set($ownerUserId);
+    } catch (Throwable $e) {
+        return $statuses;
+    }
+    if ($refs === []) {
+        return $statuses;
+    }
+    $keep = [];
+    $down = [];
+    foreach ($statuses as $st) {
+        if (ap_masto_trend_status_is_downranked($st, $refs)) {
+            $down[] = $st;
+        } else {
+            $keep[] = $st;
+        }
+    }
+    return array_merge($keep, $down);
+}
+
 function ap_search_filter_statuses(array $statuses, int $ownerUserId, int $limit): array
 {
     $limit = max(1, $limit);
@@ -12688,7 +12813,7 @@ function ap_search_filter_statuses(array $statuses, int $ownerUserId, int $limit
             break;
         }
     }
-    return $out;
+    return ap_search_downrank_statuses($out, $ownerUserId);
 }
 
 /**
