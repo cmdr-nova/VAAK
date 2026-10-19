@@ -78,7 +78,7 @@ Units: `deploy/vaak-worker-notif.service`, `deploy/vaak-worker-notif-list.servic
 
 ```bash
 cd rust && cargo build --release -p vaak-worker
-scp target/release/vaak-worker root@144.91.124.35:/usr/local/bin/vaak-worker
+scp target/release/vaak-worker root@<prod-host>:/usr/local/bin/vaak-worker
 # stop units before replacing a running binary
 ```
 

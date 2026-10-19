@@ -1,6 +1,6 @@
 {
   "provenance": {
-    "host": "144.91.124.35",
+    "host": "<prod-host>",
     "database": "novalandia",
     "transaction": "BEGIN READ ONLY/ROLLBACK",
     "raw_as2_retained": false,

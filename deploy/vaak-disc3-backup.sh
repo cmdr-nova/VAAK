@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# Read-only pull: "vaak-prod-backup" is an ~/.ssh/config alias for vaak-backup@144.91.124.35 with
+# Read-only pull: "vaak-prod-backup" is an ~/.ssh/config alias for vaak-backup@<prod-host> with
 # its own key, which the VPS restricts to `rrsync -ro /var/backups/mkultra/vaak/`.
 REMOTE="${VAAK_BACKUP_REMOTE:-vaak-prod-backup:./}"
 DEST="${VAAK_DISC3_BACKUP_DIR:-/mnt/disc3/Backups/VAAK}"
