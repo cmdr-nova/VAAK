@@ -1568,6 +1568,11 @@ function ap_http_curl_get_ex(string $url, array $headers, int $timeoutSec = 8, i
                 return strlen($data);
             },
         ]);
+        // Connect only to the addresses the SSRF guard checked.
+        if (!ap_net_curl_pin($ch, $url)) {
+            curl_close($ch);
+            return ['body' => null, 'status' => 0];
+        }
         $ok = curl_exec($ch);
         $status = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
         $errno = curl_errno($ch);
@@ -2957,7 +2962,13 @@ function ap_misskey_note_as2_from_url(string $url): ?array
         CURLOPT_POSTFIELDS => $payload,
         CURLOPT_CONNECTTIMEOUT => 3,
         CURLOPT_TIMEOUT => 6,
+        CURLOPT_FOLLOWLOCATION => false,
+        CURLOPT_PROTOCOLS => CURLPROTO_HTTPS,
     ]);
+    if (!ap_net_curl_pin($ch, $apiUrl)) {
+        curl_close($ch);
+        return null;
+    }
     $raw = curl_exec($ch);
     $status = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
     curl_close($ch);
@@ -4437,20 +4448,8 @@ function ap_resolve_actor_ref(string $input): ?string
                 $curlRes = ap_http_curl_get_ex($wfUrl, $wfHeaders, 8);
                 $href = $parseWf(is_string($curlRes['body'] ?? null) ? $curlRes['body'] : null);
             }
-            if ($href === null) {
-                $ctx = stream_context_create([
-                    'http' => [
-                        'method' => 'GET',
-                        'timeout' => 5,
-                        'follow_location' => 0,
-                        'header' => "Accept: application/jrd+json, application/json\r\nUser-Agent: " . ap_http_user_agent() . "\r\n",
-                        'ignore_errors' => true,
-                    ],
-                    'ssl' => ['verify_peer' => true, 'verify_peer_name' => true],
-                ]);
-                $body = @file_get_contents($wfUrl, false, $ctx);
-                $href = $parseWf(is_string($body) ? $body : null);
-            }
+            // No file_get_contents fallback: the stream wrapper resolves the
+            // name itself, so it cannot be pinned to the checked addresses.
             if ($href === null) {
                 // Last resort: signed GET (some locked-down hosts)
                 $href = $parseWf(ap_signed_get($wfUrl));
@@ -6014,31 +6013,19 @@ function ap_deliver_signed_json(string $inboxUrl, array $activity, string $keyId
             CURLOPT_IPRESOLVE => CURL_IPRESOLVE_V4,
             CURLOPT_SSL_VERIFYPEER => true,
             CURLOPT_SSL_VERIFYHOST => 2,
+            CURLOPT_PROTOCOLS => CURLPROTO_HTTPS,
         ]);
-        $resp = curl_exec($ch);
-        $status = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
-        $curlErr = trim((string) curl_error($ch));
+        if (ap_net_curl_pin($ch, $inboxUrl)) {
+            $resp = curl_exec($ch);
+            $status = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+            $curlErr = trim((string) curl_error($ch));
+        } else {
+            $curlErr = 'Inbox host is not public';
+        }
         curl_close($ch);
     } else {
-        $ctx = stream_context_create([
-            'http' => [
-                'method' => 'POST',
-                'timeout' => $timeoutSec,
-                'follow_location' => 0,
-                'header' => implode("\r\n", $headers) . "\r\n",
-                'content' => $body,
-                'ignore_errors' => true,
-            ],
-            'ssl' => [
-                'verify_peer' => true,
-                'verify_peer_name' => true,
-            ],
-        ]);
-        $resp = @file_get_contents($inboxUrl, false, $ctx);
-        $statusLine = $http_response_header[0] ?? '';
-        if (is_string($statusLine) && preg_match('/\s(\d{3})\s/', $statusLine, $m)) {
-            $status = (int) $m[1];
-        }
+        // The stream wrapper resolves the name itself and cannot be pinned.
+        $curlErr = 'curl is required for delivery';
     }
     $ok = $status >= 200 && $status < 300;
     $statusLine = $status > 0 ? 'HTTP ' . $status : 'No HTTP response from inbox';

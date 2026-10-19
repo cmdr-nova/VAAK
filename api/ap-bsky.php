@@ -1903,10 +1903,7 @@ function ap_bsky_xrpc(
     $respHeaders = '';
     curl_setopt_array($ch, [
         CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_FOLLOWLOCATION => true,
-        CURLOPT_MAXREDIRS => 3,
         CURLOPT_PROTOCOLS => CURLPROTO_HTTPS,
-        CURLOPT_REDIR_PROTOCOLS => CURLPROTO_HTTPS,
         CURLOPT_CONNECTTIMEOUT => $connectTimeout,
         CURLOPT_TIMEOUT => $timeoutSec,
         CURLOPT_HTTPHEADER => $headers,
@@ -1920,7 +1917,9 @@ function ap_bsky_xrpc(
         curl_setopt($ch, CURLOPT_POSTFIELDS, $payload);
     }
     $xrpcStarted = microtime(true);
-    $body = curl_exec($ch);
+    // Redirects are followed by hand, each hop checked and pinned. A redirect
+    // to another host is not followed while a bearer token is attached.
+    $body = ap_net_curl_exec($ch, $url, 3, $bearer === null || $bearer === '');
     $errno = curl_errno($ch);
     $err = curl_error($ch);
     $status = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
