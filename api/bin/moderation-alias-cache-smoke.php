@@ -4,7 +4,7 @@ declare(strict_types=1);
 require __DIR__.'/migration-reference-functions.php';
 if (!extension_loaded('mbstring')) throw new RuntimeException('Actual policy tests require mbstring.');
 $db=new PDO('sqlite::memory:',null,null,[PDO::ATTR_ERRMODE=>PDO::ERRMODE_EXCEPTION,PDO::ATTR_DEFAULT_FETCH_MODE=>PDO::FETCH_ASSOC]);
-$db->exec('CREATE TABLE ap_blocks(scope TEXT,kind TEXT,value TEXT,created_at TEXT);
+$db->exec('CREATE TABLE ap_blocks(id INTEGER PRIMARY KEY AUTOINCREMENT,scope TEXT,kind TEXT,value TEXT,created_at TEXT);
 CREATE TABLE ap_user_blocks(id INTEGER,owner_user_id INTEGER,scope TEXT,value TEXT,created_at TEXT);
 CREATE TABLE ap_mutes(owner_user_id INTEGER,actor_id TEXT,created_at TEXT);
 CREATE TABLE bsky_posts(author_handle TEXT,author_did TEXT);
@@ -25,7 +25,7 @@ $GLOBALS['redis_fixture']['vaak:moderation:mutes:v2:201']=[];
 $GLOBALS['redis_fixture']['vaak:moderation:server-blocks:v1']=[];
 $db->exec("INSERT INTO ap_user_blocks VALUES(1,201,'actor','https://encoded.test/users/%61lice','now');
 INSERT INTO ap_mutes VALUES(201,'https://mute.test/users/%61lice','now');
-INSERT INTO ap_blocks VALUES('actor','block','https://server.test/users/%61lice','now'),('actor','mute','https://global.test/users/%61lice','now');");
+INSERT INTO ap_blocks(scope,kind,value,created_at) VALUES('actor','block','https://server.test/users/%61lice','now'),('actor','mute','https://global.test/users/%61lice','now');");
 foreach(['https://encoded.test/users/alice','https://encoded.test/@alice','https://encoded.test/users/%61lice'] as $candidate) check(ap_user_is_blocked($candidate,null,201),'stored encoded personal block '.$candidate);
 check(!ap_user_is_blocked('https://encoded.test/users/Alice',null,201),'personal block keeps path case');
 check(!ap_user_is_blocked('https://encoded.test/@alice',null,202),'personal block owner isolation');
@@ -45,7 +45,7 @@ check(ap_is_blocked_actor('https://server.test/users/%61lice'),'literal server b
 check(ap_is_globally_muted_actor('https://global.test/users/%61lice'),'literal server mute matches encoded candidate');
 $db->exec("INSERT INTO ap_user_blocks VALUES(2,201,'actor','https://numeric.test/users/123','now');
 INSERT INTO ap_mutes VALUES(201,'https://numeric.test/users/123','now');
-INSERT INTO ap_blocks VALUES('actor','block','https://numeric.test/users/123','now'),('actor','mute','https://numeric-mute.test/users/123','now');");
+INSERT INTO ap_blocks(scope,kind,value,created_at) VALUES('actor','block','https://numeric.test/users/123','now'),('actor','mute','https://numeric-mute.test/users/123','now');");
 ap_user_blocks_cache_clear(201);ap_mutes_cache_clear(201);ap_block_cache_clear();
 check(ap_user_is_blocked('https://numeric.test/users/123',null,201) && !ap_user_is_blocked('https://numeric.test/@123',null,201),'numeric personal block has no web alias');
 check(ap_is_muted_actor('https://numeric.test/users/123',201) && !ap_is_muted_actor('https://numeric.test/@123',201),'numeric personal mute has no web alias');
@@ -65,7 +65,7 @@ function warm_policy(string $actor): void {
     ap_db()->exec('DELETE FROM ap_user_blocks;DELETE FROM ap_mutes;DELETE FROM ap_blocks;');
     $q=ap_db()->prepare("INSERT INTO ap_user_blocks VALUES(1,201,'actor',?,'now')");$q->execute([$actor]);
     $q=ap_db()->prepare("INSERT INTO ap_mutes VALUES(201,?,'now')");$q->execute([$actor]);
-    $q=ap_db()->prepare("INSERT INTO ap_blocks VALUES('actor','block',?,'now'),('actor','mute',?,'now')");$q->execute([$actor,$actor]);
+    $q=ap_db()->prepare("INSERT INTO ap_blocks(scope,kind,value,created_at) VALUES('actor','block',?,'now'),('actor','mute',?,'now')");$q->execute([$actor,$actor]);
     ap_user_blocks_cache_clear(201);ap_mutes_cache_clear(201);ap_block_cache_clear();
 }
 function policy_match(string $actor): array { return [ap_user_is_blocked($actor,null,201),ap_is_muted_actor($actor,201),ap_is_blocked_actor($actor),ap_is_globally_muted_actor($actor)]; }
