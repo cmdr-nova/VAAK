@@ -3340,7 +3340,9 @@ function ap_bsky_compact_label_list(mixed $labels): array
 }
 
 /**
- * All label vals on a PostView-shaped post (top-level + record self-labels).
+ * All label vals on a PostView-shaped post (top-level + record self-labels +
+ * the author's account labels). A viewRecord (quoted post) keeps its record
+ * under `value`.
  *
  * @param array<string,mixed> $post
  * @return list<string>
@@ -3351,8 +3353,14 @@ function ap_bsky_post_label_vals(array $post): array
     foreach (ap_bsky_compact_label_list($post['labels'] ?? null) as $lab) {
         $vals[] = (string) ($lab['val'] ?? '');
     }
-    $record = is_array($post['record'] ?? null) ? $post['record'] : [];
+    $record = is_array($post['record'] ?? null) ? $post['record'] : (is_array($post['value'] ?? null) ? $post['value'] : []);
     foreach (ap_bsky_compact_label_list($record['labels'] ?? ($record['selfLabels'] ?? null)) as $lab) {
+        $vals[] = (string) ($lab['val'] ?? '');
+    }
+    // Bluesky moderation labels whole accounts (e.g. `porn`) as well as posts;
+    // such an author's posts often carry no post label of their own.
+    $author = is_array($post['author'] ?? null) ? $post['author'] : [];
+    foreach (ap_bsky_compact_label_list($author['labels'] ?? null) as $lab) {
         $vals[] = (string) ($lab['val'] ?? '');
     }
     $vals = array_values(array_filter(array_unique($vals), static fn(string $v): bool => $v !== ''));
@@ -3707,6 +3715,22 @@ function ap_bsky_post_embed_compact(?array $embed): ?array
                 'createdAt' => (string) ($value['createdAt'] ?? $rec['indexedAt'] ?? ''),
             ],
         ];
+        // Quoted NSFW posts keep their CW: moderation, self and account labels.
+        $recLabels = ap_bsky_compact_label_list($rec['labels'] ?? null);
+        if ($recLabels !== []) {
+            $outRec['labels'] = $recLabels;
+        }
+        $selfLabels = ap_bsky_compact_label_list($value['labels'] ?? null);
+        if ($selfLabels !== []) {
+            $outRec['value']['labels'] = [
+                '$type' => 'com.atproto.label.defs#selfLabels',
+                'values' => $selfLabels,
+            ];
+        }
+        $authorLabels = ap_bsky_compact_label_list($author['labels'] ?? null);
+        if ($authorLabels !== []) {
+            $outRec['author']['labels'] = $authorLabels;
+        }
         // Keep quoted media so timeline quote blocks can show images/videos.
         $embedsOut = [];
         $srcEmbeds = is_array($rec['embeds'] ?? null) ? $rec['embeds'] : [];
@@ -3895,6 +3919,17 @@ function ap_bsky_post_upsert_from_feed_item(array $itemOrPost, ?int $ownerUserId
         // Keep moderation labels so Gallery / CW can blur adult media.
         'labels' => ap_bsky_compact_label_list($post['labels'] ?? null),
     ];
+    // AppView views carry indexedAt; Jetstream records do not. Moderation
+    // labels often land seconds after a post is made, so the Rust label
+    // re-check (thin_media_warm) fetches posts again when this stamp is
+    // too close to the post's creation.
+    if (trim((string) ($post['indexedAt'] ?? '')) !== '') {
+        $raw['vaak_labels_at'] = time();
+    }
+    $authorLabels = ap_bsky_compact_label_list($author['labels'] ?? null);
+    if ($authorLabels !== []) {
+        $raw['author']['labels'] = $authorLabels;
+    }
     if (isset($record['reply']) && is_array($record['reply'])) {
         $raw['record']['reply'] = $record['reply'];
     }
@@ -3924,6 +3959,13 @@ function ap_bsky_post_upsert_from_feed_item(array $itemOrPost, ?int $ownerUserId
                 }
                 // Union moderation labels so a thin re-upsert cannot wipe them.
                 $prevRaw = json_decode((string) ($prevRow['raw_json'] ?? ''), true);
+                if (is_array($prevRaw) && !isset($raw['vaak_labels_at']) && is_int($prevRaw['vaak_labels_at'] ?? null)) {
+                    $raw['vaak_labels_at'] = $prevRaw['vaak_labels_at'];
+                }
+                if (is_array($prevRaw) && ap_bsky_compact_label_list($author['labels'] ?? null) === []
+                    && is_array($prevRaw['author']['labels'] ?? null) && $prevRaw['author']['labels'] !== []) {
+                    $raw['author']['labels'] = $prevRaw['author']['labels'];
+                }
                 if (is_array($prevRaw) && is_array($prevRaw['labels'] ?? null)) {
                     $seenVals = [];
                     foreach ($raw['labels'] as $lab) {

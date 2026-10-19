@@ -189,7 +189,8 @@ fn legacy_quote(post:&Value,facts:&CardFacts)->Result<Option<String>>{
 }
 pub(crate) fn sensitive(post:&Value)->bool{
     let record=&post["record"];let record_labels=record.get("labels").filter(|v|!v.is_null()).or_else(||record.get("selfLabels")).unwrap_or(&Value::Null);
-    [&post["labels"],record_labels].into_iter().any(|labels|{
+    // Account labels count too: Bluesky moderation labels whole accounts `porn`.
+    [&post["labels"],record_labels,&post["author"]["labels"]].into_iter().any(|labels|{
         let labels=labels.get("values").filter(|v|v.is_array()).unwrap_or(labels);
         labels.as_array().into_iter().flatten().any(|label|{
             let val=label.as_str().unwrap_or(s(label,"val")).trim().to_ascii_lowercase();
