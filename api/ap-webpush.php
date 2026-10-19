@@ -464,6 +464,11 @@ function ap_webpush_notify_event(
             error_log('[ap-webpush] notify_event skipped: no owner type=' . $type);
             return;
         }
+        // Muted or blocked notifiers (personal or server-wide) never buzz the phone.
+        if ($actorId !== '' && function_exists('ap_search_actor_hidden')
+            && ap_search_actor_hidden($actorId, $ownerUserId)) {
+            return;
+        }
 
         // Soft-load helpers used for titles/avatars (inbox may not have pulled them in yet)
         if (!function_exists('ap_masto_remote_account')) {

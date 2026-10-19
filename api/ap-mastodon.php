@@ -1527,7 +1527,7 @@ function ap_masto_api(string $method, string $path): void
             $sinceId = (string) $_GET['min_id'];
         }
         [$types, $exclude] = ap_masto_parse_notification_type_filters();
-        ap_masto_json(ap_masto_notifications_api_list(ap_masto_notifications_fetch($limit, $maxId, $sinceId, $types, $exclude)));
+        ap_masto_json(ap_masto_notifications_api_list(ap_masto_notifications_fetch_visible($limit, $maxId, $sinceId, $types, $exclude)));
         return;
     }
 
@@ -1621,7 +1621,7 @@ function ap_masto_api(string $method, string $path): void
             $lastRead = (string) $nMark->last_read_id;
         }
         [$types, $exclude] = ap_masto_parse_notification_type_filters();
-        $all = ap_masto_notifications_fetch(80, null, null, $types, $exclude);
+        $all = ap_masto_notifications_fetch_visible(80, null, null, $types, $exclude);
         $count = 0;
         foreach ($all as $n) {
             if ((int) ($n['id'] ?? 0) > (int) $lastRead) {
