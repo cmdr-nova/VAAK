@@ -38,9 +38,10 @@ $check(
     isset(
         $specs['idx_bsky_posts_lower_author_did'],
         $specs['idx_bsky_posts_seen'],
-        $specs['idx_bsky_post_observations_last_seen']
+        $specs['idx_bsky_post_observations_last_seen'],
+        $specs['idx_remote_actors_lower_host_username']
     ),
-    'deploy knows the author-did, seen, and last-seen indexes'
+    'deploy knows the author-did, seen, last-seen, and actor alias indexes'
 );
 $flatSql = preg_replace('/\s+/', ' ', $indexSql) ?: '';
 foreach ($specs as $name => $spec) {
@@ -70,6 +71,15 @@ $check(
         && substr_count($entities, 'WHERE lower(author_did) IN ($ph)') === 2,
     'the hidden-handle lookup still filters on lower(author_did)'
 );
+$check(
+    str_contains($specs['idx_remote_actors_lower_host_username']['create'], "ON remote_actors (lower(COALESCE(host, '')), lower(COALESCE(username, '')))"),
+    'actor alias index matches the lookup expression'
+);
+$check(
+    str_contains($entities, "WHERE lower(COALESCE(host,\\'\\')) = ? AND lower(COALESCE(username,\\'\\')) = ?"),
+    'the actor alias lookup still filters on lower(COALESCE(host)) and lower(COALESCE(username))'
+);
+$check(!preg_match('/CREATE\s+INDEX\b[^;]*idx_remote_actors_lower_host_username/', $schema), 'a page load does not build the actor alias index');
 
 $files = array_map('basename', vaak_migrate_deploy_sql_files($api));
 $check(!in_array('20261015_cpu_load_indexes_postgres.sql', $files, true), 'concurrent index file stays out of the additive loop');
