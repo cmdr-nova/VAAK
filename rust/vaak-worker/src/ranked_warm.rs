@@ -1210,7 +1210,7 @@ async fn fetch_bsky_recommendation_keys(
             continue;
         };
         if exclude_did.is_some_and(|did| key.author_did == did)
-            || bsky_author_hidden(hidden, &key.author_did)
+            || bsky_author_hidden(hidden, &key.author_did, &key.author_handle)
             || bsky_author_keys(&key).iter().any(|k| deprioritized.contains(k))
             || text_matches_muted(&key.text, &muted)
             || seen_authors.contains(&key.author_did)
@@ -1247,7 +1247,12 @@ fn collapse_repeated_external_posts(keys: &mut Vec<BskyKey>) {
     });
 }
 
-fn bsky_author_hidden(hidden: &hidden::HiddenSets, author_did: &str) -> bool {
+fn bsky_author_hidden(hidden: &hidden::HiddenSets, author_did: &str, author_handle: &str) -> bool {
+    // A blocked fediverse actor's Bridgy Fed account is only known by handle.
+    let handle = author_handle.trim();
+    if !handle.is_empty() && hidden.is_hidden(&format!("https://bsky.app/profile/{handle}")) {
+        return true;
+    }
     let did = author_did.trim();
     if did.is_empty() || !did.starts_with("did:") {
         return false;
@@ -1334,7 +1339,7 @@ fn merge_bsky_ranked(
         if !fedi.is_empty() && seen_fedi.contains(&fedi) {
             continue;
         }
-        if bsky_author_hidden(hidden, &key.author_did) {
+        if bsky_author_hidden(hidden, &key.author_did, &key.author_handle) {
             continue;
         }
         let mut entry = json!({
