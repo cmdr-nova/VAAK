@@ -39,9 +39,10 @@ $check(
         $specs['idx_bsky_posts_lower_author_did'],
         $specs['idx_bsky_posts_seen'],
         $specs['idx_bsky_post_observations_last_seen'],
-        $specs['idx_remote_actors_lower_host_username']
+        $specs['idx_remote_actors_lower_host_username'],
+        $specs['idx_events_local_timeline_created']
     ),
-    'deploy knows the author-did, seen, last-seen, and actor alias indexes'
+    'deploy knows the author-did, seen, last-seen, actor alias, and local timeline indexes'
 );
 $flatSql = preg_replace('/\s+/', ' ', $indexSql) ?: '';
 foreach ($specs as $name => $spec) {
@@ -80,6 +81,23 @@ $check(
     'the actor alias lookup still filters on lower(COALESCE(host)) and lower(COALESCE(username))'
 );
 $check(!preg_match('/CREATE\s+INDEX\b[^;]*idx_remote_actors_lower_host_username/', $schema), 'a page load does not build the actor alias index');
+// A partial index is only used when the query repeats its predicate, so the
+// local-post reads must keep these exact filters.
+$warm = (string) file_get_contents($root . '/rust/vaak-worker/src/ranked_warm.rs');
+$newer = (string) file_get_contents($root . '/rust/vaak-worker/src/ranked/mod.rs');
+$check(
+    str_contains($specs['idx_events_local_timeline_created']['create'], "ON events (created_at DESC, id DESC) WHERE action_taken IN ('log', 'local_observe') AND actor_id LIKE 'https://mkultra.monster/users/%'"),
+    'local timeline index covers local actors sorted by recency'
+);
+$check(
+    str_contains($warm, "AND action_taken = ANY(ARRAY['log','local_observe'])")
+        && str_contains($warm, "AND actor_id LIKE 'https://mkultra.monster/users/%'\n                     ORDER BY created_at DESC, id DESC"),
+    'the Home warm local-post read still matches the local timeline index'
+);
+$check(
+    str_contains($newer, "AND action_taken IN ('log', 'local_observe')\n               AND actor_id LIKE 'https://mkultra.monster/users/%'"),
+    'the newer-items local read still matches the local timeline index'
+);
 
 $files = array_map('basename', vaak_migrate_deploy_sql_files($api));
 $check(!in_array('20261015_cpu_load_indexes_postgres.sql', $files, true), 'concurrent index file stays out of the additive loop');
