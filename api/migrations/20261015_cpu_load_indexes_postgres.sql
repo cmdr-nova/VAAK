@@ -13,6 +13,9 @@
 -- idx_bsky_posts_seen matches the observation sync's seen_at window.
 -- idx_bsky_post_observations_last_seen matches the fresh-window predicate
 -- (last_seen_at older than about 10 minutes).
+-- idx_remote_actors_lower_host_username matches the actor alias lookup in
+-- ap_masto_actor_id_aliases() and the Rust search alias lookup:
+--   WHERE lower(COALESCE(host,'')) = ? AND lower(COALESCE(username,'')) = ?
 -- uniq_bsky_post_observations_uri_owner is not in this file. Deploy creates
 -- it only when (bsky_uri, owner_user_id) has no valid unique index or
 -- primary key, so a table that already has that primary key does not gain
@@ -23,3 +26,5 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_bsky_posts_seen
     ON bsky_posts (seen_at);
 CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_bsky_post_observations_last_seen
     ON bsky_post_observations (last_seen_at);
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_remote_actors_lower_host_username
+    ON remote_actors (lower(COALESCE(host, '')), lower(COALESCE(username, '')));

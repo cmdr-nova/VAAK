@@ -446,6 +446,8 @@ function vaak_migrate_home_bsky_indexes(PDO $db): void
  * `WHERE lower(author_did) IN (...)` on bsky_posts.
  * idx_bsky_posts_seen matches the observation sync's seen_at window.
  * idx_bsky_post_observations_last_seen matches the fresh-window predicate.
+ * idx_remote_actors_lower_host_username matches the actor alias lookup
+ * `lower(COALESCE(host,'')) = ? AND lower(COALESCE(username,'')) = ?`.
  *
  * @return array<string, array{table: string, create: string, drop: string}>
  */
@@ -466,6 +468,11 @@ function vaak_migrate_cpu_index_specs(): array
             'table' => 'bsky_post_observations',
             'create' => 'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_bsky_post_observations_last_seen ON bsky_post_observations (last_seen_at)',
             'drop' => 'DROP INDEX CONCURRENTLY IF EXISTS idx_bsky_post_observations_last_seen',
+        ],
+        'idx_remote_actors_lower_host_username' => [
+            'table' => 'remote_actors',
+            'create' => "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_remote_actors_lower_host_username ON remote_actors (lower(COALESCE(host, '')), lower(COALESCE(username, '')))",
+            'drop' => 'DROP INDEX CONCURRENTLY IF EXISTS idx_remote_actors_lower_host_username',
         ],
     ];
 }
