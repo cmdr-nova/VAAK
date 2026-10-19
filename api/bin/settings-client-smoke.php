@@ -1,6 +1,8 @@
 <?php
 declare(strict_types=1);
 
+require_once dirname(__DIR__) . '/ap-shadow-http.php';
+
 /** Validate the Rust Settings JSON contract as a mobile/API client would see it. */
 $rustUrl = rtrim(trim((string) (getenv('VAAK_SETTINGS_CLIENT_RUST_URL') ?: '')), '/');
 $owner = max(1, (int) (getenv('VAAK_SETTINGS_CLIENT_OWNER_ID') ?: '1'));
@@ -13,7 +15,7 @@ if (preg_match('/novalandia|mkultra|144\.91\.124\.35/i', $rustUrl)) {
     exit(2);
 }
 try {
-    $raw = file_get_contents($rustUrl . '/shadow/settings?owner_id=' . $owner);
+    $raw = file_get_contents($rustUrl . '/shadow/settings?owner_id=' . $owner, false, stream_context_create(['http' => ['header' => ap_shadow_http_auth_header_text()]]));
     $data = is_string($raw) ? json_decode($raw, true) : null;
     if (!is_array($data) || (int) ($data['owner_id'] ?? 0) !== $owner) {
         throw new RuntimeException('owner-scoped response missing');
