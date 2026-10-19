@@ -27,6 +27,7 @@ if (!$vaakAdminLibOnly) {
 }
 
 require_once __DIR__ . '/ap-db.php';
+require_once __DIR__ . '/ap-shadow-http.php';
 require_once __DIR__ . '/ap-timeline-cursor.php';
 require_once __DIR__ . '/ap-timeline-older.php';
 
@@ -5303,7 +5304,7 @@ function admin_library_data_axum_fetch(int $ownerUserId, int $offset = 0, int $l
     [$libraryOffset, $libraryLimit] = admin_library_page_bounds($offset, $limit);
     $ch = curl_init($base . '/shadow/library-data?' . http_build_query(['owner_id' => $ownerUserId, 'library_kind' => $libraryKind, 'folder_id' => max(0, $folderId), 'offset' => $libraryOffset, 'limit' => $libraryLimit]));
     if ($ch === false) return null;
-    curl_setopt_array($ch, [CURLOPT_RETURNTRANSFER => true, CURLOPT_CONNECTTIMEOUT_MS => 80, CURLOPT_TIMEOUT_MS => 350, CURLOPT_HTTPHEADER => ['Accept: application/json', 'Connection: close']]);
+    curl_setopt_array($ch, [CURLOPT_RETURNTRANSFER => true, CURLOPT_CONNECTTIMEOUT_MS => 80, CURLOPT_TIMEOUT_MS => 350, CURLOPT_HTTPHEADER => array_merge(['Accept: application/json', 'Connection: close'], ap_shadow_http_auth_headers())]);
     $raw = curl_exec($ch);
     $code = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
     curl_close($ch);
@@ -24771,7 +24772,7 @@ function admin_account_switch_axum_prep(int $ownerUserId, string $returnView = '
         CURLOPT_RETURNTRANSFER => true,
         CURLOPT_CONNECTTIMEOUT_MS => 120,
         CURLOPT_TIMEOUT_MS => 3000,
-        CURLOPT_HTTPHEADER => ['Accept: application/json', 'Connection: close'],
+        CURLOPT_HTTPHEADER => array_merge(['Accept: application/json', 'Connection: close'], ap_shadow_http_auth_headers()),
     ]);
     $raw = curl_exec($ch);
     $code = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
@@ -24797,7 +24798,7 @@ function admin_shadow_admin_health_fetch(): ?array
     if (!is_string($host) || !in_array(strtolower($host), ['127.0.0.1', 'localhost', '::1'], true)) return null;
     $ch = curl_init($base . '/shadow/admin-health');
     if ($ch === false) return null;
-    curl_setopt_array($ch, [CURLOPT_RETURNTRANSFER => true, CURLOPT_CONNECTTIMEOUT_MS => 80, CURLOPT_TIMEOUT_MS => 350, CURLOPT_HTTPHEADER => ['Accept: application/json', 'Connection: close']]);
+    curl_setopt_array($ch, [CURLOPT_RETURNTRANSFER => true, CURLOPT_CONNECTTIMEOUT_MS => 80, CURLOPT_TIMEOUT_MS => 350, CURLOPT_HTTPHEADER => array_merge(['Accept: application/json', 'Connection: close'], ap_shadow_http_auth_headers())]);
     $raw = curl_exec($ch);
     $code = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
     curl_close($ch);
@@ -24836,7 +24837,7 @@ function admin_you_projection_axum_fetch(string $kind, int $ownerUserId, int $li
         CURLOPT_RETURNTRANSFER => true,
         CURLOPT_CONNECTTIMEOUT_MS => 80,
         CURLOPT_TIMEOUT_MS => 350,
-        CURLOPT_HTTPHEADER => ['Accept: application/json', 'Connection: close'],
+        CURLOPT_HTTPHEADER => array_merge(['Accept: application/json', 'Connection: close'], ap_shadow_http_auth_headers()),
     ]);
     $raw = curl_exec($ch);
     $code = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
@@ -24863,7 +24864,7 @@ function admin_relationship_projection_axum_fetch(string $relationship, int $own
         'limit' => max(1, min(500, $limit)),
     ]));
     if ($ch === false) return null;
-    curl_setopt_array($ch, [CURLOPT_RETURNTRANSFER => true, CURLOPT_CONNECTTIMEOUT_MS => 80, CURLOPT_TIMEOUT_MS => 350, CURLOPT_HTTPHEADER => ['Accept: application/json', 'Connection: close']]);
+    curl_setopt_array($ch, [CURLOPT_RETURNTRANSFER => true, CURLOPT_CONNECTTIMEOUT_MS => 80, CURLOPT_TIMEOUT_MS => 350, CURLOPT_HTTPHEADER => array_merge(['Accept: application/json', 'Connection: close'], ap_shadow_http_auth_headers())]);
     $raw = curl_exec($ch);
     $code = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
     curl_close($ch);
@@ -24883,7 +24884,7 @@ function admin_settings_projection_axum_fetch(int $ownerUserId): ?array
     if (!is_string($host) || !in_array(strtolower($host), ['127.0.0.1', 'localhost', '::1'], true)) return null;
     $ch = curl_init($base . '/shadow/settings?' . http_build_query(['owner_id' => $ownerUserId]));
     if ($ch === false) return null;
-    curl_setopt_array($ch, [CURLOPT_RETURNTRANSFER => true, CURLOPT_CONNECTTIMEOUT_MS => 80, CURLOPT_TIMEOUT_MS => 350, CURLOPT_HTTPHEADER => ['Accept: application/json', 'Connection: close']]);
+    curl_setopt_array($ch, [CURLOPT_RETURNTRANSFER => true, CURLOPT_CONNECTTIMEOUT_MS => 80, CURLOPT_TIMEOUT_MS => 350, CURLOPT_HTTPHEADER => array_merge(['Accept: application/json', 'Connection: close'], ap_shadow_http_auth_headers())]);
     $raw = curl_exec($ch);
     $code = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
     curl_close($ch);
@@ -24974,7 +24975,7 @@ function admin_profile_html_axum_fetch(
         // shorter than that, so PHP dropped the cards and the tab showed
         // only "End of profile".
         CURLOPT_TIMEOUT_MS => 8000,
-        CURLOPT_HTTPHEADER => ['Accept: text/html', 'Connection: close'],
+        CURLOPT_HTTPHEADER => array_merge(['Accept: text/html', 'Connection: close'], ap_shadow_http_auth_headers()),
     ]);
     $raw = curl_exec($ch);
     $code = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
@@ -25080,7 +25081,7 @@ function admin_tl_html_axum_fetch(string $view, int $limit, int $ownerUserId = 0
         CURLOPT_HEADER => true,
         CURLOPT_CONNECTTIMEOUT_MS => 120,
         CURLOPT_TIMEOUT_MS => 1500,
-        CURLOPT_HTTPHEADER => ['Accept: text/html', 'Connection: close'],
+        CURLOPT_HTTPHEADER => array_merge(['Accept: text/html', 'Connection: close'], ap_shadow_http_auth_headers()),
     ]);
     $raw = curl_exec($ch);
     $code = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
@@ -25236,7 +25237,7 @@ function admin_mentions_html_axum_fetch(int $limit, ?string $maxId, array $types
         CURLOPT_HEADER => true,
         CURLOPT_CONNECTTIMEOUT_MS => 120,
         CURLOPT_TIMEOUT_MS => 1500,
-        CURLOPT_HTTPHEADER => ['Accept: text/html', 'Connection: close'],
+        CURLOPT_HTTPHEADER => array_merge(['Accept: text/html', 'Connection: close'], ap_shadow_http_auth_headers()),
     ]);
     $raw = curl_exec($ch);
     $code = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
@@ -25322,7 +25323,7 @@ function admin_notif_embed_axum_fetch(
             CURLOPT_RETURNTRANSFER => true,
             CURLOPT_CONNECTTIMEOUT_MS => 80,
             CURLOPT_TIMEOUT_MS => 200,
-            CURLOPT_HTTPHEADER => ['Accept: text/html', 'Connection: close'],
+            CURLOPT_HTTPHEADER => array_merge(['Accept: text/html', 'Connection: close'], ap_shadow_http_auth_headers()),
         ]);
         $raw = curl_exec($ch);
         $code = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
@@ -25335,7 +25336,7 @@ function admin_notif_embed_axum_fetch(
             'http' => [
                 'method' => 'GET',
                 'timeout' => 0.2,
-                'header' => "Accept: text/html\r\nConnection: close\r\n",
+                'header' => "Accept: text/html\r\nConnection: close\r\n" . ap_shadow_http_auth_header_text(),
                 'ignore_errors' => true,
             ],
         ]);

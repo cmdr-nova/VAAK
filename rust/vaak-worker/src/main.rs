@@ -64,6 +64,7 @@ mod timeline_older;
 mod you;
 mod relationships;
 mod settings;
+mod shadow_auth;
 mod library;
 mod ml_ranker;
 mod integrations;

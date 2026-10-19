@@ -1,6 +1,8 @@
 <?php
 declare(strict_types=1);
 
+require_once dirname(__DIR__) . '/ap-shadow-http.php';
+
 /** Validate the Rust Library projection contract as a client would consume it. */
 $rustUrl = rtrim(trim((string) (getenv('VAAK_LIBRARY_CLIENT_RUST_URL') ?: '')), '/');
 $owner = max(1, (int) (getenv('VAAK_LIBRARY_CLIENT_OWNER_ID') ?: '1'));
@@ -22,7 +24,7 @@ try {
         'offset' => 0,
         'limit' => 20,
     ]);
-    $raw = file_get_contents($rustUrl . '/shadow/library-data?' . $query);
+    $raw = file_get_contents($rustUrl . '/shadow/library-data?' . $query, false, stream_context_create(['http' => ['header' => ap_shadow_http_auth_header_text()]]));
     $data = is_string($raw) ? json_decode($raw, true) : null;
     if (!is_array($data) || (int) ($data['owner_id'] ?? 0) !== $owner) {
         throw new RuntimeException('owner-scoped projection missing');

@@ -14,6 +14,11 @@
 #   GET /shadow/action-queue
 #   GET /shadow/jetstream
 # Shadow only — PHP remains live until Axum cutover; then PHP drops.
+#
+# /shadow/* and /api/v1/* require X-VAAK-Shadow-Token (/healthz stays open).
+# The token is VAAK_SHADOW_HTTP_TOKEN (32+ chars) from /etc/mkultra/vaak.env,
+# or derived from VAAK_SECRET there when unset; PHP reads the same file.
+# With neither set those routes answer 503 and PHP uses its own paths.
 
 [Unit]
 Description=VAAK Rust shadow HTTP (localhost Axum)
