@@ -37372,6 +37372,33 @@ if (!empty($GLOBALS['vaak_profile_shell'])) {
     }
     return u.pathname + u.search + (u.hash || '');
   };
+  // Address for a soft-nav destination, built from the destination alone.
+  // Editing the current URL instead carried a profile's actor/tab/post (and
+  // the pretty /users/{key} path) onto every page opened after it, so the
+  // address bar kept naming the profile while Home or a post was on screen.
+  window.vaakSoftViewHref = function (view, filter, extra) {
+    view = String(view || 'home');
+    filter = filter == null ? '' : String(filter);
+    extra = extra && typeof extra === 'object' ? extra : {};
+    const p = new URLSearchParams();
+    p.set('view', view);
+    if (view === 'status') {
+      p.set('object', String(extra.object || ''));
+      p.set('from', String(extra.from || 'home'));
+    }
+    if (view === 'mentions' && filter && filter !== 'all') p.set('notification_filter', filter);
+    if ((view === 'favourites' || view === 'following' || view === 'followers') && extra.network) {
+      p.set('network', String(extra.network));
+    }
+    if ((view === 'following' || view === 'followers') && extra.limit) p.set('limit', String(extra.limit));
+    if (view === 'bookmarks' && extra.folder) p.set('folder', String(extra.folder));
+    if (view === 'search') {
+      if (extra.q) p.set('q', String(extra.q));
+      if (extra.type) p.set('type', String(extra.type));
+      if (extra.resolve) p.set('resolve', '1');
+    }
+    return '/vaak/?' + p.toString();
+  };
 
   // Session expired mid-use: never paint /vaak login HTML into the feed.
   // Server returns 401 + X-VAAK-Auth for partial/ajax; also catch legacy login HTML.
@@ -41212,17 +41239,9 @@ window.vaakBootStatusThread();
       }
       sc.setTop(0, false);
       if (push !== false) {
-        const href = (typeof window.vaakAppHistoryUrl === 'function')
-          ? window.vaakAppHistoryUrl((u) => {
-              u.searchParams.set('view', nextView);
-              u.searchParams.delete('_r');
-            })
-          : (() => {
-              const u = new URL(window.location.href);
-              u.searchParams.set('view', nextView);
-              u.searchParams.delete('_r');
-              return u.pathname + u.search;
-            })();
+        const href = (typeof window.vaakSoftViewHref === 'function')
+          ? window.vaakSoftViewHref(nextView)
+          : '/vaak/?view=' + encodeURIComponent(nextView);
         history.pushState({ vaakTl: nextView }, '', href);
       }
       if (items.isConnected && document.getElementById('timeline-items') === items
@@ -42299,47 +42318,9 @@ window.vaakBootStatusThread();
 
   function pushSoftHistory(view, filter, extra) {
     extra = extra && typeof extra === 'object' ? extra : {};
-    const href = (typeof window.vaakAppHistoryUrl === 'function')
-      ? window.vaakAppHistoryUrl((u) => {
-          u.searchParams.set('view', view);
-          if (view === 'status') {
-            u.searchParams.set('object', extra.object || '');
-            u.searchParams.set('from', extra.from || 'home');
-          } else { u.searchParams.delete('object'); u.searchParams.delete('from'); }
-          u.searchParams.delete('refresh_thread');
-          u.searchParams.delete('_r');
-          if (view === 'mentions' && filter && filter !== 'all') u.searchParams.set('notification_filter', filter);
-          else u.searchParams.delete('notification_filter');
-          if ((view === 'favourites' || view === 'following' || view === 'followers') && extra.network) {
-            u.searchParams.set('network', extra.network);
-          } else if (view !== 'favourites' && view !== 'following' && view !== 'followers') {
-            u.searchParams.delete('network');
-          }
-          if ((view === 'following' || view === 'followers') && extra.limit) {
-            u.searchParams.set('limit', String(extra.limit));
-          } else if (view !== 'following' && view !== 'followers') {
-            u.searchParams.delete('limit');
-          }
-          if (view === 'bookmarks' && extra.folder) u.searchParams.set('folder', String(extra.folder));
-          else u.searchParams.delete('folder');
-          if (view === 'search') {
-            if (extra.q) u.searchParams.set('q', String(extra.q));
-            else u.searchParams.delete('q');
-            if (extra.type) u.searchParams.set('type', String(extra.type));
-            else u.searchParams.delete('type');
-            if (extra.resolve) u.searchParams.set('resolve', '1');
-            else u.searchParams.delete('resolve');
-          } else {
-            u.searchParams.delete('q');
-            u.searchParams.delete('type');
-            u.searchParams.delete('resolve');
-          }
-        })
-      : (() => {
-          const u = new URL(window.location.href);
-          u.searchParams.set('view', view);
-          return u.pathname + u.search;
-        })();
+    const href = (typeof window.vaakSoftViewHref === 'function')
+      ? window.vaakSoftViewHref(view, filter, extra)
+      : '/vaak/?view=' + encodeURIComponent(view);
     history.pushState({ vaakSoft: view, filter: filter || '', extra: extra }, '', href);
   }
 
@@ -42533,6 +42514,8 @@ window.vaakBootStatusThread();
         }
         main.innerHTML = html + '</div>';
         updateChrome(view);
+        // The unavailable notice is this post's page; name it in the address bar.
+        if (push !== false) pushSoftHistory(view, filter, extra);
         return;
       }
       if (!res.ok) throw new Error('HTTP ' + res.status);
