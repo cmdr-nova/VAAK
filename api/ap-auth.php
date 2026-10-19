@@ -428,7 +428,10 @@ function ap_auth_user_set_email(int $userId, string $email): array
 }
 
 /**
- * Change VAAK login password for a user (their own account).
+ * Set a user's VAAK login password, then sign out every other session and
+ * revoke app/OAuth tokens. Callers must already have proven the right to
+ * change it: ap_auth_change_password() checks the current password and the
+ * reset flow checks its emailed token.
  *
  * @return array{ok:bool,error?:string}
  */
@@ -450,11 +453,152 @@ function ap_auth_user_set_password(int $userId, string $newPassword): array
     try {
         ap_db()->prepare('UPDATE ap_users SET password_hash = ?, updated_at = ? WHERE id = ?')
             ->execute([$hash, ap_db_now(), $userId]);
-        return ['ok' => true];
     } catch (Throwable $e) {
         error_log('[ap-auth] set_password: ' . $e->getMessage());
         return ['ok' => false, 'error' => 'Could not save password.'];
     }
+    ap_auth_revoke_user_credentials($userId);
+    return ['ok' => true];
+}
+
+/**
+ * Change the signed-in user's own password. The current password is
+ * required and wrong guesses share a per-account counter.
+ *
+ * @return array{ok:bool,error?:string}
+ */
+function ap_auth_change_password(int $userId, string $currentPassword, string $newPassword): array
+{
+    $user = ap_auth_user_by_id($userId);
+    if (!is_array($user)) {
+        return ['ok' => false, 'error' => 'Invalid user.'];
+    }
+    $bucket = 'pwchange:u' . $userId;
+    if (ap_auth_rate_fails($bucket) >= AP_AUTH_PASSWORD_CHANGE_MAX) {
+        return ['ok' => false, 'error' => 'Too many attempts. Try again in a few minutes.'];
+    }
+    if ($currentPassword === ''
+        || ap_auth_verify_credentials((string) ($user['username'] ?? ''), $currentPassword) === null
+    ) {
+        ap_auth_rate_fail($bucket);
+        return ['ok' => false, 'error' => 'Current password is incorrect.'];
+    }
+    ap_auth_rate_clear($bucket);
+    return ap_auth_user_set_password($userId, $newPassword);
+}
+
+/**
+ * Revoke every credential for a user except the session making the
+ * request: OAuth/app access and refresh tokens, unused authorization
+ * codes, and other browser sessions. Legacy tokens with no user_id belong
+ * to the operator account.
+ *
+ * @return array{tokens:int,sessions:int}
+ */
+function ap_auth_revoke_user_credentials(int $userId): array
+{
+    $out = ['tokens' => 0, 'sessions' => 0];
+    if ($userId < 1) {
+        return $out;
+    }
+    $now = ap_db_now();
+    try {
+        $user = ap_auth_user_by_id($userId);
+        $legacy = is_array($user) && (string) ($user['actor_key'] ?? '') === 'cmdr_nova';
+        $st = ap_db()->prepare(
+            'UPDATE oauth_tokens SET revoked_at = ? WHERE revoked_at IS NULL AND (user_id = ?'
+            . ($legacy ? ' OR user_id IS NULL' : '') . ')'
+        );
+        $st->execute([$now, $userId]);
+        $out['tokens'] = $st->rowCount();
+        ap_db()->prepare('UPDATE oauth_codes SET used_at = ? WHERE used_at IS NULL AND user_id = ?')
+            ->execute([$now, $userId]);
+    } catch (Throwable $e) {
+        error_log('[ap-auth] credential revoke tokens: ' . $e->getMessage());
+    }
+    try {
+        $out['sessions'] = ap_auth_revoke_user_sessions($userId);
+    } catch (Throwable $e) {
+        error_log('[ap-auth] credential revoke sessions: ' . $e->getMessage());
+    }
+    return $out;
+}
+
+/**
+ * Sign a user out of every other PHP session. Sessions signed in as the
+ * user (or waiting on their two-factor step) are deleted; sessions that
+ * only list the user as a switchable account have it removed when the
+ * file is not in use. The current session keeps going under a new id.
+ */
+function ap_auth_revoke_user_sessions(int $userId): int
+{
+    ap_auth_start_session();
+    $current = session_id();
+    $path = (string) session_save_path();
+    if (str_contains($path, ';')) {
+        $path = substr($path, (int) strrpos($path, ';') + 1);
+    }
+    if ($path === '' || !is_dir($path)) {
+        return 0;
+    }
+    $mine = $_SESSION;
+    $revoked = 0;
+    try {
+        foreach (new DirectoryIterator($path) as $file) {
+            $name = $file->getFilename();
+            if (!$file->isFile() || !str_starts_with($name, 'sess_') || $name === 'sess_' . $current) {
+                continue;
+            }
+            $full = $file->getPathname();
+            $raw = @file_get_contents($full);
+            if (!is_string($raw) || $raw === '') {
+                continue;
+            }
+            $_SESSION = [];
+            if (!@session_decode($raw)) {
+                continue;
+            }
+            $data = $_SESSION;
+            if ((int) ($data['vaak_user_id'] ?? 0) === $userId
+                || (int) ($data['vaak_2fa_pending_user_id'] ?? 0) === $userId
+            ) {
+                if (@unlink($full)) {
+                    $revoked++;
+                }
+                continue;
+            }
+            $ids = array_map('intval', (array) ($data['vaak_account_ids'] ?? []));
+            if (!in_array($userId, $ids, true)) {
+                continue;
+            }
+            $fh = @fopen($full, 'r+');
+            if ($fh === false) {
+                continue;
+            }
+            // A session in use holds this lock; skip it rather than wait.
+            if (flock($fh, LOCK_EX | LOCK_NB)) {
+                $_SESSION['vaak_account_ids'] = array_values(array_filter($ids, static fn (int $id): bool => $id !== $userId));
+                $encoded = session_encode();
+                if (is_string($encoded)) {
+                    ftruncate($fh, 0);
+                    rewind($fh);
+                    fwrite($fh, $encoded);
+                    fflush($fh);
+                }
+                flock($fh, LOCK_UN);
+            }
+            fclose($fh);
+        }
+    } finally {
+        $_SESSION = $mine;
+    }
+    // Fresh id for the session that made the change.
+    if ((int) ($_SESSION['vaak_user_id'] ?? 0) === $userId) {
+        session_regenerate_id(true);
+        $_SESSION['_vaak_cookie_touched'] = time();
+        ap_auth_emit_session_cookie();
+    }
+    return $revoked;
 }
 
 /** Request a one-time password reset. Always returns a generic result. */
@@ -764,55 +908,48 @@ function ap_auth_verify_credentials(string $login, string $password): ?array
     return null;
 }
 
-function ap_auth_login_rate_path(): string
+const AP_AUTH_LOGIN_RATE_WINDOW = 900; // 15 minutes
+const AP_AUTH_LOGIN_IP_MAX = 8;
+const AP_AUTH_LOGIN_ACCOUNT_MAX = 10;
+const AP_AUTH_2FA_PENDING_MAX = 5;
+const AP_AUTH_2FA_ACCOUNT_MAX = 10;
+const AP_AUTH_PASSWORD_CHANGE_MAX = 5;
+
+/**
+ * Failure counters share one store: Redis `login:<bucket>` when available,
+ * plus a file under /tmp so limits still hold without Redis. The bare IP
+ * bucket keeps its original key and file name.
+ */
+function ap_auth_rate_path(string $bucket): string
 {
-    $ip = (string) ($_SERVER['REMOTE_ADDR'] ?? '0.0.0.0');
     $dir = '/tmp/ap-vaak-login-rate';
     if (!is_dir($dir)) {
         @mkdir($dir, 0700, true);
     }
-    return $dir . '/' . hash('sha256', $ip) . '.json';
+    return $dir . '/' . hash('sha256', $bucket) . '.json';
 }
 
-/** @return bool true if attempts are still allowed */
-function ap_auth_login_rate_ok(bool $clear = false): bool
+function ap_auth_rate_fails(string $bucket, int $window = AP_AUTH_LOGIN_RATE_WINDOW): int
 {
-    $ip = (string) ($_SERVER['REMOTE_ADDR'] ?? '0.0.0.0');
-    if ($clear) {
-        ap_redis_rate_clear('login:' . $ip);
-    } else {
-        $redisCount = ap_redis_rate_get('login:' . $ip);
-        if ($redisCount !== null && $redisCount > 8) return false;
-    }
-    $path = ap_auth_login_rate_path();
-    if ($clear) {
-        @unlink($path);
-        return true;
-    }
+    $fails = (int) (ap_redis_rate_get('login:' . $bucket) ?? 0);
+    $path = ap_auth_rate_path($bucket);
     if (!is_file($path)) {
-        return true;
+        return $fails;
     }
     $raw = @file_get_contents($path);
     $data = is_string($raw) ? json_decode($raw, true) : null;
-    if (!is_array($data)) {
+    $first = is_array($data) ? (int) ($data['first'] ?? 0) : 0;
+    if (!is_array($data) || ($first > 0 && (time() - $first) > $window)) {
         @unlink($path);
-        return true;
+        return $fails;
     }
-    $fails = (int) ($data['fails'] ?? 0);
-    $first = (int) ($data['first'] ?? 0);
-    $window = 900; // 15 minutes
-    if ($first > 0 && (time() - $first) > $window) {
-        @unlink($path);
-        return true;
-    }
-    return $fails < 8;
+    return max($fails, (int) ($data['fails'] ?? 0));
 }
 
-function ap_auth_login_rate_fail(): void
+function ap_auth_rate_fail(string $bucket, int $window = AP_AUTH_LOGIN_RATE_WINDOW): void
 {
-    $ip = (string) ($_SERVER['REMOTE_ADDR'] ?? '0.0.0.0');
-    ap_redis_rate_count('login:' . $ip, 900);
-    $path = ap_auth_login_rate_path();
+    ap_redis_rate_count('login:' . $bucket, $window);
+    $path = ap_auth_rate_path($bucket);
     $fails = 0;
     $first = time();
     if (is_file($path)) {
@@ -821,7 +958,7 @@ function ap_auth_login_rate_fail(): void
         if (is_array($data)) {
             $fails = (int) ($data['fails'] ?? 0);
             $first = (int) ($data['first'] ?? time());
-            if ((time() - $first) > 900) {
+            if ((time() - $first) > $window) {
                 $fails = 0;
                 $first = time();
             }
@@ -834,6 +971,48 @@ function ap_auth_login_rate_fail(): void
         LOCK_EX
     );
     @chmod($path, 0600);
+}
+
+function ap_auth_rate_clear(string $bucket): void
+{
+    ap_redis_rate_clear('login:' . $bucket);
+    @unlink(ap_auth_rate_path($bucket));
+}
+
+function ap_auth_login_ip(): string
+{
+    return (string) ($_SERVER['REMOTE_ADDR'] ?? '0.0.0.0');
+}
+
+/**
+ * Per-account bucket. Known accounts are keyed by id so the username and
+ * email aliases share one counter; unknown names are keyed by the
+ * normalized login so they are limited the same way.
+ */
+function ap_auth_login_account_bucket(string $login, ?array $user = null): string
+{
+    if (is_array($user) && (int) ($user['id'] ?? 0) > 0) {
+        return 'acct:u' . (int) $user['id'];
+    }
+    $login = strtolower(trim($login));
+    if (!str_contains($login, '@') || str_starts_with($login, '@')) {
+        $login = ltrim($login, '@');
+        if (str_contains($login, '@')) {
+            $login = explode('@', $login, 2)[0];
+        }
+    }
+    return 'acct:l' . $login;
+}
+
+/** @return bool true if attempts from this IP are still allowed */
+function ap_auth_login_rate_ok(): bool
+{
+    return ap_auth_rate_fails(ap_auth_login_ip()) < AP_AUTH_LOGIN_IP_MAX;
+}
+
+function ap_auth_login_rate_fail(): void
+{
+    ap_auth_rate_fail(ap_auth_login_ip());
 }
 
 /* ----------------- TOTP two-factor authentication ----------------- */
@@ -1020,7 +1199,12 @@ function ap_auth_2fa_disable(int $userId, string $password, string $code): array
 function ap_auth_2fa_pending_clear(): void
 {
     ap_auth_start_session();
-    unset($_SESSION['vaak_2fa_pending_user_id'], $_SESSION['vaak_2fa_pending_at'], $_SESSION['vaak_2fa_pending_next']);
+    unset(
+        $_SESSION['vaak_2fa_pending_user_id'],
+        $_SESSION['vaak_2fa_pending_at'],
+        $_SESSION['vaak_2fa_pending_next'],
+        $_SESSION['vaak_2fa_pending_fails']
+    );
 }
 
 /** @return array{ok:bool,error?:string,user?:array} */
@@ -1033,7 +1217,21 @@ function ap_auth_complete_2fa_login(string $code): array
         ap_auth_2fa_pending_clear();
         return ['ok' => false, 'error' => 'Two-factor sign-in expired. Please log in again.'];
     }
+    // Wrong codes are limited per pending sign-in and per account, so a
+    // fresh password step does not reset the account-wide allowance.
+    $bucket = '2fa:u' . $userId;
+    if (ap_auth_rate_fails($bucket) >= AP_AUTH_2FA_ACCOUNT_MAX) {
+        ap_auth_2fa_pending_clear();
+        return ['ok' => false, 'error' => 'Too many two-factor attempts. Try again in a few minutes.'];
+    }
     if (!ap_auth_2fa_verify_code($userId, $code)) {
+        ap_auth_rate_fail($bucket);
+        $fails = (int) ($_SESSION['vaak_2fa_pending_fails'] ?? 0) + 1;
+        if ($fails >= AP_AUTH_2FA_PENDING_MAX) {
+            ap_auth_2fa_pending_clear();
+            return ['ok' => false, 'error' => 'Too many invalid codes. Please log in again.'];
+        }
+        $_SESSION['vaak_2fa_pending_fails'] = $fails;
         return ['ok' => false, 'error' => 'Invalid two-factor code.'];
     }
     $user = ap_auth_user_by_id($userId);
@@ -1044,24 +1242,75 @@ function ap_auth_complete_2fa_login(string $code): array
 }
 
 /**
+ * Password check behind the per-account failure counter. Every sign-in
+ * surface (web login, OAuth authorize, adding an account) goes through it,
+ * so one account cannot be guessed at from many IPs or clients.
+ *
+ * @return array<string,mixed>|null user row on success
+ */
+function ap_auth_verify_credentials_limited(string $login, string $password, ?bool &$limited = null): ?array
+{
+    ap_auth_bootstrap();
+    $limited = false;
+    $account = ap_auth_login_account_bucket($login, ap_auth_user_by_login($login));
+    if (ap_auth_rate_fails($account) >= AP_AUTH_LOGIN_ACCOUNT_MAX) {
+        $limited = true;
+        return null;
+    }
+    $user = ap_auth_verify_credentials($login, $password);
+    if ($user === null) {
+        ap_auth_rate_fail($account);
+        return null;
+    }
+    ap_auth_rate_clear($account);
+    return $user;
+}
+
+/**
+ * Second-factor check behind the per-account counter, for surfaces that
+ * take a code without a pending web sign-in (adding an account).
+ */
+function ap_auth_2fa_verify_code_limited(int $userId, string $code, ?bool &$limited = null): bool
+{
+    $limited = false;
+    $bucket = '2fa:u' . $userId;
+    if (ap_auth_rate_fails($bucket) >= AP_AUTH_2FA_ACCOUNT_MAX) {
+        $limited = true;
+        return false;
+    }
+    if (ap_auth_2fa_verify_code($userId, $code)) {
+        return true;
+    }
+    ap_auth_rate_fail($bucket);
+    return false;
+}
+
+/**
  * @return array{ok:bool,error?:string,user?:array}
  */
 function ap_auth_attempt_login(string $login, string $password): array
 {
+    $limited = ['ok' => false, 'error' => 'Too many login attempts. Try again in a few minutes.'];
     if (!ap_auth_login_rate_ok()) {
-        return ['ok' => false, 'error' => 'Too many login attempts. Try again in a few minutes.'];
+        return $limited;
     }
-    $user = ap_auth_verify_credentials($login, $password);
+    $isLimited = false;
+    $user = ap_auth_verify_credentials_limited($login, $password, $isLimited);
+    if ($isLimited) {
+        return $limited;
+    }
     if ($user === null) {
+        // A success never clears the IP counter, so failures from this IP
+        // against other accounts keep counting until the window expires.
         ap_auth_login_rate_fail();
         return ['ok' => false, 'error' => 'Invalid username/email or password.'];
     }
-    ap_auth_login_rate_ok(true);
     if (ap_auth_2fa_enabled((int) $user['id'])) {
         ap_auth_start_session();
         $_SESSION['vaak_2fa_pending_user_id'] = (int) $user['id'];
         $_SESSION['vaak_2fa_pending_at'] = time();
         $_SESSION['vaak_2fa_pending_next'] = 'home';
+        $_SESSION['vaak_2fa_pending_fails'] = 0;
         return ['ok' => false, 'requires_2fa' => true, 'user' => $user];
     }
     ap_auth_login_user($user);
