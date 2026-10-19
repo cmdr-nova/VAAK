@@ -18,6 +18,13 @@ WORKER_LINK="${VAAK_WORKER_BIN:-/usr/local/bin/vaak-worker}"
 PHP_BIN="${VAAK_PHP:-/usr/bin/php}"
 CURL_BIN="${VAAK_CURL:-/usr/bin/curl}"
 KEEP="${VAAK_RELEASE_KEEP:-5}"
+# Post-deploy canary (api/bin/deploy-canary.php). Warn-only unless
+# VAAK_CANARY_ENFORCE=1; VAAK_CANARY=0 skips it. It runs as www-data through
+# sudo unless VAAK_CANARY_RUNAS is set to another user, or to empty to run as
+# the current user.
+CANARY_ENFORCE="${VAAK_CANARY_ENFORCE:-0}"
+CANARY_RUNAS="${VAAK_CANARY_RUNAS-www-data}"
+CANARY_TIMEOUT="${VAAK_CANARY_TIMEOUT:-300}"
 
 REQUIRED_UNITS=(
   php8.3-fpm.service
@@ -222,6 +229,46 @@ health_check() {
       return 1
     }
   done
+  canary_check
+}
+
+# Render real timelines, a Bluesky media post, a remote poll, and the Axum
+# timeline HTML through the live tree. Exit 3 from the script means a check
+# failed; any other non-zero exit means the canary could not run.
+canary_check() {
+  local script="${HTML_API}/bin/deploy-canary.php" rc=0 line
+  local -a cmd=()
+  if [[ "${VAAK_CANARY:-1}" == "0" ]]; then
+    echo "vaak-release: canary skipped (VAAK_CANARY=0)"
+    return 0
+  fi
+  if [[ ! -f "$script" ]]; then
+    echo "vaak-release: canary skipped (release has no api/bin/deploy-canary.php)"
+    return 0
+  fi
+  if [[ -n "$CANARY_RUNAS" && "$(id -un)" != "$CANARY_RUNAS" ]]; then
+    cmd=(sudo -n -u "$CANARY_RUNAS" "$PHP_BIN" "$script")
+  else
+    cmd=("$PHP_BIN" "$script")
+  fi
+  local out
+  out="$(timeout "$CANARY_TIMEOUT" "${cmd[@]}" 2>&1)" || rc=$?
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && echo "vaak-release: ${line}"
+  done <<< "$out"
+  if [[ "$rc" -eq 0 ]]; then
+    return 0
+  fi
+  if [[ "$rc" -eq 3 ]]; then
+    echo "vaak-release: canary found a broken render path" >&2
+  else
+    echo "vaak-release: canary did not run (exit ${rc})" >&2
+  fi
+  if [[ "$CANARY_ENFORCE" == "1" ]]; then
+    return 1
+  fi
+  echo "vaak-release: canary is warn-only (VAAK_CANARY_ENFORCE=0); keeping this release" >&2
+  return 0
 }
 
 lint_tree() {
@@ -367,12 +414,17 @@ rollback_to() {
 }
 
 self_test() {
-  local tmp sha_old sha_new sha_skip sha_fail
+  local tmp sha_old sha_new sha_skip sha_fail sha_cwarn sha_cenf sha_cskip sha_ccrash sha_cpass out
   tmp="$(mktemp -d)"
   sha_old="$(printf 'b%.0s' {1..40})"
   sha_new="$(printf 'c%.0s' {1..40})"
   sha_skip="$(printf 'd%.0s' {1..40})"
   sha_fail="$(printf 'e%.0s' {1..40})"
+  sha_cwarn="$(printf 'f%.0s' {1..40})"
+  sha_cenf="$(printf '1%.0s' {1..40})"
+  sha_cskip="$(printf '2%.0s' {1..40})"
+  sha_ccrash="$(printf '3%.0s' {1..40})"
+  sha_cpass="$(printf '4%.0s' {1..40})"
   install -d \
     "${tmp}/root/releases/${sha_old}/api" \
     "${tmp}/root/releases/${sha_old}/vaak" \
@@ -415,6 +467,18 @@ if [ "$1" = "-r" ]; then
   sed -n "s/.*'\\([0-9][0-9.]*\\)'.*/\\1/p" "$3"
   exit 0
 fi
+case "$1" in
+  */bin/deploy-canary.php)
+    mode="$(cat "${CANARY_MODE_FILE}" 2>/dev/null || echo pass)"
+    echo "$mode" >> "${CANARY_LOG}"
+    case "$mode" in
+      pass) echo "canary home ok: statuses=3"; echo "deploy_canary_ok ok=7 skip=0 fail=0"; exit 0 ;;
+      skip) echo "canary bsky_media skip: no Bluesky image posts"; echo "deploy_canary_ok ok=0 skip=7 fail=0"; exit 0 ;;
+      fail) echo "canary bsky_media fail: painted=0/3"; echo "deploy_canary_failed ok=6 skip=0 fail=1"; exit 3 ;;
+      *) echo "PHP Fatal error" >&2; exit 255 ;;
+    esac
+    ;;
+esac
 echo migrate_ok
 exit 0
 PHP
@@ -449,7 +513,8 @@ CTL
     local sha="$1" version="$2" worker="$3" vaak="$4" jet="$5"
     local dest="${tmp}/stage-${sha}"
     rm -rf "$dest"
-    install -d "${dest}/api/deploy" "${dest}/vaak" "${dest}/bin"
+    install -d "${dest}/api/deploy" "${dest}/api/bin" "${dest}/vaak" "${dest}/bin"
+    printf '<?php // canary\n' > "${dest}/api/bin/deploy-canary.php"
     cat > "${dest}/api/ap-version.php" <<PHP
 <?php
 const VAAK_VERSION = '${version}';
@@ -469,6 +534,11 @@ PHP
   make_release "$sha_new" 0.8.46 $'#!/bin/sh\necho worker-new\n' vaak-new yes
   make_release "$sha_skip" 0.8.47 $'#!/bin/sh\necho worker-new\n' vaak-skip yes
   make_release "$sha_fail" 0.8.48 $'#!/bin/sh\necho worker-fail\n' vaak-fail yes
+  make_release "$sha_cwarn" 0.8.49 $'#!/bin/sh\necho worker-fail\n' vaak-cwarn no
+  make_release "$sha_cenf" 0.8.50 $'#!/bin/sh\necho worker-fail\n' vaak-cenf no
+  make_release "$sha_cskip" 0.8.51 $'#!/bin/sh\necho worker-fail\n' vaak-cskip no
+  make_release "$sha_ccrash" 0.8.52 $'#!/bin/sh\necho worker-fail\n' vaak-ccrash no
+  make_release "$sha_cpass" 0.8.53 $'#!/bin/sh\necho worker-fail\n' vaak-cpass no
 
   python3 - "${tmp}/dotdot.tar.gz" <<'PY'
 import io, sys, tarfile
@@ -493,7 +563,11 @@ PY
   export VAAK_RELEASE_KEEP=5
   export VAAK_HEALTH_ATTEMPTS=2
   export VAAK_HEALTH_SLEEP=0
-  unset VAAK_RESTART_JETSTREAM VAAK_RESTART_SHADOW
+  export VAAK_CANARY_RUNAS=""
+  export CANARY_MODE_FILE="${tmp}/canary-mode"
+  export CANARY_LOG="${tmp}/canary.log"
+  unset VAAK_RESTART_JETSTREAM VAAK_RESTART_SHADOW VAAK_CANARY VAAK_CANARY_ENFORCE
+  : > "${CANARY_LOG}"
   : > "${SYSTEMCTL_LOG}"
 
   if bash "$0" deploy "${tmp}/dotdot.tar.gz"; then
@@ -570,7 +644,13 @@ CURL
   chmod 0755 "${tmp}/curl"
   : > "${SHADOW_DISABLED_FLAG}"
   shadow_before="$(grep -c -F 'restart vaak-worker-shadow.service' "${SYSTEMCTL_LOG}")"
+  local canary_before
+  canary_before="$(wc -l < "${CANARY_LOG}")"
+  # The canary ran on every release that ships it.
+  [[ "$canary_before" -ge 2 ]]
   VAAK_RESTART_SHADOW=1 bash "$0" rollback "$sha_old"
+  # sha_old has no canary script, so its health check skips the canary.
+  [[ "$(wc -l < "${CANARY_LOG}")" == "$canary_before" ]]
   [[ "$(grep -c -F 'restart vaak-worker-shadow.service' "${SYSTEMCTL_LOG}")" == "$shadow_before" ]]
   rm -f "${SHADOW_DISABLED_FLAG}"
   [[ "$(cat "${tmp}/root/live-revision")" == "$sha_old" ]]
@@ -583,6 +663,40 @@ CURL
   [[ ! -e "${tmp}/html/api/scratch.php" ]]
   [[ "$(cat "${tmp}/html/index.html")" == "blog" ]]
   [[ ! -L "${tmp}/html/api" && ! -L "${tmp}/html/vaak" ]]
+
+  live_version() {
+    sed -n "s/.*'\\([0-9.]*\\)'.*/\\1/p" "${tmp}/html/api/ap-version.php"
+  }
+  # Warn-only by default: a failing canary is reported and the release stays.
+  echo fail > "${CANARY_MODE_FILE}"
+  out="$(bash "$0" deploy "${tmp}/${sha_cwarn}.tar.gz" 2>&1)"
+  [[ "$out" == *"canary bsky_media fail: painted=0/3"* && "$out" == *"warn-only"* ]]
+  [[ "$(live_version)" == "0.8.49" && "$(cat "${tmp}/root/live-revision")" == "$sha_cwarn" ]]
+  # Enforced: a failing canary rolls back.
+  if VAAK_CANARY_ENFORCE=1 bash "$0" deploy "${tmp}/${sha_cenf}.tar.gz"; then
+    echo "enforced canary failure was treated as success" >&2
+    exit 1
+  fi
+  [[ "$(live_version)" == "0.8.49" && "$(cat "${tmp}/root/live-revision")" == "$sha_cwarn" ]]
+  [[ "$(cat "${tmp}/html/vaak/index.php")" == "vaak-cwarn" ]]
+  # Enforced: checks with no data skip and do not fail.
+  echo skip > "${CANARY_MODE_FILE}"
+  VAAK_CANARY_ENFORCE=1 bash "$0" deploy "${tmp}/${sha_cskip}.tar.gz"
+  [[ "$(live_version)" == "0.8.51" ]]
+  # Enforced: a canary that cannot run counts as a failure.
+  echo crash > "${CANARY_MODE_FILE}"
+  if VAAK_CANARY_ENFORCE=1 bash "$0" deploy "${tmp}/${sha_ccrash}.tar.gz"; then
+    echo "canary crash was treated as success" >&2
+    exit 1
+  fi
+  [[ "$(live_version)" == "0.8.51" ]]
+  # VAAK_CANARY=0 is the escape hatch.
+  VAAK_CANARY=0 VAAK_CANARY_ENFORCE=1 bash "$0" deploy "${tmp}/${sha_ccrash}.tar.gz"
+  [[ "$(live_version)" == "0.8.52" ]]
+  echo pass > "${CANARY_MODE_FILE}"
+  out="$(VAAK_CANARY_ENFORCE=1 bash "$0" deploy "${tmp}/${sha_cpass}.tar.gz" 2>&1)"
+  [[ "$out" == *"deploy_canary_ok"* && "$(live_version)" == "0.8.53" ]]
+  [[ "$(tail -n 1 "${CANARY_LOG}")" == "pass" ]]
   echo "activate_self_test_ok"
   rm -rf "$tmp"
 }

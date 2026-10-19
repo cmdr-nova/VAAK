@@ -7,6 +7,10 @@
 # Template instances are listed one explicit line per instance. Production
 # runs ap-bsky-jetstream@0.service and ap-bsky-jetstream@1.service. There is
 # no ap-bsky-jetstream.service.
+#
+# The last line lets the activate script run the post-deploy canary as
+# www-data, with no arguments. vaak-deploy already writes the PHP that
+# www-data serves, so this grants nothing new.
 
 Defaults:vaak-deploy !requiretty
 
@@ -23,3 +27,4 @@ vaak-deploy ALL=(root) NOPASSWD: /usr/bin/systemctl restart vaak-worker-shadow-h
 vaak-deploy ALL=(root) NOPASSWD: /usr/bin/systemctl restart vaak-worker-shadow.service
 vaak-deploy ALL=(root) NOPASSWD: /usr/bin/systemctl restart ap-bsky-jetstream@0.service
 vaak-deploy ALL=(root) NOPASSWD: /usr/bin/systemctl restart ap-bsky-jetstream@1.service
+vaak-deploy ALL=(www-data) NOPASSWD: /usr/bin/php /srv/mkultra/html/api/bin/deploy-canary.php ""

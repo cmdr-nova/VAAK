@@ -144,7 +144,7 @@ Install the sudoers snippet after `visudo -cf`:
 install -m 0440 -o root -g root deploy/vaak-deploy.sudoers /etc/sudoers.d/vaak-deploy
 ```
 
-The lines grant `systemctl restart` for the VAAK units and `php8.3-fpm.service` only. There is no `ALL`, no shell, and no `daemon-reload`. Restarting `php8.3-fpm` is a brief outage and is the intended signal so PHP-FPM loads the new files. The sudoers file stays restart-only.
+The lines grant `systemctl restart` for the VAAK units and `php8.3-fpm.service`, plus one line that runs `api/bin/deploy-canary.php` as `www-data` with no arguments. There is no `ALL`, no shell, and no `daemon-reload`. Restarting `php8.3-fpm` is a brief outage and is the intended signal so PHP-FPM loads the new files.
 
 Create the migration env as a DDL role that is not `www-data`. The deploy runs `deploy/remote/migrate.php` as `vaak-deploy` before switching the live tree:
 
@@ -204,10 +204,11 @@ Run that SQL as a superuser. The env file also sets `AP_DB_PASSWORD`. Keep that 
 
 1. Takes a non-blocking lock at `/srv/mkultra/vaak-releases/.deploy.lock`.
 2. Refuses to continue unless `html/api` and `html/vaak` are real directories, `/usr/local/bin/vaak-worker` is a symlink to `/srv/mkultra/vaak-releases/bin/vaak-worker`, and the release root is outside `/srv/mkultra/html`.
-3. Extracts the tarball under `releases/<git sha>/`. The tarball is the CI artifact: filtered `api/`, `vaak/`, `bin/vaak-worker`, and `migrate.php`. Replay tools under `api/bin/` are omitted except the production CLIs `home-timeline-warm.php`, `notif-projection-fill.php`, `phyrian-decay.php`, `phyrian-sync.php`, and `ranked-warm.php`. `api/fixtures/` and `docs/` are omitted.
+3. Extracts the tarball under `releases/<git sha>/`. The tarball is the CI artifact: filtered `api/`, `vaak/`, `bin/vaak-worker`, and `migrate.php`. Replay tools under `api/bin/` are omitted except the production CLIs `deploy-canary.php`, `home-timeline-warm.php`, `notif-projection-fill.php`, `phyrian-decay.php`, `phyrian-sync.php`, and `ranked-warm.php`. `api/fixtures/` and `docs/` are omitted.
 4. Runs `php -l` on the new PHP, then `migrate.php` against that tree, before copying it into the live directories.
 5. `rsync -a --checksum --delete-delay --delay-updates` copies `api/` and `vaak/` into the real directories. `--checksum` replaces a file whose bytes changed even when the size and mtime match. The four canonical files above are excluded, so a deploy and a rollback both leave them as they are on disk. The worker binary is installed with `mv` onto `/srv/mkultra/vaak-releases/bin/vaak-worker`.
 6. Restarts the required units, then requires `http://127.0.0.1:8787/healthz` to contain `"ok":true`, every required unit to be active, and the live `VAAK_VERSION` to match the release `VERSION` file.
+   It then runs the post-deploy canary (below).
 7. On a failed health check, rsyncs the previous release back the same way (still excluding the four canonical files), restarts, and exits non-zero.
 8. Keeps the live release, the previous release, and five other directories. It does not touch backup timers or `/var/backups`.
 
@@ -232,6 +233,29 @@ Restarted only when that unit is installed **and** the diff says so:
 Production runs those two template instances. There is no `ap-bsky-jetstream.service`. Their `ExecStart` reads `api/deploy/ap-bsky-jetstream.py` through the real `html/api` directory, so a Jetstream diff restarts both installed instances. Oneshot timers pick up the new PHP on their next run because they exec the path in the real directory. Rollback compares the two release trees and restarts an optional unit when that tree diff includes its files.
 
 The worker binary is built in CI (`cargo build --release --locked -p vaak-worker` inside `debian:bookworm-slim`) and is not compiled on the server. The version commit does not rebuild it. The build job compiles the CI-green commit, which is the parent when the tip is only the version bump. That binary is the one that ships.
+
+## Post-deploy canary
+
+`api/bin/deploy-canary.php` runs at the end of the health check, as `www-data` through `sudo -n`, against the live tree. It needs no user token. It picks the admin account from `ap_users` and checks the paths that broke silently before:
+
+- `home`: the Home timeline (`ap_masto_timeline_home_merged`) returns statuses.
+- `federated`: the Federated timeline returns statuses.
+- `local`: the Local timeline returns the instance's own public posts.
+- `bsky_media`: of the newest Bluesky posts seen in the last 6 hours whose record has image blob refs, at least one reaches the card painter with an `https` image URL.
+- `remote_poll`: the newest remote poll paints all of its options.
+- `axum_home`, `axum_local`: Axum `/shadow/home-html` and `/shadow/local-html` answer 200 with HTML, and `admin_tl_html_axum_fetch` accepts it.
+
+A check with nothing to test skips: no Bluesky image posts in the window, no remote polls, an empty instance, or an Axum cache miss (404, where PHP paints the cards itself). The script loads `/etc/mkultra/vaak.env` for names it did not inherit and defaults `AP_DB_DSN` to `pgsql:dbname=novalandia`. It does not store results or queue work itself. The render functions it calls may touch their own caches the way an ordinary page view does.
+
+The canary is **warn-only** by default. A failure is printed in the deploy log and the release stays live. Set the repository variable `VAAK_CANARY_ENFORCE=1` (Settings → Secrets and variables → Actions → Variables) to roll back a release whose canary fails or cannot run. `VAAK_CANARY=0` skips it for one run. A release without the script, such as one older than this change, skips it.
+
+Run it by hand on the server with:
+
+```bash
+sudo -u www-data php /srv/mkultra/html/api/bin/deploy-canary.php
+```
+
+Exit 0 is pass or skip, exit 3 is a failed check, and anything else means the canary itself did not run.
 
 ## Roll back
 
