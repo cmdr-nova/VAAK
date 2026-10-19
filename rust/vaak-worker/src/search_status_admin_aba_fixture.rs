@@ -28,7 +28,7 @@ async fn actual_bridge_rejects_painted_admin_aba_but_accepts_fresh_roles()->Resu
  anyhow::ensure!(owned.get::<_,String>(0)==input["oid"].as_str().context("original OID")?&&owned.get::<_,String>(1)=="postgres"&&owned.get::<_,Option<String>>(2).as_deref()==Some(token)&&owned.get::<_,String>(3)==schema&&owned.get::<_,String>(4)=="postgres","original owned OID/owner/UUID guard");
  let typed:bool=db.query_one("SELECT EXISTS(SELECT 1 FROM pg_attribute WHERE attrelid='ap_users'::regclass AND attname='is_admin' AND atttypid IN (20,23) AND NOT attisdropped)",&[]).await?.get(0);anyhow::ensure!(typed,"actual INTEGER/BIGINT role column only");
  let bytes=std::fs::read(input["request_file"].as_str().context("actual PHP source capture")?)?;use sha2::Digest;
- anyhow::ensure!(bytes.len()<=2*1024*1024&&format!("{:x}",sha2::Sha256::digest(&bytes))==input["request_sha256"].as_str().context("capture SHA")?);
+ anyhow::ensure!(bytes.len()<=2*1024*1024&&hex::encode(sha2::Sha256::digest(&bytes))==input["request_sha256"].as_str().context("capture SHA")?);
  let request:Value=serde_json::from_slice(&bytes)?;let owner=request["owner_id"].as_i64().context("actual owner")?;let statuses=request["statuses"].as_array().context("actual selected status")?;
  anyhow::ensure!(statuses.len()==1&&request["accounts"].as_array().is_some_and(Vec::is_empty)&&request["hashtags"].as_array().is_some_and(Vec::is_empty),"one genuine status-only window");
  anyhow::ensure!(crate::direct_preview::extract_url(statuses[0]["content"].as_str().context("genuine noURL text")?)?.is_none()&&statuses[0]["media_attachments"].as_array().is_none_or(Vec::is_empty)&&statuses[0]["card"].is_null(),"actual noURL preview branch");

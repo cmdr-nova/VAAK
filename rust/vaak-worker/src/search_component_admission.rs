@@ -302,7 +302,7 @@ mod actual_fixture {
    Ok::<_,anyhow::Error>(Value::Object(results))
   }.await;
   db.batch_execute("ROLLBACK").await?;let results=result?;use std::io::Write;let mut output=std::fs::OpenOptions::new().write(true).create_new(true).open(&output_path)?;
-  output.write_all(&serde_json::to_vec_pretty(&json!({"input_sha256":format!("{:x}",<sha2::Sha256 as sha2::Digest>::digest(&bytes)),"schema":namespace,"oid":oid,"label":input["label"],"results":results,"read_only_repeatable_read":true,"no_native_HTML_or_authority_grant":true}))?)?;Ok(())
+  output.write_all(&serde_json::to_vec_pretty(&json!({"input_sha256":hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&bytes)),"schema":namespace,"oid":oid,"label":input["label"],"results":results,"read_only_repeatable_read":true,"no_native_HTML_or_authority_grant":true}))?)?;Ok(())
  }
 
  #[tokio::test]

@@ -52,10 +52,10 @@ impl SearchWindowGrant {
   // accepted. PHP supplies its exact mb_strtolower query bytes, preserving its
   // Unicode semantics; the owner/resolve key is independently recomputed.
   let directory=match descriptor.cache_location.as_str(){"primary"=>std::path::PathBuf::from("/var/lib/mkultra/ap/search-cache"),"temporary"=>std::env::temp_dir().join("vaak-search-cache"),_=>bail!("invalid Search cache location")};
-  let key_hex=format!("{:x}",Sha256::digest(format!("mf3|{owner}|{}|{}|121|80",descriptor.normalized_query,if descriptor.resolve{"1"}else{"0"}).as_bytes()));
+  let key_hex=hex::encode(Sha256::digest(format!("mf3|{owner}|{}|{}|121|80",descriptor.normalized_query,if descriptor.resolve{"1"}else{"0"}).as_bytes()));
   let path=directory.join(format!("s_{key_hex}.json"));
   let (bytes,identity)=Self::read(&path).await?;
-  if format!("{:x}",Sha256::digest(&bytes))!=descriptor.cache_sha256{bail!("Search collector file differs from actual producer")}
+  if hex::encode(Sha256::digest(&bytes))!=descriptor.cache_sha256{bail!("Search collector file differs from actual producer")}
   let cached:Value=serde_json::from_slice(&bytes)?;
   if cached["have_statuses"]!=Value::Bool(true){bail!("Search collector has no status window")}
   let candidates=cached["statuses"].as_array().context("Search cache status list")?.clone();
@@ -350,7 +350,7 @@ mod differential_tests {
     let schema=format!("search_fault_{}_{}_{mutation}",width.to_ascii_lowercase(),std::process::id());admin.batch_execute(&format!("CREATE SCHEMA {schema};SET search_path={schema}")).await?;
     let url=format!("{dburl} options=-csearch_path={schema}");
     let query=format!("search-fault-{}-{mutation}-{}",width.to_ascii_lowercase(),std::process::id());
-    let key=format!("{:x}",Sha256::digest(format!("mf3|1|{query}|0|121|80").as_bytes()));let path=std::path::Path::new("/tmp/vaak-search-cache").join(format!("s_{key}.json"));
+    let key=hex::encode(Sha256::digest(format!("mf3|1|{query}|0|121|80").as_bytes()));let path=std::path::Path::new("/tmp/vaak-search-cache").join(format!("s_{key}.json"));
     let run:Result<Value>=async{
      for(table,columns)in capture["current_schema"].as_object().context("schema")?{
       anyhow::ensure!(table.bytes().all(|b|b.is_ascii_alphanumeric()||b==b'_'));let mut definitions=Vec::new();
@@ -364,7 +364,7 @@ mod differential_tests {
      // candidate ordering and current SQL retained. No card result is supplied.
      body["statuses"][0]["content"]=serde_json::json!("<p>Actual Search source text https://withdrawal-preview.test/page</p>");cache["statuses"][0]=body["statuses"][0].clone();
      let bytes=serde_json::to_vec(&cache)?;std::fs::write(&path,&bytes)?;
-     body["collector"]["normalized_query"]=Value::String(query.clone());body["collector"]["cache_location"]=Value::String("temporary".into());body["collector"]["cache_sha256"]=Value::String(format!("{:x}",Sha256::digest(&bytes)));
+     body["collector"]["normalized_query"]=Value::String(query.clone());body["collector"]["cache_location"]=Value::String("temporary".into());body["collector"]["cache_sha256"]=Value::String(hex::encode(Sha256::digest(&bytes)));
      let uri=body["statuses"][0]["uri"].as_str().context("URI")?.to_owned();
      if mutation.starts_with("cache_")&&mutation!="cache_replaced"{
       // A fixture-owned volatile SELECT function mutates actual current SQL
