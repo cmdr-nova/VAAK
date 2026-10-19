@@ -25630,21 +25630,7 @@ function admin_group_notification_rows(array $rows): array
  */
 function admin_notifications_drop_hidden(array $items, int $ownerUserId): array
 {
-    if (!function_exists('ap_search_account_hidden')) {
-        return array_values(array_filter($items, 'is_array'));
-    }
-    $out = [];
-    foreach ($items as $item) {
-        if (!is_array($item)) {
-            continue;
-        }
-        $acct = is_array($item['account'] ?? null) ? $item['account'] : [];
-        if ($acct !== [] && ap_search_account_hidden($acct, $ownerUserId)) {
-            continue;
-        }
-        $out[] = $item;
-    }
-    return $out;
+    return ap_masto_notifications_drop_hidden($items, $ownerUserId);
 }
 
 function admin_notifications_page(int $limit, ?string $maxId, array $types = []): array

@@ -426,6 +426,88 @@ pub async fn load_hidden_sets(db: &Client, owner_user_id: i64) -> Result<HiddenS
     Ok(sets)
 }
 
+/// Bluesky identities named by moderation rows: (DIDs, lowercased handles).
+fn bsky_moderation_refs(sets: &HiddenSets) -> (Vec<String>, Vec<String>) {
+    let mut dids = HashSet::new();
+    let mut handles = HashSet::new();
+    for set in [&sets.muted_actors, &sets.user_blocked_actors, &sets.instance_blocked_actors, &sets.instance_muted_actors] {
+        for actor in set {
+            let part = match actor.get(..25) {
+                Some(prefix) if prefix.eq_ignore_ascii_case("https://bsky.app/profile/") => raw_percent_decode(&actor[25..]),
+                _ if actor.starts_with("did:") => actor.clone(),
+                _ => continue,
+            };
+            if part.starts_with("did:") { dids.insert(part); }
+            else if !part.is_empty() && !part.contains('/') { handles.insert(part.trim_start_matches('@').to_ascii_lowercase()); }
+        }
+    }
+    (dids.into_iter().collect(), handles.into_iter().collect())
+}
+
+/// Add both halves of each known (DID, handle) pair to every set naming either half.
+fn apply_bsky_identity_pairs(sets: &mut HiddenSets, pairs: &[(String, String)]) {
+    for (did, handle) in pairs {
+        let handle = handle.to_ascii_lowercase();
+        let handle_url = format!("https://bsky.app/profile/{handle}");
+        let mut forms: Vec<String> = actor_aliases(did);
+        forms.extend(actor_aliases(&handle_url));
+        let names = |set: &HashSet<String>| forms.iter().any(|form| set.contains(form) || set.contains(&form.to_ascii_lowercase()))
+            || set.iter().any(|alias| alias.eq_ignore_ascii_case(&handle) || alias.eq_ignore_ascii_case(&handle_url));
+        for set in [&mut sets.muted_actors, &mut sets.user_blocked_actors, &mut sets.instance_blocked_actors] {
+            if names(set) { insert_actor_aliases(set, did); insert_actor_aliases(set, &handle_url); }
+        }
+        if names(&sets.instance_muted_actors) {
+            for alias in forms.iter() { sets.instance_muted_actors.insert(alias.to_ascii_lowercase()); }
+        }
+    }
+}
+
+/// Moderation rows store whichever Bluesky form the viewer acted on (Home cards
+/// carry the DID), while notifications name the notifier by handle URL. Resolve
+/// the missing half from local Bluesky caches, as PHP ap_actor_moderation_aliases
+/// does, so a DID block also hides handle-keyed notifications and vice versa.
+/// Best effort: a failed lookup keeps the syntactic aliases.
+pub async fn expand_bsky_identities(db: &Client, sets: &mut HiddenSets) {
+    let (dids, handles) = bsky_moderation_refs(sets);
+    if dids.is_empty() && handles.is_empty() { return; }
+    let lookup = async {
+        let mut pairs = Vec::new();
+        for row in db.query(
+            "SELECT d, (SELECT lower(author_handle) FROM bsky_posts WHERE author_did = d AND author_handle IS NOT NULL AND author_handle <> '' LIMIT 1)
+             FROM unnest($1::text[]) AS d
+             UNION ALL
+             SELECT (SELECT author_did FROM bsky_posts WHERE lower(author_handle) = h AND author_did LIKE 'did:%' LIMIT 1), h
+             FROM unnest($2::text[]) AS h",
+            &[&dids, &handles],
+        ).await.context("bsky moderation identities")? {
+            let did: Option<String> = row.get(0);
+            let handle: Option<String> = row.get(1);
+            if let (Some(did), Some(handle)) = (did, handle) {
+                if did.starts_with("did:") && !handle.is_empty() { pairs.push((did, handle)); }
+            }
+        }
+        let handle_urls: Vec<String> = handles.iter().map(|h| format!("https://bsky.app/profile/{h}")).collect();
+        for row in db.query(
+            "SELECT did, profile_json FROM bsky_actor_profiles
+             WHERE did = ANY($1) OR lower(actor_ref) = ANY($2) OR lower(actor_ref) = ANY($3)",
+            &[&dids, &handles, &handle_urls],
+        ).await.context("bsky moderation profiles")? {
+            let profile: Value = serde_json::from_str(&row.get::<_, String>(1)).unwrap_or(Value::Null);
+            let did = row.get::<_, Option<String>>(0).filter(|d| d.starts_with("did:"))
+                .or_else(|| profile.get("did").and_then(Value::as_str).map(str::to_owned));
+            let handle = profile.get("handle").and_then(Value::as_str).map(str::to_ascii_lowercase);
+            if let (Some(did), Some(handle)) = (did, handle) {
+                if did.starts_with("did:") && !handle.is_empty() { pairs.push((did, handle)); }
+            }
+        }
+        anyhow::Ok(pairs)
+    };
+    match lookup.await {
+        Ok(pairs) => apply_bsky_identity_pairs(sets, &pairs),
+        Err(error) => tracing::warn!(%error, "bsky moderation identity lookup failed"),
+    }
+}
+
 /// Library reads are authenticated and additionally obey the owner's durable
 /// Bluesky moderation set. These rows include native blocks, mutes and subscribed
 /// moderation lists. Absence in older schemas is an error, never an empty set.
@@ -663,6 +745,35 @@ pub async fn is_favourited(db: &Client, owner_user_id: i64, object_id: &str) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bsky_did_moderation_hides_handle_keyed_notifiers_and_back() {
+        let did = "did:plc:abc123";
+        let handle = "pest.bsky.social";
+        let mut sets = HiddenSets::default();
+        insert_actor_aliases(&mut sets.user_blocked_actors, &format!("https://bsky.app/profile/{did}"));
+        for alias in actor_aliases("https://bsky.app/profile/Loud.Example") { sets.instance_muted_actors.insert(alias.to_ascii_lowercase()); }
+        insert_actor_aliases(&mut sets.muted_actors, "https://bsky.app/profile/Quiet.Example");
+        let (dids, handles) = bsky_moderation_refs(&sets);
+        assert_eq!(dids, vec![did.to_string()]);
+        let mut handles = handles; handles.sort();
+        assert_eq!(handles, vec!["loud.example".to_string(), "quiet.example".to_string()]);
+        assert!(!sets.is_hidden(&format!("https://bsky.app/profile/{handle}")));
+        apply_bsky_identity_pairs(&mut sets, &[
+            (did.into(), handle.into()),
+            ("did:plc:loud".into(), "loud.example".into()),
+            ("did:plc:quiet".into(), "quiet.example".into()),
+            ("did:plc:other".into(), "other.example".into()),
+        ]);
+        assert!(sets.is_hidden(&format!("https://bsky.app/profile/{handle}")));
+        assert!(sets.is_hidden(handle));
+        assert!(sets.is_hidden("https://bsky.app/profile/did:plc:loud"));
+        assert!(sets.is_hidden("did:plc:quiet"));
+        assert!(!sets.is_hidden("https://bsky.app/profile/other.example"));
+        assert!(!sets.is_hidden("did:plc:other"));
+        let notification = serde_json::json!({"type":"favourite","account":{"uri":format!("https://bsky.app/profile/{handle}"),"url":format!("https://bsky.app/profile/{handle}")}});
+        assert!(status_hidden(&notification, &sets));
+    }
 
     #[test]
     fn domain_lookup_matches_original_predicate_for_arbitrary_string_boundaries() {
