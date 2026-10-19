@@ -41,8 +41,22 @@ function ap_net_ip_is_public(string $ip): bool
         if ($first === 0xff) {
             return false; // multicast
         }
+        // filter_var's reserved ranges differ between PHP 8.3 point releases,
+        // so the private and documentation blocks are checked here as well.
+        if (($first & 0xfe) === 0xfc) {
+            return false; // fc00::/7 unique local
+        }
+        if ($first === 0xfe && ($second & 0xc0) === 0x80) {
+            return false; // fe80::/10 link-local
+        }
         if ($first === 0xfe && ($second & 0xc0) === 0xc0) {
             return false; // fec0::/10 site-local
+        }
+        if ($first === 0x20 && $second === 0x01 && ord($bin[2]) === 0x0d && ord($bin[3]) === 0xb8) {
+            return false; // 2001:db8::/32 documentation
+        }
+        if ($first === 0x20 && $second === 0x01 && ord($bin[2]) === 0x00 && (ord($bin[3]) & 0xf0) === 0x10) {
+            return false; // 2001:10::/28 ORCHID
         }
         if ($first === 0x01 && $second === 0x00 && substr($bin, 2, 6) === str_repeat("\0", 6)) {
             return false; // 100::/64 discard
