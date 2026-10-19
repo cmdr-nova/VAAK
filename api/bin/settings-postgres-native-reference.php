@@ -37,7 +37,7 @@ if(!is_file($worker)||!is_executable($worker))throw new RuntimeException('fresh 
 $checks=0;$captures=[];
 function check_settings(bool $ok,string $label): void { if(!$ok)throw new RuntimeException($label);$GLOBALS['checks']++; }
 function native_settings(string $base,string $query,string $method='GET'): array {
-    $context=stream_context_create(['http'=>['ignore_errors'=>true,'timeout'=>5,'method'=>$method]]);
+    $context=stream_context_create(['http'=>['ignore_errors'=>true,'timeout'=>5,'method'=>$method,'header'=>'X-VAAK-Shadow-Token: '.str_repeat('s',40)]]);
     $raw=file_get_contents($base.'/shadow/settings'.$query,false,$context);
     preg_match('/\s(\d{3})\s/',$http_response_header[0]??'',$status);
     $body=json_decode((string)$raw,true);
@@ -76,7 +76,7 @@ foreach(['INTEGER','BIGINT'] as $width){
         $pg->exec('UPDATE actor_profile SET '.implode(',',array_map(fn($flag)=>$flag.'=0',$flags)));
         $GLOBALS['redis']=[];$GLOBALS['effects']=[];
         $port=18920+($width==='INTEGER'?0:1);$base='http://127.0.0.1:'.$port;
-        $env=['PATH'=>getenv('PATH'),'LD_LIBRARY_PATH'=>'/usr/lib/rustlib/x86_64-unknown-linux-gnu/lib','VAAK_ENV_FILE'=>'/tmp/vaak-no-settings-env','VAAK_PHYRIAN_BRIDGE_ENV_FILE'=>'/tmp/vaak-no-settings-bridge-env','VAAK_DATABASE_URL'=>'host='.$socket.' user=postgres dbname=postgres options=\'-csearch_path='.$schema.'\'','VAAK_SHADOW_OWNER_ID'=>'201','VAAK_REDIS_URL'=>'redis://127.0.0.1:1/0','VAAK_REDIS_QUEUE_URL'=>'redis://127.0.0.1:1/1','VAAK_BSKY_PUBLIC_API'=>'http://127.0.0.1:1','VAAK_NOTIF_CACHE_DIR'=>'/tmp/vaak-settings-unused','VAAK_LIBRARY_NATIVE_RENDER'=>'0','VAAK_SEARCH_NATIVE_RENDER'=>'0'];
+        $env=['PATH'=>getenv('PATH'),'LD_LIBRARY_PATH'=>'/usr/lib/rustlib/x86_64-unknown-linux-gnu/lib','VAAK_ENV_FILE'=>'/tmp/vaak-no-settings-env','VAAK_PHYRIAN_BRIDGE_ENV_FILE'=>'/tmp/vaak-no-settings-bridge-env','VAAK_DATABASE_URL'=>'host='.$socket.' user=postgres dbname=postgres options=\'-csearch_path='.$schema.'\'','VAAK_SHADOW_OWNER_ID'=>'201','VAAK_SHADOW_HTTP_TOKEN'=>str_repeat('s',40),'VAAK_REDIS_URL'=>'redis://127.0.0.1:1/0','VAAK_REDIS_QUEUE_URL'=>'redis://127.0.0.1:1/1','VAAK_BSKY_PUBLIC_API'=>'http://127.0.0.1:1','VAAK_NOTIF_CACHE_DIR'=>'/tmp/vaak-settings-unused','VAAK_LIBRARY_NATIVE_RENDER'=>'0','VAAK_SEARCH_NATIVE_RENDER'=>'0'];
         $pipes=[];$proc=proc_open([$worker,'serve','--bind','127.0.0.1:'.$port],[['pipe','r'],['file','/tmp/vaak-settings-worker-'.strtolower($width).'.log','a'],['file','/tmp/vaak-settings-worker-'.strtolower($width).'.log','a']],$pipes,null,$env);if(!is_resource($proc))throw new RuntimeException('worker start');fclose($pipes[0]);
         for($attempt=0;$attempt<50;$attempt++){usleep(100000);$conn=@fsockopen('127.0.0.1',$port,$errno,$error,.1);if($conn){fclose($conn);break;}}
         $rejectedPipes=[];$rejected=proc_open([$worker,'serve','--bind','0.0.0.0:'.$port],[['pipe','r'],['pipe','w'],['pipe','w']],$rejectedPipes,null,$env);

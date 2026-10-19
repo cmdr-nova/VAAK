@@ -14,6 +14,7 @@ if (!defined('AP_MASTO_LIB_ONLY')) {
 }
 
 require_once __DIR__ . '/ap-db.php';
+require_once __DIR__ . '/ap-shadow-http.php';
 require_once __DIR__ . '/ap-auth.php';
 require_once __DIR__ . '/ap-r2.php';
 require_once __DIR__ . '/ap-masto-entities.php';
@@ -409,7 +410,7 @@ function ap_masto_timeline_home_axum_try(int $limit, ?string $maxId, ?string $si
             CURLOPT_RETURNTRANSFER => true,
             CURLOPT_CONNECTTIMEOUT_MS => 120,
             CURLOPT_TIMEOUT_MS => 350,
-            CURLOPT_HTTPHEADER => ['Accept: application/json', 'Connection: close'],
+            CURLOPT_HTTPHEADER => array_merge(['Accept: application/json', 'Connection: close'], ap_shadow_http_auth_headers()),
             CURLOPT_HEADERFUNCTION => static function ($ch, string $headerLine) use (&$link): int {
                 if (stripos($headerLine, 'Link:') === 0) {
                     $link = trim(substr($headerLine, 5));
@@ -428,7 +429,7 @@ function ap_masto_timeline_home_axum_try(int $limit, ?string $maxId, ?string $si
             'http' => [
                 'method' => 'GET',
                 'timeout' => 0.35,
-                'header' => "Accept: application/json\r\nConnection: close\r\n",
+                'header' => "Accept: application/json\r\nConnection: close\r\n" . ap_shadow_http_auth_header_text(),
                 'ignore_errors' => true,
             ],
         ]);

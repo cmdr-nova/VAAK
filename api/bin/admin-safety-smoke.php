@@ -1,6 +1,8 @@
 <?php
 declare(strict_types=1);
 
+require_once dirname(__DIR__) . '/ap-shadow-http.php';
+
 /** Guarded Admin/moderation parity smoke; read-only and isolated-DB only. */
 $dsn = trim((string) (getenv('VAAK_ADMIN_PARITY_DATABASE_URL') ?: ''));
 $rustUrl = rtrim(trim((string) (getenv('VAAK_ADMIN_PARITY_RUST_URL') ?: '')), '/');
@@ -14,7 +16,7 @@ if (preg_match('/novalandia|mkultra|prod-host/i', $dsn . ' ' . $rustUrl)) {
 }
 
 try {
-    $raw = file_get_contents($rustUrl . '/shadow/admin-health');
+    $raw = file_get_contents($rustUrl . '/shadow/admin-health', false, stream_context_create(['http' => ['header' => ap_shadow_http_auth_header_text()]]));
     $report = is_string($raw) ? json_decode($raw, true) : null;
     if (!is_array($report) || ($report['source'] ?? '') !== 'vaak-worker-shadow') {
         throw new RuntimeException('invalid Rust admin projection');
