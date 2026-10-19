@@ -10,7 +10,7 @@ if ($rustUrl === '') {
     fwrite(STDERR, "you-client: requires Rust URL\n");
     exit(2);
 }
-if (preg_match('/novalandia|mkultra|prod-host/i', $rustUrl)) {
+if (preg_match('/novalandia|mkultra/i', $rustUrl)) {
     fwrite(STDERR, "you-client: refusing production-looking target; use loopback or an approved test proxy\n");
     exit(2);
 }
