@@ -1262,6 +1262,37 @@ fn bsky_author_hidden(hidden: &hidden::HiddenSets, author_did: &str) -> bool {
     false
 }
 
+/// Bridgy Fed copies of posts already ranked natively (the Bluesky post, or
+/// the fediverse note it links to) leave the ranked list. Events and outbox
+/// rows are keyed by their object (`o`), Bluesky rows by their AT URI.
+async fn collapse_bridgy_twins(db: &Client, ranked: &mut Vec<Value>) -> Result<()> {
+    let ids: Vec<String> = ranked
+        .iter()
+        .map(|row| {
+            let id = row.get("id").and_then(Value::as_str).unwrap_or("");
+            row.get("o")
+                .and_then(Value::as_str)
+                .filter(|o| !o.is_empty())
+                .unwrap_or(id)
+                .to_string()
+        })
+        .collect();
+    if !ids
+        .iter()
+        .any(|id| crate::wafrn_crosspost::bridgy_convert_at_uri(id).is_some())
+    {
+        return Ok(());
+    }
+    let links = crate::wafrn_crosspost::bridgy_links(db, &ids).await?;
+    let drop = crate::wafrn_crosspost::bridgy_twin_drops(&ids, &links);
+    let mut index = 0;
+    ranked.retain(|_| {
+        index += 1;
+        !drop.contains(&(index - 1))
+    });
+    Ok(())
+}
+
 fn ranked_row_sort(row: &Value) -> i64 {
     row.get("sort").and_then(|v| v.as_i64()).unwrap_or(0)
 }
@@ -3026,6 +3057,13 @@ pub async fn warm_home_native(cfg: &Config, owner_user_id: i64) -> Result<String
     bsky.sort_by(|a, b| b.sort.cmp(&a.sort).then(b.indexed_at.cmp(&a.indexed_at)));
     collapse_repeated_external_posts(&mut bsky);
     ranked = merge_bsky_ranked(ranked, &bsky, &hidden);
+    if let Err(e) = collapse_bridgy_twins(&db, &mut ranked).await {
+        tracing::warn!(
+            owner = owner_user_id,
+            error = %format!("{e:#}"),
+            "native home bridgy twin collapse skipped"
+        );
+    }
 
     if algorithm_on {
         match fetch_rss_keys(&db, owner_user_id, 32).await {
@@ -3135,7 +3173,15 @@ pub async fn warm_feed_native(cfg: &Config, owner_user_id: i64) -> Result<String
     let logical = cache_key_feed(owner_user_id, &following);
     let hidden = hidden::load_hidden_sets(&db, owner_user_id).await?;
     let timeline = fetch_federated_events(&db, &hidden).await?;
-    let ranked = rank_from_timeline(timeline);
+    let mut ranked = rank_from_timeline(timeline);
+    // PHP Federated collapsed native + Bridgy Fed copies of one post.
+    if let Err(e) = collapse_bridgy_twins(&db, &mut ranked).await {
+        tracing::warn!(
+            owner = owner_user_id,
+            error = %format!("{e:#}"),
+            "native federated bridgy twin collapse skipped"
+        );
+    }
     if ranked.is_empty() {
         let ms = started.elapsed().as_millis();
         return Ok(format!(
