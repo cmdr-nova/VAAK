@@ -17979,3 +17979,125 @@ function ap_search_current_accounts(array $accounts, int $ownerUserId, ?array $s
         return $out;
     } catch (Throwable $error) { return []; }
 }
+
+/**
+ * Poll state for remote Questions (Mastodon, Misskey, …). masto_polls only
+ * holds polls VAAK published, so remote polls had nothing for timelines to
+ * paint. Rows are display-only: options with counts, end time, voter count.
+ */
+function ap_remote_polls_migrate(): void
+{
+    static $done = false;
+    if ($done) {
+        return;
+    }
+    $done = true;
+    try {
+        ap_db()->exec('CREATE TABLE IF NOT EXISTS remote_polls (
+            note_id TEXT PRIMARY KEY,
+            multiple INTEGER NOT NULL DEFAULT 0,
+            expires_at TEXT,
+            closed INTEGER NOT NULL DEFAULT 0,
+            options_json TEXT NOT NULL,
+            votes_count BIGINT NOT NULL DEFAULT 0,
+            voters_count BIGINT NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL
+        )');
+    } catch (Throwable $e) {
+        error_log('[ap-db] remote_polls migrate: ' . $e->getMessage());
+    }
+}
+
+/**
+ * Normalized poll from an AS2 Question, or null when the doc has no choices.
+ *
+ * @return array{note_id:string,multiple:bool,expires_at:string,closed:bool,options:list<array{title:string,votes_count:int}>,votes_count:int,voters_count:int}|null
+ */
+function ap_remote_poll_from_doc(mixed $doc): ?array
+{
+    if (!is_array($doc) || ($doc['type'] ?? '') !== 'Question') {
+        return null;
+    }
+    $noteId = rtrim(trim((string) (ap_as_id($doc) ?? '')), '/');
+    if (!str_starts_with($noteId, 'https://') || strlen($noteId) > 800) {
+        return null;
+    }
+    $multiple = is_array($doc['anyOf'] ?? null) && $doc['anyOf'] !== [];
+    $choices = $multiple ? $doc['anyOf'] : ($doc['oneOf'] ?? null);
+    if (!is_array($choices)) {
+        return null;
+    }
+    $options = [];
+    $total = 0;
+    foreach (array_slice($choices, 0, 20) as $choice) {
+        if (!is_array($choice)) {
+            continue;
+        }
+        $title = mb_substr(trim(strip_tags((string) ($choice['name'] ?? ''))), 0, 200);
+        if ($title === '') {
+            continue;
+        }
+        $votes = max(0, (int) ($choice['replies']['totalItems'] ?? 0));
+        $total += $votes;
+        $options[] = ['title' => $title, 'votes_count' => $votes];
+    }
+    if ($options === []) {
+        return null;
+    }
+    $closedAt = is_string($doc['closed'] ?? null) ? trim((string) $doc['closed']) : '';
+    $endTime = is_string($doc['endTime'] ?? null) ? trim((string) $doc['endTime']) : '';
+    $expiresAt = '';
+    foreach ([$endTime, $closedAt] as $when) {
+        if ($when === '') {
+            continue;
+        }
+        try {
+            $expiresAt = (new DateTimeImmutable($when))->setTimezone(new DateTimeZone('UTC'))->format('Y-m-d\TH:i:s\Z');
+            break;
+        } catch (Throwable $e) {
+            // try the next field
+        }
+    }
+    return [
+        'note_id' => $noteId,
+        'multiple' => $multiple,
+        'expires_at' => $expiresAt,
+        'closed' => $closedAt !== '' || ($doc['closed'] ?? null) === true,
+        'options' => $options,
+        'votes_count' => $total,
+        'voters_count' => max(0, (int) ($doc['votersCount'] ?? 0)),
+    ];
+}
+
+/** Upsert a remote Question's poll; Update activities refresh the counts. */
+function ap_remote_poll_store(mixed $doc): bool
+{
+    $poll = ap_remote_poll_from_doc($doc);
+    if ($poll === null || str_starts_with($poll['note_id'], 'https://mkultra.monster/')) {
+        return false;
+    }
+    ap_remote_polls_migrate();
+    try {
+        ap_db()->prepare(
+            'INSERT INTO remote_polls (note_id, multiple, expires_at, closed, options_json, votes_count, voters_count, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT (note_id) DO UPDATE SET
+               multiple = excluded.multiple, expires_at = excluded.expires_at, closed = excluded.closed,
+               options_json = excluded.options_json, votes_count = excluded.votes_count,
+               voters_count = excluded.voters_count, updated_at = excluded.updated_at'
+        )->execute([
+            $poll['note_id'],
+            $poll['multiple'] ? 1 : 0,
+            $poll['expires_at'] !== '' ? $poll['expires_at'] : null,
+            $poll['closed'] ? 1 : 0,
+            json_encode($poll['options'], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES),
+            $poll['votes_count'],
+            $poll['voters_count'],
+            gmdate('Y-m-d\TH:i:s\Z'),
+        ]);
+        return true;
+    } catch (Throwable $e) {
+        error_log('[ap-db] remote poll store: ' . $e->getMessage());
+        return false;
+    }
+}
