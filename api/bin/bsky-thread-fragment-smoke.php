@@ -148,4 +148,13 @@ foreach(['wrong-uri','wrong-author','malformed-record'] as $vector){
 }
 $GLOBALS['thread_focus']=$focus;ap_bsky_post_upsert_from_feed_item(['post'=>$focus],1);
 $GLOBALS['thread_reply']=['ok'=>false];thread_check(admin_bsky_thread_fragment($focus['uri'],'replies','home',[])===null,'transport fault refuses');
+// Labels read before Bluesky moderation acted: the focus re-reads them.
+$young=$focus;$young['uri']='at://did:plc:fixture/app.bsky.feed.post/young';$young['record']['createdAt']=gmdate('c',time()-140);$young['labels']=[];unset($young['indexedAt'],$young['embed']);
+ap_bsky_post_upsert_from_feed_item($young,1);
+$liveYoung=$young;$liveYoung['indexedAt']=gmdate('c',time()-139);$liveYoung['labels']=[['val'=>'porn','src'=>'did:plc:ar7c4by46qjdydhdevvrndac']];$liveYoung['author']['labels']=[['val'=>'sexual']];
+$GLOBALS['thread_focus']=$liveYoung;$GLOBALS['thread_posts_fault']=false;$GLOBALS['admin_bsky_gallery_repair_budget']=2;
+$got=admin_bsky_thread_focus_item($young['uri'],1,true);unset($GLOBALS['admin_bsky_gallery_repair_budget']);
+thread_check(is_array($got)&&ap_bsky_post_is_sensitive($got['post'])&&($got['post']['author']['labels'][0]['val']??'')==='sexual','stale focus labels refreshed from AppView');
+thread_check(ap_bsky_post_is_sensitive(ap_bsky_post_item_by_uri($young['uri'])['post']),'refreshed labels stored');
+$GLOBALS['thread_focus']=$focus;
 echo "bsky-thread-fragment-smoke PASS $checks actual helper/controller checks; declaration fixture only\n";

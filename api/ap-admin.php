@@ -21625,20 +21625,36 @@ function admin_bsky_thread_focus_item(string $at, int $owner, bool $repairFocus)
         if($forceRepair===null)unset($GLOBALS['vaak_bsky_force_media_repair']);
         else $GLOBALS['vaak_bsky_force_media_repair']=$forceRepair;
     }
-    if(is_array($cached) && !$thin)return $cached;
+    // Bluesky moderation labels a post seconds after it is made. A cached copy
+    // read before that paints an NSFW post uncovered, so the focus re-reads labels.
+    $stale=is_array($cached) && $repairFocus && !$thin && function_exists('ap_bsky_post_labels_stale')
+        && ap_bsky_post_labels_stale($cached['post']);
+    if(is_array($cached) && !$thin && !$stale)return $cached;
     $got=ap_bsky_xrpc(AP_BSKY_PUBLIC_API,'app.bsky.feed.getPosts','GET',['uris'=>$at],null,null,$thin?6:4);
     if(empty($got['ok'])||!is_array($got['json']??null)){
         if($thin&&function_exists('ap_bsky_post_preview_warm_enqueue'))ap_bsky_post_preview_warm_enqueue($at,$owner);
-        return $thin?$cached:null;
+        return ($thin||$stale)?$cached:null;
     }
     $posts=$got['json']['posts']??null;
     if(!is_array($posts)||count($posts)!==1||!is_array($posts[0]??null)
         || ($posts[0]['uri']??'')!==$at || !admin_bsky_thread_post_valid($posts[0]))return null;
     $live=$posts[0];
+    if($stale){
+        // Keep the cached paint; take AppView's current labels.
+        $post=$cached['post'];
+        $labels=ap_bsky_compact_label_list($live['labels']??null);if($labels!==[])$post['labels']=$labels;
+        $authorLabels=ap_bsky_compact_label_list($live['author']['labels']??null);
+        if($authorLabels!==[]&&is_array($post['author']??null))$post['author']['labels']=$authorLabels;
+        $post['vaak_labels_at']=time();
+        try { ap_bsky_post_upsert_from_feed_item(['post'=>$live],$owner>0?$owner:null); } catch(Throwable $e) {}
+        return ['post'=>$post];
+    }
     if($thin){
         // Preserve cached text/identity; refresh the original labels and ready media.
         $post=$cached['post'];
         $labels=ap_bsky_compact_label_list($live['labels']??null);if($labels!==[])$post['labels']=$labels;
+        $authorLabels=ap_bsky_compact_label_list($live['author']['labels']??null);
+        if($authorLabels!==[]&&is_array($post['author']??null))$post['author']['labels']=$authorLabels;
         if(is_array($live['record']['embed']??null))$post['record']['embed']=$live['record']['embed'];
         $self=ap_bsky_compact_label_list($live['record']['labels']??($live['record']['selfLabels']??null));
         if($self!==[])$post['record']['labels']=['$type'=>'com.atproto.label.defs#selfLabels','values'=>$self];
