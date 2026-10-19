@@ -37,7 +37,7 @@ $db = new PDO('sqlite::memory:');
 $db->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
 $db->exec('CREATE TABLE ap_users (id INTEGER PRIMARY KEY, username TEXT, actor_key TEXT)');
 $db->exec('CREATE TABLE phyrian_players (owner_user_id INTEGER PRIMARY KEY, status TEXT, strain TEXT, generation INTEGER, imprinted_by_owner_id INTEGER, imprinted_at TEXT)');
-$db->exec('CREATE TABLE phyrian_bridge_links (owner_user_id INTEGER PRIMARY KEY, status TEXT, unlinked_at TEXT)');
+$db->exec('CREATE TABLE phyrian_bridge_links (owner_user_id INTEGER PRIMARY KEY, avatar_uuid TEXT, status TEXT, unlinked_at TEXT)');
 $db->exec('CREATE TABLE phyrian_requests (id INTEGER PRIMARY KEY, kind TEXT, status TEXT, resolved_at TEXT)');
 $db->exec('CREATE TABLE phyrian_clans (id INTEGER PRIMARY KEY, created_at TEXT)');
 
@@ -60,8 +60,8 @@ $players = [
 foreach ($players as $p) {
     $db->prepare('INSERT INTO phyrian_players VALUES (?, ?, ?, ?, ?, ?)')->execute($p);
 }
-$db->exec("INSERT INTO phyrian_bridge_links VALUES (5, 'verified', NULL)");
-$db->exec("INSERT INTO phyrian_bridge_links VALUES (2, 'verified', '2026-10-01 00:00:00+00')");
+$db->exec("INSERT INTO phyrian_bridge_links VALUES (5, '55555555-5555-5555-5555-555555555555', 'verified', NULL)");
+$db->exec("INSERT INTO phyrian_bridge_links VALUES (2, '22222222-2222-2222-2222-222222222222', 'verified', '2026-10-01 00:00:00+00')");
 $db->prepare("INSERT INTO phyrian_requests (kind, status, resolved_at) VALUES ('resonance', 'accepted', ?)")->execute([$ago(1)]);
 $db->prepare("INSERT INTO phyrian_requests (kind, status, resolved_at) VALUES ('resonance', 'accepted', ?)")->execute([$ago(9)]);
 $db->prepare("INSERT INTO phyrian_requests (kind, status, resolved_at) VALUES ('resonance', 'denied', ?)")->execute([$ago(1)]);
@@ -71,27 +71,27 @@ $db->prepare('INSERT INTO phyrian_clans (created_at) VALUES (?)')->execute([$ago
 $loaded = ap_phyrian_tree_load($db);
 $check(!empty($loaded['ok']), 'tree loads');
 $rows = $loaded['rows'] ?? [];
-$ids = array_map(static fn (array $r): int => $r['owner_user_id'], $rows);
-$check(count($rows) === 9 && !in_array(9, $ids, true), 'only imprinted players load');
+$ids = array_map(static fn (array $r): string => $r['key'], $rows);
+$check(count($rows) === 9 && !in_array('u9', $ids, true), 'only imprinted players load');
 $linked = [];
 foreach ($rows as $r) {
-    $linked[$r['owner_user_id']] = $r['linked'];
+    $linked[$r['key']] = $r['linked'];
 }
-$check($linked[5] === true && $linked[2] === false, 'only verified, not unlinked, bridge links count as grid-linked');
+$check($linked['u5'] === true && $linked['u2'] === false, 'only verified, not unlinked, bridge links count as grid-linked');
 
 $tree = ap_phyrian_tree_build($rows);
 $check(count($tree['root_of']) === 9, 'every player appears once');
-$check($tree['children'][1] === [2, 10] && $tree['children'][2] === [3, 4], 'children follow imprinted_by');
-$check(in_array(5, $tree['roots'], true) && in_array(8, $tree['roots'], true), 'grid-linked and orphaned players become roots');
-$loopRoots = array_values(array_intersect($tree['roots'], [6, 7]));
+$check($tree['children']['u1'] === ['u2', 'u10'] && $tree['children']['u2'] === ['u3', 'u4'], 'children follow imprinted_by');
+$check(in_array('u5', $tree['roots'], true) && in_array('u8', $tree['roots'], true), 'grid-linked and orphaned players become roots');
+$loopRoots = array_values(array_intersect($tree['roots'], ['u6', 'u7']));
 $check(count($loopRoots) === 1, 'a parent loop is broken once');
-$check($tree['root_of'][3] === 1 && $tree['root_of'][4] === 1, 'root_of walks to the origin');
+$check($tree['root_of']['u3'] === 'u1' && $tree['root_of']['u4'] === 'u1', 'root_of walks to the origin');
 
 $recap = ap_phyrian_tree_recap($rows, $tree, $db, $now);
 $check($recap['new_imprints'] === 3, 'recap counts imprints from the last seven days');
 $check($recap['exchanges'] === 1, 'recap counts accepted resonance exchanges in the window');
 $check($recap['new_clans'] === 1, 'recap counts new clans');
-$check($recap['top_root'] === 1 && $recap['top_count'] === 2, 'fastest line ignores brand-new roots');
+$check($recap['top_root'] === 'u1' && $recap['top_count'] === 2, 'fastest line ignores brand-new roots');
 
 $text = ap_phyrian_tree_recap_text($recap, count($rows));
 $check(str_contains($text, '3 new imprints') && str_contains($text, '1 resonance exchange,'), 'recap text has counts');
@@ -116,6 +116,44 @@ $guest = ap_phyrian_tree_page_html(0, '', $db, $now);
 $check(!str_contains($guest, 'Share this recap'), 'signed-out viewers get no share form');
 $newcomer = ap_phyrian_tree_page_html(9, 'csrf-ok', $db, $now);
 $check(str_contains($newcomer, 'not on the tree yet'), 'unimprinted viewer gets a join hint');
+
+// Grid lineage mirrored from OpenSim.
+$db->exec('CREATE TABLE phyrian_grid_lineage (avatar_uuid TEXT PRIMARY KEY, avatar_name TEXT, parent_uuid TEXT, strain TEXT, generation INTEGER, imprinted_at TEXT, synced_at TEXT)');
+$gUuid = static fn (string $c): string => str_repeat($c, 8) . '-' . str_repeat($c, 4) . '-' . str_repeat($c, 4) . '-' . str_repeat($c, 4) . '-' . str_repeat($c, 12);
+$grid = [
+    // Grid-only parent of the linked VAAK player 5, itself imprinted by a grid-only root.
+    [$gUuid('a'), 'Ada Gridborn', $gUuid('b'), 'Grid Tide', 3, $ago(30)],
+    [$gUuid('b'), 'Bex <b>Root</b>', null, 'Grid Tide', 2, $ago(90)],
+    // Linked player 5's own grid row points at Ada.
+    [$gUuid('5'), 'Gridder Avatar', $gUuid('a'), 'Grid Tide', 4, $ago(3)],
+    // Grid-only child of a linked VAAK player.
+    [$gUuid('c'), 'Cy Newcomer', $gUuid('5'), 'Grid Tide', 5, $ago(1)],
+    // Registered but never imprinted on the grid: not on the tree.
+    [$gUuid('d'), 'Dee Unmarked', null, '', 1, null],
+];
+foreach ($grid as $g) {
+    $db->prepare('INSERT INTO phyrian_grid_lineage (avatar_uuid, avatar_name, parent_uuid, strain, generation, imprinted_at) VALUES (?, ?, ?, ?, ?, ?)')->execute($g);
+}
+$gl = ap_phyrian_tree_load($db);
+$gRows = [];
+foreach ($gl['rows'] ?? [] as $r) {
+    $gRows[$r['key']] = $r;
+}
+$check(count($gRows) === 12, 'grid-only avatars join the tree, unimprinted ones do not');
+$check(($gRows['u5']['parent_key'] ?? '') === 'g' . $gUuid('a'), 'linked player takes its grid parent when VAAK has none');
+$check(($gRows['g' . $gUuid('c')]['parent_key'] ?? '') === 'u5', 'grid parent that is linked resolves to the VAAK node');
+$check(!isset($gRows['g' . $gUuid('5')]), 'a linked avatar is not duplicated as a grid node');
+$gTree = ap_phyrian_tree_build($gl['rows']);
+$check(($gTree['root_of']['g' . $gUuid('c')] ?? '') === 'g' . $gUuid('b'), 'line runs from VAAK back through grid-only avatars');
+$gHtml = ap_phyrian_tree_page_html(4, 'csrf-ok', $db, $now);
+$check(str_contains($gHtml, 'Ada Gridborn') && str_contains($gHtml, 'Grid only'), 'grid-only avatars show their grid name and badge');
+$check(!str_contains($gHtml, '@Ada') && !preg_match('/<a [^>]*>Ada Gridborn/', $gHtml), 'grid-only avatars get no profile link');
+$check(str_contains($gHtml, 'Bex &lt;b&gt;Root&lt;/b&gt;'), 'grid names are escaped');
+$check(!str_contains($gHtml, 'Dee Unmarked'), 'unimprinted grid avatars stay off the tree');
+$gRecap = ap_phyrian_tree_recap($gl['rows'], $gTree, $db, $now);
+$check($gRecap['new_imprints'] === 4, 'recap counts grid-only imprints too');
+$db->exec('DROP TABLE phyrian_grid_lineage');
+$check(count(ap_phyrian_tree_load($db)['rows'] ?? []) === 9, 'missing grid table leaves the VAAK tree as it was');
 
 $sent = [];
 $deliver = static function (string $body) use (&$sent): array {

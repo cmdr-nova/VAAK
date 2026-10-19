@@ -126,9 +126,19 @@ foreach ($rows as $rawOwner) {
     ));
 }
 
+// Family tree lineage. A grid without vaak_lineage_export just reports
+// lineage=skipped; it does not fail the body sync.
+$lineage = 'skipped';
+if ($owner === 0) {
+    $lineageRes = ap_phyrian_bridge_lineage_sync();
+    $lineage = !empty($lineageRes['ok'])
+        ? (string) (int) ($lineageRes['rows'] ?? 0)
+        : 'skipped(' . preg_replace('/\s+/', '_', substr((string) ($lineageRes['error'] ?? ''), 0, 60)) . ')';
+}
+
 fwrite(STDOUT, sprintf(
-    "phyrian-sync linked=%d synced=%d skipped=%d failed=%d force=%d ms=%d\n",
-    count($rows), $ok, $skipped, $failed, $force ? 1 : 0,
+    "phyrian-sync linked=%d synced=%d skipped=%d failed=%d force=%d lineage=%s ms=%d\n",
+    count($rows), $ok, $skipped, $failed, $force ? 1 : 0, $lineage,
     (int) round((microtime(true) - $started) * 1000)
 ));
 exit($failed > 0 ? 1 : 0);

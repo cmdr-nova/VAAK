@@ -4,10 +4,14 @@ declare(strict_types=1);
 /**
  * Phyrian family tree and weekly recap.
  *
- * Read-only view of who imprinted whom on this server, built from
- * phyrian_players.imprinted_by_owner_id. The OpenSim bridge never writes that
- * column, so grid-linked players keep their grid-synced stats here and show
- * up as roots when their imprint happened on the grid.
+ * Read-only view of who imprinted whom, built from
+ * phyrian_players.imprinted_by_owner_id plus the grid lineage that
+ * phyrian-sync.php mirrors into phyrian_grid_lineage. Grid-linked players
+ * keep their grid-synced stats; avatars that only exist on the grid show
+ * their grid name and no profile link until they link a VAAK account.
+ *
+ * Nodes are keyed "u<owner id>" for VAAK players and "g<avatar uuid>" for
+ * grid-only avatars.
  *
  * The recap is a draft. Nothing is posted until the viewer confirms the
  * form, and it posts from the viewer's own account. The suggested text uses
@@ -57,13 +61,11 @@ function ap_phyrian_tree_load(?PDO $db = null): array
         $st = $pdo->prepare(
             "SELECT p.owner_user_id, p.strain, p.generation, p.imprinted_by_owner_id, p.imprinted_at,
                     COALESCE(NULLIF(u.username, ''), NULLIF(u.actor_key, ''), '') AS username,
-                    CASE WHEN EXISTS (
-                        SELECT 1 FROM phyrian_bridge_links l
-                        WHERE l.owner_user_id = p.owner_user_id
-                          AND l.status = 'verified' AND l.unlinked_at IS NULL
-                    ) THEN 1 ELSE 0 END AS linked
+                    l.avatar_uuid
              FROM phyrian_players p
              LEFT JOIN ap_users u ON u.id = p.owner_user_id
+             LEFT JOIN phyrian_bridge_links l
+               ON l.owner_user_id = p.owner_user_id AND l.status = 'verified' AND l.unlinked_at IS NULL
              WHERE p.status = 'imprinted' AND COALESCE(p.strain, '') <> ''
              ORDER BY p.imprinted_at IS NULL DESC, p.imprinted_at, p.owner_user_id
              LIMIT " . (string) AP_PHYRIAN_TREE_MAX_ROWS
@@ -80,17 +82,101 @@ function ap_phyrian_tree_load(?PDO $db = null): array
         if ($id < 1) {
             continue;
         }
+        $parent = (int) ($row['imprinted_by_owner_id'] ?? 0);
+        $uuid = strtolower(trim((string) ($row['avatar_uuid'] ?? '')));
         $rows[] = [
+            'key' => 'u' . $id,
             'owner_user_id' => $id,
             'username' => trim((string) ($row['username'] ?? '')),
             'strain' => trim((string) ($row['strain'] ?? '')),
             'generation' => (int) ($row['generation'] ?? 1),
-            'parent' => (int) ($row['imprinted_by_owner_id'] ?? 0),
+            'parent_key' => $parent > 0 && $parent !== $id ? 'u' . $parent : '',
             'imprinted_at' => (string) ($row['imprinted_at'] ?? ''),
-            'linked' => !empty($row['linked']),
+            'linked' => $uuid !== '',
+            'avatar_uuid' => $uuid,
+            'grid_only' => false,
         ];
     }
-    return ['ok' => true, 'rows' => $rows];
+    // Grid rows first: the join also fills parents on $rows in place.
+    $gridOnly = ap_phyrian_tree_grid_rows($rows, ap_phyrian_tree_load_grid($db));
+    return ['ok' => true, 'rows' => array_merge($rows, $gridOnly)];
+}
+
+/**
+ * Mirrored grid lineage. Empty when the table is missing or not synced yet.
+ *
+ * @return list<array<string,mixed>>
+ */
+function ap_phyrian_tree_load_grid(?PDO $db = null): array
+{
+    try {
+        $st = ap_phyrian_tree_db($db)->prepare(
+            'SELECT avatar_uuid, avatar_name, parent_uuid, strain, generation, imprinted_at
+             FROM phyrian_grid_lineage LIMIT ' . (string) AP_PHYRIAN_TREE_MAX_ROWS
+        );
+        $st->execute();
+        return $st->fetchAll(PDO::FETCH_ASSOC) ?: [];
+    } catch (Throwable $e) {
+        return [];
+    }
+}
+
+/**
+ * Join grid lineage onto VAAK rows (by reference) and return the grid-only
+ * avatars as extra rows. A linked player keeps a VAAK imprinted_by when it
+ * has one; otherwise its grid parent is used. Grid parents that are linked
+ * resolve to their VAAK node.
+ *
+ * @param list<array<string,mixed>> $rows
+ * @param list<array<string,mixed>> $grid
+ * @return list<array<string,mixed>>
+ */
+function ap_phyrian_tree_grid_rows(array &$rows, array $grid): array
+{
+    if ($grid === []) {
+        return [];
+    }
+    $byUuid = [];
+    foreach ($rows as $i => $row) {
+        if ($row['avatar_uuid'] !== '') {
+            $byUuid[$row['avatar_uuid']] = $i;
+        }
+    }
+    $keyFor = static function (string $uuid) use (&$byUuid, &$rows): string {
+        return isset($byUuid[$uuid]) ? (string) $rows[$byUuid[$uuid]]['key'] : 'g' . $uuid;
+    };
+    $extra = [];
+    foreach ($grid as $g) {
+        $uuid = strtolower(trim((string) ($g['avatar_uuid'] ?? '')));
+        if ($uuid === '') {
+            continue;
+        }
+        $parentUuid = strtolower(trim((string) ($g['parent_uuid'] ?? '')));
+        $parentKey = $parentUuid !== '' && $parentUuid !== $uuid ? $keyFor($parentUuid) : '';
+        if (isset($byUuid[$uuid])) {
+            $i = $byUuid[$uuid];
+            if ($rows[$i]['parent_key'] === '' && $parentKey !== $rows[$i]['key']) {
+                $rows[$i]['parent_key'] = $parentKey;
+            }
+            continue;
+        }
+        if (trim((string) ($g['strain'] ?? '')) === '') {
+            continue;
+        }
+        $extra[] = [
+            'key' => 'g' . $uuid,
+            'owner_user_id' => 0,
+            'username' => trim((string) ($g['avatar_name'] ?? '')),
+            'strain' => trim((string) ($g['strain'] ?? '')),
+            'generation' => max(1, (int) ($g['generation'] ?? 1)),
+            'parent_key' => $parentKey,
+            'imprinted_at' => (string) ($g['imprinted_at'] ?? ''),
+            'linked' => false,
+            'avatar_uuid' => $uuid,
+            'grid_only' => true,
+        ];
+    }
+    return $extra;
 }
 
 /**
@@ -98,26 +184,27 @@ function ap_phyrian_tree_load(?PDO $db = null): array
  * or part of a loop becomes a root, so every row appears exactly once.
  *
  * @param list<array<string,mixed>> $rows
- * @return array{nodes:array<int,array<string,mixed>>,children:array<int,list<int>>,roots:list<int>,root_of:array<int,int>}
+ * @return array{nodes:array<string,array<string,mixed>>,children:array<string,list<string>>,roots:list<string>,root_of:array<string,string>}
  */
 function ap_phyrian_tree_build(array $rows): array
 {
     $nodes = [];
     foreach ($rows as $row) {
-        $nodes[(int) $row['owner_user_id']] = $row;
+        $nodes[(string) $row['key']] = $row;
     }
     $children = [];
     $roots = [];
     foreach ($nodes as $id => $row) {
-        $parent = (int) ($row['parent'] ?? 0);
-        if ($parent > 0 && $parent !== $id && isset($nodes[$parent])) {
+        $id = (string) $id;
+        $parent = (string) ($row['parent_key'] ?? '');
+        if ($parent !== '' && $parent !== $id && isset($nodes[$parent])) {
             $children[$parent][] = $id;
         } else {
             $roots[] = $id;
         }
     }
     $rootOf = [];
-    $walk = static function (int $root) use (&$children, &$rootOf): void {
+    $walk = static function (string $root) use (&$children, &$rootOf): void {
         $stack = [$root];
         while ($stack !== []) {
             $id = array_pop($stack);
@@ -135,13 +222,14 @@ function ap_phyrian_tree_build(array $rows): array
     }
     // Rows left over sit on a parent loop. Break each loop at its first row.
     foreach (array_keys($nodes) as $id) {
+        $id = (string) $id;
         if (isset($rootOf[$id])) {
             continue;
         }
-        $parent = (int) $nodes[$id]['parent'];
+        $parent = (string) $nodes[$id]['parent_key'];
         $children[$parent] = array_values(array_filter(
             $children[$parent] ?? [],
-            static fn (int $child): bool => $child !== $id
+            static fn (string $child): bool => $child !== $id
         ));
         $roots[] = $id;
         $walk($id);
@@ -162,8 +250,8 @@ function ap_phyrian_tree_ts(string $value): ?int
  * Last seven days of spread, from the rows already loaded plus two counts.
  *
  * @param list<array<string,mixed>> $rows
- * @param array{root_of:array<int,int>} $tree
- * @return array{new_imprints:int,new_ids:array<int,bool>,exchanges:int,new_clans:int,top_root:int,top_count:int}
+ * @param array{root_of:array<string,string>} $tree
+ * @return array{new_imprints:int,new_ids:array<string,bool>,exchanges:int,new_clans:int,top_root:string,top_count:int}
  */
 function ap_phyrian_tree_recap(array $rows, array $tree, ?PDO $db = null, ?int $now = null): array
 {
@@ -176,19 +264,19 @@ function ap_phyrian_tree_recap(array $rows, array $tree, ?PDO $db = null, ?int $
         if ($ts === null || $ts < $since || $ts > $now) {
             continue;
         }
-        $id = (int) $row['owner_user_id'];
+        $id = (string) $row['key'];
         $newIds[$id] = true;
-        $root = (int) ($tree['root_of'][$id] ?? $id);
+        $root = (string) ($tree['root_of'][$id] ?? $id);
         // A brand-new root is not growth of an existing line.
         if ($root !== $id) {
             $perRoot[$root] = ($perRoot[$root] ?? 0) + 1;
         }
     }
-    $topRoot = 0;
+    $topRoot = '';
     $topCount = 0;
     foreach ($perRoot as $root => $count) {
         if ($count > $topCount) {
-            $topRoot = (int) $root;
+            $topRoot = (string) $root;
             $topCount = $count;
         }
     }
@@ -290,40 +378,52 @@ function ap_phyrian_tree_recap_publish(int $ownerUserId, string $text, bool $con
     return ['ok' => true, 'text' => $text];
 }
 
+/** "@handle" for VAAK players, the plain grid name for grid-only avatars. */
 function ap_phyrian_tree_name(array $node): string
 {
     $name = trim((string) ($node['username'] ?? ''));
-    return $name !== '' ? $name : 'user' . (int) ($node['owner_user_id'] ?? 0);
+    if (!empty($node['grid_only'])) {
+        return $name !== '' ? $name : 'Grid resident';
+    }
+    return '@' . ($name !== '' ? $name : 'user' . (int) ($node['owner_user_id'] ?? 0));
 }
 
 /**
- * @param array{nodes:array<int,array<string,mixed>>,children:array<int,list<int>>} $tree
- * @param array<int,bool> $path viewer and their ancestors
- * @param array<int,bool> $newIds
+ * @param array{nodes:array<string,array<string,mixed>>,children:array<string,list<string>>} $tree
+ * @param array<string,bool> $path viewer and their ancestors
+ * @param array<string,bool> $newIds
  */
-function ap_phyrian_tree_node_html(array $tree, int $id, int $depth, int $viewerId, array $path, array $newIds, int $originId): string
+function ap_phyrian_tree_node_html(array $tree, string $id, int $depth, string $viewerKey, array $path, array $newIds, string $originKey): string
 {
     $node = $tree['nodes'][$id];
     $kids = $tree['children'][$id] ?? [];
-    $isSelf = $id === $viewerId;
-    $href = $isSelf ? '?view=phyrian&amp;page=dossier' : '?view=phyrian&amp;page=dossier&amp;owner=' . $id;
-    $label = '<a href="' . $href . '">@' . ap_phyrian_tree_h(ap_phyrian_tree_name($node)) . '</a>'
+    $isSelf = $id === $viewerKey;
+    $name = ap_phyrian_tree_h(ap_phyrian_tree_name($node));
+    if (!empty($node['grid_only'])) {
+        // No VAAK profile yet, so nothing to link to.
+        $label = '<span class="phyrian-tree-grid-name">' . $name . '</span>';
+    } else {
+        $href = $isSelf ? '?view=phyrian&amp;page=dossier' : '?view=phyrian&amp;page=dossier&amp;owner=' . (int) $node['owner_user_id'];
+        $label = '<a href="' . $href . '">' . $name . '</a>';
+    }
+    $label .= ''
         . ' <span class="meta">' . ap_phyrian_tree_h((string) $node['strain']) . ' · Gen ' . (int) $node['generation'] . '</span>';
     if ($isSelf) {
         $label .= ' <span class="phyrian-badge">You</span>';
     }
-    if ($id === $originId) {
+    if ($id === $originKey) {
         $label .= ' <span class="phyrian-badge phyrian-badge--origin">Origin</span>';
     }
     if (!empty($node['linked'])) {
         $label .= ' <span class="phyrian-badge phyrian-badge--grid" title="Stats synced from the NovaLandia grid">Grid-linked</span>';
+    } elseif (!empty($node['grid_only'])) {
+        $label .= ' <span class="phyrian-badge phyrian-badge--grid" title="On the NovaLandia grid, not on VAAK yet">Grid only</span>';
     }
     if (isset($newIds[$id])) {
         $label .= ' <span class="phyrian-badge phyrian-badge--new">New this week</span>';
     }
-    if ($depth === 0 && $id !== $originId) {
-        $parent = (int) ($node['parent'] ?? 0);
-        if ($parent > 0) {
+    if ($depth === 0 && $id !== $originKey) {
+        if ((string) ($node['parent_key'] ?? '') !== '') {
             $label .= ' <span class="meta">· imprinted by someone not on the tree</span>';
         } elseif (!empty($node['linked'])) {
             $label .= ' <span class="meta">· imprinted on the grid</span>';
@@ -337,7 +437,7 @@ function ap_phyrian_tree_node_html(array $tree, int $id, int $depth, int $viewer
     $html = '<li' . $class . '><details' . ($open ? ' open' : '') . '><summary class="phyrian-tree-node">' . $label
         . ' <span class="meta">(' . count($kids) . ')</span></summary><ul>';
     foreach ($kids as $kid) {
-        $html .= ap_phyrian_tree_node_html($tree, $kid, $depth + 1, $viewerId, $path, $newIds, $originId);
+        $html .= ap_phyrian_tree_node_html($tree, $kid, $depth + 1, $viewerKey, $path, $newIds, $originKey);
     }
     return $html . '</ul></details></li>';
 }
@@ -351,19 +451,21 @@ function ap_phyrian_tree_page_html(int $viewerId, string $csrf, ?PDO $db = null,
     $rows = $loaded['rows'];
     $tree = ap_phyrian_tree_build($rows);
     $recap = ap_phyrian_tree_recap($rows, $tree, $db, $now);
-    $originId = 0;
+    $originKey = '';
     foreach ($tree['nodes'] as $id => $node) {
-        if (function_exists('ap_phyrian_is_origin_owner') && ap_phyrian_is_origin_owner((int) $id)) {
-            $originId = (int) $id;
+        $owner = (int) ($node['owner_user_id'] ?? 0);
+        if ($owner > 0 && function_exists('ap_phyrian_is_origin_owner') && ap_phyrian_is_origin_owner($owner)) {
+            $originKey = (string) $id;
             break;
         }
     }
+    $viewerKey = $viewerId > 0 ? 'u' . $viewerId : '';
     $path = [];
-    $cursor = $viewerId;
-    while ($cursor > 0 && isset($tree['nodes'][$cursor]) && !isset($path[$cursor])) {
+    $cursor = $viewerKey;
+    while ($cursor !== '' && isset($tree['nodes'][$cursor]) && !isset($path[$cursor])) {
         $path[$cursor] = true;
-        $parent = (int) ($tree['nodes'][$cursor]['parent'] ?? 0);
-        $cursor = isset($tree['nodes'][$parent]) ? $parent : 0;
+        $parent = (string) ($tree['nodes'][$cursor]['parent_key'] ?? '');
+        $cursor = isset($tree['nodes'][$parent]) ? $parent : '';
     }
 
     $html = '<section class="phyrian-tree-page" aria-label="Family tree">';
@@ -374,9 +476,9 @@ function ap_phyrian_tree_page_html(int $viewerId, string $csrf, ?PDO $db = null,
     $html .= '<div><b>' . (int) $recap['new_clans'] . '</b><span class="meta">new clans</span></div>';
     $html .= '<div><b>' . count($rows) . '</b><span class="meta">carriers</span></div>';
     $html .= '</div>';
-    if ((int) $recap['top_count'] > 0 && isset($tree['nodes'][(int) $recap['top_root']])) {
-        $html .= '<p class="meta" style="margin:.5rem 0 0">Fastest-growing line: @'
-            . ap_phyrian_tree_h(ap_phyrian_tree_name($tree['nodes'][(int) $recap['top_root']]))
+    if ((int) $recap['top_count'] > 0 && isset($tree['nodes'][$recap['top_root']])) {
+        $html .= '<p class="meta" style="margin:.5rem 0 0">Fastest-growing line: '
+            . ap_phyrian_tree_h(ap_phyrian_tree_name($tree['nodes'][$recap['top_root']]))
             . '\'s, with ' . (int) $recap['top_count'] . ' new ' . ((int) $recap['top_count'] === 1 ? 'carrier' : 'carriers') . '.</p>';
     }
     if ($viewerId > 0) {
@@ -395,8 +497,8 @@ function ap_phyrian_tree_page_html(int $viewerId, string $csrf, ?PDO $db = null,
     }
 
     $html .= '<h3 class="phyrian-section-title">Family tree</h3>';
-    $html .= '<p class="meta" style="margin:0 0 .75rem">Who imprinted whom on this server. Grid-linked players keep the stats synced from the NovaLandia grid.</p>';
-    if ($viewerId > 0 && !isset($tree['nodes'][$viewerId])) {
+    $html .= '<p class="meta" style="margin:0 0 .75rem">Who imprinted whom, on VAAK and the NovaLandia grid. Grid-linked players keep the stats synced from the grid; grid-only avatars get a profile link once they link a VAAK account.</p>';
+    if ($viewerKey !== '' && !isset($tree['nodes'][$viewerKey])) {
         $html .= '<p class="meta" style="margin:0 0 .75rem">You are not on the tree yet. Accept an imprint to join a line.</p>';
     }
     if ($tree['roots'] === []) {
@@ -404,10 +506,10 @@ function ap_phyrian_tree_page_html(int $viewerId, string $csrf, ?PDO $db = null,
     }
     // Origin line first, then the rest in imprint order.
     $roots = $tree['roots'];
-    usort($roots, static fn (int $a, int $b): int => ($b === $originId) <=> ($a === $originId));
+    usort($roots, static fn (string $a, string $b): int => ($b === $originKey) <=> ($a === $originKey));
     $html .= '<ul class="phyrian-tree">';
     foreach ($roots as $root) {
-        $html .= ap_phyrian_tree_node_html($tree, $root, 0, $viewerId, $path, $recap['new_ids'], $originId);
+        $html .= ap_phyrian_tree_node_html($tree, $root, 0, $viewerKey, $path, $recap['new_ids'], $originKey);
     }
     return $html . '</ul></section>';
 }
