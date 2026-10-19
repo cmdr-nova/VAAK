@@ -558,6 +558,7 @@ fn poll_identity_attrs(boost: bool, timeline_key: &str, status_id: &str, note_id
     html
 }
 fn render_core_mode(status:&Value,facts:&CardFacts,direct:Option<&crate::direct_context::DirectPresentation>,prepared_preview:Option<&Option<Value>>,read_only:bool,silent:bool)->Result<String>{
+    crate::notif_embed::warn_card_contract(status, &facts.return_view);
     if status.get("media_attachments").and_then(Value::as_array).is_some_and(|media| media.iter().any(|attachment|
         attachment.get("url").and_then(Value::as_str).unwrap_or("").is_empty()
             && !attachment.get("preview_url").and_then(Value::as_str).unwrap_or("").is_empty())) {
@@ -860,6 +861,56 @@ mod tests {
         assert!(cw_gate("", true, "payload", true).starts_with("<div class=\"tweet-content\""));
         assert!(cw_gate("", true, "", false).contains("sensitive media"));
     }
+    /// Library, search and status pages paint with this card. These pin the
+    /// same media/quote/poll contract the Home builders are tested against.
+    mod card_contract {
+        use super::*;
+        use serde_json::json;
+        fn facts() -> CardFacts {
+            CardFacts { current_action_counts:None, bsky:None, owner_id:1, owner_actor:"https://mkultra.monster/users/fixture".into(), return_view:"bookmarks".into(), auto_unblur_sensitive:false, resolved_avatar:"https://mkultra.monster/img/avatar/default.webp".into(), csrf:"fixture-csrf-token".into(), favourited:false, bookmarked:false, boosted:false, own:None, rss_row:None, rss_quote_row:None, rss_quoted:false, emoji_by_actor:Default::default(), reply_mentions:Vec::new(), moderation:Default::default(), poll_row:None, ask_row:None, now:chrono::DateTime::from_timestamp(1791673200,0).unwrap(), lazy_media:false }
+        }
+        fn status(media: Value) -> Value {
+            json!({"id":"https://social.example/notes/1","uri":"https://social.example/notes/1","url":"https://social.example/notes/1",
+                "created_at":"2026-10-19T05:00:00.000Z","content":"<p>look</p>","spoiler_text":"","sensitive":false,"visibility":"public",
+                "account":{"id":"https://social.example/users/a","uri":"https://social.example/users/a","url":"https://social.example/@a","acct":"a@social.example","username":"a","display_name":"A","avatar":"https://social.example/a.png"},
+                "media_attachments":media,"card":null,"poll":null,"quote":null,"reblog":null})
+        }
+        const IMG: &str = "https://cdn.bsky.app/img/feed_fullsize/plain/did:plc:abc/bafkreiaaa@jpeg";
+        const QIMG: &str = "https://cdn.bsky.app/img/feed_fullsize/plain/did:plc:q/bafkreiqqq@jpeg";
+
+        #[test]
+        fn media_paints_on_the_library_card() {
+            let st = status(json!([{"id":"m1","type":"image","url":IMG,"preview_url":IMG,"description":"cat"}]));
+            assert!(vaak_types::check_timeline_status(&st).is_empty());
+            let html = render(&st, &facts()).unwrap();
+            assert!(html.contains(IMG), "{html}");
+        }
+
+        #[test]
+        fn quoted_media_stays_inside_the_quote() {
+            let quoted = status(json!([{"id":"q1","type":"image","url":QIMG,"preview_url":QIMG,"description":""}]));
+            let mut st = status(json!([]));
+            st["quote"] = json!({"state":"accepted","quoted_status":quoted});
+            assert!(vaak_types::check_timeline_status(&st).is_empty());
+            let quote = quote_card(&st["quote"]["quoted_status"], &facts()).unwrap();
+            assert!(quote.contains("quote-media") && quote.contains(QIMG), "quoted image must paint in the quote: {quote}");
+            let html = render(&st, &facts()).unwrap();
+            let at = html.find(QIMG).expect("quoted image paints on the card");
+            let inside = html.find("quote-media").expect("quote media row");
+            assert!(inside < at, "quoted image must sit inside the quote, not on the outer card: {html}");
+        }
+
+        #[test]
+        fn remote_poll_row_paints_results_without_a_vote_form() {
+            // remote_polls has no local_id: display-only.
+            let row = json!({"note_id":"https://social.example/notes/1","multiple":0,"expires_at":"2026-10-20T05:00:00+00:00","closed":0,
+                "options_json":"[{\"title\":\"yes\",\"votes_count\":3},{\"title\":\"no\",\"votes_count\":1}]","votes_count":4,"voters_count":4});
+            let html = poll_html(&row, "https://social.example/notes/1", &facts());
+            assert!(html.contains("poll-opt--result") && html.contains("yes") && html.contains("75% · 3"), "{html}");
+            assert!(!html.contains("poll-vote-form"), "{html}");
+        }
+    }
+
 }
 
 /// Pinned feed presentation is scoped to the admitted card, including quote media.
