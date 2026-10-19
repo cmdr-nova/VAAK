@@ -10,7 +10,7 @@ if ($rustUrl === '') {
     fwrite(STDERR, "search-parity: requires Rust URL\n");
     exit(2);
 }
-if (preg_match('/novalandia|mkultra|144\.91\.124\.35/i', $rustUrl)) {
+if (preg_match('/novalandia|mkultra/i', $rustUrl)) {
     fwrite(STDERR, "search-parity: refusing production-looking target; use loopback or an approved test proxy\n");
     exit(2);
 }

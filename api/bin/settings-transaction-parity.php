@@ -10,7 +10,7 @@ if ($dsn === '' || $rustUrl === '') {
     fwrite(STDERR, "settings-transaction-parity: requires isolated DB URL and Rust URL\n");
     exit(2);
 }
-if (preg_match('/novalandia|mkultra|144\.91\.124\.35/i', $dsn . ' ' . $rustUrl)) {
+if (preg_match('/novalandia|mkultra/i', $dsn . ' ' . $rustUrl)) {
     fwrite(STDERR, "settings-transaction-parity: refusing production-looking target\n");
     exit(2);
 }

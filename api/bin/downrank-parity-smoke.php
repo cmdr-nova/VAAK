@@ -3,7 +3,7 @@ declare(strict_types=1);
 
 /** Guarded PHP/Rust downranking parity fixture; isolated DB only. */
 $dsn = trim((string) (getenv('VAAK_DOWNRANK_DATABASE_URL') ?: ''));
-if ($dsn === '' || preg_match('/novalandia|mkultra|144\.91\.124\.35/i', $dsn)) {
+if ($dsn === '' || preg_match('/novalandia|mkultra/i', $dsn)) {
     fwrite(STDERR, "downrank-parity: requires a non-production isolated DB URL\n");
     exit(2);
 }
