@@ -39,12 +39,13 @@ reference_load($api . '/ap-auth.php', [
     'ap_auth_login_ip', 'ap_auth_login_account_bucket', 'ap_auth_login_rate_ok', 'ap_auth_login_rate_fail',
     'ap_auth_user_by_id', 'ap_auth_user_by_login', 'ap_auth_verify_credentials',
     'ap_auth_verify_credentials_limited', 'ap_auth_2fa_verify_code_limited',
-    'ap_auth_attempt_login', 'ap_auth_complete_2fa_login', 'ap_auth_2fa_pending_clear',
+    'ap_auth_attempt_login', 'ap_auth_complete_2fa_login', 'ap_auth_2fa_pending_clear', 'ap_auth_2fa_pending_attempt',
     'ap_auth_2fa_row', 'ap_auth_2fa_enabled', 'ap_auth_2fa_verify_code', 'ap_auth_2fa_verify_recovery',
     'ap_auth_totp_verify', 'ap_auth_totp_base32_decode', 'ap_auth_totp_base32_encode',
     'ap_auth_user_set_password', 'ap_auth_change_password',
     'ap_auth_revoke_user_credentials', 'ap_auth_revoke_user_sessions',
 ]);
+reference_load($api . '/ap-mastodon.php', ['ap_masto_oauth_2fa_binding', 'ap_masto_oauth_2fa_begin', 'ap_masto_oauth_2fa_step']);
 
 $n = 0;
 function check(bool $ok, string $why): void
@@ -168,6 +169,43 @@ $res = ap_auth_complete_2fa_login(totp_now($secret));
 check(empty($res['ok']) && str_starts_with((string) $res['error'], 'Too many two-factor attempts'), 'account 2FA cooldown blocks even a correct code');
 $limited = false;
 check(!ap_auth_2fa_verify_code_limited(3, totp_now($secret), $limited) && $limited, 'add-account 2FA path shares the cooldown');
+
+// (a) OAuth authorize: same pending flow and limits; params are bound.
+$bind = ap_masto_oauth_2fa_binding('client', 'app://cb', 'read write', 'st', 'chal', 'S256');
+check($bind !== ap_masto_oauth_2fa_binding('client', 'app://evil', 'read write', 'st', 'chal', 'S256'), 'binding covers redirect_uri');
+check($bind !== ap_masto_oauth_2fa_binding('client', 'app://cb', 'read write', 'st', 'other', 'S256'), 'binding covers PKCE');
+check(ap_masto_oauth_2fa_step($bind, totp_now($secret))['error'] === 'Two-factor sign-in expired. Please sign in again.', 'no pending OAuth sign-in, no code');
+ap_masto_oauth_2fa_begin($bind, 4);
+$step = ap_masto_oauth_2fa_step(ap_masto_oauth_2fa_binding('client', 'app://evil', 'read write', 'st', 'chal', 'S256'), totp_now($secret));
+check(!isset($step['user']) && !$step['keep'] && !isset($_SESSION['vaak_oauth_2fa']), 'changed OAuth params discard the pending sign-in');
+ap_masto_oauth_2fa_begin($bind, 4);
+for ($i = 1; $i < AP_AUTH_2FA_PENDING_MAX; $i++) {
+    $step = ap_masto_oauth_2fa_step($bind, '000000');
+    check(!isset($step['user']) && $step['keep'] && $step['error'] === 'Invalid two-factor code.', 'OAuth wrong code ' . $i);
+}
+$step = ap_masto_oauth_2fa_step($bind, '000000');
+check(!isset($step['user']) && !$step['keep'] && str_starts_with($step['error'], 'Too many invalid codes'), 'OAuth pending sign-in discarded after 5');
+check(ap_auth_rate_fails('2fa:u4') === AP_AUTH_2FA_PENDING_MAX, 'OAuth wrong codes count toward the account');
+ap_masto_oauth_2fa_begin($bind, 4);
+$step = ap_masto_oauth_2fa_step($bind, totp_now($secret));
+check(($step['user']['id'] ?? 0) == 4 && !isset($_SESSION['vaak_oauth_2fa']), 'correct OAuth code yields the user once');
+check(!isset(ap_masto_oauth_2fa_step($bind, totp_now($secret))['user']), 'OAuth pending sign-in is single use');
+ap_masto_oauth_2fa_begin($bind, 3);
+$step = ap_masto_oauth_2fa_step($bind, totp_now($secret));
+check(!isset($step['user']) && str_starts_with($step['error'], 'Too many two-factor attempts'), 'OAuth shares the account cooldown with web login');
+$_SESSION['vaak_oauth_2fa'] = ['user_id' => 4, 'at' => time() - 601, 'fails' => 0, 'binding' => $bind];
+check(!isset(ap_masto_oauth_2fa_step($bind, totp_now($secret))['user']), 'OAuth pending sign-in expires');
+// The handler issues an authorization code only after this step.
+$masto = (string) file_get_contents($api . '/ap-mastodon.php');
+$auth = substr($masto, (int) strpos($masto, 'function ap_masto_oauth_authorize('));
+$auth = substr($auth, 0, (int) strpos($auth, "\nfunction "));
+check(substr_count($auth, 'ap_oauth_code_create(') === 1, 'one code issue point');
+$issue = strpos($auth, 'ap_oauth_code_create(');
+$gate = strpos($auth, 'if (is_array($user)) {');
+$begin = strpos($auth, 'ap_masto_oauth_2fa_begin(');
+check($gate !== false && $begin !== false && $begin < $gate && $gate < $issue, 'code issued only for a fully verified user');
+check(preg_match('/if \(ap_auth_2fa_enabled\(\(int\) \$verified\[\'id\'\]\)\) \{\s*\/\/[^\n]*\n\s*ap_masto_oauth_2fa_begin/', $auth) === 1, '2FA accounts go to the code step');
+check(str_contains($auth, 'name="oauth_step" value="2fa"') && str_contains($auth, 'name="code_challenge"') && str_contains($auth, 'name="state"'), 'code form keeps OAuth params');
 
 // (c) Password change: current password required; others revoked.
 $_SESSION = ['vaak_user_id' => 5, 'keep_me' => 'yes'];
