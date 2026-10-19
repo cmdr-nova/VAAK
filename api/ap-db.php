@@ -9518,7 +9518,7 @@ function ap_outbound_follow_count_recent(int $withinSeconds = 3600): int
 function ap_block_list(): array
 {
     try {
-        return ap_db()->query('SELECT * FROM ap_blocks ORDER BY created_at DESC')->fetchAll();
+        return ap_db()->query('SELECT * FROM ap_blocks ORDER BY created_at DESC, id DESC')->fetchAll();
     } catch (Throwable $e) {
         error_log('[ap-db] block_list: ' . $e->getMessage());
         return [];
