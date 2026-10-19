@@ -195,6 +195,24 @@ if (is_array($json)) {
                 ap_short($sig['keyId']),
                 ap_short($claimedActor)
             ));
+            // The forwarder vouches for delivery, not for the post. Store the
+            // copy the author's server serves, or nothing.
+            if ($type === 'Create') {
+                $refetched = ap_inbox_refetch_forwarded_create($json);
+                if ($refetched === null) {
+                    ap_log(sprintf(
+                        'forward_refetch_drop keyId=%s actor=%s object=%s',
+                        ap_short($sig['keyId']),
+                        ap_short($claimedActor),
+                        ap_short((string) (ap_as_id($json['object'] ?? null) ?? ''))
+                    ));
+                    http_response_code(202);
+                    header('Content-Type: application/json');
+                    echo json_encode(['status' => 'accepted', 'action' => 'forward_dropped'], JSON_UNESCAPED_SLASHES);
+                    exit;
+                }
+                $json = $refetched;
+            }
         } else {
             // The HTTP signature proves who delivered the POST, not that they
             // are the activity actor. Mastodon inbox-forwarding (and relays
@@ -1181,10 +1199,122 @@ function ap_inbox_reconcile_decision(?array $posted, string $keyId, bool $truste
         return null;
     }
     $claimed = ap_as_id($posted['actor'] ?? null);
-    if ($claimed === null || $trusted || ap_inbox_actor_matches_key($keyId, $claimed)) {
+    if ($claimed === null || ap_inbox_actor_matches_key($keyId, $claimed)) {
         return $posted;
     }
+    if ($trusted) {
+        $type = is_string($posted['type'] ?? null) ? $posted['type'] : '';
+        return strcasecmp($type, 'Create') === 0 ? ap_inbox_forwarded_create_decision($posted, $fetches) : $posted;
+    }
     return ap_inbox_origin_decision($posted, $fetches);
+}
+
+/**
+ * Where to fetch the object of a forwarded Create: its id, on the claimed
+ * actor's host. Null when there is no such id.
+ *
+ * @param array<string,mixed> $posted
+ */
+function ap_inbox_forwarded_create_url(array $posted): ?string
+{
+    $claimed = ap_inbox_https_id($posted['actor'] ?? null);
+    $url = ap_inbox_fetch_url(ap_inbox_https_id($posted['object'] ?? null));
+    if ($claimed === null || $url === null) {
+        return null;
+    }
+    $actorHost = strtolower((string) parse_url($claimed, PHP_URL_HOST));
+    return $actorHost !== '' && ap_inbox_same_host($url, $actorHost) ? $url : null;
+}
+
+/**
+ * Rebuild a forwarded Create from the origin copy of its object. The fetched
+ * object must keep its id on the fetched host and be attributed to the
+ * claimed actor. Addressing comes from the fetched object, not the forward.
+ *
+ * @param array<string,mixed>|null $posted
+ * @param array<string,array{status?:int,doc?:mixed}> $fetches keyed by fetch URL
+ * @return array<string,mixed>|null
+ */
+function ap_inbox_forwarded_create_decision(?array $posted, array $fetches): ?array
+{
+    if ($posted === null) {
+        return null;
+    }
+    $type = is_string($posted['type'] ?? null) ? $posted['type'] : '';
+    $claimed = ap_inbox_https_id($posted['actor'] ?? null);
+    $url = ap_inbox_forwarded_create_url($posted);
+    if (strcasecmp($type, 'Create') !== 0 || $claimed === null || $url === null) {
+        return null;
+    }
+    $res = $fetches[$url] ?? null;
+    $status = is_array($res) ? (int) ($res['status'] ?? 0) : 0;
+    $doc = is_array($res) && is_array($res['doc'] ?? null) ? $res['doc'] : null;
+    if ($doc === null || $status < 200 || $status >= 300) {
+        return null;
+    }
+    $host = strtolower((string) parse_url($url, PHP_URL_HOST));
+    $docId = ap_inbox_https_id($doc['id'] ?? null);
+    if ($docId === null || !ap_inbox_same_host($docId, $host)) {
+        return null;
+    }
+    $docType = is_string($doc['type'] ?? null) ? $doc['type'] : '';
+    if ($docType === '' || strcasecmp($docType, 'Tombstone') === 0 || isset($doc['actor'])) {
+        return null;
+    }
+    $attributed = [];
+    $attr = $doc['attributedTo'] ?? null;
+    foreach ((is_array($attr) && array_is_list($attr)) ? $attr : [$attr] as $entry) {
+        $id = ap_inbox_https_id($entry);
+        if ($id !== null) {
+            $attributed[] = ap_inbox_norm_id($id);
+        }
+    }
+    if (!in_array(ap_inbox_norm_id($claimed), $attributed, true)) {
+        return null;
+    }
+    $activity = [
+        '@context' => $doc['@context'] ?? 'https://www.w3.org/ns/activitystreams',
+        'type' => 'Create',
+        'actor' => $claimed,
+        'object' => $doc,
+    ];
+    $activityId = ap_inbox_https_id($posted['id'] ?? null);
+    if ($activityId !== null && ap_inbox_same_host($activityId, $host)) {
+        $activity['id'] = $activityId;
+    }
+    foreach (['to', 'cc', 'bto', 'bcc', 'audience', 'published'] as $key) {
+        if (array_key_exists($key, $doc)) {
+            $activity[$key] = $doc[$key];
+        }
+    }
+    return $activity;
+}
+
+/**
+ * Fetch the object of a forwarded Create from its origin and rebuild the
+ * activity from it. Null when the fetch fails or the copy does not match.
+ *
+ * @param array<string,mixed> $posted
+ * @return array<string,mixed>|null
+ */
+function ap_inbox_refetch_forwarded_create(array $posted): ?array
+{
+    $url = ap_inbox_forwarded_create_url($posted);
+    if ($url === null) {
+        return null;
+    }
+    $host = strtolower((string) parse_url($url, PHP_URL_HOST));
+    try {
+        if (ap_is_blocked_host($host)) {
+            return null;
+        }
+    } catch (Throwable $e) {
+        return null;
+    }
+    if (!ap_net_host_is_public($host)) {
+        return null;
+    }
+    return ap_inbox_forwarded_create_decision($posted, [$url => ap_inbox_origin_fetch($url)]);
 }
 
 /**
