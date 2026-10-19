@@ -180,40 +180,66 @@ impl TimelineStatus {
     /// Shape problems a painter would silently drop, including nested
     /// reblogs and quotes. Empty means the status is safe to paint.
     pub fn contract_violations(&self) -> Vec<String> {
-        let mut out = Vec::new();
-        self.collect_violations("", &mut out);
-        out
+        check_value(&self.to_value())
     }
+}
 
-    fn collect_violations(&self, path: &str, out: &mut Vec<String>) {
-        let at = |field: &str| format!("{path}{field}");
-        if self.id.trim().is_empty() {
-            out.push(at("id is empty"));
-        }
-        for (i, media) in self.media_attachments.iter().enumerate() {
-            if !media.url.starts_with("https://") {
-                out.push(at(&format!("media_attachments[{i}].url is not https: {}", media.url)));
+/// The same contract for a status JSON any builder produced, typed or not.
+/// Library, search and notifications build partial shapes, so only the
+/// fields a status carries are checked: media, poll, card, reblog, quote.
+pub fn check_value(status: &Value) -> Vec<String> {
+    let mut out = Vec::new();
+    collect_violations(status, "", &mut out);
+    out
+}
+
+fn collect_violations(st: &Value, path: &str, out: &mut Vec<String>) {
+    let at = |field: &str| format!("{path}{field}");
+    let id_empty = match st.get("id") {
+        Some(Value::String(id)) => id.trim().is_empty(),
+        Some(Value::Number(_)) => false,
+        _ => true,
+    };
+    if id_empty {
+        out.push(at("id is empty"));
+    }
+    match st.get("media_attachments") {
+        None | Some(Value::Null) => {}
+        Some(Value::Array(media)) => {
+            for (i, m) in media.iter().enumerate() {
+                let url = m.get("url").and_then(Value::as_str).unwrap_or("");
+                if !url.starts_with("https://") {
+                    out.push(at(&format!("media_attachments[{i}].url is not https: {url}")));
+                }
+                let kind = m.get("type").and_then(Value::as_str).unwrap_or("");
+                if !matches!(kind, "image" | "gifv" | "video" | "audio" | "unknown") {
+                    out.push(at(&format!("media_attachments[{i}].type is {kind}")));
+                }
             }
-            if !matches!(media.kind.as_str(), "image" | "gifv" | "video" | "audio" | "unknown") {
-                out.push(at(&format!("media_attachments[{i}].type is {}", media.kind)));
-            }
         }
-        if let Some(poll) = &self.poll {
-            if poll.options.iter().all(|o| o.title.trim().is_empty()) {
-                out.push(at("poll has no options"));
-            }
+        Some(_) => out.push(at("media_attachments is not a list")),
+    }
+    if let Some(poll) = st.get("poll").filter(|p| !p.is_null()) {
+        let titled = poll.get("options").and_then(Value::as_array).is_some_and(|opts| {
+            opts.iter().any(|o| {
+                o.get("title").or_else(|| o.get("name")).and_then(Value::as_str).is_some_and(|t| !t.trim().is_empty())
+            })
+        });
+        if !titled {
+            out.push(at("poll has no options"));
         }
-        if let Some(card) = &self.card {
-            if !card.url.starts_with("http") && !card.extra.contains_key("vaak_collection_kind") {
-                out.push(at(&format!("card.url is not a link: {}", card.url)));
-            }
+    }
+    if let Some(card) = st.get("card").filter(|c| !c.is_null()) {
+        let url = card.get("url").and_then(Value::as_str).unwrap_or("");
+        if !url.starts_with("http") && card.get("vaak_collection_kind").is_none() {
+            out.push(at(&format!("card.url is not a link: {url}")));
         }
-        if let Some(reblog) = &self.reblog {
-            reblog.collect_violations(&format!("{path}reblog."), out);
-        }
-        if let Some(quoted) = self.quote.as_ref().and_then(|q| q.quoted_status.as_ref()) {
-            quoted.collect_violations(&format!("{path}quote."), out);
-        }
+    }
+    if let Some(reblog) = st.get("reblog").filter(|r| r.is_object()) {
+        collect_violations(reblog, &format!("{path}reblog."), out);
+    }
+    if let Some(quoted) = st.get("quote").and_then(|q| q.get("quoted_status")).filter(|q| q.is_object()) {
+        collect_violations(quoted, &format!("{path}quote."), out);
     }
 }
 
@@ -261,6 +287,16 @@ mod tests {
         let bad = st.contract_violations();
         assert_eq!(bad.len(), 3, "{bad:?}");
         assert!(bad[2].starts_with("quote.media_attachments[0].type"), "{bad:?}");
+    }
+
+    #[test]
+    fn checks_partial_shapes_from_other_builders() {
+        let partial = json!({"id": 7, "content": "x",
+            "media_attachments": [{"type": "image", "url": "https://cdn.example/a.jpg"}],
+            "quote": {"quoted_status": {"id": "q", "media_attachments": [{"type": "image", "url": ""}]}}});
+        let bad = check_value(&partial);
+        assert_eq!(bad, vec!["quote.media_attachments[0].url is not https: ".to_string()]);
+        assert!(check_value(&json!({"id": "1", "media_attachments": {}})).len() == 1);
     }
 
     #[test]

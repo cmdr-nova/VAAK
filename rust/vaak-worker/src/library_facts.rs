@@ -81,6 +81,15 @@ fn reply_seeds(status: &Value, owner_actor: &str, owner_key: &str) -> Vec<String
     out
 }
 
+/// Remote Questions have no masto_polls row; inbox keeps them in remote_polls
+/// (created with the first one). No local_id, so poll_html shows results only.
+pub(crate) async fn remote_poll_row(db: &Client, note: &str) -> Result<Option<Value>> {
+    let exists = db.query_one("SELECT to_regclass('public.remote_polls') IS NOT NULL", &[]).await?.get::<_, bool>(0);
+    if !exists { return Ok(None); }
+    let note = note.trim_end_matches('/');
+    Ok(db.query_opt("SELECT to_jsonb(p) FROM remote_polls p WHERE rtrim(note_id,'/')=$1 LIMIT 1", &[&note]).await?.map(|r| r.get(0)))
+}
+
 /// Match PHP's current trusted directory plus additive DB overrides. Missing
 /// directory IO is a fallback boundary, not permission to omit Ask actions.
 pub(crate) async fn wafrn_host_known(db: &Client, actor: &str) -> Result<bool> {
@@ -277,7 +286,8 @@ pub(crate) async fn resolve(db: &Client, owner_id: i64, owner_actor: &str, statu
         }
     }
     moderation.is_wafrn = wafrn_host_known(db,actor).await?;
-    let poll_row = db.query_opt("SELECT to_jsonb(p) FROM masto_polls p WHERE rtrim(note_id,'/')=$1 LIMIT 1", &[&uri]).await?.map(|r| r.get(0));
+    let mut poll_row: Option<Value> = db.query_opt("SELECT to_jsonb(p) FROM masto_polls p WHERE rtrim(note_id,'/')=$1 LIMIT 1", &[&uri]).await?.map(|r| r.get(0));
+    if poll_row.is_none() { poll_row = remote_poll_row(db, uri).await?; }
     let local_ask=db.query_opt("SELECT to_jsonb(a) FROM ap_asks a WHERE rtrim(answer_note_id,'/')=$1 ORDER BY id DESC LIMIT 1", &[&uri]).await?.map(|r|r.get::<_,Value>(0));
     let ask_row=if let Some(mut ask)=local_ask {
         // ap_asks has no answer column. A local answer is the current stored
