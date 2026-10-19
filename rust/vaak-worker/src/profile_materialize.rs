@@ -1,6 +1,14 @@
 //! Private local-profile selection-to-presentation boundary. A projection is
 //! derived from the selected SQL ledger, never accepted from a browser or PHP
 //! status snapshot. This stage performs no HTTP, DNS, warming or rendering.
+/// One compiled regex per call site. These builders run once per card, and
+/// compiling Unicode classes per call dominated their cost.
+/// The same for a pattern picked from a fixed list.
+fn cached_re(pattern:&'static str)->regex::Regex{
+    static CACHE:std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<&'static str,regex::Regex>>>=std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default).lock().expect("regex cache").entry(pattern).or_insert_with(||regex::Regex::new(pattern).unwrap()).clone()
+}
+macro_rules! re{($pattern:literal)=>{{static RE:std::sync::OnceLock<regex::Regex>=std::sync::OnceLock::new();RE.get_or_init(||regex::Regex::new($pattern).unwrap())}}}
 use anyhow::{bail,Context,Result};
 use serde_json::{json,Value};
 use tokio_postgres::Client;
@@ -77,7 +85,7 @@ impl StaticCountDependency {
 fn static_count_integer(value:&Value)->Result<i64>{
     let value=if let Value::String(raw)=value{
         let raw=raw.trim_start_matches([' ','\t','\n','\r','\x0b','\x0c']);
-        let numeric=regex::Regex::new(r"^[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?").unwrap().find(raw).map(|m|m.as_str()).unwrap_or("");
+        let numeric=re!(r"^[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?").find(raw).map(|m|m.as_str()).unwrap_or("");
         if let Ok(integer)=numeric.parse::<i64>(){return Ok(integer.max(0))}
         if numeric.is_empty(){return Ok(0)}
         let number=numeric.parse::<f64>().context("PHP fallback: static numeric count exceeds native parser")?;
@@ -437,16 +445,16 @@ fn snowflake(raw:&str,id:i64,kind:i64)->Result<String>{
     let dt=chrono::DateTime::parse_from_rfc3339(raw).context("PHP fallback: profile snowflake date needs PHP parser")?;
     Ok((dt.timestamp()*1_000_000_000+(kind%10)*100_000_000+id%100_000_000).to_string())
 }
-fn strip_html(raw:&str)->String{crate::home_hydrate_ranked::html_entity_decode(&regex::Regex::new("<[^>]*>").unwrap().replace_all(raw,""))}
+fn strip_html(raw:&str)->String{crate::home_hydrate_ranked::html_entity_decode(&re!("<[^>]*>").replace_all(raw,""))}
 fn normalized_html(raw:&str)->String{
     let mut html=crate::library::card::php_trim(raw).to_owned();
-    for(pattern,replacement)in [(r"(?i)</p>(?-u:\s)*<br(?-u:\s)*/?>(?-u:\s)*<p","</p><p"),(r"(?i)<br(?-u:\s)*/?>(?-u:\s)*(?:<br(?-u:\s)*/?>(?-u:\s)*)+","</p><p>"),(r"(?i)<p>(?-u:\s)*(?:<br(?-u:\s)*/?>(?-u:\s)*)*</p>",""),(r"(?i)<p>(?-u:\s)*</p>","")]{html=regex::Regex::new(pattern).unwrap().replace_all(&html,replacement).into_owned();}
+    for(pattern,replacement)in [(r"(?i)</p>(?-u:\s)*<br(?-u:\s)*/?>(?-u:\s)*<p","</p><p"),(r"(?i)<br(?-u:\s)*/?>(?-u:\s)*(?:<br(?-u:\s)*/?>(?-u:\s)*)+","</p><p>"),(r"(?i)<p>(?-u:\s)*(?:<br(?-u:\s)*/?>(?-u:\s)*)*</p>",""),(r"(?i)<p>(?-u:\s)*</p>","")]{html=cached_re(pattern).replace_all(&html,replacement).into_owned();}
     crate::library::card::php_trim(&html).to_owned()
 }
 fn plain_html(text:&str)->Result<String>{
     let text=text.replace("\r\n","\n").replace('\r',"\n");let text=crate::library::card::php_trim(&text);
-    let url_pattern=regex::Regex::new(r#"https://[^\s<>"']+"#).unwrap();
-    Ok(regex::Regex::new(r"\n{2,}").unwrap().split(text).filter_map(|p|{let p=crate::library::card::php_trim(p);if p.is_empty(){return None}let escaped=crate::library::actions::esc(p);let escaped=url_pattern.replace_all(&escaped,|c:&regex::Captures|{let url=c[0].trim_end_matches(['.',',',')',';',']','!','?','\'', '"']);let trail=&c[0][url.len()..];let href=crate::library::actions::esc(url);format!("<a href=\"{href}\" target=\"_blank\" rel=\"nofollow noopener noreferrer\">{href}</a>{trail}")});Some(format!("<p>{}</p>",escaped.replace('\n',"<br>\n")))}).collect::<Vec<_>>().join("\n"))
+    let url_pattern=re!(r#"https://[^\s<>"']+"#);
+    Ok(re!(r"\n{2,}").split(text).filter_map(|p|{let p=crate::library::card::php_trim(p);if p.is_empty(){return None}let escaped=crate::library::actions::esc(p);let escaped=url_pattern.replace_all(&escaped,|c:&regex::Captures|{let url=c[0].trim_end_matches(['.',',',')',';',']','!','?','\'', '"']);let trail=&c[0][url.len()..];let href=crate::library::actions::esc(url);format!("<a href=\"{href}\" target=\"_blank\" rel=\"nofollow noopener noreferrer\">{href}</a>{trail}")});Some(format!("<p>{}</p>",escaped.replace('\n',"<br>\n")))}).collect::<Vec<_>>().join("\n"))
 }
 fn local_profile_defaults(key:&str)->Value{
  let primary=key=="cmdr_nova";let summary=if primary{"<p>Local ActivityPub presence for mkultra.monster.</p><p>VAAK profile: <a href=\"https://mkultra.monster/users/cmdr_nova\" rel=\"nofollow noopener noreferrer\">@cmdr_nova@mkultra.monster</a>. Site bridge handle: <code>@val3r1e@mkultra.monster</code> (Bridgy Fed).</p>"}else{"<p>On mkultra.monster.</p>"};
@@ -456,7 +464,7 @@ fn local_profile_defaults(key:&str)->Value{
 fn profile_source_fields(profile:&Value)->Result<Vec<Value>>{
  let atts:Value=serde_json::from_str(s(profile,"attachment_json")).unwrap_or(json!([]));let mut fields=vec![];
  for att in atts.as_array().into_iter().flatten().take(8){let name=crate::library::card::php_trim(s(att,"name"));let raw=s(att,"value");if name.is_empty()||crate::library::card::php_trim(&strip_html(raw)).is_empty(){continue}
- let url=regex::Regex::new(r#"(?i)href\s*=\s*["'](https://[^"']+)["']"#).unwrap().captures(raw).map(|c|c[1].to_owned()).or_else(||raw.starts_with("https://").then(||raw.to_owned()));let plain=url.unwrap_or_else(||crate::library::card::php_trim(&crate::home_hydrate_ranked::html_entity_decode(&strip_html(raw))).to_owned());
+ let url=re!(r#"(?i)href\s*=\s*["'](https://[^"']+)["']"#).captures(raw).map(|c|c[1].to_owned()).or_else(||raw.starts_with("https://").then(||raw.to_owned()));let plain=url.unwrap_or_else(||crate::library::card::php_trim(&crate::home_hydrate_ranked::html_entity_decode(&strip_html(raw))).to_owned());
  fields.push(json!({"name":name,"value":plain,"verified_at":att.get("verified_at").filter(|v|v.is_string()&&truth(v)).cloned().unwrap_or(Value::Null)}));}Ok(fields)
 }
 fn profile_fields(profile:&Value)->Result<Vec<Value>>{
@@ -464,7 +472,7 @@ fn profile_fields(profile:&Value)->Result<Vec<Value>>{
     for att in atts.as_array().into_iter().flatten().take(8){
         let name=crate::library::card::php_trim(s(att,"name"));let raw=s(att,"value");
         if name.is_empty()||crate::library::card::php_trim(&strip_html(raw)).is_empty(){continue}
-        let url=regex::Regex::new(r#"(?i)href\s*=\s*["'](https://[^"']+)["']"#).unwrap().captures(raw).map(|c|c[1].to_owned()).or_else(||raw.starts_with("https://").then(||raw.to_owned()));
+        let url=re!(r#"(?i)href\s*=\s*["'](https://[^"']+)["']"#).captures(raw).map(|c|c[1].to_owned()).or_else(||raw.starts_with("https://").then(||raw.to_owned()));
         let verified=att.get("verified_at").filter(|v|v.is_string()&&truth(v)).cloned().unwrap_or(Value::Null);
         let value=if let Some(url)=url{
             let parsed=reqwest::Url::parse(&url).context("PHP fallback: profile field URL needs PHP coercion")?;
@@ -477,7 +485,7 @@ fn profile_fields(profile:&Value)->Result<Vec<Value>>{
 impl Projector<'_>{
     async fn remote_account_media(&mut self,actor:&str,override_peer:bool)->Result<(Option<String>,Option<String>)>{
         // The remote account helper tries structural avatar aliases in order.
-        let mut aliases=vec![actor.to_owned()];if let Some(c)=regex::Regex::new(r"^(https://[^/]+)/@([^/?#]+)$").unwrap().captures(actor){aliases.push(format!("{}/users/{}",&c[1],&c[2]));}else if let Some(c)=regex::Regex::new(r"^(https://[^/]+)/users/([^/?#]+)$").unwrap().captures(actor){aliases.push(format!("{}/@{}",&c[1],&c[2]));}
+        let mut aliases=vec![actor.to_owned()];if let Some(c)=re!(r"^(https://[^/]+)/@([^/?#]+)$").captures(actor){aliases.push(format!("{}/users/{}",&c[1],&c[2]));}else if let Some(c)=re!(r"^(https://[^/]+)/users/([^/?#]+)$").captures(actor){aliases.push(format!("{}/@{}",&c[1],&c[2]));}
         let mut avatar=None;let mut header=None;let mut warm_actor=actor.to_owned();
         let override_avatar:Option<String>=if override_peer&&matches!(actor,"https://waffles.baeddel.social/fediverse/blog/admin"|"https://app.wafrn.net/fediverse/blog/admin"){Some("https://mkultra.monster/img/avatar/wafrn-approvals.webp".into())}else{None};
         if let Some(value)=override_avatar{avatar=Some(value.clone());header=Some(value)}else{
@@ -549,7 +557,7 @@ impl Projector<'_>{
                 }else{self.effect(ProjectionEffect::PostMediaWarm{source_url:clean.clone()});clean.clone()};
                 media.push(json!({"id":format!("{sid}{}",media.len()+1),"type":"image","url":display,"preview_url":display,"remote_url":clean,"preview_remote_url":null,"text_url":null,"meta":null,"description":null,"blurhash":null}));if media.len()>=4{break}continue
             }
-            let poster=regex::Regex::new(r"(?i)^(https://.+)/original/([^/?#]+)\.(mp4|m4v|mov|webm)([?#].*)?$").unwrap().captures(&clean).map(|c|format!("{}/small/{}.png",&c[1],&c[2]));
+            let poster=re!(r"(?i)^(https://.+)/original/([^/?#]+)\.(mp4|m4v|mov|webm)([?#].*)?$").captures(&clean).map(|c|format!("{}/small/{}.png",&c[1],&c[2]));
             media.push(json!({"id":format!("{sid}{}",media.len()+1),"type":"video","url":clean,"preview_url":poster,"remote_url":clean,"preview_remote_url":null,"text_url":null,"meta":null,"description":null,"blurhash":null}));if media.len()>=4{break}
         }
         let(reply_id,reply_account,reply_actor,reply_url)=self.event_reply_projection(s(row,"in_reply_to")).await?;
@@ -712,7 +720,7 @@ impl Projector<'_>{
             if !s(&status,"content").contains("ask-container"){
                 let identity=self.ask_identity_projection(meta).await?;
                 let card=crate::library::card::ask_html(&identity)?;
-                if !card.is_empty(){let plain=strip_html(s(&status,"content"));status["content"]=json!(if !s(&status,"content").is_empty()&&!regex::Regex::new(r"(?i)\basked\b").unwrap().is_match(&plain){format!("{card}{}",s(&status,"content"))}else{card});}
+                if !card.is_empty(){let plain=strip_html(s(&status,"content"));status["content"]=json!(if !s(&status,"content").is_empty()&&!re!(r"(?i)\basked\b").is_match(&plain){format!("{card}{}",s(&status,"content"))}else{card});}
             }
         }
         self.interaction_flags(&mut status).await?;Ok(status)
@@ -744,7 +752,7 @@ impl Projector<'_>{
         let rows=self.rows("SELECT to_jsonb(a) FROM remote_actors a WHERE actor_id IN($1::jsonb->>'actor',($1::jsonb->>'actor')||'/') LIMIT 1",json!({"actor":actor})).await?;
         let mut host=reqwest::Url::parse(actor)?.host_str().unwrap_or("").to_ascii_lowercase();let mut username=String::new();
         if let Some(row)=rows.first(){username=crate::library::card::php_trim(s(row,"username")).into();if !s(row,"host").is_empty(){host=crate::library::card::php_trim(s(row,"host")).to_ascii_lowercase();}}
-        if username.is_empty(){if let Some(c)=regex::Regex::new(r"(?i)/(?:users|@)([^/]+)/?$").unwrap().captures(actor){let name=crate::hidden::raw_percent_decode(&c[1]);if !name.is_empty()&&!name.bytes().all(|b|b.is_ascii_digit()){username=name;}}}
+        if username.is_empty(){if let Some(c)=re!(r"(?i)/(?:users|@)([^/]+)/?$").captures(actor){let name=crate::hidden::raw_percent_decode(&c[1]);if !name.is_empty()&&!name.bytes().all(|b|b.is_ascii_digit()){username=name;}}}
         let key=if !username.is_empty()&&!host.is_empty()&&host!="unknown"{Some(format!("{}@{host}",username.to_lowercase()))}else{None};
         let seed=key.map(|k|format!("acct:{k}")).unwrap_or_else(||actor.into());Ok((300_000_000+crc32(seed.as_bytes()) as i64%699_999_999).to_string())
     }
@@ -772,7 +780,7 @@ fn masto_preview_card(card:&Value)->Value{
 fn crc32(bytes:&[u8])->u32{let mut crc=u32::MAX;for byte in bytes{crc^=*byte as u32;for _ in 0..8{crc=(crc>>1)^if crc&1==1{0xedb88320}else{0};}}!crc}
 fn actor_from_object(raw:&str)->Option<String>{
     for pattern in [r"(?i)^(https://[^/]+)/users/([^/]+)/(?:statuses|notes|objects)/",r"(?i)^(https://[^/]+)/@([^/]+)/(?:statuses/)?[A-Za-z0-9_-]+",r"(?i)^(https://[^/]+)/ap/users/([^/]+)/(?:statuses|notes)/"]{
-        if let Some(c)=regex::Regex::new(pattern).unwrap().captures(raw){let name=crate::hidden::raw_percent_decode(&c[2]);let encoded: String=name.bytes().map(|b|if b.is_ascii_alphanumeric()||b"-_.~".contains(&b){(b as char).to_string()}else{format!("%{b:02X}")}).collect();let ap=if pattern.contains("/ap/"){"/ap"}else{""};return Some(format!("{}{ap}/users/{encoded}",&c[1]));}
+        if let Some(c)=cached_re(pattern).captures(raw){let name=crate::hidden::raw_percent_decode(&c[2]);let encoded: String=name.bytes().map(|b|if b.is_ascii_alphanumeric()||b"-_.~".contains(&b){(b as char).to_string()}else{format!("%{b:02X}")}).collect();let ap=if pattern.contains("/ap/"){"/ap"}else{""};return Some(format!("{}{ap}/users/{encoded}",&c[1]));}
     }None
 }
 fn quote_url(raw:&Value)->Option<String>{
@@ -800,6 +808,10 @@ pub(crate) use post_media::PostMediaWarmEffects;
 #[path="profile_materialize_surface.rs"]
 mod surface;
 pub(crate) use surface::{CanonicalProjection,project_library_search_source};
+
+#[path="profile_materialize_search.rs"]
+mod search;
+pub(crate) use search::{SearchHit,SearchProjector,post_media_resolve};
 
 #[path="profile_materialize_entities.rs"]
 mod entities;

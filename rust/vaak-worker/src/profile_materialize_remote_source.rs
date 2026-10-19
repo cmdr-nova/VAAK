@@ -32,7 +32,7 @@ impl SelectedRemoteApPage{
 fn remote_parts(actor:&str)->Result<(String,String)>{
     // PHP parse_url preserves raw host case and path spelling; URL parsers
     // which lowercase hosts would change gateway path equality and LIKE keys.
-    let expression=regex::Regex::new(r"^[A-Za-z][A-Za-z0-9+.-]*://(?:[^/?#]*@)?(\[[^\]]+\]|[^:/?#]+)(?::[^/?#]*)?([^?#]*)").unwrap();
+    let expression=re!(r"^[A-Za-z][A-Za-z0-9+.-]*://(?:[^/?#]*@)?(\[[^\]]+\]|[^:/?#]+)(?::[^/?#]*)?([^?#]*)");
     let captures=expression.captures(actor).context("PHP fallback: remote AP actor parse unsupported")?;
     Ok((captures[1].to_owned(),captures[2].trim_matches('/').to_owned()))
 }
@@ -96,7 +96,7 @@ async fn normalized_event(projector:&mut Projector<'_>,row:&Value)->Result<Optio
  if !matches!(s(row,"type").to_ascii_lowercase().as_str(),"create"|"update"){return Ok(None)}
  let actor=s(row,"actor_id").trim_end_matches('/');let object=s(row,"object_id").trim_end_matches('/');if actor.is_empty()||object.is_empty()||!object.starts_with("https://"){return Ok(None)}
  let raw=crate::library::card::php_trim(s(row,"summary"));let reason=if !raw.is_empty()&&!matches!(raw,"(media)"|"(attachment)"|"(poll)"|"(quote)"|"(boost)"){"half_parsed"}else{"empty_shell"};
- let mut text=if raw.contains('<'){crate::library::body::html_to_plain(raw)}else{raw.to_owned()};text=regex::Regex::new(r"\s+").unwrap().replace_all(&text," ").chars().take(2000).collect();if matches!(text.as_str(),"(attachment)"|"(media)"|"(poll)"|"(quote)"|"(boost)"){text.clear()}
+ let mut text=if raw.contains('<'){crate::library::body::html_to_plain(raw)}else{raw.to_owned()};text=re!(r"\s+").replace_all(&text," ").chars().take(2000).collect();if matches!(text.as_str(),"(attachment)"|"(media)"|"(poll)"|"(quote)"|"(boost)"){text.clear()}
  let account=projector.remote_account(actor).await?;let created=crate::library::card::php_trim(s(row,"created_at"));if created.is_empty(){bail!("PHP fallback: remote degraded event current clock required")}
  let mut status=json!({"id":snowflake(&format_time(created)?,i(row,"id"),1)?,"uri":object,"url":object,"content":if text.is_empty(){String::new()}else{format!("<p>{}</p>",crate::library::actions::esc(&text))},"created_at":created,"sensitive":truth(&row["sensitive"]),"spoiler_text":s(row,"spoiler_text"),"visibility":row.get("visibility").and_then(Value::as_str).unwrap_or("public"),"account":account,"media_attachments":[],"reblog":null,"quote":null,"vaak_degraded":true,"vaak_degraded_reason":reason});
  let reply=s(row,"in_reply_to").trim_end_matches('/');if reply.starts_with("https://"){status["vaak_in_reply_to_url"]=json!(reply)}Ok(Some(status))

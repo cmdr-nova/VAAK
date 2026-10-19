@@ -74,9 +74,17 @@ impl ComponentsGrant {
 }
 
 async fn current_tags(db:&Client,owner:i64,actor:&str,key:&str,descriptor:&ComponentCollectorDescriptor)->Result<Vec<(String,bool)>> {
+ let names=ordered_tag_names(db,owner,actor,key,&descriptor.query).await?.into_iter().skip(descriptor.offset).take(descriptor.limit).collect::<Vec<_>>();
+ let shape=crate::search_context::selection::final_facts::followed_tag_shape(db).await?;
+ let followed=if crate::search_context::selection::final_facts::tag_shape_supported(&shape){db.query("SELECT name FROM masto_followed_tags WHERE owner_user_id=$1::bigint AND name=ANY($2::text[])",&[&owner,&names]).await?.into_iter().map(|r|r.get::<_,String>(0)).collect::<std::collections::HashSet<_>>()}else{std::collections::HashSet::new()};
+ Ok(names.into_iter().map(|name|{let follow=followed.contains(&name);(name,follow)}).collect())
+}
+
+/// ap_masto_search_hashtags($query, 80) names, in PHP's order.
+pub(crate) async fn ordered_tag_names(db:&Client,owner:i64,actor:&str,key:&str,raw_query:&str)->Result<Vec<String>> {
  static TAG:std::sync::OnceLock<regex::Regex>=std::sync::OnceLock::new();
  let tag=TAG.get_or_init(||regex::Regex::new(r"#([\p{L}\p{N}_]{1,100})").unwrap());
- let query=super::canonical_query::lowercase(super::trim(&descriptor.query).trim_start_matches('#'));
+ let query=super::canonical_query::lowercase(super::trim(raw_query).trim_start_matches('#'));
  let mut sources=Vec::new();let mut texts=Vec::new();
  for (outbox,sql,field,decode) in [
   (true,"SELECT to_jsonb(q) FROM (SELECT id,content,visibility FROM outbox_notes ORDER BY published DESC LIMIT 400) q","content",false),
@@ -95,13 +103,13 @@ async fn current_tags(db:&Client,owner:i64,actor:&str,key:&str,descriptor:&Compo
  let allowed=crate::search_context::current_tag_contributions(db,owner,actor,key,&sources).await?;
  let mut counts:HashMap<String,(usize,usize)>=HashMap::new();let mut sequence=0;
  for (text,allowed) in texts.iter().zip(allowed){if !allowed{continue}for m in tag.captures_iter(text){let name=super::canonical_query::lowercase(&m[1]);let entry=counts.entry(name).or_insert_with(||{let order=sequence;sequence+=1;(0,order)});entry.0+=1;}}
- let mut ordered=counts.into_iter().filter(|(name,_)|query.is_empty()||name.contains(&query)).collect::<Vec<_>>();
+ // PHP turns a decimal tag such as 2024 into an integer array key, and the
+ // is_string filter on a non-empty query then drops it.
+ let int_key=|name:&str|(name=="0"||(name.starts_with(|c:char|('1'..='9').contains(&c))&&name.bytes().all(|b|b.is_ascii_digit())))&&name.parse::<i64>().is_ok();
+ let mut ordered=counts.into_iter().filter(|(name,_)|query.is_empty()||(name.contains(&query)&&!int_key(name))).collect::<Vec<_>>();
  ordered.sort_by(|a,b|b.1.0.cmp(&a.1.0).then(a.1.1.cmp(&b.1.1)));
  static CHAR:std::sync::OnceLock<regex::Regex>=std::sync::OnceLock::new();let valid=CHAR.get_or_init(||regex::Regex::new(r"^[\p{L}\p{N}_]$").unwrap());
- let names=ordered.into_iter().take(80).skip(descriptor.offset).take(descriptor.limit).map(|(name,_)|name.chars().filter(|c|valid.is_match(&c.to_string())).take(100).collect::<String>()).collect::<Vec<_>>();
- let shape=crate::search_context::selection::final_facts::followed_tag_shape(db).await?;
- let followed=if crate::search_context::selection::final_facts::tag_shape_supported(&shape){db.query("SELECT name FROM masto_followed_tags WHERE owner_user_id=$1::bigint AND name=ANY($2::text[])",&[&owner,&names]).await?.into_iter().map(|r|r.get::<_,String>(0)).collect::<std::collections::HashSet<_>>()}else{std::collections::HashSet::new()};
- Ok(names.into_iter().map(|name|{let follow=followed.contains(&name);(name,follow)}).collect())
+ Ok(ordered.into_iter().take(80).map(|(name,_)|name.chars().filter(|c|valid.is_match(&c.to_string())).take(100).collect::<String>()).collect())
 }
 
 #[cfg(test)]

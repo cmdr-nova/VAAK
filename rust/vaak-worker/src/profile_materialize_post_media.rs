@@ -23,6 +23,9 @@ async fn enqueue(db:&Client,cfg:&crate::config::Config,source_url:&str,transport
     effects.queued=true;grant.require_current(db).await?;effects.nudged=transport.media_process().await;grant.require_current(db).await?;Ok(effects)
 }
 
+/// Search-built post media: the same queue and nudge as profile cards.
+pub(super) async fn enqueue_search(db:&Client,cfg:&crate::config::Config,source_url:&str,transport:&dyn crate::profile_warm::WarmTransport,grant:&dyn crate::profile_enrichment::CurrentEnrichmentGrant)->Result<PostMediaWarmEffects>{enqueue(db,cfg,source_url,transport,grant).await}
+
 impl MaterializedProfilePage{
     pub(crate) async fn apply_source_post_media_warm(&self,db:&Client,effect:&DeferredProjectionEffect,status:&Value,grant:&crate::profile_context::AdmittedProjectionSources,cfg:&crate::config::Config,transport:&dyn crate::profile_warm::WarmTransport)->Result<PostMediaWarmEffects>{
         if !self.effects.contains(effect)||grant.disposition(effect.source_index,status)!=Some(true){bail!("PHP fallback: post-media effect differs from admitted native source")}

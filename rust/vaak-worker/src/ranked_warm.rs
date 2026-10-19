@@ -1747,7 +1747,7 @@ fn phrase_matches_text(text: &str, phrase: &str) -> bool {
     false
 }
 
-fn toxicity_categories(text: &str, admin_terms: &[(String, String)]) -> Vec<String> {
+pub(crate) fn toxicity_categories(text: &str, admin_terms: &[(String, String)]) -> Vec<String> {
     let lower = strip_tags_lower(text);
     if lower.trim().is_empty() {
         return Vec::new();
@@ -1781,7 +1781,7 @@ fn toxicity_categories(text: &str, admin_terms: &[(String, String)]) -> Vec<Stri
     matches
 }
 
-async fn load_downrank_terms(db: &Client) -> Result<Vec<(String, String)>> {
+pub(crate) async fn load_downrank_terms(db: &Client) -> Result<Vec<(String, String)>> {
     let rows = db
         .query(
             "SELECT phrase, category FROM ap_home_downrank_terms

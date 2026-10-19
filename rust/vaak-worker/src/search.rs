@@ -70,6 +70,9 @@ pub(crate) fn parity_postgres_match(value: &str) -> String { query::postgres_mat
 
 pub fn tag_match_query(tag: &str) -> Option<String> { query::tag_match(tag) }
 
+/// PHP mb_strtolower, including final sigma.
+pub(crate) fn php_lowercase(value: &str) -> String { query::lowercase(value) }
+
 fn postgres_tsquery(value: &str) -> String { query::postgres_match(value) }
 
 /// Canonical ranked source slice only. It does not serialize or admit a status
