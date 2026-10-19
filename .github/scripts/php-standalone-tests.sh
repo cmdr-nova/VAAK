@@ -53,6 +53,7 @@ php_tests=(
   api/bin/bsky-notif-subject-backfill-smoke.php
   api/bin/remote-poll-smoke.php
   api/bin/bsky-jetstream-media-smoke.php
+  api/bin/jetstream-worker-smoke.php
   api/bin/media-warm-lock-smoke.php
   api/bin/media-magick-coder-smoke.php
   api/bin/net-guard-smoke.php
