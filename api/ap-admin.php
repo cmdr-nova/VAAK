@@ -19,6 +19,8 @@ if (!$vaakAdminLibOnly) {
     }
     header('Cache-Control: no-store');
     header('X-Robots-Tag: noindex, nofollow');
+    require_once __DIR__ . '/ap-csp.php';
+    ap_csp_send_headers('app');
     $vaakCorrelationId = trim((string) ($_SERVER['HTTP_X_REQUEST_ID'] ?? ''));
     if ($vaakCorrelationId === '' || !preg_match('/^[A-Za-z0-9._:-]{8,96}$/', $vaakCorrelationId)) {
         $vaakCorrelationId = bin2hex(random_bytes(8));
@@ -1285,10 +1287,15 @@ $vaakAdminOnlyActions = [
             if ($voter === '') {
                 $error = 'Not signed in.';
             } else {
-                $vres = ap_masto_poll_vote($pollId, $voter, $choices);
+                $remoteVote = ap_remote_poll_row_id($pollId) > 0;
+                $vres = $remoteVote
+                    ? ap_remote_poll_vote($pollId, $voter, $choices)
+                    : ap_masto_poll_vote($pollId, $voter, $choices);
                 if (!empty($vres['ok'])) {
                     $notice = 'Vote recorded.';
-                    if ($noteIdForPoll === '') {
+                    if ($remoteVote) {
+                        $noteIdForPoll = (string) ($vres['note_id'] ?? $noteIdForPoll);
+                    } elseif ($noteIdForPoll === '') {
                         try {
                             $pst = ap_db()->prepare('SELECT note_id FROM masto_polls WHERE local_id = ?');
                             $pst->execute([$pollId]);
@@ -16122,6 +16129,7 @@ function admin_poll_block_html(string $noteId, bool $interactive = true, string 
     $votesCount = 0;
     $votersCount = 0;
     $voted = false;
+    $ownVotes = [];
     $pollLocalId = 0;
     try {
         $st = ap_db()->prepare('SELECT * FROM masto_polls WHERE note_id = ? OR note_id = ? LIMIT 1');
@@ -16187,11 +16195,10 @@ function admin_poll_block_html(string $noteId, bool $interactive = true, string 
         }
     }
     if ((!is_array($choices) || $choices === []) && !str_starts_with($noteId, 'https://mkultra.monster/')) {
-        // Remote Question stored at inbox (display-only, no vote form).
+        // Remote Question stored at inbox. Votes go to the author through
+        // ap_remote_poll_vote; the form posts the remote public poll id.
         try {
-            $rst = ap_db()->prepare('SELECT * FROM remote_polls WHERE note_id = ? LIMIT 1');
-            $rst->execute([$noteId]);
-            $remotePoll = $rst->fetch();
+            $remotePoll = ap_remote_poll_find($noteId);
         } catch (Throwable $e) {
             $remotePoll = null;
         }
@@ -16202,12 +16209,11 @@ function admin_poll_block_html(string $noteId, bool $interactive = true, string 
             $votesCount = (int) ($remotePoll['votes_count'] ?? 0);
             $votersCount = (int) ($remotePoll['voters_count'] ?? 0);
             $expiresAt = (string) ($remotePoll['expires_at'] ?? '');
-            try {
-                $expired = !empty($remotePoll['closed'])
-                    || ($expiresAt !== '' && (new DateTimeImmutable($expiresAt)) <= new DateTimeImmutable('now'));
-            } catch (Throwable $e) {
-                $expired = !empty($remotePoll['closed']);
-            }
+            $expired = ap_remote_poll_is_expired($remotePoll);
+            $pollLocalId = ap_remote_poll_public_id((int) ($remotePoll['id'] ?? 0));
+            $mine = ap_remote_poll_own_votes($noteId, function_exists('vaak_actor_id') ? vaak_actor_id() : '');
+            $voted = $mine !== null;
+            $ownVotes = $mine ?? [];
         }
     }
     if (!is_array($choices) || $choices === []) {
@@ -16259,13 +16265,15 @@ function admin_poll_block_html(string $noteId, bool $interactive = true, string 
         $html .= '<button class="btn btn-ghost" type="submit" style="margin-top:.4rem;padding:.3rem .7rem;font-size:.82rem">Vote</button>'
             . '</form>';
     } else {
-        foreach ($opts as $opt) {
+        foreach ($opts as $i => $opt) {
             $pct = ($showResults && $votesCount > 0)
                 ? (int) round(($opt['votes'] / $votesCount) * 100)
                 : 0;
-            $html .= '<div class="poll-opt' . ($showResults ? ' poll-opt--result' : '') . '">'
+            $own = in_array($i, $ownVotes, true);
+            $html .= '<div class="poll-opt' . ($showResults ? ' poll-opt--result' : '') . ($own ? ' poll-opt--own' : '') . '">'
                 . '<div class="poll-opt-bar" style="width:' . $pct . '%"></div>'
-                . '<span class="poll-opt-text">' . h($opt['title']) . '</span>';
+                . '<span class="poll-opt-text">' . h($opt['title']) . '</span>'
+                . ($own ? '<span class="poll-opt-own" title="Your vote">✓</span>' : '');
             if ($showResults) {
                 $html .= '<span class="poll-opt-count">' . $pct . '% · ' . (int) $opt['votes'] . '</span>';
             }
@@ -27342,6 +27350,8 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       position: relative; z-index: 1; flex: 0 0 auto;
       font-size: .75rem; color: var(--primary);
     }
+    .poll-block .poll-opt--own { border-color: color-mix(in srgb, var(--primary) 55%, var(--border)); }
+    .poll-block .poll-opt-own { position: relative; z-index: 1; flex: 0 0 auto; color: var(--primary); font-size: .8rem; }
     .poll-block .poll-meta { margin-top: .4rem; font-size: .75rem; color: var(--muted); }
     .poll-block .poll-vote-form .btn {
       border-color: color-mix(in srgb, var(--primary) 40%, var(--border));

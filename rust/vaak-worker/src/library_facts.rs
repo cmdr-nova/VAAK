@@ -82,12 +82,25 @@ fn reply_seeds(status: &Value, owner_actor: &str, owner_key: &str) -> Vec<String
 }
 
 /// Remote Questions have no masto_polls row; inbox keeps them in remote_polls
-/// (created with the first one). No local_id, so poll_html shows results only.
-pub(crate) async fn remote_poll_row(db: &Client, note: &str) -> Result<Option<Value>> {
+/// (created with the first one). poll_html reads the masto_polls shape, so
+/// the row gains `local_id` (the offset remote poll id PHP's poll_vote takes),
+/// and the owner's ballot as `voters_json` plus `own_votes`.
+pub(crate) async fn remote_poll_row(db: &Client, note: &str, owner_actor: &str) -> Result<Option<Value>> {
     let exists = db.query_one("SELECT to_regclass('public.remote_polls') IS NOT NULL", &[]).await?.get::<_, bool>(0);
     if !exists { return Ok(None); }
     let note = note.trim_end_matches('/');
-    Ok(db.query_opt("SELECT to_jsonb(p) FROM remote_polls p WHERE rtrim(note_id,'/')=$1 LIMIT 1", &[&note]).await?.map(|r| r.get(0)))
+    let Some(mut row) = db.query_opt("SELECT to_jsonb(p) FROM remote_polls p WHERE rtrim(note_id,'/')=$1 LIMIT 1", &[&note]).await?.map(|r| r.get::<_, Value>(0)) else { return Ok(None) };
+    let id = row.get("id").and_then(Value::as_i64).unwrap_or(0);
+    row["local_id"] = serde_json::json!(if id > 0 { vaak_types::REMOTE_POLL_ID_BASE + id } else { 0 });
+    let owner = owner_actor.trim_end_matches('/');
+    let votes_table = db.query_one("SELECT to_regclass('public.remote_poll_votes') IS NOT NULL", &[]).await?.get::<_, bool>(0);
+    if votes_table && !owner.is_empty() {
+        if let Some(r) = db.query_opt("SELECT choices_json FROM remote_poll_votes WHERE note_id=$1 AND voter_actor=$2 LIMIT 1", &[&note, &owner]).await? {
+            row["voters_json"] = serde_json::json!(serde_json::json!([owner]).to_string());
+            row["own_votes"] = serde_json::from_str::<Value>(&r.get::<_, String>(0)).unwrap_or(Value::Null);
+        }
+    }
+    Ok(Some(row))
 }
 
 /// Match PHP's current trusted directory plus additive DB overrides. Missing
@@ -287,7 +300,7 @@ pub(crate) async fn resolve(db: &Client, owner_id: i64, owner_actor: &str, statu
     }
     moderation.is_wafrn = wafrn_host_known(db,actor).await?;
     let mut poll_row: Option<Value> = db.query_opt("SELECT to_jsonb(p) FROM masto_polls p WHERE rtrim(note_id,'/')=$1 LIMIT 1", &[&uri]).await?.map(|r| r.get(0));
-    if poll_row.is_none() { poll_row = remote_poll_row(db, uri).await?; }
+    if poll_row.is_none() { poll_row = remote_poll_row(db, uri, owner_actor).await?; }
     let local_ask=db.query_opt("SELECT to_jsonb(a) FROM ap_asks a WHERE rtrim(answer_note_id,'/')=$1 ORDER BY id DESC LIMIT 1", &[&uri]).await?.map(|r|r.get::<_,Value>(0));
     let ask_row=if let Some(mut ask)=local_ask {
         // ap_asks has no answer column. A local answer is the current stored

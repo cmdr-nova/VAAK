@@ -5125,13 +5125,35 @@ pub async fn attach_polls(db: &Client, statuses: &mut [Value], viewer_actor: &st
         );
     }
     // Remote Questions have no masto_polls row; inbox stores their options in
-    // remote_polls. Display-only (id 0): the painter shows results, no vote form.
+    // remote_polls. The id is offset into its own range so PHP's poll_vote
+    // sends the ballot to the author; rows from before remote voting have no
+    // id yet and stay display-only (id 0).
     let remote_keys: Vec<String> = keys
         .iter()
         .filter(|k| !polls.contains_key(k.trim_end_matches('/')))
         .cloned()
         .collect();
     if !remote_keys.is_empty() {
+        // The viewer's own ballots. PHP creates the table with remote_polls;
+        // until then the query errors and nobody has voted.
+        let mut own: HashMap<String, Vec<i64>> = HashMap::new();
+        let viewer = viewer_actor.trim().trim_end_matches('/').to_string();
+        if !viewer.is_empty() {
+            if let Ok(rows) = db
+                .query(
+                    "SELECT rtrim(note_id, '/'), choices_json FROM remote_poll_votes
+                     WHERE voter_actor = $1 AND note_id = ANY($2)",
+                    &[&viewer, &remote_keys],
+                )
+                .await
+            {
+                for row in rows {
+                    let note_id: String = row.try_get(0).unwrap_or_default();
+                    let choices: String = row.try_get(1).unwrap_or_default();
+                    own.insert(note_id, serde_json::from_str::<Vec<i64>>(&choices).unwrap_or_default());
+                }
+            }
+        }
         // The table appears with the first stored remote poll.
         if let Ok(rows) = db
             .query(
@@ -5141,8 +5163,9 @@ pub async fn attach_polls(db: &Client, statuses: &mut [Value], viewer_actor: &st
                         COALESCE(closed, 0)::text,
                         COALESCE(options_json, '[]'),
                         COALESCE(votes_count, 0)::bigint,
-                        COALESCE(voters_count, 0)::bigint
-                 FROM remote_polls
+                        COALESCE(voters_count, 0)::bigint,
+                        COALESCE(to_jsonb(p)->>'id', '0')
+                 FROM remote_polls p
                  WHERE note_id = ANY($1)",
                 &[&remote_keys],
             )
@@ -5163,15 +5186,18 @@ pub async fn attach_polls(db: &Client, statuses: &mut [Value], viewer_actor: &st
                 let expires_at: String = row.try_get(2).unwrap_or_default();
                 let (ended, expires_label) = poll_expires_label(&expires_at);
                 let options_json: String = row.try_get(4).unwrap_or_else(|_| "[]".into());
+                let row_id: i64 = row.try_get::<_, String>(7).unwrap_or_default().parse().unwrap_or(0);
+                let mine = own.get(&note_id);
                 polls.insert(
-                    note_id,
+                    note_id.clone(),
                     json!({
-                        "id": "0",
+                        "id": if row_id > 0 { (vaak_types::REMOTE_POLL_ID_BASE + row_id).to_string() } else { "0".to_string() },
                         "expired": ended || flag(3),
                         "multiple": flag(1),
                         "votes_count": row.try_get::<_, i64>(5).unwrap_or(0),
                         "voters_count": row.try_get::<_, i64>(6).unwrap_or(0),
-                        "voted": false,
+                        "voted": mine.is_some(),
+                        "own_votes": mine.cloned().unwrap_or_default(),
                         "expires_label": expires_label,
                         "options": serde_json::from_str::<Value>(&options_json).unwrap_or(Value::Null),
                     }),

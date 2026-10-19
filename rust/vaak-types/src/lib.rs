@@ -12,4 +12,4 @@ pub use status::{
 
 mod timeline;
 
-pub use timeline::{check_value as check_timeline_status, MediaAttachment, Poll, PollOption, PreviewCard, Quote, TimelineStatus};
+pub use timeline::{check_value as check_timeline_status, MediaAttachment, Poll, PollOption, PreviewCard, Quote, TimelineStatus, REMOTE_POLL_ID_BASE};

@@ -17984,7 +17984,10 @@ function ap_search_current_accounts(array $accounts, int $ownerUserId, ?array $s
 /**
  * Poll state for remote Questions (Mastodon, Misskey, …). masto_polls only
  * holds polls VAAK published, so remote polls had nothing for timelines to
- * paint. Rows are display-only: options with counts, end time, voter count.
+ * paint. Rows carry options with counts, end time and voter count; `id` is a
+ * numeric handle for vote forms and the Mastodon API, `actor_id` the author
+ * whose inbox receives our votes. remote_poll_votes holds each local
+ * account's own choices (one row per account per poll).
  */
 function ap_remote_polls_migrate(): void
 {
@@ -17993,26 +17996,90 @@ function ap_remote_polls_migrate(): void
         return;
     }
     $done = true;
+    $db = ap_db();
+    $pg = ap_db_driver($db) === 'pgsql';
     try {
-        ap_db()->exec('CREATE TABLE IF NOT EXISTS remote_polls (
-            note_id TEXT PRIMARY KEY,
-            multiple INTEGER NOT NULL DEFAULT 0,
-            expires_at TEXT,
-            closed INTEGER NOT NULL DEFAULT 0,
-            options_json TEXT NOT NULL,
-            votes_count BIGINT NOT NULL DEFAULT 0,
-            voters_count BIGINT NOT NULL DEFAULT 0,
-            updated_at TEXT NOT NULL
-        )');
+        $cols = [];
+        $rows = $pg
+            ? $db->query("SELECT column_name AS name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'remote_polls'")->fetchAll()
+            : $db->query('PRAGMA table_info(remote_polls)')->fetchAll();
+        foreach ($rows as $row) {
+            $cols[(string) ($row['name'] ?? '')] = true;
+        }
+        if ($cols === []) {
+            $db->exec('CREATE TABLE IF NOT EXISTS remote_polls (
+                note_id TEXT PRIMARY KEY,
+                multiple INTEGER NOT NULL DEFAULT 0,
+                expires_at TEXT,
+                closed INTEGER NOT NULL DEFAULT 0,
+                options_json TEXT NOT NULL,
+                votes_count BIGINT NOT NULL DEFAULT 0,
+                voters_count BIGINT NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL,
+                actor_id TEXT,
+                id ' . ($pg ? 'BIGSERIAL' : 'INTEGER') . '
+            )');
+            $db->exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_remote_polls_id ON remote_polls (id)');
+        } else {
+            // Tables from before voting: ALTER only when a column is missing so
+            // the hot path never takes the ALTER lock.
+            if (!isset($cols['actor_id'])) {
+                $db->exec('ALTER TABLE remote_polls ADD COLUMN actor_id TEXT');
+            }
+            if (!isset($cols['id'])) {
+                // PostgreSQL numbers existing rows from the new sequence;
+                // SQLite copies rowid in ap_remote_poll_store.
+                $db->exec('ALTER TABLE remote_polls ADD COLUMN id ' . ($pg ? 'BIGSERIAL' : 'INTEGER'));
+                if (!$pg) {
+                    $db->exec('UPDATE remote_polls SET id = rowid WHERE id IS NULL');
+                }
+                $db->exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_remote_polls_id ON remote_polls (id)');
+            }
+        }
     } catch (Throwable $e) {
         error_log('[ap-db] remote_polls migrate: ' . $e->getMessage());
     }
+    try {
+        $db->exec('CREATE TABLE IF NOT EXISTS remote_poll_votes (
+            note_id TEXT NOT NULL,
+            voter_actor TEXT NOT NULL,
+            choices_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (note_id, voter_actor)
+        )');
+    } catch (Throwable $e) {
+        error_log('[ap-db] remote_poll_votes migrate: ' . $e->getMessage());
+    }
+}
+
+/**
+ * Remote polls share the Mastodon poll id space with masto_polls.local_id;
+ * this offset keeps them apart and stays below 2^53 for JS clients.
+ */
+function ap_remote_poll_id_base(): int
+{
+    return 900000000000;
+}
+
+/** Public poll id for a remote_polls row id, or 0 when the row has none yet. */
+function ap_remote_poll_public_id(int $rowId): int
+{
+    return $rowId > 0 ? ap_remote_poll_id_base() + $rowId : 0;
+}
+
+/** remote_polls row id for a public poll id, or 0 when it is a local poll id. */
+function ap_remote_poll_row_id(int $publicId): int
+{
+    return $publicId > ap_remote_poll_id_base() ? $publicId - ap_remote_poll_id_base() : 0;
 }
 
 /**
  * Normalized poll from an AS2 Question, or null when the doc has no choices.
  *
- * @return array{note_id:string,multiple:bool,expires_at:string,closed:bool,options:list<array{title:string,votes_count:int}>,votes_count:int,voters_count:int}|null
+ * `actor_id` is the author only when it lives on the note's host: a third
+ * party's Question copy must not steer our votes to its own inbox.
+ *
+ * @return array{note_id:string,actor_id:string,multiple:bool,expires_at:string,closed:bool,options:list<array{title:string,votes_count:int}>,votes_count:int,voters_count:int}|null
  */
 function ap_remote_poll_from_doc(mixed $doc): ?array
 {
@@ -18059,8 +18126,14 @@ function ap_remote_poll_from_doc(mixed $doc): ?array
             // try the next field
         }
     }
+    $actorId = rtrim(trim((string) (ap_as_id($doc['attributedTo'] ?? null) ?? '')), '/');
+    if (!str_starts_with($actorId, 'https://')
+        || strtolower((string) parse_url($actorId, PHP_URL_HOST)) !== strtolower((string) parse_url($noteId, PHP_URL_HOST))) {
+        $actorId = '';
+    }
     return [
         'note_id' => $noteId,
+        'actor_id' => $actorId,
         'multiple' => $multiple,
         'expires_at' => $expiresAt,
         'closed' => $closedAt !== '' || ($doc['closed'] ?? null) === true,
@@ -18080,12 +18153,13 @@ function ap_remote_poll_store(mixed $doc): bool
     ap_remote_polls_migrate();
     try {
         ap_db()->prepare(
-            'INSERT INTO remote_polls (note_id, multiple, expires_at, closed, options_json, votes_count, voters_count, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            'INSERT INTO remote_polls (note_id, multiple, expires_at, closed, options_json, votes_count, voters_count, updated_at, actor_id)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT (note_id) DO UPDATE SET
                multiple = excluded.multiple, expires_at = excluded.expires_at, closed = excluded.closed,
                options_json = excluded.options_json, votes_count = excluded.votes_count,
-               voters_count = excluded.voters_count, updated_at = excluded.updated_at'
+               voters_count = excluded.voters_count, updated_at = excluded.updated_at,
+               actor_id = COALESCE(excluded.actor_id, remote_polls.actor_id)'
         )->execute([
             $poll['note_id'],
             $poll['multiple'] ? 1 : 0,
@@ -18095,10 +18169,207 @@ function ap_remote_poll_store(mixed $doc): bool
             $poll['votes_count'],
             $poll['voters_count'],
             gmdate('Y-m-d\TH:i:s\Z'),
+            $poll['actor_id'] !== '' ? $poll['actor_id'] : null,
         ]);
+        if (ap_db_driver() !== 'pgsql') {
+            ap_db()->prepare('UPDATE remote_polls SET id = rowid WHERE note_id = ? AND id IS NULL')->execute([$poll['note_id']]);
+        }
         return true;
     } catch (Throwable $e) {
         error_log('[ap-db] remote poll store: ' . $e->getMessage());
         return false;
     }
+}
+
+/**
+ * remote_polls row by public poll id (int) or note id (string), or null.
+ *
+ * @return array<string,mixed>|null
+ */
+function ap_remote_poll_find(int|string $ref): ?array
+{
+    ap_remote_polls_migrate();
+    try {
+        if (is_int($ref)) {
+            $rowId = ap_remote_poll_row_id($ref);
+            if ($rowId < 1) {
+                return null;
+            }
+            $st = ap_db()->prepare('SELECT * FROM remote_polls WHERE id = ? LIMIT 1');
+            $st->execute([$rowId]);
+        } else {
+            $st = ap_db()->prepare('SELECT * FROM remote_polls WHERE note_id = ? LIMIT 1');
+            $st->execute([rtrim(trim($ref), '/')]);
+        }
+        $row = $st->fetch();
+        return is_array($row) ? $row : null;
+    } catch (Throwable $e) {
+        return null;
+    }
+}
+
+/**
+ * The voter's stored choice indexes for a remote poll, or null when they
+ * have not voted.
+ *
+ * @return list<int>|null
+ */
+function ap_remote_poll_own_votes(string $noteId, string $voterActor): ?array
+{
+    $voterActor = rtrim(trim($voterActor), '/');
+    if ($voterActor === '') {
+        return null;
+    }
+    ap_remote_polls_migrate();
+    try {
+        $st = ap_db()->prepare('SELECT choices_json FROM remote_poll_votes WHERE note_id = ? AND voter_actor = ? LIMIT 1');
+        $st->execute([rtrim(trim($noteId), '/'), $voterActor]);
+        $raw = $st->fetchColumn();
+    } catch (Throwable $e) {
+        return null;
+    }
+    if (!is_string($raw)) {
+        return null;
+    }
+    $choices = json_decode($raw, true);
+    return is_array($choices) ? array_values(array_map('intval', $choices)) : [];
+}
+
+/** True when the poll no longer takes votes (closed flag or past end time). */
+function ap_remote_poll_is_expired(array $row): bool
+{
+    if (!empty($row['closed'])) {
+        return true;
+    }
+    $expiresAt = trim((string) ($row['expires_at'] ?? ''));
+    if ($expiresAt === '') {
+        return false;
+    }
+    try {
+        return (new DateTimeImmutable($expiresAt)) <= new DateTimeImmutable('now');
+    } catch (Throwable $e) {
+        return false;
+    }
+}
+
+/**
+ * Validate a ballot against a remote poll row. Choices are option indexes
+ * (ints or digit strings) or exact option titles, as the local vote path
+ * accepts. A single-choice poll takes exactly one option.
+ *
+ * @param list<int|string> $choices
+ * @return array{ok:true,indexes:list<int>}|array{ok:false,error:string}
+ */
+function ap_remote_poll_ballot(array $row, array $choices): array
+{
+    if (ap_remote_poll_is_expired($row)) {
+        return ['ok' => false, 'error' => 'Poll expired'];
+    }
+    $options = json_decode((string) ($row['options_json'] ?? '[]'), true);
+    if (!is_array($options) || $options === []) {
+        return ['ok' => false, 'error' => 'Invalid poll'];
+    }
+    $indexes = [];
+    foreach ($choices as $c) {
+        if (is_int($c) || (is_string($c) && ctype_digit($c))) {
+            $i = (int) $c;
+            if ($i < 0 || $i >= count($options)) {
+                return ['ok' => false, 'error' => 'No valid choices'];
+            }
+            $indexes[] = $i;
+        } elseif (is_string($c)) {
+            foreach ($options as $i => $opt) {
+                if (is_array($opt) && ($opt['title'] ?? '') === $c) {
+                    $indexes[] = (int) $i;
+                }
+            }
+        }
+    }
+    $indexes = array_values(array_unique($indexes));
+    sort($indexes);
+    if ($indexes === []) {
+        return ['ok' => false, 'error' => 'No valid choices'];
+    }
+    if (empty($row['multiple']) && count($indexes) > 1) {
+        return ['ok' => false, 'error' => 'This poll allows only one choice'];
+    }
+    return ['ok' => true, 'indexes' => $indexes];
+}
+
+/**
+ * Mastodon-style vote activities: one Create per chosen option, each wrapping
+ * a Note whose `name` is the option title and whose `inReplyTo` is the poll.
+ * Addressed to the poll author only. Ids are fragments of the voter's actor
+ * URL (as Mastodon does) so they never collide with real notes and nothing
+ * routes them into an outbox, profile or timeline.
+ *
+ * @param list<string> $titles
+ * @return list<array<string,mixed>>
+ */
+function ap_remote_poll_vote_activities(string $voterActor, string $authorActor, string $noteId, array $titles): array
+{
+    $out = [];
+    $published = gmdate('Y-m-d\TH:i:s\Z');
+    foreach ($titles as $title) {
+        $voteId = $voterActor . '#votes/' . bin2hex(random_bytes(8));
+        $out[] = [
+            '@context' => 'https://www.w3.org/ns/activitystreams',
+            'id' => $voteId . '/activity',
+            'type' => 'Create',
+            'actor' => $voterActor,
+            'published' => $published,
+            'to' => [$authorActor],
+            'object' => [
+                'id' => $voteId,
+                'type' => 'Note',
+                'name' => $title,
+                'attributedTo' => $voterActor,
+                'to' => [$authorActor],
+                'inReplyTo' => $noteId,
+            ],
+        ];
+    }
+    return $out;
+}
+
+/**
+ * Record the voter's ballot and bump the stored counts so the card shows the
+ * vote at once; the author's next Update replaces them with real totals.
+ * False when this account already voted (primary key).
+ *
+ * @param list<int> $indexes
+ */
+function ap_remote_poll_record_vote(array $row, string $voterActor, array $indexes): bool
+{
+    $noteId = rtrim((string) ($row['note_id'] ?? ''), '/');
+    $st = ap_db()->prepare(
+        'INSERT INTO remote_poll_votes (note_id, voter_actor, choices_json, created_at)
+         VALUES (?, ?, ?, ?) ON CONFLICT (note_id, voter_actor) DO NOTHING'
+    );
+    $st->execute([$noteId, rtrim($voterActor, '/'), json_encode(array_values($indexes)), gmdate('Y-m-d\TH:i:s\Z')]);
+    if ($st->rowCount() < 1) {
+        return false;
+    }
+    $options = json_decode((string) ($row['options_json'] ?? '[]'), true);
+    if (is_array($options)) {
+        foreach ($indexes as $i) {
+            if (isset($options[$i]) && is_array($options[$i])) {
+                $options[$i]['votes_count'] = (int) ($options[$i]['votes_count'] ?? 0) + 1;
+            }
+        }
+        ap_db()->prepare(
+            'UPDATE remote_polls SET options_json = ?, votes_count = votes_count + ?, voters_count = voters_count + 1 WHERE note_id = ?'
+        )->execute([json_encode($options, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES), count($indexes), $noteId]);
+    }
+    return true;
+}
+
+/** Undo ap_remote_poll_record_vote when the vote could not be queued. */
+function ap_remote_poll_forget_vote(array $row, string $voterActor): void
+{
+    $noteId = rtrim((string) ($row['note_id'] ?? ''), '/');
+    ap_db()->prepare('DELETE FROM remote_poll_votes WHERE note_id = ? AND voter_actor = ?')->execute([$noteId, rtrim($voterActor, '/')]);
+    ap_db()->prepare(
+        'UPDATE remote_polls SET options_json = ?, votes_count = ?, voters_count = ? WHERE note_id = ?'
+    )->execute([(string) ($row['options_json'] ?? '[]'), (int) ($row['votes_count'] ?? 0), (int) ($row['voters_count'] ?? 0), $noteId]);
 }
