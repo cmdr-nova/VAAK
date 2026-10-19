@@ -47,7 +47,9 @@ async fn admin(db:&tokio_postgres::Client,owner:i64)->Result<()> {
 fn empty(s:&str)->bool{s.is_empty()||s=="0"}
 fn relative(s:&str,now:i64)->Result<String>{
  if s.is_empty(){return Ok(String::new());}
- let timestamp=chrono::DateTime::parse_from_rfc3339(s).map(|v|v.timestamp()).or_else(|_|chrono::NaiveDateTime::parse_from_str(s,"%Y-%m-%d %H:%M:%S").map(|v|v.and_utc().timestamp()));
+ let timestamp=chrono::DateTime::parse_from_rfc3339(s).map(|v|v.timestamp()).or_else(|_|chrono::NaiveDateTime::parse_from_str(s,"%Y-%m-%d %H:%M:%S").map(|v|v.and_utc().timestamp()))
+  // Postgres timestamptz text, e.g. "2026-10-19 12:00:00.123456+00"; strtotime drops the fraction.
+  .or_else(|_|chrono::DateTime::parse_from_str(s,"%Y-%m-%d %H:%M:%S%.f%#z").map(|v|v.timestamp()));
  let t=match timestamp{Ok(t)=>t,Err(_)=>bail!("unproven PHP date format")};
  let d=now.checked_sub(t).ok_or_else(||anyhow::anyhow!("date range"))?;
  Ok(if d<60{format!("{d}s")}else if d<3600{format!("{}m",d/60)}else if d<86400{format!("{}h",d/3600)}else{format!("{}d",d/86400)})
@@ -105,6 +107,13 @@ async fn paint(cfg:&crate::config::Config,r:&Request)->Result<Value>{
   }
  };
  role(&db,r).await?;
+ // ap_remote_actor_label queues the same warm for an uncached or placeholder actor.
+ // Queued together so ten misses cost one 80 ms Redis budget, not ten.
+ if let Collected::Blocks(rows)=&collected{
+  let mut warms=tokio::task::JoinSet::new();
+  for actor in rows.iter().filter_map(|row|row.warm.clone()){let cfg=cfg.clone();warms.spawn(async move{crate::profile_warm::actor_warm(&cfg,&actor,&crate::profile_warm::ProcessWarmTransport::configured()).await;});}
+  while warms.join_next().await.is_some(){}
+ }
  db.batch_execute("COMMIT").await?;role(&db,r).await?;
  // The final painter is synchronous: no I/O follows the final fresh role admission.
  let (html,count,rows)=match collected{
@@ -144,6 +153,7 @@ mod settings_lists;
  #[test]fn policies_envelope_has_no_selectors(){let good=json!({"protocol_version":1,"owner_id":1,"csrf":"session","view":"policies","mode":"full","offset":0,"approvals_enabled":false,"now":100,"php_timezone":"UTC"});assert!(decode(&serde_json::to_vec(&good).unwrap()).is_ok());for(k,v)in[("offset",json!(1)),("search",json!(""))]{let mut bad=good.clone();bad[k]=v;assert!(decode(&serde_json::to_vec(&bad).unwrap()).is_err());}}
  #[test]fn settings_lists_envelope_needs_viewer_role(){let good=json!({"protocol_version":1,"owner_id":2,"csrf":"session","view":"settings_lists","mode":"full","offset":0,"approvals_enabled":false,"now":100,"php_timezone":"UTC","viewer_admin":false});assert!(decode(&serde_json::to_vec(&good).unwrap()).is_ok());for(k,v)in[("offset",json!(1)),("search",json!("")),("viewer_admin",Value::Null)]{let mut bad=good.clone();bad[k]=v;assert!(decode(&serde_json::to_vec(&bad).unwrap()).is_err());}let mut admin_view=good.clone();admin_view["view"]=json!("blocks");assert!(decode(&serde_json::to_vec(&admin_view).unwrap()).is_err());}
  #[test]fn personal_row_models_are_closed(){assert!(serde_json::from_value::<settings_lists::UserBlock>(json!({"id":1,"scope":"actor","value":"x","kind":"block","reason":null,"created_at":"a","owner_user_id":2})).is_err());assert!(serde_json::from_value::<settings_lists::MutedWord>(json!({"id":1,"phrase":"x","created_at":"a","note":null,"owner_user_id":2})).is_err());}
+ #[test]fn relative_accepts_postgres_timestamptz_text(){for(s,want)in[("2026-10-19 12:00:00.123456+00","10s"),("2026-10-19 12:00:00+00","10s"),("2026-10-19 14:00:00.5+02","10s"),("2026-10-19 12:00:00.999999+00:00","10s")]{assert_eq!(relative(s,chrono::DateTime::parse_from_rfc3339("2026-10-19T12:00:10Z").unwrap().timestamp()).unwrap(),want,"{s}");}assert!(relative("yesterday",0).is_err());}
  #[test]fn block_row_model_is_closed(){assert!(serde_json::from_value::<blocks::Block>(json!({"id":1,"scope":"domain","value":"x","kind":"block","reason":null,"created_at":"a","created_by":"admin"})).is_err());}
  #[test]fn relay_row_model_is_closed(){assert!(serde_json::from_value::<relays::Relay>(json!({"id":1,"inbox_url":"https://r/inbox","state":"idle","follow_activity_id":null,"created_at":"a","updated_at":"b","secret":"x"})).is_err());}
  #[test]fn no_application_hash_model(){assert!(serde_json::from_value::<Application>(json!({"id":1,"username":"x","email":null,"status":"pending","created_at":"now","decided_at":null,"password_hash":"forbidden"})).is_err());}
