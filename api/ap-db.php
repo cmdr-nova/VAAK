@@ -11222,7 +11222,7 @@ function ap_deprioritized_list(int $ownerUserId): array
     }
     try {
         $st = ap_db()->prepare(
-            'SELECT * FROM ap_deprioritized_actors WHERE owner_user_id = ? ORDER BY created_at DESC'
+            'SELECT * FROM ap_deprioritized_actors WHERE owner_user_id = ? ORDER BY created_at DESC, actor_id DESC'
         );
         $st->execute([$ownerUserId]);
         return $st->fetchAll() ?: [];
