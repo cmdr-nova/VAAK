@@ -12,7 +12,12 @@ function ap_home_recommendation_interacted_objects(int $owner, array $objects): 
         ? "$column #>> '{" . str_replace('.', ',', $path) . "}'"
         : "json_extract(NULLIF($column,''), '$.$path')";
     $doc = static fn(string $column): string => $pgsql ? "NULLIF($column,'')::jsonb" : "NULLIF($column,'')";
-    $noteDoc = $doc('o.raw_create_json');
+    // Only quote fields are read from the note document. Skip the parse for
+    // notes whose JSON never mentions "quote": it kept a jsonb copy of every
+    // own note in the CTE, which spilled to temp files on each call.
+    $noteDoc = $pgsql
+        ? "CASE WHEN strpos(o.raw_create_json,'quote')>0 THEN " . $doc('o.raw_create_json') . ' END'
+        : $doc('o.raw_create_json');
     $signalDoc = $doc('s.metadata_json');
     $quote = 'COALESCE(' . $json('n.doc', 'object.quote') . ',' . $json('n.doc', 'object.quoteUrl') . ',' . $json('n.doc', 'object._misskey_quote') . ", '')";
     $signalObject = $json('s.doc', 'object_id');

@@ -13,7 +13,11 @@ pub const INTERACTED_SQL: &str = r#"
 WITH candidates AS (SELECT unnest($2::text[]) AS object_id),
 viewer AS (SELECT id,actor_id FROM ap_users WHERE id=$1::bigint),
 own_notes AS MATERIALIZED (
- SELECT o.in_reply_to, NULLIF(o.raw_create_json,'')::jsonb AS doc FROM outbox_notes o, viewer v
+ SELECT o.in_reply_to,
+  -- Only quote fields are read from the document. A note whose JSON never
+  -- mentions "quote" has none, so skip the parse and keep the CTE small.
+  CASE WHEN strpos(o.raw_create_json,'quote')>0 THEN NULLIF(o.raw_create_json,'')::jsonb END AS doc
+ FROM outbox_notes o, viewer v
  WHERE substr(o.id,1,length(rtrim(v.actor_id,'/') || '/notes/'))=rtrim(v.actor_id,'/') || '/notes/'
 ),
 signals AS MATERIALIZED (
