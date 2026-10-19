@@ -17437,16 +17437,13 @@ function ap_remote_emoji_http_json(string $url): ?array
     }
     curl_setopt_array($ch, [
         CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_FOLLOWLOCATION => true,
-        CURLOPT_MAXREDIRS => 3,
         CURLOPT_TIMEOUT => 6,
         CURLOPT_CONNECTTIMEOUT => 3,
         CURLOPT_USERAGENT => 'mkultra.monster-emoji-cache/1.0 (+https://mkultra.monster)',
         CURLOPT_HTTPHEADER => ['Accept: application/json'],
         CURLOPT_PROTOCOLS => CURLPROTO_HTTPS,
-        CURLOPT_REDIR_PROTOCOLS => CURLPROTO_HTTPS,
     ]);
-    $body = curl_exec($ch);
+    $body = ap_net_curl_exec($ch, $url, 3);
     $code = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
     curl_close($ch);
     if (!is_string($body) || $body === '' || $code < 200 || $code >= 300) {

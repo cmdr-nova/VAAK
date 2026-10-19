@@ -405,6 +405,11 @@ function ap_link_preview_http_get(string $url, int $timeoutSec = 4, int $maxByte
                 'Accept-Language: en-US,en;q=0.8',
             ],
         ]);
+        // Pin to the addresses ap_link_preview_url_allowed() just checked.
+        if (!ap_net_curl_pin($ch, $current)) {
+            curl_close($ch);
+            return null;
+        }
         $ok = curl_exec($ch);
         $code = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
         curl_close($ch);
