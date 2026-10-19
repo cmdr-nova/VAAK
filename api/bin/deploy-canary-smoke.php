@@ -14,6 +14,10 @@ reference_load($api . '/ap-bsky.php', [
 ]);
 reference_load($api . '/ap-masto-entities.php', ['ap_masto_bsky_media_attachments', 'ap_masto_animated_media_from_url']);
 reference_load($api . '/ap-admin.php', ['admin_poll_block_html', 'h', 'admin_tl_html_axum_fetch']);
+reference_load($api . '/ap-db.php', [
+    'ap_db_driver', 'ap_remote_polls_migrate', 'ap_remote_poll_id_base', 'ap_remote_poll_public_id',
+    'ap_remote_poll_row_id', 'ap_remote_poll_find', 'ap_remote_poll_own_votes', 'ap_remote_poll_is_expired',
+]);
 if (!defined('AP_BSKY_POST_TEXT_MAX')) define('AP_BSKY_POST_TEXT_MAX', 5000);
 const CANARY_BSKY_WINDOW_SECONDS = 6 * 3600;
 
@@ -34,6 +38,13 @@ $db->exec('CREATE TABLE remote_polls (note_id TEXT PRIMARY KEY, multiple INTEGER
 $db->exec('CREATE TABLE following (actor_id TEXT PRIMARY KEY, followed_at TEXT NOT NULL, host TEXT)');
 
 function ap_db(): PDO { return $GLOBALS['db']; }
+// Declared before the canary can require api/ap-shadow-http.php: no token
+// until a case sets $GLOBALS['shadow_token'].
+function ap_shadow_http_auth_headers(): array
+{
+    $token = (string) ($GLOBALS['shadow_token'] ?? '');
+    return $token === '' ? [] : ['X-VAAK-Shadow-Token: ' . $token];
+}
 function canary_boot_masto(): int { return $GLOBALS['owner']; }
 function canary_boot_admin(): int { return $GLOBALS['owner']; }
 function ap_masto_timeline_home_merged(int $limit, ?string $max, ?string $since, bool $std): array { return $GLOBALS['home']; }
@@ -118,7 +129,6 @@ try {
     $r = canary_check_axum('home');
     dc_check($r[0] === 'fail' && str_contains($r[1], '401') && str_contains($r[1], 'no token'), 'missing shadow token fails');
     $GLOBALS['shadow_token'] = 'good-token';
-    eval('function ap_shadow_http_auth_headers(): array { return ["X-VAAK-Shadow-Token: " . $GLOBALS["shadow_token"]]; }');
     // Main's admin fetch sends no token yet, so log the header rather than
     // reject; the canary's own request must carry it.
     file_put_contents($mode, 'auth-log');
