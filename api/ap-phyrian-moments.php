@@ -420,7 +420,7 @@ function ap_phyrian_moments_hub_html(?array $player, string $actorKey, string $c
         'level_up' => 'Level-up',
         'rare_find' => 'Rare find',
         'win' => 'Win',
-        'card' => 'Post my Strains card',
+        'card' => 'Your Strains card',
     ];
     $blocks = [];
     foreach ($kinds as $kind => $label) {
@@ -442,14 +442,14 @@ function ap_phyrian_moments_hub_html(?array $player, string $actorKey, string $c
             . (string) AP_PHYRIAN_MOMENTS_TEXT_MAX . '" required rows="2" style="width:100%;box-sizing:border-box">'
             . ap_phyrian_moments_h($suggestion) . '</textarea>'
             . '<div class="composer-actions"><span class="meta">Posts to your timeline with a card image. Nothing is posted until you confirm.</span>'
-            . '<button class="btn btn-primary" type="submit">Post this moment</button></div>'
+            . '<button class="btn btn-primary" type="submit">Share my card</button></div>'
             . '</form>';
     }
     if ($blocks === []) {
         return '';
     }
-    return '<section class="phyrian-moments" aria-label="Share a Phyrian moment" style="margin:1rem 0;padding:.85rem;border:1px solid var(--border);border-radius:12px">'
-        . '<h3 class="phyrian-section-title" style="margin-top:0">Share a moment</h3>'
+    return '<section class="phyrian-moments" aria-label="Share your Strains card" style="margin:1rem 0;padding:.85rem;border:1px solid var(--border);border-radius:12px">'
+        . '<h3 class="phyrian-section-title" style="margin-top:0">Share your card</h3>'
         . '<p class="meta" style="margin:0 0 .75rem">Confirm the text below. VAAK attaches a picture of your Strains card so followers on other servers and Bluesky can see it, and links back to your profile.</p>'
         . implode('', $blocks)
         . '</section>';

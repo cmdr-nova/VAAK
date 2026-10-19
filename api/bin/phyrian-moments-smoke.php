@@ -273,7 +273,7 @@ $hubOn = ap_phyrian_moments_hub_html([
     'resonance_exchanges' => 2,
     'inductions_given' => 1,
 ], 'cmdr_nova', 'csrf-ok');
-$check(str_contains($hubOn, 'Share a moment') && str_contains($hubOn, 'Post this moment'), 'hub offers a confirm button');
+$check(str_contains($hubOn, 'Share your card') && str_contains($hubOn, 'Share my card'), 'hub offers a confirm button');
 $check(str_contains($hubOn, 'name="confirm" value="1"') && str_contains($hubOn, 'name="action" value="phyrian_moment_post"'), 'hub posts only through the confirm action');
 $check(!str_contains($hubOn, '<script>') && !str_contains($hubOn, 'Cosmic Alien'), 'hub card form does not print the strain');
 $check(ap_phyrian_moments_h('Cosmic Alien <script>') === 'Cosmic Alien &lt;script&gt;', 'hub text is escaped before it is printed');
@@ -313,7 +313,7 @@ $check(!str_contains($admin, '.phyrian-moments {'), 'moments do not add a global
 
 $moments = (string) file_get_contents(dirname(__DIR__) . '/ap-phyrian-moments.php');
 $check(str_contains($moments, "const AP_PHYRIAN_MOMENTS_ALLOWED = ['card']"), 'allowlist names only the strains card');
-foreach (["'level_up' => 'Level-up'", "'rare_find' => 'Rare find'", "'win' => 'Win'", "'card' => 'Post my Strains card'"] as $keptLabel) {
+foreach (["'level_up' => 'Level-up'", "'rare_find' => 'Rare find'", "'win' => 'Win'", "'card' => 'Your Strains card'"] as $keptLabel) {
     $check(str_contains($moments, $keptLabel), 'moment label stays in the helper: ' . $keptLabel);
 }
 $check(substr_count($moments, 'FROM phyrian_players') === 1, 'moments helper has one player read');

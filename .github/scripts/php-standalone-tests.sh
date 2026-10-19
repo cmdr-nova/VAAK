@@ -91,6 +91,7 @@ php_tests=(
   api/bin/phyrian-moments-smoke.php
   api/bin/phyrian-clans-smoke.php
   api/bin/phyrian-clans-migration-smoke.php
+  api/bin/phyrian-tree-smoke.php
   api/bin/pin-federation-behavior-smoke.php
   api/bin/public-doc-cache-smoke.php
   api/bin/pluraldawn-decode-smoke.php
