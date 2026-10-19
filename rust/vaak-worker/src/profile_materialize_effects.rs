@@ -20,8 +20,8 @@ pub(super) fn reconcile_preview_write(deps:&mut [Dependency],write:&crate::profi
  let key=json!({"url":write.url()});if !deps.iter().any(|d|d.sql==PREVIEW_CACHE&&d.key==key){bail!("PHP fallback: preview receipt URL lacks retained native cache snapshot")}
  reconcile(deps,&preview_changes(std::slice::from_ref(write)))
 }
-pub(super) enum Grant<'a>{Surface(&'a crate::library::context::SelectedLibrarySearchSource),Source(&'a crate::profile_context::AdmittedProjectionSources,usize),Quote(&'a crate::profile_context::AdmittedQuoteProjection,&'a str)}
-impl Grant<'_>{async fn current(&self,db:&Client,status:&Value)->Result<()>{match self{Self::Surface(selected)=>selected.require_projected_current(db,status).await,Self::Source(grant,index)=>grant.require_current(db,*index,status).await,Self::Quote(grant,target)=>grant.require_current(db,target,status).await}}}
+pub(super) enum Grant<'a>{Search,Surface(&'a crate::library::context::SelectedLibrarySearchSource),Source(&'a crate::profile_context::AdmittedProjectionSources,usize),Quote(&'a crate::profile_context::AdmittedQuoteProjection,&'a str)}
+impl Grant<'_>{async fn current(&self,db:&Client,status:&Value)->Result<()>{match self{Self::Search=>Ok(()),Self::Surface(selected)=>selected.require_projected_current(db,status).await,Self::Source(grant,index)=>grant.require_current(db,*index,status).await,Self::Quote(grant,target)=>grant.require_current(db,target,status).await}}}
 impl MaterializedProfilePage{
  pub(crate) fn reconcile_account_changes(&mut self,changes:&AccountMappingChanges)->Result<()>{reconcile(&mut self.dependencies,changes)}
  pub(crate) async fn apply_source_effect(&mut self,db:&Client,effect:&DeferredProjectionEffect,status:&Value,grant:&crate::profile_context::AdmittedProjectionSources)->Result<AccountMappingChanges>{
@@ -47,7 +47,7 @@ pub(super) async fn aliases(db:&Client,deps:&mut Vec<Dependency>,actor:&str)->Re
  if actor.is_empty(){return Ok(vec![])}
  if !actor.starts_with("https://"){return Ok(vec![actor.into()])}
  let Some(mut host)=reqwest::Url::parse(actor).ok().and_then(|u|u.host_str().map(|s|s.to_ascii_lowercase()))else{return Ok(vec![actor.into(),format!("{actor}/")])};
- let path=regex::Regex::new(r"(?i)/(?:users|ap/users|@)([^/]+)/?$").unwrap().captures(actor).map(|c|crate::hidden::raw_percent_decode(&c[1]).trim_start_matches('@').to_owned()).unwrap_or_default();
+ let path=re!(r"(?i)/(?:users|ap/users|@)([^/]+)/?$").captures(actor).map(|c|crate::hidden::raw_percent_decode(&c[1]).trim_start_matches('@').to_owned()).unwrap_or_default();
  let rows=read(db,deps,"SELECT to_jsonb(a) FROM remote_actors a WHERE actor_id IN($1::jsonb->>'actor',($1::jsonb->>'actor')||'/') LIMIT 1",json!({"actor":actor})).await?;
  let mut username=String::new();if let Some(row)=rows.first(){username=crate::library::card::php_trim(s(row,"username")).into();let h=crate::library::card::php_trim(s(row,"host")).to_ascii_lowercase();if !h.is_empty(){host=h}}
  if username.is_empty()&&!path.is_empty()&&!path.bytes().all(|b|b.is_ascii_digit()){username=path}
@@ -56,7 +56,7 @@ pub(super) async fn aliases(db:&Client,deps:&mut Vec<Dependency>,actor:&str)->Re
   let encoded=reqwest::Url::parse("https://placeholder.test/").unwrap().join(&format!("users/{}",raw_encode(&username)))?.path().to_owned();
   candidates.push(format!("https://{host}{encoded}"));candidates.push(format!("https://{host}/@{}",raw_encode(&username)));
   for row in read(db,deps,"SELECT to_jsonb(a) FROM remote_actors a WHERE lower(COALESCE(host,''))=$1::jsonb->>'host' AND lower(COALESCE(username,''))=$1::jsonb->>'username'",json!({"host":host,"username":username.to_lowercase()})).await?{let a=s(&row,"actor_id").trim_end_matches('/');if !a.is_empty(){candidates.push(a.into())}}
-  for row in read(db,deps,"SELECT to_jsonb(f) FROM following f WHERE lower(COALESCE(host,''))=$1::jsonb->>'host'",json!({"host":host})).await?{let a=s(&row,"actor_id").trim_end_matches('/');if let Some(c)=regex::Regex::new(r"(?i)/(?:users|@)([^/]+)/?$").unwrap().captures(a){if crate::hidden::raw_percent_decode(&c[1]).to_lowercase()==username.to_lowercase(){candidates.push(a.into())}}}
+  for row in read(db,deps,"SELECT to_jsonb(f) FROM following f WHERE lower(COALESCE(host,''))=$1::jsonb->>'host'",json!({"host":host})).await?{let a=s(&row,"actor_id").trim_end_matches('/');if let Some(c)=re!(r"(?i)/(?:users|@)([^/]+)/?$").captures(a){if crate::hidden::raw_percent_decode(&c[1]).to_lowercase()==username.to_lowercase(){candidates.push(a.into())}}}
  }
  let mut unique=Vec::<String>::new();for a in candidates{let a=a.trim_end_matches('/');if !a.is_empty()&&a.starts_with("https://")&&!unique.iter().any(|v|v==a){unique.push(a.into())}}
  if unique.len()>1{
@@ -73,7 +73,7 @@ async fn local(db:&Client,deps:&mut Vec<Dependency>,id:&str)->Result<bool>{
  if !read(db,deps,sql,json!({"id":numeric})).await?.is_empty(){return Ok(true)}
  if id=="1"{return Ok(false)}
  let rows=read(db,deps,MAP,json!({"account_id":id})).await?;
- let Some(key)=rows.first().and_then(|r|regex::Regex::new(r"^https://mkultra\.monster/users/([A-Za-z0-9_]+)$").unwrap().captures(s(r,"actor_id").trim_end_matches('/')).map(|c|c[1].to_ascii_lowercase()))else{return Ok(false)};
+ let Some(key)=rows.first().and_then(|r|re!(r"^https://mkultra\.monster/users/([A-Za-z0-9_]+)$").captures(s(r,"actor_id").trim_end_matches('/')).map(|c|c[1].to_ascii_lowercase()))else{return Ok(false)};
  Ok(!read(db,deps,"SELECT to_jsonb(u) FROM ap_users u WHERE lower(actor_key)=$1::jsonb->>'key' AND disabled_at IS NULL LIMIT 1",json!({"key":key})).await?.is_empty())
 }
 pub(super) async fn apply(db:&Client,deps:&mut Vec<Dependency>,effect:&DeferredProjectionEffect,grant:&Grant<'_>,status:&Value)->Result<AccountMappingChanges>{
