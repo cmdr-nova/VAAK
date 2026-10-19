@@ -1745,13 +1745,6 @@ SQL);
         }
     }
 
-    // DMs: Bridgy Fed sends HTML with <a href> action links — keep them
-    $dmCols = $db->query('PRAGMA table_info(direct_messages)')->fetchAll();
-    $dmNames = array_column($dmCols, 'name');
-    if (!in_array('attachments_json', $dmNames, true)) {
-        $db->exec('ALTER TABLE direct_messages ADD COLUMN attachments_json TEXT');
-    }
-
     $db->exec(<<<'SQL'
 CREATE TABLE IF NOT EXISTS link_preview_cards (
     url TEXT PRIMARY KEY,
@@ -2307,6 +2300,14 @@ CREATE TABLE IF NOT EXISTS quote_authorizations (
 CREATE INDEX IF NOT EXISTS idx_quote_auth_quoted ON quote_authorizations(quoted_note_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_quote_auth_pair ON quote_authorizations(quoted_note_id, quoting_object_id);
 SQL);
+
+    // DMs: Bridgy Fed sends HTML with <a href> action links — keep them.
+    // Runs after the CREATE above so a fresh database has the table first.
+    $dmCols = $db->query('PRAGMA table_info(direct_messages)')->fetchAll();
+    $dmNames = array_column($dmCols, 'name');
+    if (!in_array('attachments_json', $dmNames, true)) {
+        $db->exec('ALTER TABLE direct_messages ADD COLUMN attachments_json TEXT');
+    }
 
     // Ensure ap_users.xai_api_key_enc (older installs created ap_users without it)
     $apUserCols = $db->query('PRAGMA table_info(ap_users)')->fetchAll();
