@@ -31427,7 +31427,7 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
           }
         ?>
         <?php if ($view === 'profile'): ?>
-        <?php if (!empty($followRequests)): ?>
+        <?php if (($settingsNativeFollow = ap_settings_native_body('settings_follow_requests', !empty($vaakIsAdmin))) !== null): ?><?= $settingsNativeFollow ?><?php elseif (!empty($followRequests)): ?>
           <div class="composer" style="margin:0 0 1rem">
             <h3 style="margin-top:0">Pending follower requests</h3>
             <div class="meta" style="margin-bottom:.65rem">Approve requests to add the account to your followers, or reject them without accepting the follow.</div>
@@ -31826,6 +31826,7 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
           <?php endif; ?>
         </div>
 
+        <?php if (($settingsNativeFeatured = ap_settings_native_body('settings_featured', !empty($vaakIsAdmin))) !== null): ?><?= $settingsNativeFeatured ?><?php else: ?>
         <?php
           $featuredCards = function_exists('ap_featured_cards')
               ? ap_featured_cards((int) ($vaakUser['id'] ?? 0))
@@ -31896,6 +31897,7 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
             <div class="meta">Limit reached (<?= (int) $featuredMax ?>). Remove one to add another.</div>
           <?php endif; ?>
         </div>
+        <?php endif; ?>
 
         <form class="composer" method="post" action="?view=profile" style="margin-top:1.25rem" autocomplete="off">
           <input type="hidden" name="action" value="change_password">
@@ -32164,6 +32166,7 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
           <label for="profile-list-search">Search your mutes, deprioritized accounts, and blocks</label>
           <input id="profile-list-search" type="search" placeholder="Filter these lists…" autocomplete="off">
         </div>
+        <?php if (($settingsNativeMutes = ap_settings_native_body('settings_mutes', !empty($vaakIsAdmin))) !== null): ?><?= $settingsNativeMutes ?><?php else: ?>
         <details class="profile-list-section"><summary style="cursor:pointer;font-size:1rem;font-weight:650;margin:1.25rem 0 .5rem">Muted accounts</summary>
         <div class="meta" style="margin-bottom:.75rem">
           Hide from <b>your</b> Home / Federated / Notifications. Follow stays. Also available on remote profiles.
@@ -32210,6 +32213,7 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
           <?php endforeach; ?>
         <?php endif; ?>
         </details>
+        <?php endif; ?>
 
         <?php if (($settingsNativeLists = ap_settings_native_lists_body(!empty($vaakIsAdmin))) !== null): ?><?= $settingsNativeLists ?><?php else: ?>
         <details class="profile-list-section"><summary style="cursor:pointer;font-size:1rem;font-weight:650;margin:1.25rem 0 .5rem">Deprioritized on Home</summary>

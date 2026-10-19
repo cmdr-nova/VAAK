@@ -20,14 +20,15 @@ function ap_admin_native_reply(array $reply,array $request): ?string
     $keys=array_keys($reply);sort($keys);$expected=['protocol_version','ok','request_binding','source_count','rows','html'];sort($expected);
     if($keys!==$expected || $reply['protocol_version']!==1 || $reply['ok']!==true || !is_string($reply['html'])
         || strlen($reply['html'])>2*1024*1024 || !is_int($reply['source_count']) || !is_array($reply['rows'])
-        || !array_is_list($reply['rows']) || count($reply['rows'])!==$reply['source_count'] || count($reply['rows'])>match($request['view']){'users'=>20,'blocks'=>1000,'settings_lists'=>3000,default=>100}) return null;
+        || !array_is_list($reply['rows']) || count($reply['rows'])!==$reply['source_count'] || count($reply['rows'])>match($request['view']){'users'=>20,'blocks'=>1000,'settings_lists'=>3000,'settings_follow_requests'=>1000,'settings_mutes'=>1000,'settings_featured'=>40,default=>100}) return null;
     $binding=[];foreach(['owner_id','view','mode','offset','approvals_enabled'] as $key)$binding[$key]=$request[$key];
     if($request['view']==='users')$binding['search']=$request['search'];
-    if($request['view']==='settings_lists')$binding['viewer_admin']=$request['viewer_admin'];
+    if(str_starts_with($request['view'],'settings_'))$binding['viewer_admin']=$request['viewer_admin'];
     if(!is_array($reply['request_binding']))return null;
     $bindingKeys=array_keys($reply['request_binding']);sort($bindingKeys);$requiredBinding=array_keys($binding);sort($requiredBinding);if($bindingKeys!==$requiredBinding)return null;
     foreach($binding as $key=>$value)if($reply['request_binding'][$key]!==$value)return null;
     if($request['view']==='settings_lists')return ap_settings_native_rows_valid($reply['rows'])?$reply['html']:null;
+    if(str_starts_with($request['view'],'settings_'))return ap_settings_native_account_rows_valid($request['view'],$reply['rows'])?$reply['html']:null;
     $required=match($request['view']){'users'=>['id','username','email','actor_key','actor_id','is_admin','created_at','updated_at','disabled_at','profile_name','icon_url'],
         'invites'=>['id','code','created_at','used_at','note'],'relays'=>['id','inbox_url','state','follow_activity_id','created_at','updated_at'],'policies'=>['id','text'],'blocks'=>['id','scope','value','kind','reason','created_at'],
         default=>['id','username','email','status','created_at','decided_at']};sort($required);
@@ -53,6 +54,21 @@ function ap_settings_native_rows_valid(array $rows): bool
     }
     return true;
 }
+/** Follow request, Featured and Muted account rows: closed key sets, ids where the table has them. */
+function ap_settings_native_account_rows_valid(string $view,array $rows): bool
+{
+    $required=match($view){'settings_follow_requests'=>['id','actor_id','username'],'settings_featured'=>['id','actor_id','acct','display_name','avatar'],'settings_mutes'=>['actor_id','created_at'],default=>null};
+    if($required===null)return false;sort($required);
+    foreach($rows as $row){
+        if(!is_array($row))return false;$keys=array_keys($row);sort($keys);if($keys!==$required)return false;
+        foreach($row as $key=>$value){
+            if($key==='id'){if(!is_int($value)||$value<1)return false;continue;}
+            if($key==='username'&&$value===null)continue;
+            if(!is_string($value))return false;
+        }
+    }
+    return true;
+}
 function ap_admin_native_post(string $url,array $request): ?string
 {
     try{
@@ -75,11 +91,17 @@ function ap_admin_native_post(string $url,array $request): ?string
  */
 function ap_settings_native_lists_body(bool $viewerAdmin): ?string
 {
-    if(!ap_admin_native_enabled() || getenv('VAAK_SETTINGS_LISTS_NATIVE')!=='1')return null;
+    return ap_settings_native_body('settings_lists',$viewerAdmin);
+}
+/** One Settings section for the signed-in account: settings_lists, settings_follow_requests, settings_featured or settings_mutes. */
+function ap_settings_native_body(string $view,bool $viewerAdmin): ?string
+{
+    $flag=match($view){'settings_lists'=>'VAAK_SETTINGS_LISTS_NATIVE','settings_follow_requests','settings_featured','settings_mutes'=>'VAAK_SETTINGS_ACCOUNTS_NATIVE',default=>null};
+    if($flag===null || !ap_admin_native_enabled() || getenv($flag)!=='1')return null;
     $user=ap_auth_current_user();$owner=(int)($user['id']??0);
     if($owner<1 || !function_exists('admin_owner_user_id') || admin_owner_user_id()!==$owner || ap_auth_is_admin($user)!==$viewerAdmin)return null;
     $url=(string)(getenv('VAAK_ADMIN_READ_URL')?:'http://127.0.0.1:8787/internal/admin/read');if(!ap_admin_native_url_allowed($url))return null;
-    $request=['protocol_version'=>1,'owner_id'=>$owner,'csrf'=>ap_auth_csrf_token(),'view'=>'settings_lists',
+    $request=['protocol_version'=>1,'owner_id'=>$owner,'csrf'=>ap_auth_csrf_token(),'view'=>$view,
         'mode'=>isset($_GET['partial'])&& (string)$_GET['partial']==='1'?'shell':'full','offset'=>0,
         'approvals_enabled'=>ap_registration_approvals_enabled(),'now'=>time(),'php_timezone'=>date_default_timezone_get(),'viewer_admin'=>$viewerAdmin];
     $html=ap_admin_native_post($url,$request);if($html===null)return null;

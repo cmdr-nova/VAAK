@@ -10945,7 +10945,7 @@ function ap_mutes_list(int $ownerUserId): array
         return [];
     }
     $st = ap_db()->prepare(
-        'SELECT * FROM ap_mutes WHERE owner_user_id = ? ORDER BY created_at DESC'
+        'SELECT * FROM ap_mutes WHERE owner_user_id = ? ORDER BY created_at DESC, actor_id DESC'
     );
     $st->execute([$ownerUserId]);
     return $st->fetchAll() ?: [];

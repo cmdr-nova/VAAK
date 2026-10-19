@@ -6,7 +6,8 @@ use serde_json::{json,Value};
 use crate::library::actions::{esc,query};
 #[derive(Clone,Debug,Deserialize,Serialize,PartialEq)]
 #[serde(rename_all="snake_case")]
-enum View {Invites,Approvals,Users,Relays,Policies,Blocks,SettingsLists}
+enum View {Invites,Approvals,Users,Relays,Policies,Blocks,SettingsLists,SettingsFollowRequests,SettingsFeatured,SettingsMutes}
+impl View{fn settings(&self)->bool{matches!(self,View::SettingsLists|View::SettingsFollowRequests|View::SettingsFeatured|View::SettingsMutes)}}
 #[derive(Clone,Debug,Deserialize,Serialize,PartialEq)]
 #[serde(rename_all="snake_case")]
 enum Mode {Full,Shell}
@@ -28,15 +29,15 @@ fn decode(bytes:&[u8])->Result<Request>{
  let r:Request=serde_json::from_slice(bytes)?;
  if r.protocol_version!=1||r.owner_id<1||r.csrf.is_empty()||r.csrf.len()>4096||r.offset<0||r.offset>i64::MAX-100||r.now<0{bail!("admin envelope");}
  if r.php_timezone!="UTC" { bail!("unproven PHP timezone"); }
- if matches!(r.view,View::Invites|View::Relays|View::Policies|View::Blocks|View::SettingsLists)&&r.offset!=0{bail!("invite selector");}
+ if (matches!(r.view,View::Invites|View::Relays|View::Policies|View::Blocks)||r.view.settings())&&r.offset!=0{bail!("invite selector");}
  if r.view==View::Users{if r.offset<1||r.search.as_ref().is_none_or(|s|s.len()>4096||crate::library::card::php_trim(s)!=s){bail!("users selector");}}else if r.search.is_some(){bail!("unexpected users selector");}
- if (r.view==View::SettingsLists)!=r.viewer_admin.is_some(){bail!("viewer role selector");}
+ if r.view.settings()!=r.viewer_admin.is_some(){bail!("viewer role selector");}
  Ok(r)
 }
 /// Settings views admit any active account and must agree with the role PHP painted for;
 /// every other view requires a current active administrator.
 async fn role(db:&tokio_postgres::Client,r:&Request)->Result<()>{
- if r.view!=View::SettingsLists{return admin(db,r.owner_id).await;}
+ if !r.view.settings(){return admin(db,r.owner_id).await;}
  let Some(row)=db.query_opt("SELECT COALESCE(is_admin,0)<>0 FROM ap_users WHERE id::bigint=$1 AND disabled_at IS NULL",&[&r.owner_id]).await? else {bail!("current active account required")};
  if Some(row.get::<_,bool>(0))!=r.viewer_admin{bail!("viewer role changed");}Ok(())
 }
@@ -85,12 +86,13 @@ async fn paint(cfg:&crate::config::Config,r:&Request)->Result<Value>{
  if r.view==View::Policies&&std::env::var("VAAK_ADMIN_POLICIES_NATIVE").ok().as_deref()!=Some("1"){bail!("native Policies disabled");}
  if r.view==View::Blocks&&std::env::var("VAAK_ADMIN_BLOCKS_NATIVE").ok().as_deref()!=Some("1"){bail!("native Blocks disabled");}
  if r.view==View::SettingsLists&&std::env::var("VAAK_SETTINGS_LISTS_NATIVE").ok().as_deref()!=Some("1"){bail!("native Settings lists disabled");}
+ if matches!(r.view,View::SettingsFollowRequests|View::SettingsFeatured|View::SettingsMutes)&&std::env::var("VAAK_SETTINGS_ACCOUNTS_NATIVE").ok().as_deref()!=Some("1"){bail!("native Settings accounts disabled");}
  let db=crate::db::connect(&cfg.database_url).await?;
  db.batch_execute("BEGIN READ ONLY ISOLATION LEVEL READ COMMITTED").await?;
  role(&db,r).await?;
  let configured=std::env::var("VAAK_REGISTRATION_APPROVALS").ok().as_deref()==Some("1");
  if r.approvals_enabled!=configured{bail!("approval mode mismatch");}
- enum Collected { Invites(Vec<Invite>), Applications(Vec<Application>), Users(users::Collected), Relays(Vec<relays::Relay>), Policies(policies::Collected), Blocks(Vec<blocks::Row>), SettingsLists(settings_lists::Collected) }
+ enum Collected { Invites(Vec<Invite>), Applications(Vec<Application>), Users(users::Collected), Relays(Vec<relays::Relay>), Policies(policies::Collected), Blocks(Vec<blocks::Row>), SettingsLists(settings_lists::Collected), FollowRequests(Vec<settings_accounts::FollowRequest>), Featured(Vec<settings_accounts::Featured>,settings_accounts::Owner), Mutes(Vec<settings_accounts::Mute>) }
  let collected=match r.view{
   View::Invites=>{
    let mut rows=Vec::new();for row in db.query("SELECT jsonb_build_object('id',id::bigint,'code',code,'created_at',created_at,'used_at',used_at,'note',note) FROM ap_invite_codes ORDER BY created_at DESC,id DESC LIMIT 100",&[]).await?{rows.push(serde_json::from_value::<Invite>(row.get(0))?);}
@@ -101,6 +103,9 @@ async fn paint(cfg:&crate::config::Config,r:&Request)->Result<Value>{
   View::Policies=>Collected::Policies(policies::collect(&db).await?),
   View::Blocks=>Collected::Blocks(blocks::collect(&db,cfg).await?),
   View::SettingsLists=>Collected::SettingsLists(settings_lists::collect(&db,r.owner_id).await?),
+  View::SettingsFollowRequests=>{let owner=settings_accounts::owner(&db,r.owner_id).await?;Collected::FollowRequests(settings_accounts::follow_requests(&db,&owner).await?)},
+  View::SettingsFeatured=>{let owner=settings_accounts::owner(&db,r.owner_id).await?;Collected::Featured(settings_accounts::featured(&db,cfg,r.owner_id).await?,owner)},
+  View::SettingsMutes=>Collected::Mutes(settings_accounts::mutes(&db,cfg,r.owner_id,r.now).await?),
   View::Approvals=>{
    let mut rows=Vec::new();for row in db.query("SELECT jsonb_build_object('id',id::bigint,'username',username,'email',email,'status',status,'created_at',created_at,'decided_at',decided_at) FROM ap_registration_applications ORDER BY id DESC LIMIT 100 OFFSET $1",&[&r.offset]).await?{rows.push(serde_json::from_value::<Application>(row.get(0))?);}
    Collected::Applications(rows)
@@ -110,6 +115,11 @@ async fn paint(cfg:&crate::config::Config,r:&Request)->Result<Value>{
  // ap_remote_actor_label queues the same warm for an uncached or placeholder actor.
  // Queued together so ten misses cost one 80 ms Redis budget, not ten.
  if let Collected::Blocks(rows)=&collected{
+  let mut warms=tokio::task::JoinSet::new();
+  for actor in rows.iter().filter_map(|row|row.warm.clone()){let cfg=cfg.clone();warms.spawn(async move{crate::profile_warm::actor_warm(&cfg,&actor,&crate::profile_warm::ProcessWarmTransport::configured()).await;});}
+  while warms.join_next().await.is_some(){}
+ }
+ if let Collected::Mutes(rows)=&collected{
   let mut warms=tokio::task::JoinSet::new();
   for actor in rows.iter().filter_map(|row|row.warm.clone()){let cfg=cfg.clone();warms.spawn(async move{crate::profile_warm::actor_warm(&cfg,&actor,&crate::profile_warm::ProcessWarmTransport::configured()).await;});}
   while warms.join_next().await.is_some(){}
@@ -124,6 +134,9 @@ async fn paint(cfg:&crate::config::Config,r:&Request)->Result<Value>{
   Collected::Policies(c)=>policies::paint(c)?,
   Collected::Blocks(rows)=>blocks::paint(rows,r)?,
   Collected::SettingsLists(c)=>settings_lists::paint(c,r)?,
+  Collected::FollowRequests(rows)=>settings_accounts::paint_follow_requests(rows,r)?,
+  Collected::Featured(cards,owner)=>settings_accounts::paint_featured(cards,&owner)?,
+  Collected::Mutes(rows)=>settings_accounts::paint_mutes(rows,r)?,
  };
  if html.len()>1024*1024 || serde_json::to_vec(&rows)?.len()>512*1024 { bail!("admin response bound"); }
 
@@ -146,6 +159,8 @@ mod policies;
 mod blocks;
 #[path="admin_settings_lists.rs"]
 mod settings_lists;
+#[path="admin_settings_accounts.rs"]
+mod settings_accounts;
 #[cfg(test)]mod tests{
  use super::*;
  #[test]fn strict_admin_read_envelope(){let good=json!({"protocol_version":1,"owner_id":1,"csrf":"session","view":"invites","mode":"full","offset":0,"approvals_enabled":false,"now":100,"php_timezone":"UTC"});assert!(decode(&serde_json::to_vec(&good).unwrap()).is_ok());for(k,v)in[("owner_id",json!(0)),("is_admin",json!(true)),("view",json!("users")),("offset",json!(1)),("csrf",json!("")),("rows",json!([]))]{let mut bad=good.clone();bad[k]=v;assert!(decode(&serde_json::to_vec(&bad).unwrap()).is_err());}}
@@ -154,6 +169,7 @@ mod settings_lists;
  #[test]fn settings_lists_envelope_needs_viewer_role(){let good=json!({"protocol_version":1,"owner_id":2,"csrf":"session","view":"settings_lists","mode":"full","offset":0,"approvals_enabled":false,"now":100,"php_timezone":"UTC","viewer_admin":false});assert!(decode(&serde_json::to_vec(&good).unwrap()).is_ok());for(k,v)in[("offset",json!(1)),("search",json!("")),("viewer_admin",Value::Null)]{let mut bad=good.clone();bad[k]=v;assert!(decode(&serde_json::to_vec(&bad).unwrap()).is_err());}let mut admin_view=good.clone();admin_view["view"]=json!("blocks");assert!(decode(&serde_json::to_vec(&admin_view).unwrap()).is_err());}
  #[test]fn personal_row_models_are_closed(){assert!(serde_json::from_value::<settings_lists::UserBlock>(json!({"id":1,"scope":"actor","value":"x","kind":"block","reason":null,"created_at":"a","owner_user_id":2})).is_err());assert!(serde_json::from_value::<settings_lists::MutedWord>(json!({"id":1,"phrase":"x","created_at":"a","note":null,"owner_user_id":2})).is_err());}
  #[test]fn relative_accepts_postgres_timestamptz_text(){for(s,want)in[("2026-10-19 12:00:00.123456+00","10s"),("2026-10-19 12:00:00+00","10s"),("2026-10-19 14:00:00.5+02","10s"),("2026-10-19 12:00:00.999999+00:00","10s")]{assert_eq!(relative(s,chrono::DateTime::parse_from_rfc3339("2026-10-19T12:00:10Z").unwrap().timestamp()).unwrap(),want,"{s}");}assert!(relative("yesterday",0).is_err());}
+ #[test]fn settings_account_views_need_viewer_role(){for view in["settings_follow_requests","settings_featured","settings_mutes"]{let good=json!({"protocol_version":1,"owner_id":2,"csrf":"session","view":view,"mode":"full","offset":0,"approvals_enabled":false,"now":100,"php_timezone":"UTC","viewer_admin":false});assert!(decode(&serde_json::to_vec(&good).unwrap()).is_ok());for(k,v)in[("offset",json!(1)),("viewer_admin",Value::Null),("search",json!(""))]{let mut bad=good.clone();bad[k]=v;assert!(decode(&serde_json::to_vec(&bad).unwrap()).is_err(),"{view} {k}");}}}
  #[test]fn block_row_model_is_closed(){assert!(serde_json::from_value::<blocks::Block>(json!({"id":1,"scope":"domain","value":"x","kind":"block","reason":null,"created_at":"a","created_by":"admin"})).is_err());}
  #[test]fn relay_row_model_is_closed(){assert!(serde_json::from_value::<relays::Relay>(json!({"id":1,"inbox_url":"https://r/inbox","state":"idle","follow_activity_id":null,"created_at":"a","updated_at":"b","secret":"x"})).is_err());}
  #[test]fn no_application_hash_model(){assert!(serde_json::from_value::<Application>(json!({"id":1,"username":"x","email":null,"status":"pending","created_at":"now","decided_at":null,"password_hash":"forbidden"})).is_err());}
