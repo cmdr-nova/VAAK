@@ -30921,6 +30921,8 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
       <?php elseif ($view === 'policies'): ?>
         <?php if (empty($vaakIsAdmin)): ?>
           <div class="empty">Admin only.</div>
+        <?php elseif (($adminNativeBody = ap_admin_native_read_body('policies')) !== null): ?>
+          <?= $adminNativeBody ?>
         <?php else: ?>
           <?php
             require_once __DIR__ . '/ap-instance-docs.php';
