@@ -1,0 +1,23 @@
+# Monthly restore drill for the PostgreSQL backups.
+#   install -m 0755 deploy/vaak-backup-restore-drill.sh /usr/local/sbin/vaak-backup-restore-drill.sh
+#   cp deploy/vaak-backup-restore-drill.{service,timer} /etc/systemd/system/
+#   systemctl daemon-reload
+#   systemctl enable --now vaak-backup-restore-drill.timer
+#
+# Restores the newest dump into novalandia_restore_drill, compares row counts
+# with novalandia, then drops the scratch database. Output: journalctl -u.
+
+[Unit]
+Description=VAAK PostgreSQL backup restore drill
+After=postgresql.service
+Requires=postgresql.service
+
+[Service]
+Type=oneshot
+User=root
+Nice=19
+IOSchedulingClass=idle
+CPUSchedulingPolicy=batch
+ExecStart=/usr/local/sbin/vaak-backup-restore-drill.sh
+NoNewPrivileges=true
+PrivateTmp=true
