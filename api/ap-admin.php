@@ -12476,6 +12476,30 @@ function admin_search_host_is_our_typo(string $host): bool
     return false;
 }
 
+/**
+ * Account rows for one Search page, with the source each account was built
+ * from (the render bridge rebinds them). Shared by the PHP collector and the
+ * native collector when it leaves this section to PHP.
+ *
+ * @return array{accounts:list<array<string,mixed>>,more:bool,sources:list<string>}
+ */
+function admin_search_account_section(string $sq, bool $sresolve, int $limit, int $offset): array
+{
+    require_once __DIR__ . '/ap-masto-entities.php';
+    if (!defined('AP_INBOX_LIB_ONLY')) {
+        define('AP_INBOX_LIB_ONLY', true);
+    }
+    require_once __DIR__ . '/ap-inbox.php';
+    $GLOBALS['vaak_search_account_sources'] = [];
+    $GLOBALS['vaak_search_selected_actor_witnesses'] = [];
+    $GLOBALS['vaak_search_account_witnesses'] = [];
+    $GLOBALS['vaak_search_collect_account_sources'] = true;
+    try { $accounts = admin_search_account_results($sq, $sresolve, $limit, $offset); }
+    finally { $GLOBALS['vaak_search_collect_account_sources'] = false; }
+    $sources = array_map(static fn(array $account): string => (string)($GLOBALS['vaak_search_account_sources'][hash('sha256',json_encode($account,JSON_THROW_ON_ERROR))] ?? rtrim((string)($account['uri'] ?? $account['url'] ?? ''),'/')), $accounts);
+    return ['accounts' => $accounts, 'more' => !empty($GLOBALS['vaak_search_account_more']), 'sources' => $sources];
+}
+
 /** @return array<string,mixed>|null */
 function admin_search_local_account(string $key): ?array
 {
@@ -12522,6 +12546,13 @@ function admin_search_run(string $sq, string $stype, bool $sresolve, int $limit 
     $sq = trim($sq);
     if ($sq === '') {
         return $empty;
+    }
+    // Default-off native collector. Any refusal leaves this PHP path intact.
+    if (ap_search_native_collect_enabled()) {
+        $native = ap_search_native_collect($sq, $stype, $sresolve, $limit, $offset);
+        if (is_array($native)) {
+            return $native;
+        }
     }
     require_once __DIR__ . '/ap-masto-entities.php';
     if (str_starts_with($sq, 'https://')
@@ -12622,14 +12653,9 @@ function admin_search_run(string $sq, string $stype, bool $sresolve, int $limit 
 
     $accounts = [];
     $acctMore = false;
+    $accountSources = [];
     if ($needAccounts) {
-        $GLOBALS['vaak_search_account_sources'] = [];
-        $GLOBALS['vaak_search_selected_actor_witnesses'] = [];
-        $GLOBALS['vaak_search_account_witnesses'] = [];
-        $GLOBALS['vaak_search_collect_account_sources'] = true;
-        try { $accounts = admin_search_account_results($sq, $sresolve, $limit, $offset); }
-        finally { $GLOBALS['vaak_search_collect_account_sources'] = false; }
-        $acctMore = !empty($GLOBALS['vaak_search_account_more']);
+        ['accounts' => $accounts, 'more' => $acctMore, 'sources' => $accountSources] = admin_search_account_section($sq, $sresolve, $limit, $offset);
     }
     $owner = admin_owner_user_id();
     $statuses = [];
@@ -12677,7 +12703,7 @@ function admin_search_run(string $sq, string $stype, bool $sresolve, int $limit 
     return [
         '_native_collector' => $nativeCollector,
         '_native_components' => ['query' => $sq, 'section' => $stype, 'offset' => $offset, 'limit' => $limit,
-            'account_sources' => array_map(static fn(array $account): string => (string)($GLOBALS['vaak_search_account_sources'][hash('sha256',json_encode($account,JSON_THROW_ON_ERROR))] ?? rtrim((string)($account['uri'] ?? $account['url'] ?? ''),'/')), $accounts)],
+            'account_sources' => $accountSources],
         'accounts' => $accounts,
         'hashtags' => $tags,
         'statuses' => $statuses,
@@ -23513,14 +23539,21 @@ if (!$isPartial && $view === 'search') {
     if ($earlyPostUrl !== '' && str_starts_with($earlyPostUrl, 'https://')) {
         require_once __DIR__ . '/ap-masto-entities.php';
         if (function_exists('ap_masto_url_looks_like_status') && ap_masto_url_looks_like_status($earlyPostUrl)) {
-            if (!defined('AP_INBOX_LIB_ONLY')) {
-                define('AP_INBOX_LIB_ONLY', true);
+            // Default-off native lookup of an already stored post; a miss
+            // keeps the PHP fetch below.
+            $nativeResolved = ap_search_native_collect_enabled() ? ap_search_native_resolve($earlyPostUrl) : null;
+            if (is_array($nativeResolved)) {
+                $resolvedPost = $nativeResolved['object'];
+            } else {
+                if (!defined('AP_INBOX_LIB_ONLY')) {
+                    define('AP_INBOX_LIB_ONLY', true);
+                }
+                require_once __DIR__ . '/ap-inbox.php';
+                @set_time_limit(45);
+                $resolvedPost = function_exists('ap_masto_resolve_pasted_status_url')
+                    ? ap_masto_resolve_pasted_status_url($earlyPostUrl)
+                    : $earlyPostUrl;
             }
-            require_once __DIR__ . '/ap-inbox.php';
-            @set_time_limit(45);
-            $resolvedPost = function_exists('ap_masto_resolve_pasted_status_url')
-                ? ap_masto_resolve_pasted_status_url($earlyPostUrl)
-                : $earlyPostUrl;
             if (is_string($resolvedPost) && str_starts_with($resolvedPost, 'https://')) {
                 // Don't deep-link into a post whose author is content-blocked for this viewer.
                 $blockAuthor = function_exists('ap_masto_actor_url_from_object_url')

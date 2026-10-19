@@ -226,3 +226,135 @@ function ap_search_native_render_batch(array $accounts, array $hashtags, array $
         return null;
     }
 }
+
+function ap_search_native_collect_enabled(): bool
+{
+    return getenv('VAAK_SEARCH_NATIVE_COLLECT') === '1'
+        && strlen((string) getenv('VAAK_SEARCH_NATIVE_SECRET')) >= 32;
+}
+
+/** Loopback http only, and only the two collector routes. */
+function ap_search_native_collect_url_allowed(string $url): bool
+{
+    $parts = parse_url($url);
+    return is_array($parts) && ($parts['scheme'] ?? '') === 'http'
+        && in_array($parts['host'] ?? '', ['127.0.0.1', '[::1]'], true)
+        && in_array($parts['path'] ?? '', ['/internal/search/collect', '/internal/search/resolve'], true)
+        && !isset($parts['user']) && !isset($parts['pass'])
+        && !isset($parts['query']) && !isset($parts['fragment']);
+}
+
+/** One JSON POST to a collector route. Null on any refusal or transport error. */
+function ap_search_native_post(string $route, array $payload, int $timeoutMs): ?array
+{
+    if (!function_exists('curl_init')) {
+        return null;
+    }
+    $base = (string) (getenv('VAAK_SEARCH_NATIVE_COLLECT_URL') ?: 'http://127.0.0.1:8787/internal/search/collect');
+    $url = preg_replace('~/internal/search/collect$~', '/internal/search/' . $route, $base) ?? '';
+    if (!ap_search_native_collect_url_allowed($url)) {
+        return null;
+    }
+    try {
+        $body = json_encode($payload, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR);
+        if (strlen($body) > 64 * 1024) {
+            return null;
+        }
+        $response = '';
+        $handle = curl_init($url);
+        if ($handle === false) {
+            return null;
+        }
+        curl_setopt_array($handle, [CURLOPT_POST => true, CURLOPT_POSTFIELDS => $body,
+            CURLOPT_HTTPHEADER => ['Content-Type: application/json', 'X-VAAK-Search-Token: ' . getenv('VAAK_SEARCH_NATIVE_SECRET')],
+            CURLOPT_RETURNTRANSFER => false, CURLOPT_FOLLOWLOCATION => false, CURLOPT_MAXREDIRS => 0,
+            CURLOPT_WRITEFUNCTION => static function ($handle, string $chunk) use (&$response): int {
+                if (strlen($response) + strlen($chunk) > 8 * 1024 * 1024) {
+                    return 0;
+                }
+                $response .= $chunk;
+                return strlen($chunk);
+            },
+            CURLOPT_CONNECTTIMEOUT_MS => 200, CURLOPT_TIMEOUT_MS => $timeoutMs,
+            CURLOPT_PROXY => '', CURLOPT_PROTOCOLS => CURLPROTO_HTTP]);
+        $success = curl_exec($handle);
+        $code = curl_getinfo($handle, CURLINFO_RESPONSE_CODE);
+        curl_close($handle);
+        if ($success === false || $code !== 200) {
+            return null;
+        }
+        $reply = json_decode($response, true, 512, JSON_THROW_ON_ERROR);
+        return is_array($reply) && ($reply['protocol_version'] ?? null) === 1 ? $reply : null;
+    } catch (Throwable $error) {
+        return null;
+    }
+}
+
+/**
+ * admin_search_run from the Rust worker: the same bundle, cache file and
+ * private collector descriptors. Null means PHP collects the whole request.
+ * When the worker leaves only the account section to PHP (remote host lists,
+ * WebFinger, bridged accounts), PHP fills that section here.
+ *
+ * @return array<string,mixed>|null
+ */
+function ap_search_native_collect(string $sq, string $stype, bool $sresolve, int $limit, int $offset): ?array
+{
+    if (!function_exists('admin_owner_user_id')) {
+        return null;
+    }
+    $owner = admin_owner_user_id();
+    if ($owner < 1) {
+        return null;
+    }
+    $sq = trim($sq);
+    $reply = ap_search_native_post('collect', ['protocol_version' => 1, 'owner_id' => $owner, 'query' => $sq,
+        'query_lower' => mb_strtolower($sq), 'section' => $stype, 'resolve' => $sresolve,
+        'limit' => $limit, 'offset' => $offset,
+        'cache_ttl' => function_exists('ap_redis_search_ttl') ? ap_redis_search_ttl() : 45], 10000);
+    if ($reply === null || !is_bool($reply['accounts_php'] ?? null)
+        || !is_array($reply['bundle'] ?? null) || !is_array($reply['bundle']['has_more'] ?? null)) {
+        return null;
+    }
+    $bundle = $reply['bundle'];
+    foreach (['accounts', 'hashtags', 'statuses'] as $section) {
+        if (!is_array($bundle[$section] ?? null) || !array_is_list($bundle[$section]) || count($bundle[$section]) > max(1, min(40, $limit))
+            || !is_bool($bundle['has_more'][$section] ?? null)) {
+            return null;
+        }
+    }
+    if ($reply['accounts_php']) {
+        if (!is_array($bundle['_native_components'] ?? null)) {
+            return null;
+        }
+        try {
+            $section = admin_search_account_section($sq, $sresolve, $limit, $offset);
+        } catch (Throwable $error) {
+            return null;
+        }
+        $bundle['accounts'] = $section['accounts'];
+        $bundle['has_more']['accounts'] = $section['more'];
+        $bundle['_native_components']['account_sources'] = $section['sources'];
+    }
+    return $bundle;
+}
+
+/**
+ * Cached part of ap_masto_resolve_pasted_status_url: a post already stored as
+ * an event or a local status. Returns ['object' => ?string], or null when the
+ * worker leaves it to PHP (an uncached post needs a network fetch).
+ *
+ * @return array{object:?string}|null
+ */
+function ap_search_native_resolve(string $url): ?array
+{
+    $reply = ap_search_native_post('resolve', ['protocol_version' => 1, 'url' => $url], 2000);
+    if ($reply === null || !array_key_exists('object', $reply)) {
+        return null;
+    }
+    $object = $reply['object'];
+    if ($object !== null && (!is_string($object) || !str_starts_with($object, 'https://'))) {
+        return null;
+    }
+    return ['object' => $object];
+}
