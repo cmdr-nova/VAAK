@@ -1,24 +1,15 @@
 #!/usr/bin/env bash
 # PHP (and two small drivers) that pass with no Postgres, Redis, or live worker.
 #
-# Not run here:
-#   Needs a service or a live worker:
-#     normalize-fixture-smoke.php (ap-db.php peer Postgres; migrations are not a schema)
-#     admin-safety-smoke.php, downrank-parity-smoke.php
-#     library-client-smoke.php, private-surfaces-client-smoke.php
-#     search-parity-smoke.php, settings-client-smoke.php
-#     you-client-smoke.php, you-integrations-client-smoke.php
-#     search-direct-undo-smoke.php's PostgreSQL copy (only if LIBRARY_FIXTURE_SOCKET is set;
-#       the SQLite path below does run)
-#   Already failing on current main (not gated, so a red run means a new break):
-#     search-native-bridge-smoke.php
-#     settings-behavior-smoke.php
-#     library-privacy-admission-smoke.php
-#     library-facts-independent-smoke.php (requires the privacy smoke)
-#     library-settings-durable-smoke.php
-#     library-controller-action-smoke.php
-#     migration-folder-reference-smoke.php
-#     direct-partial-blocks-smoke.php
+# Not run here: smokes that need PostgreSQL, Redis, or the Rust shadow worker.
+# .github/scripts/php-db-smokes.sh runs those in the CI "PHP database smokes" job:
+#   normalize-fixture-smoke.php, admin-safety-smoke.php, downrank-parity-smoke.php
+#   library-client-smoke.php, private-surfaces-client-smoke.php
+#   search-parity-smoke.php, settings-client-smoke.php
+#   you-client-smoke.php, you-integrations-client-smoke.php
+#   direct-partial-blocks-smoke.php (PostgreSQL over a Unix socket)
+#   search-direct-undo-smoke.php's PostgreSQL copy (LIBRARY_FIXTURE_SOCKET set;
+#     the SQLite path below runs here too)
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -70,6 +61,10 @@ php_tests=(
   api/bin/library-page-capture.php
   api/bin/library-privacy-capture.php
   api/bin/library-moderation-actions-smoke.php
+  api/bin/library-privacy-admission-smoke.php
+  api/bin/library-facts-independent-smoke.php
+  api/bin/library-settings-durable-smoke.php
+  api/bin/library-controller-action-smoke.php
   api/bin/library-native-bridge-test.php
   api/bin/profile-local-chrome-capture.php
   api/bin/profile-local-native-bridge-test.php
@@ -79,6 +74,7 @@ php_tests=(
   api/bin/profile-bsky-native-bridge-test.php
   api/bin/profile-guest-actions-capture.php
   api/bin/library-own-cw-smoke.php
+  api/bin/migration-folder-reference-smoke.php
   api/bin/login-hardening-smoke.php
   api/bin/migration-php-reference-smoke.php
   api/bin/moderation-alias-cache-smoke.php
@@ -107,8 +103,10 @@ php_tests=(
   api/bin/recommendations-behavior-smoke.php
   api/bin/search-direct-undo-smoke.php
   api/bin/search-indexing-behavior-smoke.php
+  api/bin/search-native-bridge-smoke.php
   api/bin/schema-probe-cache-smoke.php
   api/bin/search-quote-preview-boundary-smoke.php
+  api/bin/settings-behavior-smoke.php
   api/bin/settings-parity-smoke.php
   api/bin/shadow-http-token-smoke.php
   api/bin/trends-response-cache-smoke.php

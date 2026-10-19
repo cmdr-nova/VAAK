@@ -14,22 +14,17 @@
 #                     does not fail the job. The job fails when the harness
 #                     breaks or a Rust producer errors. No Postgres and no
 #                     live worker. See parity/README.md to add a case.
-#
-#                     ActivityPub normalize fixtures under api/fixtures/normalize
-#                     are not replayed here: normalize-fixture-smoke.php opens
-#                     Postgres, and vaak-types only round-trips expected.json.
-#
-# Not in this workflow (no service, or already red on current main):
-#   - Postgres. Migrations under api/migrations and ops/migrations are incremental
-#     and are not a bootable schema. normalize-fixture-smoke.php defaults to
-#     peer database "novalandia" through ap-db.php.
-#   - Live worker client smokes (*-client-smoke.php, search-parity-smoke.php,
-#     admin-safety-smoke.php, downrank-parity-smoke.php) require an explicit
-#     loopback Rust URL and/or an isolated database URL.
-#   - search-direct-undo-smoke.php's PostgreSQL INTEGER/BIGINT copy runs only
-#     when LIBRARY_FIXTURE_SOCKET is set. CI runs the SQLite path.
-#   - PHP scripts that fail on current main are omitted so this workflow stays
-#     a signal for new breakage. They are listed in the pull request.
+#   php-db          — PHP smokes that need Postgres, Redis, or the Rust shadow
+#                     worker (`.github/scripts/php-db-smokes.sh`). postgres:16
+#                     and redis:7 service containers. The schema is staged
+#                     from the migrated SQLite tables
+#                     (`.github/scripts/pg-ci-schema.php`), then
+#                     deploy/remote/migrate.php runs as it does on deploy.
+#                     Covers normalize-fixture-smoke.php (the ActivityPub
+#                     normalize fixtures), the *-client smokes against
+#                     `vaak-worker serve`, admin-safety, downrank-parity,
+#                     search-parity, direct-partial-blocks, and the
+#                     PostgreSQL copy of search-direct-undo-smoke.php.
 
 name: CI
 
@@ -38,6 +33,8 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # Run on a branch before its pull request exists.
+  workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
@@ -151,3 +148,59 @@ jobs:
           name: php-rust-parity-report
           path: parity-report/
           if-no-files-found: warn
+
+  php-db:
+    name: PHP database smokes
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        # The socket directory is shared with the runner for the smokes that
+        # connect over a Unix socket under /tmp/.
+        volumes:
+          - /tmp/vaak-pg-socket:/var/run/postgresql
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install PHP 8.3
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.3"
+          extensions: mbstring, pdo_sqlite, sqlite3, curl, pdo_pgsql, pgsql, redis
+          coverage: none
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - name: Build vaak-worker
+        working-directory: rust
+        run: cargo build -p vaak-worker --locked
+      - name: Database smokes
+        env:
+          PGHOST: 127.0.0.1
+          PGPORT: "5432"
+          PGUSER: postgres
+          LIBRARY_FIXTURE_SOCKET: /tmp/vaak-pg-socket
+          VAAK_REDIS_DSN: redis://127.0.0.1:6379/0
+          VAAK_WORKER_BIN: ${{ github.workspace }}/rust/target/debug/vaak-worker
+        run: .github/scripts/php-db-smokes.sh
