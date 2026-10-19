@@ -14,6 +14,13 @@ header('Referrer-Policy: strict-origin-when-cross-origin');
 if (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') {
     header('Strict-Transport-Security: max-age=31536000; includeSubDomains');
 }
+require_once dirname(__DIR__) . '/api/ap-csp.php';
+// Browsers POST CSP violation reports here; no session, no CSRF, no output.
+if (isset($_GET['csp_report'])) {
+    require_once dirname(__DIR__) . '/api/ap-redis.php';
+    ap_csp_report_handle();
+}
+ap_csp_send_headers('app');
 
 /** Keep bootstrap failures human-readable instead of returning a blank page. */
 function vaak_render_failure(?Throwable $error = null): void

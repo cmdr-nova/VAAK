@@ -19,6 +19,8 @@ if (!$vaakAdminLibOnly) {
     }
     header('Cache-Control: no-store');
     header('X-Robots-Tag: noindex, nofollow');
+    require_once __DIR__ . '/ap-csp.php';
+    ap_csp_send_headers('app');
     $vaakCorrelationId = trim((string) ($_SERVER['HTTP_X_REQUEST_ID'] ?? ''));
     if ($vaakCorrelationId === '' || !preg_match('/^[A-Za-z0-9._:-]{8,96}$/', $vaakCorrelationId)) {
         $vaakCorrelationId = bin2hex(random_bytes(8));
