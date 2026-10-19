@@ -78,6 +78,7 @@ mod preview_fixture_server;
 mod direct_context;
 mod direct_render;
 mod search_bridge;
+mod search_collect;
 mod search_components;
 mod cleanup;
 mod follow_fallback;

@@ -173,6 +173,8 @@ pub async fn serve(cfg: Config, bind: SocketAddr) -> Result<()> {
         ;
     if crate::library::bridge::enabled(){app=app.route("/internal/library/render",post(internal_library_render).layer(axum::extract::DefaultBodyLimit::max(2*1024*1024)).layer(axum::middleware::map_response(crate::profile_bridge::no_store)));}
     if crate::search_bridge::enabled(){app=app.route("/internal/search/render",post(internal_search_render).layer(axum::extract::DefaultBodyLimit::max(2*1024*1024)).layer(axum::middleware::map_response(crate::profile_bridge::no_store)));}
+    if crate::search_collect::enabled(){app=app.route("/internal/search/collect",post(internal_search_collect).layer(axum::extract::DefaultBodyLimit::max(64*1024)).layer(axum::middleware::map_response(crate::profile_bridge::no_store)));}
+    if crate::search_collect::enabled(){app=app.route("/internal/search/resolve",post(internal_search_resolve).layer(axum::extract::DefaultBodyLimit::max(16*1024)).layer(axum::middleware::map_response(crate::profile_bridge::no_store)));}
     if crate::profile_local::enabled(){app=app.route("/internal/profile/local",post(internal_profile_local).layer(axum::extract::DefaultBodyLimit::max(256*1024)).layer(axum::middleware::map_response(crate::profile_bridge::no_store)));}
     if crate::profile_local::enabled(){app=app.route("/internal/profile/remote",post(internal_profile_remote).layer(axum::extract::DefaultBodyLimit::max(256*1024)).layer(axum::middleware::map_response(crate::profile_bridge::no_store)));}
     if crate::profile_local::enabled(){app=app.route("/internal/profile/bsky",post(internal_profile_bsky).layer(axum::extract::DefaultBodyLimit::max(256*1024)).layer(axum::middleware::map_response(crate::profile_bridge::no_store)));}
@@ -1307,6 +1309,12 @@ async fn internal_library_render(State(state):State<AppState>,headers:axum::http
 
 async fn internal_search_render(State(state):State<AppState>,headers:axum::http::HeaderMap,bytes:axum::body::Bytes)->axum::response::Response{
     crate::search_bridge::render(&state.cfg,headers,bytes).await
+}
+async fn internal_search_collect(State(state):State<AppState>,headers:axum::http::HeaderMap,bytes:axum::body::Bytes)->axum::response::Response{
+    crate::search_collect::collect(&state.cfg,headers,bytes).await
+}
+async fn internal_search_resolve(State(state):State<AppState>,headers:axum::http::HeaderMap,bytes:axum::body::Bytes)->axum::response::Response{
+    crate::search_collect::resolve(&state.cfg,headers,bytes).await
 }
 async fn internal_profile_local(State(state):State<AppState>,headers:axum::http::HeaderMap,bytes:axum::body::Bytes)->axum::response::Response{crate::profile_local::render(&state.cfg,headers,bytes).await}
 async fn internal_profile_remote(State(state):State<AppState>,headers:axum::http::HeaderMap,bytes:axum::body::Bytes)->axum::response::Response{crate::profile_remote::render(&state.cfg,headers,bytes).await}

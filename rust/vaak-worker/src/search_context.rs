@@ -179,6 +179,19 @@ pub(crate) async fn require_component_accounts(db:&Client,owner:i64,actor:&str,k
  Ok(())
 }
 
+/// ap_search_account_hidden for the native account collector, with the same
+/// owner identity the component admission uses.
+pub(crate) struct SearchAccountPolicy {identity:SearchIdentity,hidden:HiddenSets}
+impl SearchAccountPolicy {
+ pub(crate) async fn load(db:&Client,owner:i64,actor:&str,key:&str)->Result<Self>{
+  let mut identity=SearchIdentity{refs:crate::hidden::actor_aliases(actor).iter().map(|v|v.to_ascii_lowercase()).collect()};
+  for value in [format!("acct:{}",key.to_ascii_lowercase()),format!("acct:{}@mkultra.monster",key.to_ascii_lowercase()),format!("acct:{}@vaak.monster",key.to_ascii_lowercase())]{identity.refs.insert(value);}
+  let mut hidden=crate::hidden::load_search_hidden_sets(db,owner).await?;hidden.muted_phrases.clear();
+  Ok(Self{identity,hidden})
+ }
+ pub(crate) fn hidden(&self,account:&Value)->bool{account_hidden(account,&self.identity,&self.hidden)}
+}
+
 /// Actual hashtag corpus: outbox rows use indexing/actor/audience policy but
 /// do not require the separate masto_statuses projection. Event/mention rows
 /// use the complete ordinary Search status current-source predicate.
