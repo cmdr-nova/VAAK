@@ -233,6 +233,25 @@ function ap_search_native_collect_enabled(): bool
         && strlen((string) getenv('VAAK_SEARCH_NATIVE_SECRET')) >= 32;
 }
 
+/**
+ * The worker answers only from an index the PHP writers have finished, and it
+ * is asked before ap_search_fts_query would run them. Run the same two writers
+ * first, so a busy instance (a new post every few seconds) does not make the
+ * newest-event check fail on nearly every search.
+ */
+function ap_search_native_prepare_index(): void
+{
+    try {
+        require_once __DIR__ . '/ap-search-fts.php';
+        if (function_exists('ap_search_fts_available') && ap_search_fts_available()) {
+            ap_search_fts_maybe_backfill_slice();
+            ap_search_fts_maybe_index_recent_events();
+        }
+    } catch (Throwable $error) {
+        error_log('[ap-search-native] index prepare: ' . $error->getMessage());
+    }
+}
+
 /** Loopback http only, and only the two collector routes. */
 function ap_search_native_collect_url_allowed(string $url): bool
 {
