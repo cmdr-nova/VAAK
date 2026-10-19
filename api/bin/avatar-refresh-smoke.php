@@ -238,6 +238,28 @@ $GLOBALS['ap_avatar_host_budget'] = [];
 ap_avatar_refresh_resolve(['https://bsky.app/profile/did:plc:missingactor'], []);
 $check($GLOBALS['fixture_pushes'] !== [], 'bsky miss pushes the warm queue');
 
+$GLOBALS['fixture_pushes'] = [];
+$GLOBALS['ap_avatar_host_budget'] = [];
+ap_avatar_refresh_resolve(['https://bsky.app/profile/alice.bsky.example'], []);
+$handlePush = json_decode((string) ($GLOBALS['fixture_pushes'][0][1] ?? ''), true);
+$check(($handlePush['did'] ?? '') === 'https://bsky.app/profile/alice.bsky.example', 'handle-form bsky miss pushes the warm queue');
+
+$GLOBALS['fixture_pushes'] = [];
+$GLOBALS['ap_avatar_host_budget'] = [];
+$many = [];
+for ($i = 0; $i < 20; $i++) {
+    $many[] = 'https://bsky.app/profile/did:plc:many' . $i;
+}
+ap_avatar_refresh_resolve($many, []);
+$check(count($GLOBALS['fixture_pushes']) === 20, 'bsky misses are not capped by the per-host budget');
+
+$GLOBALS['ap_avatar_host_budget'] = [];
+$brokenBsky = ap_avatar_refresh_resolve(
+    ['https://bsky.app/profile/did:plc:dee'],
+    ['https://bsky.app/profile/did:plc:dee']
+);
+$check(str_starts_with($brokenBsky['https://bsky.app/profile/did:plc:dee'] ?? '', 'https://cdn.bsky.app/'), 'broken bsky avatar gets the profile cache url');
+
 $GLOBALS['fixture_warm'] = [];
 $GLOBALS['ap_avatar_host_budget'] = [];
 $broken = ap_avatar_refresh_resolve(

@@ -2574,35 +2574,64 @@ pub(crate) async fn fetch_bsky_map(db: &Client, uris: &[String]) -> Result<HashM
             }
         }
     }
-    // Jetstream can persist a thin post before its author view arrives. Use the
-    // durable actor-profile cache as a second read source so cards do not paint
-    // a DID/default avatar while actor-warm catches up.
-    let missing: Vec<String> = map.values()
-        .filter(|r| r.author_handle.trim().is_empty() || r.author_avatar.trim().is_empty())
-        .map(|r| r.author_did.clone())
-        .filter(|did| !did.trim().is_empty())
+    // Jetstream can persist a thin post before its author view arrives, and a
+    // post row keeps the avatar CID it was stored with even after the author
+    // changes it (the old blob then 404s on the CDN). The durable actor-profile
+    // cache is what actor-warm refreshes, so it fills gaps and replaces a post
+    // avatar that is older than the cached profile. Both writers key a row by
+    // the bare DID, so the primary-key lookup is enough.
+    let mut dids: Vec<String> = map.values()
+        .map(|r| r.author_did.trim().to_string())
+        .filter(|did| did.starts_with("did:"))
         .collect();
-    if !missing.is_empty() {
+    dids.sort();
+    dids.dedup();
+    if !dids.is_empty() {
         if let Ok(rows) = db.query(
-            "SELECT did, profile_json FROM bsky_actor_profiles WHERE did = ANY($1) OR actor_ref = ANY($1)",
-            &[&missing],
+            "SELECT actor_ref, profile_json, COALESCE(updated_at::text,'') FROM bsky_actor_profiles WHERE actor_ref = ANY($1)",
+            &[&dids],
         ).await {
             for row in rows {
                 let did: String = row.get(0);
                 let raw: String = row.get(1);
+                let updated_at: String = row.get(2);
                 let Ok(profile) = serde_json::from_str::<Value>(&raw) else { continue; };
                 let handle = profile.get("handle").and_then(|v| v.as_str()).unwrap_or("").to_string();
                 let display = profile.get("displayName").or_else(|| profile.get("display_name")).and_then(|v| v.as_str()).unwrap_or("").to_string();
                 let avatar = crate::actor_warm::bsky_avatar_url(profile.get("avatar"), &did).unwrap_or_default();
+                let profile_ts = bsky_profile_ts(&updated_at);
                 for post in map.values_mut().filter(|p| p.author_did == did) {
                     if post.author_handle.trim().is_empty() { post.author_handle = handle.clone(); }
                     if post.author_display.trim().is_empty() { post.author_display = display.clone(); }
-                    if post.author_avatar.trim().is_empty() { post.author_avatar = avatar.clone(); }
+                    if prefer_profile_avatar(&post.author_avatar, &post.indexed_at, &avatar, profile_ts) {
+                        post.author_avatar = avatar.clone();
+                    }
                 }
             }
         }
     }
     Ok(map)
+}
+
+fn bsky_profile_ts(raw: &str) -> i64 {
+    if raw.trim().is_empty() {
+        return 0;
+    }
+    chrono::DateTime::parse_from_rfc3339(&format_time(raw))
+        .map(|d| d.timestamp())
+        .unwrap_or(0)
+}
+
+/// The profile avatar wins when the post has none, or when the profile was
+/// fetched after the post was indexed (the post's CID may be a retired avatar).
+fn prefer_profile_avatar(post_avatar: &str, post_indexed_at: &str, profile_avatar: &str, profile_ts: i64) -> bool {
+    if profile_avatar.is_empty() || post_avatar == profile_avatar {
+        return false;
+    }
+    if post_avatar.trim().is_empty() || !post_avatar.starts_with("https://") {
+        return true;
+    }
+    profile_ts > 0 && profile_ts >= bsky_profile_ts(post_indexed_at)
 }
 
 /// Indexed by `idx_bsky_posts_post_rkey`. The delimiter and argument order
@@ -5349,6 +5378,20 @@ pub(crate) async fn statuses_for_older_hits(
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn profile_avatar_replaces_missing_or_older_post_avatar() {
+        let fresh = "https://cdn.bsky.app/img/avatar/plain/did:plc:a/bafkreinewavatarcid0000001@jpeg";
+        let old = "https://cdn.bsky.app/img/avatar/plain/did:plc:a/bafkreioldavatarcid0000001@jpeg";
+        let ts = bsky_profile_ts("2026-10-19T12:00:00+00:00");
+        assert!(ts > 0);
+        assert!(prefer_profile_avatar("", "2026-10-19 13:00:00+00", fresh, ts), "thin Jetstream row takes the profile avatar");
+        assert!(prefer_profile_avatar(old, "2026-10-18 09:00:00+00", fresh, ts), "post older than the profile fetch takes the new avatar");
+        assert!(!prefer_profile_avatar(old, "2026-10-19 13:00:00+00", fresh, ts), "post newer than the profile keeps its own avatar");
+        assert!(!prefer_profile_avatar(old, "2026-10-18 09:00:00+00", "", ts), "empty profile avatar never wins");
+        assert!(!prefer_profile_avatar(fresh, "2026-10-18 09:00:00+00", fresh, ts));
+        assert!(!prefer_profile_avatar(old, "2026-10-18 09:00:00+00", fresh, 0), "unknown fetch time keeps the post avatar");
+    }
 
     #[tokio::test]
     #[ignore = "requires sanitized production quote rows and isolated genuine PostgreSQL schemas"]

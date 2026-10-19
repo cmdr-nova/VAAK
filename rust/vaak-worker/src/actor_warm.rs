@@ -78,6 +78,14 @@ fn normalize_actor_ref(raw: &str) -> Option<String> {
         }
         return Some(urlencoding_decode(ident));
     }
+    // Bridgy Fed's ActivityPub face of a Bluesky account.
+    if let Some(rest) = s.strip_prefix("https://bsky.brid.gy/ap/") {
+        let did = urlencoding_decode(rest.split(['?', '#', '/']).next().unwrap_or("").trim());
+        if did.starts_with("did:") && !did.contains('%') {
+            return Some(did);
+        }
+        return None;
+    }
     // Bare handle
     if s.contains('.') && !s.contains(' ') && !s.contains('/') {
         return Some(s.trim_start_matches('@').to_string());
@@ -452,17 +460,20 @@ async fn upsert_and_cache(cfg: &Config, owner: i64, profile: &Value) -> Result<(
             .with_context(|| format!("upsert bsky_actor_profiles {actor_ref}"))?;
         }
 
-        // Mark matching PG refresh rows succeeded (best-effort).
+        // Mark matching PG refresh rows succeeded (best-effort). Rows queued by
+        // handle URL or Bridgy URL used to stay pending forever, and the PG scan
+        // picks the oldest pending rows first, so they kept re-enqueueing the
+        // same 20 actors and starved newer authors.
         if owner > 0 {
-            let did_url = format!("https://bsky.app/profile/{did}");
+            let done = done_refs(&did, &handle);
             let _ = db
                 .execute(
                     "UPDATE bsky_actor_refresh_queue
                      SET status = 'succeeded', attempts = 0, locked_at = NULL, last_error = NULL
                      WHERE owner_user_id = $1
                        AND status IN ('pending', 'processing')
-                       AND (actor_ref = $2 OR actor_ref = $3)",
-                    &[&owner, &did, &did_url],
+                       AND actor_ref = ANY($2)",
+                    &[&owner, &done],
                 )
                 .await;
         }
@@ -478,6 +489,21 @@ async fn upsert_and_cache(cfg: &Config, owner: i64, profile: &Value) -> Result<(
     let mut cache = redis_util::connect(&cfg.redis_url).await?;
     redis_util::json_set(&mut cache, &flat_redis_key(&did), &flat, FLAT_TTL_SECS).await?;
     Ok(())
+}
+
+/// Every spelling PHP may have queued for one account.
+fn done_refs(did: &str, handle: &str) -> Vec<String> {
+    let mut refs = vec![
+        did.to_string(),
+        format!("https://bsky.app/profile/{did}"),
+        format!("https://bsky.app/profile/{}", did.replace(':', "%3A")),
+        format!("https://bsky.brid.gy/ap/{did}"),
+    ];
+    if !handle.is_empty() && !handle.starts_with("did:") {
+        refs.push(handle.to_string());
+        refs.push(format!("https://bsky.app/profile/{handle}"));
+    }
+    refs
 }
 
 pub async fn run_worker_loop(cfg: &Config, pg_scan_interval_secs: u64) -> Result<()> {
@@ -721,6 +747,24 @@ mod avatar_url_tests {
         assert_eq!(bsky_avatar_url(Some(&blob), "did%3Aplc%3Aabc"), None);
         assert_eq!(bsky_avatar_url(Some(&blob), ""), None);
         assert_eq!(bsky_avatar_url(Some(&json!("http://cdn.bsky.app/x")), did), None);
+    }
+
+    #[test]
+    fn actor_refs_normalize_and_mark_done() {
+        assert_eq!(normalize_actor_ref("https://bsky.brid.gy/ap/did:plc:abc").as_deref(), Some("did:plc:abc"));
+        assert_eq!(normalize_actor_ref("https://bsky.brid.gy/ap/did%3Aplc%3Aabc").as_deref(), Some("did:plc:abc"));
+        assert_eq!(normalize_actor_ref("https://bsky.app/profile/alice.bsky.social").as_deref(), Some("alice.bsky.social"));
+        let done = done_refs("did:plc:abc", "alice.bsky.social");
+        for r in [
+            "did:plc:abc",
+            "https://bsky.app/profile/did:plc:abc",
+            "https://bsky.app/profile/did%3Aplc%3Aabc",
+            "https://bsky.brid.gy/ap/did:plc:abc",
+            "https://bsky.app/profile/alice.bsky.social",
+            "alice.bsky.social",
+        ] {
+            assert!(done.iter().any(|d| d == r), "missing {r}");
+        }
     }
 
     #[test]

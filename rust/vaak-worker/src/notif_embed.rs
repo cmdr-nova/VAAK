@@ -3955,7 +3955,7 @@ pub fn paint_lean_embed_from(
             String::new()
         };
         let av_img = format!(
-            "<img class=\"tweet-av\" src=\"{}\" alt=\"\" width=\"40\" height=\"40\" loading=\"lazy\" decoding=\"async\" referrerpolicy=\"no-referrer\" data-profile-hover-actor=\"{}\"{}>",
+            "<img class=\"tweet-av\" src=\"{}\" alt=\"\" width=\"40\" height=\"40\" loading=\"lazy\" decoding=\"async\" referrerpolicy=\"no-referrer\" onerror=\"this.onerror=null;this.src='https://mkultra.monster/img/avatar/default.webp'\" data-profile-hover-actor=\"{}\"{}>",
             esc(av),
             esc(actor_ref),
             hover_meta
