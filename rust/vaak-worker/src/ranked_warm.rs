@@ -1102,6 +1102,135 @@ fn stamp_bsky_sort(
     }
 }
 
+/// Every key a Bluesky author can be stored under in ap_deprioritized_actors
+/// or the rank weights: the DID and its bsky.app profile URLs.
+fn bsky_author_keys(key: &BskyKey) -> Vec<String> {
+    let mut out = Vec::new();
+    let did = key.author_did.trim().to_ascii_lowercase();
+    if did.starts_with("did:") {
+        out.push(format!("https://bsky.app/profile/{did}"));
+        out.push(did);
+    }
+    let handle = key.author_handle.trim().trim_start_matches('@').to_ascii_lowercase();
+    if !handle.is_empty() && !handle.starts_with("did:") {
+        out.push(format!("https://bsky.app/profile/{handle}"));
+    }
+    out
+}
+
+/// Deprioritize on Home moves a Bluesky author back six hours, the same as
+/// `apply_deprioritized_rank` does for fediverse authors.
+fn apply_bsky_deprioritized(keys: &mut [BskyKey], actors: &HashSet<String>) {
+    if actors.is_empty() {
+        return;
+    }
+    for key in keys.iter_mut() {
+        if bsky_author_keys(key).iter().any(|k| actors.contains(k)) {
+            key.sort -= 6 * 3600;
+        }
+    }
+}
+
+/// The toxicity downrank, run over Bluesky posts through the same
+/// suppression state fediverse authors use.
+async fn apply_bsky_toxicity_downrank(db: &Client, owner: i64, keys: &mut [BskyKey]) -> Result<()> {
+    let mut items: Vec<TimelineItem> = keys
+        .iter()
+        .map(|key| {
+            let actor = format!("https://bsky.app/profile/{}", key.author_did.trim());
+            TimelineItem::event(
+                key.uri.clone(),
+                key.sort,
+                actor.clone(),
+                actor,
+                key.text.clone(),
+                "public".into(),
+                key.uri.clone(),
+                "Create".into(),
+                "bluesky",
+            )
+        })
+        .collect();
+    apply_toxicity_downrank(db, owner, &mut items).await?;
+    for (key, item) in keys.iter_mut().zip(items) {
+        key.sort = item.sort;
+    }
+    Ok(())
+}
+
+const BSKY_RECOMMENDATION_MAX: usize = 4;
+
+/// Bluesky posts the owner has seen in their Bluesky feeds from accounts they
+/// don't follow, scored like fediverse recommendations: author and hashtag
+/// affinity, at least 1.5, one post per author.
+async fn fetch_bsky_recommendation_keys(
+    db: &Client,
+    owner: i64,
+    exclude_did: Option<&str>,
+    hidden: &hidden::HiddenSets,
+    deprioritized: &HashSet<String>,
+    actor_weights: &HashMap<String, f64>,
+    tag_weights: &HashMap<String, i32>,
+) -> Result<Vec<BskyKey>> {
+    if owner < 1 || (actor_weights.is_empty() && tag_weights.is_empty()) {
+        return Ok(Vec::new());
+    }
+    let sql = format!(
+        "SELECT p.bsky_uri, COALESCE(l.fediverse_id, ''), COALESCE(p.author_did, ''),
+                COALESCE(p.author_handle, ''), COALESCE(p.text, ''),
+                COALESCE(p.indexed_at::text, ''), {BSKY_EXTERNAL_HINT_SQL}
+         FROM bsky_posts p
+         LEFT JOIN bsky_post_links l ON l.bsky_uri = p.bsky_uri
+         WHERE EXISTS (
+           SELECT 1 FROM bsky_post_observations o
+           WHERE o.bsky_uri = p.bsky_uri AND o.owner_user_id = $1::bigint
+         )
+           AND NOT EXISTS (
+             SELECT 1 FROM bsky_graph_sync g
+             WHERE g.owner_user_id = $1::bigint AND g.kind = 'follow' AND g.target_did = p.author_did
+           )
+           AND p.text IS NOT NULL
+           AND COALESCE(p.reply_parent, '') = ''
+           AND p.indexed_at::timestamptz >= NOW() - INTERVAL '7 days'
+         ORDER BY p.indexed_at DESC, p.updated_at DESC
+         LIMIT 160"
+    );
+    let rows = db
+        .query(&sql, &[&owner])
+        .await
+        .context("select bsky recommendation keys")?;
+    let muted = load_muted_phrases(db, owner).await;
+    let mut seen_authors = HashSet::new();
+    let mut out = Vec::new();
+    for row in rows {
+        if out.len() >= BSKY_RECOMMENDATION_MAX {
+            break;
+        }
+        let Some(mut key) = bsky_key_from_row(&row)? else {
+            continue;
+        };
+        if exclude_did.is_some_and(|did| key.author_did == did)
+            || bsky_author_hidden(hidden, &key.author_did)
+            || bsky_author_keys(&key).iter().any(|k| deprioritized.contains(k))
+            || text_matches_muted(&key.text, &muted)
+            || seen_authors.contains(&key.author_did)
+        {
+            continue;
+        }
+        let mut score = bsky_actor_weight(&key, actor_weights);
+        for tag in extract_hashtags(&key.text) {
+            score += tag_weights.get(&tag).copied().unwrap_or(0) as f64 * 0.5;
+        }
+        if score < 1.5 {
+            continue;
+        }
+        key.sort = key.indexed_at + recommendation_bump(score);
+        seen_authors.insert(key.author_did.clone());
+        out.push(key);
+    }
+    Ok(out)
+}
+
 /// Drop a later post when the same author already contributed the same
 /// external link. Call after `stamp_bsky_sort` so the higher-ranked copy stays.
 /// The SQL per-author LIMIT can still spend a slot on the duplicate; that is
@@ -2854,6 +2983,47 @@ pub async fn warm_home_native(cfg: &Config, owner_user_id: i64) -> Result<String
     bsky.retain(|row| !mirrors.get(&row.uri).map(|flag| flag.mirror || flag.note_id.is_some()).unwrap_or(false));
     // Algorithm-off leaves both maps empty, so this keeps indexed_at order.
     stamp_bsky_sort(&mut bsky, &actor_weights, &tag_weights);
+    // Bluesky gets the same treatment as fediverse posts above: Deprioritize,
+    // recommendations and the toxicity downrank.
+    apply_bsky_deprioritized(&mut bsky, &deprioritized);
+    if algorithm_on {
+        let existing: HashSet<String> = bsky.iter().map(|row| row.uri.clone()).collect();
+        match fetch_bsky_recommendation_keys(
+            &db,
+            owner_user_id,
+            own_did.as_deref(),
+            &hidden,
+            &deprioritized,
+            &actor_weights,
+            &tag_weights,
+        )
+        .await
+        {
+            Ok(recs) => {
+                let uris: Vec<String> = recs.iter().map(|row| row.uri.clone()).collect();
+                let mirrors = crate::home_bsky_mirrors::flags(&db, &uris).await?;
+                bsky.extend(recs.into_iter().filter(|row| {
+                    !existing.contains(&row.uri)
+                        && !mirrors.get(&row.uri).map(|flag| flag.mirror || flag.note_id.is_some()).unwrap_or(false)
+                }));
+            }
+            Err(e) => tracing::warn!(
+                owner = owner_user_id,
+                error = %format!("{e:#}"),
+                "native home bluesky recommendations skipped"
+            ),
+        }
+        if downranking_on {
+            if let Err(e) = apply_bsky_toxicity_downrank(&db, owner_user_id, &mut bsky).await {
+                tracing::warn!(
+                    owner = owner_user_id,
+                    error = %format!("{e:#}"),
+                    "native home bluesky toxicity downrank skipped"
+                );
+            }
+        }
+    }
+    bsky.sort_by(|a, b| b.sort.cmp(&a.sort).then(b.indexed_at.cmp(&a.indexed_at)));
     collapse_repeated_external_posts(&mut bsky);
     ranked = merge_bsky_ranked(ranked, &bsky, &hidden);
 
@@ -3852,6 +4022,26 @@ mod tests {
         assert_eq!(ranked[0]["sort"], json!(1_700_000_000));
         assert_eq!(ranked[0]["o"], json!("https://example.com/notes/1"));
         assert_eq!(ranked[0]["k"], json!("event"));
+    }
+
+    #[test]
+    fn deprioritize_reaches_bluesky_authors_by_did_or_handle() {
+        let mut keys = vec![
+            bsky_key("at://did:plc:a/app.bsky.feed.post/1", "did:plc:a", 1_000_000, 1_000_000),
+            bsky_key("at://did:plc:b/app.bsky.feed.post/2", "did:plc:b", 1_000_000, 1_000_000),
+            bsky_key("at://did:plc:c/app.bsky.feed.post/3", "did:plc:c", 1_000_000, 1_000_000),
+        ];
+        keys[1].author_handle = "Bee.bsky.social".into();
+        let actors: HashSet<String> = [
+            "https://bsky.app/profile/did:plc:a".to_string(),
+            "https://bsky.app/profile/bee.bsky.social".to_string(),
+        ]
+        .into_iter()
+        .collect();
+        apply_bsky_deprioritized(&mut keys, &actors);
+        assert_eq!(keys[0].sort, 1_000_000 - 6 * 3600);
+        assert_eq!(keys[1].sort, 1_000_000 - 6 * 3600);
+        assert_eq!(keys[2].sort, 1_000_000);
     }
 
     #[test]
