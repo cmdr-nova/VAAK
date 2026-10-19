@@ -20,15 +20,17 @@ function ap_admin_native_reply(array $reply,array $request): ?string
     $keys=array_keys($reply);sort($keys);$expected=['protocol_version','ok','request_binding','source_count','rows','html'];sort($expected);
     if($keys!==$expected || $reply['protocol_version']!==1 || $reply['ok']!==true || !is_string($reply['html'])
         || strlen($reply['html'])>2*1024*1024 || !is_int($reply['source_count']) || !is_array($reply['rows'])
-        || !array_is_list($reply['rows']) || count($reply['rows'])!==$reply['source_count'] || count($reply['rows'])>match($request['view']){'users'=>20,'blocks'=>1000,'settings_lists'=>3000,'settings_follow_requests'=>1000,'settings_mutes'=>1000,'settings_featured'=>40,default=>100}) return null;
+        || !array_is_list($reply['rows']) || count($reply['rows'])!==$reply['source_count'] || count($reply['rows'])>match($request['view']){'users'=>20,'blocks'=>1000,'settings_lists'=>3000,'settings_follow_requests'=>1000,'settings_mutes'=>1000,'settings_featured'=>40,'moderation'=>80,default=>100}) return null;
     $binding=[];foreach(['owner_id','view','mode','offset','approvals_enabled'] as $key)$binding[$key]=$request[$key];
     if($request['view']==='users')$binding['search']=$request['search'];
     if(str_starts_with($request['view'],'settings_'))$binding['viewer_admin']=$request['viewer_admin'];
+    if($request['view']==='moderation')$binding['filter']=$request['filter'];
     if(!is_array($reply['request_binding']))return null;
     $bindingKeys=array_keys($reply['request_binding']);sort($bindingKeys);$requiredBinding=array_keys($binding);sort($requiredBinding);if($bindingKeys!==$requiredBinding)return null;
     foreach($binding as $key=>$value)if($reply['request_binding'][$key]!==$value)return null;
     if($request['view']==='settings_lists')return ap_settings_native_rows_valid($reply['rows'])?$reply['html']:null;
     if(str_starts_with($request['view'],'settings_'))return ap_settings_native_account_rows_valid($request['view'],$reply['rows'])?$reply['html']:null;
+    if($request['view']==='moderation')return ap_moderation_native_rows_valid($reply['rows'])?$reply['html']:null;
     $required=match($request['view']){'users'=>['id','username','email','actor_key','actor_id','is_admin','created_at','updated_at','disabled_at','profile_name','icon_url'],
         'invites'=>['id','code','created_at','used_at','note'],'relays'=>['id','inbox_url','state','follow_activity_id','created_at','updated_at'],'policies'=>['id','text'],'blocks'=>['id','scope','value','kind','reason','created_at'],
         default=>['id','username','email','status','created_at','decided_at']};sort($required);
@@ -66,6 +68,18 @@ function ap_settings_native_account_rows_valid(string $view,array $rows): bool
             if($key==='username'&&$value===null)continue;
             if(!is_string($value))return false;
         }
+    }
+    return true;
+}
+/** Moderation report rows: the list's identity, routing and triage hint only. */
+function ap_moderation_native_rows_valid(array $rows): bool
+{
+    $required=['id','direction','state','reporter_actor_id','target_actor_id','priority_score','created_at'];sort($required);
+    foreach($rows as $row){
+        if(!is_array($row))return false;$keys=array_keys($row);sort($keys);if($keys!==$required)return false;
+        if(!is_int($row['id'])||$row['id']<1||!is_int($row['priority_score'])||$row['priority_score']<0||$row['priority_score']>13)return false;
+        foreach(['direction','state','reporter_actor_id','created_at'] as $key)if(!is_string($row[$key]))return false;
+        if($row['target_actor_id']!==null&&!is_string($row['target_actor_id']))return false;
     }
     return true;
 }
@@ -109,19 +123,22 @@ function ap_settings_native_body(string $view,bool $viewerAdmin): ?string
     if((int)($current['id']??0)!==$owner || ap_auth_is_admin($current)!==$viewerAdmin)return null;
     return $html;
 }
-function ap_admin_native_read_body(string $view,int $offset=0): ?string
+function ap_admin_native_read_body(string $view,int $offset=0,?string $filter=null): ?string
 {
-    if(!ap_admin_native_enabled() || !in_array($view,['invites','approvals','users','relays','policies','blocks'],true) || $offset<0 || $offset>PHP_INT_MAX-100)return null;
+    if(!ap_admin_native_enabled() || !in_array($view,['invites','approvals','users','relays','policies','blocks','moderation'],true) || $offset<0 || $offset>PHP_INT_MAX-100)return null;
     if($view==='users' && getenv('VAAK_ADMIN_USERS_NATIVE')!=='1')return null;
     if($view==='relays' && (getenv('VAAK_ADMIN_RELAYS_NATIVE')!=='1' || $offset!==0))return null;
     if($view==='policies' && (getenv('VAAK_ADMIN_POLICIES_NATIVE')!=='1' || $offset!==0))return null;
     if($view==='blocks' && (getenv('VAAK_ADMIN_BLOCKS_NATIVE')!=='1' || $offset!==0))return null;
+    if($view==='moderation' && (getenv('VAAK_ADMIN_MODERATION_NATIVE')!=='1' || $offset!==0 || !in_array($filter,['open','about_us','outbound','closed','all'],true)))return null;
+    if($view!=='moderation' && $filter!==null)return null;
     if(!ap_registration_current_admin(ap_db()))return null;
     $user=ap_auth_current_user();$owner=(int)($user['id']??0);if($owner<1)return null;
     $url=(string)(getenv('VAAK_ADMIN_READ_URL')?:'http://127.0.0.1:8787/internal/admin/read');if(!ap_admin_native_url_allowed($url))return null;
     $request=['protocol_version'=>1,'owner_id'=>$owner,'csrf'=>ap_auth_csrf_token(),'view'=>$view,
         'mode'=>isset($_GET['partial'])&& (string)$_GET['partial']==='1'?'shell':'full','offset'=>$offset,
         'approvals_enabled'=>ap_registration_approvals_enabled(),'now'=>time(),'php_timezone'=>date_default_timezone_get()];
+    if($view==='moderation')$request['filter']=$filter;
     if($view==='users'){
         $request['offset']=max(1,(int)($_GET['page']??$_POST['users_page']??1));
         $request['search']=trim((string)($_GET['q']??$_POST['users_q']??''));
