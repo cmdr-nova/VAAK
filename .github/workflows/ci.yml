@@ -7,6 +7,9 @@
 #                     api/bin/php-policy-test, so this job installs PHP too.
 #   deploy-scripts  — version counter, release-commit gate, restart plan, and
 #                     the production runner job guard
+#   cargo-audit     — RustSec advisories against rust/Cargo.lock. Fails on
+#                     vulnerabilities only; unmaintained and yanked warnings
+#                     are printed and do not fail the job.
 #   php-rust-parity — replay fixtures through both sides
 #                     (`.github/scripts/php-rust-parity.py`, catalog in
 #                     `parity/catalog.json`). Rust is the source of truth.
@@ -38,6 +41,8 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # Run on a branch before its pull request exists.
+  workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
@@ -66,6 +71,21 @@ jobs:
           python3 deploy/bump_version.py --check
           bash deploy/assemble-release.sh --self-test
           bash deploy/test_runner_job_guard.sh
+
+  cargo-audit:
+    name: Cargo audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      # Without --deny, cargo audit exits non-zero only for vulnerabilities.
+      - name: Audit
+        working-directory: rust
+        run: cargo audit
 
   php:
     name: PHP syntax and standalone tests
