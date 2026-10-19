@@ -3,6 +3,8 @@ set -euo pipefail
 
 DB_NAME="${VAAK_DB_NAME:-novalandia}"
 BACKUP_DIR="${VAAK_BACKUP_DIR:-/var/backups/mkultra/vaak}"
+DRILL_STAMP="${VAAK_DRILL_STATE_DIR:-/var/lib/mkultra/vaak-restore-drill}/last-ok"
+DRILL_MAX_DAYS="${VAAK_DRILL_MAX_AGE_DAYS:-40}"
 LOG_TAG="vaak-integrity"
 WARN=0
 CRIT=0
@@ -25,6 +27,18 @@ else
     now_ts="$(date +%s)"
     age=$(( now_ts - ${latest_ts%.*} ))
     (( age > 36 * 3600 )) && crit "latest PostgreSQL backup is older than 36h"
+  fi
+fi
+
+# vaak-backup-restore-drill.sh writes "<epoch> <dump>" after a good restore.
+if [[ ! -f "${DRILL_STAMP}" ]]; then
+  warn "no successful backup restore drill recorded (${DRILL_STAMP})"
+else
+  drill_ts="$(cut -d' ' -f1 "${DRILL_STAMP}" 2>/dev/null || true)"
+  if [[ ! "${drill_ts}" =~ ^[0-9]+$ ]]; then
+    warn "unreadable restore drill stamp ${DRILL_STAMP}"
+  elif (( $(date +%s) - drill_ts > DRILL_MAX_DAYS * 86400 )); then
+    warn "last successful backup restore drill is older than ${DRILL_MAX_DAYS} days"
   fi
 fi
 
