@@ -348,7 +348,7 @@ impl ProjectedQuoteTarget {
 }
 pub(crate) async fn materialize_quote_target(db:&Client,viewer:&ProfileViewer<'_>,target:&str)->Result<ProjectedQuoteTarget>{
     let requested=crate::library::card::php_trim(target).trim_end_matches('/').to_owned();
-    let mut projector=Projector{db,owner:viewer.owner(),dependencies:vec![],static_counts:vec![],effects:vec![],source_index:0,account_memo:Default::default(),bare_memo:Default::default(),cache:vec![],graphs:vec![],path:vec![]};
+    let mut projector=Projector{db,php_web_urls:false,owner:viewer.owner(),dependencies:vec![],static_counts:vec![],effects:vec![],source_index:0,account_memo:Default::default(),bare_memo:Default::default(),cache:vec![],graphs:vec![],path:vec![]};
     let mut status=None;
     if requested.starts_with("https://"){
         // Native local target branch. Remote alias/event/mention branches stay
@@ -374,7 +374,10 @@ pub(crate) async fn materialize_quote_target(db:&Client,viewer:&ProfileViewer<'_
     let cache_complete=projector.cache.is_empty()&&projector.graphs.is_empty();let result=ProjectedQuoteTarget{requested,status,ledger:ProjectionLedger{dependencies:projector.dependencies,static_counts:projector.static_counts},effects:projector.effects,cache:projector.cache,graphs:projector.graphs,cache_complete};
     result.require_current(db).await?;Ok(result)
 }
-struct Projector<'a>{db:&'a Client,owner:i64,dependencies:Vec<Dependency>,static_counts:Vec<StaticCountDependency>,effects:Vec<DeferredProjectionEffect>,source_index:usize,account_memo:std::collections::HashMap<String,Value>,bare_memo:std::collections::HashMap<String,Option<Value>>,cache:Vec<DeferredCacheProjection>,graphs:Vec<DeferredFollowGraph>,path:Vec<String>}
+struct Projector<'a>{db:&'a Client,owner:i64,
+    /// Search builds bridged/Threads/unknown-host web URLs like PHP; other
+    /// surfaces still hand those accounts to PHP until they are switched over.
+    php_web_urls:bool,dependencies:Vec<Dependency>,static_counts:Vec<StaticCountDependency>,effects:Vec<DeferredProjectionEffect>,source_index:usize,account_memo:std::collections::HashMap<String,Value>,bare_memo:std::collections::HashMap<String,Option<Value>>,cache:Vec<DeferredCacheProjection>,graphs:Vec<DeferredFollowGraph>,path:Vec<String>}
 impl Projector<'_> {
     async fn rows(&mut self,sql:&'static str,key:Value)->Result<Vec<Value>>{
         // Projection is read-only until the separately admitted effect stage.
@@ -406,7 +409,7 @@ pub(crate) async fn materialize(db:&Client,viewer:&ProfileViewer<'_>,selection:c
     let pinned=selection.tab()=="pinned";
     let answered_asks=selection.tab()=="asks";
     let (rows,page)=selection.into_indexed_parts();
-    let mut projector=Projector{db,owner:viewer.owner(),dependencies:Vec::new(),static_counts:Vec::new(),effects:Vec::new(),source_index:0,account_memo:std::collections::HashMap::new(),bare_memo:Default::default(),cache:Vec::new(),graphs:Vec::new(),path:Vec::new()};
+    let mut projector=Projector{db,php_web_urls:false,owner:viewer.owner(),dependencies:Vec::new(),static_counts:Vec::new(),effects:Vec::new(),source_index:0,account_memo:std::collections::HashMap::new(),bare_memo:Default::default(),cache:Vec::new(),graphs:Vec::new(),path:Vec::new()};
     let mut sources=Vec::with_capacity(rows.len());
     for (source_index,row) in rows{
         projector.source_index=source_index;
@@ -529,9 +532,29 @@ impl Projector<'_>{
         let id=self.remote_account_id(actor).await?;
         self.effect(ProjectionEffect::RememberAccount{account_id:id.clone(),actor:canonical.clone()});
         let mut web=canonical.clone();
-        if host.ends_with("brid.gy")||host=="bsky.app"{bail!("PHP fallback: remote account web URL needs protocol/alias metadata")}
-        if !host.is_empty()&&!username.is_empty()&&username!="user"&&!crate::profile_identity::placeholder(username){web=format!("https://{host}/@{}",entities::encode(username))}
-        if host=="bsky.app"{acct=username.into()}
+        if !self.php_web_urls{
+            if host.ends_with("brid.gy")||host=="bsky.app"{bail!("PHP fallback: remote account web URL needs protocol/alias metadata")}
+            if !host.is_empty()&&!username.is_empty()&&username!="user"&&!crate::profile_identity::placeholder(username){web=format!("https://{host}/@{}",entities::encode(username))}
+        }else{
+        // PHP's label host falls back to "unknown" before the web URL is built.
+        let host=if host.is_empty(){"unknown"}else{host};
+        let lower_user=username.to_ascii_lowercase();
+        let bridgy_did=cached_re(r"(?i)^https://bsky\.brid\.gy/ap/(did:[a-z0-9:]+)$").captures(&canonical).map(|c|c[1].to_ascii_lowercase())
+            .or_else(||cached_re(r"(?i)^did:[a-z0-9:]+$").is_match(&canonical).then(||canonical.to_ascii_lowercase()));
+        let threads_host=reqwest::Url::parse(crate::library::card::php_trim(&canonical)).ok().and_then(|u|u.host_str().map(str::to_ascii_lowercase)).is_some_and(|h|matches!(h.as_str(),"threads.net"|"www.threads.net"|"threads.com"|"www.threads.com"));
+        // ap_bridgy_bsky_profile_web_url / ap_threads_profile_web_url read the
+        // actor cache again when the label has no username; leave that to PHP.
+        if (bridgy_did.is_some()||threads_host)&&crate::library::card::php_trim(username).is_empty(){bail!("PHP fallback: bridged account web URL needs the actor cache")}
+        let threads_web=threads_host.then(||crate::library::card::php_trim(username)).filter(|u|!u.bytes().all(|b|b.is_ascii_digit())&&!u.to_ascii_lowercase().starts_with("did:")&&!crate::profile_identity::placeholder(u)).map(|u|format!("https://www.threads.com/@{}",entities::encode(u)));
+        if let Some(did)=bridgy_did{
+            let u=crate::library::card::php_trim(username);let lu=u.to_ascii_lowercase();
+            web=if u.contains('.')&&!lu.ends_with(".brid.gy")&&!lu.starts_with("did:")&&!crate::profile_identity::placeholder(u){format!("https://bsky.app/profile/{}",entities::encode(u))}else{format!("https://bsky.app/profile/{did}")};
+            if !username.is_empty()&&username.contains('.')&&!lower_user.starts_with("did:"){acct=username.into()}
+        }else if host=="bsky.app"&&!username.is_empty()&&!lower_user.starts_with("did:")&&!crate::profile_identity::placeholder(username){
+            acct=username.into();web=format!("https://bsky.app/profile/{}",entities::encode(username));
+        }else if let Some(threads)=threads_web{web=threads;}
+        else if !username.is_empty()&&username!="user"&&!crate::profile_identity::placeholder(username){web=format!("https://{host}/@{}",entities::encode(username))}
+        }
         let account=json!({"id":id,"username":username,"acct":acct,"display_name":label["display_name"],"locked":false,"bot":false,"discoverable":true,"group":false,"created_at":"2020-01-01T00:00:00.000Z","note":"","url":web,"uri":canonical,"avatar":avatar,"avatar_static":avatar,"header":header,"header_static":header,"followers_count":0,"following_count":0,"statuses_count":0,"last_status_at":null,"emojis":[],"fields":[]});
         self.account_memo.insert(actor.into(),account.clone());Ok(account)
     }
@@ -563,7 +586,8 @@ impl Projector<'_>{
         let(reply_id,reply_account,reply_actor,reply_url)=self.event_reply_projection(s(row,"in_reply_to")).await?;
         let mut pack=if text.contains('@'){self.canonical_pack_with_actors(&text,&reply_actor.iter().cloned().collect::<Vec<_>>()).await?}else{entities::event_pack(&text)};
         if let (Some(account),Some(actor))=(&reply_account,&reply_actor){if !pack["mentions"].as_array().unwrap().iter().any(|m|s(m,"id")==account){let mention=self.mention_from_actor(actor).await?;pack["mentions"].as_array_mut().unwrap().insert(0,mention);}}
-        let mut inner=json!({"id":sid,"created_at":created,"in_reply_to_id":reply_id,"in_reply_to_account_id":reply_account,"sensitive":truth(&row["sensitive"])||!spoiler.is_empty(),"spoiler_text":spoiler,"visibility":row.get("visibility").and_then(Value::as_str).unwrap_or("public"),"language":"en","uri":url,"url":url,"replies_count":0,"reblogs_count":0,"favourites_count":0,"edited_at":null,"favourited":false,"reblogged":false,"muted":false,"bookmarked":false,"pinned":false,"content":pack["content"],"reblog":null,"application":null,"account":account,"media_attachments":media,"mentions":pack["mentions"],"tags":pack["tags"],"emojis":[],"card":null,"poll":null,"quote":null,"quote_approval":{"automatic":["public"],"manual":[],"current_user":"automatic"}});
+        let web=if self.php_web_urls&&!object.is_empty(){let mapped=self.object_web_url(object).await?;if mapped.is_empty(){url.to_owned()}else{mapped}}else{url.to_owned()};
+        let mut inner=json!({"id":sid,"created_at":created,"in_reply_to_id":reply_id,"in_reply_to_account_id":reply_account,"sensitive":truth(&row["sensitive"])||!spoiler.is_empty(),"spoiler_text":spoiler,"visibility":row.get("visibility").and_then(Value::as_str).unwrap_or("public"),"language":"en","uri":url,"url":web,"replies_count":0,"reblogs_count":0,"favourites_count":0,"edited_at":null,"favourited":false,"reblogged":false,"muted":false,"bookmarked":false,"pinned":false,"content":pack["content"],"reblog":null,"application":null,"account":account,"media_attachments":media,"mentions":pack["mentions"],"tags":pack["tags"],"emojis":[],"card":null,"poll":null,"quote":null,"quote_approval":{"automatic":["public"],"manual":[],"current_user":"automatic"}});
         // The actual normalizer marks Create/Update cards without visible
         // content/media as degraded. If from_event refuses the no-CW empty
         // shell it rebuilds the smaller degraded shape with raw created time.
@@ -749,12 +773,58 @@ impl Projector<'_>{
         ask["asker_display"]=json!(display);ask["asker_handle"]=json!(handle);ask["asker_avatar"]=json!(avatar);Ok(ask)
     }
     async fn remote_account_id(&mut self,actor:&str)->Result<String>{
+        if self.php_web_urls{
+            // ap_masto_remote_account_id: placeholder handles do not key the
+            // account, and snowflake IRIs borrow the first alias that does.
+            let actor=crate::library::card::php_trim(actor).trim_end_matches('/').to_owned();
+            let mut key=self.remote_account_acct_key(&actor).await?;
+            if key.is_none(){
+                for alias in effects::aliases(self.db,&mut self.dependencies,&actor).await?{
+                    let alias=alias.trim_end_matches('/');if alias.is_empty()||alias==actor{continue}
+                    key=self.remote_account_acct_key(alias).await?;if key.is_some(){break}
+                }
+            }
+            let seed=key.map(|k|format!("acct:{k}")).unwrap_or(actor);
+            return Ok((300_000_000+crc32(seed.as_bytes()) as i64%699_999_999).to_string())
+        }
         let rows=self.rows("SELECT to_jsonb(a) FROM remote_actors a WHERE actor_id IN($1::jsonb->>'actor',($1::jsonb->>'actor')||'/') LIMIT 1",json!({"actor":actor})).await?;
         let mut host=reqwest::Url::parse(actor)?.host_str().unwrap_or("").to_ascii_lowercase();let mut username=String::new();
         if let Some(row)=rows.first(){username=crate::library::card::php_trim(s(row,"username")).into();if !s(row,"host").is_empty(){host=crate::library::card::php_trim(s(row,"host")).to_ascii_lowercase();}}
         if username.is_empty(){if let Some(c)=re!(r"(?i)/(?:users|@)([^/]+)/?$").captures(actor){let name=crate::hidden::raw_percent_decode(&c[1]);if !name.is_empty()&&!name.bytes().all(|b|b.is_ascii_digit()){username=name;}}}
         let key=if !username.is_empty()&&!host.is_empty()&&host!="unknown"{Some(format!("{}@{host}",username.to_lowercase()))}else{None};
         let seed=key.map(|k|format!("acct:{k}")).unwrap_or_else(||actor.into());Ok((300_000_000+crc32(seed.as_bytes()) as i64%699_999_999).to_string())
+    }
+    /// ap_masto_remote_account_acct_key.
+    async fn remote_account_acct_key(&mut self,raw:&str)->Result<Option<String>>{
+        let actor=crate::library::card::php_trim(raw).trim_end_matches('/');
+        if actor.is_empty()||!actor.starts_with("https://"){return Ok(None)}
+        let mut host=reqwest::Url::parse(actor).ok().and_then(|u|u.host_str().map(str::to_ascii_lowercase)).unwrap_or_default();let mut username=String::new();
+        let rows=self.rows("SELECT to_jsonb(a) FROM remote_actors a WHERE actor_id IN($1::jsonb->>'actor',($1::jsonb->>'actor')||'/') LIMIT 1",json!({"actor":actor})).await?;
+        if let Some(row)=rows.first(){username=crate::library::card::php_trim(s(row,"username")).into();let h=crate::library::card::php_trim(s(row,"host")).to_ascii_lowercase();if !h.is_empty(){host=h;}}
+        if username.is_empty(){if let Some(c)=re!(r"(?i)/(?:users|@)([^/]+)/?$").captures(actor){let name=crate::hidden::raw_percent_decode(&c[1]);if !name.is_empty()&&!name.bytes().all(|b|b.is_ascii_digit())&&!crate::profile_identity::placeholder(&name){username=name;}}}
+        if username.is_empty()||host.is_empty()||host=="unknown"||crate::profile_identity::placeholder(&username){return Ok(None)}
+        Ok(Some(format!("{}@{host}",username.to_lowercase())))
+    }
+    /// ap_remote_object_web_url($objectId) without an AS2 url field.
+    async fn object_web_url(&mut self,raw:&str)->Result<String>{
+        let object=crate::library::card::php_trim(raw);
+        if object.starts_with("https://"){
+            if let Some(c)=re!(r"(?i)^https://bsky\.brid\.gy/r/(https://bsky\.app/.+)$").captures(object){return Ok(c[1].to_owned())}
+            if object.starts_with("https://bsky.app/"){return Ok(object.to_owned())}
+            if let Some(c)=re!(r"(?i)^https://bsky\.brid\.gy/convert/ap/at://(did:[^/]+)/app\.bsky\.feed\.post/([A-Za-z0-9]+)(?:[/?#]|$)").captures(object){return Ok(format!("https://bsky.app/profile/{}/post/{}",&c[1],entities::encode(&c[2])))}
+            if let Some(c)=re!(r"(?i)at://(did:[^/]+)/app\.bsky\.feed\.post/([A-Za-z0-9]+)").captures(object){return Ok(format!("https://bsky.app/profile/{}/post/{}",&c[1],entities::encode(&c[2])))}
+            let threads=reqwest::Url::parse(object).ok().and_then(|u|u.host_str().map(str::to_ascii_lowercase)).is_some_and(|h|matches!(h.as_str(),"threads.net"|"www.threads.net"|"threads.com"|"www.threads.com"));
+            if threads{
+                if let Some(c)=re!(r"(?i)^https://(?:www\.)?threads\.(?:net|com)/@([^/?#]+)").captures(object){return Ok(format!("https://www.threads.com/@{}",entities::encode(&crate::hidden::raw_percent_decode(&c[1]))))}
+                if let Some(c)=re!(r"(?i)^https://(?:www\.)?threads\.net/ap/users/(\d+)").captures(object){
+                    let actor=format!("https://threads.net/ap/users/{}",&c[1]);
+                    let rows=self.rows("SELECT to_jsonb(a) FROM remote_actors a WHERE actor_id IN($1::jsonb->>'actor',($1::jsonb->>'actor')||'/') LIMIT 1",json!({"actor":actor})).await?;
+                    let user=rows.first().map(|r|crate::library::card::php_trim(s(r,"username")).to_owned()).unwrap_or_default();
+                    if !user.is_empty()&&!user.bytes().all(|b|b.is_ascii_digit())&&!user.to_ascii_lowercase().starts_with("did:")&&!crate::profile_identity::placeholder(&user){return Ok(format!("https://www.threads.com/@{}",entities::encode(&user)))}
+                }
+            }
+        }
+        Ok(object.to_owned())
     }
     async fn interaction_flags(&mut self,status:&mut Value)->Result<()>{
         let sid=s(status,"id").to_owned();let object=s(status,"uri").to_owned();let canonical=object.trim_end_matches('/');
@@ -937,7 +1007,7 @@ mod tests {
         let case=&reference["compose"][0];assert!(case.is_object(),"capture compose PHP helper with local PostgreSQL driver");
         for row in case["rows"].as_array().unwrap(){db.execute("INSERT INTO outbox_notes SELECT * FROM jsonb_populate_record(NULL::outbox_notes,$1)",&[row]).await.unwrap();}
         let root=std::env::temp_dir().join(format!("profile_primary_count_native_{}",std::process::id()));std::fs::create_dir_all(root.join("assets/data")).unwrap();std::fs::write(root.join("assets/data/site-counts.json"),"{\"blog_posts\":7,\"notes\":9}").unwrap();
-        let mut projector=Projector{db:&db,owner:1,dependencies:vec![],static_counts:vec![],effects:vec![],source_index:0,account_memo:Default::default(),bare_memo:Default::default(),cache:vec![],graphs:vec![],path:vec![]};
+        let mut projector=Projector{db:&db,php_web_urls:false,owner:1,dependencies:vec![],static_counts:vec![],effects:vec![],source_index:0,account_memo:Default::default(),bare_memo:Default::default(),cache:vec![],graphs:vec![],path:vec![]};
         assert_eq!(projector.primary_public_count(&root.join("api")).await.unwrap(),16+case["count"].as_u64().unwrap() as usize);
         let ledger=ProjectionLedger{dependencies:projector.dependencies,static_counts:projector.static_counts};ledger.require_current(&db).await.unwrap();
         db.batch_execute("UPDATE outbox_notes SET visibility='private' WHERE id='owner-two'").await.unwrap();assert!(ledger.require_current(&db).await.is_err());

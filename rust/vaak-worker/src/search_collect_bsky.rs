@@ -77,6 +77,8 @@ fn nl2br(text:&str)->String{
 fn esc(text:&str)->String{crate::library::actions::esc(text)}
 
 struct Animated{url:String,preview:String,kind:&'static str,media_type:Option<&'static str>}
+/// ap_masto_animated_media_from_url for other Search builders: (url, preview_url, type, mediaType).
+pub(crate) fn animated_media(url:&str,preview:&str)->(String,String,&'static str,Option<&'static str>){let a=animated(url,preview);(a.url,a.preview,a.kind,a.media_type)}
 /// ap_masto_animated_media_from_url.
 fn animated(url:&str,preview:&str)->Animated{
     let url=trim(url).to_owned();let mut preview=trim(preview).to_owned();let lower=url.to_ascii_lowercase();
@@ -113,30 +115,72 @@ fn url_looks_like_media(url:&str)->bool{
 
 pub(super) struct BskyBuilder<'a>{
     db:&'a Client,owner:i64,cfg:Option<&'a crate::config::Config>,warm:Option<&'a crate::profile_enrichment::WarmContext>,
-    flat:HashMap<String,Option<Value>>,profiles:HashMap<String,Option<Value>>,authors:HashMap<String,Option<Value>>,avatars:HashMap<String,String>,
+    flat:HashMap<String,Option<Value>>,profiles:HashMap<String,Option<Value>>,authors:HashMap<String,Option<Value>>,avatars:HashMap<String,String>,refreshed:std::collections::HashSet<String>,
 }
 impl<'a> BskyBuilder<'a>{
     pub(super) fn new(db:&'a Client,owner:i64,cfg:Option<&'a crate::config::Config>,warm:Option<&'a crate::profile_enrichment::WarmContext>)->Self{
-        Self{db,owner,cfg,warm,flat:HashMap::new(),profiles:HashMap::new(),authors:HashMap::new(),avatars:HashMap::new()}
+        Self{db,owner,cfg,warm,flat:HashMap::new(),profiles:HashMap::new(),authors:HashMap::new(),avatars:HashMap::new(),refreshed:std::collections::HashSet::new()}
     }
     async fn redis_json(&self,key:&str)->Option<Value>{
         let cfg=self.cfg?;crate::profile_header::cache::read_json(cfg,key).await.filter(|v|v.is_object()||v.is_array())
     }
-    /// ap_bsky_actor_profile_cache_get(did, owner): Redis first, then rows.
-    async fn profile_cache(&mut self,did:&str)->Result<Option<Value>>{
-        if let Some(hit)=self.profiles.get(did){return Ok(hit.clone())}
-        let keys=vec![did.to_owned(),format!("https://bsky.app/profile/{did}"),format!("https://bsky.app/profile/{}",rawurlencode(did))];
+    /// ap_bsky_actor_profile_cache_get(actor_ref, owner): Redis first, then
+    /// rows (plus the owner's viewer row), written back to Redis for 300s.
+    async fn cache_get(&mut self,actor_ref:&str)->Result<Option<Value>>{
+        let actor_ref=trim(actor_ref).to_owned();if actor_ref.is_empty(){return Ok(None)}
+        if let Some(hit)=self.profiles.get(&actor_ref){return Ok(hit.clone())}
+        let mut keys=vec![actor_ref.clone()];
+        if let Some(c)=re!(r"(?i)^https://bsky\.app/profile/([^/?#]+)").captures(&actor_ref){
+            let ident=crate::hidden::raw_percent_decode(&c[1]);
+            keys.push(format!("https://bsky.app/profile/{ident}"));keys.push(format!("https://bsky.app/profile/{}",rawurlencode(&ident)));keys.push(ident.clone());
+            if ident.starts_with("did:"){keys.push(ident)}
+        }else if actor_ref.starts_with("did:"){keys.push(format!("https://bsky.app/profile/{actor_ref}"));keys.push(format!("https://bsky.app/profile/{}",rawurlencode(&actor_ref)));}
         let mut unique:Vec<String>=Vec::new();for k in keys{if !k.is_empty()&&!unique.contains(&k){unique.push(k)}}
         use sha2::Digest;
         let redis_key=format!("vaak:profile:v1:bsky:{}{}",if self.owner>0{format!("{}:",self.owner)}else{"public:".into()},hex::encode(sha2::Sha256::digest(unique.join("\n").as_bytes())));
         let mut out=self.redis_json(&redis_key).await;
         if out.is_none(){
-            let mut row=None;
-            for key in &unique{if let Some(hit)=self.db.query_opt("SELECT to_jsonb(p) FROM bsky_actor_profiles p WHERE actor_ref=$1 LIMIT 1",&[key]).await?{row=Some(hit.get::<_,Value>(0));break}}
-            if row.is_none(){row=self.db.query_opt("SELECT to_jsonb(p) FROM bsky_actor_profiles p WHERE did=$1 ORDER BY updated_at DESC LIMIT 1",&[&did]).await?.map(|r|r.get::<_,Value>(0));}
-            if let Some(row)=row{if let Ok(profile)=serde_json::from_str::<Value>(s(&row,"profile_json")){if profile.is_object()||profile.is_array(){out=Some(json!({"profile":profile}))}}}
+            let mut row=None;let mut matched=actor_ref.clone();
+            for key in &unique{if let Some(hit)=self.db.query_opt("SELECT to_jsonb(p) FROM bsky_actor_profiles p WHERE actor_ref=$1 LIMIT 1",&[key]).await?{row=Some(hit.get::<_,Value>(0));matched=key.clone();break}}
+            if row.is_none(){
+                if let Some(did_key)=unique.iter().find(|k|k.starts_with("did:")){
+                    if let Some(hit)=self.db.query_opt("SELECT to_jsonb(p) FROM bsky_actor_profiles p WHERE did=$1 ORDER BY updated_at DESC LIMIT 1",&[did_key]).await?{
+                        let hit=hit.get::<_,Value>(0);matched=if hit.get("actor_ref").is_some_and(|v|!v.is_null()){s(&hit,"actor_ref").to_owned()}else{did_key.clone()};row=Some(hit);
+                    }
+                }
+            }
+            if let Some(row)=row{if let Ok(profile)=serde_json::from_str::<Value>(s(&row,"profile_json")){if profile.is_object()||profile.is_array(){
+                let mut value=json!({"profile":profile,"did":s(&row,"did"),"updated_at":s(&row,"updated_at")});
+                if self.owner>0{
+                    if let Some(viewer)=self.db.query_opt("SELECT to_jsonb(v) FROM bsky_actor_viewers v WHERE owner_user_id=$1::bigint AND actor_ref=$2 LIMIT 1",&[&self.owner,&matched]).await?{
+                        let viewer=viewer.get::<_,Value>(0);value["viewer"]=json!({"following":s(&viewer,"following_uri"),"followedBy":crate::library::card::boolean(&viewer,"followed_by")});
+                    }
+                }
+                if let Some(cfg)=self.cfg{crate::profile_header::cache::write_json(cfg,&redis_key,&value,300).await;}
+                out=Some(value);
+            }}}
         }
-        self.profiles.insert(did.into(),out.clone());Ok(out)
+        self.profiles.insert(actor_ref,out.clone());Ok(out)
+    }
+    /// The tail of ap_bsky_enrich_author_view for an author that is still
+    /// thin: queue the owner's profile refresh and the Rust actor warm, once
+    /// per DID per request (both writers dedupe on their own as well).
+    async fn queue_thin_refresh(&mut self,did:&str)->Result<()>{
+        if !self.refreshed.insert(did.to_owned()){return Ok(())}
+        let cfg=self.cfg.context("PHP fallback: thin Bluesky author refresh needs the worker config")?;
+        if self.owner>0{
+            // ap_bsky_actor_refresh_enqueue(owner, ap_bsky_actor_profile_url(did))
+            let actor_ref=format!("https://bsky.app/profile/{did}");
+            let cached=self.cache_get(&actor_ref).await?;
+            let fresh=match &cached{Some(c) if c.get("viewer").is_some_and(|v|!v.is_null())=>super::downrank::strtotime(s(c,"updated_at"))?>chrono::Utc::now().timestamp()-6*3600,_=>false};
+            if !fresh{
+                let now=chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs,false);
+                self.db.execute("INSERT INTO bsky_actor_refresh_queue (owner_user_id, actor_ref, status, queued_at, next_attempt_at, attempts) VALUES ($1::bigint, $2, 'pending', $3, $3, 0) ON CONFLICT (owner_user_id, actor_ref) DO UPDATE SET status = 'pending', queued_at = excluded.queued_at, next_attempt_at = excluded.next_attempt_at, attempts = 0, locked_at = NULL, last_error = NULL WHERE bsky_actor_refresh_queue.status IN ('succeeded', 'failed')",&[&self.owner,&actor_ref,&now]).await.context("PHP fallback: Bluesky actor refresh enqueue")?;
+            }
+        }
+        let primary=std::env::var("VAAK_ACTOR_WARM_RUST_PRIMARY").map(|v|!matches!(v.trim().to_ascii_lowercase().as_str(),"0"|"false"|"off"|"no")).unwrap_or(true);
+        if primary{if let Err(error)=crate::actor_warm::enqueue(cfg,did,self.owner,"thin-author").await{tracing::debug!(%error,"Search thin author warm enqueue failed");}}
+        Ok(())
     }
     /// ap_bsky_enrich_author_view. Returns None when PHP would still queue a
     /// refresh for a thin author; that writer stays on PHP for now.
@@ -157,7 +201,7 @@ impl<'a> BskyBuilder<'a>{
             if !needs(thin,&display,&avatar){return Ok(author)}
         }
         // 1) durable profile cache.
-        if let Some(cached)=self.profile_cache(&did).await?{
+        if let Some(cached)=self.cache_get(&did).await?{
             let profile=cached.get("profile").filter(|p|p.is_object()).cloned().unwrap_or(Value::Null);
             if profile.as_object().is_some_and(|m|!m.is_empty()){
                 let ch=trim(&scalar(&profile,"handle")?).to_owned();let cdn=trim(&scalar(&profile,"displayName")?).to_owned();let cav=avatar_public_url(profile.get("avatar").unwrap_or(&Value::Null),&did)?.unwrap_or_default();
@@ -188,7 +232,7 @@ impl<'a> BskyBuilder<'a>{
             }
         }
         let _=&handle;
-        if thin||avatar.is_empty(){bail!("PHP fallback: thin Bluesky author queues a profile refresh")}
+        if thin||avatar.is_empty(){self.queue_thin_refresh(&did).await?;}
         Ok(author)
     }
     async fn media(&mut self,post:&Value,status_id:&str)->Result<Vec<Value>>{
