@@ -5020,10 +5020,26 @@ $vaakAdminOnlyActions = [
                 $csrfToken
             );
             if (!empty($momentRes['ok'])) {
-                $notice = 'Posted your Phyrian moment.';
+                $notice = 'Posted your Strains card.';
             } else {
                 $error = (string) ($momentRes['error'] ?? 'Could not post that moment.');
             }
+        }
+    } elseif ($action === 'phyrian_recap_post') {
+        // Family tree recap. Posts only after the confirmed form; not a game mutation.
+        require_once __DIR__ . '/ap-phyrian-tree.php';
+        $view = 'phyrian';
+        $_GET['page'] = 'tree';
+        $recapRes = ap_phyrian_tree_recap_publish(
+            (int) $vaakOwnerId,
+            (string) ($_POST['recap_text'] ?? ''),
+            ((string) ($_POST['confirm'] ?? '')) === '1',
+            $csrfToken
+        );
+        if (!empty($recapRes['ok'])) {
+            $notice = 'Posted the Phyrian recap.';
+        } else {
+            $error = (string) ($recapRes['error'] ?? 'Could not post the recap.');
         }
     } elseif (in_array($action, ['phyrian_clan_create', 'phyrian_clan_join', 'phyrian_clan_leave'], true)) {
         // Off unless VAAK_PHYRIAN_CLANS is on. Check that before loading the
@@ -28438,6 +28454,42 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     .phyrian-badge--unknown {
       border-color: var(--border); color: var(--muted); background: transparent;
     }
+    .phyrian-badge--grid {
+      border-color: color-mix(in srgb, #7be08f 45%, var(--border));
+      color: #b4f2c0; background: rgba(123,224,143,.1);
+    }
+    .phyrian-badge--new {
+      border-color: color-mix(in srgb, #f0c060 45%, var(--border));
+      color: #f6dc9e; background: rgba(240,192,96,.1);
+    }
+    .phyrian-recap {
+      display: grid; grid-template-columns: repeat(auto-fit, minmax(7rem, 1fr)); gap: .5rem;
+    }
+    .phyrian-recap > div {
+      display: flex; flex-direction: column; gap: .1rem; padding: .6rem .75rem;
+      border: 1px solid var(--border); border-radius: 10px;
+    }
+    .phyrian-recap b { font-size: 1.35rem; color: #9fefff; }
+    .phyrian-recap-share { margin: .85rem 0 0; }
+    .phyrian-recap-share summary { cursor: pointer; color: #cbb8e0; font-size: .85rem; }
+    .phyrian-recap-share form { margin: .6rem 0 0; }
+    .phyrian-recap-share textarea { width: 100%; box-sizing: border-box; }
+    .phyrian-tree, .phyrian-tree ul { list-style: none; margin: 0; padding: 0; }
+    .phyrian-tree ul { margin-left: .55rem; padding-left: .9rem; border-left: 1px solid rgba(148,120,180,.32); }
+    .phyrian-tree li { position: relative; margin: .2rem 0; }
+    .phyrian-tree ul > li::before {
+      content: ""; position: absolute; left: -.9rem; top: .85rem; width: .7rem;
+      border-top: 1px solid rgba(148,120,180,.32);
+    }
+    .phyrian-tree-node {
+      display: inline-flex; flex-wrap: wrap; align-items: baseline; gap: .3rem;
+      padding: .25rem .5rem; border-radius: 8px; line-height: 1.35;
+    }
+    .phyrian-tree summary.phyrian-tree-node { cursor: pointer; }
+    .phyrian-tree li.is-path > .phyrian-tree-node,
+    .phyrian-tree li.is-path > details > summary {
+      background: rgba(94,231,255,.07); box-shadow: inset 0 0 0 1px rgba(94,231,255,.25);
+    }
     .phyrian-res {
       margin: .35rem 0 .65rem;
     }
@@ -36244,6 +36296,7 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
           if (is_string($phyrianClansOn) && in_array(strtolower(trim($phyrianClansOn)), ['1', 'true', 'yes', 'on'], true)) {
               $phyPages[] = 'clans';
           }
+          $phyPages[] = 'tree';
           if (!in_array($phyPage, $phyPages, true)) {
               $phyPage = 'hub';
           }
@@ -36278,6 +36331,8 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
                   require_once __DIR__ . '/ap-phyrian-clans.php';
                   echo ap_phyrian_clans_nav_html((string) $phyPage);
               }
+              require_once __DIR__ . '/ap-phyrian-tree.php';
+              echo ap_phyrian_tree_nav_html((string) $phyPage);
             ?>
           </nav>
 
@@ -36379,6 +36434,14 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
                       function_exists('ap_auth_csrf_token') ? ap_auth_csrf_token() : ''
                   );
               }
+            ?>
+          <?php elseif ($phyPage === 'tree'): ?>
+            <?php
+              require_once __DIR__ . '/ap-phyrian-tree.php';
+              echo ap_phyrian_tree_page_html(
+                  (int) $vaakOwnerId,
+                  function_exists('ap_auth_csrf_token') ? ap_auth_csrf_token() : ''
+              );
             ?>
           <?php else: /* hub */ ?>
 
