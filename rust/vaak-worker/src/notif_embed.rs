@@ -3771,6 +3771,16 @@ pub fn paint_lean_embed(status: &Value, hide_header: bool) -> String {
     paint_lean_embed_from(status, hide_header, "mentions", "", true)
 }
 
+/// Logs a status that breaks the shared timeline contract (non-https media,
+/// an empty poll, a quote whose media won't paint) instead of letting the card
+/// silently lose it. Painting continues either way.
+pub(crate) fn warn_card_contract(status: &Value, surface: &str) {
+    for violation in vaak_types::check_timeline_status(status) {
+        let uri = status.get("uri").and_then(Value::as_str).unwrap_or("");
+        tracing::warn!(surface, uri, %violation, "card breaks the timeline contract");
+    }
+}
+
 /// Lean status card HTML with `from=` deep-link context (Mentions nest or Home fill).
 ///
 /// `show_actions` is false for a post nested inside a quote-boost. The action
@@ -3782,6 +3792,10 @@ pub fn paint_lean_embed_from(
     viewer_actor: &str,
     show_actions: bool,
 ) -> String {
+    // A nested quote (show_actions false) is checked with its outer card.
+    if show_actions {
+        warn_card_contract(status, from);
+    }
     let account = status.get("account").cloned().unwrap_or(Value::Null);
     let acct = account
         .get("acct")
@@ -5887,5 +5901,55 @@ mod privacy_settings_tests {
         moderation.auto_unblur_sensitive = true;
         stamp_viewer_moderation_tree(&mut st, &moderation);
         assert_eq!(st["reblog"]["quote"]["quoted_status"]["_vaak_auto_unblur_sensitive"], json!(true));
+    }
+}
+
+/// Notifications and Mentions paint with paint_lean_embed_from. These pin the
+/// shared media/quote/poll contract on that path too.
+#[cfg(test)]
+mod notification_contract {
+    use super::*;
+    use serde_json::json;
+
+    const IMG: &str = "https://cdn.bsky.app/img/feed_fullsize/plain/did:plc:abc/bafkreiaaa@jpeg";
+    const QIMG: &str = "https://cdn.bsky.app/img/feed_fullsize/plain/did:plc:q/bafkreiqqq@jpeg";
+
+    fn status(id: &str, media: Value) -> Value {
+        json!({
+            "id": id, "uri": format!("https://social.example/notes/{id}"), "url": format!("https://social.example/notes/{id}"),
+            "content": "<p>look</p>", "created_at": "2026-10-19T05:00:00.000Z",
+            "account": {"acct": "a@social.example", "display_name": "A", "avatar": "https://social.example/a.png", "uri": "https://social.example/users/a"},
+            "media_attachments": media
+        })
+    }
+
+    #[test]
+    fn notification_embed_paints_media() {
+        let st = status("1", json!([{"id": "m1", "type": "image", "url": IMG, "preview_url": IMG}]));
+        assert!(vaak_types::check_timeline_status(&st).is_empty());
+        let html = paint_lean_embed_from(&st, false, "mentions", "", true);
+        assert!(html.contains(IMG), "{html}");
+    }
+
+    #[test]
+    fn notification_embed_keeps_quote_media_in_the_quote() {
+        let mut st = status("1", json!([]));
+        st["quote"] = json!({"state": "accepted", "quoted_status": status("2", json!([{"id": "q1", "type": "image", "url": QIMG, "preview_url": QIMG}]))});
+        assert!(vaak_types::check_timeline_status(&st).is_empty());
+        let html = paint_lean_embed_from(&st, false, "mentions", "", true);
+        let at = html.find(QIMG).unwrap_or_else(|| panic!("quoted image must paint: {html}"));
+        let quote = html.find("quote").unwrap_or_else(|| panic!("quote block: {html}"));
+        assert!(quote < at, "quoted image must sit inside the quote: {html}");
+    }
+
+    #[test]
+    fn notification_embed_paints_a_remote_poll_read_only() {
+        let mut st = status("1", json!([]));
+        st["poll"] = json!({"id": "0", "expired": false, "multiple": false, "votes_count": 4, "voters_count": 4,
+            "voted": false, "expires_label": "", "options": [{"title": "yes", "votes_count": 3}, {"title": "no", "votes_count": 1}]});
+        assert!(vaak_types::check_timeline_status(&st).is_empty());
+        let html = paint_lean_embed_from(&st, false, "mentions", "", true);
+        assert!(html.contains("poll-block") && html.contains("yes"), "{html}");
+        assert!(!html.contains("poll_vote"), "a remote poll has no local vote form: {html}");
     }
 }
