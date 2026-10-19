@@ -7810,6 +7810,10 @@ if (
         echo (string) $axumFill['html'];
         exit;
     }
+    // Rust had no page: PHP paints this one. Counted so Queue health shows the rate.
+    if (function_exists('ap_timing_record')) {
+        ap_timing_record($view . '.fill.axum_miss', 0.0);
+    }
     // Past the warm head: keyset already-stored posts. No worker, no remote fetch.
     if ($fillOffset > 0 || $fillCursor !== null) {
         $olderCursor = $fillCursor;
@@ -11770,8 +11774,13 @@ if (
             if (function_exists('ap_timing_record')) {
                 ap_timing_record($view . '.first_paint.axum_html_hit', (microtime(true) - $adminHomeFirstPaintStarted) * 1000.0);
             }
-        } elseif ($view !== 'home' && function_exists('ap_timeline_public_hydrate_warm_async')) {
-            ap_timeline_public_hydrate_warm_async((int) $vaakOwnerId, $view, '15,40,50,80,160,240');
+        } else {
+            if (function_exists('ap_timing_record')) {
+                ap_timing_record($view . '.first_paint.axum_html_miss', (microtime(true) - $adminHomeFirstPaintStarted) * 1000.0);
+            }
+            if ($view !== 'home' && function_exists('ap_timeline_public_hydrate_warm_async')) {
+                ap_timeline_public_hydrate_warm_async((int) $vaakOwnerId, $view, '15,40,50,80,160,240');
+            }
         }
     }
     if (
