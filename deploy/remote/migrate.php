@@ -474,6 +474,11 @@ function vaak_migrate_cpu_index_specs(): array
             'create' => "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_remote_actors_lower_host_username ON remote_actors (lower(COALESCE(host, '')), lower(COALESCE(username, '')))",
             'drop' => 'DROP INDEX CONCURRENTLY IF EXISTS idx_remote_actors_lower_host_username',
         ],
+        'idx_events_local_timeline_created' => [
+            'table' => 'events',
+            'create' => "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_events_local_timeline_created ON events (created_at DESC, id DESC) WHERE action_taken IN ('log', 'local_observe') AND actor_id LIKE 'https://mkultra.monster/users/%'",
+            'drop' => 'DROP INDEX CONCURRENTLY IF EXISTS idx_events_local_timeline_created',
+        ],
     ];
 }
 
