@@ -18,6 +18,15 @@ const AP_INBOX_KEY_CACHE_TTL = 3600;
 /** How long to remember "this keyId is not fetchable" (Threads dead actors, etc.). */
 const AP_INBOX_KEY_NEG_CACHE_TTL = 900; // 15 minutes
 const AP_INBOX_KEY_FETCH_TIMEOUT = 8;
+/**
+ * Remote fetches an inbox POST may cause before its signature is verified.
+ * Key fetches are budgeted per key URL and per key host; origin recovery of
+ * an unverified body is budgeted per claimed actor host. Over budget → 429.
+ */
+const AP_INBOX_FETCH_BUDGET_WINDOW = 600;  // seconds
+const AP_INBOX_KEY_FETCH_MAX_PER_KEY = 6;  // a miss plus a rotation refetch, a few times over
+const AP_INBOX_KEY_FETCH_MAX_PER_HOST = 240;
+const AP_INBOX_ORIGIN_FETCH_MAX_PER_HOST = 240;
 const AP_INBOX_LOG = '/var/log/mkultra/ap-inbox.log';
 const AP_INBOX_RATE_DIR = '/tmp/ap-inbox-rate';
 const AP_INBOX_KEY_CACHE_DIR = '/tmp/ap-inbox-keys';
@@ -73,17 +82,20 @@ if ($method !== 'POST') {
 
 $ip = ap_client_ip();
 // Peek Signature early so accepted relays get a higher rate ceiling (firehose).
+// The keyId is only a claim until it verifies: relay-keyed requests draw on a
+// separate relay bucket, are refused once this IP's normal bucket is spent,
+// and are charged to the normal bucket when the signature does not verify.
 $sigHdrEarly = ap_header('Signature');
-$rateMax = AP_INBOX_RATE_MAX;
+$claimsRelay = false;
 if ($sigHdrEarly !== '' && preg_match('/keyId="([^"]+)"/', $sigHdrEarly, $km)) {
     if (!function_exists('ap_relay_is_accepted_key')) {
         require_once __DIR__ . '/ap-relays.php';
     }
     if (function_exists('ap_relay_is_accepted_key') && ap_relay_is_accepted_key($km[1])) {
-        $rateMax = AP_INBOX_RATE_MAX_RELAY;
+        $claimsRelay = true;
     }
 }
-if (!ap_rate_limit($ip, $rateMax)) {
+if (!ap_inbox_rate_admit($ip, $claimsRelay)) {
     ap_fail('Too many requests', 429);
 }
 
@@ -100,10 +112,13 @@ if ($raw === '') {
 }
 
 $selected = ap_inbox_select($raw);
+if ($claimsRelay && ($selected === null || $selected['via'] !== 'signature')) {
+    ap_rate_limit($ip, AP_INBOX_RATE_MAX);
+}
 if ($selected === null) {
     $verifyCode = (int) ($GLOBALS['ap_inbox_verify_code'] ?? 401);
     $verifyError = (string) ($GLOBALS['ap_inbox_verify_error'] ?? 'Invalid signature');
-    ap_fail($verifyError, $verifyCode === 403 ? 403 : 401);
+    ap_fail($verifyError, in_array($verifyCode, [403, 429], true) ? $verifyCode : 401);
 }
 $json = $selected['activity'];
 $sig = $selected['sig'];
@@ -226,6 +241,20 @@ exit;
 
 /* ----------------- helpers ----------------- */
 
+/**
+ * Pre-verification per-IP admission. A relay keyId uses the relay bucket but
+ * still needs room in the normal bucket, which failed relay-keyed requests
+ * are charged to after verification.
+ */
+function ap_inbox_rate_admit(string $ip, bool $claimsRelay): bool
+{
+    if (!$claimsRelay) {
+        return ap_rate_limit($ip, AP_INBOX_RATE_MAX);
+    }
+    return ap_rate_limit($ip, AP_INBOX_RATE_MAX, AP_INBOX_RATE_WINDOW, false)
+        && ap_rate_limit('relay_' . $ip, AP_INBOX_RATE_MAX_RELAY);
+}
+
 function ap_fail(string $message, int $code): void
 {
     $detail = (string) ($GLOBALS['ap_inbox_reject_detail'] ?? '');
@@ -286,17 +315,104 @@ function ap_header(string $name): string
     return trim((string) ($_SERVER[$key] ?? ''));
 }
 
+/**
+ * Client address for rate limits and logs.
+ *
+ * X-Forwarded-For is only read when the direct peer (REMOTE_ADDR) is a
+ * trusted proxy: loopback by default, or the comma-separated addresses and
+ * CIDR ranges in VAAK_TRUSTED_PROXIES. The header is then walked from the
+ * right and the first address that is not itself a trusted proxy wins, so
+ * entries the client wrote ahead of our proxy's own append are ignored.
+ */
 function ap_client_ip(): string
 {
+    $remote = $_SERVER['REMOTE_ADDR'] ?? '';
+    $remote = is_string($remote) ? trim($remote) : '';
+    if (!filter_var($remote, FILTER_VALIDATE_IP)) {
+        return '0.0.0.0';
+    }
+    if (!ap_client_ip_is_trusted_proxy($remote)) {
+        return $remote;
+    }
     $xff = $_SERVER['HTTP_X_FORWARDED_FOR'] ?? '';
-    if (is_string($xff) && $xff !== '') {
-        $first = trim(explode(',', $xff)[0]);
-        if (filter_var($first, FILTER_VALIDATE_IP)) {
-            return $first;
+    if (!is_string($xff) || trim($xff) === '') {
+        return $remote;
+    }
+    $client = $remote;
+    foreach (array_reverse(explode(',', $xff)) as $hop) {
+        $hop = trim($hop);
+        if (!filter_var($hop, FILTER_VALIDATE_IP)) {
+            break;
+        }
+        $client = $hop;
+        if (!ap_client_ip_is_trusted_proxy($hop)) {
+            break;
         }
     }
-    $ip = $_SERVER['REMOTE_ADDR'] ?? '0.0.0.0';
-    return is_string($ip) ? $ip : '0.0.0.0';
+    return $client;
+}
+
+/** @return list<string> */
+function ap_client_ip_trusted_proxies(): array
+{
+    $raw = getenv('VAAK_TRUSTED_PROXIES');
+    if ($raw === false || trim((string) $raw) === '') {
+        $raw = $_SERVER['VAAK_TRUSTED_PROXIES'] ?? '';
+    }
+    $raw = trim((string) $raw);
+    if ($raw === '') {
+        return ['127.0.0.0/8', '::1/128', '::ffff:127.0.0.0/104'];
+    }
+    $out = [];
+    foreach (preg_split('/[\s,]+/', $raw) ?: [] as $entry) {
+        if ($entry !== '') {
+            $out[] = $entry;
+        }
+    }
+    return $out;
+}
+
+function ap_client_ip_is_trusted_proxy(string $ip): bool
+{
+    foreach (ap_client_ip_trusted_proxies() as $cidr) {
+        if (ap_client_ip_in_cidr($ip, $cidr)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+function ap_client_ip_in_cidr(string $ip, string $cidr): bool
+{
+    $net = $cidr;
+    $bits = null;
+    if (str_contains($cidr, '/')) {
+        [$net, $len] = explode('/', $cidr, 2);
+        if (!preg_match('/^[0-9]{1,3}$/', $len)) {
+            return false;
+        }
+        $bits = (int) $len;
+    }
+    $ipBin = @inet_pton($ip);
+    $netBin = @inet_pton($net);
+    if ($ipBin === false || $netBin === false || strlen($ipBin) !== strlen($netBin)) {
+        return false;
+    }
+    $max = strlen($ipBin) * 8;
+    $bits = $bits === null ? $max : $bits;
+    if ($bits > $max) {
+        return false;
+    }
+    $whole = intdiv($bits, 8);
+    if (substr($ipBin, 0, $whole) !== substr($netBin, 0, $whole)) {
+        return false;
+    }
+    $rest = $bits % 8;
+    if ($rest === 0) {
+        return true;
+    }
+    $mask = (0xff << (8 - $rest)) & 0xff;
+    return (ord($ipBin[$whole]) & $mask) === (ord($netBin[$whole]) & $mask);
 }
 
 function ap_short(string $s, int $n = 120): string
@@ -608,14 +724,18 @@ function ap_inbox_select(string $raw): ?array
             'path' => $verified['path'],
         ];
     }
-    if ((int) ($GLOBALS['ap_inbox_verify_code'] ?? 401) === 403) {
+    if (in_array((int) ($GLOBALS['ap_inbox_verify_code'] ?? 401), [403, 429], true)) {
         return null;
     }
     $verifyError = (string) ($GLOBALS['ap_inbox_verify_error'] ?? 'Invalid signature');
     ap_log('verify_fail msg=' . preg_replace('/[^A-Za-z0-9 ._-]+/', '_', $verifyError));
     $posted = json_decode($raw, true);
+    $GLOBALS['ap_inbox_fetch_throttled'] = false;
     $recovered = ap_inbox_recover_unverified(is_array($posted) ? $posted : null);
     if ($recovered === null) {
+        if (!empty($GLOBALS['ap_inbox_fetch_throttled'])) {
+            return ap_inbox_verify_fail('Too many requests', 429);
+        }
         return null;
     }
     return [
@@ -686,15 +806,23 @@ function ap_inbox_try_verify(string $raw): ?array
         ap_log(sprintf('blocked_reject_keyhost ip=%s keyId=%s', ap_client_ip(), ap_short($sig['keyId'])));
         return ap_inbox_verify_fail('Instance blocked', 403);
     }
+    $GLOBALS['ap_inbox_fetch_throttled'] = false;
     $pem = ap_fetch_actor_pubkey($sig['keyId']);
     $sigRaw = base64_decode($sig['signature'], true) ?: '';
     $okPath = ($pem !== null) ? ap_verify_http_signature($sig['headers'], $raw, $sigRaw, $pem, $sig) : null;
     if ($okPath === null && $pem !== null) {
-        ap_inbox_forget_actor_pubkey($sig['keyId']);
+        // Refetch once for a rotated key. Keep the cached key when the fetch
+        // budget refuses, so failed signatures cannot evict a working key.
         $pem = ap_fetch_actor_pubkey($sig['keyId'], true);
+        if ($pem === null && empty($GLOBALS['ap_inbox_fetch_throttled'])) {
+            ap_inbox_forget_actor_pubkey($sig['keyId']);
+        }
         $okPath = ($pem !== null) ? ap_verify_http_signature($sig['headers'], $raw, $sigRaw, $pem, $sig) : null;
     }
     if ($pem === null) {
+        if (!empty($GLOBALS['ap_inbox_fetch_throttled'])) {
+            return ap_inbox_verify_fail('Too many key fetches', 429);
+        }
         return ap_inbox_verify_fail('Unable to fetch key');
     }
     if ($okPath === null) {
@@ -799,14 +927,22 @@ function ap_inbox_try_verify_rfc9421(string $raw, string $sigHdr, string $sigInp
         return ap_inbox_verify_fail('Malformed Signature');
     }
     $sigRaw = base64_decode($sm[1], true) ?: '';
+    $GLOBALS['ap_inbox_fetch_throttled'] = false;
     $pem = ap_fetch_actor_pubkey($keyId);
     $okPath = ($pem !== null) ? ap_inbox_verify_rfc9421_base($parsed, $sigRaw, $pem, $contentDigest) : null;
     if ($okPath === null && $pem !== null) {
-        ap_inbox_forget_actor_pubkey($keyId);
+        // Refetch once for a rotated key. Keep the cached key when the fetch
+        // budget refuses, so failed signatures cannot evict a working key.
         $pem = ap_fetch_actor_pubkey($keyId, true);
+        if ($pem === null && empty($GLOBALS['ap_inbox_fetch_throttled'])) {
+            ap_inbox_forget_actor_pubkey($keyId);
+        }
         $okPath = ($pem !== null) ? ap_inbox_verify_rfc9421_base($parsed, $sigRaw, $pem, $contentDigest) : null;
     }
     if ($pem === null) {
+        if (!empty($GLOBALS['ap_inbox_fetch_throttled'])) {
+            return ap_inbox_verify_fail('Too many key fetches', 429);
+        }
         return ap_inbox_verify_fail('Unable to fetch key');
     }
     if ($okPath === null) {
@@ -1067,7 +1203,7 @@ function ap_inbox_recover_unverified(?array $posted): ?array
         return null;
     }
     $actorHost = strtolower((string) parse_url($claimed, PHP_URL_HOST));
-    if ($actorHost === '' || (function_exists('ap_host_resolves_public') && !ap_host_resolves_public($actorHost))) {
+    if ($actorHost === '') {
         return null;
     }
     try {
@@ -1079,6 +1215,12 @@ function ap_inbox_recover_unverified(?array $posted): ?array
     }
     $urls = ap_inbox_origin_urls($posted);
     if ($urls === []) {
+        return null;
+    }
+    if (!ap_inbox_fetch_budget_take([['origin:' . $actorHost, AP_INBOX_ORIGIN_FETCH_MAX_PER_HOST]])) {
+        return null;
+    }
+    if (function_exists('ap_host_resolves_public') && !ap_host_resolves_public($actorHost)) {
         return null;
     }
     $fetches = [];
@@ -1328,7 +1470,11 @@ function ap_inbox_origin_cache_write(string $url, array $res): void
     }
 }
 
-function ap_rate_limit(string $ip, int $max = AP_INBOX_RATE_MAX): bool
+/**
+ * Sliding-window counter in AP_INBOX_RATE_DIR. $charge=false only checks
+ * whether the bucket still has room.
+ */
+function ap_rate_limit(string $ip, int $max = AP_INBOX_RATE_MAX, int $window = AP_INBOX_RATE_WINDOW, bool $charge = true): bool
 {
     if (!is_dir(AP_INBOX_RATE_DIR)) {
         @mkdir(AP_INBOX_RATE_DIR, 0750, true);
@@ -1351,9 +1497,12 @@ function ap_rate_limit(string $ip, int $max = AP_INBOX_RATE_MAX): bool
                 $stamps = array_map('intval', $decoded);
             }
         }
-        $stamps = array_values(array_filter($stamps, static fn($t) => $t > $now - AP_INBOX_RATE_WINDOW));
+        $stamps = array_values(array_filter($stamps, static fn($t) => $t > $now - $window));
         if (count($stamps) >= $max) {
             return false;
+        }
+        if (!$charge) {
+            return true;
         }
         $stamps[] = $now;
         ftruncate($fh, 0);
@@ -1720,6 +1869,42 @@ function ap_inbox_forget_actor_pubkey(string $keyId): void
     }
 }
 
+/**
+ * Spend one unit of a remote-fetch budget. Redis when available, else the
+ * same file counters the per-IP limiter uses. Sets
+ * $GLOBALS['ap_inbox_fetch_throttled'] when a bucket is spent.
+ *
+ * @param list<array{0:string,1:int}> $buckets [bucket name, max per window]
+ */
+function ap_inbox_fetch_budget_take(array $buckets): bool
+{
+    foreach ($buckets as [$bucket, $max]) {
+        $name = 'inbox-fetch:' . $bucket;
+        $count = function_exists('ap_redis_rate_count')
+            ? ap_redis_rate_count($name, AP_INBOX_FETCH_BUDGET_WINDOW)
+            : null;
+        $ok = $count === null
+            ? ap_rate_limit('fetch_' . hash('sha256', $name), $max, AP_INBOX_FETCH_BUDGET_WINDOW)
+            : $count <= $max;
+        if (!$ok) {
+            $GLOBALS['ap_inbox_fetch_throttled'] = true;
+            ap_log('fetch_budget_exceeded bucket=' . ap_short($bucket));
+            return false;
+        }
+    }
+    return true;
+}
+
+function ap_inbox_key_fetch_budget_take(string $keyId): bool
+{
+    $base = preg_replace('/#.*$/', '', trim($keyId)) ?: trim($keyId);
+    $host = strtolower((string) parse_url($base, PHP_URL_HOST));
+    return ap_inbox_fetch_budget_take([
+        ['key:' . $base, AP_INBOX_KEY_FETCH_MAX_PER_KEY],
+        ['keyhost:' . $host, AP_INBOX_KEY_FETCH_MAX_PER_HOST],
+    ]);
+}
+
 function ap_fetch_actor_pubkey(string $keyId, bool $bypassCache = false): ?string
 {
     $keyId = trim($keyId);
@@ -1738,7 +1923,7 @@ function ap_fetch_actor_pubkey(string $keyId, bool $bypassCache = false): ?strin
         return null;
     }
     $host = $parts['host'] ?? '';
-    if ($host === '' || !ap_host_resolves_public($host)) {
+    if ($host === '') {
         return null;
     }
 
@@ -1762,6 +1947,14 @@ function ap_fetch_actor_pubkey(string $keyId, bool $bypassCache = false): ?strin
             . ' http=' . (int) $neg['http']
             . ' reason=' . preg_replace('/[^a-z0-9_]+/i', '_', (string) $neg['reason'])
         );
+        return null;
+    }
+
+    // Everything below is a remote fetch for a sender that has not verified yet.
+    if (!ap_inbox_key_fetch_budget_take($keyId)) {
+        return null;
+    }
+    if (!ap_host_resolves_public($host)) {
         return null;
     }
 
