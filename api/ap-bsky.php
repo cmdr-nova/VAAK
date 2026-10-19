@@ -3368,6 +3368,32 @@ function ap_bsky_post_label_vals(array $post): array
 }
 
 /**
+ * True while a post's stored labels may predate Bluesky moderation: labels
+ * never read from AppView, or read before the 2 min / 30 min points the Rust
+ * label re-check (thin_media_warm) uses. Posts older than 2 h are settled.
+ *
+ * @param array<string,mixed> $post
+ */
+function ap_bsky_post_labels_stale(array $post, ?int $now = null): bool
+{
+    $now ??= time();
+    $created = strtotime((string) ($post['record']['createdAt'] ?? $post['indexedAt'] ?? ''));
+    if ($created === false) {
+        return false;
+    }
+    $age = $now - $created;
+    if ($age < 0 || $age > 7200) {
+        return false;
+    }
+    $at = $post['vaak_labels_at'] ?? null;
+    if (!is_int($at)) {
+        return true;
+    }
+    $due = $age >= 1800 ? 1800 : ($age >= 120 ? 120 : null);
+    return $due !== null && $at < $created + $due;
+}
+
+/**
  * True when a Bluesky post carries adult/graphic moderation labels.
  *
  * @param array<string,mixed> $post
@@ -3941,54 +3967,53 @@ function ap_bsky_post_upsert_from_feed_item(array $itemOrPost, ?int $ownerUserId
     if (!empty($record['fediverseId'])) {
         $raw['record']['fediverseId'] = (string) $record['fediverseId'];
     }
-    // Never clobber a hydrated AppView embed with a later Jetstream/thin upsert.
-    if ($embedCompact === null) {
-        try {
-            $prev = ap_db()->prepare('SELECT embed_json, raw_json FROM bsky_posts WHERE bsky_uri = ? LIMIT 1');
-            $prev->execute([$uri]);
-            $prevRow = $prev->fetch(PDO::FETCH_ASSOC);
-            if (is_array($prevRow)) {
+    // Never clobber a hydrated AppView embed with a later Jetstream/thin upsert,
+    // and never let any re-upsert wipe moderation labels already stored: a view
+    // that lacks them (Jetstream replay, a cached copy, a feed read before the
+    // labeler acted) would uncover an NSFW post. The Rust label re-check
+    // replaces labels from AppView when they really change.
+    try {
+        $prev = ap_db()->prepare('SELECT embed_json, raw_json FROM bsky_posts WHERE bsky_uri = ? LIMIT 1');
+        $prev->execute([$uri]);
+        $prevRow = $prev->fetch(PDO::FETCH_ASSOC);
+        if (is_array($prevRow)) {
+            $prevRaw = json_decode((string) ($prevRow['raw_json'] ?? ''), true);
+            if ($embedCompact === null) {
                 $prevEmbed = json_decode((string) ($prevRow['embed_json'] ?? ''), true);
                 if (!is_array($prevEmbed)) {
-                    $prevRaw = json_decode((string) ($prevRow['raw_json'] ?? ''), true);
                     $prevEmbed = is_array($prevRaw['embed'] ?? null) ? $prevRaw['embed'] : null;
                 }
                 if (is_array($prevEmbed) && $prevEmbed !== []) {
                     $embedCompact = $prevEmbed;
                     $raw['embed'] = $prevEmbed;
                 }
-                // Union moderation labels so a thin re-upsert cannot wipe them.
-                $prevRaw = json_decode((string) ($prevRow['raw_json'] ?? ''), true);
-                if (is_array($prevRaw) && !isset($raw['vaak_labels_at']) && is_int($prevRaw['vaak_labels_at'] ?? null)) {
-                    $raw['vaak_labels_at'] = $prevRaw['vaak_labels_at'];
-                }
-                if (is_array($prevRaw) && ap_bsky_compact_label_list($author['labels'] ?? null) === []
-                    && is_array($prevRaw['author']['labels'] ?? null) && $prevRaw['author']['labels'] !== []) {
-                    $raw['author']['labels'] = $prevRaw['author']['labels'];
-                }
-                if (is_array($prevRaw) && is_array($prevRaw['labels'] ?? null)) {
-                    $seenVals = [];
-                    foreach ($raw['labels'] as $lab) {
-                        if (is_array($lab) && isset($lab['val'])) {
-                            $seenVals[strtolower((string) $lab['val'])] = true;
-                        }
+            }
+            if (is_array($prevRaw) && ap_bsky_compact_label_list($author['labels'] ?? null) === []
+                && is_array($prevRaw['author']['labels'] ?? null) && $prevRaw['author']['labels'] !== []) {
+                $raw['author']['labels'] = $prevRaw['author']['labels'];
+            }
+            if (is_array($prevRaw) && is_array($prevRaw['labels'] ?? null)) {
+                $seenVals = [];
+                foreach ($raw['labels'] as $lab) {
+                    if (is_array($lab) && isset($lab['val'])) {
+                        $seenVals[strtolower((string) $lab['val'])] = true;
                     }
-                    foreach ($prevRaw['labels'] as $lab) {
-                        if (!is_array($lab)) {
-                            continue;
-                        }
-                        $val = strtolower(trim((string) ($lab['val'] ?? '')));
-                        if ($val === '' || isset($seenVals[$val])) {
-                            continue;
-                        }
-                        $raw['labels'][] = $lab;
-                        $seenVals[$val] = true;
+                }
+                foreach ($prevRaw['labels'] as $lab) {
+                    if (!is_array($lab)) {
+                        continue;
                     }
+                    $val = strtolower(trim((string) ($lab['val'] ?? '')));
+                    if ($val === '' || isset($seenVals[$val])) {
+                        continue;
+                    }
+                    $raw['labels'][] = $lab;
+                    $seenVals[$val] = true;
                 }
             }
-        } catch (Throwable $e) {
-            // ignore
         }
+    } catch (Throwable $e) {
+        // ignore
     }
     // Jetstream posts have no view embed. Build the media URLs from the blob
     // refs so Home shows them before (or without) the AppView repair.

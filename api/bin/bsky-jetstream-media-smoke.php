@@ -7,7 +7,7 @@ reference_load(dirname(__DIR__) . '/ap-bsky.php', [
     'ap_bsky_post_embed_compact', 'ap_bsky_embed_video_view', 'ap_bsky_compact_label_list',
     'ap_bsky_compact_facets', 'ap_bsky_post_upsert_from_feed_item', 'ap_bsky_post_embed_media_thin',
     'ap_bsky_jetstream_media_backfill', 'ap_bsky_cached_quote_view',
-    'ap_bsky_sensitive_label_vals', 'ap_bsky_post_label_vals', 'ap_bsky_post_is_sensitive',
+    'ap_bsky_sensitive_label_vals', 'ap_bsky_post_label_vals', 'ap_bsky_post_is_sensitive', 'ap_bsky_post_labels_stale',
 ]);
 if (!defined('AP_BSKY_POST_TEXT_MAX')) define('AP_BSKY_POST_TEXT_MAX', 5000);
 $db = new PDO('sqlite::memory:');
@@ -119,10 +119,21 @@ try {
     $a = $row($aUri)['raw'];
     jm_check(($a['author']['labels'][0]['val'] ?? '') === 'porn' && ap_bsky_post_is_sensitive($a), 'account porn label marks the post sensitive');
     jm_check(is_int($a['vaak_labels_at'] ?? null), 'AppView upsert stamps when labels were read');
-    // A Jetstream replay (no view embed, no author view) keeps both.
+    // A Jetstream replay (no view embed, no author view) keeps the account labels;
+    // the missing stamp only means labels get read again.
     ap_bsky_post_upsert_from_feed_item(['uri' => $aUri, 'author' => ['did' => $did], 'record' => ['text' => 'clip', 'createdAt' => '2026-10-19T05:00:00Z']], null);
     $a2 = $row($aUri)['raw'];
-    jm_check(($a2['author']['labels'][0]['val'] ?? '') === 'porn' && ($a2['vaak_labels_at'] ?? null) === $a['vaak_labels_at'], 'Jetstream replay keeps account labels and the stamp');
+    jm_check(($a2['author']['labels'][0]['val'] ?? '') === 'porn' && !isset($a2['vaak_labels_at']), 'Jetstream replay keeps account labels');
+    // A later AppView view read before the labeler acted keeps stored labels.
+    ap_bsky_post_upsert_from_feed_item(['post' => ['uri' => $aUri, 'indexedAt' => '2026-10-19T05:00:01Z',
+        'author' => ['did' => $did, 'handle' => 'a.example'], 'record' => ['text' => 'clip', 'createdAt' => '2026-10-19T05:00:00Z'],
+        'embed' => ['$type' => 'app.bsky.embed.images#view', 'images' => [['thumb' => $live, 'fullsize' => $live]]], 'labels' => []]], null);
+    $a3 = $row($aUri)['raw'];
+    jm_check(($a3['author']['labels'][0]['val'] ?? '') === 'porn' && ap_bsky_post_is_sensitive($a3), 'AppView re-upsert without labels keeps stored labels');
+    $sp = ['record' => ['createdAt' => gmdate('c', 1000000)], 'indexedAt' => ''];
+    jm_check(ap_bsky_post_labels_stale($sp, 1000030) && !ap_bsky_post_labels_stale($sp + ['vaak_labels_at' => 1000001], 1000060), 'fresh post: stale only until labels are read');
+    jm_check(ap_bsky_post_labels_stale($sp + ['vaak_labels_at' => 1000001], 1000140) && !ap_bsky_post_labels_stale($sp + ['vaak_labels_at' => 1000125], 1000600), 'labels read in the first 2 min are stale after 2 min');
+    jm_check(!ap_bsky_post_labels_stale($sp, 1000000 + 7201), 'posts older than 2 h are settled');
     $qlUri = "at://{$did}/app.bsky.feed.post/3quotelabel";
     ap_bsky_post_upsert_from_feed_item(['post' => ['uri' => $qlUri, 'indexedAt' => '2026-10-19T05:00:01Z', 'author' => ['did' => $did],
         'record' => ['text' => 'look', 'createdAt' => '2026-10-19T05:00:00Z'],
