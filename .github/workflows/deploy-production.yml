@@ -254,6 +254,8 @@ jobs:
       - name: Assemble and activate
         env:
           RELEASE_SHA: ${{ steps.version.outputs.sha }}
+          # Repository variable. 1 rolls back a release whose canary fails.
+          VAAK_CANARY_ENFORCE: ${{ vars.VAAK_CANARY_ENFORCE || '0' }}
         run: |
           set -euo pipefail
           [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]
@@ -338,6 +340,7 @@ jobs:
       - name: Roll back to an installed release
         env:
           ROLLBACK_TO: ${{ inputs.rollback_to }}
+          VAAK_CANARY_ENFORCE: ${{ vars.VAAK_CANARY_ENFORCE || '0' }}
         run: |
           set -euo pipefail
           [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]

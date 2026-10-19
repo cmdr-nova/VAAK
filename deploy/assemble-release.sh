@@ -29,6 +29,7 @@ done
 BIN_ALLOW=(
   bsky-jetstream-media-backfill.php
   bsky-notif-subject-backfill.php
+  deploy-canary.php
   home-timeline-warm.php
   notif-projection-fill.php
   phyrian-decay.php
@@ -98,6 +99,8 @@ self_test() {
   [[ -f "${tmp}/out/api/ap-version.php" ]]
   [[ -f "${tmp}/out/api/bin/notif-projection-fill.php" ]]
   [[ -f "${tmp}/out/api/bin/bsky-notif-subject-backfill.php" ]]
+  [[ -f "${tmp}/out/api/bin/deploy-canary.php" ]]
+  [[ ! -e "${tmp}/out/api/bin/deploy-canary-smoke.php" ]]
   [[ ! -e "${tmp}/out/api/bin/bsky-notif-subject-backfill-smoke.php" ]]
   [[ ! -e "${tmp}/out/api/bin/library-client-smoke.php" ]]
   [[ ! -e "${tmp}/out/api/fixtures" ]]
