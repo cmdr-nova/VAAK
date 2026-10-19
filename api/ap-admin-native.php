@@ -20,19 +20,19 @@ function ap_admin_native_reply(array $reply,array $request): ?string
     $keys=array_keys($reply);sort($keys);$expected=['protocol_version','ok','request_binding','source_count','rows','html'];sort($expected);
     if($keys!==$expected || $reply['protocol_version']!==1 || $reply['ok']!==true || !is_string($reply['html'])
         || strlen($reply['html'])>2*1024*1024 || !is_int($reply['source_count']) || !is_array($reply['rows'])
-        || !array_is_list($reply['rows']) || count($reply['rows'])!==$reply['source_count'] || count($reply['rows'])>($request['view']==='users'?20:100)) return null;
+        || !array_is_list($reply['rows']) || count($reply['rows'])!==$reply['source_count'] || count($reply['rows'])>match($request['view']){'users'=>20,'blocks'=>1000,default=>100}) return null;
     $binding=[];foreach(['owner_id','view','mode','offset','approvals_enabled'] as $key)$binding[$key]=$request[$key];
     if($request['view']==='users')$binding['search']=$request['search'];
     if(!is_array($reply['request_binding']))return null;
     $bindingKeys=array_keys($reply['request_binding']);sort($bindingKeys);$requiredBinding=array_keys($binding);sort($requiredBinding);if($bindingKeys!==$requiredBinding)return null;
     foreach($binding as $key=>$value)if($reply['request_binding'][$key]!==$value)return null;
     $required=match($request['view']){'users'=>['id','username','email','actor_key','actor_id','is_admin','created_at','updated_at','disabled_at','profile_name','icon_url'],
-        'invites'=>['id','code','created_at','used_at','note'],'relays'=>['id','inbox_url','state','follow_activity_id','created_at','updated_at'],'policies'=>['id','text'],
+        'invites'=>['id','code','created_at','used_at','note'],'relays'=>['id','inbox_url','state','follow_activity_id','created_at','updated_at'],'policies'=>['id','text'],'blocks'=>['id','scope','value','kind','reason','created_at'],
         default=>['id','username','email','status','created_at','decided_at']};sort($required);
     foreach($reply['rows'] as $row){
         if(!is_array($row))return null;$rowKeys=array_keys($row);sort($rowKeys);if($rowKeys!==$required || !is_int($row['id']) || $row['id']<1)return null;
         $mandatory=match($request['view']){'users'=>['username','actor_key','actor_id','created_at','updated_at'],'invites'=>['code','created_at'],
-            'relays'=>['inbox_url','state','created_at','updated_at'],'policies'=>['text'],default=>['username','status','created_at']};
+            'relays'=>['inbox_url','state','created_at','updated_at'],'policies'=>['text'],'blocks'=>['scope','value','kind','created_at'],default=>['username','status','created_at']};
         foreach($row as $key=>$value){if($key==='id')continue;if($request['view']==='users'&&$key==='is_admin'){if(!is_int($value))return null;continue;}if(!is_string($value)&&($value!==null||in_array($key,$mandatory,true)))return null;}
         if($request['view']==='approvals'&&!in_array($row['status'],['pending','approved','rejected'],true))return null;
     }
@@ -40,10 +40,11 @@ function ap_admin_native_reply(array $reply,array $request): ?string
 }
 function ap_admin_native_read_body(string $view,int $offset=0): ?string
 {
-    if(!ap_admin_native_enabled() || !in_array($view,['invites','approvals','users','relays','policies'],true) || $offset<0 || $offset>PHP_INT_MAX-100)return null;
+    if(!ap_admin_native_enabled() || !in_array($view,['invites','approvals','users','relays','policies','blocks'],true) || $offset<0 || $offset>PHP_INT_MAX-100)return null;
     if($view==='users' && getenv('VAAK_ADMIN_USERS_NATIVE')!=='1')return null;
     if($view==='relays' && (getenv('VAAK_ADMIN_RELAYS_NATIVE')!=='1' || $offset!==0))return null;
     if($view==='policies' && (getenv('VAAK_ADMIN_POLICIES_NATIVE')!=='1' || $offset!==0))return null;
+    if($view==='blocks' && (getenv('VAAK_ADMIN_BLOCKS_NATIVE')!=='1' || $offset!==0))return null;
     if(!ap_registration_current_admin(ap_db()))return null;
     $user=ap_auth_current_user();$owner=(int)($user['id']??0);if($owner<1)return null;
     $url=(string)(getenv('VAAK_ADMIN_READ_URL')?:'http://127.0.0.1:8787/internal/admin/read');if(!ap_admin_native_url_allowed($url))return null;

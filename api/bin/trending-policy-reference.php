@@ -32,7 +32,7 @@ foreach(['sqlite','pgsql-integer','pgsql-bigint'] as $driver){
  $schema='trending_policy_'.getmypid().'_'.str_replace('-','_',$driver);if($driver!=='sqlite'){$db->exec('CREATE SCHEMA '.$schema);$db->exec('SET search_path TO '.$schema);}
  try{
   $width=$driver==='pgsql-bigint'?'BIGINT':'INTEGER';
-  $db->exec("CREATE TABLE ap_blocks(scope TEXT,kind TEXT,value TEXT,created_at TEXT);
+  $db->exec("CREATE TABLE ap_blocks(id INTEGER PRIMARY KEY AUTOINCREMENT,scope TEXT,kind TEXT,value TEXT,created_at TEXT);
   CREATE TABLE ap_user_blocks(id $width,owner_user_id $width,scope TEXT,value TEXT,created_at TEXT);
   CREATE TABLE ap_mutes(owner_user_id $width,actor_id TEXT,created_at TEXT);
   CREATE TABLE ap_deprioritized_actors(owner_user_id $width,actor_id TEXT,created_at TEXT);
@@ -83,7 +83,7 @@ foreach(['sqlite','pgsql-integer','pgsql-bigint'] as $driver){
    $db->exec('DELETE FROM ap_user_blocks; DELETE FROM ap_mutes; DELETE FROM ap_blocks; DELETE FROM ap_muted_words');
    if($policy==='personal-block')$db->exec("INSERT INTO ap_user_blocks VALUES(1,201,'actor','https://remote.test/users/alice','now')");
    if($policy==='personal-mute')$db->exec("INSERT INTO ap_mutes VALUES(201,'https://remote.test/users/alice','now')");
-   if($policy==='server-block'||$policy==='server-mute')$db->exec("INSERT INTO ap_blocks VALUES('actor','".($policy==='server-block'?'block':'mute')."','https://remote.test/users/alice','now')");
+   if($policy==='server-block'||$policy==='server-mute')$db->exec("INSERT INTO ap_blocks(scope,kind,value,created_at) VALUES('actor','".($policy==='server-block'?'block':'mute')."','https://remote.test/users/alice','now')");
    if($policy==='word')$db->exec("INSERT INTO ap_muted_words VALUES(1,201,'forbidden','now',NULL)");
    trend_clear();$nested=$base;$nested['content']='forbidden';$candidates['statuses']=[array_replace(trend_status('outer','https://outer.test/users/outer'),['quote'=>['reblog'=>$nested]])];
    trend_check(!str_contains(admin_trends_sidebar_html('home',true,$meta),'POST-outer'),'nested '.$policy);
@@ -100,21 +100,21 @@ foreach(['sqlite','pgsql-integer','pgsql-bigint'] as $driver){
    $did='did:plc:'.str_replace('-','',$rule).str_replace('-','',$driver);
    if($rule==='personal-mute')$db->prepare("INSERT INTO ap_mutes VALUES(201,?,'now')")->execute([$did]);
    elseif($rule==='personal-block')$db->prepare("INSERT INTO ap_user_blocks VALUES(1,201,'actor',?,'now')")->execute([$did]);
-   else $db->prepare("INSERT INTO ap_blocks VALUES('actor',?,?,'now')")->execute([$rule==='server-mute'?'mute':'block',$did]);
+   else $db->prepare("INSERT INTO ap_blocks(scope,kind,value,created_at) VALUES('actor',?,?,'now')")->execute([$rule==='server-mute'?'mute':'block',$did]);
    trend_clear();$candidates['statuses']=[array_replace(trend_status('didouter','https://outer.test/users/outer'),['quote'=>['reblog'=>['author_did'=>$did]]])];
    trend_check(!str_contains(admin_trends_sidebar_html('home',true,$meta),'POST-didouter'),'nested DID '.$rule);
   }
   $db->exec('DELETE FROM ap_user_blocks; DELETE FROM ap_mutes; DELETE FROM ap_blocks; DELETE FROM ap_muted_words');trend_clear();
   $viewer=0;$uriOnly=$base;$uriOnly['account']=['uri'=>'https://remote.test/@alice'];$candidates['statuses']=[$uriOnly];
   foreach(['block','mute'] as $kind){
-   $db->exec('DELETE FROM ap_blocks');$db->prepare("INSERT INTO ap_blocks VALUES('actor',?,'https://remote.test/users/alice','now')")->execute([$kind]);trend_clear();
+   $db->exec('DELETE FROM ap_blocks');$db->prepare("INSERT INTO ap_blocks(scope,kind,value,created_at) VALUES('actor',?,'https://remote.test/users/alice','now')")->execute([$kind]);trend_clear();
    trend_check(!str_contains(admin_trends_sidebar_html('home',true,$meta),'POST-target'),'guest URI-only server '.$kind);
   }
   $viewer=201;$db->exec('DELETE FROM ap_blocks');trend_clear();
   $deep=trend_status('deep','https://eligible.test/users/u');foreach(range(1,18) as $level)$deep=['content'=>'POST-too-deep','quote'=>$deep];$candidates['statuses']=[$deep];
   trend_check(!str_contains(admin_trends_sidebar_html('home',true,$meta),'POST-too-deep'),'excess nesting fails closed');
   $db->exec('DELETE FROM ap_user_blocks; DELETE FROM ap_mutes; DELETE FROM ap_blocks; DELETE FROM ap_muted_words');trend_clear();
-  $db->exec("INSERT INTO ap_blocks VALUES('actor','block','https://remote.test/users/alice','now')");trend_clear();$viewer=0;$candidates['statuses']=[$base];
+  $db->exec("INSERT INTO ap_blocks(scope,kind,value,created_at) VALUES('actor','block','https://remote.test/users/alice','now')");trend_clear();$viewer=0;$candidates['statuses']=[$base];
   trend_check(!str_contains(admin_trends_sidebar_html('home',true,$meta),'POST-target'),'server moderation applies with owner zero');
   $viewer=201;$db->exec('DELETE FROM ap_blocks');trend_clear();
   $db->exec("INSERT INTO ap_deprioritized_actors VALUES(201,'https://remote.test/users/alice','now')");$candidates['statuses']=[$base];foreach(range(1,8) as $n)$candidates['statuses'][]=trend_status('eligible'.$n,'https://eligible.test/users/u'.$n);

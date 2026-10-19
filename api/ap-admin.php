@@ -30416,6 +30416,9 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
         <?php endif; ?>
 
       <?php elseif ($view === 'blocks'): ?>
+        <?php if (($adminNativeBody = ap_admin_native_read_body('blocks')) !== null): ?>
+          <?= $adminNativeBody ?>
+        <?php else: ?>
         <div class="meta" style="margin-bottom:1rem">
           <b>Server-wide controls</b>:
           <b>Block / Suspend</b> fully reject inbound federation (HTTP 403), stop outbound delivery, and for actor blocks also send ActivityPub <code>Block</code> from local accounts so remotes learn; domain blocks stay local reject (no mass fan-out);
@@ -30591,6 +30594,7 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
           });
         })();
         </script>
+        <?php endif; ?>
 
       <?php elseif ($view === 'users'): ?>
         <?php if (empty($vaakIsAdmin)): ?>
