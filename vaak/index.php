@@ -409,7 +409,8 @@ if ($isAuthPost) {
             exit;
         }
         $error = $res['error'] ?? 'Two-factor verification failed.';
-        $mode = '2fa';
+        // A discarded pending sign-in (expired or too many codes) starts over.
+        $mode = (int) ($_SESSION['vaak_2fa_pending_user_id'] ?? 0) > 0 ? '2fa' : 'login';
     }
 }
 

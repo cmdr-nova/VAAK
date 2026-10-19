@@ -5,6 +5,7 @@
 declare(strict_types=1);
 
 require_once __DIR__ . '/ap-link-preview.php';
+require_once __DIR__ . '/ap-shadow-http.php';
 require_once __DIR__ . '/ap-asks.php';
 require_once __DIR__ . '/ap-normalize.php';
 require_once __DIR__ . '/ap-visibility.php';
@@ -7071,7 +7072,7 @@ function ap_masto_notifications_axum_fetch(
             CURLOPT_RETURNTRANSFER => true,
             CURLOPT_CONNECTTIMEOUT_MS => 120,
             CURLOPT_TIMEOUT_MS => 350,
-            CURLOPT_HTTPHEADER => ['Accept: application/json', 'Connection: close'],
+            CURLOPT_HTTPHEADER => array_merge(['Accept: application/json', 'Connection: close'], ap_shadow_http_auth_headers()),
         ]);
         $raw = curl_exec($ch);
         $code = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
@@ -7084,7 +7085,7 @@ function ap_masto_notifications_axum_fetch(
             'http' => [
                 'method' => 'GET',
                 'timeout' => 0.35,
-                'header' => "Accept: application/json\r\nConnection: close\r\n",
+                'header' => "Accept: application/json\r\nConnection: close\r\n" . ap_shadow_http_auth_header_text(),
                 'ignore_errors' => true,
             ],
         ]);
@@ -7181,7 +7182,7 @@ function ap_masto_timeline_home_axum_fetch(int $limit = 15, int $ownerUserId = 0
             CURLOPT_RETURNTRANSFER => true,
             CURLOPT_CONNECTTIMEOUT_MS => 120,
             CURLOPT_TIMEOUT_MS => 350,
-            CURLOPT_HTTPHEADER => ['Accept: application/json', 'Connection: close'],
+            CURLOPT_HTTPHEADER => array_merge(['Accept: application/json', 'Connection: close'], ap_shadow_http_auth_headers()),
         ]);
         $raw = curl_exec($ch);
         $code = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
@@ -7194,7 +7195,7 @@ function ap_masto_timeline_home_axum_fetch(int $limit = 15, int $ownerUserId = 0
             'http' => [
                 'method' => 'GET',
                 'timeout' => 0.35,
-                'header' => "Accept: application/json\r\nConnection: close\r\n",
+                'header' => "Accept: application/json\r\nConnection: close\r\n" . ap_shadow_http_auth_header_text(),
                 'ignore_errors' => true,
             ],
         ]);
@@ -7295,7 +7296,7 @@ function ap_masto_timeline_home_axum_since_fetch(int $sinceTs, int $limit = 20, 
             CURLOPT_RETURNTRANSFER => true,
             CURLOPT_CONNECTTIMEOUT_MS => 120,
             CURLOPT_TIMEOUT_MS => 400,
-            CURLOPT_HTTPHEADER => ['Accept: application/json', 'Connection: close'],
+            CURLOPT_HTTPHEADER => array_merge(['Accept: application/json', 'Connection: close'], ap_shadow_http_auth_headers()),
             CURLOPT_HEADER => true,
         ]);
         $raw = curl_exec($ch);
@@ -7319,7 +7320,7 @@ function ap_masto_timeline_home_axum_since_fetch(int $sinceTs, int $limit = 20, 
             'http' => [
                 'method' => 'GET',
                 'timeout' => 0.4,
-                'header' => "Accept: application/json\r\nConnection: close\r\n",
+                'header' => "Accept: application/json\r\nConnection: close\r\n" . ap_shadow_http_auth_header_text(),
                 'ignore_errors' => true,
             ],
         ]);
@@ -7455,7 +7456,7 @@ function ap_masto_timeline_home_axum_since_html_fetch(int $sinceTs, int $limit =
         CURLOPT_HEADER => true,
         CURLOPT_CONNECTTIMEOUT_MS => 120,
         CURLOPT_TIMEOUT_MS => 700,
-        CURLOPT_HTTPHEADER => ['Accept: text/html', 'Connection: close'],
+        CURLOPT_HTTPHEADER => array_merge(['Accept: text/html', 'Connection: close'], ap_shadow_http_auth_headers()),
     ]);
     $raw = curl_exec($ch);
     $code = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
@@ -7545,7 +7546,7 @@ function ap_masto_timeline_chrono_axum_since_html_fetch(string $view, int $since
         CURLOPT_HEADER => true,
         CURLOPT_CONNECTTIMEOUT_MS => 120,
         CURLOPT_TIMEOUT_MS => 700,
-        CURLOPT_HTTPHEADER => ['Accept: text/html', 'Connection: close'],
+        CURLOPT_HTTPHEADER => array_merge(['Accept: text/html', 'Connection: close'], ap_shadow_http_auth_headers()),
     ]);
     $raw = curl_exec($ch);
     $code = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
@@ -8173,7 +8174,7 @@ function ap_masto_notifications_unread_axum_fetch(int $ownerUserId, int $scan = 
         CURLOPT_RETURNTRANSFER => true,
         CURLOPT_CONNECTTIMEOUT_MS => 80,
         CURLOPT_TIMEOUT_MS => 400,
-        CURLOPT_HTTPHEADER => ['Accept: application/json', 'Connection: close'],
+        CURLOPT_HTTPHEADER => array_merge(['Accept: application/json', 'Connection: close'], ap_shadow_http_auth_headers()),
     ]);
     $raw = curl_exec($ch);
     $code = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);

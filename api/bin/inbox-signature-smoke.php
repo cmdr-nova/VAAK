@@ -253,8 +253,56 @@ $spoofForward = ap_inbox_reconcile_decision($forwarded, 'https://other.test/user
     ]],
 ]);
 check($spoofForward === null, 'forwarded Create whose origin actor differs is rejected');
-$trusted = ap_inbox_reconcile_decision($forwarded, 'https://other.test/users/bob#main-key', true, []);
-check(is_array($trusted) && ($trusted['object']['content'] ?? '') === 'spoofed-by-forwarder', 'trusted forwarder keeps the signed body');
+
+// Relays and followed forwarders: a Create is rebuilt from the origin copy of
+// its object. Announce and same-signer deliveries keep the signed body.
+$originNote = [
+    'id' => $objectId,
+    'type' => 'Note',
+    'attributedTo' => $actor,
+    'to' => ['https://www.w3.org/ns/activitystreams#Public'],
+    'cc' => [$actor . '/followers'],
+    'content' => 'origin-body',
+];
+$forwarded['to'] = ['https://www.w3.org/ns/activitystreams#Public'];
+$forwarded['cc'] = [];
+$forwarded['signature'] = ['type' => 'RsaSignature2017', 'creator' => $actor . '#main-key', 'signatureValue' => 'x'];
+$relayKey = 'https://other.test/actor#main-key';
+check(ap_inbox_forwarded_create_url($forwarded) === $objectId, 'forwarded Create fetches its object id');
+$trusted = ap_inbox_reconcile_decision($forwarded, $relayKey, true, [$objectId => ['status' => 200, 'doc' => $originNote]]);
+check(is_array($trusted) && ($trusted['object']['content'] ?? '') === 'origin-body', 'trusted forwarder Create is replaced by the origin note');
+check(($trusted['actor'] ?? '') === $actor && ($trusted['id'] ?? '') === $activityId, 'rebuilt Create keeps actor and same-host id');
+check(($trusted['cc'] ?? null) === [$actor . '/followers'], 'rebuilt Create takes addressing from the origin note');
+check(!isset($trusted['signature']), 'rebuilt Create drops the forwarded LD signature');
+check(ap_inbox_reconcile_decision($forwarded, $relayKey, true, []) === null, 'trusted forwarder Create without an origin copy is dropped');
+check(ap_inbox_reconcile_decision($forwarded, $relayKey, true, [$objectId => ['status' => 404, 'doc' => null]]) === null, 'trusted forwarder Create whose object is gone is dropped');
+check(ap_inbox_reconcile_decision($forwarded, $relayKey, true, [$objectId => ['status' => 200, 'doc' => ['attributedTo' => 'https://example.com/users/bob'] + $originNote]]) === null, 'origin note by another actor is dropped');
+check(ap_inbox_reconcile_decision($forwarded, $relayKey, true, [$objectId => ['status' => 200, 'doc' => ['id' => 'https://other.test/notes/1'] + $originNote]]) === null, 'origin note whose id moved host is dropped');
+check(ap_inbox_reconcile_decision($forwarded, $relayKey, true, [$objectId => ['status' => 200, 'doc' => ['type' => 'Tombstone', 'id' => $objectId]]]) === null, 'tombstoned origin note is dropped');
+$multiAttr = ap_inbox_reconcile_decision($forwarded, $relayKey, true, [$objectId => ['status' => 200, 'doc' => ['attributedTo' => [
+    ['type' => 'Person', 'id' => $actor],
+    ['type' => 'Group', 'id' => 'https://example.com/channels/c'],
+]] + $originNote]]);
+check(is_array($multiAttr), 'origin note attributed to the actor and a group is accepted');
+$offHost = ['object' => ['id' => 'https://other.test/notes/1', 'type' => 'Note', 'attributedTo' => $actor]] + $forwarded;
+check(ap_inbox_forwarded_create_url($offHost) === null, 'object off the actor host is not fetched');
+check(ap_inbox_reconcile_decision($offHost, $relayKey, true, []) === null, 'forwarded Create with an off-host object is dropped');
+$announce = ['id' => 'https://example.com/users/alice/statuses/2/activity', 'type' => 'Announce', 'actor' => $actor, 'object' => 'https://elsewhere.example/notes/9'];
+check(ap_inbox_reconcile_decision($announce, $relayKey, true, []) === $announce, 'trusted forwarder Announce keeps the signed body');
+check(ap_inbox_reconcile_decision($forwarded, $keyId, false, []) === $forwarded, 'same-signer Create keeps the signed body');
+
+// Live path: SSRF guard and the fetch hook.
+$GLOBALS['ap_inbox_origin_mem'] = [];
+$GLOBALS['ap_inbox_origin_cache_dir'] = sys_get_temp_dir() . '/ap-inbox-origin-refetch-' . bin2hex(random_bytes(4));
+$refetchCalls = [];
+$GLOBALS['ap_inbox_origin_fetch'] = static function (string $url) use (&$refetchCalls, $objectId, $originNote): array {
+    $refetchCalls[] = $url;
+    return $url === $objectId ? ['status' => 200, 'doc' => $originNote] : ['status' => 404];
+};
+$live = ap_inbox_refetch_forwarded_create($forwarded);
+check(is_array($live) && ($live['object']['content'] ?? '') === 'origin-body' && $refetchCalls === [$objectId], 'forwarded Create is refetched from its origin');
+$local = ['actor' => 'https://127.0.0.1/users/a', 'object' => ['id' => 'https://127.0.0.1/users/a/statuses/1', 'type' => 'Note']] + $forwarded;
+check(ap_inbox_refetch_forwarded_create($local) === null && count($refetchCalls) === 1, 'non-public origin is not fetched');
 
 // Captured production 401s. Signatures and public keys are public.
 $fixturePath = dirname(__DIR__) . '/fixtures/inbox-401-signatures.json';
