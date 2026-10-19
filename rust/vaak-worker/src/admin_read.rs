@@ -6,7 +6,7 @@ use serde_json::{json,Value};
 use crate::library::actions::{esc,query};
 #[derive(Clone,Debug,Deserialize,Serialize,PartialEq)]
 #[serde(rename_all="snake_case")]
-enum View {Invites,Approvals,Users}
+enum View {Invites,Approvals,Users,Relays}
 #[derive(Clone,Debug,Deserialize,Serialize,PartialEq)]
 #[serde(rename_all="snake_case")]
 enum Mode {Full,Shell}
@@ -28,7 +28,7 @@ fn decode(bytes:&[u8])->Result<Request>{
  let r:Request=serde_json::from_slice(bytes)?;
  if r.protocol_version!=1||r.owner_id<1||r.csrf.is_empty()||r.csrf.len()>4096||r.offset<0||r.offset>i64::MAX-100||r.now<0{bail!("admin envelope");}
  if r.php_timezone!="UTC" { bail!("unproven PHP timezone"); }
- if r.view==View::Invites&&r.offset!=0{bail!("invite selector");}
+ if matches!(r.view,View::Invites|View::Relays)&&r.offset!=0{bail!("invite selector");}
  if r.view==View::Users{if r.offset<1||r.search.as_ref().is_none_or(|s|s.len()>4096||crate::library::card::php_trim(s)!=s){bail!("users selector");}}else if r.search.is_some(){bail!("unexpected users selector");}
  Ok(r)
 }
@@ -71,18 +71,20 @@ fn applications(rows:&[Application],r:&Request)->String{
 }
 async fn paint(cfg:&crate::config::Config,r:&Request)->Result<Value>{
  if r.view==View::Users&&std::env::var("VAAK_ADMIN_USERS_NATIVE").ok().as_deref()!=Some("1"){bail!("native Users disabled");}
+ if r.view==View::Relays&&std::env::var("VAAK_ADMIN_RELAYS_NATIVE").ok().as_deref()!=Some("1"){bail!("native Relays disabled");}
  let db=crate::db::connect(&cfg.database_url).await?;
  db.batch_execute("BEGIN READ ONLY ISOLATION LEVEL READ COMMITTED").await?;
  admin(&db,r.owner_id).await?;
  let configured=std::env::var("VAAK_REGISTRATION_APPROVALS").ok().as_deref()==Some("1");
  if r.approvals_enabled!=configured{bail!("approval mode mismatch");}
- enum Collected { Invites(Vec<Invite>), Applications(Vec<Application>), Users(users::Collected) }
+ enum Collected { Invites(Vec<Invite>), Applications(Vec<Application>), Users(users::Collected), Relays(Vec<relays::Relay>) }
  let collected=match r.view{
   View::Invites=>{
    let mut rows=Vec::new();for row in db.query("SELECT jsonb_build_object('id',id::bigint,'code',code,'created_at',created_at,'used_at',used_at,'note',note) FROM ap_invite_codes ORDER BY created_at DESC,id DESC LIMIT 100",&[]).await?{rows.push(serde_json::from_value::<Invite>(row.get(0))?);}
    Collected::Invites(rows)
   },
   View::Users=>Collected::Users(users::collect(&db,r).await?),
+  View::Relays=>Collected::Relays(relays::collect(&db).await?),
   View::Approvals=>{
    let mut rows=Vec::new();for row in db.query("SELECT jsonb_build_object('id',id::bigint,'username',username,'email',email,'status',status,'created_at',created_at,'decided_at',decided_at) FROM ap_registration_applications ORDER BY id DESC LIMIT 100 OFFSET $1",&[&r.offset]).await?{rows.push(serde_json::from_value::<Application>(row.get(0))?);}
    Collected::Applications(rows)
@@ -95,6 +97,7 @@ async fn paint(cfg:&crate::config::Config,r:&Request)->Result<Value>{
   Collected::Invites(rows)=>(invites(&rows,r.now)?,rows.len(),serde_json::to_value(rows)?),
   Collected::Applications(rows)=>(applications(&rows,r),rows.len(),serde_json::to_value(rows)?),
   Collected::Users(rows)=>users::paint(rows,r)?,
+  Collected::Relays(rows)=>relays::paint(rows,r)?,
  };
  if html.len()>1024*1024 || serde_json::to_vec(&rows)?.len()>512*1024 { bail!("admin response bound"); }
 
@@ -109,8 +112,12 @@ pub(crate) async fn render(cfg:&crate::config::Config,headers:HeaderMap,bytes:By
 }
 #[path="admin_users.rs"]
 mod users;
+#[path="admin_relays.rs"]
+mod relays;
 #[cfg(test)]mod tests{
  use super::*;
  #[test]fn strict_admin_read_envelope(){let good=json!({"protocol_version":1,"owner_id":1,"csrf":"session","view":"invites","mode":"full","offset":0,"approvals_enabled":false,"now":100,"php_timezone":"UTC"});assert!(decode(&serde_json::to_vec(&good).unwrap()).is_ok());for(k,v)in[("owner_id",json!(0)),("is_admin",json!(true)),("view",json!("users")),("offset",json!(1)),("csrf",json!("")),("rows",json!([]))]{let mut bad=good.clone();bad[k]=v;assert!(decode(&serde_json::to_vec(&bad).unwrap()).is_err());}}
+ #[test]fn relays_envelope_has_no_selectors(){let good=json!({"protocol_version":1,"owner_id":1,"csrf":"session","view":"relays","mode":"shell","offset":0,"approvals_enabled":false,"now":100,"php_timezone":"UTC"});assert!(decode(&serde_json::to_vec(&good).unwrap()).is_ok());for(k,v)in[("offset",json!(1)),("search",json!(""))]{let mut bad=good.clone();bad[k]=v;assert!(decode(&serde_json::to_vec(&bad).unwrap()).is_err());}}
+ #[test]fn relay_row_model_is_closed(){assert!(serde_json::from_value::<relays::Relay>(json!({"id":1,"inbox_url":"https://r/inbox","state":"idle","follow_activity_id":null,"created_at":"a","updated_at":"b","secret":"x"})).is_err());}
  #[test]fn no_application_hash_model(){assert!(serde_json::from_value::<Application>(json!({"id":1,"username":"x","email":null,"status":"pending","created_at":"now","decided_at":null,"password_hash":"forbidden"})).is_err());}
 }
