@@ -37,8 +37,13 @@ pub struct PollOption {
     pub votes_count: i64,
 }
 
-/// `id` is the local masto_polls id as a string; "0" marks a display-only
-/// remote poll (results shown, no vote form).
+/// Remote polls (remote_polls.id) share the poll id space with masto_polls
+/// local ids, offset by this base; PHP `ap_remote_poll_id_base` matches.
+pub const REMOTE_POLL_ID_BASE: i64 = 900_000_000_000;
+
+/// `id` is the local masto_polls id, or REMOTE_POLL_ID_BASE + remote_polls.id
+/// for a remote poll, as a string; "0" marks a display-only poll (results
+/// shown, no vote form). `own_votes` are the viewer's option indexes.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Poll {
     pub id: String,
@@ -47,6 +52,8 @@ pub struct Poll {
     pub votes_count: i64,
     pub voters_count: i64,
     pub voted: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub own_votes: Vec<i64>,
     #[serde(default)]
     pub expires_label: String,
     pub options: Vec<PollOption>,

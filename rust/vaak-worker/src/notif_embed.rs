@@ -3337,6 +3337,12 @@ fn poll_block_html(st: &Value, from: &str) -> String {
     let expired = json_flag(poll, "expired");
     let voted = json_flag(poll, "voted");
     let multiple = json_flag(poll, "multiple");
+    // The viewer's choices (remote polls attach them; local ones send none).
+    let own_votes: Vec<i64> = poll
+        .get("own_votes")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|v| v.as_i64()).collect())
+        .unwrap_or_default();
     let mut votes_count = poll
         .get("votes_count")
         .and_then(|v| v.as_i64())
@@ -3398,16 +3404,19 @@ fn poll_block_html(st: &Value, from: &str) -> String {
             "<button class=\"btn btn-ghost\" type=\"submit\" style=\"margin-top:.4rem;padding:.3rem .7rem;font-size:.82rem\">Vote</button></form>",
         );
     } else {
-        for (title, votes) in &opts {
+        for (i, (title, votes)) in opts.iter().enumerate() {
             let pct = if show_results && votes_count > 0 {
                 ((*votes as f64 / votes_count as f64) * 100.0).round() as i64
             } else {
                 0
             };
+            let own = own_votes.contains(&(i as i64));
             html.push_str(&format!(
-                "<div class=\"poll-opt{}\"><div class=\"poll-opt-bar\" style=\"width:{pct}%\"></div><span class=\"poll-opt-text\">{}</span>",
+                "<div class=\"poll-opt{}{}\"><div class=\"poll-opt-bar\" style=\"width:{pct}%\"></div><span class=\"poll-opt-text\">{}</span>{}",
                 if show_results { " poll-opt--result" } else { "" },
-                esc(title)
+                if own { " poll-opt--own" } else { "" },
+                esc(title),
+                if own { "<span class=\"poll-opt-own\" title=\"Your vote\">✓</span>" } else { "" }
             ));
             if show_results {
                 html.push_str(&format!(
@@ -5951,5 +5960,22 @@ mod notification_contract {
         let html = paint_lean_embed_from(&st, false, "mentions", "", true);
         assert!(html.contains("poll-block") && html.contains("yes"), "{html}");
         assert!(!html.contains("poll_vote"), "a remote poll has no local vote form: {html}");
+    }
+
+    #[test]
+    fn notification_embed_paints_the_viewers_remote_poll_vote() {
+        let mut st = status("1", json!([]));
+        let id = (vaak_types::REMOTE_POLL_ID_BASE + 7).to_string();
+        st["poll"] = json!({"id": id, "expired": false, "multiple": true, "votes_count": 5, "voters_count": 4,
+            "voted": true, "own_votes": [1], "expires_label": "", "options": [{"title": "yes", "votes_count": 3}, {"title": "no", "votes_count": 2}]});
+        assert!(vaak_types::check_timeline_status(&st).is_empty());
+        let html = paint_lean_embed_from(&st, false, "home", "", true);
+        assert!(html.contains("Poll · voted") && !html.contains("poll-vote-form"), "{html}");
+        let mine = html.find("poll-opt--own").unwrap_or_else(|| panic!("own choice marked: {html}"));
+        assert!(html[mine..].contains("no") && !html[mine..].contains("yes"), "only the chosen option is marked: {html}");
+        st["poll"]["voted"] = json!(false);
+        st["poll"]["own_votes"] = json!([]);
+        let html = paint_lean_embed_from(&st, false, "home", "", true);
+        assert!(html.contains("poll-vote-form") && html.contains(&format!("value=\"{id}\"")), "an open remote poll takes votes: {html}");
     }
 }

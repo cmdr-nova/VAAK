@@ -168,6 +168,11 @@ function ap_masto_json(mixed $data, int $code = 200): void
 {
     http_response_code($code);
     header('Content-Type: application/json; charset=utf-8');
+    // Remote polls carry the viewer's vote, so they join the response here
+    // instead of inside status builders whose output can be cached.
+    if ($code === 200 && function_exists('ap_masto_attach_remote_polls')) {
+        $data = ap_masto_attach_remote_polls($data);
+    }
     // INVALID_UTF8_SUBSTITUTE: never emit an empty body (Ice Cubes →
     // "The data couldn't be read because it isn't in the correct format").
     $json = json_encode(
@@ -764,6 +769,10 @@ function ap_masto_oauth_2fa_step(string $binding, string $code): array
 
 function ap_masto_oauth_authorize(string $method): void
 {
+    // The password form must never be framed (clickjacking): frame-ancestors
+    // 'none' and X-Frame-Options: DENY are enforced on every response here.
+    require_once __DIR__ . '/ap-csp.php';
+    ap_csp_send_headers('oauth');
     $clientId = ap_masto_oauth_param('client_id');
     $redirectUri = ap_masto_oauth_param('redirect_uri');
     $scope = ap_oauth_normalize_scopes(ap_masto_oauth_param('scope', 'read'));
@@ -2432,6 +2441,23 @@ function ap_masto_api(string $method, string $path): void
         $voterActor = function_exists('ap_masto_session_actor_id')
             ? ap_masto_session_actor_id()
             : rtrim((string) ($GLOBALS['vaak_actor_id'] ?? 'https://mkultra.monster/users/cmdr_nova'), '/');
+        if (ap_remote_poll_row_id((int) $pm[1]) > 0) {
+            // Remote poll: record locally, federate the ballot to the author.
+            if (!function_exists('ap_remote_poll_vote')) {
+                if (!defined('AP_INBOX_LIB_ONLY')) {
+                    define('AP_INBOX_LIB_ONLY', true);
+                }
+                require_once __DIR__ . '/ap-inbox.php';
+            }
+            $res = ap_remote_poll_vote((int) $pm[1], $voterActor, $choices);
+            if (empty($res['ok'])) {
+                $code = ($res['error'] ?? '') === 'Poll not found' ? 404 : 422;
+                ap_masto_json(['error' => $res['error'] ?? 'Vote failed'], $code);
+            }
+            $row = ap_remote_poll_find((int) $pm[1]);
+            ap_masto_json(is_array($row) ? ap_masto_remote_poll_entity($row, $res['own_votes'] ?? []) : null);
+            return;
+        }
         $res = ap_masto_poll_vote((int) $pm[1], $voterActor, $choices);
         if (empty($res['ok'])) {
             $code = ($res['error'] ?? '') === 'Poll not found' ? 404 : 422;
@@ -2448,6 +2474,17 @@ function ap_masto_api(string $method, string $path): void
 
     if (preg_match('#^/api/v1/polls/(\d+)$#', $path, $pm) && $method === 'GET') {
         ap_masto_require_token('read');
+        if (ap_remote_poll_row_id((int) $pm[1]) > 0) {
+            $row = ap_remote_poll_find((int) $pm[1]);
+            $entity = is_array($row)
+                ? ap_masto_remote_poll_entity($row, ap_remote_poll_own_votes((string) $row['note_id'], ap_masto_session_actor_id()))
+                : null;
+            if ($entity === null) {
+                ap_masto_json(['error' => 'Record not found'], 404);
+            }
+            ap_masto_json($entity);
+            return;
+        }
         $st = ap_db()->prepare('SELECT * FROM masto_polls WHERE local_id = ?');
         $st->execute([(int) $pm[1]]);
         $row = $st->fetch();
