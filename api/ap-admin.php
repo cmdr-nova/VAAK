@@ -31054,6 +31054,9 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
         <?php endif; ?>
 
       <?php elseif ($view === 'relays'): ?>
+        <?php if (($adminNativeBody = ap_admin_native_read_body('relays')) !== null): ?>
+          <?= $adminNativeBody ?>
+        <?php else: ?>
         <?php $relayRows = function_exists('ap_relays_list') ? ap_relays_list() : []; ?>
         <?php
           $relayCounts = ['accepted' => 0, 'pending' => 0, 'rejected' => 0, 'idle' => 0];
@@ -31149,6 +31152,7 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
               </div>
             </article>
           <?php endforeach; ?>
+        <?php endif; ?>
         <?php endif; ?>
 
       <?php elseif ($view === 'account_switcher'): ?>

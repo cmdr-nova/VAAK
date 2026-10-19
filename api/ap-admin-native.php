@@ -26,10 +26,13 @@ function ap_admin_native_reply(array $reply,array $request): ?string
     if(!is_array($reply['request_binding']))return null;
     $bindingKeys=array_keys($reply['request_binding']);sort($bindingKeys);$requiredBinding=array_keys($binding);sort($requiredBinding);if($bindingKeys!==$requiredBinding)return null;
     foreach($binding as $key=>$value)if($reply['request_binding'][$key]!==$value)return null;
-    $required=$request['view']==='users'?['id','username','email','actor_key','actor_id','is_admin','created_at','updated_at','disabled_at','profile_name','icon_url']:($request['view']==='invites'?['id','code','created_at','used_at','note']:['id','username','email','status','created_at','decided_at']);sort($required);
+    $required=match($request['view']){'users'=>['id','username','email','actor_key','actor_id','is_admin','created_at','updated_at','disabled_at','profile_name','icon_url'],
+        'invites'=>['id','code','created_at','used_at','note'],'relays'=>['id','inbox_url','state','follow_activity_id','created_at','updated_at'],
+        default=>['id','username','email','status','created_at','decided_at']};sort($required);
     foreach($reply['rows'] as $row){
         if(!is_array($row))return null;$rowKeys=array_keys($row);sort($rowKeys);if($rowKeys!==$required || !is_int($row['id']) || $row['id']<1)return null;
-        $mandatory=$request['view']==='users'?['username','actor_key','actor_id','created_at','updated_at']:($request['view']==='invites'?['code','created_at']:['username','status','created_at']);
+        $mandatory=match($request['view']){'users'=>['username','actor_key','actor_id','created_at','updated_at'],'invites'=>['code','created_at'],
+            'relays'=>['inbox_url','state','created_at','updated_at'],default=>['username','status','created_at']};
         foreach($row as $key=>$value){if($key==='id')continue;if($request['view']==='users'&&$key==='is_admin'){if(!is_int($value))return null;continue;}if(!is_string($value)&&($value!==null||in_array($key,$mandatory,true)))return null;}
         if($request['view']==='approvals'&&!in_array($row['status'],['pending','approved','rejected'],true))return null;
     }
@@ -37,8 +40,9 @@ function ap_admin_native_reply(array $reply,array $request): ?string
 }
 function ap_admin_native_read_body(string $view,int $offset=0): ?string
 {
-    if(!ap_admin_native_enabled() || !in_array($view,['invites','approvals','users'],true) || $offset<0 || $offset>PHP_INT_MAX-100)return null;
+    if(!ap_admin_native_enabled() || !in_array($view,['invites','approvals','users','relays'],true) || $offset<0 || $offset>PHP_INT_MAX-100)return null;
     if($view==='users' && getenv('VAAK_ADMIN_USERS_NATIVE')!=='1')return null;
+    if($view==='relays' && (getenv('VAAK_ADMIN_RELAYS_NATIVE')!=='1' || $offset!==0))return null;
     if(!ap_registration_current_admin(ap_db()))return null;
     $user=ap_auth_current_user();$owner=(int)($user['id']??0);if($owner<1)return null;
     $url=(string)(getenv('VAAK_ADMIN_READ_URL')?:'http://127.0.0.1:8787/internal/admin/read');if(!ap_admin_native_url_allowed($url))return null;
