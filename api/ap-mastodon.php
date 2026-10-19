@@ -769,6 +769,10 @@ function ap_masto_oauth_2fa_step(string $binding, string $code): array
 
 function ap_masto_oauth_authorize(string $method): void
 {
+    // The password form must never be framed (clickjacking): frame-ancestors
+    // 'none' and X-Frame-Options: DENY are enforced on every response here.
+    require_once __DIR__ . '/ap-csp.php';
+    ap_csp_send_headers('oauth');
     $clientId = ap_masto_oauth_param('client_id');
     $redirectUri = ap_masto_oauth_param('redirect_uri');
     $scope = ap_oauth_normalize_scopes(ap_masto_oauth_param('scope', 'read'));
