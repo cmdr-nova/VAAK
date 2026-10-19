@@ -21,7 +21,7 @@ pub(super) struct FollowRequest {id:i64,actor_id:String,username:Option<String>}
 pub(super) struct Featured {id:i64,actor_id:String,acct:String,display_name:String,avatar:String}
 #[derive(Debug,Clone,Serialize)]
 pub(super) struct Mute {actor_id:String,created_at:String,#[serde(skip)]avatar:String,#[serde(skip)]who:String,#[serde(skip)]handle:String,#[serde(skip)]pub(super) warm:Option<String>}
-pub(super) struct Owner {actor_id:String,actor_key:String}
+pub(super) struct Owner {pub(super) actor_id:String,actor_key:String}
 pub(super) async fn owner(db:&tokio_postgres::Client,id:i64)->Result<Owner>{
  let row=db.query_one("SELECT actor_id::text,actor_key::text FROM ap_users WHERE id::bigint=$1",&[&id]).await?;
  let key:Option<String>=row.get(1);let key=key.unwrap_or_else(||"cmdr_nova".into());

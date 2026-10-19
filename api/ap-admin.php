@@ -30185,7 +30185,6 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
           if (!in_array($modFilter, ['open', 'about_us', 'outbound', 'closed', 'all'], true)) {
               $modFilter = 'open';
           }
-          $modReports = ap_reports_list($modFilter, 80);
           $reportTargetPrefill = trim((string) ($_GET['report_target'] ?? ''));
           $reportObjectPrefill = trim((string) ($_GET['report_object'] ?? ''));
           if ($reportObjectPrefill !== '' && !str_starts_with($reportObjectPrefill, 'https://')) {
@@ -30321,6 +30320,9 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
         </script>
         <?php endif; ?>
 
+        <?php if (($modNativeBody = ap_admin_native_read_body('moderation', 0, $modFilter)) !== null): ?>
+          <?= $modNativeBody ?>
+        <?php else: $modReports = ap_reports_list($modFilter, 80); ?>
         <?php if (!$modReports): ?>
           <div class="empty">No reports in this filter.</div>
         <?php else: ?>
@@ -30413,6 +30415,7 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
               </details>
             </article>
           <?php endforeach; ?>
+        <?php endif; ?>
         <?php endif; ?>
 
       <?php elseif ($view === 'blocks'): ?>
