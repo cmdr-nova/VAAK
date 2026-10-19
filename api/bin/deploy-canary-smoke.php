@@ -96,6 +96,9 @@ try {
     file_put_contents($router, '<?php $m = trim((string) @file_get_contents(' . var_export($mode, true) . '));'
         . ' if ($m === "404") { http_response_code(404); echo "{}"; return true; }'
         . ' if ($m === "500") { http_response_code(500); echo "{}"; return true; }'
+        . ' if ($m === "503tok") { http_response_code(503); echo "shadow token not configured"; return true; }'
+        . ' if ($m === "auth-log") { file_put_contents(' . var_export($router . '.log', true) . ', ($_SERVER["HTTP_X_VAAK_SHADOW_TOKEN"] ?? "-") . "\\n", FILE_APPEND); }'
+        . ' if ($m === "auth" && ($_SERVER["HTTP_X_VAAK_SHADOW_TOKEN"] ?? "") !== "good-token") { http_response_code(401); return true; }'
         . ' header("Content-Type: text/html"); echo "<article>card</article>"; return true;');
     file_put_contents($mode, '200');
     $server = proc_open([PHP_BINARY, '-S', "127.0.0.1:{$port}", $router], [1 => ['file', '/dev/null', 'w'], 2 => ['file', '/dev/null', 'w']], $pipes);
@@ -106,9 +109,30 @@ try {
     dc_check(canary_check_axum('local')[0] === 'skip', 'Axum cache miss skips');
     file_put_contents($mode, '500');
     dc_check(canary_check_axum('home')[0] === 'fail', 'Axum 500 fails');
+    // After the shadow-token change: unconfigured worker skips, a token PHP
+    // sends is accepted, and a missing or mismatched token fails.
+    file_put_contents($mode, '503tok');
+    $r = canary_check_axum('home');
+    dc_check($r[0] === 'skip' && str_contains($r[1], 'token not configured'), 'unconfigured shadow token skips');
+    file_put_contents($mode, 'auth');
+    $r = canary_check_axum('home');
+    dc_check($r[0] === 'fail' && str_contains($r[1], '401') && str_contains($r[1], 'no token'), 'missing shadow token fails');
+    $GLOBALS['shadow_token'] = 'good-token';
+    eval('function ap_shadow_http_auth_headers(): array { return ["X-VAAK-Shadow-Token: " . $GLOBALS["shadow_token"]]; }');
+    // Main's admin fetch sends no token yet, so log the header rather than
+    // reject; the canary's own request must carry it.
+    file_put_contents($mode, 'auth-log');
+    dc_check(canary_check_axum('home')[0] === 'ok', 'shadow token request passes');
+    $seen = (string) @file_get_contents($router . '.log');
+    dc_check(str_starts_with($seen, "good-token\n"), 'shadow token header is sent');
+    file_put_contents($mode, 'auth');
+    $GLOBALS['shadow_token'] = 'stale-token';
+    $r = canary_check_axum('local');
+    dc_check($r[0] === 'fail' && str_contains($r[1], 'different tokens'), 'mismatched shadow token fails');
     putenv('VAAK_SHADOW_HTTP=http://127.0.0.1:1');
     dc_check(canary_check_axum('home')[0] === 'fail', 'Axum down fails');
     @unlink($mode);
+    @unlink($router . '.log');
     @unlink($router);
 
     // The whole script: a check that throws is a failure, and the exit code says so.

@@ -294,8 +294,16 @@ function canary_check_axum(string $view): array
     $base = getenv('VAAK_SHADOW_HTTP');
     $base = is_string($base) && trim($base) !== '' ? rtrim(trim($base), '/') : 'http://127.0.0.1:8787';
     $url = $base . '/shadow/' . $view . '-html?' . http_build_query(['owner_id' => $owner, 'limit' => 5]);
+    // Once Axum requires the shared shadow token, send it the way PHP does.
+    // Releases without api/ap-shadow-http.php send no header.
+    $guard = dirname(__DIR__) . '/ap-shadow-http.php';
+    if (!function_exists('ap_shadow_http_auth_headers') && is_file($guard)) {
+        require_once $guard;
+    }
+    $auth = function_exists('ap_shadow_http_auth_headers') ? ap_shadow_http_auth_headers() : [];
     $code = 0;
     $len = 0;
+    $body = '';
     // Axum was restarted moments ago; give it a few tries before calling a
     // connection error or a 5xx a failure.
     for ($i = 0; $i < 3; $i++) {
@@ -304,16 +312,25 @@ function canary_check_axum(string $view): array
             CURLOPT_RETURNTRANSFER => true,
             CURLOPT_CONNECTTIMEOUT_MS => 1000,
             CURLOPT_TIMEOUT_MS => 5000,
-            CURLOPT_HTTPHEADER => ['Accept: text/html'],
+            CURLOPT_HTTPHEADER => array_merge(['Accept: text/html'], $auth),
         ]);
         $body = curl_exec($ch);
         $code = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
         curl_close($ch);
         $len = is_string($body) ? strlen($body) : 0;
-        if ($code > 0 && $code < 500) {
+        $tokenMissing = $code === 503 && is_string($body) && str_contains($body, 'shadow token not configured');
+        if (($code > 0 && $code < 500) || $tokenMissing) {
             break;
         }
         sleep(1);
+    }
+    if ($code === 503 && is_string($body) && str_contains($body, 'shadow token not configured')) {
+        // The worker has no token, so PHP's Axum calls fall back to card paint.
+        return canary_r('skip', "{$view}-html: Axum shadow token not configured (503); set VAAK_SECRET or VAAK_SHADOW_HTTP_TOKEN in vaak.env");
+    }
+    if ($code === 401) {
+        return canary_r('fail', "{$view}-html refused the shadow token (401): "
+            . ($auth === [] ? 'PHP has no token to send' : 'PHP and the worker resolve different tokens'));
     }
     if ($code === 404) {
         // Cache miss: PHP paints the cards itself, and the warm worker refills.
