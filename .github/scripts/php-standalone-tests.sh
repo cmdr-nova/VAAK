@@ -107,6 +107,7 @@ php_tests=(
   api/bin/schema-probe-cache-smoke.php
   api/bin/search-quote-preview-boundary-smoke.php
   api/bin/settings-parity-smoke.php
+  api/bin/shadow-http-token-smoke.php
   api/bin/trends-response-cache-smoke.php
   api/bin/trending-open-ref-smoke.php
   api/bin/timeline-newer-counter-smoke.php

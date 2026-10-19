@@ -26,6 +26,8 @@ $homeCalls = 0; $warnings = [];
 set_error_handler(function($number, $message) use (&$warnings) {$warnings[] = $message; return true;});
 function ap_masto_timeline_home_axum_fetch($limit, $owner) {global $homeCalls; ++$homeCalls; return [['id'=>'home-status','created_at'=>'2026-10-11T00:00:00Z']];}
 function ap_db_masto_owner_user_id() {return 7;}
+function ap_shadow_http_auth_headers() {return ['X-VAAK-Shadow-Token: probe'];}
+function ap_shadow_http_auth_header_text() {return "X-VAAK-Shadow-Token: probe\r\n";}
 '''
     trailer = '''
 $result = ap_masto_notifications_axum_fetch(12, '12345', '54321', ['quote']);

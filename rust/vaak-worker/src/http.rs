@@ -120,8 +120,13 @@ pub async fn serve(cfg: Config, bind: SocketAddr) -> Result<()> {
     let state = AppState {
         cfg: Arc::new(cfg),
     };
-    let mut app = Router::new()
-        .route("/healthz", get(healthz))
+    let shadow_token = crate::shadow_auth::resolve();
+    if shadow_token.is_none() {
+        tracing::warn!("shadow HTTP token not configured; /shadow/* and /api/v1/* will answer 503");
+    }
+    // Every read route below needs X-VAAK-Shadow-Token; /healthz and the
+    // /internal/* routes (which carry their own secrets) are added after.
+    let gated = Router::new()
         .route("/shadow/notif", get(shadow_notif))
         .route("/shadow/notifications", get(shadow_notifications))
         .route("/shadow/ranked-newer", get(shadow_ranked))
@@ -153,10 +158,6 @@ pub async fn serve(cfg: Config, bind: SocketAddr) -> Result<()> {
         .route("/shadow/library-fragment", get(shadow_library_fragment))
         // Read-only Phyrian dossier/directory parity projection (10.6).
         .route("/shadow/phyrian", get(shadow_phyrian))
-        // Guarded migration endpoint. Disabled unless an internal token is
-        // configured; loopback binding is still required by `serve`.
-        .route("/internal/phyrian/mutate", post(internal_phyrian_mutate))
-        .route("/internal/phyrian/bridge", post(internal_phyrian_bridge))
         // Account-switch prep: ranked + badge + hydrate spawn (0.7.5).
         .route("/shadow/account-switch-prep", get(shadow_account_switch_prep))
         // Mastodon-shaped Home: hydrated status JSON from vaak:timeline:v1 (slice 4).
@@ -170,7 +171,14 @@ pub async fn serve(cfg: Config, bind: SocketAddr) -> Result<()> {
         .route("/shadow/local-since-html", get(shadow_local_since_html))
         .route("/shadow/feed-since-html", get(shadow_feed_since_html))
         .route("/api/v1/notifications", get(shadow_notifications_masto))
-        ;
+        .route_layer(axum::middleware::from_fn_with_state(shadow_token, crate::shadow_auth::require));
+    let mut app = Router::new()
+        .route("/healthz", get(healthz))
+        // Guarded migration endpoint. Disabled unless an internal token is
+        // configured; loopback binding is still required by `serve`.
+        .route("/internal/phyrian/mutate", post(internal_phyrian_mutate))
+        .route("/internal/phyrian/bridge", post(internal_phyrian_bridge))
+        .merge(gated);
     if crate::library::bridge::enabled(){app=app.route("/internal/library/render",post(internal_library_render).layer(axum::extract::DefaultBodyLimit::max(2*1024*1024)).layer(axum::middleware::map_response(crate::profile_bridge::no_store)));}
     if crate::search_bridge::enabled(){app=app.route("/internal/search/render",post(internal_search_render).layer(axum::extract::DefaultBodyLimit::max(2*1024*1024)).layer(axum::middleware::map_response(crate::profile_bridge::no_store)));}
     if crate::search_collect::enabled(){app=app.route("/internal/search/collect",post(internal_search_collect).layer(axum::extract::DefaultBodyLimit::max(64*1024)).layer(axum::middleware::map_response(crate::profile_bridge::no_store)));}
@@ -198,6 +206,7 @@ async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
         "service": "vaak-worker-shadow",
         "owner_default": state.cfg.default_owner_id,
         "mode": "shadow",
+        "shadow_token_configured": crate::shadow_auth::resolve().is_some(),
         "freeze_contract": "vaak_types::NormalizedStatusProjection",
         "routes": [
             "/healthz",
@@ -272,7 +281,7 @@ async fn internal_phyrian_mutate(
         .get("x-vaak-internal-token")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    if supplied != expected {
+    if !crate::shadow_auth::ct_eq(supplied, expected) {
         return (
             StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({"error": "Unauthorized"})),
@@ -354,7 +363,7 @@ async fn internal_phyrian_bridge(
         return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Phyrian bridge route disabled"}))).into_response();
     };
     let supplied = headers.get("x-vaak-internal-token").and_then(|v| v.to_str().ok()).unwrap_or("");
-    if supplied != expected {
+    if !crate::shadow_auth::ct_eq(supplied, expected) {
         return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "Unauthorized"}))).into_response();
     }
     match crate::phyrian::bridge_read(&state.cfg, input.action.trim(), input.body).await {
