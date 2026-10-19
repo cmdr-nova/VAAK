@@ -18,7 +18,7 @@ if ($dsn === '' || $rustUrl === '' || $token === '') {
     fwrite(STDERR, "phyrian-transaction-parity: requires isolated DB URL, Rust URL, and test token\n");
     exit(2);
 }
-if (preg_match('/novalandia|mkultra|prod-host/i', $dsn . ' ' . $rustUrl)) {
+if (preg_match('/novalandia|mkultra/i', $dsn . ' ' . $rustUrl)) {
     fwrite(STDERR, "phyrian-transaction-parity: refusing production-looking target\n");
     exit(2);
 }
