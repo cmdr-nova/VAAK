@@ -74,7 +74,8 @@ $seeds = [
         [[1, 'actor', 'https://b.example/users/a b?c=d&e', 'block', 'harassment <x>', '2026-10-19 09:00:00'],
          [2, 'domain', 'spam.example', 'suspend', '0', '2026-10-19 09:00:00'],
          [3, 'actor', 'https://c.example/@x~y', 'suspend', '', '2026-10-01T12:00:00Z'],
-         [4, 'weird', 'odd & <scope>', 'kind<>', null, '2026-10-01 12:00:00']],
+         [4, 'weird', 'odd & <scope>', 'kind<>', null, '2026-10-01 12:00:00'],
+         [5, 'domain', 'pgtext.example', 'block', null, gmdate('Y-m-d H:i:s', time() - 7200) . '.654321+00']],
     ],
 ];
 $checks = 0; $failures = [];

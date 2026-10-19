@@ -1,15 +1,16 @@
 //! Server blocks read page copied from ap_block_list, actor_display_name /
 //! actor_handle and the ap-admin Blocks branch. PHP retains CSRF injection and
-//! every block/unblock action and its federation. Actor rows that PHP would
-//! label from a local profile or answer with an async actor warm (no cached
-//! row, placeholder username) render the PHP page instead. Spaces stand where
-//! the PHP template has whitespace.
+//! every block/unblock action and its federation. Actor rows that PHP labels
+//! from a local profile render the PHP page instead. Rows with no cached actor
+//! or a placeholder username get PHP's URL-derived label and the same async
+//! actor warm PHP queues for them. Spaces stand where the PHP template has
+//! whitespace.
 use super::*;
 use crate::library::card::php_trim;
 #[derive(Debug,Clone,Deserialize,Serialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Block {id:i64,scope:String,value:String,kind:String,reason:Option<String>,created_at:String}
-pub(super) struct Row {block:Block,who:String,handle:String}
+pub(super) struct Row {block:Block,who:String,handle:String,pub(super) warm:Option<String>}
 pub(super) const MAX_ROWS:usize=1000;
 fn local_host(actor:&str)->bool{
  let host=actor.strip_prefix("https://").unwrap_or("").split(['/', '?','#']).next().unwrap_or("").rsplit('@').next().unwrap_or("").split(':').next().unwrap_or("").to_ascii_lowercase();
@@ -19,19 +20,19 @@ pub(super) async fn collect(db:&tokio_postgres::Client,cfg:&crate::config::Confi
  let mut rows=Vec::new();
  for row in db.query("SELECT jsonb_build_object('id',id::bigint,'scope',scope::text,'value',value::text,'kind',kind::text,'reason',reason::text,'created_at',created_at::text) FROM ap_blocks ORDER BY created_at DESC, id DESC LIMIT 1001",&[]).await?{
   let block:Block=serde_json::from_value(row.get(0))?;
-  let (mut who,mut handle)=(block.value.clone(),String::new());
+  let (mut who,mut handle,mut warm)=(block.value.clone(),String::new(),None);
   if block.scope=="actor"&&!block.value.is_empty(){
    let actor=block.value.trim_end_matches('/');
    if !actor.starts_with("https://")||local_host(actor){bail!("PHP-only actor label");}
    let cached=crate::profile_identity::lookup_actor(db,cfg,actor).await?;
-   if cached.as_ref().is_none_or(|r|crate::profile_identity::placeholder(r["username"].as_str().unwrap_or(""))){bail!("PHP would warm this actor");}
+   if cached.as_ref().is_none_or(|r|crate::profile_identity::placeholder(r["username"].as_str().unwrap_or(""))){warm=Some(actor.to_string());}
    let label=crate::profile_identity::label(actor,cached.as_ref());
    handle=label["handle"].as_str().unwrap_or("").to_string();
    let display=php_trim(label["display_name"].as_str().unwrap_or("")).to_string();
    let name=if display.is_empty()||crate::profile_identity::placeholder(&display){handle.clone()}else{display};
    if !empty(&name){who=name;}
   }else if !matches!(block.scope.as_str(),"actor"|"domain"){bail!("unproven block scope");}
-  rows.push(Row{block,who,handle});
+  rows.push(Row{block,who,handle,warm});
  }
  if rows.len()>MAX_ROWS{bail!("block rows beyond bridge bound");}
  Ok(rows)

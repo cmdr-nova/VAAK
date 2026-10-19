@@ -8,7 +8,7 @@
  * runs. Also checks the fallback cases (non-admin, disabled admin, too many
  * rows). Never point it at production: it drops and recreates its tables.
  *
- * Usage: php admin-blocks-native-review.php 'pgsql:host=/var/run/postgresql;dbname=X' INTEGER|BIGINT http://127.0.0.1:PORT/internal/admin/read SECRET
+ * Usage: php admin-blocks-native-review.php 'pgsql:host=/var/run/postgresql;dbname=X' INTEGER|BIGINT http://127.0.0.1:PORT/internal/admin/read SECRET [QUEUE_REDIS_PORT]
  */
 declare(strict_types=1);
 if (PHP_SAPI !== 'cli') { http_response_code(403); exit('CLI only'); }
@@ -104,6 +104,7 @@ $cases = [
         [$ago(90000), 'domain', 'sus.example', 'suspend', '0'],
         [$ago(90000), 'domain', 'tie.example', 'block', ''],
         [$ago(5), 'domain', 'Ünïcode.Example', 'block', "line\nbreak"],
+        [gmdate('Y-m-d H:i:s', time() - 7200) . '.123456+00', 'domain', 'pgtext.example', 'block', null],
     ], []],
     'actors' => [[
         [$ago(10), 'actor', 'https://m.example/users/alice', 'block', 'harassment'],
@@ -116,11 +117,27 @@ $cases = [
         [$ago(70), 'domain', 'mixed.example', 'block', null],
         [$ago(80), 'actor', '', 'block', 'empty value'],
     ], $actorsCached],
+    // PHP labels these from the actor URL and queues an async warm; native does the same.
+    'warmed actors' => [[
+        [$ago(5), 'actor', 'https://x.example/users/new', 'block', null],
+        [$ago(6), 'actor', 'https://x.example/ap/users/123456789', 'mute', 'snowflake'],
+        [$ago(7), 'actor', 'https://y.example/@dana/', 'block', null],
+        [$ago(8), 'actor', 'https://m.example/users/erin', 'block', null],
+    ], [['https://x.example/ap/users/123456789', '123456789', '', 'x.example'], ['https://m.example/users/erin', 'erin', 'Erin', 'm.example']]],
     'many' => [array_map(fn($i) => [$ago($i), $i % 2 ? 'actor' : 'domain', $i % 2 ? "https://m.example/users/u$i" : "d$i.example", 'block', null], range(1, 170)),
         array_map(fn($i) => ["https://m.example/users/u$i", "u$i", "User $i", 'm.example'], range(1, 170, 2))],
 ];
+$expectWarm = ['warmed actors' => ['https://x.example/users/new', 'https://x.example/ap/users/123456789', 'https://y.example/@dana']];
+// Optional 5th argument: redis-cli port of the worker's VAAK_REDIS_QUEUE_URL, to read back its queued warms.
+$queuePort = $argv[5] ?? null;
+function queued(): array {
+    global $queuePort; if ($queuePort === null) return [];
+    $out = []; exec('redis-cli -p ' . (int) $queuePort . ' LRANGE vaak:queue:ap_actor_warm 0 -1', $out);
+    return array_values(array_unique(array_filter(array_map(fn($j) => (string) (json_decode($j, true)['actor_id'] ?? ''), $out), 'strlen')));
+}
+function clear_queue(): void { global $queuePort; if ($queuePort !== null) exec('redis-cli -p ' . (int) $queuePort . ' FLUSHDB'); }
 foreach ($cases as $name => [$blocks, $actors]) {
-    seed($blocks, $actors); $GLOBALS['ap_remote_actor_memo'] = []; $warmed = [];
+    seed($blocks, $actors); $GLOBALS['ap_remote_actor_memo'] = []; $warmed = []; clear_queue();
     $blocks = ap_block_list();
     foreach (['full', 'shell'] as $mode) {
         // Relative times read the clock: retry until PHP and the native request share one second.
@@ -130,7 +147,10 @@ foreach ($cases as $name => [$blocks, $actors]) {
             [$status, $reply] = native(request(1, $mode), $secret);
             if (time() === $second) break;
         }
-        check($warmed === [], "$name php warmed nothing");
+        $want = $expectWarm[$name] ?? [];
+        check(array_values(array_unique($warmed)) === $want, "$name php warms " . json_encode(array_values(array_unique($warmed))));
+        if ($queuePort !== null) { $got = queued(); sort($got); $sorted = $want; sort($sorted); check($got === $sorted, "$name/$mode native warms " . json_encode($got)); clear_queue(); }
+        $warmed = [];
         check($status === 200, "$name/$mode status $status");
         $html = collapse((string) ($reply['html'] ?? ''));
         check($html === $php, "$name/$mode html");
@@ -142,11 +162,9 @@ foreach ($cases as $name => [$blocks, $actors]) {
     }
 }
 
-// Fallbacks: rows PHP labels from a local profile or would warm, and every refusal, render the PHP page.
+// Fallbacks: rows PHP labels from a local profile, and every refusal, render the PHP page.
 $base = [[$ago(10), 'domain', 'ok.example', 'block', null]];
 $fallbacks = [
-    'uncached actor' => [[[$ago(5), 'actor', 'https://x.example/users/new', 'block', null]], []],
-    'placeholder actor' => [[[$ago(5), 'actor', 'https://x.example/ap/users/123456789', 'block', null]], [['https://x.example/ap/users/123456789', '123456789', '', 'x.example']]],
     'local actor' => [[[$ago(5), 'actor', 'https://mkultra.monster/users/someone', 'block', null]], []],
     'non-https actor' => [[[$ago(5), 'actor', 'http://x.example/users/a', 'block', null]], []],
     'unknown scope' => [[[$ago(5), 'tag', 'x', 'block', null]], []],
