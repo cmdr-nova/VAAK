@@ -1207,6 +1207,32 @@ function ap_auth_2fa_pending_clear(): void
     );
 }
 
+/**
+ * One code attempt against a pending two-factor sign-in (web login or
+ * OAuth authorize). Wrong codes are limited per pending sign-in and per
+ * account, so a fresh password step does not reset the account-wide
+ * allowance. Status: ok, invalid (keep the pending sign-in with the new
+ * fail count), discard or cooldown (drop the pending sign-in).
+ *
+ * @return array{status:string,fails:int,error:string}
+ */
+function ap_auth_2fa_pending_attempt(int $userId, string $code, int $pendingFails): array
+{
+    $bucket = '2fa:u' . $userId;
+    if (ap_auth_rate_fails($bucket) >= AP_AUTH_2FA_ACCOUNT_MAX) {
+        return ['status' => 'cooldown', 'fails' => $pendingFails, 'error' => 'Too many two-factor attempts. Try again in a few minutes.'];
+    }
+    if (ap_auth_2fa_verify_code($userId, $code)) {
+        return ['status' => 'ok', 'fails' => $pendingFails, 'error' => ''];
+    }
+    ap_auth_rate_fail($bucket);
+    $fails = $pendingFails + 1;
+    if ($fails >= AP_AUTH_2FA_PENDING_MAX) {
+        return ['status' => 'discard', 'fails' => $fails, 'error' => 'Too many invalid codes. Please log in again.'];
+    }
+    return ['status' => 'invalid', 'fails' => $fails, 'error' => 'Invalid two-factor code.'];
+}
+
 /** @return array{ok:bool,error?:string,user?:array} */
 function ap_auth_complete_2fa_login(string $code): array
 {
@@ -1217,22 +1243,14 @@ function ap_auth_complete_2fa_login(string $code): array
         ap_auth_2fa_pending_clear();
         return ['ok' => false, 'error' => 'Two-factor sign-in expired. Please log in again.'];
     }
-    // Wrong codes are limited per pending sign-in and per account, so a
-    // fresh password step does not reset the account-wide allowance.
-    $bucket = '2fa:u' . $userId;
-    if (ap_auth_rate_fails($bucket) >= AP_AUTH_2FA_ACCOUNT_MAX) {
-        ap_auth_2fa_pending_clear();
-        return ['ok' => false, 'error' => 'Too many two-factor attempts. Try again in a few minutes.'];
-    }
-    if (!ap_auth_2fa_verify_code($userId, $code)) {
-        ap_auth_rate_fail($bucket);
-        $fails = (int) ($_SESSION['vaak_2fa_pending_fails'] ?? 0) + 1;
-        if ($fails >= AP_AUTH_2FA_PENDING_MAX) {
+    $attempt = ap_auth_2fa_pending_attempt($userId, $code, (int) ($_SESSION['vaak_2fa_pending_fails'] ?? 0));
+    if ($attempt['status'] !== 'ok') {
+        if ($attempt['status'] === 'invalid') {
+            $_SESSION['vaak_2fa_pending_fails'] = $attempt['fails'];
+        } else {
             ap_auth_2fa_pending_clear();
-            return ['ok' => false, 'error' => 'Too many invalid codes. Please log in again.'];
         }
-        $_SESSION['vaak_2fa_pending_fails'] = $fails;
-        return ['ok' => false, 'error' => 'Invalid two-factor code.'];
+        return ['ok' => false, 'error' => $attempt['error']];
     }
     $user = ap_auth_user_by_id($userId);
     ap_auth_2fa_pending_clear();
