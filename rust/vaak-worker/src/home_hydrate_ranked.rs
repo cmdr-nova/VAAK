@@ -5151,6 +5151,61 @@ pub async fn attach_polls(db: &Client, statuses: &mut [Value], viewer_actor: &st
             }),
         );
     }
+    // Remote Questions have no masto_polls row; inbox stores their options in
+    // remote_polls. Display-only (id 0): the painter shows results, no vote form.
+    let remote_keys: Vec<String> = keys
+        .iter()
+        .filter(|k| !polls.contains_key(k.trim_end_matches('/')))
+        .cloned()
+        .collect();
+    if !remote_keys.is_empty() {
+        // The table appears with the first stored remote poll.
+        if let Ok(rows) = db
+            .query(
+                "SELECT rtrim(note_id, '/'),
+                        COALESCE(multiple, 0)::text,
+                        COALESCE(expires_at::text, ''),
+                        COALESCE(closed, 0)::text,
+                        COALESCE(options_json, '[]'),
+                        COALESCE(votes_count, 0)::bigint,
+                        COALESCE(voters_count, 0)::bigint
+                 FROM remote_polls
+                 WHERE note_id = ANY($1)",
+                &[&remote_keys],
+            )
+            .await
+        {
+            for row in rows {
+                let note_id: String = row.try_get::<_, String>(0).unwrap_or_default();
+                let note_id = note_id.trim().trim_end_matches('/').to_string();
+                if note_id.is_empty() || polls.contains_key(&note_id) {
+                    continue;
+                }
+                let flag = |i: usize| {
+                    matches!(
+                        row.try_get::<_, String>(i).unwrap_or_default().trim().to_ascii_lowercase().as_str(),
+                        "1" | "t" | "true"
+                    )
+                };
+                let expires_at: String = row.try_get(2).unwrap_or_default();
+                let (ended, expires_label) = poll_expires_label(&expires_at);
+                let options_json: String = row.try_get(4).unwrap_or_else(|_| "[]".into());
+                polls.insert(
+                    note_id,
+                    json!({
+                        "id": "0",
+                        "expired": ended || flag(3),
+                        "multiple": flag(1),
+                        "votes_count": row.try_get::<_, i64>(5).unwrap_or(0),
+                        "voters_count": row.try_get::<_, i64>(6).unwrap_or(0),
+                        "voted": false,
+                        "expires_label": expires_label,
+                        "options": serde_json::from_str::<Value>(&options_json).unwrap_or(Value::Null),
+                    }),
+                );
+            }
+        }
+    }
     if polls.is_empty() {
         return Ok(());
     }
