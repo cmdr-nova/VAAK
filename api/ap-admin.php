@@ -39952,10 +39952,24 @@ window.vaakBootStatusThread();
     walk(root);
     return cards;
   }
-  function filterNewHtml(html) {
+  function filterNewHtml(html, opts) {
     const wrap = document.createElement('div');
     wrap.innerHTML = (html || '').trim();
     const cards = collectPollCards(wrap);
+    if (opts && opts.dropKnownAncestors) {
+      // An older page can carry a self-reply whose parent is already on
+      // screen (ranked order). Keep the new reply, drop its repainted parent.
+      const onScreen = seenKeys();
+      cards.forEach((el) => {
+        if (!el.classList.contains('tweet-thread')) return;
+        el.querySelectorAll('.tweet-thread-seg--ancestor').forEach((ancestor) => {
+          if (!cardIsKnown(onScreen, ancestor)) return;
+          const rail = ancestor.nextElementSibling;
+          if (rail && rail.classList.contains('tweet-thread-rail')) rail.remove();
+          ancestor.remove();
+        });
+      });
+    }
     let sortCeiling = 0;
     let everySorted = cards.length > 0;
     cards.forEach((el) => {
@@ -40452,7 +40466,7 @@ window.vaakBootStatusThread();
           // infinite-scroll request (especially when a cache is rebuilt).
           // Apply the same stable-key filter used by newer-post polling so a
           // boundary card is never appended twice.
-          const filteredPage = filterNewHtml(html);
+          const filteredPage = filterNewHtml(html, { dropKnownAncestors: true });
           if (!filteredPage.count) {
             // The server returned only cards already on screen. Keep walking
             // the cursor/offset while more data exists rather than stopping
