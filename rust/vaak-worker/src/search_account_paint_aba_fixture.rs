@@ -38,7 +38,7 @@ async fn actual_bridge_rejects_account_following_aba_but_keeps_unchanged()->Resu
  let owned=db.query_one("SELECT oid::text,pg_get_userbyid(nspowner),obj_description(oid,'pg_namespace'),current_schema(),current_user FROM pg_namespace WHERE nspname=$1",&[&schema]).await?;
  anyhow::ensure!(owned.get::<_,String>(0)==input["oid"].as_str().context("original OID receipt")?&&owned.get::<_,String>(1)=="postgres"&&owned.get::<_,Option<String>>(2).as_deref()==Some(token)&&owned.get::<_,String>(3)==schema&&owned.get::<_,String>(4)=="postgres","original OID/owner/UUID marker ownership");
  let bytes=std::fs::read(input["request_file"].as_str().context("actual PHP bridge capture")?)?;
- use sha2::Digest;anyhow::ensure!(format!("{:x}",sha2::Sha256::digest(&bytes))==input["request_sha256"].as_str().context("pinned PHP capture bytes")?,"actual capture changed");
+ use sha2::Digest;anyhow::ensure!(hex::encode(sha2::Sha256::digest(&bytes))==input["request_sha256"].as_str().context("pinned PHP capture bytes")?,"actual capture changed");
  let request:Value=serde_json::from_slice(&bytes)?;let owner=request["owner_id"].as_i64().context("actual owner")?;
  let accounts=request["accounts"].as_array().context("actual accounts")?.clone();let target=input["target_index"].as_u64().context("actual selected target index")? as usize;
  anyhow::ensure!(target<accounts.len()&&request["statuses"].as_array().is_some_and(Vec::is_empty)&&request["hashtags"].as_array().is_some_and(Vec::is_empty),"genuine bounded accounts-only branch");
