@@ -40,6 +40,7 @@ php_tests=(
   api/bin/classic-profile-redirect-smoke.php
   api/bin/bsky-thread-no-federation-smoke.php
   api/bin/cpu-index-smoke.php
+  api/bin/deploy-canary-smoke.php
   api/bin/downrank-search-trends-smoke.php
   api/bin/bsky-notif-subject-backfill-smoke.php
   api/bin/remote-poll-smoke.php
