@@ -5866,7 +5866,7 @@ function ap_masto_notification_entity(array $item): ?array
  */
 function ap_masto_notifications_grouped_fetch(int $limit = 40, ?string $maxId = null, ?string $sinceId = null, array $types = [], array $exclude = [], string $expandAccounts = 'full'): array
 {
-    $notifs = ap_masto_notifications_fetch($limit, $maxId, $sinceId, $types, $exclude);
+    $notifs = ap_masto_notifications_fetch_visible($limit, $maxId, $sinceId, $types, $exclude);
     return ap_masto_notifications_grouped_from_items(is_array($notifs) ? $notifs : [], $expandAccounts);
 }
 
@@ -7625,6 +7625,50 @@ function ap_masto_timeline_home_hydrate_warm_async(int $ownerUserId, int $limit 
             // optional
         }
     });
+}
+
+/**
+ * Drop notifications whose notifier is muted or blocked for this viewer,
+ * personally or server-wide. Cached lists (Redis, projection, Axum) are built
+ * before a mute/block can land, so this runs at read time: hiding is immediate
+ * and unmuting/unblocking brings the rows back.
+ * The embedded status is often the viewer's own post, so only the notifier counts.
+ *
+ * @param list<mixed> $items
+ * @return list<array<string,mixed>>
+ */
+function ap_masto_notifications_drop_hidden(array $items, ?int $ownerUserId = null): array
+{
+    if ($ownerUserId === null) {
+        $ownerUserId = function_exists('ap_db_masto_owner_user_id')
+            ? ap_db_masto_owner_user_id()
+            : ap_db_default_owner_user_id();
+    }
+    $out = [];
+    foreach ($items as $item) {
+        if (!is_array($item)) {
+            continue;
+        }
+        $acct = is_array($item['account'] ?? null) ? $item['account'] : [];
+        if ($acct !== [] && function_exists('ap_search_account_hidden')
+            && ap_search_account_hidden($acct, (int) $ownerUserId)) {
+            continue;
+        }
+        $out[] = $item;
+    }
+    return $out;
+}
+
+/**
+ * ap_masto_notifications_fetch for API readers, with mute/block applied.
+ *
+ * @param list<string> $types
+ * @param list<string> $exclude
+ * @return list<array<string,mixed>>
+ */
+function ap_masto_notifications_fetch_visible(int $limit = 40, ?string $maxId = null, ?string $sinceId = null, array $types = [], array $exclude = []): array
+{
+    return ap_masto_notifications_drop_hidden(ap_masto_notifications_fetch($limit, $maxId, $sinceId, $types, $exclude));
 }
 
 /**

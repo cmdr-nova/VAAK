@@ -27,6 +27,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 BIN_ALLOW=(
+  bsky-jetstream-media-backfill.php
   bsky-notif-subject-backfill.php
   home-timeline-warm.php
   notif-projection-fill.php
