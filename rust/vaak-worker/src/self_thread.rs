@@ -155,7 +155,14 @@ pub fn plan_feed_paint_units(
             continue;
         }
         if let Some(parent_uri) = self_reply_parent_uri(st) {
-            if let Some(parent) = by_uri.get(&parent_uri).cloned() {
+            // A parent already painted (as a tip, an ancestor, or on its own)
+            // stays where it is. Ranked order can put a later reply below its
+            // parent's own thread card, and two replies can share one parent;
+            // grouping again painted that parent twice.
+            let parent = (!consumed.contains(&parent_uri))
+                .then(|| by_uri.get(&parent_uri).cloned())
+                .flatten();
+            if let Some(parent) = parent {
                 if !parent_uri.is_empty() {
                     consumed.insert(parent_uri);
                 }
@@ -468,6 +475,51 @@ mod tests {
                 assert!(status_object_uri(st).ends_with("/notes/other"));
             }
             _ => panic!("expected single"),
+        }
+    }
+
+    #[test]
+    fn ranked_chain_paints_each_post_once() {
+        // A -> B -> C self-thread, ranked so B comes before its own reply C.
+        let did = "did:plc:qnwrertmdznkkexzktkweuvb";
+        let a = "at://did:plc:qnwrertmdznkkexzktkweuvb/app.bsky.feed.post/a";
+        let b = "at://did:plc:qnwrertmdznkkexzktkweuvb/app.bsky.feed.post/b";
+        let c = "at://did:plc:qnwrertmdznkkexzktkweuvb/app.bsky.feed.post/c";
+        let statuses = vec![
+            bsky_note(b, did, Some(a)),
+            bsky_note(c, did, Some(b)),
+            bsky_note(a, did, None),
+        ];
+        let units = plan_feed_paint_units(&statuses, &HashMap::new());
+        let mut painted = Vec::new();
+        for unit in &units {
+            match unit {
+                FeedPaintUnit::Single(st) => painted.push(status_object_uri(st)),
+                FeedPaintUnit::Thread { parent, tip } => {
+                    painted.push(status_object_uri(parent));
+                    painted.push(status_object_uri(tip));
+                }
+            }
+        }
+        painted.sort();
+        assert_eq!(painted, vec![a.to_string(), b.to_string(), c.to_string()]);
+    }
+
+    #[test]
+    fn sibling_self_replies_share_parent_once() {
+        let did = "did:plc:qnwrertmdznkkexzktkweuvb";
+        let a = "at://did:plc:qnwrertmdznkkexzktkweuvb/app.bsky.feed.post/a";
+        let b1 = "at://did:plc:qnwrertmdznkkexzktkweuvb/app.bsky.feed.post/b1";
+        let b2 = "at://did:plc:qnwrertmdznkkexzktkweuvb/app.bsky.feed.post/b2";
+        let statuses = vec![bsky_note(b2, did, Some(a)), bsky_note(b1, did, Some(a))];
+        let mut extras = HashMap::new();
+        extras.insert(a.to_string(), bsky_note(a, did, None));
+        let units = plan_feed_paint_units(&statuses, &extras);
+        assert_eq!(units.len(), 2);
+        assert!(matches!(units[0], FeedPaintUnit::Thread { .. }));
+        match &units[1] {
+            FeedPaintUnit::Single(st) => assert_eq!(status_object_uri(st), b1),
+            _ => panic!("second reply must not repaint the shared parent"),
         }
     }
 
