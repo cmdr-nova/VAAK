@@ -65,21 +65,26 @@ pub async fn enqueue_thin_scan(cfg: &Config, owner: i64, limit: usize) -> Result
         .query(
             "SELECT bsky_uri FROM bsky_posts
              WHERE embed_json IS NOT NULL
-               AND (
-                 embed_json ILIKE '%images%'
-                 OR embed_json ILIKE '%video%'
-                 OR embed_json ILIKE '%recordWithMedia%'
-                 OR embed_json ILIKE '%gallery%'
-               )
-               AND (
-                 raw_json IS NULL
-                 OR (
-                   raw_json NOT ILIKE '%fullsize%'
-                   AND raw_json NOT ILIKE '%playlist%'
+               AND ((
+                 (
+                   embed_json ILIKE '%images%'
+                   OR embed_json ILIKE '%video%'
+                   OR embed_json ILIKE '%recordWithMedia%'
+                   OR embed_json ILIKE '%gallery%'
                  )
+                 AND (
+                   raw_json IS NULL
+                   OR (
+                     raw_json NOT ILIKE '%fullsize%'
+                     AND raw_json NOT ILIKE '%playlist%'
+                   )
+                 )
+                 AND embed_json NOT ILIKE '%fullsize%'
+                 AND embed_json NOT ILIKE '%playlist%'
                )
-               AND embed_json NOT ILIKE '%fullsize%'
-               AND embed_json NOT ILIKE '%playlist%'
+               -- PHP built these URLs from Jetstream blob refs; AppView still
+               -- owes the moderation labels and the quoted post.
+               OR embed_json LIKE '%\"vaak_synth\":true%')
              ORDER BY indexed_at DESC NULLS LAST
              LIMIT $1",
             &[&limit],
