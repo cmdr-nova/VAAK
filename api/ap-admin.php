@@ -16173,6 +16173,30 @@ function admin_poll_block_html(string $noteId, bool $interactive = true, string 
             $choices = null;
         }
     }
+    if ((!is_array($choices) || $choices === []) && !str_starts_with($noteId, 'https://mkultra.monster/')) {
+        // Remote Question stored at inbox (display-only, no vote form).
+        try {
+            $rst = ap_db()->prepare('SELECT * FROM remote_polls WHERE note_id = ? LIMIT 1');
+            $rst->execute([$noteId]);
+            $remotePoll = $rst->fetch();
+        } catch (Throwable $e) {
+            $remotePoll = null;
+        }
+        if (is_array($remotePoll)) {
+            $decoded = json_decode((string) ($remotePoll['options_json'] ?? '[]'), true);
+            $choices = is_array($decoded) ? $decoded : [];
+            $multiple = !empty($remotePoll['multiple']);
+            $votesCount = (int) ($remotePoll['votes_count'] ?? 0);
+            $votersCount = (int) ($remotePoll['voters_count'] ?? 0);
+            $expiresAt = (string) ($remotePoll['expires_at'] ?? '');
+            try {
+                $expired = !empty($remotePoll['closed'])
+                    || ($expiresAt !== '' && (new DateTimeImmutable($expiresAt)) <= new DateTimeImmutable('now'));
+            } catch (Throwable $e) {
+                $expired = !empty($remotePoll['closed']);
+            }
+        }
+    }
     if (!is_array($choices) || $choices === []) {
         return '';
     }

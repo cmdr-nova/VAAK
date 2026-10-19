@@ -2527,7 +2527,10 @@ function ap_enrich_activity_for_feed(array $activity, string $type, ?string $obj
     if (is_array($obj)) {
         $media = ap_extract_media_urls($obj);
         $inReplyTo = ap_as_id($obj['inReplyTo'] ?? null);
+        // Remote Questions: keep the options so timelines can paint the poll.
+        ap_remote_poll_store($obj);
         if (($type === 'Announce' || $isQuoteActivity) && isset($obj['object']) && is_array($obj['object'])) {
+            ap_remote_poll_store($obj['object']);
             $media = array_values(array_unique(array_merge($media, ap_extract_media_urls($obj['object']))));
             if (($summary === null || $summary === '') && isset($obj['object']['content']) && is_string($obj['object']['content'])) {
                 $summary = ap_fix_utf8($obj['object']['content']);
@@ -2569,6 +2572,7 @@ function ap_enrich_activity_for_feed(array $activity, string $type, ?string $obj
                 }
             }
             if (is_array($remote)) {
+                ap_remote_poll_store($remote);
                 $media = array_values(array_unique(array_merge($media, ap_extract_media_urls($remote))));
                 if (($summary === null || $summary === '') && isset($remote['content']) && is_string($remote['content'])) {
                     $summary = ap_fix_utf8($remote['content']);
@@ -5397,6 +5401,7 @@ function ap_local_observe(array $activity): void
                 break;
             }
         }
+        ap_remote_poll_store($object);
         // Collect https image URLs for admin preview only — never download/store bytes.
         $mediaUrls = ap_extract_media_urls($object);
         // Announce may wrap a nested Note/object
@@ -5412,6 +5417,7 @@ function ap_local_observe(array $activity): void
     } elseif (is_string($object) && str_starts_with($object, 'https://') && !str_starts_with($object, 'https://mkultra.monster/')) {
         $remoteDoc = ap_fetch_as2_object($object);
         if (is_array($remoteDoc)) {
+            ap_remote_poll_store($remoteDoc);
             $objType = is_string($remoteDoc['type'] ?? null) ? $remoteDoc['type'] : $type;
             if (isset($remoteDoc['content']) && is_string($remoteDoc['content'])) {
                 $content = $remoteDoc['content'];
