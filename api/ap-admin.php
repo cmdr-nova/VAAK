@@ -12549,6 +12549,7 @@ function admin_search_run(string $sq, string $stype, bool $sresolve, int $limit 
     }
     // Default-off native collector. Any refusal leaves this PHP path intact.
     if (ap_search_native_collect_enabled()) {
+        ap_search_native_prepare_index();
         $native = ap_search_native_collect($sq, $stype, $sresolve, $limit, $offset);
         if (is_array($native)) {
             return $native;
