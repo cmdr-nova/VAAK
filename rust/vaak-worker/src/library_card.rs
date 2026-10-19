@@ -393,7 +393,7 @@ pub(crate) fn poll_html_mode(row: &Value, note: &str, facts: &CardFacts, read_on
     if opts.is_empty() { return String::new(); }
     let local_id = integer(row, "local_id");
     let expires = chrono::DateTime::parse_from_rfc3339(string(row, "expires_at")).ok();
-    let expired = expires.is_some_and(|time| time <= facts.now);
+    let expired = expires.is_some_and(|time| time <= facts.now) || boolean(row, "closed");
     let voters: Value = serde_json::from_str(string(row, "voters_json")).unwrap_or(Value::Null);
     let voted = !facts.owner_actor.trim_end_matches('/').is_empty() && voters.as_array().into_iter().flatten().filter_map(Value::as_str).any(|v| v.trim_end_matches('/') == facts.owner_actor.trim_end_matches('/'));
     let results = read_only || expired || voted || local_id <= 0;
@@ -409,9 +409,12 @@ pub(crate) fn poll_html_mode(row: &Value, note: &str, facts: &CardFacts, read_on
         }
         html.push_str("<button class=\"btn btn-ghost\" type=\"submit\" style=\"margin-top:.4rem;padding:.3rem .7rem;font-size:.82rem\">Vote</button></form>");
     } else {
-        for (title, count) in &opts {
+        // own_votes: the viewer's choices on a remote poll (library_facts).
+        let own: Vec<i64> = row.get("own_votes").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_i64).collect()).unwrap_or_default();
+        for (i, (title, count)) in opts.iter().enumerate() {
             let pct = if votes > 0 { (*count as f64 / votes as f64 * 100.0).round() as i64 } else { 0 };
-            html.push_str(&format!("<div class=\"poll-opt poll-opt--result\"><div class=\"poll-opt-bar\" style=\"width:{pct}%\"></div><span class=\"poll-opt-text\">{}</span><span class=\"poll-opt-count\">{pct}% · {count}</span></div>", esc(title)));
+            let mine = own.contains(&(i as i64));
+            html.push_str(&format!("<div class=\"poll-opt poll-opt--result{}\"><div class=\"poll-opt-bar\" style=\"width:{pct}%\"></div><span class=\"poll-opt-text\">{}</span>{}<span class=\"poll-opt-count\">{pct}% · {count}</span></div>", if mine { " poll-opt--own" } else { "" }, esc(title), if mine { "<span class=\"poll-opt-own\" title=\"Your vote\">✓</span>" } else { "" }));
         }
     }
     let mut meta = Vec::new();
@@ -908,6 +911,23 @@ mod tests {
             let html = poll_html(&row, "https://social.example/notes/1", &facts());
             assert!(html.contains("poll-opt--result") && html.contains("yes") && html.contains("75% · 3"), "{html}");
             assert!(!html.contains("poll-vote-form"), "{html}");
+        }
+
+        #[test]
+        fn remote_poll_row_paints_the_owners_vote() {
+            // library_facts::remote_poll_row adds local_id, voters_json and own_votes.
+            let mut row = json!({"note_id":"https://social.example/notes/1","multiple":1,"expires_at":"2099-10-20T05:00:00+00:00","closed":0,
+                "options_json":"[{\"title\":\"yes\",\"votes_count\":3},{\"title\":\"no\",\"votes_count\":1}]","votes_count":4,"voters_count":4,
+                "local_id": vaak_types::REMOTE_POLL_ID_BASE + 3});
+            let open = poll_html(&row, "https://social.example/notes/1", &facts());
+            assert!(open.contains("poll-vote-form") && open.contains(&format!("value=\"{}\"", vaak_types::REMOTE_POLL_ID_BASE + 3)), "{open}");
+            row["voters_json"] = json!(json!([facts().owner_actor]).to_string());
+            row["own_votes"] = json!([0]);
+            let html = poll_html(&row, "https://social.example/notes/1", &facts());
+            assert!(html.contains("Poll · voted") && !html.contains("poll-vote-form"), "{html}");
+            assert!(html.contains("poll-opt poll-opt--result poll-opt--own\"><div class=\"poll-opt-bar\" style=\"width:75%\""), "{html}");
+            row["closed"] = json!(1);
+            assert!(poll_html(&row, "https://social.example/notes/1", &facts()).contains("Poll · closed"));
         }
     }
 

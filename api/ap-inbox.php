@@ -8041,6 +8041,86 @@ function ap_masto_poll_vote(int $pollLocalId, string $voterActorId, array $choic
 }
 
 /**
+ * Vote on a remote poll (remote_polls row) as the session actor and federate
+ * the ballot to the poll author through the durable fan-out queue.
+ *
+ * @param int|string $pollRef public poll id (int) or the poll's note id
+ * @param list<int|string> $choices indexes or option titles
+ * @return array{ok:bool,error?:string,note_id?:string,own_votes?:list<int>,queued?:int}
+ */
+function ap_remote_poll_vote(int|string $pollRef, string $voterActorId, array $choices): array
+{
+    $row = ap_remote_poll_find($pollRef);
+    if (!is_array($row)) {
+        return ['ok' => false, 'error' => 'Poll not found'];
+    }
+    $noteId = rtrim((string) ($row['note_id'] ?? ''), '/');
+    $ident = ap_outbound_identity();
+    $voter = rtrim($voterActorId, '/');
+    // Only ever sign as the account that is voting.
+    if ($voter === '' || $voter !== rtrim((string) $ident['id'], '/')) {
+        return ['ok' => false, 'error' => 'Not signed in'];
+    }
+    if (ap_remote_poll_own_votes($noteId, $voter) !== null) {
+        return ['ok' => false, 'error' => 'Already voted'];
+    }
+    // Older rows predate actor_id: ask the poll's origin who wrote it (and
+    // take its current options and counts while at it).
+    $author = rtrim((string) ($row['actor_id'] ?? ''), '/');
+    if ($author === '') {
+        $doc = ap_fetch_as2_object($noteId);
+        $fresh = ap_remote_poll_from_doc($doc);
+        if (is_array($fresh) && $fresh['note_id'] === $noteId) {
+            ap_remote_poll_store($doc);
+            $row = ap_remote_poll_find($noteId) ?? $row;
+            $author = $fresh['actor_id'];
+        }
+    }
+    if ($author === '') {
+        return ['ok' => false, 'error' => 'Could not resolve poll author'];
+    }
+    $ballot = ap_remote_poll_ballot($row, $choices);
+    if (empty($ballot['ok'])) {
+        return ['ok' => false, 'error' => (string) ($ballot['error'] ?? 'Vote failed')];
+    }
+    $indexes = $ballot['indexes'];
+    if (ap_is_blocked_actor($author)) {
+        return ['ok' => false, 'error' => 'Poll author is blocked'];
+    }
+    $doc = ap_fetch_actor_doc($author);
+    $inbox = is_array($doc) ? ap_resolve_personal_inbox_from_actor_doc($doc) : null;
+    if (!is_string($inbox) || !str_starts_with($inbox, 'https://') || ap_is_blocked_inbox($inbox)) {
+        return ['ok' => false, 'error' => 'Poll author has no inbox'];
+    }
+
+    $options = json_decode((string) ($row['options_json'] ?? '[]'), true);
+    $titles = [];
+    foreach ($indexes as $i) {
+        $titles[] = (string) ($options[$i]['title'] ?? '');
+    }
+    try {
+        if (!ap_remote_poll_record_vote($row, $voter, $indexes)) {
+            return ['ok' => false, 'error' => 'Already voted'];
+        }
+    } catch (Throwable $e) {
+        error_log('[ap-inbox] remote poll vote store: ' . $e->getMessage());
+        return ['ok' => false, 'error' => 'Could not record vote'];
+    }
+    $queued = 0;
+    foreach (ap_remote_poll_vote_activities($voter, $author, $noteId, $titles) as $create) {
+        if (ap_deliver_fanout_background($create, [$inbox], $ident['key_id'], $ident['priv'])) {
+            $queued++;
+        }
+    }
+    if ($queued < 1) {
+        ap_remote_poll_forget_vote($row, $voter);
+        return ['ok' => false, 'error' => 'Could not deliver vote'];
+    }
+    ap_log('remote_poll_vote note=' . ap_short($noteId) . ' choices=' . implode(',', $indexes) . ' queued=' . $queued);
+    return ['ok' => true, 'note_id' => $noteId, 'own_votes' => $indexes, 'queued' => $queued];
+}
+
+/**
  * Delete a local public/compose status and federate Delete to followers.
  *
  * @return array{ok:bool,error?:string,note_id?:string,delivered?:int,queued?:int,status_row?:array}
