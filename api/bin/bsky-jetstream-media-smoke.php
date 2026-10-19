@@ -7,6 +7,7 @@ reference_load(dirname(__DIR__) . '/ap-bsky.php', [
     'ap_bsky_post_embed_compact', 'ap_bsky_embed_video_view', 'ap_bsky_compact_label_list',
     'ap_bsky_compact_facets', 'ap_bsky_post_upsert_from_feed_item', 'ap_bsky_post_embed_media_thin',
     'ap_bsky_jetstream_media_backfill', 'ap_bsky_cached_quote_view',
+    'ap_bsky_sensitive_label_vals', 'ap_bsky_post_label_vals', 'ap_bsky_post_is_sensitive',
 ]);
 if (!defined('AP_BSKY_POST_TEXT_MAX')) define('AP_BSKY_POST_TEXT_MAX', 5000);
 $db = new PDO('sqlite::memory:');
@@ -102,6 +103,35 @@ try {
         'embed' => ['$type' => 'app.bsky.embed.record', 'record' => ['uri' => 'at://did:plc:nobody/app.bsky.feed.post/3x']]]], null);
     $u = $row($uUri)['embed'];
     jm_check(($u['$type'] ?? '') === 'app.bsky.embed.record#view' && !empty($u['vaak_synth']) && !isset($u['record']), 'uncached quote is marked for the warm scan');
+
+    // Sensitive labels: Jetstream self-labels, account labels, quoted posts.
+    $sUri = "at://{$did}/app.bsky.feed.post/3selflabel";
+    $selfRec = ['text' => 'nsfw', 'createdAt' => '2026-10-19T05:00:00Z', 'embed' => $imgEmbed,
+        'labels' => ['$type' => 'com.atproto.label.defs#selfLabels', 'values' => [['val' => 'porn']]]];
+    ap_bsky_post_upsert_from_feed_item(['uri' => $sUri, 'author' => ['did' => $did], 'record' => $selfRec], null);
+    $s = $row($sUri)['raw'];
+    jm_check(ap_bsky_post_is_sensitive($s) && !isset($s['vaak_labels_at']), 'Jetstream self-label is sensitive; labels still owed by AppView');
+    $mod = 'did:plc:ar7c4by46qjdydhdevvrndac';
+    $aUri = "at://{$did}/app.bsky.feed.post/3acctlabel";
+    ap_bsky_post_upsert_from_feed_item(['post' => ['uri' => $aUri, 'indexedAt' => '2026-10-19T05:00:01Z',
+        'author' => ['did' => $did, 'handle' => 'a.example', 'labels' => [['val' => 'porn', 'src' => $mod, 'uri' => "at://{$did}/app.bsky.actor.profile/self"]]],
+        'record' => ['text' => 'clip', 'createdAt' => '2026-10-19T05:00:00Z'], 'labels' => []]], null);
+    $a = $row($aUri)['raw'];
+    jm_check(($a['author']['labels'][0]['val'] ?? '') === 'porn' && ap_bsky_post_is_sensitive($a), 'account porn label marks the post sensitive');
+    jm_check(is_int($a['vaak_labels_at'] ?? null), 'AppView upsert stamps when labels were read');
+    // A Jetstream replay (no view embed, no author view) keeps both.
+    ap_bsky_post_upsert_from_feed_item(['uri' => $aUri, 'author' => ['did' => $did], 'record' => ['text' => 'clip', 'createdAt' => '2026-10-19T05:00:00Z']], null);
+    $a2 = $row($aUri)['raw'];
+    jm_check(($a2['author']['labels'][0]['val'] ?? '') === 'porn' && ($a2['vaak_labels_at'] ?? null) === $a['vaak_labels_at'], 'Jetstream replay keeps account labels and the stamp');
+    $qlUri = "at://{$did}/app.bsky.feed.post/3quotelabel";
+    ap_bsky_post_upsert_from_feed_item(['post' => ['uri' => $qlUri, 'indexedAt' => '2026-10-19T05:00:01Z', 'author' => ['did' => $did],
+        'record' => ['text' => 'look', 'createdAt' => '2026-10-19T05:00:00Z'],
+        'embed' => ['$type' => 'app.bsky.embed.record#view', 'record' => ['$type' => 'app.bsky.embed.record#viewRecord',
+            'uri' => $qUri, 'cid' => 'bafyq', 'author' => ['did' => 'did:plc:quoted1', 'handle' => 'q.example'],
+            'value' => ['text' => 'quoted text'], 'labels' => [['val' => 'nudity', 'src' => $mod]]]]]], null);
+    $ql = $row($qlUri)['embed']['record'] ?? [];
+    jm_check(($ql['labels'][0]['val'] ?? '') === 'nudity' && ap_bsky_post_is_sensitive($ql), 'quoted post keeps its label');
+    jm_check(!ap_bsky_post_is_sensitive($row($qlUri)['raw']), 'outer post stays unlabelled');
 
     // Backfill rows stored before this change (embed_json NULL, record.embed kept).
     $now = gmdate('Y-m-d\TH:i:s\Z');

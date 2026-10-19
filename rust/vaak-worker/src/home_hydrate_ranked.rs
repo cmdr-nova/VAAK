@@ -979,13 +979,19 @@ fn bsky_label_vals_from_json(raw: &Value) -> Vec<String> {
     if let Some(labels) = raw.get("labels") {
         push_list(labels);
     }
-    if let Some(record) = raw.get("record") {
+    // A viewRecord (quoted post) keeps its record under `value`.
+    if let Some(record) = raw.get("record").or_else(|| raw.get("value")) {
         if let Some(labels) = record
             .get("labels")
             .or_else(|| record.get("selfLabels"))
         {
             push_list(labels);
         }
+    }
+    // Account labels (Bluesky moderation marks whole accounts `porn` etc.);
+    // those authors' posts often carry no post label of their own.
+    if let Some(labels) = raw.get("author").and_then(|a| a.get("labels")) {
+        push_list(labels);
     }
     out
 }
@@ -5560,6 +5566,21 @@ mod tests {
         assert!(!bsky_is_sensitive(clean));
         let self_lab = r#"{"record":{"selfLabels":{"values":[{"val":"nudity"}]}}}"#;
         assert!(bsky_is_sensitive(self_lab));
+    }
+
+    #[test]
+    fn bsky_sensitive_from_jetstream_self_labels_account_labels_and_quotes() {
+        // Jetstream record shape: record.labels = selfLabels object.
+        let jet = r#"{"record":{"text":"x","labels":{"$type":"com.atproto.label.defs#selfLabels","values":[{"val":"porn"}]}},"labels":[]}"#;
+        assert!(bsky_is_sensitive(jet));
+        // Account labelled by Bluesky moderation, post itself unlabelled.
+        let account = r#"{"author":{"did":"did:plc:x","labels":[{"val":"porn","src":"did:plc:ar7c4by46qjdydhdevvrndac"}]},"record":{"text":"x"},"labels":[]}"#;
+        assert!(bsky_is_sensitive(account));
+        let benign = r#"{"author":{"did":"did:plc:x","labels":[{"val":"!no-unauthenticated"}]},"labels":[]}"#;
+        assert!(!bsky_is_sensitive(benign));
+        // Quoted viewRecord keeps its record under `value`.
+        let quoted = r#"{"value":{"text":"q","labels":{"values":[{"val":"nudity"}]}}}"#;
+        assert!(bsky_is_sensitive(quoted));
     }
 
     #[test]

@@ -210,7 +210,12 @@ async fn upsert_from_appview(
         "replyCount": post.get("replyCount").and_then(|n| n.as_i64()).unwrap_or(0),
         "quoteCount": post.get("quoteCount").and_then(|n| n.as_i64()).unwrap_or(0),
         "labels": labels,
+        "vaak_labels_at": chrono::Utc::now().timestamp(),
     });
+    let author_labels = compact_labels(author.get("labels").unwrap_or(&Value::Null));
+    if !author_labels.is_empty() {
+        raw["author"]["labels"] = Value::Array(author_labels);
+    }
     if let Some(viewer) = post.get("viewer") {
         raw["viewer"] = viewer.clone();
     }
@@ -297,11 +302,200 @@ async fn upsert_from_appview(
     Ok(repaired)
 }
 
+/// Bluesky moderation often labels a post seconds after it is made, while
+/// Jetstream ingest and the warm above read it within a second or two. Fetch
+/// posts again once they are this old (seconds), if their labels were last
+/// read before that point.
+const LABEL_RECHECK_AFTER_SECS: [i64; 2] = [120, 1800];
+/// Posts older than this keep the labels they have.
+const LABEL_RECHECK_WINDOW_SECS: i64 = 2 * 3600;
+/// AppView getPosts accepts up to 25 URIs.
+const LABEL_RECHECK_BATCH: usize = 25;
+const LABEL_RECHECK_MAX_PER_RUN: usize = 250;
+const LABEL_RECHECK_INTERVAL_SECS: u64 = 60;
+
+fn compact_labels(labels: &Value) -> Vec<Value> {
+    let list = labels
+        .get("values")
+        .filter(|v| v.is_array())
+        .unwrap_or(labels);
+    let mut out: Vec<Value> = Vec::new();
+    for lab in list.as_array().into_iter().flatten() {
+        let val = lab
+            .as_str()
+            .or_else(|| lab.get("val").and_then(Value::as_str))
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
+        if val.is_empty() || out.iter().any(|o| o["val"] == val.as_str()) {
+            continue;
+        }
+        let mut row = serde_json::json!({ "val": val });
+        if let Some(src) = lab.get("src").and_then(Value::as_str).filter(|s| !s.trim().is_empty()) {
+            row["src"] = Value::String(src.trim().to_string());
+        }
+        out.push(row);
+    }
+    out
+}
+
+/// True when a post `published` (unix) has passed a re-check point since its
+/// labels were last read at `labels_at`.
+fn label_recheck_due(published: i64, labels_at: Option<i64>, now: i64) -> bool {
+    let age = now - published;
+    if !(0..=LABEL_RECHECK_WINDOW_SECS).contains(&age) {
+        return false;
+    }
+    let Some(due) = LABEL_RECHECK_AFTER_SECS.iter().rev().find(|&&t| age >= t) else {
+        return false;
+    };
+    labels_at.is_none_or(|at| at < published + due)
+}
+
+fn parse_unix(ts: &str) -> Option<i64> {
+    let ts = ts.trim();
+    chrono::DateTime::parse_from_rfc3339(ts)
+        .map(|d| d.timestamp())
+        .ok()
+        .or_else(|| {
+            chrono::NaiveDateTime::parse_from_str(ts, "%Y-%m-%d %H:%M:%S")
+                .ok()
+                .map(|d| d.and_utc().timestamp())
+        })
+}
+
+/// Fold a fresh AppView PostView's labels into a stored raw_json. The post's
+/// own self-labels stay; account labels follow the author.
+fn apply_appview_labels(raw: &mut Value, post: Option<&Value>, now: i64) {
+    if !raw.is_object() {
+        return;
+    }
+    if let Some(post) = post {
+        let mut labels = compact_labels(post.get("labels").unwrap_or(&Value::Null));
+        let self_labels = raw
+            .pointer("/record/labels")
+            .or_else(|| post.pointer("/record/labels"))
+            .map(compact_labels)
+            .unwrap_or_default();
+        for lab in self_labels {
+            if !labels.iter().any(|l| l["val"] == lab["val"]) {
+                labels.push(lab);
+            }
+        }
+        raw["labels"] = Value::Array(labels);
+        let author_labels = compact_labels(post.pointer("/author/labels").unwrap_or(&Value::Null));
+        if raw["author"].is_object() {
+            if author_labels.is_empty() {
+                if let Some(author) = raw["author"].as_object_mut() {
+                    author.remove("labels");
+                }
+            } else {
+                raw["author"]["labels"] = Value::Array(author_labels);
+            }
+        }
+    }
+    raw["vaak_labels_at"] = serde_json::json!(now);
+}
+
+/// Re-read moderation labels for recent posts whose labels were read too soon
+/// after they were made. Labels only: media repair stays with the warm queue.
+pub async fn label_recheck_once(cfg: &Config) -> Result<usize> {
+    let db = crate::db::connect(&cfg.database_url).await?;
+    let now = chrono::Utc::now().timestamp();
+    let since = chrono::DateTime::from_timestamp(now - LABEL_RECHECK_WINDOW_SECS, 0)
+        .unwrap_or_default()
+        .to_rfc3339();
+    let rows = db
+        .query(
+            "SELECT bsky_uri, COALESCE(published_at, indexed_at, ''),
+                    substring(raw_json from '\"vaak_labels_at\":([0-9]+)')
+             FROM bsky_posts
+             WHERE seen_at >= $1 AND raw_json IS NOT NULL
+             ORDER BY seen_at DESC
+             LIMIT 2000",
+            &[&since],
+        )
+        .await
+        .context("select label recheck candidates")?;
+    let due: Vec<String> = rows
+        .iter()
+        .filter_map(|row| {
+            let uri: String = row.get(0);
+            let published = parse_unix(&row.get::<_, String>(1))?;
+            let labels_at = row
+                .get::<_, Option<String>>(2)
+                .and_then(|s| s.parse::<i64>().ok());
+            (uri.starts_with("at://") && label_recheck_due(published, labels_at, now)).then_some(uri)
+        })
+        .take(LABEL_RECHECK_MAX_PER_RUN)
+        .collect();
+    if due.is_empty() {
+        return Ok(0);
+    }
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .user_agent("vaak-worker-live/0.1 (label-recheck)")
+        .build()?;
+    let url = format!("{}/xrpc/app.bsky.feed.getPosts", cfg.bsky_public_api.trim_end_matches('/'));
+    let mut updated = 0usize;
+    for chunk in due.chunks(LABEL_RECHECK_BATCH) {
+        let query: Vec<(&str, &str)> = chunk.iter().map(|u| ("uris", u.as_str())).collect();
+        let resp = match client.get(&url).query(&query).send().await {
+            Ok(r) if r.status().is_success() => r,
+            Ok(r) => {
+                tracing::warn!(status = %r.status(), "label recheck getPosts");
+                break;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "label recheck getPosts");
+                break;
+            }
+        };
+        let body: Value = resp.json().await.context("decode getPosts")?;
+        let posts = body.get("posts").and_then(Value::as_array).cloned().unwrap_or_default();
+        let stored = db
+            .query(
+                "SELECT bsky_uri, raw_json FROM bsky_posts WHERE bsky_uri = ANY($1)",
+                &[&chunk.to_vec()],
+            )
+            .await
+            .context("select label recheck raw")?;
+        for row in stored {
+            let uri: String = row.get(0);
+            let Some(old) = row.get::<_, Option<String>>(1) else { continue };
+            let Ok(mut raw) = serde_json::from_str::<Value>(&old) else { continue };
+            // A post missing from getPosts (deleted, blocked) is still marked
+            // checked so it leaves the candidate list.
+            let post = posts.iter().find(|p| p.get("uri").and_then(Value::as_str) == Some(uri.as_str()));
+            apply_appview_labels(&mut raw, post, now);
+            let new = serde_json::to_string(&raw)?;
+            // Skip rows another writer changed since the read; the next run retries.
+            updated += db
+                .execute(
+                    "UPDATE bsky_posts SET raw_json = $2 WHERE bsky_uri = $1 AND raw_json = $3",
+                    &[&uri, &new, &old],
+                )
+                .await
+                .context("update label recheck raw")? as usize;
+        }
+    }
+    Ok(updated)
+}
+
 pub async fn run_worker_loop(cfg: &Config, scan_interval_secs: u64) -> Result<()> {
     let mut q = redis_util::connect(&cfg.redis_queue_url).await?;
     let mut last_scan = std::time::Instant::now()
         - std::time::Duration::from_secs(scan_interval_secs.max(60));
+    let mut last_label_check = std::time::Instant::now()
+        - std::time::Duration::from_secs(LABEL_RECHECK_INTERVAL_SECS);
     loop {
+        if last_label_check.elapsed() >= std::time::Duration::from_secs(LABEL_RECHECK_INTERVAL_SECS) {
+            match label_recheck_once(cfg).await {
+                Ok(n) => tracing::info!(updated = n, "bsky label recheck"),
+                Err(e) => tracing::warn!(error = %e, "bsky label recheck failed"),
+            }
+            last_label_check = std::time::Instant::now();
+        }
         // Periodic thin scan → enqueue.
         if last_scan.elapsed() >= std::time::Duration::from_secs(scan_interval_secs.max(60)) {
             match enqueue_thin_scan(cfg, cfg.default_owner_id, 15).await {
@@ -359,4 +553,51 @@ fn sha256_hex(s: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(s.as_bytes());
     hex::encode(hasher.finalize())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn label_recheck_runs_at_two_minutes_and_thirty_minutes() {
+        let p = 1_000_000;
+        // Too fresh: the labeler may not have acted yet.
+        assert!(!label_recheck_due(p, None, p + 60));
+        // Read 1 s after posting, now 2 min old: due.
+        assert!(label_recheck_due(p, Some(p + 1), p + 120));
+        // Rechecked at 2 min: quiet until 30 min.
+        assert!(!label_recheck_due(p, Some(p + 125), p + 600));
+        assert!(label_recheck_due(p, Some(p + 125), p + 1800));
+        assert!(!label_recheck_due(p, Some(p + 1805), p + 3600));
+        // Fetched late (old polling path): nothing owed.
+        assert!(!label_recheck_due(p, Some(p + 2000), p + 2100));
+        // Outside the window.
+        assert!(!label_recheck_due(p, None, p + LABEL_RECHECK_WINDOW_SECS + 1));
+    }
+
+    #[test]
+    fn appview_labels_fold_post_self_and_account_labels() {
+        let mut raw = json!({
+            "uri": "at://did:plc:a/app.bsky.feed.post/x",
+            "author": {"did": "did:plc:a", "handle": "a.test"},
+            "record": {"text": "hi", "labels": {"$type": "com.atproto.label.defs#selfLabels", "values": [{"val": "nudity"}]}},
+            "labels": [],
+        });
+        let post = json!({
+            "uri": "at://did:plc:a/app.bsky.feed.post/x",
+            "author": {"did": "did:plc:a", "labels": [{"val": "porn", "src": "did:plc:ar7c4by46qjdydhdevvrndac", "uri": "at://did:plc:a/app.bsky.actor.profile/self", "sig": "x"}]},
+            "labels": [{"val": "porn", "src": "did:plc:ar7c4by46qjdydhdevvrndac", "cts": "2026-10-19T13:12:25Z"}],
+        });
+        apply_appview_labels(&mut raw, Some(&post), 42);
+        assert_eq!(raw["labels"], json!([{"val": "porn", "src": "did:plc:ar7c4by46qjdydhdevvrndac"}, {"val": "nudity"}]));
+        assert_eq!(raw["author"]["labels"], json!([{"val": "porn", "src": "did:plc:ar7c4by46qjdydhdevvrndac"}]));
+        assert_eq!(raw["vaak_labels_at"], json!(42));
+        assert_eq!(raw["record"]["text"], json!("hi"));
+
+        let mut gone = json!({"uri": "at://did:plc:a/app.bsky.feed.post/y", "labels": []});
+        apply_appview_labels(&mut gone, None, 7);
+        assert_eq!(gone["vaak_labels_at"], json!(7));
+    }
 }
