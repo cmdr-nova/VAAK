@@ -101,7 +101,7 @@ impl CanonicalProjection {
 pub(crate) async fn project_library_search_source(db:&Client,selected:Selected)->Result<CanonicalProjection>{
     selected.require_current(db).await?;let requested=crate::library::card::php_trim(selected.object_id()).trim_end_matches('/').to_owned();
     if !requested.starts_with("https://"){bail!("PHP fallback: surface canonical source protocol unsupported")}
-    let mut projector=Projector{db,owner:selected.owner_id(),dependencies:vec![],static_counts:vec![],effects:vec![],source_index:0,account_memo:Default::default(),bare_memo:Default::default(),cache:vec![],graphs:vec![],path:vec![]};
+    let mut projector=Projector{db,php_web_urls:false,owner:selected.owner_id(),dependencies:vec![],static_counts:vec![],effects:vec![],source_index:0,account_memo:Default::default(),bare_memo:Default::default(),cache:vec![],graphs:vec![],path:vec![]};
     let rows=projector.rows("SELECT to_jsonb(s) FROM masto_statuses s WHERE note_id IN($1::jsonb->>'note',($1::jsonb->>'note')||'/') LIMIT 1",json!({"note":requested})).await?;
     let status=if let Some(row)=rows.first(){
         let notes=projector.rows("SELECT to_jsonb(n) FROM outbox_notes n WHERE id=$1::jsonb->>'note'",json!({"note":s(row,"note_id")})).await?;

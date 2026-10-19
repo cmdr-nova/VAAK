@@ -85,7 +85,7 @@ impl Refs{
 }
 
 /// PHP strtotime for the stored suppression timestamps; unknown text stays on PHP.
-fn strtotime(text:&str)->Result<i64>{
+pub(super) fn strtotime(text:&str)->Result<i64>{
     let text=trim(text);if text.is_empty(){return Ok(0)}
     if let Ok(t)=chrono::DateTime::parse_from_rfc3339(text){return Ok(t.timestamp())}
     for format in ["%Y-%m-%d %H:%M:%S%:z","%Y-%m-%dT%H:%M:%S%z","%Y-%m-%d %H:%M:%S%z"]{if let Ok(t)=chrono::DateTime::parse_from_str(text,format){return Ok(t.timestamp())}}
