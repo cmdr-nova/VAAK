@@ -3257,6 +3257,13 @@ function ap_bsky_jetstream_ingest_event(array $event): array
                 ap_bsky_actor_refresh_enqueue((int) $owner, $did, true);
             }
         }
+        // Media and cached quotes paint from the record; queue the AppView view
+        // for labels and quotes that were not cached.
+        $recEmbedType = (string) ($record['embed']['$type'] ?? '');
+        if (ap_bsky_record_embed_looks_media(is_array($record['embed'] ?? null) ? $record['embed'] : null)
+            || $recEmbedType === 'app.bsky.embed.record') {
+            ap_bsky_post_preview_warm_enqueue($uri, (int) ($owners[0] ?? 0));
+        }
         return ['ok' => true, 'type' => 'post', 'owners' => count($owners)];
     }
     if ($action === 'delete' && ($collection === 'app.bsky.feed.post' || $collection === 'app.bsky.feed.repost')) {
@@ -3405,6 +3412,168 @@ function ap_bsky_embed_video_view(?array $embed): ?array
         }
     }
     return (isset($embed['playlist']) || isset($embed['thumbnail'])) ? $embed : null;
+}
+
+/** CID of a record blob ref (`ref.$link`, or the legacy `cid` form). */
+function ap_bsky_blob_cid(mixed $blob): ?string
+{
+    if (!is_array($blob)) {
+        return null;
+    }
+    $cid = $blob['ref']['$link'] ?? ($blob['cid'] ?? null);
+    $cid = is_string($cid) ? trim($cid) : '';
+    return preg_match('/^[A-Za-z0-9]{8,128}$/', $cid) ? $cid : null;
+}
+
+/**
+ * AppView-shaped view of a record embed, built from its blob refs.
+ *
+ * Jetstream carries only the record, so its posts reach bsky_posts with no
+ * view embed and no media URLs. Bluesky serves blobs from fixed CDN paths,
+ * so the view can be rebuilt without an AppView call. Quoted records are left
+ * out (they need the quoted post); the media half of recordWithMedia is kept.
+ *
+ * @param array<string,mixed>|null $recEmbed
+ * @return array<string,mixed>|null
+ */
+function ap_bsky_record_embed_view(?array $recEmbed, string $did): ?array
+{
+    if (!is_array($recEmbed) || !preg_match('/^did:[a-z0-9]+:[A-Za-z0-9._:%-]+$/', $did)) {
+        return null;
+    }
+    $type = (string) ($recEmbed['$type'] ?? '');
+    $img = static fn(string $kind, string $cid): string
+        => 'https://cdn.bsky.app/img/' . $kind . '/plain/' . $did . '/' . $cid . '@jpeg';
+    if ($type === 'app.bsky.embed.images') {
+        $images = [];
+        foreach (is_array($recEmbed['images'] ?? null) ? array_slice($recEmbed['images'], 0, 4) : [] as $image) {
+            $cid = is_array($image) ? ap_bsky_blob_cid($image['image'] ?? null) : null;
+            if ($cid === null) {
+                continue;
+            }
+            $images[] = [
+                'thumb' => $img('feed_thumbnail', $cid),
+                'fullsize' => $img('feed_fullsize', $cid),
+                'alt' => (string) ($image['alt'] ?? ''),
+            ];
+        }
+        return $images === [] ? null : ['$type' => 'app.bsky.embed.images#view', 'images' => $images];
+    }
+    if ($type === 'app.bsky.embed.video') {
+        $cid = ap_bsky_blob_cid($recEmbed['video'] ?? null);
+        if ($cid === null) {
+            return null;
+        }
+        $base = 'https://video.bsky.app/watch/' . rawurlencode($did) . '/' . $cid;
+        $view = [
+            '$type' => 'app.bsky.embed.video#view',
+            'cid' => $cid,
+            'playlist' => $base . '/playlist.m3u8',
+            'thumbnail' => $base . '/thumbnail.jpg',
+            'alt' => (string) ($recEmbed['alt'] ?? ''),
+        ];
+        if (is_array($recEmbed['aspectRatio'] ?? null)) {
+            $view['aspectRatio'] = $recEmbed['aspectRatio'];
+        }
+        return $view;
+    }
+    if ($type === 'app.bsky.embed.external' && is_array($recEmbed['external'] ?? null)) {
+        $ext = $recEmbed['external'];
+        $thumb = ap_bsky_blob_cid($ext['thumb'] ?? null);
+        return [
+            '$type' => 'app.bsky.embed.external#view',
+            'external' => [
+                'uri' => (string) ($ext['uri'] ?? ''),
+                'title' => (string) ($ext['title'] ?? ''),
+                'description' => (string) ($ext['description'] ?? ''),
+                'thumb' => $thumb === null ? '' : $img('feed_thumbnail', $thumb),
+            ],
+        ];
+    }
+    if ($type === 'app.bsky.embed.recordWithMedia') {
+        $media = ap_bsky_record_embed_view(is_array($recEmbed['media'] ?? null) ? $recEmbed['media'] : null, $did);
+        $quote = ap_bsky_cached_quote_view((string) ($recEmbed['record']['record']['uri'] ?? ''));
+        if ($media === null && $quote === null) {
+            return null;
+        }
+        $view = ['$type' => 'app.bsky.embed.recordWithMedia#view'];
+        if ($media !== null) {
+            $view['media'] = $media;
+        }
+        if ($quote !== null) {
+            $view['record'] = ['record' => $quote];
+        }
+        return $view;
+    }
+    if ($type === 'app.bsky.embed.record') {
+        $quote = ap_bsky_cached_quote_view((string) ($recEmbed['record']['uri'] ?? ''));
+        // An empty view still marks the row for the AppView warm scan.
+        return ['$type' => 'app.bsky.embed.record#view'] + ($quote === null ? [] : ['record' => $quote]);
+    }
+    return null;
+}
+
+/**
+ * viewRecord for a quoted post already in bsky_posts, with its own media
+ * under `embeds` so the quote card paints it inside the quote.
+ *
+ * @return array<string,mixed>|null
+ */
+function ap_bsky_cached_quote_view(string $uri): ?array
+{
+    if (!preg_match('#^at://did:[^/]+/app\.bsky\.feed\.post/[A-Za-z0-9._:~-]+$#', $uri)) {
+        return null;
+    }
+    try {
+        $st = ap_db()->prepare('SELECT bsky_cid, author_did, author_handle, author_display, author_avatar,
+            text, published_at, embed_json FROM bsky_posts WHERE bsky_uri = ? LIMIT 1');
+        $st->execute([$uri]);
+        $row = $st->fetch(PDO::FETCH_ASSOC);
+    } catch (Throwable $e) {
+        return null;
+    }
+    if (!is_array($row)) {
+        return null;
+    }
+    $view = [
+        '$type' => 'app.bsky.embed.record#viewRecord',
+        'uri' => $uri,
+        'cid' => (string) ($row['bsky_cid'] ?? ''),
+        'author' => [
+            'did' => (string) ($row['author_did'] ?? ''),
+            'handle' => (string) ($row['author_handle'] ?? ''),
+            'displayName' => (string) ($row['author_display'] ?? ''),
+            'avatar' => (string) ($row['author_avatar'] ?? ''),
+        ],
+        'value' => [
+            '$type' => 'app.bsky.feed.post',
+            'text' => (string) ($row['text'] ?? ''),
+            'createdAt' => (string) ($row['published_at'] ?? ''),
+        ],
+    ];
+    $embed = json_decode((string) ($row['embed_json'] ?? ''), true);
+    if (is_array($embed) && $embed !== []) {
+        $view['embeds'] = [$embed];
+    }
+    return $view;
+}
+
+/**
+ * Compact cache embed rebuilt from a record embed, flagged `vaak_synth` so
+ * render paths still queue the AppView fetch that brings moderation labels
+ * and any quoted post that was not cached yet.
+ *
+ * @return array<string,mixed>|null
+ */
+function ap_bsky_record_embed_synth_compact(mixed $recEmbed, string $did): ?array
+{
+    $view = ap_bsky_record_embed_view(is_array($recEmbed) ? $recEmbed : null, $did);
+    $compact = $view === null ? null : ap_bsky_post_embed_compact($view);
+    if (!is_array($compact) || (count($compact) < 2 && !str_contains((string) ($compact['$type'] ?? ''), 'embed.record'))) {
+        return null;
+    }
+    $compact['vaak_synth'] = true;
+    return $compact;
 }
 
 function ap_bsky_post_embed_compact(?array $embed): ?array
@@ -3778,6 +3947,15 @@ function ap_bsky_post_upsert_from_feed_item(array $itemOrPost, ?int $ownerUserId
             }
         } catch (Throwable $e) {
             // ignore
+        }
+    }
+    // Jetstream posts have no view embed. Build the media URLs from the blob
+    // refs so Home shows them before (or without) the AppView repair.
+    if ($embedCompact === null) {
+        $synth = ap_bsky_record_embed_synth_compact($record['embed'] ?? null, $authorDid);
+        if ($synth !== null) {
+            $embedCompact = $synth;
+            $raw['embed'] = $synth;
         }
     }
     // Self-labels live on the record (composer shield); also fold into top-level labels.
@@ -10194,6 +10372,10 @@ function ap_bsky_record_embed_looks_media(?array $recEmbed): bool
  */
 function ap_bsky_post_embed_media_thin(array $post): bool
 {
+    // Blob-built URLs paint, but AppView still owes labels and the quoted post.
+    if (!empty($post['embed']['vaak_synth'])) {
+        return true;
+    }
     $uri = (string) ($post['uri'] ?? 'x');
     $hasUrls = false;
     if (function_exists('ap_masto_bsky_media_attachments')) {
@@ -14139,5 +14321,50 @@ function ap_bsky_home_filter_items(array $items, int $ownerUserId): array
     $session=ap_db()->prepare('SELECT did FROM bsky_sessions WHERE owner_user_id=? LIMIT 1');$session->execute([$ownerUserId]);$own=(string)($session->fetchColumn()?:'');
     $flags=ap_bsky_home_mirror_segment_flags($uris);$out=[];
     foreach($items as $i=>$item){$uri=$keys[$i]??'';if($uri!==''&&(($own!==''&&str_starts_with($uri,'at://'.$own.'/'))||!empty($flags[$uri]['mirror'])||!empty($flags[$uri]['canonical_note_id'])))continue;$out[]=$item;}
+    return $out;
+}
+
+/**
+ * Give Jetstream rows stored before blob-built embeds their media URLs.
+ * Those rows have no embed_json, so Home painted the text alone (or a
+ * "Bluesky post" link card when the post was media only). Opt-in only:
+ * api/bin/bsky-jetstream-media-backfill.php.
+ *
+ * @return array{scanned:int,repaired:int,no_media:int,dry_run:bool,sample:list<string>}
+ */
+function ap_bsky_jetstream_media_backfill(int $days, int $limit, bool $dryRun): array
+{
+    $out = ['scanned' => 0, 'repaired' => 0, 'no_media' => 0, 'dry_run' => $dryRun, 'sample' => []];
+    ap_bsky_posts_migrate();
+    $st = ap_db()->prepare(
+        "SELECT bsky_uri, author_did, raw_json FROM bsky_posts
+         WHERE embed_json IS NULL AND indexed_at >= ? AND raw_json LIKE '%\"embed\":{%'
+         ORDER BY indexed_at DESC LIMIT ?"
+    );
+    $st->bindValue(1, gmdate('Y-m-d\TH:i:s', time() - max(1, $days) * 86400));
+    $st->bindValue(2, max(1, $limit), PDO::PARAM_INT);
+    $st->execute();
+    $upd = ap_db()->prepare('UPDATE bsky_posts SET embed_json = ?, raw_json = ? WHERE bsky_uri = ? AND embed_json IS NULL');
+    foreach ($st->fetchAll(PDO::FETCH_ASSOC) ?: [] as $row) {
+        $out['scanned']++;
+        $raw = json_decode((string) ($row['raw_json'] ?? ''), true);
+        $synth = is_array($raw)
+            ? ap_bsky_record_embed_synth_compact($raw['record']['embed'] ?? null, (string) ($row['author_did'] ?? ''))
+            : null;
+        if ($synth === null) {
+            $out['no_media']++;
+            continue;
+        }
+        $out['repaired']++;
+        if (count($out['sample']) < 10) {
+            $out['sample'][] = (string) $row['bsky_uri'];
+        }
+        if ($dryRun) {
+            continue;
+        }
+        $raw['embed'] = $synth;
+        $flags = JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE;
+        $upd->execute([json_encode($synth, $flags), json_encode($raw, $flags), (string) $row['bsky_uri']]);
+    }
     return $out;
 }

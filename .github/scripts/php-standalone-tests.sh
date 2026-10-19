@@ -51,6 +51,7 @@ php_tests=(
   api/bin/cpu-index-smoke.php
   api/bin/downrank-search-trends-smoke.php
   api/bin/bsky-notif-subject-backfill-smoke.php
+  api/bin/bsky-jetstream-media-smoke.php
   api/bin/media-warm-lock-smoke.php
   api/bin/media-magick-coder-smoke.php
   api/bin/net-guard-smoke.php
