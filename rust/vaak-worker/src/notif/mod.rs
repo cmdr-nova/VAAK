@@ -33,7 +33,8 @@ pub async fn compute_unread(db: &Client, owner_user_id: i64, scan: i64) -> Resul
     let last_read = load_last_read_id(db, owner_user_id).await?;
     let owner_actor = load_owner_actor_id(db, owner_user_id).await?;
     let owner_actor_trim = owner_actor.trim_end_matches('/').to_string();
-    let hidden = hidden::load_hidden_sets(db, owner_user_id).await?;
+    let mut hidden = hidden::load_hidden_sets(db, owner_user_id).await?;
+    hidden::expand_bsky_identities(db, &mut hidden).await;
     let subscriptions = hidden::load_post_subscriptions(db, owner_user_id).await?;
 
     let mut ids: Vec<String> = Vec::new();

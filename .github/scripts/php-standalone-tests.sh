@@ -52,6 +52,7 @@ php_tests=(
   api/bin/downrank-search-trends-smoke.php
   api/bin/bsky-notif-subject-backfill-smoke.php
   api/bin/remote-poll-smoke.php
+  api/bin/bsky-jetstream-media-smoke.php
   api/bin/media-warm-lock-smoke.php
   api/bin/media-magick-coder-smoke.php
   api/bin/net-guard-smoke.php
@@ -79,6 +80,7 @@ php_tests=(
   api/bin/moderation-alias-cache-smoke.php
   api/bin/notif-bsky-subject-hydrate-smoke.php
   api/bin/notif-grouped-schema-smoke.php
+  api/bin/notif-hidden-filter-smoke.php
   api/bin/notif-page-speed-smoke.php
   api/bin/notif-reply-content-smoke.php
   api/bin/notif-reply-preview-smoke.php

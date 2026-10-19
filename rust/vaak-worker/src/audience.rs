@@ -468,7 +468,8 @@ mod tests {
 /// Recheck cached notification cards against current viewer rules.
 pub async fn filter_notifications(db: &Client, owner: i64, items: &mut Vec<Value>) -> Result<()> {
     crate::home_hydrate_ranked::refresh_local_accounts(db, items).await?;
-    let hidden = crate::hidden::load_hidden_sets(db, owner).await?;
+    let mut hidden = crate::hidden::load_hidden_sets(db, owner).await?;
+    crate::hidden::expand_bsky_identities(db, &mut hidden).await;
     let mut statuses = Vec::new();
     for (idx, item) in items.iter().enumerate() {
         if let Some(st) = item.get("status").filter(|s| s.is_object()) {
