@@ -669,10 +669,52 @@ async fn active_owner_ids(
     Ok(ids)
 }
 
+/// How long the worker loop reuses an owner's mutes and blocks. Fan-out only
+/// decides which cached Home lists get a new row. Every page render loads
+/// fresh moderation and filters again, so a block still hides a post at once.
+const HIDDEN_TTL: Duration = Duration::from_secs(30);
+
+/// Per-owner moderation sets for fan-out. `ttl` zero loads every time.
+pub struct HiddenCache {
+    ttl: Duration,
+    entries: HashMap<i64, (Instant, hidden::HiddenSets)>,
+    empty: hidden::HiddenSets,
+}
+
+impl HiddenCache {
+    pub fn new(ttl: Duration) -> Self {
+        Self { ttl, entries: HashMap::new(), empty: hidden::HiddenSets::default() }
+    }
+
+    /// Same fail-open behavior as before: a failed load hides nothing and is
+    /// not cached, so the next job retries it.
+    async fn get(&mut self, db: &Client, owner: i64) -> &hidden::HiddenSets {
+        let fresh = self.entries.get(&owner).is_some_and(|(at, _)| at.elapsed() < self.ttl);
+        if !fresh {
+            match hidden::load_hidden_sets(db, owner).await {
+                Ok(sets) if !self.ttl.is_zero() => {
+                    self.entries.insert(owner, (Instant::now(), sets));
+                }
+                Ok(sets) => {
+                    self.empty = sets;
+                    return &self.empty;
+                }
+                Err(_) => {
+                    self.entries.remove(&owner);
+                    self.empty = hidden::HiddenSets::default();
+                    return &self.empty;
+                }
+            }
+        }
+        self.entries.get(&owner).map(|(_, sets)| sets).unwrap_or(&self.empty)
+    }
+}
+
 async fn process_home_followers(
     cfg: &Config,
     db: &Client,
     cache: &mut redis::aio::MultiplexedConnection,
+    hidden_cache: &mut HiddenCache,
     job: &FanoutJob,
 ) -> Result<FanoutStats> {
     let mut stats = FanoutStats::default();
@@ -690,8 +732,7 @@ async fn process_home_followers(
     }
     let do_rewarm = rewarm_max() > 0 && owners.len() <= rewarm_max();
     for owner in &owners {
-        let hidden_sets = hidden::load_hidden_sets(db, *owner).await.unwrap_or_default();
-        if hidden_sets.is_hidden(&actor) {
+        if hidden_cache.get(db, *owner).await.is_hidden(&actor) {
             stats.skipped += 1;
             continue;
         }
@@ -724,6 +765,7 @@ async fn process_home_bsky(
     cfg: &Config,
     db: &Client,
     cache: &mut redis::aio::MultiplexedConnection,
+    hidden_cache: &mut HiddenCache,
     job: &FanoutJob,
 ) -> Result<FanoutStats> {
     let mut stats = FanoutStats::default();
@@ -756,8 +798,7 @@ async fn process_home_bsky(
             stats.skipped += 1;
             continue;
         }
-        let hidden_sets = hidden::load_hidden_sets(db, *owner).await.unwrap_or_default();
-        if hidden_sets.is_hidden(&bsky_profile) {
+        if hidden_cache.get(db, *owner).await.is_hidden(&bsky_profile) {
             stats.skipped += 1;
             continue;
         }
@@ -788,6 +829,7 @@ async fn process_public_feed(
     cfg: &Config,
     db: &Client,
     cache: &mut redis::aio::MultiplexedConnection,
+    hidden_cache: &mut HiddenCache,
     job: &FanoutJob,
 ) -> Result<FanoutStats> {
     let mut stats = FanoutStats::default();
@@ -809,8 +851,7 @@ async fn process_public_feed(
         views.push("local");
     }
     for owner in &owners {
-        let hidden_sets = hidden::load_hidden_sets(db, *owner).await.unwrap_or_default();
-        if hidden_sets.is_hidden(&actor) {
+        if hidden_cache.get(db, *owner).await.is_hidden(&actor) {
             stats.skipped += 1;
             continue;
         }
@@ -898,11 +939,55 @@ pub async fn process_job(cfg: &Config, job: &FanoutJob) -> Result<FanoutStats> {
     }
     let db = crate::db::connect(&cfg.database_url).await?;
     let mut cache = redis_util::connect(&cfg.redis_url).await?;
+    let mut hidden_cache = HiddenCache::new(Duration::ZERO);
+    dispatch_job(cfg, &db, &mut cache, &mut hidden_cache, job).await
+}
+
+/// Postgres and Redis connections the worker loop keeps between jobs.
+/// A job error drops both, and the next job reconnects.
+struct LoopConnections {
+    db: Option<Client>,
+    cache: Option<redis::aio::MultiplexedConnection>,
+}
+
+impl LoopConnections {
+    async fn run(&mut self, cfg: &Config, hidden_cache: &mut HiddenCache, job: &FanoutJob) -> Result<FanoutStats> {
+        if !ingest_enabled() {
+            return Ok(FanoutStats {
+                skipped: 1,
+                ..Default::default()
+            });
+        }
+        if self.db.as_ref().is_none_or(Client::is_closed) {
+            self.db = Some(crate::db::connect(&cfg.database_url).await?);
+        }
+        if self.cache.is_none() {
+            self.cache = Some(redis_util::connect(&cfg.redis_url).await?);
+        }
+        let (Some(db), Some(cache)) = (self.db.as_ref(), self.cache.as_mut()) else {
+            unreachable!("connections were just opened");
+        };
+        let result = dispatch_job(cfg, db, cache, hidden_cache, job).await;
+        if result.is_err() {
+            self.db = None;
+            self.cache = None;
+        }
+        result
+    }
+}
+
+async fn dispatch_job(
+    cfg: &Config,
+    db: &Client,
+    cache: &mut redis::aio::MultiplexedConnection,
+    hidden_cache: &mut HiddenCache,
+    job: &FanoutJob,
+) -> Result<FanoutStats> {
     match job.op.as_str() {
-        "home_followers" => process_home_followers(cfg, &db, &mut cache, job).await,
-        "home_bsky" => process_home_bsky(cfg, &db, &mut cache, job).await,
-        "public_feed" => process_public_feed(cfg, &db, &mut cache, job).await,
-        "owner_status" => process_owner_status(cfg, &mut cache, job).await,
+        "home_followers" => process_home_followers(cfg, db, cache, hidden_cache, job).await,
+        "home_bsky" => process_home_bsky(cfg, db, cache, hidden_cache, job).await,
+        "public_feed" => process_public_feed(cfg, db, cache, hidden_cache, job).await,
+        "owner_status" => process_owner_status(cfg, cache, job).await,
         other => {
             tracing::warn!(op = %other, "unknown timeline fanout op");
             Ok(FanoutStats {
@@ -934,6 +1019,8 @@ pub async fn run_worker_loop(cfg: &Config) -> Result<()> {
     tracing::info!(queue = QUEUE_NAME, "timeline-fanout worker starting");
     let mut q = redis_util::connect(&cfg.redis_queue_url).await?;
     let mut last_depth_log = Instant::now() - Duration::from_secs(60);
+    let mut connections = LoopConnections { db: None, cache: None };
+    let mut hidden_cache = HiddenCache::new(HIDDEN_TTL);
     loop {
         if last_depth_log.elapsed() >= Duration::from_secs(60) {
             let depth = redis_util::queue_llen(&mut q, QUEUE_NAME).await.unwrap_or(0);
@@ -949,7 +1036,7 @@ pub async fn run_worker_loop(cfg: &Config) -> Result<()> {
                         continue;
                     }
                 };
-                match process_job(cfg, &job).await {
+                match connections.run(cfg, &mut hidden_cache, &job).await {
                     Ok(stats) => tracing::debug!(
                         op = %job.op,
                         touched = stats.touched_owners,
@@ -1017,6 +1104,37 @@ mod tests {
         let out = place_ranked_rows(&old, new_entry, PlaceMode::BySort, MAX_RANKED);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0]["k"], "event");
+    }
+
+    /// Needs a throwaway Postgres: VAAK_FANOUT_FIXTURE_DB=host=/tmp/... dbname=...
+    #[tokio::test]
+    async fn hidden_cache_reuses_sets_until_ttl() {
+        let Ok(url) = std::env::var("VAAK_FANOUT_FIXTURE_DB") else { return };
+        let db = crate::db::connect(&url).await.unwrap();
+        db.batch_execute(
+            "DROP TABLE IF EXISTS ap_mutes, ap_user_blocks, ap_blocks, ap_muted_words;
+             CREATE TABLE ap_mutes (owner_user_id BIGINT, actor_id TEXT);
+             CREATE TABLE ap_user_blocks (owner_user_id BIGINT, scope TEXT, value TEXT);
+             CREATE TABLE ap_blocks (scope TEXT, value TEXT, kind TEXT);
+             CREATE TABLE ap_muted_words (owner_user_id BIGINT, phrase TEXT);",
+        )
+        .await
+        .unwrap();
+        let actor = "https://blocked.example/users/a";
+        let mut cached = HiddenCache::new(Duration::from_secs(60));
+        let mut uncached = HiddenCache::new(Duration::ZERO);
+        assert!(!cached.get(&db, 7).await.is_hidden(actor));
+        db.execute("INSERT INTO ap_mutes VALUES (7, $1)", &[&actor]).await.unwrap();
+        assert!(!cached.get(&db, 7).await.is_hidden(actor), "within the TTL the cached sets are reused");
+        assert!(uncached.get(&db, 7).await.is_hidden(actor), "a zero TTL reloads every call");
+        assert!(!cached.get(&db, 8).await.is_hidden(actor), "sets are per owner");
+        cached.entries.get_mut(&7).unwrap().0 -= Duration::from_secs(61);
+        assert!(cached.get(&db, 7).await.is_hidden(actor), "an expired entry reloads");
+        db.batch_execute("DROP TABLE ap_mutes").await.unwrap();
+        cached.entries.clear();
+        assert!(!cached.get(&db, 7).await.is_hidden(actor), "a failed load hides nothing");
+        assert!(cached.entries.is_empty(), "a failed load is not cached");
+        db.batch_execute("DROP TABLE ap_user_blocks, ap_blocks, ap_muted_words").await.unwrap();
     }
 
     #[test]

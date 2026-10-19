@@ -54,6 +54,7 @@ php_tests=(
   api/bin/home-bsky-index-smoke.php
   api/bin/inbox-signature-smoke.php
   api/bin/inbox-ownership-smoke.php
+  api/bin/inbox-flood-smoke.php
   api/bin/library-deletion-smoke.php
   api/bin/library-folder-capture.php
   api/bin/library-page-capture.php
@@ -73,6 +74,7 @@ php_tests=(
   api/bin/profile-guest-actions-capture.php
   api/bin/library-own-cw-smoke.php
   api/bin/migration-folder-reference-smoke.php
+  api/bin/login-hardening-smoke.php
   api/bin/migration-php-reference-smoke.php
   api/bin/moderation-alias-cache-smoke.php
   api/bin/notif-bsky-subject-hydrate-smoke.php
@@ -105,6 +107,7 @@ php_tests=(
   api/bin/search-quote-preview-boundary-smoke.php
   api/bin/settings-behavior-smoke.php
   api/bin/settings-parity-smoke.php
+  api/bin/shadow-http-token-smoke.php
   api/bin/trends-response-cache-smoke.php
   api/bin/trending-open-ref-smoke.php
   api/bin/timeline-newer-counter-smoke.php
