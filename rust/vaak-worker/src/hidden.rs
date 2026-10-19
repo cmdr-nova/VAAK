@@ -18,6 +18,9 @@ pub struct HiddenSets {
     pub muted_phrases: Vec<String>,
     /// Populated only for selected canonical local outbox objects on ordinary surfaces.
     pub ordinary_owned_notes: HashMap<String, String>,
+    /// Bridgy Fed Bluesky handles (`user.host.ap.brid.gy`, lowercased) of
+    /// blocked fediverse actors. A block hides the bridged account too.
+    pub bridged_blocked_handles: HashSet<String>,
 }
 
 impl HiddenSets {
@@ -55,8 +58,90 @@ impl HiddenSets {
                 return true;
             }
         }
+        // A Bridgy Fed account is `user.host.ap.brid.gy` on Bluesky, so a
+        // blocked fediverse actor or domain also hides its bridged account.
+        if let Some(handle) = bridgy_ap_handle(actor) {
+            let fedi = &handle[..handle.len() - BRIDGY_AP_SUFFIX.len()];
+            if self.bridged_blocked_handles.contains(&handle) || self.host_blocked(fedi) {
+                return true;
+            }
+        }
         false
     }
+}
+
+const BRIDGY_AP_SUFFIX: &str = ".ap.brid.gy";
+
+/// Lowercased Bluesky handle when `actor` names a Bridgy Fed bridged
+/// fediverse account, as a bare handle or a bsky.app profile URL.
+fn bridgy_ap_handle(actor: &str) -> Option<String> {
+    let actor = actor.trim().trim_end_matches('/');
+    let handle = match actor.get(..25) {
+        Some(prefix) if prefix.eq_ignore_ascii_case("https://bsky.app/profile/") => raw_percent_decode(&actor[25..]),
+        _ => actor.to_owned(),
+    };
+    let handle = handle.trim_start_matches('@').to_ascii_lowercase();
+    (handle.len() > BRIDGY_AP_SUFFIX.len() && handle.ends_with(BRIDGY_AP_SUFFIX) && !handle.contains(['/', '@', ':'])).then_some(handle)
+}
+
+/// Bridgy Fed handles for `user@host`: underscores become hyphens on Bluesky,
+/// so both spellings are kept.
+fn bridgy_handles_for(username: &str, host: &str) -> Vec<String> {
+    let username = username.trim().trim_start_matches('@').to_ascii_lowercase();
+    let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    if username.is_empty() || host.is_empty() || username.contains(['/', '@', ':']) || host.contains(['/', '@', ':']) {
+        return Vec::new();
+    }
+    let mut out = vec![format!("{username}.{host}{BRIDGY_AP_SUFFIX}")];
+    if username.contains('_') {
+        out.push(format!("{}.{host}{BRIDGY_AP_SUFFIX}", username.replace('_', "-")));
+    }
+    out
+}
+
+/// `user@host` named by a blocked actor value, from the value itself
+/// (`@user@host`, `/users/user`, `/@user`) when no cached actor row exists.
+fn fedi_account_of(actor: &str) -> Option<(String, String)> {
+    static ACCT_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static PATH_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    if let Some(c) = ACCT_RE.get_or_init(|| regex::Regex::new(r"^@?([^@/\s]+)@([^@/\s]+)$").unwrap()).captures(actor.trim()) {
+        return Some((c[1].to_owned(), c[2].to_owned()));
+    }
+    let c = PATH_RE.get_or_init(|| regex::Regex::new(r"(?i)^https://([^/]+)/(?:users/|@)([^/?#]+)$").unwrap()).captures(actor.trim().trim_end_matches('/'))?;
+    let (decoded, _) = path_segment_forms(&c[2]);
+    (!decoded.is_empty() && !decoded.bytes().all(|b| b.is_ascii_digit())).then(|| (decoded, c[1].to_owned()))
+}
+
+/// Fill `bridged_blocked_handles` from blocked fediverse actors, using the
+/// cached actor's username and host (Wafrn, Misskey and others don't put
+/// the username in the URL).
+async fn load_bridged_blocks(db: &Client, blocked: &[String], sets: &mut HiddenSets) -> Result<()> {
+    let actors: Vec<String> = blocked.iter().filter(|a| a.starts_with("https://") && !a.contains(".brid.gy/")).cloned().collect();
+    let mut cached = HashSet::new();
+    if !actors.is_empty() {
+        for row in db
+            .query("SELECT actor_id, COALESCE(username, ''), COALESCE(host, '') FROM remote_actors WHERE actor_id = ANY($1)", &[&actors])
+            .await
+            .context("select blocked remote_actors")?
+        {
+            let actor: String = row.get(0);
+            let (username, host): (String, String) = (row.get(1), row.get(2));
+            let handles = bridgy_handles_for(&username, &host);
+            if !handles.is_empty() {
+                cached.insert(actor);
+                sets.bridged_blocked_handles.extend(handles);
+            }
+        }
+    }
+    for actor in blocked {
+        if cached.contains(actor) {
+            continue;
+        }
+        if let Some((username, host)) = fedi_account_of(actor) {
+            sets.bridged_blocked_handles.extend(bridgy_handles_for(&username, &host));
+        }
+    }
+    Ok(())
 }
 
 /// Apply viewer moderation to already-hydrated cards as well as ranked IDs.
@@ -346,6 +431,7 @@ fn insert_actor_aliases(set: &mut HashSet<String>, actor: &str) {
 
 pub async fn load_hidden_sets(db: &Client, owner_user_id: i64) -> Result<HiddenSets> {
     let mut sets = HiddenSets::default();
+    let mut blocked_actors = Vec::new();
 
     let mute_rows = db
         .query(
@@ -377,6 +463,7 @@ pub async fn load_hidden_sets(db: &Client, owner_user_id: i64) -> Result<HiddenS
                 let a = norm_actor(&value);
                 if !a.is_empty() {
                     insert_actor_aliases(&mut sets.user_blocked_actors, &a);
+                    blocked_actors.push(a);
                 }
             }
             "domain" => {
@@ -403,7 +490,7 @@ pub async fn load_hidden_sets(db: &Client, owner_user_id: i64) -> Result<HiddenS
                 if !a.is_empty() {
                     if kind == "mute" {
                         for alias in actor_aliases(&a) { sets.instance_muted_actors.insert(alias.to_ascii_lowercase()); }
-                    } else { insert_actor_aliases(&mut sets.instance_blocked_actors, &a); }
+                    } else { insert_actor_aliases(&mut sets.instance_blocked_actors, &a); blocked_actors.push(a); }
                 }
             }
             "domain" => {
@@ -422,6 +509,9 @@ pub async fn load_hidden_sets(db: &Client, owner_user_id: i64) -> Result<HiddenS
             let phrase = normalize_muted_text(&phrase);
             if !phrase.is_empty() { sets.muted_phrases.push(phrase); }
         }
+    }
+    if let Err(error) = load_bridged_blocks(db, &blocked_actors, &mut sets).await {
+        tracing::warn!(%error, "bridged block handles skipped");
     }
     Ok(sets)
 }
@@ -1115,3 +1205,59 @@ mod canonical_policy_differential {
 #[cfg(test)]
 #[path="search_batch_hidden_fixture.rs"]
 pub(crate) mod batch_differential;
+
+#[cfg(test)]
+mod bridgy_block_tests {
+    use super::*;
+
+    #[test]
+    fn blocked_fediverse_actor_hides_its_bridgy_account() {
+        let mut hidden = HiddenSets::default();
+        hidden.bridged_blocked_handles.extend(bridgy_handles_for("Cool_Cat", "app.wafrn.net"));
+        for actor in [
+            "https://bsky.app/profile/cool-cat.app.wafrn.net.ap.brid.gy",
+            "https://bsky.app/profile/cool_cat.app.wafrn.net.ap.brid.gy",
+            "cool-cat.app.wafrn.net.ap.brid.gy",
+            "@Cool-Cat.app.wafrn.net.ap.brid.gy",
+        ] {
+            assert!(hidden.is_hidden(actor), "{actor}");
+        }
+        assert!(!hidden.is_hidden("https://bsky.app/profile/other.app.wafrn.net.ap.brid.gy"));
+        assert!(!hidden.is_hidden("https://bsky.app/profile/cool-cat.bsky.social"));
+    }
+
+    #[test]
+    fn blocked_domain_hides_bridgy_accounts_from_it() {
+        for (personal, server) in [(true, false), (false, true)] {
+            let mut hidden = HiddenSets::default();
+            if personal { hidden.user_blocked_domains.insert("bad.example".into()); }
+            if server { hidden.instance_blocked_domains.insert("bad.example".into()); }
+            assert!(hidden.is_hidden("https://bsky.app/profile/alice.bad.example.ap.brid.gy"));
+            assert!(hidden.is_hidden("https://bsky.app/profile/alice.social.bad.example.ap.brid.gy"));
+            assert!(!hidden.is_hidden("https://bsky.app/profile/alice.notbad.example.ap.brid.gy"));
+            assert!(!hidden.is_hidden("https://bsky.app/profile/alice.bad.example"));
+        }
+    }
+
+    #[test]
+    fn bridgy_status_card_is_hidden_by_account_handle() {
+        let mut hidden = HiddenSets::default();
+        hidden.bridged_blocked_handles.extend(bridgy_handles_for("alice", "mastodon.example"));
+        let status = serde_json::json!({
+            "uri": "at://did:plc:bridged/app.bsky.feed.post/1",
+            "content": "hi",
+            "account": {"id": "did:plc:bridged", "uri": "https://bsky.app/profile/alice.mastodon.example.ap.brid.gy"},
+        });
+        assert!(status_hidden(&status, &hidden));
+    }
+
+    #[test]
+    fn account_comes_from_acct_or_profile_path() {
+        assert_eq!(fedi_account_of("@alice@mastodon.example"), Some(("alice".into(), "mastodon.example".into())));
+        assert_eq!(fedi_account_of("https://mastodon.example/users/alice"), Some(("alice".into(), "mastodon.example".into())));
+        assert_eq!(fedi_account_of("https://mastodon.example/@alice"), Some(("alice".into(), "mastodon.example".into())));
+        assert_eq!(fedi_account_of("https://misskey.example/users/9abc"), Some(("9abc".into(), "misskey.example".into())));
+        assert_eq!(fedi_account_of("https://misskey.example/users/12345"), None);
+        assert_eq!(fedi_account_of("https://app.wafrn.net/fediverse/blog/alice"), None);
+    }
+}

@@ -344,6 +344,69 @@ pub async fn filter_statuses(db: &Client, statuses: &mut Vec<Value>) -> Result<(
     Ok(())
 }
 
+/// Bridgy Fed serves a bridged Bluesky post to the fediverse as
+/// `https://bsky.brid.gy/convert/ap/at://{did}/app.bsky.feed.post/{rkey}`.
+pub fn bridgy_convert_at_uri(object: &str) -> Option<String> {
+    let caps = bridgy_convert().captures(object.trim())?;
+    let did = caps[1].replace("%3A", ":").replace("%3a", ":");
+    Some(format!("at://{did}/app.bsky.feed.post/{}", &caps[2]))
+}
+
+/// Indexes of Bridgy Fed copies whose post is already in `ids` natively:
+/// the Bluesky post itself, or a fediverse note it links to
+/// (`bsky_post_links`, e.g. a Wafrn dual-publish). The native copy stays,
+/// like PHP `admin_is_bridgy_convert_object_id`; a repeated copy keeps the first.
+pub fn bridgy_twin_drops(ids: &[String], links: &HashMap<String, String>) -> HashSet<usize> {
+    let native: HashSet<String> = ids
+        .iter()
+        .filter(|id| bridgy_convert_at_uri(id).is_none())
+        .map(|id| post_identity(id))
+        .filter(|id| !id.is_empty())
+        .collect();
+    let mut seen = HashSet::new();
+    let mut drop = HashSet::new();
+    for (index, id) in ids.iter().enumerate() {
+        let Some(at) = bridgy_convert_at_uri(id) else {
+            continue;
+        };
+        let linked = links
+            .get(&at)
+            .map(|fedi| post_identity(fedi))
+            .is_some_and(|fedi| native.contains(&fedi));
+        if native.contains(&at) || linked || !seen.insert(at) {
+            drop.insert(index);
+        }
+    }
+    drop
+}
+
+/// `bsky_post_links` fediverse ids for the Bluesky posts behind Bridgy copies.
+pub async fn bridgy_links(db: &Client, ids: &[String]) -> Result<HashMap<String, String>> {
+    let uris: Vec<String> = ids
+        .iter()
+        .filter_map(|id| bridgy_convert_at_uri(id))
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    lookup_links(db, &uris).await
+}
+
+/// Drop Bridgy Fed copies of posts already on the page natively.
+pub async fn filter_bridgy_twins(db: &Client, statuses: &mut Vec<Value>) -> Result<()> {
+    let ids: Vec<String> = statuses.iter().map(|status| json_str(status, "uri")).collect();
+    if !ids.iter().any(|id| bridgy_convert_at_uri(id).is_some()) {
+        return Ok(());
+    }
+    let links = bridgy_links(db, &ids).await.unwrap_or_default();
+    let drop = bridgy_twin_drops(&ids, &links);
+    let mut index = 0;
+    statuses.retain(|_| {
+        index += 1;
+        !drop.contains(&(index - 1))
+    });
+    Ok(())
+}
+
 /// Paint-only. Sets `vaak_ask` for a linked Wafrn Bluesky ask and leaves
 /// `content` alone, so Mastodon JSON from `view_hydrate` stays unchanged.
 pub async fn stamp_text_asks(db: &Client, statuses: &mut [Value]) -> Result<()> {
@@ -774,6 +837,16 @@ fn text_ask() -> &'static regex::Regex {
     })
 }
 
+fn bridgy_convert() -> &'static regex::Regex {
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        regex::Regex::new(
+            r"(?i)^https?://bsky\.brid\.gy/convert/ap/at(?::|%3A)(?://|%2F%2F)(did(?::|%3A)[A-Za-z0-9._:%-]+?)(?:/|%2F)app\.bsky\.feed\.post(?:/|%2F)([A-Za-z0-9]+)/?(?:[?#].*)?$",
+        )
+        .unwrap()
+    })
+}
+
 fn did_pattern() -> &'static regex::Regex {
     static RE: OnceLock<regex::Regex> = OnceLock::new();
     RE.get_or_init(|| regex::Regex::new(r"(did:(?:plc|web):[A-Za-z0-9._:%-]+)").unwrap())
@@ -810,5 +883,44 @@ mod tests {
             let expect = case.get("expect").cloned().unwrap_or(Value::Null);
             assert_eq!(output, expect, "{id}");
         }
+    }
+
+    #[test]
+    fn bridgy_convert_ids_map_to_the_bluesky_post() {
+        let at = "at://did:plc:abc123/app.bsky.feed.post/3kxyz";
+        for id in [
+            "https://bsky.brid.gy/convert/ap/at://did:plc:abc123/app.bsky.feed.post/3kxyz",
+            "https://bsky.brid.gy/convert/ap/at://did:plc:abc123/app.bsky.feed.post/3kxyz/",
+            "https://bsky.brid.gy/convert/ap/at%3A%2F%2Fdid%3Aplc%3Aabc123%2Fapp.bsky.feed.post%2F3kxyz",
+        ] {
+            assert_eq!(bridgy_convert_at_uri(id).as_deref(), Some(at), "{id}");
+        }
+        for id in [
+            at,
+            "https://bsky.brid.gy/ap/did:plc:abc123",
+            "https://fed.brid.gy/convert/ap/https://example.com/post",
+            "https://example.com/notes/1",
+        ] {
+            assert!(bridgy_convert_at_uri(id).is_none(), "{id}");
+        }
+    }
+
+    #[test]
+    fn bridgy_twins_collapse_onto_the_native_copy() {
+        let at = "at://did:plc:abc123/app.bsky.feed.post/3kxyz".to_string();
+        let convert =
+            "https://bsky.brid.gy/convert/ap/at://did:plc:abc123/app.bsky.feed.post/3kxyz".to_string();
+        let wafrn = "https://app.wafrn.net/fediverse/post/42".to_string();
+        let links = HashMap::from([(at.clone(), wafrn.clone())]);
+        // Native Bluesky copy on the page (connected account follows the DID).
+        assert_eq!(bridgy_twin_drops(&[convert.clone(), at.clone()], &links), HashSet::from([0]));
+        // Native fediverse note the Bluesky post links to (Wafrn dual-publish).
+        assert_eq!(bridgy_twin_drops(&[wafrn.clone(), convert.clone()], &links), HashSet::from([1]));
+        // Wafrn's activity-path spelling still matches through post_identity.
+        let activity = "https://app.wafrn.net/fediverse/activity/post/42".to_string();
+        assert_eq!(bridgy_twin_drops(&[convert.clone(), activity], &links), HashSet::from([0]));
+        // Only the Bridgy copy is on the page: it stays, a repeat does not.
+        assert_eq!(bridgy_twin_drops(&[convert.clone(), convert.clone()], &HashMap::new()), HashSet::from([1]));
+        assert!(bridgy_twin_drops(&[convert, wafrn], &HashMap::new()).is_empty());
     }
 }

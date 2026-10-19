@@ -367,6 +367,7 @@ async fn tl_html_older(
         return Ok(None);
     }
     let _ = crate::wafrn_crosspost::filter_statuses(&db, &mut statuses).await;
+    let _ = crate::wafrn_crosspost::filter_bridgy_twins(&db, &mut statuses).await;
     let _ = crate::wafrn_crosspost::stamp_text_asks(&db, &mut statuses).await;
     let viewer_actor = owner_actor;
     let units = plan_feed_paint_units(&statuses, &std::collections::HashMap::new());
