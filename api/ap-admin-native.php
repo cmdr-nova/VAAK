@@ -20,12 +20,14 @@ function ap_admin_native_reply(array $reply,array $request): ?string
     $keys=array_keys($reply);sort($keys);$expected=['protocol_version','ok','request_binding','source_count','rows','html'];sort($expected);
     if($keys!==$expected || $reply['protocol_version']!==1 || $reply['ok']!==true || !is_string($reply['html'])
         || strlen($reply['html'])>2*1024*1024 || !is_int($reply['source_count']) || !is_array($reply['rows'])
-        || !array_is_list($reply['rows']) || count($reply['rows'])!==$reply['source_count'] || count($reply['rows'])>match($request['view']){'users'=>20,'blocks'=>1000,default=>100}) return null;
+        || !array_is_list($reply['rows']) || count($reply['rows'])!==$reply['source_count'] || count($reply['rows'])>match($request['view']){'users'=>20,'blocks'=>1000,'settings_lists'=>3000,default=>100}) return null;
     $binding=[];foreach(['owner_id','view','mode','offset','approvals_enabled'] as $key)$binding[$key]=$request[$key];
     if($request['view']==='users')$binding['search']=$request['search'];
+    if($request['view']==='settings_lists')$binding['viewer_admin']=$request['viewer_admin'];
     if(!is_array($reply['request_binding']))return null;
     $bindingKeys=array_keys($reply['request_binding']);sort($bindingKeys);$requiredBinding=array_keys($binding);sort($requiredBinding);if($bindingKeys!==$requiredBinding)return null;
     foreach($binding as $key=>$value)if($reply['request_binding'][$key]!==$value)return null;
+    if($request['view']==='settings_lists')return ap_settings_native_rows_valid($reply['rows'])?$reply['html']:null;
     $required=match($request['view']){'users'=>['id','username','email','actor_key','actor_id','is_admin','created_at','updated_at','disabled_at','profile_name','icon_url'],
         'invites'=>['id','code','created_at','used_at','note'],'relays'=>['id','inbox_url','state','follow_activity_id','created_at','updated_at'],'policies'=>['id','text'],'blocks'=>['id','scope','value','kind','reason','created_at'],
         default=>['id','username','email','status','created_at','decided_at']};sort($required);
@@ -37,6 +39,53 @@ function ap_admin_native_reply(array $reply,array $request): ?string
         if($request['view']==='approvals'&&!in_array($row['status'],['pending','approved','rejected'],true))return null;
     }
     return $reply['html'];
+}
+/** Personal list rows: deprioritized accounts carry no id; muted words and personal blocks do. */
+function ap_settings_native_rows_valid(array $rows): bool
+{
+    $required=['list','id','value','note','scope','kind','created_at'];sort($required);
+    foreach($rows as $row){
+        if(!is_array($row))return false;$keys=array_keys($row);sort($keys);if($keys!==$required)return false;
+        if(!in_array($row['list'],['deprioritized','muted_words','user_blocks'],true) || !is_string($row['value']) || !is_string($row['created_at']))return false;
+        if($row['list']==='deprioritized'?$row['id']!==null:(!is_int($row['id']) || $row['id']<1))return false;
+        foreach(['note','scope','kind'] as $key)if($row[$key]!==null&&!is_string($row[$key]))return false;
+        if(($row['list']==='user_blocks')!==(is_string($row['scope'])&&is_string($row['kind'])))return false;
+    }
+    return true;
+}
+function ap_admin_native_post(string $url,array $request): ?string
+{
+    try{
+        $payload=json_encode($request,JSON_THROW_ON_ERROR);
+        $curl=curl_init($url);if($curl===false)return null;$body='';
+        curl_setopt_array($curl,[CURLOPT_POST=>true,CURLOPT_POSTFIELDS=>$payload,CURLOPT_RETURNTRANSFER=>false,
+            CURLOPT_CONNECTTIMEOUT_MS=>250,CURLOPT_TIMEOUT_MS=>2000,CURLOPT_FOLLOWLOCATION=>false,
+            CURLOPT_WRITEFUNCTION=>static function($handle,string $chunk)use(&$body):int{if(strlen($body)+strlen($chunk)>2*1024*1024)return 0;$body.=$chunk;return strlen($chunk);},
+            CURLOPT_HTTPHEADER=>['Content-Type: application/json','X-Vaak-Admin-Token: '.(string)getenv('VAAK_ADMIN_READ_SECRET')]]);
+        $success=curl_exec($curl);$status=(int)curl_getinfo($curl,CURLINFO_RESPONSE_CODE);curl_close($curl);
+        if($success!==true || $status!==200 || !is_string($body) || strlen($body)>2*1024*1024)return null;
+        $reply=json_decode($body,true,512,JSON_THROW_ON_ERROR);if(!is_array($reply))return null;
+        return ap_admin_native_reply($reply,$request);
+    }catch(Throwable $e){return null;}
+}
+/**
+ * Settings personal lists (Deprioritized, Muted words, Your blocks) for the signed-in
+ * account. Open to every active account; the worker refuses when the account is
+ * disabled or its admin role no longer matches the one this page shows.
+ */
+function ap_settings_native_lists_body(bool $viewerAdmin): ?string
+{
+    if(!ap_admin_native_enabled() || getenv('VAAK_SETTINGS_LISTS_NATIVE')!=='1')return null;
+    $user=ap_auth_current_user();$owner=(int)($user['id']??0);
+    if($owner<1 || !function_exists('admin_owner_user_id') || admin_owner_user_id()!==$owner || ap_auth_is_admin($user)!==$viewerAdmin)return null;
+    $url=(string)(getenv('VAAK_ADMIN_READ_URL')?:'http://127.0.0.1:8787/internal/admin/read');if(!ap_admin_native_url_allowed($url))return null;
+    $request=['protocol_version'=>1,'owner_id'=>$owner,'csrf'=>ap_auth_csrf_token(),'view'=>'settings_lists',
+        'mode'=>isset($_GET['partial'])&& (string)$_GET['partial']==='1'?'shell':'full','offset'=>0,
+        'approvals_enabled'=>ap_registration_approvals_enabled(),'now'=>time(),'php_timezone'=>date_default_timezone_get(),'viewer_admin'=>$viewerAdmin];
+    $html=ap_admin_native_post($url,$request);if($html===null)return null;
+    try{$current=ap_auth_current_user();}catch(Throwable $e){return null;}
+    if((int)($current['id']??0)!==$owner || ap_auth_is_admin($current)!==$viewerAdmin)return null;
+    return $html;
 }
 function ap_admin_native_read_body(string $view,int $offset=0): ?string
 {
@@ -56,19 +105,10 @@ function ap_admin_native_read_body(string $view,int $offset=0): ?string
         $request['search']=trim((string)($_GET['q']??$_POST['users_q']??''));
         if(strlen($request['search'])>4096 || $request['offset']>PHP_INT_MAX-100)return null;
     }
+    $html=ap_admin_native_post($url,$request);if($html===null)return null;
     try{
-        $payload=json_encode($request,JSON_THROW_ON_ERROR);
-        $curl=curl_init($url);if($curl===false)return null;$body='';
-        curl_setopt_array($curl,[CURLOPT_POST=>true,CURLOPT_POSTFIELDS=>$payload,CURLOPT_RETURNTRANSFER=>false,
-            CURLOPT_CONNECTTIMEOUT_MS=>250,CURLOPT_TIMEOUT_MS=>2000,CURLOPT_FOLLOWLOCATION=>false,
-            CURLOPT_WRITEFUNCTION=>static function($handle,string $chunk)use(&$body):int{if(strlen($body)+strlen($chunk)>2*1024*1024)return 0;$body.=$chunk;return strlen($chunk);},
-            CURLOPT_HTTPHEADER=>['Content-Type: application/json','X-Vaak-Admin-Token: '.(string)getenv('VAAK_ADMIN_READ_SECRET')]]);
-        $success=curl_exec($curl);$status=(int)curl_getinfo($curl,CURLINFO_RESPONSE_CODE);curl_close($curl);
-        if($success!==true || $status!==200 || !is_string($body) || strlen($body)>2*1024*1024)return null;
-        $reply=json_decode($body,true,512,JSON_THROW_ON_ERROR);if(!is_array($reply))return null;
-        $html=ap_admin_native_reply($reply,$request);if($html===null)return null;
         $current=ap_auth_current_user();
         if((int)($current['id']??0)!==$owner || !ap_registration_current_admin(ap_db()))return null;
-        return $html;
     }catch(Throwable $e){return null;}
+    return $html;
 }

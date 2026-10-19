@@ -32211,6 +32211,7 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
         <?php endif; ?>
         </details>
 
+        <?php if (($settingsNativeLists = ap_settings_native_lists_body(!empty($vaakIsAdmin))) !== null): ?><?= $settingsNativeLists ?><?php else: ?>
         <details class="profile-list-section"><summary style="cursor:pointer;font-size:1rem;font-weight:650;margin:1.25rem 0 .5rem">Deprioritized on Home</summary>
         <div class="meta" style="margin-bottom:.75rem">
           Soft-rank these accounts lower on <b>Home</b> only (⋯ → Deprioritize). They still appear on Federated, Local, and notifications. Mute/block still fully hide.
@@ -32334,6 +32335,7 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
           <?php endforeach; ?>
         <?php endif; ?>
         </details>
+        <?php endif; ?>
         <script>
           (function () {
             const input = document.getElementById('profile-list-search');
