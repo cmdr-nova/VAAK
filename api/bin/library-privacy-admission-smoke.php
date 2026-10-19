@@ -8,7 +8,7 @@ require __DIR__ . '/migration-reference-functions.php';
 $api = dirname(__DIR__);
 if (!extension_loaded('mbstring')) throw new RuntimeException('This actual Unicode policy fixture requires mbstring (no polyfill).');
 $db = new PDO('sqlite::memory:', null, null, [PDO::ATTR_ERRMODE=>PDO::ERRMODE_EXCEPTION, PDO::ATTR_DEFAULT_FETCH_MODE=>PDO::FETCH_ASSOC]);
-$db->exec("CREATE TABLE ap_users(id INTEGER,actor_id TEXT);
+$db->exec("CREATE TABLE ap_users(id INTEGER,actor_id TEXT,disabled_at TEXT);
 CREATE TABLE events(id INTEGER,object_id TEXT,type TEXT,action_taken TEXT,visibility TEXT,actor_id TEXT);
 CREATE TABLE outbox_notes(id TEXT,visibility TEXT,to_json TEXT,cc_json TEXT);
 CREATE TABLE mentions(id INTEGER,owner_user_id INTEGER,deleted_at TEXT,activity_type TEXT,object_id TEXT);
@@ -20,7 +20,7 @@ CREATE TABLE fixture_words(owner_user_id INTEGER,phrase TEXT);
 CREATE TABLE bsky_hide_dids(owner_user_id INTEGER,did TEXT);
 CREATE TABLE rss_feeds(id INTEGER,owner_user_id INTEGER,title TEXT,favicon_url TEXT,site_url TEXT,feed_url TEXT);
 CREATE TABLE rss_items(id INTEGER,feed_id INTEGER,title TEXT);
-INSERT INTO ap_users VALUES(201,'https://mkultra.monster/users/viewer'),(202,'https://mkultra.monster/users/other');
+INSERT INTO ap_users(id,actor_id) VALUES(201,'https://mkultra.monster/users/viewer'),(202,'https://mkultra.monster/users/other');
 INSERT INTO events VALUES(1,'https://remote.test/private','Create','log','private','https://remote.test/users/author');
 INSERT INTO following VALUES('https://mkultra.monster/users/viewer','https://remote.test/users/author');
 INSERT INTO outbox_notes VALUES('https://mkultra.monster/users/author/notes/direct','direct','[\"https://mkultra.monster/users/viewer\"]','[]');
@@ -36,7 +36,7 @@ function ap_mutes_set_cached(int $owner): array { $q=ap_db()->prepare('SELECT ac
 function ap_blocks_actor_id_set(int $owner): array { $q=ap_db()->prepare("SELECT value FROM fixture_blocks WHERE owner_user_id=? AND scope='actor'");$q->execute([$owner]);return array_fill_keys($q->fetchAll(PDO::FETCH_COLUMN),true); }
 function ap_user_blocks_list_cached(int $owner): array { $q=ap_db()->prepare('SELECT * FROM fixture_blocks WHERE owner_user_id=?');$q->execute([$owner]);return $q->fetchAll(); }
 function ap_muted_words_phrases_cached(int $owner): array { $q=ap_db()->prepare('SELECT phrase FROM fixture_words WHERE owner_user_id=?');$q->execute([$owner]);return $q->fetchAll(PDO::FETCH_COLUMN); }
-reference_load($api.'/ap-db.php',['ap_db_owner_actor_id_for_user_id','ap_moderation_syntactic_refs','ap_moderation_path_segment_forms','ap_is_muted_actor','ap_user_is_blocked','ap_muted_words_match','ap_muted_words_normalize_haystack']);
+reference_load($api.'/ap-db.php',['ap_db_owner_actor_id_for_user_id','ap_ordinary_note_owned','ap_ordinary_ask_questions_muted','ap_visibility_ordinary_status_hidden','ap_moderation_syntactic_refs','ap_moderation_path_segment_forms','ap_is_muted_actor','ap_user_is_blocked','ap_muted_words_match','ap_muted_words_normalize_haystack']);
 reference_load($api.'/ap-visibility.php',['ap_visibility_actor_hidden','ap_visibility_status_hidden','ap_visibility_status_audience_allowed']);
 reference_load($api.'/ap-bsky.php',['ap_bsky_hide_did_set','ap_bsky_at_uri_from_any_url','ap_bsky_post_as_quote_preview','ap_bsky_media_items_from_embeds','ap_bsky_post_is_sensitive','ap_bsky_sensitive_label_vals','ap_bsky_post_label_vals','ap_bsky_compact_label_list']);
 reference_load($api.'/ap-bsky-urls.php',['ap_bsky_https_url_from_at_uri','ap_bsky_normalize_web_url']);
