@@ -14,7 +14,7 @@ use std::sync::OnceLock;
 use tokio_postgres::Client;
 
 #[path="search_collect_bsky.rs"]
-mod bsky;
+pub(crate) mod bsky;
 #[path="search_collect_downrank.rs"]
 mod downrank;
 
@@ -132,7 +132,7 @@ pub(crate) async fn collect(cfg:&crate::config::Config,headers:HeaderMap,bytes:B
     let warm=crate::library::bridge::native_warm(cfg,None);
     let deps=crate::direct_preview::PreviewDependencies::production();
     let result:Result<Vec<u8>>=async{
-        let db=crate::db::connect(&cfg.database_url).await?;
+        let db=crate::db::reused(&cfg.database_url).await?;
         let reply=run(&db,Some(cfg),Some(&warm),deps.dns,&request,&cache_dir()).await?;
         Ok(serde_json::to_vec(&reply)?)
     }.await;
@@ -177,7 +177,7 @@ pub(crate) async fn resolve(cfg:&crate::config::Config,headers:HeaderMap,bytes:B
     let Some(secret)=enabled_secret() else{return StatusCode::NOT_FOUND.into_response()};
     if !authorized(&headers,&secret){return StatusCode::UNAUTHORIZED.into_response()}
     let request=match serde_json::from_slice::<ResolveRequest>(&bytes){Ok(r) if r.protocol_version==1&&r.url.len()<=4096=>r,_=>return no_store(StatusCode::BAD_REQUEST.into_response())};
-    let result=async{let db=crate::db::connect(&cfg.database_url).await?;resolve_cached(&db,&request.url).await}.await;
+    let result=async{let db=crate::db::reused(&cfg.database_url).await?;resolve_cached(&db,&request.url).await}.await;
     no_store(match result{
         Ok(object)=>axum::Json(json!({"protocol_version":1,"object":object})).into_response(),
         Err(error)=>{tracing::debug!(reason=%format!("{error:#}"),"Search resolve PHP fallback");fallback()}
@@ -309,7 +309,9 @@ async fn statuses(db:&Client,owner:&Owner,raw_q:&str,cfg:Option<&crate::config::
                 }
             }
             "mention" if hit.source_pk>0=>{
-                if mention_rows.contains_key(&hit.source_pk){bail!("PHP fallback: Search mention hit")}
+                if let Some(row)=mention_rows.get(&hit.source_pk){
+                    if let Some(st)=projector.project(crate::profile_materialize::SearchHit::Mention(row),warm,dns).await?{push(st,&mut window,&mut built);}
+                }
             }
             "event" if hit.source_pk>0=>{
                 if let Some(row)=event_rows.get(&hit.source_pk){
@@ -606,7 +608,7 @@ mod oracle{
     async fn php_oracle_dump()->Result<()>{
         let url=std::env::var("SEARCH_ORACLE_DATABASE_URL")?;let redis=std::env::var("SEARCH_ORACLE_REDIS")?;
         let cases:Vec<Value>=serde_json::from_str(&std::env::var("SEARCH_ORACLE_CASES")?)?;
-        let cfg=crate::config::Config{database_url:url.clone(),redis_url:redis.clone(),redis_queue_url:redis,jetstream_state:Default::default(),default_owner_id:1,bsky_public_api:String::new(),notif_cache_dir:Default::default(),phyrian_mutation_token:None,phyrian_bridge_url:String::new(),phyrian_bridge_secret:None};
+        let cfg=crate::config::Config{database_url:url.clone(),redis_url:redis.clone(),redis_queue_url:std::env::var("SEARCH_ORACLE_REDIS_QUEUE").unwrap_or_else(|_|redis.clone()),jetstream_state:Default::default(),default_owner_id:1,bsky_public_api:String::new(),notif_cache_dir:Default::default(),phyrian_mutation_token:None,phyrian_bridge_url:String::new(),phyrian_bridge_secret:None};
         let warm=crate::profile_enrichment::WarmContext::new(cfg.clone(),Arc::new(NoWorkers));
         let db=crate::db::connect(&url).await?;
         let dir=std::env::temp_dir().join("vaak-search-cache-native-oracle");std::fs::create_dir_all(&dir)?;

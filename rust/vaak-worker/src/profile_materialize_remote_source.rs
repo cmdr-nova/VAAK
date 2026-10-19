@@ -103,7 +103,7 @@ async fn normalized_event(projector:&mut Projector<'_>,row:&Value)->Result<Optio
 }
 pub(crate) async fn materialize_remote_ap(db:&Client,session:&dyn RemoteApSourceSession,selected:SelectedRemoteApPage)->Result<MaterializedRemoteApPage>{
  selected.require_current(db,session).await?;
- let mut projector=Projector{db,owner:session.owner_id(),dependencies:vec![],static_counts:vec![],effects:vec![],source_index:0,account_memo:Default::default(),bare_memo:Default::default(),cache:vec![],graphs:vec![],path:vec![]};let mut sources=vec![];
+ let mut projector=Projector{db,php_web_urls:false,owner:session.owner_id(),dependencies:vec![],static_counts:vec![],effects:vec![],source_index:0,account_memo:Default::default(),bare_memo:Default::default(),cache:vec![],graphs:vec![],path:vec![]};let mut sources=vec![];
  for(index,row)in selected.rows(){projector.source_index=*index;selected.require_source_row(*index,row)?;
   let(status,branch)=if private_stub(row){(None,RemoteApEventBranch::PrivateStub)}else{
    let status=normalized_event(&mut projector,row).await?;

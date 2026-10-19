@@ -112,8 +112,11 @@ async fn render_request_with_warm_inner(database_url:&str,secret:Option<&str>,he
     if cfg.is_some()&&(!batch.accounts.is_empty()||!batch.hashtags.is_empty())&&batch.component_collector.is_none(){return (StatusCode::UNPROCESSABLE_ENTITY,axum::Json(json!({"fallback":true}))).into_response()}
     let warm=warm.or_else(||cfg.map(|cfg|crate::library::bridge::native_warm(cfg,batch.bsky_budget_deadline)));
     let result: anyhow::Result<Vec<u8>>=async{
-        let db=crate::db::connect(database_url).await?;
-        let reply=paint_with_warm(&db,batch,deps,warm).await?;
+        // With the native collector switched on, the render call reuses the
+        // Search connection list too (one switch, one rollback).
+        let reused;let opened;
+        let db:&tokio_postgres::Client=if crate::search_collect::enabled(){reused=crate::db::reused(database_url).await?;&reused}else{opened=crate::db::connect(database_url).await?;&opened};
+        let reply=paint_with_warm(db,batch,deps,warm).await?;
         let bytes=serde_json::to_vec(&reply)?;
         if bytes.len()>MAX_REPLY{anyhow::bail!("Search reply limit")}
         Ok(bytes)
