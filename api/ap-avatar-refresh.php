@@ -111,7 +111,12 @@ function ap_avatar_queue_bsky(string $actorId, int $ownerUserId, bool $durable =
     if ($durable && $ownerUserId > 0 && function_exists('ap_bsky_actor_refresh_enqueue')) {
         ap_bsky_actor_refresh_enqueue($ownerUserId, $actorId);
     }
+    // Handle-form refs (bsky.app/profile/alice.example) carry no DID. The Rust
+    // worker resolves handles through getProfiles, so they take the fast queue too.
     $did = ap_avatar_bsky_did($actorId);
+    if ($did === '' && ap_avatar_is_bsky_app($actorId)) {
+        $did = rtrim(trim($actorId), '/');
+    }
     if ($did === '' || !function_exists('ap_redis_queue_push')) {
         return;
     }
@@ -143,10 +148,13 @@ function ap_avatar_queue_refresh(string $actorId, bool $force, int $ownerUserId 
     if ($actorId === '' || !str_starts_with($actorId, 'https://')) {
         return;
     }
-    if (!ap_avatar_host_budget_take($actorId)) {
+    $bskyApp = ap_avatar_is_bsky_app($actorId);
+    // Every Bluesky author shares the bsky.app host, so an 8-per-host budget
+    // dropped most of a Home page. Those jobs batch through getProfiles and
+    // dedupe on a per-DID lock instead; the 40-actor poll cap still bounds them.
+    if (!$bskyApp && !ap_avatar_host_budget_take($actorId)) {
         return;
     }
-    $bskyApp = ap_avatar_is_bsky_app($actorId);
     if (!$bskyApp && function_exists('ap_remote_actor_warm_async')) {
         ap_remote_actor_warm_async($actorId, $force);
     }
@@ -340,6 +348,11 @@ function ap_avatar_refresh_resolve(array $actors, array $broken = [], int $owner
             ap_avatar_queue_refresh($actor, true, $ownerUserId);
             if (ap_avatar_is_usable($r2Url)) {
                 $out[$actor] = (string) $r2Url;
+            } elseif ($bskyUrl !== null && ap_avatar_is_usable($bskyUrl)) {
+                // Bluesky has no R2 copy. A post row can hold an old avatar CID
+                // after the author changes it; the profile cache has the current
+                // one. The browser skips a URL it already tried, so this can't loop.
+                $out[$actor] = (string) $bskyUrl;
             }
             continue;
         }
