@@ -66,6 +66,7 @@ jobs:
           python3 deploy/bump_version.py --check
           bash deploy/assemble-release.sh --self-test
           bash deploy/test_runner_job_guard.sh
+          bash deploy/test_backup_restore_drill.sh
 
   php:
     name: PHP syntax and standalone tests

@@ -259,7 +259,7 @@ These are not deploys of the VAAK app and this workflow does not replace them:
 
 - `NovaLandia/update_site.sh` (Jekyll blog; keeps excluding `api/`, `vaak/`, and `clearance/`)
 - `deploy_clearance.sh` (Clearance, separate tree)
-- `deploy/vaak-postgres-backup.sh`, `deploy/vaak-disc3-backup.sh`, and their timers
+- `deploy/vaak-postgres-backup.sh`, `deploy/vaak-disc3-backup.sh`, `deploy/vaak-backup-restore-drill.sh` ([restore drill](vaak-integrity-policy.md#restore-drill)), and their timers
 - `deploy/vaak-integrity-check.sh`
 - The systemd units and cron files under `deploy/` and `ops/`. Installing or changing a unit is still a root edit under `/etc/systemd/system`. This workflow does not copy unit files and it cannot `daemon-reload`.
 

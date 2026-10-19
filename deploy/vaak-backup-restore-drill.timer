@@ -1,0 +1,12 @@
+[Unit]
+Description=Run the VAAK backup restore drill monthly
+
+[Timer]
+# The 3rd of each month, after the 02:15 backup and outside peak hours.
+OnCalendar=*-*-03 04:30:00
+RandomizedDelaySec=30m
+Persistent=true
+Unit=vaak-backup-restore-drill.service
+
+[Install]
+WantedBy=timers.target
