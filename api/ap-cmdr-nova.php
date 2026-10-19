@@ -12,6 +12,8 @@ header('Referrer-Policy: strict-origin-when-cross-origin');
 if (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') {
     header('Strict-Transport-Security: max-age=31536000; includeSubDomains');
 }
+require_once __DIR__ . '/ap-csp.php';
+ap_csp_send_headers('app');
 
 const CMDR_ACTOR_ID = 'https://mkultra.monster/users/cmdr_nova';
 const CMDR_PUB = '/etc/mkultra/ap-inbox/cmdr_nova_public.pem';

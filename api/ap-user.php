@@ -12,6 +12,8 @@ header('Referrer-Policy: strict-origin-when-cross-origin');
 if (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') {
     header('Strict-Transport-Security: max-age=31536000; includeSubDomains');
 }
+require_once __DIR__ . '/ap-csp.php';
+ap_csp_send_headers('app');
 
 require_once __DIR__ . '/ap-db.php';
 require_once __DIR__ . '/ap-auth.php';
