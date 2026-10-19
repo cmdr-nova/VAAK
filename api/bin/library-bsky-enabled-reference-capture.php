@@ -73,7 +73,8 @@ foreach ($variants as $name=>$replace) {
     if($name==='legacy_own_mapped_pinned') ap_db()->exec('INSERT INTO masto_pins VALUES(1,456)');
     ap_db()->exec("UPDATE masto_statuses SET visibility='".($name==='legacy_own_mapped_direct'?'direct':'public')."' WHERE local_id=456");
     $context=$base['context'];
-    $context['rendered_at']=time();
+    // Freeze relative_time() at the clock handed to the native renderer.
+    $context['rendered_at']=time();$GLOBALS['fixture_render_clock']=$context['rendered_at'];
     $context['profile']=ap_profile_get('fixture');
     $context['bsky_session']=$GLOBALS['fixture_bsky_session'];
     if(in_array($name,['legacy_own_mapped','legacy_own_mapped_pinned','legacy_own_mapped_direct'],true)) { $context['mapped_own']=ap_db()->query("SELECT * FROM masto_statuses WHERE local_id=456")->fetch(); $context['mapped_own']['pinned']=$name==='legacy_own_mapped_pinned'; }
