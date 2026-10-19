@@ -13,6 +13,10 @@ function ap_deliver_public_activity(array $activity,array $extra=[],bool $skipBr
 }
 function ap_metrics_record(mixed ...$args): void {ap_db()->prepare('INSERT INTO transport_log(kind,json) VALUES(?,?)')->execute(['metrics',json_encode($args)]);}
 function ap_log(string $line): void {ap_db()->prepare('INSERT INTO transport_log(kind,json) VALUES(?,?)')->execute(['log',json_encode($line)]);}
+function ap_deliver_fanout_background(array $activity,array $targets,string $keyId,string $priv): bool {
+    ap_db()->prepare('INSERT INTO transport_log(kind,json) VALUES(?,?)')->execute(['fanout',json_encode(['activity'=>$activity,'targets'=>$targets])]);
+    return true;
+}
 function ap_bsky_delete_crosspost_for_note(int $owner,string $note): array {return ['ok'=>true,'skipped'=>true];}
 
 // Boundary adapters: session already established by test host; schema provisioned;
@@ -23,7 +27,7 @@ function ap_rss_migrate(): void {}
 function ap_redis_library_html_invalidate(int $owner,string $view): void { ap_db()->prepare('INSERT INTO invalidations VALUES(?,?)')->execute([$owner,$view]); }
 $root=dirname(__DIR__);
 reference_load($root.'/ap-auth.php',['ap_auth_csrf_ok']);
-reference_load($root.'/ap-db.php',['ap_db_driver','ap_db_last_insert_id','ap_db_now','ap_db_session_bound','ap_db_session_owner_user_id','ap_db_default_owner_user_id','ap_db_owner_actor_id_for_user_id','ap_masto_canonical_interaction_keys','ap_masto_object_id_lookup_keys','ap_masto_favourite_row','ap_masto_favourite_add','ap_masto_favourite_remove','ap_masto_bookmark_add','ap_masto_bookmark_remove','ap_masto_reblog_add','ap_masto_reblog_row_by_status','ap_masto_reblog_remove','ap_local_actor_id','ap_masto_status_by_local_id','ap_masto_status_is_pinned','ap_masto_status_pin','ap_masto_status_unpin']);
+reference_load($root.'/ap-db.php',['ap_db_driver','ap_db_last_insert_id','ap_db_now','ap_db_session_bound','ap_db_session_owner_user_id','ap_db_default_owner_user_id','ap_db_owner_actor_id_for_user_id','ap_masto_canonical_interaction_keys','ap_masto_object_id_lookup_keys','ap_masto_favourite_row','ap_masto_favourite_add','ap_masto_favourite_remove','ap_masto_bookmark_add','ap_masto_bookmark_remove','ap_masto_reblog_add','ap_masto_reblog_row_by_status','ap_masto_reblog_remove','ap_local_actor_id','ap_masto_status_by_local_id','ap_masto_status_is_pinned','ap_masto_status_pin','ap_masto_status_unpin','ap_masto_pin_federate','ap_masto_pin_is_federatable']);
 reference_load($root.'/ap-admin.php',['vaak_actor_id','vaak_is_own_url']);
 reference_load($root.'/ap-masto-entities.php',['ap_masto_session_actor_id','ap_masto_format_time','ap_masto_poll_entity','ap_masto_parse_public_status_id','ap_masto_local_row_from_public_id','ap_masto_mention_id_from_status_id','ap_masto_event_id_from_status_id','ap_masto_dm_id_from_status_id','ap_masto_resolve_status_interaction']);
 reference_load($root.'/ap-inbox.php',['ap_masto_poll_vote']);
@@ -95,8 +99,8 @@ CREATE TABLE masto_statuses(local_id INTEGER PRIMARY KEY,note_id TEXT,visibility
 INSERT INTO masto_statuses(local_id,note_id,visibility) VALUES(1,'https://local.test/users/a/notes/aaa','private'),(2,'https://local.test/users/b/notes/bbb','public'),(3,'https://local.test/users/a/notes/ddd','direct');
 CREATE TABLE events(id INTEGER PRIMARY KEY, object_id TEXT);
 CREATE TABLE masto_media(local_id INTEGER PRIMARY KEY,status_local_id INTEGER,owner_user_id INTEGER,mime TEXT,public_url TEXT);
-CREATE TABLE outbox_notes(id TEXT PRIMARY KEY,content TEXT,raw_create_json TEXT,to_json TEXT,cc_json TEXT,in_reply_to TEXT);
-INSERT INTO outbox_notes VALUES('https://local.test/users/a/notes/aaa','old','{}','[\"https://local.test/users/a/followers\"]','[]',NULL);
+CREATE TABLE outbox_notes(id TEXT PRIMARY KEY,content TEXT,raw_create_json TEXT,to_json TEXT,cc_json TEXT,in_reply_to TEXT,create_id TEXT);
+INSERT INTO outbox_notes VALUES('https://local.test/users/a/notes/aaa','old','{}','[\"https://local.test/users/a/followers\"]','[]',NULL,'https://local.test/users/a/notes/aaa/activity');
 CREATE TABLE transport_log(kind TEXT,json TEXT);
 CREATE TABLE masto_pins(owner_user_id INTEGER,status_local_id INTEGER,pinned_at TEXT,PRIMARY KEY(owner_user_id,status_local_id));
 CREATE TABLE masto_polls(local_id INTEGER PRIMARY KEY,status_local_id INTEGER,note_id TEXT,expires_at TEXT,multiple INTEGER,options_json TEXT,voters_json TEXT,votes_count INTEGER,voters_count INTEGER);
@@ -158,6 +162,7 @@ try {
     check(!request_action(201,'pin_status',['note_id'=>'https://local.test/users/a/notes/ddd'])['ok'],'pin direct post denied');
     check(request_action(201,'pin_status',['note_id'=>'https://local.test/users/a/notes/aaa','return_view'=>'status','from'=>'bookmarks'])['ok'],'pin current post succeeds');
     check(count_rows('masto_pins',201)===1,'pin durable owner receipt');
+    check((int)ap_db()->query("SELECT COUNT(*) FROM transport_log WHERE kind='fanout'")->fetchColumn()===0,'private pin is not federated');
     check(request_action(201,'pin_status',['note_id'=>'https://local.test/users/a/notes/aaa'])['ok']&&count_rows('masto_pins',201)===1,'pin idempotent');
     check(!request_action(202,'unpin_status',['note_id'=>'https://local.test/users/a/notes/aaa'])['ok']&&count_rows('masto_pins',201)===1,'foreign unpin has no effect');
     $pinReturn=request_action(201,'unpin_status',['note_id'=>'https://local.test/users/a/notes/aaa','return_view'=>'status','from'=>'bookmarks']);

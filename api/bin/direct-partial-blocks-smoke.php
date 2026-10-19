@@ -1,6 +1,8 @@
 <?php
 declare(strict_types=1);
 /** Actual current PostgreSQL policy and painter regression; no web bootstrap/native. */
+// Current painters only: skip the baseline's machine-local historical oracle.
+putenv('ROOT_LIBRARY_SEARCH_PRODUCER_BOOTSTRAP=1');
 $source=(string)file_get_contents(__DIR__.'/remote-direct-card-reference.php');
 $end=strpos($source,"\n\$rows=[];\$checks=0;");
 if($end===false)throw new RuntimeException('bootstrap boundary missing');

@@ -23,10 +23,10 @@ function bridge_check(bool $value,string $message): void { global $checks; if(!$
 foreach(['http://127.0.0.1:18873/internal/search/render','http://[::1]:18873/internal/search/render'] as $url) bridge_check(ap_search_native_url_allowed($url),'loopback allowed');
 foreach(['https://127.0.0.1/internal/search/render','http://localhost/internal/search/render','http://127.0.0.1@evil.test/internal/search/render','http://127.0.0.1/internal/search/render?q=1','http://127.0.0.1/internal/search/render#x','http://127.0.0.1/internal/library/render','http://user@127.0.0.1/internal/search/render'] as $url) bridge_check(!ap_search_native_url_allowed($url),'unsafe URL rejected');
 $counts=['accounts'=>1,'hashtags'=>1,'statuses'=>3];
-$reply=['ok'=>true,'source_counts'=>$counts,'accounts'=>['A'],'hashtags'=>[''],'statuses'=>[['source_index'=>0,'html'=>'S0'],['source_index'=>2,'html'=>'S2']]];
+$reply=['ok'=>true,'protocol_version'=>1,'status_preview_state'=>['initial'=>3,'remaining'=>3,'attempts'=>0],'source_counts'=>$counts,'accounts'=>['A'],'hashtags'=>[''],'statuses'=>[['source_index'=>0,'html'=>'S0'],['source_index'=>2,'html'=>'S2']]];
 bridge_check(ap_search_native_validate_reply($reply,$counts)===['accounts'=>'A','hashtags'=>'','statuses'=>'S0S2'],'ordered original slots');
 foreach([
- array_replace($reply,['ok'=>1]),array_replace($reply,['accounts'=>[]]),array_replace($reply,['source_counts'=>array_replace($counts,['statuses'=>'3'])]),
+ array_replace($reply,['ok'=>1]),array_replace($reply,['protocol_version'=>2]),array_replace($reply,['status_preview_state'=>['initial'=>3,'remaining'=>3,'attempts'=>1]]),array_replace($reply,['accounts'=>[]]),array_replace($reply,['source_counts'=>array_replace($counts,['statuses'=>'3'])]),
  array_replace($reply,['statuses'=>[['source_index'=>2,'html'=>'x'],['source_index'=>0,'html'=>'x']]]),
  array_replace($reply,['statuses'=>[['source_index'=>0,'html'=>'x'],['source_index'=>0,'html'=>'x']]]),
  array_replace($reply,['statuses'=>[['source_index'=>3,'html'=>'x']]]),array_replace($reply,['statuses'=>[['source_index'=>-1,'html'=>'x']]]),

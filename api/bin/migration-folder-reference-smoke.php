@@ -9,14 +9,17 @@ if (!extension_loaded('pdo_sqlite')) { fwrite(STDERR, "requires pdo_sqlite\n"); 
 if (!function_exists('mb_strlen')) { function mb_strlen(string $s): int { return preg_match_all('/./us', $s); } }
 $fixtureDb = new PDO('sqlite::memory:', null, null, [PDO::ATTR_ERRMODE=>PDO::ERRMODE_EXCEPTION, PDO::ATTR_DEFAULT_FETCH_MODE=>PDO::FETCH_ASSOC]);
 $fixtureDb->exec('CREATE TABLE vaak_bookmark_folders(id INTEGER PRIMARY KEY AUTOINCREMENT,owner_user_id INTEGER,title TEXT,position INTEGER,created_at TEXT,updated_at TEXT)');
-$fixtureDb->exec('CREATE TABLE bookmarks(owner INTEGER,status TEXT,object TEXT,PRIMARY KEY(owner,status))');
+$fixtureDb->exec('CREATE TABLE masto_bookmarks(id INTEGER PRIMARY KEY AUTOINCREMENT,owner_user_id INTEGER,status_id TEXT,object_id TEXT,created_at TEXT,UNIQUE(owner_user_id,status_id))');
+// Folder counts match memberships to saved rows through these id spaces.
+$fixtureDb->exec('CREATE TABLE events(id INTEGER PRIMARY KEY,object_id TEXT)');
+$fixtureDb->exec('CREATE TABLE masto_statuses(local_id INTEGER PRIMARY KEY,note_id TEXT)');
 function ap_db(): PDO { return $GLOBALS['fixtureDb']; }
 function ap_db_now(): string { return '2026-10-10T12:00:00Z'; }
 function ap_db_last_insert_id(string $table): string { return ap_db()->lastInsertId(); }
-function ap_masto_bookmark_add(string $status, ?string $object, int $owner): void { ap_db()->prepare('INSERT OR IGNORE INTO bookmarks(owner,status,object) VALUES(?,?,?)')->execute([$owner,$status,$object]); }
+function ap_masto_bookmark_add(string $status, ?string $object, int $owner): void { ap_db()->prepare('INSERT OR IGNORE INTO masto_bookmarks(owner_user_id,status_id,object_id,created_at) VALUES(?,?,?,?)')->execute([$owner,$status,$object,ap_db_now()]); }
 function verify(bool $condition, string $case): void { if (!$condition) throw new RuntimeException($case); $GLOBALS['checks']++; }
 $GLOBALS['checks'] = 0;
-reference_load(dirname(__DIR__) . '/ap-bookmark-folders.php', ['vaak_bookmark_folders_ensure_schema','vaak_bookmark_folders_list','vaak_bookmark_folder_create','vaak_bookmark_folder_delete','vaak_bookmark_folder_add_status','vaak_bookmark_folder_remove_status','vaak_bookmark_folders_on_unbookmark']);
+reference_load(dirname(__DIR__) . '/ap-bookmark-folders.php', ['vaak_bookmark_folder_fedi_match_sql','vaak_bookmark_folder_saved_keys','vaak_bookmark_folders_ensure_schema','vaak_bookmark_folders_list','vaak_bookmark_folder_create','vaak_bookmark_folder_delete','vaak_bookmark_folder_add_status','vaak_bookmark_folder_remove_status','vaak_bookmark_folders_on_unbookmark']);
 verify(!vaak_bookmark_folder_create(0,'test')['ok'], 'missing owner rejected');
 verify(!vaak_bookmark_folder_create(1,' ')['ok'], 'empty title rejected');
 verify(!vaak_bookmark_folder_create(1,str_repeat('é',81))['ok'], 'Unicode title limit');
@@ -25,13 +28,13 @@ verify($a['ok'] && $a['folder']['title'] === 'Saved A' && $b['ok'], 'trim and pe
 verify(count(vaak_bookmark_folders_list(1)) === 1 && count(vaak_bookmark_folders_list(2)) === 1, 'owner list isolation');
 verify(!vaak_bookmark_folder_add_status($a['id'],'7',2)['ok'], 'foreign folder add denied');
 verify(vaak_bookmark_folder_add_status($a['id'],'7',1,'https://remote.test/7')['ok'], 'add persists');
-verify(ap_db()->query('SELECT COUNT(*) FROM bookmarks WHERE owner=1')->fetchColumn() === 1, 'add ensures underlying bookmark');
+verify(ap_db()->query('SELECT COUNT(*) FROM masto_bookmarks WHERE owner_user_id=1')->fetchColumn() === 1, 'add ensures underlying bookmark');
 verify(!empty(vaak_bookmark_folder_add_status($a['id'],'7',1)['already']), 'duplicate idempotent');
 verify(vaak_bookmark_folders_list(1)[0]['item_count'] === 1, 'count memberships');
 vaak_bookmark_folder_remove_status($a['id'],'7',2);
 verify(vaak_bookmark_folders_list(1)[0]['item_count'] === 1, 'foreign remove no effect');
 vaak_bookmark_folder_remove_status($a['id'],'7',1);
-verify(vaak_bookmark_folders_list(1)[0]['item_count'] === 0 && ap_db()->query('SELECT COUNT(*) FROM bookmarks')->fetchColumn() === 1, 'remove retains bookmark');
+verify(vaak_bookmark_folders_list(1)[0]['item_count'] === 0 && ap_db()->query('SELECT COUNT(*) FROM masto_bookmarks')->fetchColumn() === 1, 'remove retains bookmark');
 $second = vaak_bookmark_folder_create(1,'second');
 vaak_bookmark_folder_add_status($a['id'],'7',1); vaak_bookmark_folder_add_status($second['id'],'7',1); vaak_bookmark_folder_add_status($b['id'],'7',2);
 vaak_bookmark_folders_on_unbookmark('7',1);
@@ -40,7 +43,7 @@ verify(ap_db()->query('SELECT COUNT(*) FROM vaak_bookmark_folder_items WHERE own
 verify(!vaak_bookmark_folder_delete($a['id'],2)['ok'], 'foreign delete denied');
 vaak_bookmark_folder_add_status($a['id'],'8',1);
 verify(vaak_bookmark_folder_delete($a['id'],1)['ok'] && ap_db()->query('SELECT COUNT(*) FROM vaak_bookmark_folder_items WHERE folder_id=' . (int)$a['id'])->fetchColumn() === 0, 'delete removes own memberships');
-verify(ap_db()->query('SELECT COUNT(*) FROM bookmarks WHERE owner=1')->fetchColumn() === 2, 'folder delete retains flat bookmarks');
+verify(ap_db()->query('SELECT COUNT(*) FROM masto_bookmarks WHERE owner_user_id=1')->fetchColumn() === 2, 'folder delete retains flat bookmarks');
 for ($i=0;$i<39;$i++) verify(vaak_bookmark_folder_create(1,'folder'.$i)['ok'], 'folder creation below cap');
 verify(!vaak_bookmark_folder_create(1,'overflow')['ok'], '40 folder cap');
 echo 'migration-folder-reference: PASS (' . $GLOBALS['checks'] . " checks; actual PHP folder SQL effects in disposable SQLite)\n";
