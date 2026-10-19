@@ -77,6 +77,7 @@ php_tests=(
   api/bin/profile-bsky-native-bridge-test.php
   api/bin/profile-guest-actions-capture.php
   api/bin/library-own-cw-smoke.php
+  api/bin/login-hardening-smoke.php
   api/bin/migration-php-reference-smoke.php
   api/bin/moderation-alias-cache-smoke.php
   api/bin/notif-bsky-subject-hydrate-smoke.php

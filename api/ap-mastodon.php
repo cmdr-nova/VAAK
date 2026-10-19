@@ -763,8 +763,11 @@ function ap_masto_oauth_authorize(string $method): void
         } else {
             $username = (string) ($_POST['username'] ?? '');
             $password = (string) ($_POST['password'] ?? '');
-            $user = ap_auth_verify_credentials($username, $password);
-            if ($user === null) {
+            $limited = false;
+            $user = ap_auth_verify_credentials_limited($username, $password, $limited);
+            if ($limited) {
+                $error = 'Too many attempts. Try again in a few minutes.';
+            } elseif ($user === null) {
                 ap_masto_oauth_rate_fail();
                 $error = 'Invalid username or password';
             } else {

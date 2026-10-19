@@ -1072,11 +1072,14 @@ $vaakAdminOnlyActions = [
         $password = (string) ($_POST['account_password'] ?? '');
         $code = trim((string) ($_POST['account_2fa_code'] ?? ''));
         $view = 'account_switcher';
-        $candidate = ($login !== '' && $password !== '') ? ap_auth_verify_credentials($login, $password) : null;
-        if (!is_array($candidate)) {
+        $limited = false;
+        $candidate = ($login !== '' && $password !== '') ? ap_auth_verify_credentials_limited($login, $password, $limited) : null;
+        if ($limited) {
+            $error = 'Too many attempts for that account. Try again in a few minutes.';
+        } elseif (!is_array($candidate)) {
             $error = 'Account credentials were not accepted.';
         } elseif (ap_auth_2fa_enabled((int) ($candidate['id'] ?? 0))
-            && !ap_auth_2fa_verify_code((int) ($candidate['id'] ?? 0), $code)
+            && !ap_auth_2fa_verify_code_limited((int) ($candidate['id'] ?? 0), $code)
         ) {
             $error = 'That account requires a valid two-factor code.';
         } else {
@@ -4706,17 +4709,26 @@ $vaakAdminOnlyActions = [
         } else {
         $pass = (string) ($_POST['password'] ?? '');
         $pass2 = (string) ($_POST['password_confirm'] ?? '');
+        $appPwBucket = 'pwchange:u' . $vaakOwnerId;
         if ($pass !== $pass2) {
             $error = 'Passwords do not match.';
+        } elseif (ap_auth_rate_fails($appPwBucket) >= AP_AUTH_PASSWORD_CHANGE_MAX) {
+            $error = 'Too many attempts. Try again in a few minutes.';
+        } elseif (ap_auth_verify_credentials($vaakUsername, (string) ($_POST['current_password'] ?? '')) === null) {
+            // This also replaces the VAAK login password, so it needs the current one.
+            ap_auth_rate_fail($appPwBucket);
+            $error = 'Current password is incorrect.';
         } else {
+            ap_auth_rate_clear($appPwBucket);
             $res = ap_app_password_set($pass);
             if (!empty($res['ok'])) {
                 // Keep VAAK web login in sync (cmdr_nova uses the same password)
                 $row = ap_db()->query('SELECT password_hash FROM app_auth WHERE id = 1')->fetch();
                 if (is_array($row) && !empty($row['password_hash'])) {
                     ap_auth_sync_admin_password_hash((string) $row['password_hash']);
+                    ap_auth_revoke_user_credentials($vaakOwnerId);
                 }
-                $notice = 'App password saved. Use it for VAAK login and Ice Cubes (@cmdr_nova@mkultra.monster).';
+                $notice = 'App password saved. Use it for VAAK login and Ice Cubes (@cmdr_nova@mkultra.monster). Other sessions and app tokens were signed out.';
             } else {
                 $error = $res['error'] ?? 'Could not save app password.';
             }
@@ -4733,13 +4745,13 @@ $vaakAdminOnlyActions = [
         if ($pass !== $pass2) {
             $error = 'Passwords do not match.';
         } else {
-            $res = ap_auth_user_set_password($vaakOwnerId, $pass);
+            $res = ap_auth_change_password($vaakOwnerId, (string) ($_POST['current_password'] ?? ''), $pass);
             if (!empty($res['ok'])) {
                 // Keep Ice Cubes app password in sync only for cmdr_nova
                 if ($vaakActorKey === 'cmdr_nova' && function_exists('ap_app_password_set')) {
                     ap_app_password_set($pass);
                 }
-                $notice = 'Account password updated. Use it next time you log in to VAAK.';
+                $notice = 'Account password updated. Other sessions and app tokens were signed out.';
             } else {
                 $error = $res['error'] ?? 'Could not update password.';
             }
@@ -31173,6 +31185,7 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
           <input type="hidden" name="action" value="change_password">
           <input type="hidden" name="return_view" value="security">
           <div class="meta" style="margin-bottom:.45rem"><strong>Change account password</strong></div>
+          <input type="password" name="current_password" required autocomplete="current-password" placeholder="Current password">
           <input type="password" name="password" required minlength="10" autocomplete="new-password" placeholder="New password (min 10 chars)">
           <input type="password" name="password_confirm" required minlength="10" autocomplete="new-password" placeholder="Confirm password">
           <div class="composer-actions">
@@ -31257,6 +31270,7 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
         </div>
         <form class="composer" method="post" action="?view=security" style="margin-bottom:1.25rem">
           <input type="hidden" name="action" value="set_app_password">
+          <input type="password" name="current_password" required autocomplete="current-password" placeholder="Current password">
           <input type="password" name="password" required minlength="10" autocomplete="new-password" placeholder="New app password (min 10 chars)">
           <input type="password" name="password_confirm" required minlength="10" autocomplete="new-password" placeholder="Confirm app password">
           <div class="composer-actions">
@@ -31818,6 +31832,7 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
             Updates your VAAK login password for <code><?= h($vaakUsername) ?></code>
             (also available under <a href="?view=security">You → Security</a>).
           </div>
+          <input type="password" name="current_password" required autocomplete="current-password" placeholder="Current password">
           <input type="password" name="password" required minlength="10" autocomplete="new-password" placeholder="New password (min 10 chars)">
           <input type="password" name="password_confirm" required minlength="10" autocomplete="new-password" placeholder="Confirm password">
           <div class="composer-actions">
