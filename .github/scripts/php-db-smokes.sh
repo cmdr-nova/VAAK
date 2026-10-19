@@ -93,6 +93,8 @@ SQL
 
 echo "==> vaak-worker serve"
 mkdir -p "${work}/worker"
+# The worker refuses /shadow/* without a token; the PHP smokes send the same one.
+export VAAK_SHADOW_HTTP_TOKEN="${VAAK_SHADOW_HTTP_TOKEN:-php-db-smokes-$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')}"
 VAAK_ENV_FILE=/nonexistent VAAK_PHYRIAN_BRIDGE_ENV_FILE=/nonexistent \
   VAAK_DATABASE_URL="postgresql://${PGUSER}@${PGHOST}:${PGPORT}/${db}" \
   VAAK_REDIS_URL="redis://${redis_hostport}/0" VAAK_REDIS_QUEUE_URL="redis://${redis_hostport}/1" \
