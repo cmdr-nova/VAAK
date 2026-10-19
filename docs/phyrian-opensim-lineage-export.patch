@@ -1,0 +1,41 @@
+--- a/index.php
++++ b/index.php
+@@ -1265,6 +1265,38 @@
+             ]);
+         }
+ 
++        if ($action === 'vaak_lineage_export') {
++            // Read-only family tree export for VAAK: who imprinted whom. No decay, no writes.
++            $select = 'SELECT p.avatar_uuid, p.avatar_name, p.strain, p.lineage_parent_uuid, p.created_at';
++            $from = " FROM strain_players p WHERE p.strain IS NOT NULL AND p.strain <> '' ORDER BY p.avatar_uuid LIMIT 5000";
++            try {
++                $rows = $db->query(
++                    $select . ", (SELECT MAX(e.created_at) FROM strain_events e
++                       WHERE e.avatar_uuid = p.avatar_uuid AND e.event_type = 'imprint_offer_accepted') AS imprinted_at" . $from
++                )->fetchAll(PDO::FETCH_ASSOC);
++            } catch (Throwable $e) {
++                $rows = $db->query($select . ', NULL AS imprinted_at' . $from)->fetchAll(PDO::FETCH_ASSOC);
++            }
++            $players = [];
++            foreach ($rows as $row) {
++                $at = null;
++                if (is_string($row['imprinted_at'] ?? null) && $row['imprinted_at'] !== '') {
++                    // The bridge PDO session is UTC, so naive values are UTC instants.
++                    $instant = DateTimeImmutable::createFromFormat('!Y-m-d H:i:s', $row['imprinted_at'], new DateTimeZone('UTC'));
++                    $at = $instant !== false ? $instant->format('Y-m-d\TH:i:s\Z') : null;
++                }
++                $players[] = [
++                    'avatar_uuid' => $row['avatar_uuid'],
++                    'avatar_name' => $row['avatar_name'],
++                    'strain' => $row['strain'],
++                    'generation' => player_generation($row),
++                    'parent_uuid' => $row['lineage_parent_uuid'] ?: null,
++                    'imprinted_at' => $at,
++                ];
++            }
++            respond(200, ['ok' => true, 'players' => $players]);
++        }
++
+         if ($action === 'vaak_daily_claim') {
+             $uuid = clean_uuid($input['avatar_uuid'] ?? '');
+             $player = fetch_player($db, $uuid);

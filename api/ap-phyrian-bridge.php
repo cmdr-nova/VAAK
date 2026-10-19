@@ -987,3 +987,96 @@ function ap_phyrian_bridge_checkin_via_opensim(int $ownerUserId): array
         'message' => (string) ($data['message'] ?? ''),
     ];
 }
+
+const AP_PHYRIAN_BRIDGE_LINEAGE_MAX = 5000;
+
+/**
+ * Pure normalizer for the grid's vaak_lineage_export response. Rows with a
+ * bad UUID are dropped; a bad parent becomes no parent. Timestamps are kept
+ * only when they carry an explicit offset, so a naive grid clock can never
+ * be read in the wrong timezone (see docs/10.11-phyrian-resonance-audit.md).
+ *
+ * @param array<string,mixed> $data
+ * @return list<array{avatar_uuid:string,avatar_name:string,parent_uuid:?string,strain:string,generation:int,imprinted_at:?string}>
+ */
+function ap_phyrian_bridge_normalize_lineage(array $data): array
+{
+    $players = $data['players'] ?? null;
+    if (!is_array($players)) {
+        return [];
+    }
+    $out = [];
+    foreach ($players as $p) {
+        if (!is_array($p) || count($out) >= AP_PHYRIAN_BRIDGE_LINEAGE_MAX) {
+            continue;
+        }
+        $uuid = strtolower(trim((string) ($p['avatar_uuid'] ?? '')));
+        if (!ap_phyrian_bridge_valid_uuid($uuid) || isset($out[$uuid])) {
+            continue;
+        }
+        $parent = strtolower(trim((string) ($p['parent_uuid'] ?? '')));
+        if (!ap_phyrian_bridge_valid_uuid($parent) || $parent === $uuid) {
+            $parent = null;
+        }
+        $name = trim(preg_replace('/\s+/u', ' ', strip_tags((string) ($p['avatar_name'] ?? ''))) ?? '');
+        $name = preg_replace("/[\\x00-\\x1F\\x7F]/", '', $name) ?? '';
+        $strain = trim(preg_replace("/[\\x00-\\x1F\\x7F]/", '', strip_tags((string) ($p['strain'] ?? ''))) ?? '');
+        $at = trim((string) ($p['imprinted_at'] ?? ''));
+        if (!preg_match('/^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}(:?\d{2})?)$/', $at)) {
+            $at = null;
+        }
+        $out[$uuid] = [
+            'avatar_uuid' => $uuid,
+            'avatar_name' => mb_substr($name, 0, 80),
+            'parent_uuid' => $parent,
+            'strain' => mb_substr($strain, 0, 60),
+            'generation' => max(1, min(
+                defined('AP_PHYRIAN_MAX_GENERATION') ? (int) AP_PHYRIAN_MAX_GENERATION : 10,
+                (int) ($p['generation'] ?? 1)
+            )),
+            'imprinted_at' => $at,
+        ];
+    }
+    return array_values($out);
+}
+
+/**
+ * Mirror the grid's lineage into phyrian_grid_lineage for the family tree.
+ * Read-only toward the grid and never touches player stats. Until the grid
+ * has the export action this returns its error and changes nothing.
+ *
+ * @param callable(string,array<string,mixed>):array<string,mixed>|null $call
+ * @return array{ok:bool,error?:string,rows?:int}
+ */
+function ap_phyrian_bridge_lineage_sync(?PDO $db = null, ?callable $call = null): array
+{
+    $call ??= static fn (string $action, array $body): array => ap_phyrian_bridge_strains_call($action, $body);
+    $res = $call('vaak_lineage_export', []);
+    if (empty($res['ok'])) {
+        return ['ok' => false, 'error' => (string) ($res['error'] ?? 'lineage export failed')];
+    }
+    $data = is_array($res['data'] ?? null) ? $res['data'] : [];
+    if (!is_array($data['players'] ?? null)) {
+        return ['ok' => false, 'error' => 'lineage export had no players list'];
+    }
+    $rows = ap_phyrian_bridge_normalize_lineage($data);
+    $db ??= ap_db();
+    try {
+        $db->beginTransaction();
+        $db->exec('DELETE FROM phyrian_grid_lineage');
+        $ins = $db->prepare(
+            'INSERT INTO phyrian_grid_lineage (avatar_uuid, avatar_name, parent_uuid, strain, generation, imprinted_at, synced_at)
+             VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)'
+        );
+        foreach ($rows as $r) {
+            $ins->execute([$r['avatar_uuid'], $r['avatar_name'], $r['parent_uuid'], $r['strain'], $r['generation'], $r['imprinted_at']]);
+        }
+        $db->commit();
+    } catch (Throwable $e) {
+        if ($db->inTransaction()) {
+            $db->rollBack();
+        }
+        return ['ok' => false, 'error' => 'lineage store failed: ' . $e->getMessage()];
+    }
+    return ['ok' => true, 'rows' => count($rows)];
+}
