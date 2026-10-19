@@ -5,6 +5,7 @@
 declare(strict_types=1);
 
 require_once __DIR__ . '/ap-link-preview.php';
+require_once __DIR__ . '/ap-shadow-http.php';
 require_once __DIR__ . '/ap-asks.php';
 require_once __DIR__ . '/ap-normalize.php';
 require_once __DIR__ . '/ap-visibility.php';
@@ -930,6 +931,162 @@ function ap_masto_poll_entity(array $row): array
         'own_votes' => $voted ? [] : null, // detailed own_votes filled by vote endpoint
         'options' => $optsOut,
     ];
+}
+
+/**
+ * Mastodon Poll entity for a remote_polls row. voted / own_votes come from
+ * remote_poll_votes for the viewer; null when the row has no numeric id yet.
+ *
+ * @param array<string,mixed> $row remote_polls row
+ * @param list<int>|null $ownVotes the viewer's choices, null when not voted
+ * @return array<string,mixed>|null
+ */
+function ap_masto_remote_poll_entity(array $row, ?array $ownVotes): ?array
+{
+    $publicId = ap_remote_poll_public_id((int) ($row['id'] ?? 0));
+    if ($publicId < 1) {
+        return null;
+    }
+    $options = json_decode((string) ($row['options_json'] ?? '[]'), true);
+    $optsOut = [];
+    foreach (is_array($options) ? $options : [] as $opt) {
+        if (is_array($opt)) {
+            $optsOut[] = ['title' => (string) ($opt['title'] ?? ''), 'votes_count' => (int) ($opt['votes_count'] ?? 0)];
+        }
+    }
+    $expiresAt = (string) ($row['expires_at'] ?? '');
+    return [
+        'id' => (string) $publicId,
+        'expires_at' => $expiresAt !== '' ? ap_masto_format_time($expiresAt) : null,
+        'expired' => ap_remote_poll_is_expired($row),
+        'multiple' => !empty($row['multiple']),
+        'votes_count' => (int) ($row['votes_count'] ?? 0),
+        'voters_count' => (int) ($row['voters_count'] ?? 0),
+        'voted' => $ownVotes !== null,
+        'own_votes' => $ownVotes ?? [],
+        'options' => $optsOut,
+        'emojis' => [],
+    ];
+}
+
+/**
+ * Fill `poll` on remote statuses (and their reblog / quote) from remote_polls
+ * right before a response is written. Status builders and warm envelopes
+ * emit `poll: null` for remote posts; attaching here keeps the viewer's vote
+ * out of any shared cache. Accepts a status, a list of statuses or
+ * notifications, a context ({ancestors, descendants}) or search results.
+ */
+function ap_masto_attach_remote_polls(mixed $data): mixed
+{
+    if (!is_array($data) || $data === []) {
+        return $data;
+    }
+    $uris = [];
+    $collect = static function (array $st, int $depth = 0) use (&$collect, &$uris): void {
+        if ($depth > 3) {
+            return;
+        }
+        $uri = rtrim((string) ($st['uri'] ?? ''), '/');
+        // remote_polls never holds local notes (ap_remote_poll_store refuses them).
+        if (array_key_exists('poll', $st) && $st['poll'] === null && str_starts_with($uri, 'https://')) {
+            $uris[$uri] = true;
+        }
+        foreach (['reblog', 'quote', 'quoted_status'] as $k) {
+            if (is_array($st[$k] ?? null)) {
+                $collect(is_array($st[$k]['quoted_status'] ?? null) ? $st[$k]['quoted_status'] : $st[$k], $depth + 1);
+            }
+        }
+    };
+    $isStatus = static fn($v): bool => is_array($v) && isset($v['uri']) && array_key_exists('account', $v);
+    $lists = [];
+    if ($isStatus($data)) {
+        $collect($data);
+    } else {
+        foreach (array_is_list($data) ? [$data] : [$data['ancestors'] ?? [], $data['descendants'] ?? [], $data['statuses'] ?? []] as $list) {
+            foreach (is_array($list) ? $list : [] as $item) {
+                if ($isStatus($item)) {
+                    $collect($item);
+                } elseif (is_array($item) && $isStatus($item['status'] ?? null)) {
+                    $collect($item['status']);
+                }
+            }
+        }
+    }
+    if ($uris === []) {
+        return $data;
+    }
+    $viewer = ap_masto_session_actor_id();
+    $polls = [];
+    try {
+        ap_remote_polls_migrate();
+        $keys = array_keys($uris);
+        $marks = implode(',', array_fill(0, count($keys), '?'));
+        $st = ap_db()->prepare("SELECT * FROM remote_polls WHERE note_id IN ($marks)");
+        $st->execute($keys);
+        $rows = $st->fetchAll();
+        $own = [];
+        if ($viewer !== '' && $rows) {
+            $vst = ap_db()->prepare("SELECT note_id, choices_json FROM remote_poll_votes WHERE voter_actor = ? AND note_id IN ($marks)");
+            $vst->execute(array_merge([$viewer], $keys));
+            foreach ($vst->fetchAll() as $v) {
+                $choices = json_decode((string) $v['choices_json'], true);
+                $own[(string) $v['note_id']] = is_array($choices) ? array_values(array_map('intval', $choices)) : [];
+            }
+        }
+        foreach ($rows as $row) {
+            $nid = rtrim((string) $row['note_id'], '/');
+            $entity = ap_masto_remote_poll_entity($row, $own[$nid] ?? null);
+            if ($entity !== null) {
+                $polls[$nid] = $entity;
+            }
+        }
+    } catch (Throwable $e) {
+        error_log('[ap-masto] remote polls attach: ' . $e->getMessage());
+        return $data;
+    }
+    if ($polls === []) {
+        return $data;
+    }
+    $apply = static function (array $st, int $depth = 0) use (&$apply, $polls): array {
+        if ($depth > 3) {
+            return $st;
+        }
+        $uri = rtrim((string) ($st['uri'] ?? ''), '/');
+        if (array_key_exists('poll', $st) && $st['poll'] === null && isset($polls[$uri])) {
+            $st['poll'] = $polls[$uri];
+        }
+        foreach (['reblog', 'quoted_status'] as $k) {
+            if (is_array($st[$k] ?? null)) {
+                $st[$k] = $apply($st[$k], $depth + 1);
+            }
+        }
+        if (is_array($st['quote']['quoted_status'] ?? null)) {
+            $st['quote']['quoted_status'] = $apply($st['quote']['quoted_status'], $depth + 1);
+        }
+        return $st;
+    };
+    if ($isStatus($data)) {
+        return $apply($data);
+    }
+    $applyList = static function (array $list) use ($apply, $isStatus): array {
+        foreach ($list as $i => $item) {
+            if ($isStatus($item)) {
+                $list[$i] = $apply($item);
+            } elseif (is_array($item) && $isStatus($item['status'] ?? null)) {
+                $list[$i]['status'] = $apply($item['status']);
+            }
+        }
+        return $list;
+    };
+    if (array_is_list($data)) {
+        return $applyList($data);
+    }
+    foreach (['ancestors', 'descendants', 'statuses'] as $k) {
+        if (is_array($data[$k] ?? null)) {
+            $data[$k] = $applyList($data[$k]);
+        }
+    }
+    return $data;
 }
 
 /**
@@ -6284,6 +6441,7 @@ function ap_masto_api_poll(mixed $poll): ?array
         'voted' => array_key_exists('voted', $poll) && $poll['voted'] !== null
             ? ap_masto_api_bool($poll['voted'])
             : null,
+        'own_votes' => is_array($poll['own_votes'] ?? null) ? array_values(array_map('intval', $poll['own_votes'])) : null,
         'options' => $options,
     ];
 }
@@ -7071,7 +7229,7 @@ function ap_masto_notifications_axum_fetch(
             CURLOPT_RETURNTRANSFER => true,
             CURLOPT_CONNECTTIMEOUT_MS => 120,
             CURLOPT_TIMEOUT_MS => 350,
-            CURLOPT_HTTPHEADER => ['Accept: application/json', 'Connection: close'],
+            CURLOPT_HTTPHEADER => array_merge(['Accept: application/json', 'Connection: close'], ap_shadow_http_auth_headers()),
         ]);
         $raw = curl_exec($ch);
         $code = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
@@ -7084,7 +7242,7 @@ function ap_masto_notifications_axum_fetch(
             'http' => [
                 'method' => 'GET',
                 'timeout' => 0.35,
-                'header' => "Accept: application/json\r\nConnection: close\r\n",
+                'header' => "Accept: application/json\r\nConnection: close\r\n" . ap_shadow_http_auth_header_text(),
                 'ignore_errors' => true,
             ],
         ]);
@@ -7181,7 +7339,7 @@ function ap_masto_timeline_home_axum_fetch(int $limit = 15, int $ownerUserId = 0
             CURLOPT_RETURNTRANSFER => true,
             CURLOPT_CONNECTTIMEOUT_MS => 120,
             CURLOPT_TIMEOUT_MS => 350,
-            CURLOPT_HTTPHEADER => ['Accept: application/json', 'Connection: close'],
+            CURLOPT_HTTPHEADER => array_merge(['Accept: application/json', 'Connection: close'], ap_shadow_http_auth_headers()),
         ]);
         $raw = curl_exec($ch);
         $code = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
@@ -7194,7 +7352,7 @@ function ap_masto_timeline_home_axum_fetch(int $limit = 15, int $ownerUserId = 0
             'http' => [
                 'method' => 'GET',
                 'timeout' => 0.35,
-                'header' => "Accept: application/json\r\nConnection: close\r\n",
+                'header' => "Accept: application/json\r\nConnection: close\r\n" . ap_shadow_http_auth_header_text(),
                 'ignore_errors' => true,
             ],
         ]);
@@ -7295,7 +7453,7 @@ function ap_masto_timeline_home_axum_since_fetch(int $sinceTs, int $limit = 20, 
             CURLOPT_RETURNTRANSFER => true,
             CURLOPT_CONNECTTIMEOUT_MS => 120,
             CURLOPT_TIMEOUT_MS => 400,
-            CURLOPT_HTTPHEADER => ['Accept: application/json', 'Connection: close'],
+            CURLOPT_HTTPHEADER => array_merge(['Accept: application/json', 'Connection: close'], ap_shadow_http_auth_headers()),
             CURLOPT_HEADER => true,
         ]);
         $raw = curl_exec($ch);
@@ -7319,7 +7477,7 @@ function ap_masto_timeline_home_axum_since_fetch(int $sinceTs, int $limit = 20, 
             'http' => [
                 'method' => 'GET',
                 'timeout' => 0.4,
-                'header' => "Accept: application/json\r\nConnection: close\r\n",
+                'header' => "Accept: application/json\r\nConnection: close\r\n" . ap_shadow_http_auth_header_text(),
                 'ignore_errors' => true,
             ],
         ]);
@@ -7455,7 +7613,7 @@ function ap_masto_timeline_home_axum_since_html_fetch(int $sinceTs, int $limit =
         CURLOPT_HEADER => true,
         CURLOPT_CONNECTTIMEOUT_MS => 120,
         CURLOPT_TIMEOUT_MS => 700,
-        CURLOPT_HTTPHEADER => ['Accept: text/html', 'Connection: close'],
+        CURLOPT_HTTPHEADER => array_merge(['Accept: text/html', 'Connection: close'], ap_shadow_http_auth_headers()),
     ]);
     $raw = curl_exec($ch);
     $code = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
@@ -7545,7 +7703,7 @@ function ap_masto_timeline_chrono_axum_since_html_fetch(string $view, int $since
         CURLOPT_HEADER => true,
         CURLOPT_CONNECTTIMEOUT_MS => 120,
         CURLOPT_TIMEOUT_MS => 700,
-        CURLOPT_HTTPHEADER => ['Accept: text/html', 'Connection: close'],
+        CURLOPT_HTTPHEADER => array_merge(['Accept: text/html', 'Connection: close'], ap_shadow_http_auth_headers()),
     ]);
     $raw = curl_exec($ch);
     $code = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
@@ -8173,7 +8331,7 @@ function ap_masto_notifications_unread_axum_fetch(int $ownerUserId, int $scan = 
         CURLOPT_RETURNTRANSFER => true,
         CURLOPT_CONNECTTIMEOUT_MS => 80,
         CURLOPT_TIMEOUT_MS => 400,
-        CURLOPT_HTTPHEADER => ['Accept: application/json', 'Connection: close'],
+        CURLOPT_HTTPHEADER => array_merge(['Accept: application/json', 'Connection: close'], ap_shadow_http_auth_headers()),
     ]);
     $raw = curl_exec($ch);
     $code = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);

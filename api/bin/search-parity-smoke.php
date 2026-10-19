@@ -1,6 +1,8 @@
 <?php
 declare(strict_types=1);
 
+require_once dirname(__DIR__) . '/ap-shadow-http.php';
+
 /** Validate the Rust Search contract and indexed text/tag projection. */
 $rustUrl = rtrim(trim((string) (getenv('VAAK_SEARCH_CONTRACT_RUST_URL') ?: '')), '/');
 $owner = max(1, (int) (getenv('VAAK_SEARCH_CONTRACT_OWNER_ID') ?: '1'));
@@ -13,7 +15,7 @@ if (preg_match('/novalandia|mkultra|144\.91\.124\.35/i', $rustUrl)) {
     exit(2);
 }
 try {
-    $raw = file_get_contents($rustUrl . '/shadow/search-contract?owner_id=' . $owner);
+    $raw = file_get_contents($rustUrl . '/shadow/search-contract?owner_id=' . $owner, false, stream_context_create(['http' => ['header' => ap_shadow_http_auth_header_text()]]));
     $data = is_string($raw) ? json_decode($raw, true) : null;
     if (!is_array($data) || (int) ($data['owner_id'] ?? 0) !== $owner) {
         throw new RuntimeException('owner-scoped contract missing');
@@ -37,7 +39,7 @@ try {
     }
     $resultBase = preg_replace('#/shadow/search-contract$#', '', $rustUrl) ?: $rustUrl;
     $call = static function (string $url): array {
-        $raw = file_get_contents($url);
+        $raw = file_get_contents($url, false, stream_context_create(['http' => ['header' => ap_shadow_http_auth_header_text()]]));
         $decoded = is_string($raw) ? json_decode($raw, true) : null;
         if (!is_array($decoded)) {
             throw new RuntimeException('invalid indexed Search JSON');

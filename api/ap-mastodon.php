@@ -14,6 +14,7 @@ if (!defined('AP_MASTO_LIB_ONLY')) {
 }
 
 require_once __DIR__ . '/ap-db.php';
+require_once __DIR__ . '/ap-shadow-http.php';
 require_once __DIR__ . '/ap-auth.php';
 require_once __DIR__ . '/ap-r2.php';
 require_once __DIR__ . '/ap-masto-entities.php';
@@ -167,6 +168,11 @@ function ap_masto_json(mixed $data, int $code = 200): void
 {
     http_response_code($code);
     header('Content-Type: application/json; charset=utf-8');
+    // Remote polls carry the viewer's vote, so they join the response here
+    // instead of inside status builders whose output can be cached.
+    if ($code === 200 && function_exists('ap_masto_attach_remote_polls')) {
+        $data = ap_masto_attach_remote_polls($data);
+    }
     // INVALID_UTF8_SUBSTITUTE: never emit an empty body (Ice Cubes →
     // "The data couldn't be read because it isn't in the correct format").
     $json = json_encode(
@@ -409,7 +415,7 @@ function ap_masto_timeline_home_axum_try(int $limit, ?string $maxId, ?string $si
             CURLOPT_RETURNTRANSFER => true,
             CURLOPT_CONNECTTIMEOUT_MS => 120,
             CURLOPT_TIMEOUT_MS => 350,
-            CURLOPT_HTTPHEADER => ['Accept: application/json', 'Connection: close'],
+            CURLOPT_HTTPHEADER => array_merge(['Accept: application/json', 'Connection: close'], ap_shadow_http_auth_headers()),
             CURLOPT_HEADERFUNCTION => static function ($ch, string $headerLine) use (&$link): int {
                 if (stripos($headerLine, 'Link:') === 0) {
                     $link = trim(substr($headerLine, 5));
@@ -428,7 +434,7 @@ function ap_masto_timeline_home_axum_try(int $limit, ?string $maxId, ?string $si
             'http' => [
                 'method' => 'GET',
                 'timeout' => 0.35,
-                'header' => "Accept: application/json\r\nConnection: close\r\n",
+                'header' => "Accept: application/json\r\nConnection: close\r\n" . ap_shadow_http_auth_header_text(),
                 'ignore_errors' => true,
             ],
         ]);
@@ -711,6 +717,56 @@ function ap_masto_oauth_param(string $key, string $default = ''): string
     return (string) ($_GET[$key] ?? $_POST[$key] ?? $default);
 }
 
+/**
+ * OAuth authorize with two-factor: after the password step the pending
+ * sign-in lives in the PHP session, bound to the exact client, redirect,
+ * scope, state and PKCE values, and expires like the web 2FA step.
+ */
+function ap_masto_oauth_2fa_binding(string $clientId, string $redirectUri, string $scope, string $state, string $challenge, string $challengeMethod): string
+{
+    return hash('sha256', (string) json_encode([$clientId, $redirectUri, $scope, $state, $challenge, strtoupper(trim($challengeMethod))]));
+}
+
+function ap_masto_oauth_2fa_begin(string $binding, int $userId): void
+{
+    ap_auth_start_session();
+    $_SESSION['vaak_oauth_2fa'] = ['user_id' => $userId, 'at' => time(), 'fails' => 0, 'binding' => $binding];
+}
+
+/**
+ * One code attempt for a pending OAuth sign-in, with the same limits as
+ * the web login. keep=true means the code form should be shown again.
+ *
+ * @return array{user?:array,error?:string,keep:bool}
+ */
+function ap_masto_oauth_2fa_step(string $binding, string $code): array
+{
+    ap_auth_start_session();
+    $pending = $_SESSION['vaak_oauth_2fa'] ?? null;
+    $userId = is_array($pending) ? (int) ($pending['user_id'] ?? 0) : 0;
+    $started = is_array($pending) ? (int) ($pending['at'] ?? 0) : 0;
+    if ($userId < 1 || $started < 1 || time() - $started > 600
+        || !hash_equals((string) ($pending['binding'] ?? ''), $binding)
+    ) {
+        unset($_SESSION['vaak_oauth_2fa']);
+        return ['error' => 'Two-factor sign-in expired. Please sign in again.', 'keep' => false];
+    }
+    $attempt = ap_auth_2fa_pending_attempt($userId, $code, (int) ($pending['fails'] ?? 0));
+    if ($attempt['status'] === 'invalid') {
+        $_SESSION['vaak_oauth_2fa']['fails'] = $attempt['fails'];
+        return ['error' => $attempt['error'], 'keep' => true];
+    }
+    unset($_SESSION['vaak_oauth_2fa']);
+    if ($attempt['status'] !== 'ok') {
+        return ['error' => $attempt['error'], 'keep' => false];
+    }
+    $user = ap_auth_user_by_id($userId);
+    if (!is_array($user)) {
+        return ['error' => 'Account is no longer available.', 'keep' => false];
+    }
+    return ['user' => $user, 'keep' => false];
+}
+
 function ap_masto_oauth_authorize(string $method): void
 {
     $clientId = ap_masto_oauth_param('client_id');
@@ -756,83 +812,105 @@ function ap_masto_oauth_authorize(string $method): void
 
     // Client/redirect/PKCE must be valid to show the login form (not auth failures).
     $configOk = ($error === null);
+    $show2fa = false;
 
     if ($method === 'POST' && $configOk) {
+        $binding = ap_masto_oauth_2fa_binding($clientId, $redirectUri, $scope, $state, $challenge, $challengeMethod);
+        $user = null;
         if (!ap_masto_oauth_rate_ok()) {
             $error = 'Too many attempts. Try again in a few minutes.';
+        } elseif ((string) ($_POST['oauth_step'] ?? '') === '2fa') {
+            $step = ap_masto_oauth_2fa_step($binding, (string) ($_POST['code'] ?? ''));
+            $user = $step['user'] ?? null;
+            if (!is_array($user)) {
+                $error = $step['error'] ?? 'Two-factor verification failed.';
+                $show2fa = !empty($step['keep']);
+            }
         } else {
             $username = (string) ($_POST['username'] ?? '');
             $password = (string) ($_POST['password'] ?? '');
-            $user = ap_auth_verify_credentials($username, $password);
-            if ($user === null) {
+            $limited = false;
+            $verified = ap_auth_verify_credentials_limited($username, $password, $limited);
+            if ($limited) {
+                $error = 'Too many attempts. Try again in a few minutes.';
+            } elseif ($verified === null) {
                 ap_masto_oauth_rate_fail();
                 $error = 'Invalid username or password';
             } else {
                 ap_masto_oauth_rate_ok(true); // clear fail counter on success
-                $granted = ap_oauth_normalize_scopes($scope);
-                // Intersect with app's registered scopes
-                $appScopes = ap_oauth_normalize_scopes((string) $app['scopes']);
-                $parts = [];
-                foreach (preg_split('/\s+/', $granted) ?: [] as $s) {
-                    if (ap_oauth_scopes_allow($appScopes, $s) || ap_oauth_scopes_allow($appScopes, explode(':', $s)[0])) {
-                        $parts[] = $s;
-                    }
-                }
-                if (!$parts) {
-                    $error = 'Requested scopes do not overlap this app’s registered scopes.';
-                    ap_masto_oauth_rate_fail();
-                    // fall through to re-render authorize form with error
+                if (ap_auth_2fa_enabled((int) $verified['id'])) {
+                    // No code is issued until the second factor passes.
+                    ap_masto_oauth_2fa_begin($binding, (int) $verified['id']);
+                    $show2fa = true;
                 } else {
-                    $code = ap_oauth_code_create(
-                        $clientId,
-                        implode(' ', $parts),
-                        $redirectUri,
-                        $challenge !== '' ? $challenge : null,
-                        $challenge !== '' ? 'S256' : null,
-                        (int) $user['id']
-                    );
-                    if ($redirectUri === 'urn:ietf:wg:oauth:2.0:oob') {
-                        header('Content-Type: text/html; charset=utf-8');
-                        echo '<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1">'
-                            . '<body style="font:16px/1.4 system-ui;background:#111;color:#eee;padding:2rem">'
-                            . '<h1>Authorization code</h1><p>Paste this back into the app:</p>'
-                            . '<code style="font-size:1.2rem;word-break:break-all">' . htmlspecialchars($code) . '</code></body>';
-                        exit;
-                    }
-                    $sep = str_contains($redirectUri, '?') ? '&' : '?';
-                    $loc = $redirectUri . $sep . 'code=' . rawurlencode($code);
-                    if ($state !== '') {
-                        $loc .= '&state=' . rawurlencode($state);
-                    }
-                    // Custom-scheme clients (Ice Cubes: icecubesapp://) — WKWebView often
-                    // drops bare 302 Location to non-http(s) schemes and leaves the user
-                    // on the authorize form while /oauth/token gets a bad/missing code.
-                    // Serve an interstitial that also JS-navigates to the app callback.
-                    $isCustomScheme = !str_starts_with($redirectUri, 'https://')
-                        && !str_starts_with($redirectUri, 'http://')
-                        && $redirectUri !== 'urn:ietf:wg:oauth:2.0:oob';
-                    if ($isCustomScheme) {
-                        // 200 (not 302): WKWebView often ignores Location: to custom schemes.
-                        // Rendering this page lets meta-refresh / JS / tap open Ice Cubes.
-                        http_response_code(200);
-                        header('Content-Type: text/html; charset=utf-8');
-                        $safeLoc = htmlspecialchars($loc, ENT_QUOTES, 'UTF-8');
-                        $jsLoc = json_encode($loc, JSON_UNESCAPED_SLASHES | JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS);
-                        echo '<!doctype html><html><head><meta charset="utf-8">'
-                            . '<meta name="viewport" content="width=device-width,initial-scale=1">'
-                            . '<meta http-equiv="refresh" content="0;url=' . $safeLoc . '">'
-                            . '<title>Returning to app…</title>'
-                            . '<style>body{font:16px/1.45 system-ui,sans-serif;background:#0b0c0f;color:#e8e8e8;margin:0;padding:2rem}'
-                            . 'a{color:#8bf}</style></head><body>'
-                            . '<p>Authorized. Returning to Ice Cubes…</p>'
-                            . '<p><a id="go" href="' . $safeLoc . '">Tap here if the app doesn’t open</a></p>'
-                            . '<script>location.replace(' . $jsLoc . ');</script>'
-                            . '</body></html>';
-                        exit;
-                    }
-                    header('Location: ' . $loc, true, 302);
+                    $user = $verified;
+                }
+            }
+        }
+        if (is_array($user)) {
+            $granted = ap_oauth_normalize_scopes($scope);
+            // Intersect with app's registered scopes
+            $appScopes = ap_oauth_normalize_scopes((string) $app['scopes']);
+            $parts = [];
+            foreach (preg_split('/\s+/', $granted) ?: [] as $s) {
+                if (ap_oauth_scopes_allow($appScopes, $s) || ap_oauth_scopes_allow($appScopes, explode(':', $s)[0])) {
+                    $parts[] = $s;
+                }
+            }
+            if (!$parts) {
+                $error = 'Requested scopes do not overlap this app’s registered scopes.';
+                ap_masto_oauth_rate_fail();
+                // fall through to re-render authorize form with error
+            } else {
+                $code = ap_oauth_code_create(
+                    $clientId,
+                    implode(' ', $parts),
+                    $redirectUri,
+                    $challenge !== '' ? $challenge : null,
+                    $challenge !== '' ? 'S256' : null,
+                    (int) $user['id']
+                );
+                if ($redirectUri === 'urn:ietf:wg:oauth:2.0:oob') {
+                    header('Content-Type: text/html; charset=utf-8');
+                    echo '<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1">'
+                        . '<body style="font:16px/1.4 system-ui;background:#111;color:#eee;padding:2rem">'
+                        . '<h1>Authorization code</h1><p>Paste this back into the app:</p>'
+                        . '<code style="font-size:1.2rem;word-break:break-all">' . htmlspecialchars($code) . '</code></body>';
                     exit;
                 }
+                $sep = str_contains($redirectUri, '?') ? '&' : '?';
+                $loc = $redirectUri . $sep . 'code=' . rawurlencode($code);
+                if ($state !== '') {
+                    $loc .= '&state=' . rawurlencode($state);
+                }
+                // Custom-scheme clients (Ice Cubes: icecubesapp://) — WKWebView often
+                // drops bare 302 Location to non-http(s) schemes and leaves the user
+                // on the authorize form while /oauth/token gets a bad/missing code.
+                // Serve an interstitial that also JS-navigates to the app callback.
+                $isCustomScheme = !str_starts_with($redirectUri, 'https://')
+                    && !str_starts_with($redirectUri, 'http://')
+                    && $redirectUri !== 'urn:ietf:wg:oauth:2.0:oob';
+                if ($isCustomScheme) {
+                    // 200 (not 302): WKWebView often ignores Location: to custom schemes.
+                    // Rendering this page lets meta-refresh / JS / tap open Ice Cubes.
+                    http_response_code(200);
+                    header('Content-Type: text/html; charset=utf-8');
+                    $safeLoc = htmlspecialchars($loc, ENT_QUOTES, 'UTF-8');
+                    $jsLoc = json_encode($loc, JSON_UNESCAPED_SLASHES | JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS);
+                    echo '<!doctype html><html><head><meta charset="utf-8">'
+                        . '<meta name="viewport" content="width=device-width,initial-scale=1">'
+                        . '<meta http-equiv="refresh" content="0;url=' . $safeLoc . '">'
+                        . '<title>Returning to app…</title>'
+                        . '<style>body{font:16px/1.45 system-ui,sans-serif;background:#0b0c0f;color:#e8e8e8;margin:0;padding:2rem}'
+                        . 'a{color:#8bf}</style></head><body>'
+                        . '<p>Authorized. Returning to Ice Cubes…</p>'
+                        . '<p><a id="go" href="' . $safeLoc . '">Tap here if the app doesn’t open</a></p>'
+                        . '<script>location.replace(' . $jsLoc . ');</script>'
+                        . '</body></html>';
+                    exit;
+                }
+                header('Location: ' . $loc, true, 302);
+                exit;
             }
         }
     }
@@ -865,9 +943,13 @@ function ap_masto_oauth_authorize(string $method): void
             . '<input type="hidden" name="response_type" value="code">'
             . ($challenge !== '' ? '<input type="hidden" name="code_challenge" value="' . htmlspecialchars($challenge, ENT_QUOTES, 'UTF-8') . '">' : '')
             . ($challengeMethod !== '' ? '<input type="hidden" name="code_challenge_method" value="' . htmlspecialchars($challengeMethod, ENT_QUOTES, 'UTF-8') . '">' : '')
-            . '<label>Username<br><input type="text" name="username" required autocomplete="username" placeholder="username or email" value="' . $postedUser . '"></label>'
-            . '<label>Password<br><input type="password" name="password" required autocomplete="current-password" placeholder="Account password (admins may use app password)"></label>'
-            . '<button type="submit">Authorize</button>'
+            . ($show2fa
+                ? '<input type="hidden" name="oauth_step" value="2fa">'
+                    . '<label>Two-factor code<br><input type="text" name="code" required autocomplete="one-time-code" inputmode="numeric" placeholder="6-digit code or recovery code" autofocus></label>'
+                    . '<button type="submit">Verify and authorize</button>'
+                : '<label>Username<br><input type="text" name="username" required autocomplete="username" placeholder="username or email" value="' . $postedUser . '"></label>'
+                    . '<label>Password<br><input type="password" name="password" required autocomplete="current-password" placeholder="Account password (admins may use app password)"></label>'
+                    . '<button type="submit">Authorize</button>')
             . '</form>';
     } else {
         echo '<p style="margin-top:1rem">Fix the client configuration and try again from the app.</p>';
@@ -2355,6 +2437,23 @@ function ap_masto_api(string $method, string $path): void
         $voterActor = function_exists('ap_masto_session_actor_id')
             ? ap_masto_session_actor_id()
             : rtrim((string) ($GLOBALS['vaak_actor_id'] ?? 'https://mkultra.monster/users/cmdr_nova'), '/');
+        if (ap_remote_poll_row_id((int) $pm[1]) > 0) {
+            // Remote poll: record locally, federate the ballot to the author.
+            if (!function_exists('ap_remote_poll_vote')) {
+                if (!defined('AP_INBOX_LIB_ONLY')) {
+                    define('AP_INBOX_LIB_ONLY', true);
+                }
+                require_once __DIR__ . '/ap-inbox.php';
+            }
+            $res = ap_remote_poll_vote((int) $pm[1], $voterActor, $choices);
+            if (empty($res['ok'])) {
+                $code = ($res['error'] ?? '') === 'Poll not found' ? 404 : 422;
+                ap_masto_json(['error' => $res['error'] ?? 'Vote failed'], $code);
+            }
+            $row = ap_remote_poll_find((int) $pm[1]);
+            ap_masto_json(is_array($row) ? ap_masto_remote_poll_entity($row, $res['own_votes'] ?? []) : null);
+            return;
+        }
         $res = ap_masto_poll_vote((int) $pm[1], $voterActor, $choices);
         if (empty($res['ok'])) {
             $code = ($res['error'] ?? '') === 'Poll not found' ? 404 : 422;
@@ -2371,6 +2470,17 @@ function ap_masto_api(string $method, string $path): void
 
     if (preg_match('#^/api/v1/polls/(\d+)$#', $path, $pm) && $method === 'GET') {
         ap_masto_require_token('read');
+        if (ap_remote_poll_row_id((int) $pm[1]) > 0) {
+            $row = ap_remote_poll_find((int) $pm[1]);
+            $entity = is_array($row)
+                ? ap_masto_remote_poll_entity($row, ap_remote_poll_own_votes((string) $row['note_id'], ap_masto_session_actor_id()))
+                : null;
+            if ($entity === null) {
+                ap_masto_json(['error' => 'Record not found'], 404);
+            }
+            ap_masto_json($entity);
+            return;
+        }
         $st = ap_db()->prepare('SELECT * FROM masto_polls WHERE local_id = ?');
         $st->execute([(int) $pm[1]]);
         $row = $st->fetch();

@@ -27,6 +27,7 @@ if (!$vaakAdminLibOnly) {
 }
 
 require_once __DIR__ . '/ap-db.php';
+require_once __DIR__ . '/ap-shadow-http.php';
 require_once __DIR__ . '/ap-timeline-cursor.php';
 require_once __DIR__ . '/ap-timeline-older.php';
 
@@ -1072,11 +1073,14 @@ $vaakAdminOnlyActions = [
         $password = (string) ($_POST['account_password'] ?? '');
         $code = trim((string) ($_POST['account_2fa_code'] ?? ''));
         $view = 'account_switcher';
-        $candidate = ($login !== '' && $password !== '') ? ap_auth_verify_credentials($login, $password) : null;
-        if (!is_array($candidate)) {
+        $limited = false;
+        $candidate = ($login !== '' && $password !== '') ? ap_auth_verify_credentials_limited($login, $password, $limited) : null;
+        if ($limited) {
+            $error = 'Too many attempts for that account. Try again in a few minutes.';
+        } elseif (!is_array($candidate)) {
             $error = 'Account credentials were not accepted.';
         } elseif (ap_auth_2fa_enabled((int) ($candidate['id'] ?? 0))
-            && !ap_auth_2fa_verify_code((int) ($candidate['id'] ?? 0), $code)
+            && !ap_auth_2fa_verify_code_limited((int) ($candidate['id'] ?? 0), $code)
         ) {
             $error = 'That account requires a valid two-factor code.';
         } else {
@@ -1281,10 +1285,15 @@ $vaakAdminOnlyActions = [
             if ($voter === '') {
                 $error = 'Not signed in.';
             } else {
-                $vres = ap_masto_poll_vote($pollId, $voter, $choices);
+                $remoteVote = ap_remote_poll_row_id($pollId) > 0;
+                $vres = $remoteVote
+                    ? ap_remote_poll_vote($pollId, $voter, $choices)
+                    : ap_masto_poll_vote($pollId, $voter, $choices);
                 if (!empty($vres['ok'])) {
                     $notice = 'Vote recorded.';
-                    if ($noteIdForPoll === '') {
+                    if ($remoteVote) {
+                        $noteIdForPoll = (string) ($vres['note_id'] ?? $noteIdForPoll);
+                    } elseif ($noteIdForPoll === '') {
                         try {
                             $pst = ap_db()->prepare('SELECT note_id FROM masto_polls WHERE local_id = ?');
                             $pst->execute([$pollId]);
@@ -4706,17 +4715,26 @@ $vaakAdminOnlyActions = [
         } else {
         $pass = (string) ($_POST['password'] ?? '');
         $pass2 = (string) ($_POST['password_confirm'] ?? '');
+        $appPwBucket = 'pwchange:u' . $vaakOwnerId;
         if ($pass !== $pass2) {
             $error = 'Passwords do not match.';
+        } elseif (ap_auth_rate_fails($appPwBucket) >= AP_AUTH_PASSWORD_CHANGE_MAX) {
+            $error = 'Too many attempts. Try again in a few minutes.';
+        } elseif (ap_auth_verify_credentials($vaakUsername, (string) ($_POST['current_password'] ?? '')) === null) {
+            // This also replaces the VAAK login password, so it needs the current one.
+            ap_auth_rate_fail($appPwBucket);
+            $error = 'Current password is incorrect.';
         } else {
+            ap_auth_rate_clear($appPwBucket);
             $res = ap_app_password_set($pass);
             if (!empty($res['ok'])) {
                 // Keep VAAK web login in sync (cmdr_nova uses the same password)
                 $row = ap_db()->query('SELECT password_hash FROM app_auth WHERE id = 1')->fetch();
                 if (is_array($row) && !empty($row['password_hash'])) {
                     ap_auth_sync_admin_password_hash((string) $row['password_hash']);
+                    ap_auth_revoke_user_credentials($vaakOwnerId);
                 }
-                $notice = 'App password saved. Use it for VAAK login and Ice Cubes (@cmdr_nova@mkultra.monster).';
+                $notice = 'App password saved. Use it for VAAK login and Ice Cubes (@cmdr_nova@mkultra.monster). Other sessions and app tokens were signed out.';
             } else {
                 $error = $res['error'] ?? 'Could not save app password.';
             }
@@ -4733,13 +4751,13 @@ $vaakAdminOnlyActions = [
         if ($pass !== $pass2) {
             $error = 'Passwords do not match.';
         } else {
-            $res = ap_auth_user_set_password($vaakOwnerId, $pass);
+            $res = ap_auth_change_password($vaakOwnerId, (string) ($_POST['current_password'] ?? ''), $pass);
             if (!empty($res['ok'])) {
                 // Keep Ice Cubes app password in sync only for cmdr_nova
                 if ($vaakActorKey === 'cmdr_nova' && function_exists('ap_app_password_set')) {
                     ap_app_password_set($pass);
                 }
-                $notice = 'Account password updated. Use it next time you log in to VAAK.';
+                $notice = 'Account password updated. Other sessions and app tokens were signed out.';
             } else {
                 $error = $res['error'] ?? 'Could not update password.';
             }
@@ -5303,7 +5321,7 @@ function admin_library_data_axum_fetch(int $ownerUserId, int $offset = 0, int $l
     [$libraryOffset, $libraryLimit] = admin_library_page_bounds($offset, $limit);
     $ch = curl_init($base . '/shadow/library-data?' . http_build_query(['owner_id' => $ownerUserId, 'library_kind' => $libraryKind, 'folder_id' => max(0, $folderId), 'offset' => $libraryOffset, 'limit' => $libraryLimit]));
     if ($ch === false) return null;
-    curl_setopt_array($ch, [CURLOPT_RETURNTRANSFER => true, CURLOPT_CONNECTTIMEOUT_MS => 80, CURLOPT_TIMEOUT_MS => 350, CURLOPT_HTTPHEADER => ['Accept: application/json', 'Connection: close']]);
+    curl_setopt_array($ch, [CURLOPT_RETURNTRANSFER => true, CURLOPT_CONNECTTIMEOUT_MS => 80, CURLOPT_TIMEOUT_MS => 350, CURLOPT_HTTPHEADER => array_merge(['Accept: application/json', 'Connection: close'], ap_shadow_http_auth_headers())]);
     $raw = curl_exec($ch);
     $code = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
     curl_close($ch);
@@ -16109,6 +16127,7 @@ function admin_poll_block_html(string $noteId, bool $interactive = true, string 
     $votesCount = 0;
     $votersCount = 0;
     $voted = false;
+    $ownVotes = [];
     $pollLocalId = 0;
     try {
         $st = ap_db()->prepare('SELECT * FROM masto_polls WHERE note_id = ? OR note_id = ? LIMIT 1');
@@ -16174,11 +16193,10 @@ function admin_poll_block_html(string $noteId, bool $interactive = true, string 
         }
     }
     if ((!is_array($choices) || $choices === []) && !str_starts_with($noteId, 'https://mkultra.monster/')) {
-        // Remote Question stored at inbox (display-only, no vote form).
+        // Remote Question stored at inbox. Votes go to the author through
+        // ap_remote_poll_vote; the form posts the remote public poll id.
         try {
-            $rst = ap_db()->prepare('SELECT * FROM remote_polls WHERE note_id = ? LIMIT 1');
-            $rst->execute([$noteId]);
-            $remotePoll = $rst->fetch();
+            $remotePoll = ap_remote_poll_find($noteId);
         } catch (Throwable $e) {
             $remotePoll = null;
         }
@@ -16189,12 +16207,11 @@ function admin_poll_block_html(string $noteId, bool $interactive = true, string 
             $votesCount = (int) ($remotePoll['votes_count'] ?? 0);
             $votersCount = (int) ($remotePoll['voters_count'] ?? 0);
             $expiresAt = (string) ($remotePoll['expires_at'] ?? '');
-            try {
-                $expired = !empty($remotePoll['closed'])
-                    || ($expiresAt !== '' && (new DateTimeImmutable($expiresAt)) <= new DateTimeImmutable('now'));
-            } catch (Throwable $e) {
-                $expired = !empty($remotePoll['closed']);
-            }
+            $expired = ap_remote_poll_is_expired($remotePoll);
+            $pollLocalId = ap_remote_poll_public_id((int) ($remotePoll['id'] ?? 0));
+            $mine = ap_remote_poll_own_votes($noteId, function_exists('vaak_actor_id') ? vaak_actor_id() : '');
+            $voted = $mine !== null;
+            $ownVotes = $mine ?? [];
         }
     }
     if (!is_array($choices) || $choices === []) {
@@ -16246,13 +16263,15 @@ function admin_poll_block_html(string $noteId, bool $interactive = true, string 
         $html .= '<button class="btn btn-ghost" type="submit" style="margin-top:.4rem;padding:.3rem .7rem;font-size:.82rem">Vote</button>'
             . '</form>';
     } else {
-        foreach ($opts as $opt) {
+        foreach ($opts as $i => $opt) {
             $pct = ($showResults && $votesCount > 0)
                 ? (int) round(($opt['votes'] / $votesCount) * 100)
                 : 0;
-            $html .= '<div class="poll-opt' . ($showResults ? ' poll-opt--result' : '') . '">'
+            $own = in_array($i, $ownVotes, true);
+            $html .= '<div class="poll-opt' . ($showResults ? ' poll-opt--result' : '') . ($own ? ' poll-opt--own' : '') . '">'
                 . '<div class="poll-opt-bar" style="width:' . $pct . '%"></div>'
-                . '<span class="poll-opt-text">' . h($opt['title']) . '</span>';
+                . '<span class="poll-opt-text">' . h($opt['title']) . '</span>'
+                . ($own ? '<span class="poll-opt-own" title="Your vote">✓</span>' : '');
             if ($showResults) {
                 $html .= '<span class="poll-opt-count">' . $pct . '% · ' . (int) $opt['votes'] . '</span>';
             }
@@ -24771,7 +24790,7 @@ function admin_account_switch_axum_prep(int $ownerUserId, string $returnView = '
         CURLOPT_RETURNTRANSFER => true,
         CURLOPT_CONNECTTIMEOUT_MS => 120,
         CURLOPT_TIMEOUT_MS => 3000,
-        CURLOPT_HTTPHEADER => ['Accept: application/json', 'Connection: close'],
+        CURLOPT_HTTPHEADER => array_merge(['Accept: application/json', 'Connection: close'], ap_shadow_http_auth_headers()),
     ]);
     $raw = curl_exec($ch);
     $code = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
@@ -24797,7 +24816,7 @@ function admin_shadow_admin_health_fetch(): ?array
     if (!is_string($host) || !in_array(strtolower($host), ['127.0.0.1', 'localhost', '::1'], true)) return null;
     $ch = curl_init($base . '/shadow/admin-health');
     if ($ch === false) return null;
-    curl_setopt_array($ch, [CURLOPT_RETURNTRANSFER => true, CURLOPT_CONNECTTIMEOUT_MS => 80, CURLOPT_TIMEOUT_MS => 350, CURLOPT_HTTPHEADER => ['Accept: application/json', 'Connection: close']]);
+    curl_setopt_array($ch, [CURLOPT_RETURNTRANSFER => true, CURLOPT_CONNECTTIMEOUT_MS => 80, CURLOPT_TIMEOUT_MS => 350, CURLOPT_HTTPHEADER => array_merge(['Accept: application/json', 'Connection: close'], ap_shadow_http_auth_headers())]);
     $raw = curl_exec($ch);
     $code = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
     curl_close($ch);
@@ -24836,7 +24855,7 @@ function admin_you_projection_axum_fetch(string $kind, int $ownerUserId, int $li
         CURLOPT_RETURNTRANSFER => true,
         CURLOPT_CONNECTTIMEOUT_MS => 80,
         CURLOPT_TIMEOUT_MS => 350,
-        CURLOPT_HTTPHEADER => ['Accept: application/json', 'Connection: close'],
+        CURLOPT_HTTPHEADER => array_merge(['Accept: application/json', 'Connection: close'], ap_shadow_http_auth_headers()),
     ]);
     $raw = curl_exec($ch);
     $code = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
@@ -24863,7 +24882,7 @@ function admin_relationship_projection_axum_fetch(string $relationship, int $own
         'limit' => max(1, min(500, $limit)),
     ]));
     if ($ch === false) return null;
-    curl_setopt_array($ch, [CURLOPT_RETURNTRANSFER => true, CURLOPT_CONNECTTIMEOUT_MS => 80, CURLOPT_TIMEOUT_MS => 350, CURLOPT_HTTPHEADER => ['Accept: application/json', 'Connection: close']]);
+    curl_setopt_array($ch, [CURLOPT_RETURNTRANSFER => true, CURLOPT_CONNECTTIMEOUT_MS => 80, CURLOPT_TIMEOUT_MS => 350, CURLOPT_HTTPHEADER => array_merge(['Accept: application/json', 'Connection: close'], ap_shadow_http_auth_headers())]);
     $raw = curl_exec($ch);
     $code = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
     curl_close($ch);
@@ -24883,7 +24902,7 @@ function admin_settings_projection_axum_fetch(int $ownerUserId): ?array
     if (!is_string($host) || !in_array(strtolower($host), ['127.0.0.1', 'localhost', '::1'], true)) return null;
     $ch = curl_init($base . '/shadow/settings?' . http_build_query(['owner_id' => $ownerUserId]));
     if ($ch === false) return null;
-    curl_setopt_array($ch, [CURLOPT_RETURNTRANSFER => true, CURLOPT_CONNECTTIMEOUT_MS => 80, CURLOPT_TIMEOUT_MS => 350, CURLOPT_HTTPHEADER => ['Accept: application/json', 'Connection: close']]);
+    curl_setopt_array($ch, [CURLOPT_RETURNTRANSFER => true, CURLOPT_CONNECTTIMEOUT_MS => 80, CURLOPT_TIMEOUT_MS => 350, CURLOPT_HTTPHEADER => array_merge(['Accept: application/json', 'Connection: close'], ap_shadow_http_auth_headers())]);
     $raw = curl_exec($ch);
     $code = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
     curl_close($ch);
@@ -24974,7 +24993,7 @@ function admin_profile_html_axum_fetch(
         // shorter than that, so PHP dropped the cards and the tab showed
         // only "End of profile".
         CURLOPT_TIMEOUT_MS => 8000,
-        CURLOPT_HTTPHEADER => ['Accept: text/html', 'Connection: close'],
+        CURLOPT_HTTPHEADER => array_merge(['Accept: text/html', 'Connection: close'], ap_shadow_http_auth_headers()),
     ]);
     $raw = curl_exec($ch);
     $code = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
@@ -25080,7 +25099,7 @@ function admin_tl_html_axum_fetch(string $view, int $limit, int $ownerUserId = 0
         CURLOPT_HEADER => true,
         CURLOPT_CONNECTTIMEOUT_MS => 120,
         CURLOPT_TIMEOUT_MS => 1500,
-        CURLOPT_HTTPHEADER => ['Accept: text/html', 'Connection: close'],
+        CURLOPT_HTTPHEADER => array_merge(['Accept: text/html', 'Connection: close'], ap_shadow_http_auth_headers()),
     ]);
     $raw = curl_exec($ch);
     $code = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
@@ -25236,7 +25255,7 @@ function admin_mentions_html_axum_fetch(int $limit, ?string $maxId, array $types
         CURLOPT_HEADER => true,
         CURLOPT_CONNECTTIMEOUT_MS => 120,
         CURLOPT_TIMEOUT_MS => 1500,
-        CURLOPT_HTTPHEADER => ['Accept: text/html', 'Connection: close'],
+        CURLOPT_HTTPHEADER => array_merge(['Accept: text/html', 'Connection: close'], ap_shadow_http_auth_headers()),
     ]);
     $raw = curl_exec($ch);
     $code = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
@@ -25322,7 +25341,7 @@ function admin_notif_embed_axum_fetch(
             CURLOPT_RETURNTRANSFER => true,
             CURLOPT_CONNECTTIMEOUT_MS => 80,
             CURLOPT_TIMEOUT_MS => 200,
-            CURLOPT_HTTPHEADER => ['Accept: text/html', 'Connection: close'],
+            CURLOPT_HTTPHEADER => array_merge(['Accept: text/html', 'Connection: close'], ap_shadow_http_auth_headers()),
         ]);
         $raw = curl_exec($ch);
         $code = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
@@ -25335,7 +25354,7 @@ function admin_notif_embed_axum_fetch(
             'http' => [
                 'method' => 'GET',
                 'timeout' => 0.2,
-                'header' => "Accept: text/html\r\nConnection: close\r\n",
+                'header' => "Accept: text/html\r\nConnection: close\r\n" . ap_shadow_http_auth_header_text(),
                 'ignore_errors' => true,
             ],
         ]);
@@ -27329,6 +27348,8 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       position: relative; z-index: 1; flex: 0 0 auto;
       font-size: .75rem; color: var(--primary);
     }
+    .poll-block .poll-opt--own { border-color: color-mix(in srgb, var(--primary) 55%, var(--border)); }
+    .poll-block .poll-opt-own { position: relative; z-index: 1; flex: 0 0 auto; color: var(--primary); font-size: .8rem; }
     .poll-block .poll-meta { margin-top: .4rem; font-size: .75rem; color: var(--muted); }
     .poll-block .poll-vote-form .btn {
       border-color: color-mix(in srgb, var(--primary) 40%, var(--border));
@@ -31173,6 +31194,7 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
           <input type="hidden" name="action" value="change_password">
           <input type="hidden" name="return_view" value="security">
           <div class="meta" style="margin-bottom:.45rem"><strong>Change account password</strong></div>
+          <input type="password" name="current_password" required autocomplete="current-password" placeholder="Current password">
           <input type="password" name="password" required minlength="10" autocomplete="new-password" placeholder="New password (min 10 chars)">
           <input type="password" name="password_confirm" required minlength="10" autocomplete="new-password" placeholder="Confirm password">
           <div class="composer-actions">
@@ -31257,6 +31279,7 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
         </div>
         <form class="composer" method="post" action="?view=security" style="margin-bottom:1.25rem">
           <input type="hidden" name="action" value="set_app_password">
+          <input type="password" name="current_password" required autocomplete="current-password" placeholder="Current password">
           <input type="password" name="password" required minlength="10" autocomplete="new-password" placeholder="New app password (min 10 chars)">
           <input type="password" name="password_confirm" required minlength="10" autocomplete="new-password" placeholder="Confirm app password">
           <div class="composer-actions">
@@ -31818,6 +31841,7 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
             Updates your VAAK login password for <code><?= h($vaakUsername) ?></code>
             (also available under <a href="?view=security">You → Security</a>).
           </div>
+          <input type="password" name="current_password" required autocomplete="current-password" placeholder="Current password">
           <input type="password" name="password" required minlength="10" autocomplete="new-password" placeholder="New password (min 10 chars)">
           <input type="password" name="password_confirm" required minlength="10" autocomplete="new-password" placeholder="Confirm password">
           <div class="composer-actions">
