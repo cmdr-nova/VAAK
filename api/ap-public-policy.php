@@ -29,6 +29,8 @@ if ($rules !== []) {
     }
     $bodyHtml .= '</ol>';
 }
+require_once __DIR__ . '/ap-csp.php';
+ap_csp_send_headers('app');
 header('Content-Type: text/html; charset=utf-8');
 header('Cache-Control: no-store, no-cache, must-revalidate');
 ?><!doctype html>

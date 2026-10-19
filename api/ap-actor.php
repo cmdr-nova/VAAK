@@ -24,6 +24,8 @@ $wantsAp = str_contains($accept, 'application/activity+json')
     || str_contains($accept, 'application/json');
 
 if (!$wantsAp && strtoupper($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'GET') {
+    require_once __DIR__ . '/ap-csp.php';
+    ap_csp_send_headers('app');
     header('Content-Type: text/html; charset=utf-8');
     echo '<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">';
     echo '<title>mkultra.monster instance actor</title>';

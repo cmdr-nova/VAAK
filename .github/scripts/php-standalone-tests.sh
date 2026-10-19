@@ -52,6 +52,7 @@ php_tests=(
   api/bin/downrank-search-trends-smoke.php
   api/bin/bsky-notif-subject-backfill-smoke.php
   api/bin/remote-poll-smoke.php
+  api/bin/csp-smoke.php
   api/bin/bsky-jetstream-media-smoke.php
   api/bin/jetstream-worker-smoke.php
   api/bin/media-warm-lock-smoke.php
