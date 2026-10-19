@@ -16,6 +16,13 @@
 -- idx_remote_actors_lower_host_username matches the actor alias lookup in
 -- ap_masto_actor_id_aliases() and the Rust search alias lookup:
 --   WHERE lower(COALESCE(host,'')) = ? AND lower(COALESCE(username,'')) = ?
+-- idx_events_local_timeline_created matches the newest-local-posts reads in
+-- the Rust Home warm (cached recommendations, local_only) and the
+-- newer-items check, which filter on
+--   action_taken IN ('log','local_observe')
+--   AND actor_id LIKE 'https://mkultra.monster/users/%'
+-- and sort by created_at DESC, id DESC. Without it Postgres walks every event
+-- in the window to find the few local ones.
 -- uniq_bsky_post_observations_uri_owner is not in this file. Deploy creates
 -- it only when (bsky_uri, owner_user_id) has no valid unique index or
 -- primary key, so a table that already has that primary key does not gain
@@ -28,3 +35,6 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_bsky_post_observations_last_seen
     ON bsky_post_observations (last_seen_at);
 CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_remote_actors_lower_host_username
     ON remote_actors (lower(COALESCE(host, '')), lower(COALESCE(username, '')));
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_events_local_timeline_created
+    ON events (created_at DESC, id DESC)
+    WHERE action_taken IN ('log', 'local_observe') AND actor_id LIKE 'https://mkultra.monster/users/%';
