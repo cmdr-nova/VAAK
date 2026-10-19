@@ -34,7 +34,7 @@ reference_load($root.'/ap-inbox.php',['ap_masto_poll_vote']);
 reference_load($root.'/ap-db.php',['ap_masto_reblog_row_by_boost_id','ap_local_object_is_direct_message']);
 reference_load($root.'/ap-action-queue.php',['ap_action_queue_make_tid','ap_action_queue_enqueue','ap_action_queue_status']);
 reference_load($root.'/ap-signals.php',['ap_signal_record']);
-reference_load($root.'/ap-db.php',['ap_feature_enabled']);
+reference_load($root.'/ap-db.php',['ap_feature_enabled','ap_remote_poll_id_base','ap_remote_poll_row_id']);
 reference_load($root.'/ap-bsky.php',['ap_bsky_tab_enabled']);
 reference_load($root.'/ap-admin.php',['admin_bsky_bookmark_keys']);
 reference_load($root.'/ap-inbox.php',['ap_outbound_identity','ap_update_local_status','ap_delete_local_status']);
