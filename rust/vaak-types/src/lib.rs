@@ -9,3 +9,7 @@ mod status;
 pub use status::{
     MediaProjection, NormalizedAccount, NormalizedStatusProjection, StatusSource,
 };
+
+mod timeline;
+
+pub use timeline::{MediaAttachment, Poll, PollOption, PreviewCard, Quote, TimelineStatus};
