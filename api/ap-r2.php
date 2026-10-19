@@ -5,6 +5,8 @@
  */
 declare(strict_types=1);
 
+require_once __DIR__ . '/ap-net-guard.php';
+
 function ap_r2_config(): ?array
 {
     static $cfg = null;
@@ -951,6 +953,49 @@ function ap_as2_media_url(mixed $node): ?string
 }
 
 /**
+ * GET one remote image with curl pinned to the guard's addresses. No
+ * redirects. Reads at most $maxBytes + 1 bytes so the caller can tell an
+ * oversized file from a complete one.
+ *
+ * @return array{status:int,body:string,content_type:string,refused:bool}
+ */
+function ap_remote_media_http_get(string $url, float $timeoutSec, int $maxBytes, string $accept): array
+{
+    $out = ['status' => 0, 'body' => '', 'content_type' => 'application/octet-stream', 'refused' => false];
+    $ch = curl_init();
+    if ($ch === false) {
+        return $out;
+    }
+    $buf = '';
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => false,
+        CURLOPT_PROTOCOLS => CURLPROTO_HTTPS,
+        CURLOPT_SSL_VERIFYPEER => true,
+        CURLOPT_SSL_VERIFYHOST => 2,
+        CURLOPT_CONNECTTIMEOUT_MS => (int) (min(4.0, $timeoutSec) * 1000),
+        CURLOPT_TIMEOUT_MS => (int) ($timeoutSec * 1000),
+        CURLOPT_HTTPHEADER => [
+            'Accept: ' . $accept,
+            'User-Agent: mkultra-ap-media/1.0 (+https://mkultra.monster/users/cmdr_nova)',
+        ],
+        CURLOPT_WRITEFUNCTION => static function ($ch, string $data) use (&$buf, $maxBytes): int {
+            $buf .= $data;
+            return strlen($buf) > $maxBytes ? 0 : strlen($data);
+        },
+    ]);
+    $ok = ap_net_curl_exec($ch, $url);
+    $out['refused'] = $ok === false && ap_net_last_refusal() !== '';
+    $out['status'] = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+    $ctype = curl_getinfo($ch, CURLINFO_CONTENT_TYPE);
+    if (is_string($ctype) && $ctype !== '') {
+        $out['content_type'] = strtolower(trim(explode(';', $ctype, 2)[0]));
+    }
+    curl_close($ch);
+    $out['body'] = substr($buf, 0, $maxBytes + 1);
+    return $out;
+}
+
+/**
  * Download a remote image with SSRF protections. Max 2MB.
  *
  * @return array{ok:bool,error?:string,body?:string,content_type?:string}
@@ -981,39 +1026,23 @@ function ap_remote_media_download(string $url, float $timeoutSec = 4.0): array
         return $fail('Host not public');
     }
     $timeoutSec = max(1.0, min(10.0, $timeoutSec));
-    $ctx = stream_context_create([
-        'http' => [
-            'method' => 'GET',
-            'timeout' => $timeoutSec,
-            'follow_location' => 0, // no redirects → harder SSRF bounce
-            'header' => "Accept: image/*,*/*\r\nUser-Agent: mkultra-ap-media/1.0 (+https://mkultra.monster/users/cmdr_nova)\r\n",
-            'ignore_errors' => true,
-        ],
-        'ssl' => [
-            'verify_peer' => true,
-            'verify_peer_name' => true,
-        ],
-    ]);
-    $body = @file_get_contents($url, false, $ctx, 0, 2 * 1024 * 1024 + 1);
-    if (!is_string($body) || $body === '') {
+    // No redirects: a redirect is a harder SSRF bounce.
+    $res = ap_remote_media_http_get($url, $timeoutSec, 2 * 1024 * 1024, 'image/*,*/*');
+    if ($res['refused']) {
+        return $fail('Host not public');
+    }
+    $body = $res['body'];
+    if ($body === '') {
         return $fail('Download failed');
     }
     if (strlen($body) > 2 * 1024 * 1024) {
         return $fail('Remote media too large', false);
     }
-    $statusLine = $http_response_header[0] ?? '';
-    if (!is_string($statusLine) || !preg_match('/\s200\s/', $statusLine)) {
-        preg_match('/\s(\d{3})\s/', (string) $statusLine, $statusMatch);
-        $statusCode = (int) ($statusMatch[1] ?? 0);
-        return $fail('Remote media HTTP ' . trim($statusLine), $statusCode === 0 || $statusCode >= 500 || $statusCode === 429);
+    $statusCode = $res['status'];
+    if ($statusCode !== 200) {
+        return $fail('Remote media HTTP ' . $statusCode, $statusCode === 0 || $statusCode >= 500 || $statusCode === 429);
     }
-    $ctype = 'application/octet-stream';
-    foreach ($http_response_header as $h) {
-        if (stripos($h, 'Content-Type:') === 0) {
-            $ctype = strtolower(trim(explode(';', substr($h, 13), 2)[0]));
-            break;
-        }
-    }
+    $ctype = $res['content_type'];
     $finfo = new finfo(FILEINFO_MIME_TYPE);
     $sniff = $finfo->buffer($body) ?: $ctype;
     $sniff = strtolower($sniff);
@@ -1047,27 +1076,20 @@ function ap_remote_post_media_download(string $url, float $timeoutSec = 6.0): ar
         }
         return ['ok' => false, 'error' => $message];
     };
-    $ctx = stream_context_create([
-        'http' => [
-            'method' => 'GET', 'timeout' => max(1.0, min(15.0, $timeoutSec)),
-            'follow_location' => 0,
-            'header' => "Accept: image/*\r\nUser-Agent: mkultra-ap-media/1.0 (+https://mkultra.monster/users/cmdr_nova)\r\n",
-            'ignore_errors' => true,
-        ],
-        'ssl' => ['verify_peer' => true, 'verify_peer_name' => true],
-    ]);
-    $body = @file_get_contents($url, false, $ctx, 0, 8 * 1024 * 1024 + 1);
-    if (!is_string($body) || $body === '') {
+    $res = ap_remote_media_http_get($url, max(1.0, min(15.0, $timeoutSec)), 8 * 1024 * 1024, 'image/*');
+    if ($res['refused']) {
+        return ['ok' => false, 'error' => 'Host not public'];
+    }
+    $body = $res['body'];
+    if ($body === '') {
         return $fail('Remote image too large or unavailable');
     }
     if (strlen($body) > 8 * 1024 * 1024) {
         return $fail('Remote image too large or unavailable', false);
     }
-    $statusLine = $http_response_header[0] ?? '';
-    if (!is_string($statusLine) || !preg_match('/\s200\s/', $statusLine)) {
-        preg_match('/\s(\d{3})\s/', (string) $statusLine, $statusMatch);
-        $statusCode = (int) ($statusMatch[1] ?? 0);
-        return $fail('Remote media HTTP ' . trim((string) $statusLine), $statusCode === 0 || $statusCode >= 500 || $statusCode === 429);
+    $statusCode = $res['status'];
+    if ($statusCode !== 200) {
+        return $fail('Remote media HTTP ' . $statusCode, $statusCode === 0 || $statusCode >= 500 || $statusCode === 429);
     }
     $sniff = strtolower((string) ((new finfo(FILEINFO_MIME_TYPE))->buffer($body) ?: ''));
     if (!in_array($sniff, ['image/jpeg', 'image/png', 'image/gif', 'image/webp', 'image/avif'], true)) {

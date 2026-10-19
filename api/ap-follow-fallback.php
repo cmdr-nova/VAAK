@@ -85,6 +85,10 @@ function ap_follow_fallback_http(string $url, ?string $etag, ?string $lastModifi
     if (defined('CURL_IPRESOLVE_V4')) {
         curl_setopt($ch, CURLOPT_IPRESOLVE, CURL_IPRESOLVE_V4);
     }
+    if (!ap_net_curl_pin($ch, $url)) {
+        curl_close($ch);
+        return $empty;
+    }
     $body = curl_exec($ch);
     $status = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
     curl_close($ch);

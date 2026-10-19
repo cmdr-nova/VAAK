@@ -5,6 +5,11 @@
  * A host is public only when every A and AAAA answer is a public unicast
  * address. IPv6 forms that carry an IPv4 address (mapped, compatible, NAT64,
  * 6to4) are judged by that IPv4 address. Unresolvable hosts are not public.
+ *
+ * Checking a name and then letting curl resolve it again leaves a gap: the
+ * second answer can differ from the one that was checked. Callers that fetch
+ * pin the handle to the vetted addresses with ap_net_curl_pin(), or use
+ * ap_net_curl_exec(), which also re-checks and re-pins every redirect hop.
  */
 declare(strict_types=1);
 
@@ -36,8 +41,22 @@ function ap_net_ip_is_public(string $ip): bool
         if ($first === 0xff) {
             return false; // multicast
         }
+        // filter_var's reserved ranges differ between PHP 8.3 point releases,
+        // so the private and documentation blocks are checked here as well.
+        if (($first & 0xfe) === 0xfc) {
+            return false; // fc00::/7 unique local
+        }
+        if ($first === 0xfe && ($second & 0xc0) === 0x80) {
+            return false; // fe80::/10 link-local
+        }
         if ($first === 0xfe && ($second & 0xc0) === 0xc0) {
             return false; // fec0::/10 site-local
+        }
+        if ($first === 0x20 && $second === 0x01 && ord($bin[2]) === 0x0d && ord($bin[3]) === 0xb8) {
+            return false; // 2001:db8::/32 documentation
+        }
+        if ($first === 0x20 && $second === 0x01 && ord($bin[2]) === 0x00 && (ord($bin[3]) & 0xf0) === 0x10) {
+            return false; // 2001:10::/28 ORCHID
         }
         if ($first === 0x01 && $second === 0x00 && substr($bin, 2, 6) === str_repeat("\0", 6)) {
             return false; // 100::/64 discard
@@ -60,13 +79,25 @@ function ap_net_ip_is_public(string $ip): bool
 
 function ap_net_host_is_public(string $host): bool
 {
+    return ap_net_host_public_ips($host) !== null;
+}
+
+/**
+ * The addresses $host resolves to, when every one of them is public.
+ * Null when the name is refused, unresolvable, or has any non-public answer.
+ * A literal address is returned as itself.
+ *
+ * @return list<string>|null
+ */
+function ap_net_host_public_ips(string $host): ?array
+{
     $host = strtolower(trim($host, " \t[]."));
     if ($host === '' || $host === 'localhost' || str_ends_with($host, '.localhost')
         || str_ends_with($host, '.local') || str_ends_with($host, '.internal')) {
-        return false;
+        return null;
     }
     if (filter_var($host, FILTER_VALIDATE_IP)) {
-        return ap_net_ip_is_public($host);
+        return ap_net_ip_is_public($host) ? [$host] : null;
     }
     static $memo = [];
     if (isset($memo[$host]) && $memo[$host][1] > time()) {
@@ -88,6 +119,7 @@ function ap_net_host_is_public(string $host): bool
             $ips = $fallback;
         }
     }
+    $ips = array_values(array_unique($ips));
     $ok = $ips !== [];
     foreach ($ips as $ip) {
         if (!ap_net_ip_is_public($ip)) {
@@ -95,6 +127,99 @@ function ap_net_host_is_public(string $host): bool
             break;
         }
     }
-    $memo[$host] = [$ok, time() + 60];
-    return $ok;
+    $memo[$host] = [$ok ? $ips : null, time() + 60];
+    return $memo[$host][0];
+}
+
+/**
+ * CURLOPT_RESOLVE entry ("host:port:addr[,addr]") for a URL, or null when the
+ * URL is not http(s) or its host is not public. A literal-address URL gives
+ * an empty string: curl connects to it without resolving.
+ */
+function ap_net_resolve_entry(string $url): ?string
+{
+    $parts = parse_url($url);
+    if (!is_array($parts) || !is_string($parts['host'] ?? null) || $parts['host'] === '') {
+        return null;
+    }
+    $scheme = strtolower((string) ($parts['scheme'] ?? ''));
+    if ($scheme !== 'https' && $scheme !== 'http') {
+        return null;
+    }
+    $host = strtolower(trim($parts['host'], '[]'));
+    $ips = ap_net_host_public_ips($host);
+    if ($ips === null) {
+        return null;
+    }
+    if (filter_var($host, FILTER_VALIDATE_IP)) {
+        return '';
+    }
+    $port = isset($parts['port']) ? (int) $parts['port'] : ($scheme === 'https' ? 443 : 80);
+    return ap_net_format_resolve($host, $port, $ips);
+}
+
+/** @param list<string> $ips */
+function ap_net_format_resolve(string $host, int $port, array $ips): string
+{
+    $addrs = array_map(static fn(string $ip): string => str_contains($ip, ':') ? '[' . $ip . ']' : $ip, $ips);
+    return $host . ':' . $port . ':' . implode(',', $addrs);
+}
+
+/**
+ * Pin a curl handle to the vetted addresses for $url so curl does not
+ * resolve the name again. False when the host is not public; the caller
+ * must not run the request then.
+ */
+function ap_net_curl_pin(CurlHandle $ch, string $url): bool
+{
+    $entry = ap_net_resolve_entry($url);
+    if ($entry === null) {
+        return false;
+    }
+    if ($entry !== '') {
+        curl_setopt($ch, CURLOPT_RESOLVE, [$entry]);
+    }
+    return true;
+}
+
+/**
+ * curl_exec() for a guarded URL. The handle is pinned before each request.
+ * Redirects are followed here, never by curl: at most $maxRedirects hops,
+ * each one checked and pinned again. Only http(s) hops are considered, and
+ * the handle's CURLOPT_PROTOCOLS still applies, so an https-only handle
+ * refuses an http hop. With $crossHost false a redirect
+ * to another host is returned as-is, so credentials in the request headers
+ * stay with the host they were meant for.
+ *
+ * Returns what curl_exec() returned for the last request, or false when a
+ * hop was refused (ap_net_last_refusal() then says why). curl_getinfo()
+ * describes the last request that ran.
+ */
+function ap_net_curl_exec(CurlHandle $ch, string $url, int $maxRedirects = 0, bool $crossHost = true): string|bool
+{
+    $GLOBALS['ap_net_last_refusal'] = '';
+    curl_setopt($ch, CURLOPT_FOLLOWLOCATION, false);
+    $firstHost = strtolower((string) parse_url($url, PHP_URL_HOST));
+    for ($hop = 0; ; $hop++) {
+        curl_setopt($ch, CURLOPT_URL, $url);
+        if (!ap_net_curl_pin($ch, $url)) {
+            $GLOBALS['ap_net_last_refusal'] = $hop === 0 ? 'host is not public' : 'redirect host is not public';
+            return false;
+        }
+        $result = curl_exec($ch);
+        $status = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+        $next = (string) curl_getinfo($ch, CURLINFO_REDIRECT_URL);
+        if ($result === false || $status < 300 || $status >= 400 || $next === '' || $hop >= $maxRedirects) {
+            return $result;
+        }
+        if (!$crossHost && strtolower((string) parse_url($next, PHP_URL_HOST)) !== $firstHost) {
+            return $result;
+        }
+        $url = $next;
+    }
+}
+
+function ap_net_last_refusal(): string
+{
+    return (string) ($GLOBALS['ap_net_last_refusal'] ?? '');
 }

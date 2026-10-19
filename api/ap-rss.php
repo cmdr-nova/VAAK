@@ -1520,20 +1520,22 @@ function ap_rss_http_get(string $url, string $etag = '', string $lastModified = 
         if (!ap_net_host_is_public((string) (parse_url($url, PHP_URL_HOST) ?: ''))) {
             return ['ok' => false, 'status' => 0, 'body' => '', 'etag' => '', 'last_modified' => '', 'error' => 'Feed host is not public'];
         }
-        $ch = curl_init($url);
+        $ch = curl_init();
         curl_setopt_array($ch, [
             CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_FOLLOWLOCATION => true,
-            CURLOPT_MAXREDIRS => 4,
             CURLOPT_CONNECTTIMEOUT => 8,
             CURLOPT_TIMEOUT => 18,
             CURLOPT_PROTOCOLS => CURLPROTO_HTTPS,
-            CURLOPT_REDIR_PROTOCOLS => CURLPROTO_HTTPS,
             CURLOPT_HTTPHEADER => $headers,
             CURLOPT_HEADER => true,
             CURLOPT_ENCODING => '', // accept gzip/br when available
         ]);
-        $raw = curl_exec($ch);
+        // Up to 4 redirects, each hop checked and pinned (curl never follows them).
+        $raw = ap_net_curl_exec($ch, $url, 4);
+        if ($raw === false && ap_net_last_refusal() !== '') {
+            curl_close($ch);
+            return ['ok' => false, 'status' => 0, 'body' => '', 'etag' => '', 'last_modified' => '', 'error' => 'Feed redirected to a host that is not public'];
+        }
         $errno = curl_errno($ch);
         $err = (string) curl_error($ch);
         $status = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
