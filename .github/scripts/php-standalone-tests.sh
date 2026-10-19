@@ -151,6 +151,7 @@ node_tests=(
   api/bin/reply-no-reload-regression.js
   api/bin/home-notifications-view-switch-regression.js
   api/bin/profile-end-label-regression.js
+  api/bin/soft-nav-address-regression.js
 )
 for test in "${node_tests[@]}"; do
   echo "==> ${test}"
