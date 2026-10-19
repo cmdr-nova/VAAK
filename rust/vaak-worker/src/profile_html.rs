@@ -587,38 +587,21 @@ fn materialize_outbox_status(row: &OutboxPaintRow, account: &Value) -> Value {
         .local_id
         .map(|n| n.to_string())
         .unwrap_or_else(|| row.id.clone());
-    let media = media_from_raw_create(&row.raw_create_json);
-    let mut st = json!({
-        "id": sid,
-        "created_at": created,
-        "in_reply_to_id": Value::Null,
-        "in_reply_to_account_id": Value::Null,
-        "sensitive": row.sensitive || !row.spoiler_text.trim().is_empty(),
-        "spoiler_text": row.spoiler_text,
-        "visibility": if row.visibility.is_empty() { "public" } else { row.visibility.as_str() },
-        "language": Value::Null,
-        "uri": row.id.trim_end_matches('/'),
-        "url": row.id.trim_end_matches('/'),
-        "replies_count": 0,
-        "reblogs_count": 0,
-        "favourites_count": 0,
-        "edited_at": Value::Null,
-        "favourited": false,
-        "reblogged": false,
-        "muted": false,
-        "bookmarked": false,
-        "pinned": row.pinned,
-        "content": content,
-        "reblog": Value::Null,
-        "application": Value::Null,
-        "account": account,
-        "media_attachments": media,
-        "mentions": [],
-        "tags": [],
-        "emojis": [],
-        "card": Value::Null,
-        "poll": Value::Null,
-    });
+    let uri = row.id.trim_end_matches('/');
+    // Same typed shape as Home / Local / Federated (vaak-types).
+    let mut typed = vaak_types::TimelineStatus::base(&sid, &created, &content, uri, uri, account.clone());
+    typed.sensitive = row.sensitive || !row.spoiler_text.trim().is_empty();
+    typed.spoiler_text = row.spoiler_text.clone();
+    if !row.visibility.is_empty() {
+        typed.visibility = row.visibility.clone();
+    }
+    typed.pinned = row.pinned;
+    let (media, bad) = vaak_types::TimelineStatus::media_from_values(media_from_raw_create(&row.raw_create_json));
+    for e in bad {
+        tracing::warn!(%uri, error = %e, "profile media dropped: not a timeline shape");
+    }
+    typed.media_attachments = media;
+    let mut st = typed.to_value();
     if !row.ask_question.trim().is_empty() {
         st["vaak_ask"] = json!({
             "ask_actor": row.ask_actor,
@@ -629,15 +612,10 @@ fn materialize_outbox_status(row: &OutboxPaintRow, account: &Value) -> Value {
     if !row.quote_object.trim().is_empty() {
         let target = row.quote_object.trim().trim_end_matches('/');
         let quoted_account = empty_account(target, "quoted", "Quoted post", DEFAULT_AVATAR);
-        let quoted = json!({
-            "id": target,
-            "uri": target,
-            "url": target,
-            "content": "",
-            "account": quoted_account,
-            "media_attachments": [],
-            "card": {"url": target, "title": "Quoted post", "description": "Open quoted post", "provider_name": "VAAK", "type": "link"}
-        });
+        // Placeholder until hydrate_local_quote_targets fills the quoted post.
+        let mut stub = vaak_types::TimelineStatus::base(target, "", "", target, target, quoted_account);
+        stub.card = serde_json::from_value(json!({"url": target, "title": "Quoted post", "description": "Open quoted post", "provider_name": "VAAK", "type": "link"})).ok();
+        let quoted = stub.to_value();
         st["vaak_quote_preview"] = quoted.clone();
         st["quote"] = json!({"state": "accepted", "quoted_status": quoted, "quoted_status_id": target});
         st["quote_approval"] = json!({"automatic": ["public"], "manual": [], "current_user": "automatic"});
@@ -975,6 +953,39 @@ pub async fn fetch_outbox_statuses_by_uris(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Profiles build statuses separately from Home; they must meet the same
+    /// vaak-types contract and paint with the same painter.
+    #[test]
+    fn profile_post_meets_the_timeline_contract() {
+        let row = OutboxPaintRow {
+            id: "https://mkultra.monster/users/fixture/notes/1".into(),
+            published: "2026-10-19T05:00:00Z".into(),
+            content: "<p>hello</p>".into(),
+            raw_create_json: json!({"object": {"attachment": [{"type": "Document", "mediaType": "image/png",
+                "url": "https://mkultra.monster/media/a.png", "name": "alt"}]}}).to_string(),
+            in_reply_to: String::new(),
+            local_id: Some(7),
+            spoiler_text: String::new(),
+            sensitive: false,
+            visibility: "public".into(),
+            content_text: "hello".into(),
+            pinned: true,
+            ask_actor: String::new(),
+            ask_question: String::new(),
+            ask_answer: String::new(),
+            quote_object: "https://social.example/users/b/statuses/9".into(),
+        };
+        let account = empty_account("https://mkultra.monster/users/fixture", "fixture", "Fixture", "");
+        let st = materialize_outbox_status(&row, &account);
+        let typed = vaak_types::TimelineStatus::from_value(&st).expect("profile status is a TimelineStatus");
+        assert!(typed.contract_violations().is_empty(), "{:?}", typed.contract_violations());
+        assert_eq!(typed.media_attachments.len(), 1);
+        assert!(typed.pinned);
+        assert!(typed.quote.and_then(|q| q.quoted_status).is_some(), "quote placeholder missing");
+        let html = crate::notif_embed::paint_lean_feed_card_opts(&st, "outbox", "");
+        assert!(html.contains("mkultra.monster/media/a.png") && html.contains("quote-block"), "{html}");
+    }
 
     #[tokio::test]
     async fn legacy_guest_profiles_require_readonly_php_without_io() -> Result<()> {

@@ -504,47 +504,20 @@ fn base_status(
     media: Vec<Value>,
     card: Option<Value>,
 ) -> Value {
-    let mut st = json!({
-        "id": id,
-        "created_at": created_at,
-        "in_reply_to_id": Value::Null,
-        "in_reply_to_account_id": Value::Null,
-        "sensitive": false,
-        "spoiler_text": "",
-        "visibility": "public",
-        "language": Value::Null,
-        "uri": uri,
-        "url": url,
-        "replies_count": 0,
-        "reblogs_count": 0,
-        "favourites_count": 0,
-        "edited_at": Value::Null,
-        "favourited": false,
-        "reblogged": false,
-        "muted": false,
-        "bookmarked": false,
-        "pinned": false,
-        "content": content,
-        "reblog": Value::Null,
-        "application": Value::Null,
-        "account": account,
-        "media_attachments": media,
-        "mentions": [],
-        "tags": [],
-        "emojis": [],
-        "card": Value::Null,
-        "poll": Value::Null,
-        "quote": Value::Null,
-        "quote_approval": {
-            "automatic": ["public"],
-            "manual": [],
-            "current_user": "automatic"
-        },
-    });
-    if let Some(c) = card {
-        st["card"] = c;
+    // Every timeline card starts from the shared typed shape in vaak-types.
+    let mut st = vaak_types::TimelineStatus::base(id, created_at, content, uri, url, account);
+    let (typed_media, bad) = vaak_types::TimelineStatus::media_from_values(media);
+    for e in bad {
+        tracing::warn!(%uri, error = %e, "media dropped: not a timeline shape");
     }
-    st
+    st.media_attachments = typed_media;
+    if let Some(c) = card {
+        match serde_json::from_value(c) {
+            Ok(c) => st.card = Some(c),
+            Err(e) => tracing::warn!(%uri, error = %e, "card dropped: not a timeline shape"),
+        }
+    }
+    st.to_value()
 }
 
 /// Mastodon `/original/*.mp4` → `/small/*.png` still (Ice Cubes + lean poster).
@@ -6138,5 +6111,140 @@ mod settings_regression_tests {
         assert_eq!(account["bot"], true);
         assert_eq!(account["discoverable"], false);
         assert_eq!(account["indexable"], false);
+    }
+}
+
+/// One fixture per post shape, built by the real Home / Local / Federated
+/// builders and painted by the shared lean painter. Each case must parse as a
+/// `vaak_types::TimelineStatus` with no contract violations and paint the
+/// feature, so a builder that drops media, a poll or a quote fails here.
+#[cfg(test)]
+mod timeline_contract {
+    use super::*;
+
+    fn bsky_row(text: &str, embed: Value) -> BskyRow {
+        BskyRow {
+            uri: "at://did:plc:author/app.bsky.feed.post/3contract".into(),
+            author_did: "did:plc:author".into(),
+            author_handle: "author.bsky.social".into(),
+            author_display: "Author".into(),
+            author_avatar: String::new(),
+            indexed_at: "2026-10-19T05:00:00Z".into(),
+            published_at: "2026-10-19T05:00:00Z".into(),
+            text: text.into(),
+            embed_json: embed.to_string(),
+            raw_json: json!({"uri": "at://did:plc:author/app.bsky.feed.post/3contract", "record": {"text": text}}).to_string(),
+            like_count: 0,
+            repost_count: 0,
+            reply_count: 0,
+        }
+    }
+
+    fn checked(st: &Value) -> vaak_types::TimelineStatus {
+        let typed = vaak_types::TimelineStatus::from_value(st).unwrap_or_else(|e| panic!("not a TimelineStatus: {e}\n{st:#}"));
+        let bad = typed.contract_violations();
+        assert!(bad.is_empty(), "contract violations: {bad:?}");
+        typed
+    }
+
+    fn img(name: &str) -> Value {
+        json!({"thumb": format!("https://cdn.bsky.app/img/feed_thumbnail/plain/did:plc:author/{name}@jpeg"),
+               "fullsize": format!("https://cdn.bsky.app/img/feed_fullsize/plain/did:plc:author/{name}@jpeg"), "alt": ""})
+    }
+
+    fn quoted_view(media: Value) -> Value {
+        json!({"$type": "app.bsky.embed.record#viewRecord", "uri": "at://did:plc:quoted/app.bsky.feed.post/3q",
+               "cid": "c", "author": {"did": "did:plc:quoted", "handle": "quoted.bsky.social"},
+               "value": {"$type": "app.bsky.feed.post", "text": "quoted words"}, "embeds": [media]})
+    }
+
+    #[test]
+    fn bluesky_images_paint_on_the_card() {
+        let st = materialize_bsky(&bsky_row("look #TransRights", json!({"$type": "app.bsky.embed.images#view", "images": [img("bafkreione")], "vaak_synth": true})));
+        assert_eq!(checked(&st).media_attachments.len(), 1);
+        let html = crate::notif_embed::paint_lean_feed_card_opts(&st, "home", "");
+        assert!(html.contains("feed_fullsize/plain/did:plc:author/bafkreione@jpeg"), "{html}");
+    }
+
+    #[test]
+    fn bluesky_media_only_post_is_not_an_open_on_bluesky_card() {
+        let st = materialize_bsky(&bsky_row("", json!({"$type": "app.bsky.embed.images#view", "images": [img("bafkreitwo")]})));
+        let typed = checked(&st);
+        assert_eq!(typed.media_attachments.len(), 1);
+        assert!(typed.card.is_none(), "media-only post fell back to a link card: {:?}", typed.card);
+        let html = crate::notif_embed::paint_lean_feed_card_opts(&st, "home", "");
+        assert!(!html.contains("Open this post on Bluesky"), "{html}");
+    }
+
+    #[test]
+    fn bluesky_video_and_link_card_paint() {
+        let video = materialize_bsky(&bsky_row("clip", json!({"$type": "app.bsky.embed.video#view",
+            "playlist": "https://video.bsky.app/watch/did%3Aplc%3Aauthor/bafkreivid/playlist.m3u8",
+            "thumbnail": "https://video.bsky.app/watch/did%3Aplc%3Aauthor/bafkreivid/thumbnail.jpg"})));
+        assert_eq!(checked(&video).media_attachments[0].kind, "video");
+        let link = materialize_bsky(&bsky_row("read", json!({"$type": "app.bsky.embed.external#view",
+            "external": {"uri": "https://example.com/a", "title": "A", "description": "d", "thumb": ""}})));
+        assert_eq!(checked(&link).card.as_ref().map(|c| c.url.as_str()), Some("https://example.com/a"));
+    }
+
+    #[test]
+    fn bluesky_quote_keeps_its_media_inside_the_quote() {
+        let st = materialize_bsky(&bsky_row("this", json!({"$type": "app.bsky.embed.record#view",
+            "record": quoted_view(json!({"$type": "app.bsky.embed.images#view", "images": [img("bafkreiquoted")]}))})));
+        let typed = checked(&st);
+        assert!(typed.media_attachments.is_empty(), "quoted media hoisted onto the outer post");
+        let quoted = typed.quote.and_then(|q| q.quoted_status).expect("quote painted");
+        assert_eq!(quoted.media_attachments.len(), 1);
+        let html = crate::notif_embed::paint_lean_feed_card_opts(&st, "home", "");
+        let quote_at = html.find("quote-block").expect("quote block");
+        let media_at = html.find("bafkreiquoted").expect("quoted media painted");
+        assert!(media_at > quote_at, "quoted media painted outside the quote");
+    }
+
+    #[test]
+    fn bluesky_record_with_media_splits_outer_and_quoted_media() {
+        let st = materialize_bsky(&bsky_row("both", json!({"$type": "app.bsky.embed.recordWithMedia#view",
+            "media": {"$type": "app.bsky.embed.images#view", "images": [img("bafkreiouter")]},
+            "record": {"record": quoted_view(json!({"$type": "app.bsky.embed.images#view", "images": [img("bafkreiinner")]}))}})));
+        let typed = checked(&st);
+        assert_eq!(typed.media_attachments.len(), 1);
+        assert!(typed.media_attachments[0].url.contains("bafkreiouter"));
+        let html = crate::notif_embed::paint_lean_feed_card_opts(&st, "home", "");
+        let quote_at = html.find("quote-block").expect("quote block");
+        assert!(html.find("bafkreiouter").expect("outer media") < quote_at, "outer media moved into the quote");
+        assert!(html.find("bafkreiinner").expect("inner media") > quote_at, "quoted media moved out of the quote");
+    }
+
+    #[test]
+    fn fediverse_post_with_media_and_remote_poll_paints_both() {
+        let row = EventRow {
+            id: 42,
+            event_type: "Create".into(),
+            actor_id: "https://social.example/users/a".into(),
+            object_id: "https://social.example/users/a/statuses/1".into(),
+            summary: "Tea or coffee?".into(),
+            media_urls: json!(["https://social.example/media/a.jpg"]).to_string(),
+            created_at: "2026-10-19T05:00:00Z".into(),
+            sensitive: false,
+            spoiler_text: String::new(),
+            host: "social.example".into(),
+            target_actor: String::new(),
+            in_reply_to: String::new(),
+            ask_actor: String::new(),
+            ask_question: String::new(),
+            ask_answer: String::new(),
+        };
+        let mut st = materialize_event_create(&row, None);
+        let mut polls = HashMap::new();
+        polls.insert("https://social.example/users/a/statuses/1".to_string(), json!({
+            "id": "0", "expired": false, "multiple": false, "votes_count": 7, "voters_count": 7, "voted": false,
+            "expires_label": "ends 1 Jan 2099", "options": [{"title": "Tea", "votes_count": 4}, {"title": "Coffee", "votes_count": 3}]}));
+        apply_saved_poll(&mut st, &polls);
+        let typed = checked(&st);
+        assert_eq!(typed.media_attachments.len(), 1);
+        assert_eq!(typed.poll.as_ref().map(|p| p.options.len()), Some(2));
+        let html = crate::notif_embed::paint_lean_feed_card_opts(&st, "local", "");
+        assert!(html.contains("poll-block") && html.contains("Coffee"), "{html}");
+        assert!(html.contains("social.example/media/a.jpg"), "{html}");
     }
 }
