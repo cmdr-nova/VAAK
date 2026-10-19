@@ -18,31 +18,35 @@ require_once __DIR__ . '/ap-db.php';
 require_once __DIR__ . '/ap-auth.php';
 require_once __DIR__ . '/ap-bsky.php';
 sort($files, SORT_STRING);
-$done = 0; $failed = 0;
+$failedDir = $stateDir . '/failed';
+$done = 0; $ignored = 0; $failed = 0;
 foreach ($files as $file) {
     $name = basename($file);
     $active = $processing . '/' . $name;
     if (dirname($file) !== $processing && !rename($file, $active)) { $failed++; continue; }
-    $ok = true;
     $fh = fopen($active, 'rb');
     if (!$fh) { $failed++; continue; }
+    // One event that cannot be ingested is set aside in failed/ and the rest
+    // of the segment carries on. Putting the whole segment back blocked every
+    // later segment behind the same bad event.
     while (($line = fgets($fh)) !== false) {
         $event = json_decode($line, true);
         if (!is_array($event)) continue;
         try {
             $result = ap_bsky_jetstream_ingest_event($event);
-            if (empty($result['ok'])) throw new RuntimeException((string) ($result['error'] ?? 'ingest failed'));
-            $done++;
+            if (!empty($result['ok'])) { $done++; continue; }
+            if (!empty($result['ignored'])) { $ignored++; continue; }
+            throw new RuntimeException((string) ($result['error'] ?? 'ingest failed'));
         } catch (Throwable $e) {
-            error_log('[ap-bsky-jetstream-worker] ' . $e->getMessage());
-            $ok = false; $failed++; break;
+            error_log('[ap-bsky-jetstream-worker] ' . $name . ': ' . $e->getMessage());
+            $failed++;
+            if (!is_dir($failedDir)) @mkdir($failedDir, 0750, true);
+            @file_put_contents($failedDir . '/' . $name, $line, FILE_APPEND | LOCK_EX);
         }
     }
     fclose($fh);
-    if ($ok) unlink($active);
-    else rename($active, $incoming . '/' . $name);
-    if (!$ok) break;
+    unlink($active);
 }
 flock($lock, LOCK_UN); fclose($lock);
-fwrite(STDOUT, sprintf("jetstream processed=%d failed=%d\n", $done, $failed));
+fwrite(STDOUT, sprintf("jetstream processed=%d ignored=%d failed=%d\n", $done, $ignored, $failed));
 if ($failed > 0) exit(1);

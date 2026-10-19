@@ -76,9 +76,12 @@ sudo_restart() {
 }
 
 unit_installed() {
-  local unit="$1" out
-  out="$(systemctl_bin list-unit-files --no-legend --type=service "$unit" 2>/dev/null || true)"
-  [[ "$out" == "$unit "* || "$out" == "$unit" ]]
+  # list-unit-files only lists unit files, so a template instance such as
+  # ap-bsky-jetstream@0.service never matched and was skipped as "not
+  # installed". LoadState is "loaded" for plain units and instances alike.
+  local unit="$1" state
+  state="$(systemctl_bin show --property=LoadState --value "$unit" 2>/dev/null || true)"
+  [[ "$state" == "loaded" ]]
 }
 
 unit_enabled() {
@@ -422,7 +425,13 @@ CURL
   cat > "${tmp}/systemctl" <<'CTL'
 #!/bin/sh
 printf '%s\n' "$*" >> "${SYSTEMCTL_LOG}"
+if [ "$1" = "show" ]; then
+  echo loaded
+  exit 0
+fi
 if [ "$1" = "list-unit-files" ]; then
+  # Real systemd lists the template file, never an instance name.
+  case "$4" in *@?*.service) exit 0 ;; esac
   echo "$4 enabled enabled"
   exit 0
 fi
