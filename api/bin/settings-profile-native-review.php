@@ -66,7 +66,7 @@ $identity = region($source, "} else {\n    \$vaakActorKey = (string) (\$vaakUser
 $identity = "\$vaakActorKey = (string) (\$vaakUser['actor_key'] ?? 'cmdr_nova');" . $identity;
 $template = region($source, "<?php elseif (\$view === 'profile' || \$view === 'atmosphere'): ?>", "        <?php if (\$view === 'profile'): ?>")
     . region($source, "<?php if ((\$settingsNativeProfile = ap_settings_native_body('settings_profile', !empty(\$vaakIsAdmin))) !== null): ?><?= \$settingsNativeProfile ?><?php else: ?>",
-        "        <?php endif; ?>\n\n        <?php\n          \$slLink");
+        "        <?php endif; ?>\n\n        <?php if ((\$settingsNativeLinks = ap_settings_native_body('settings_links'");
 require $api . '/ap-admin-native.php';
 
 $db = new PDO($dsn, null, null, [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION, PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC]);

@@ -20,7 +20,7 @@ function ap_admin_native_reply(array $reply,array $request): ?string
     $keys=array_keys($reply);sort($keys);$expected=['protocol_version','ok','request_binding','source_count','rows','html'];sort($expected);
     if($keys!==$expected || $reply['protocol_version']!==1 || $reply['ok']!==true || !is_string($reply['html'])
         || strlen($reply['html'])>2*1024*1024 || !is_int($reply['source_count']) || !is_array($reply['rows'])
-        || !array_is_list($reply['rows']) || count($reply['rows'])!==$reply['source_count'] || count($reply['rows'])>match($request['view']){'users'=>20,'blocks'=>1000,'settings_lists'=>3000,'settings_follow_requests'=>1000,'settings_mutes'=>1000,'settings_featured'=>40,'settings_profile'=>1,'settings_links'=>2,'settings_ai'=>1,'moderation'=>80,default=>100}) return null;
+        || !array_is_list($reply['rows']) || count($reply['rows'])!==$reply['source_count'] || count($reply['rows'])>match($request['view']){'users'=>20,'blocks'=>1000,'settings_lists'=>3000,'settings_follow_requests'=>1000,'settings_mutes'=>1000,'settings_featured'=>40,'settings_profile'=>1,'settings_links'=>2,'settings_ai'=>1,'settings_tokens'=>40,'settings_two_factor'=>1,'moderation'=>80,default=>100}) return null;
     $binding=[];foreach(['owner_id','view','mode','offset','approvals_enabled'] as $key)$binding[$key]=$request[$key];
     if($request['view']==='users')$binding['search']=$request['search'];
     if(str_starts_with($request['view'],'settings_'))$binding['viewer_admin']=$request['viewer_admin'];
@@ -56,11 +56,11 @@ function ap_settings_native_rows_valid(array $rows): bool
     }
     return true;
 }
-/** Follow request, Featured, Muted account, profile form, linked-avatar and AI key presence rows: closed key sets, ids where the table has them. */
+/** Follow request, Featured, Muted account, profile form, linked-avatar, AI key presence, OAuth token and 2FA presence rows: closed key sets, ids where the table has them. */
 function ap_settings_native_account_rows_valid(string $view,array $rows): bool
 {
-    $required=match($view){'settings_follow_requests'=>['id','actor_id','username'],'settings_featured'=>['id','actor_id','acct','display_name','avatar'],'settings_mutes'=>['actor_id','created_at'],'settings_profile'=>['actor_key','source'],'settings_links'=>['panel','state'],'settings_ai'=>['panel','configured'],default=>null};
-    if($required===null || (in_array($view,['settings_profile','settings_ai'],true) && count($rows)!==1))return false;sort($required);
+    $required=match($view){'settings_follow_requests'=>['id','actor_id','username'],'settings_featured'=>['id','actor_id','acct','display_name','avatar'],'settings_mutes'=>['actor_id','created_at'],'settings_profile'=>['actor_key','source'],'settings_links'=>['panel','state'],'settings_ai'=>['panel','configured'],'settings_tokens'=>['id','status'],'settings_two_factor'=>['panel','enabled'],default=>null};
+    if($required===null || (in_array($view,['settings_profile','settings_ai','settings_two_factor'],true) && count($rows)!==1))return false;sort($required);
     if($view==='settings_links' && array_map(fn($r)=>is_array($r)?($r['panel']??null):null,$rows)!==['second_life','wow'])return false;
     foreach($rows as $row){
         if(!is_array($row))return false;$keys=array_keys($row);sort($keys);if($keys!==$required)return false;
@@ -69,6 +69,8 @@ function ap_settings_native_account_rows_valid(string $view,array $rows): bool
             if($key==='username'&&$value===null)continue;
             if($key==='source'&&!in_array($value,['cache','db'],true))return false;
             if($key==='configured'){if(!is_bool($value)||$row['panel']!=='ai_alt_text')return false;continue;}
+            if($key==='enabled'){if(!is_bool($value)||$row['panel']!=='two_factor')return false;continue;}
+            if($key==='status'&&!in_array($value,['revoked','expired','active'],true))return false;
             if($key==='state'&&!in_array($value,$row['panel']==='second_life'?['linked','pending','unlinked']:['linked','unlinked'],true))return false;
             if(!is_string($value))return false;
         }
@@ -111,10 +113,10 @@ function ap_settings_native_lists_body(bool $viewerAdmin): ?string
 {
     return ap_settings_native_body('settings_lists',$viewerAdmin);
 }
-/** One Settings section for the signed-in account: settings_lists, settings_follow_requests, settings_featured, settings_mutes, settings_profile, settings_links or settings_ai. */
+/** One Settings section for the signed-in account: settings_lists, settings_follow_requests, settings_featured, settings_mutes, settings_profile, settings_links, settings_ai, settings_tokens or settings_two_factor. */
 function ap_settings_native_body(string $view,bool $viewerAdmin): ?string
 {
-    $flag=match($view){'settings_lists'=>'VAAK_SETTINGS_LISTS_NATIVE','settings_follow_requests','settings_featured','settings_mutes'=>'VAAK_SETTINGS_ACCOUNTS_NATIVE','settings_profile'=>'VAAK_SETTINGS_PROFILE_NATIVE','settings_links'=>'VAAK_SETTINGS_LINKS_NATIVE','settings_ai'=>'VAAK_SETTINGS_AI_NATIVE',default=>null};
+    $flag=match($view){'settings_lists'=>'VAAK_SETTINGS_LISTS_NATIVE','settings_follow_requests','settings_featured','settings_mutes'=>'VAAK_SETTINGS_ACCOUNTS_NATIVE','settings_profile'=>'VAAK_SETTINGS_PROFILE_NATIVE','settings_links'=>'VAAK_SETTINGS_LINKS_NATIVE','settings_ai'=>'VAAK_SETTINGS_AI_NATIVE','settings_tokens','settings_two_factor'=>'VAAK_SETTINGS_SECURITY_NATIVE',default=>null};
     if($flag===null || !ap_admin_native_enabled() || getenv($flag)!=='1')return null;
     $user=ap_auth_current_user();$owner=(int)($user['id']??0);
     if($owner<1 || !function_exists('admin_owner_user_id') || admin_owner_user_id()!==$owner || ap_auth_is_admin($user)!==$viewerAdmin)return null;
