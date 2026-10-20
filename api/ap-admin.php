@@ -29074,6 +29074,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       $navAdminOpen = false;
       $navSiteOpen = false;
       $reportsOpenCount = function_exists('ap_reports_open_count') ? ap_reports_open_count() : 0;
+      $approvalsPendingCount = !empty($vaakIsAdmin) && function_exists('ap_registration_pending_count') ? ap_registration_pending_count() : 0;
     ?>
     <nav class="nav">
       <a class="<?= in_array($view, ['home', 'local', 'feed'], true) ? 'active' : '' ?>" href="/vaak/?view=home" data-vaak-soft-nav="home"><span class="ico">⌂</span><span class="label">Home</span></a>
@@ -29146,7 +29147,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       <?php if (!empty($vaakIsAdmin)): ?>
       <hr class="nav-sep">
       <details class="nav-group" data-nav-key="admin" <?= $navAdminOpen ? 'open' : '' ?>>
-        <summary><span class="ico">⚙</span><span class="label">Admin</span><?php if ($reportsOpenCount > 0): ?><span class="nav-badge" style="position:static" aria-label="<?= (int) $reportsOpenCount ?> open reports">⚑ <?= $reportsOpenCount > 99 ? '99+' : (string) (int) $reportsOpenCount ?></span><?php endif; ?></summary>
+        <summary><span class="ico">⚙</span><span class="label">Admin</span><?php if ($reportsOpenCount > 0): ?><span class="nav-badge" style="position:static" aria-label="<?= (int) $reportsOpenCount ?> open reports">⚑ <?= $reportsOpenCount > 99 ? '99+' : (string) (int) $reportsOpenCount ?></span><?php endif; ?><?php if ($approvalsPendingCount > 0): ?><span class="nav-badge" style="position:static" aria-label="<?= (int) $approvalsPendingCount ?> pending approvals">✓ <?= $approvalsPendingCount > 99 ? '99+' : (string) (int) $approvalsPendingCount ?></span><?php endif; ?></summary>
         <div class="nav-sub">
           <a class="<?= $view === 'moderation' ? 'active' : '' ?>" href="/vaak/?view=moderation" id="nav-moderation">
             <span class="ico">⚑</span><span class="label">Moderation</span>
@@ -29155,7 +29156,12 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
             <?php endif; ?>
           </a>
           <a class="<?= $view === 'blocks' ? 'active' : '' ?>" href="/vaak/?view=blocks"><span class="ico">⊘</span><span class="label">Server blocks</span></a>
-          <a class="<?= $view === 'approvals' ? 'active' : '' ?>" href="/vaak/?view=approvals"><span class="ico">✓</span><span class="label">Approvals</span></a>
+          <a class="<?= $view === 'approvals' ? 'active' : '' ?>" href="/vaak/?view=approvals" id="nav-approvals">
+            <span class="ico">✓</span><span class="label">Approvals</span>
+            <?php if ($approvalsPendingCount > 0): ?>
+              <span class="nav-badge"><?= $approvalsPendingCount > 99 ? '99+' : (string) (int) $approvalsPendingCount ?></span>
+            <?php endif; ?>
+          </a>
           <a class="<?= $view === 'invites' ? 'active' : '' ?>" href="/vaak/?view=invites"><span class="ico">✦</span><span class="label">Invites</span></a>
           <a class="<?= $view === 'users' ? 'active' : '' ?>" href="/vaak/?view=users"><span class="ico"><i class="ph ph-users-three" aria-hidden="true"></i></span><span class="label">Users</span></a>
           <a class="<?= $view === 'policies' ? 'active' : '' ?>" href="/vaak/?view=policies"><span class="ico">§</span><span class="label">Policies</span></a>

@@ -193,25 +193,57 @@ function ap_registration_submit(string $username, string $password, string $emai
         if (ap_supporter_enabled()) ap_supporter_schema($db);
         $db->beginTransaction();
         ap_registration_approvals_lock($db);
-        if (!ap_registration_accepting($db, true)) throw new RuntimeException('Registration closed.');
+        // Code 4220 marks applicant-facing messages; never put credentials in them.
+        if (!ap_registration_accepting($db, true)) throw new RuntimeException('Registration is closed.', 4220);
         $supporterHash=null;
         if (trim($supporterCode)!=='') {
-            if (!ap_supporter_enabled()) throw new RuntimeException('Rewards closed');
+            if (!ap_supporter_enabled()) throw new RuntimeException('Supporter codes are not being accepted right now. Leave that field empty to apply without one.', 4220);
             if (ap_db_driver($db)==='pgsql') $db->exec('LOCK TABLE ap_supporter_codes IN SHARE ROW EXCLUSIVE MODE');
             $supporterHash=ap_supporter_code_hash($supporterCode);
-            if (!ap_supporter_available($db,$supporterHash,$email)) throw new RuntimeException('Invalid reward');
+            if (!ap_supporter_available($db,$supporterHash,$email)) throw new RuntimeException('That supporter code is not valid for this email, or it was already used or expired. Leave it empty to apply without one.', 4220);
         }
-        $st = $db->prepare("SELECT 1 FROM ap_users WHERE lower(username) = lower(?) OR (? <> '' AND lower(email) = lower(?))");
+        // Usernames are public profile handles, so naming which field collided leaks nothing new.
+        $st = $db->prepare('SELECT 1 FROM ap_users WHERE lower(username) = lower(?)');
+        $st->execute([$username]);
+        if ($st->fetchColumn()) throw new RuntimeException('That username is already taken.', 4220);
+        if ($email !== '') {
+            $st = $db->prepare('SELECT 1 FROM ap_users WHERE lower(email) = lower(?)');
+            $st->execute([$email]);
+            if ($st->fetchColumn()) throw new RuntimeException('That email already belongs to an account. Log in instead, or use a different email.', 4220);
+        }
+        $st = $db->prepare("SELECT 1 FROM ap_registration_applications WHERE status = 'pending' AND (lower(username) = lower(?) OR (? <> '' AND lower(email) = lower(?)))");
         $st->execute([$username, $email, $email]);
-        if ($st->fetchColumn()) throw new RuntimeException('Collision');
+        if ($st->fetchColumn()) throw new RuntimeException('An application with that username or email is already waiting for approval.', 4220);
         $st = $db->prepare("INSERT INTO ap_registration_applications (username,email,password_hash,created_at,supporter_hash) VALUES (?,?,?,?,?)");
         $st->execute([$username, $email !== '' ? $email : null, $hash, ap_db_now(), $supporterHash]);
         $db->commit();
         return ['ok' => true, 'pending' => true];
+    } catch (PDOException $e) {
+        if ($db->inTransaction()) $db->rollBack();
+        $state = (string) $e->getCode();
+        // A concurrent pending row lost the race against the unique indexes above.
+        if ($state === '23505') return ['ok' => false, 'error' => 'An application with that username or email is already waiting for approval.'];
+        // Integrity errors can quote submitted values, so only other classes log the driver text.
+        error_log('vaak registration submit failed: SQLSTATE ' . $state
+            . (str_starts_with($state, '23') ? '' : ' ' . preg_replace('/\s+/', ' ', $e->getMessage())));
+        return ['ok' => false, 'error' => 'The server could not save your application (database error ' . $state . ', logged). Try again later or tell an admin.'];
     } catch (Throwable $e) {
         if ($db->inTransaction()) $db->rollBack();
-        // Do not leak account/application existence or applicant credentials.
-        return ['ok' => false, 'error' => 'Could not submit application. Check your details or try again later.'];
+        if ($e instanceof RuntimeException && $e->getCode() === 4220) return ['ok' => false, 'error' => $e->getMessage()];
+        error_log('vaak registration submit failed: ' . $e::class . ' at ' . basename($e->getFile()) . ':' . $e->getLine());
+        return ['ok' => false, 'error' => 'The server could not save your application (logged). Try again later or tell an admin.'];
+    }
+}
+
+/** Admin nav badge. Read-only: never runs schema DDL, and a missing table counts as none. */
+function ap_registration_pending_count(): int
+{
+    try {
+        $db = ap_db();
+        if (ap_db_driver($db) === 'pgsql' && $db->query("SELECT to_regclass('ap_registration_applications')")->fetchColumn() === null) return 0;
+        return (int) $db->query("SELECT COUNT(*) FROM ap_registration_applications WHERE status = 'pending'")->fetchColumn();
+    } catch (Throwable $e) {
+        return 0;
     }
 }
 
