@@ -4641,6 +4641,54 @@ function ap_bsky_import_own_post_as_local(int $ownerUserId, array $post, int $de
  * @param list<array<string,mixed>> $feed
  * @return array{imported:int,skipped:int,errors:int}
  */
+/** Stable masto_reblogs status id for one of the owner's own Bluesky reposts. */
+function ap_bsky_own_repost_status_id(string $selfDid, string $subjectUri): string
+{
+    return 'bsky-repost-' . substr(hash('sha256', $selfDid . '|' . $subjectUri), 0, 32);
+}
+
+/**
+ * Keep the owner's profile Boosts tab in step with a repost made from VAAK.
+ * Uses the same row key as the author-feed import, so a later import of the
+ * same repost updates this row instead of adding a second one.
+ */
+function ap_bsky_own_repost_profile_sync(int $ownerUserId, string $subjectUri, bool $reposted): void
+{
+    $subjectUri = trim($subjectUri);
+    if ($ownerUserId < 1 || !preg_match('~^at://([^/]+)/app\.bsky\.feed\.post/~', $subjectUri, $m)) {
+        return;
+    }
+    $session = ap_bsky_session_row($ownerUserId);
+    $selfDid = is_array($session) ? trim((string) ($session['did'] ?? '')) : '';
+    if ($selfDid === '') {
+        return;
+    }
+    $stable = ap_bsky_own_repost_status_id($selfDid, $subjectUri);
+    try {
+        if (!$reposted) {
+            ap_db()->prepare('DELETE FROM masto_reblogs WHERE owner_user_id = ? AND status_id = ?')
+                ->execute([$ownerUserId, $stable]);
+            return;
+        }
+        if (!function_exists('ap_masto_reblog_add')) {
+            require_once __DIR__ . '/ap-masto-entities.php';
+        }
+        if (!function_exists('ap_masto_reblog_add')) {
+            return;
+        }
+        ap_masto_reblog_add(
+            $stable,
+            $stable,
+            ap_bsky_https_url_from_at_uri($subjectUri),
+            ap_bsky_actor_profile_url($m[1]),
+            $stable,
+            $ownerUserId
+        );
+    } catch (Throwable $e) {
+        error_log('[ap-bsky] own repost profile sync: ' . $e->getMessage());
+    }
+}
+
 function ap_bsky_import_own_feed_as_local(int $ownerUserId, array $feed): array
 {
     $stats = ['imported' => 0, 'skipped' => 0, 'errors' => 0];
@@ -4705,7 +4753,7 @@ function ap_bsky_import_own_feed_as_local(int $ownerUserId, array $feed): array
             $targetActor = $handle !== '' && function_exists('ap_bsky_actor_profile_url')
                 ? ap_bsky_actor_profile_url($handle)
                 : null;
-            $stable = 'bsky-repost-' . substr(hash('sha256', $selfDid . '|' . $uri), 0, 32);
+            $stable = ap_bsky_own_repost_status_id($selfDid, $uri);
             $targetUrl = function_exists('ap_bsky_https_url_from_at_uri')
                 ? ap_bsky_https_url_from_at_uri($uri, $handle !== '' ? $handle : null)
                 : $uri;

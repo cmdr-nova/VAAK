@@ -46,6 +46,7 @@ php_tests=(
   api/bin/deploy-canary-smoke.php
   api/bin/downrank-search-trends-smoke.php
   api/bin/bsky-notif-subject-backfill-smoke.php
+  api/bin/bsky-own-repost-profile-smoke.php
   api/bin/remote-poll-smoke.php
   api/bin/remote-emoji-smoke.php
   api/bin/csp-smoke.php
