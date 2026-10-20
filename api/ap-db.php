@@ -4624,7 +4624,7 @@ function ap_profile_store_uploaded_image(array $file, string $kind): array
         @unlink($tmp);
     }
 
-    ap_profile_prune_media_files($kind, 3);
+    ap_profile_prune_media_files($kind, 3, $outPath);
 
     $url = 'https://mkultra.monster/img/profile/' . $outName;
     return [
@@ -4636,9 +4636,13 @@ function ap_profile_store_uploaded_image(array $file, string $kind): array
 }
 
 /**
- * Keep the newest $keep files per kind under img/profile/; delete older ones.
+ * Trim leftover uploads per kind under img/profile/. Every account shares this
+ * folder, so a file any actor_profile row still points at is never deleted,
+ * nor is $protectPath (the upload this request is about to save). Only the
+ * newest $keep unreferenced files survive. If the referenced set can't be read,
+ * nothing is deleted.
  */
-function ap_profile_prune_media_files(string $kind, int $keep = 3): void
+function ap_profile_prune_media_files(string $kind, int $keep = 3, ?string $protectPath = null): void
 {
     $kind = $kind === 'header' ? 'header' : 'avatar';
     $keep = max(1, min(10, $keep));
@@ -4651,12 +4655,49 @@ function ap_profile_prune_media_files(string $kind, int $keep = 3): void
     if (count($files) <= $keep) {
         return;
     }
+    $inUse = ap_profile_media_names_in_use();
+    if ($inUse === null) {
+        return;
+    }
+    if ($protectPath !== null && $protectPath !== '') {
+        $inUse[basename($protectPath)] = true;
+    }
+    $files = array_values(array_filter($files, static fn (string $f): bool => !isset($inUse[basename($f)])));
+    if (count($files) <= $keep) {
+        return;
+    }
     usort($files, static function (string $a, string $b): int {
         return (filemtime($b) ?: 0) <=> (filemtime($a) ?: 0);
     });
     foreach (array_slice($files, $keep) as $old) {
         @unlink($old);
     }
+}
+
+/**
+ * File names under img/profile/ that some actor_profile row uses as its avatar
+ * or header, as a set. Null when the table can't be read.
+ *
+ * @return array<string,true>|null
+ */
+function ap_profile_media_names_in_use(): ?array
+{
+    try {
+        $rows = ap_db()->query('SELECT icon_url, image_url FROM actor_profile')->fetchAll(PDO::FETCH_NUM);
+    } catch (Throwable $e) {
+        error_log('ap_profile_media_names_in_use: ' . $e->getMessage());
+        return null;
+    }
+    $names = [];
+    foreach ($rows as $row) {
+        foreach ($row as $url) {
+            $path = is_string($url) ? (string) parse_url($url, PHP_URL_PATH) : '';
+            if (str_starts_with($path, '/img/profile/')) {
+                $names[basename($path)] = true;
+            }
+        }
+    }
+    return $names;
 }
 
 /**
