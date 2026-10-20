@@ -5744,6 +5744,49 @@ function ap_inbox_recipient_owner(array $activity = []): array
     ];
 }
 
+/**
+ * Notification row key for an inbound activity. Likes, boosts and quotes use a
+ * stable actor+target key so repeats collapse into one row. A quote is keyed by
+ * the quoting note whether it arrives as Create or as a later Update (Mastodon
+ * and VAAK send an Update once the quote is approved), so the pair shares one
+ * "quoted your post" notification instead of two.
+ */
+function ap_local_observe_store_object_id(
+    string $type,
+    string $storeActivityType,
+    ?string $objectId,
+    ?string $actorId,
+    ?string $activityId,
+    string $localActor
+): string {
+    $objectId = is_string($objectId) ? $objectId : '';
+    $actorId = is_string($actorId) ? $actorId : '';
+    $stable = static function (string $target, string $actor, string $kind): string {
+        return function_exists('ap_mention_interaction_object_id')
+            ? ap_mention_interaction_object_id($target, $actor, $kind)
+            : (rtrim($target, '/') . '#' . $kind . '-' . substr(hash('sha256', rtrim($actor, '/') . '|' . rtrim($target, '/') . '|' . $kind), 0, 12));
+    };
+    $storeObjectId = $objectId !== '' ? $objectId : (($activityId ?: 'unknown') . '#obj');
+    if (in_array($type, ['Like', 'EmojiReact'], true) && $objectId !== '' && $actorId !== '') {
+        return $stable($objectId, $actorId, 'like');
+    }
+    if ($type === 'Announce' && str_starts_with(rtrim($objectId, '/'), rtrim($localActor, '/') . '/notes/') && $actorId !== '') {
+        return $stable($objectId, $actorId, 'reblog');
+    }
+    if ($storeActivityType === 'Quote' && $objectId !== '') {
+        // Quote keyed by quoting object (+ actor) so Delete(quote note) can soft-delete via prefix
+        return $stable($objectId, $actorId !== '' ? $actorId : 'unknown', 'quote');
+    }
+    if ($type === 'Update' && $objectId !== '' && $actorId !== '') {
+        // Updates: keep per-edit uniqueness via activity id when present, else stable
+        if ($activityId) {
+            return rtrim($objectId, '/') . '#update-' . substr(hash('sha256', $activityId), 0, 12);
+        }
+        return $stable($objectId, $actorId, 'update');
+    }
+    return $storeObjectId;
+}
+
 function ap_local_observe(array $activity): void
 {
     $type = $activity['type'] ?? 'unknown';
@@ -5888,33 +5931,27 @@ function ap_local_observe(array $activity): void
             }
         }
 
-        // Likes/reblogs/updates share target URLs — use stable actor+target keys so
-        // undo+redo collapses to one notification (ON CONFLICT clears deleted_at).
-        $storeObjectId = $objectId ?: ((ap_as_id($activity) ?: 'unknown') . '#obj');
-        if (in_array($type, ['Like', 'EmojiReact'], true) && is_string($objectId) && $objectId !== '' && is_string($actorId) && $actorId !== '') {
-            $storeObjectId = function_exists('ap_mention_interaction_object_id')
-                ? ap_mention_interaction_object_id($objectId, $actorId, 'like')
-                : (rtrim($objectId, '/') . '#like-' . substr(hash('sha256', $actorId . '|' . rtrim($objectId, '/') . '|like'), 0, 12));
-        } elseif ($type === 'Announce' && is_string($objectId) && str_starts_with(rtrim($objectId, '/'), rtrim($localActor, '/') . '/notes/') && is_string($actorId) && $actorId !== '') {
-            $storeObjectId = function_exists('ap_mention_interaction_object_id')
-                ? ap_mention_interaction_object_id($objectId, $actorId, 'reblog')
-                : (rtrim($objectId, '/') . '#reblog-' . substr(hash('sha256', $actorId . '|' . rtrim($objectId, '/') . '|reblog'), 0, 12));
-        } elseif ($type === 'Update' && is_string($objectId) && $objectId !== '' && is_string($actorId) && $actorId !== '') {
-            // Updates: keep per-edit uniqueness via activity id when present, else stable
-            $actId = ap_as_id($activity);
-            if ($actId) {
-                $storeObjectId = rtrim($objectId, '/') . '#update-' . substr(hash('sha256', $actId), 0, 12);
-            } else {
-                $storeObjectId = function_exists('ap_mention_interaction_object_id')
-                    ? ap_mention_interaction_object_id($objectId, $actorId, 'update')
-                    : (rtrim($objectId, '/') . '#update-' . substr(hash('sha256', $actorId . '|' . rtrim($objectId, '/') . '|update'), 0, 12));
+        // Likes/reblogs/quotes share target URLs — use stable actor+target keys so
+        // undo+redo (and a quote's later Update) collapses to one notification.
+        $storeObjectId = ap_local_observe_store_object_id(
+            (string) $type,
+            (string) $storeActivityType,
+            is_string($objectId) ? $objectId : null,
+            is_string($actorId) ? $actorId : null,
+            ap_as_id($activity),
+            $localActor
+        );
+        // A quote's Update (FEP-044f approval stamp, or an edit) lands on the
+        // quote's existing row; it must not push a second "quoted your post".
+        $quoteRowExisted = false;
+        if ($type === 'Update' && $storeActivityType === 'Quote') {
+            try {
+                $qst = ap_db()->prepare('SELECT 1 FROM mentions WHERE owner_user_id = ? AND object_id = ? AND deleted_at IS NULL LIMIT 1');
+                $qst->execute([(int) ($recipient['owner_user_id'] ?? 0), $storeObjectId]);
+                $quoteRowExisted = (bool) $qst->fetchColumn();
+            } catch (Throwable $e) {
+                $quoteRowExisted = false;
             }
-        } elseif ($storeActivityType === 'Quote' && is_string($objectId) && $objectId !== '') {
-            // Quote keyed by quoting object (+ actor) so Delete(quote note) can soft-delete via prefix
-            $qActor = is_string($actorId) && $actorId !== '' ? $actorId : 'unknown';
-            $storeObjectId = function_exists('ap_mention_interaction_object_id')
-                ? ap_mention_interaction_object_id($objectId, $qActor, 'quote')
-                : (rtrim($objectId, '/') . '#quote-' . substr(hash('sha256', $qActor . '|' . rtrim($objectId, '/') . '|quote'), 0, 12));
         }
 
         // Notifications must be recipient-specific: only store when this local actor
@@ -6027,7 +6064,7 @@ function ap_local_observe(array $activity): void
                 'owner_actor_id' => (string) ($recipient['owner_actor_id'] ?? ''),
             ]);
             // Ice Cubes Web Push (best-effort; never block inbox)
-            if (is_string($actorId) && $actorId !== '') {
+            if (is_string($actorId) && $actorId !== '' && !$quoteRowExisted) {
                 try {
                     require_once __DIR__ . '/ap-webpush.php';
                     $pushType = null;
