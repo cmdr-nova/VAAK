@@ -32622,7 +32622,7 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
             <button class="btn btn-primary" type="submit">Add alias</button>
           </div>
         </form>
-        <?php if (!$aliases): ?>
+        <?php if (($settingsNativeAliases = ap_settings_native_body('settings_aliases', !empty($vaakIsAdmin))) !== null): ?><?= $settingsNativeAliases ?><?php elseif (!$aliases): ?>
           <div class="empty">No aliases yet.</div>
         <?php else: ?>
           <?php foreach ($aliases as $arow): ?>
@@ -32679,7 +32679,7 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
           </div>
         </div>
 
-        <?php if ($activeMove): ?>
+        <?php if (($settingsNativeMove = ap_settings_native_body('settings_move', !empty($vaakIsAdmin))) !== null): ?><?= $settingsNativeMove ?><?php elseif ($activeMove): ?>
           <article class="tweet" style="margin-bottom:1rem;border-color:var(--danger)">
             <div class="tweet-hd"><div class="who">Active Move</div></div>
             <div class="body">
