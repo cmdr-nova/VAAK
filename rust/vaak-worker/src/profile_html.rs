@@ -774,6 +774,7 @@ pub async fn profile_html_fill(
     let _ = crate::home_hydrate_ranked::attach_polls(&db, &mut statuses, &viewer_actor).await;
     let _ = crate::home_hydrate_ranked::attach_bsky_link_facets(&db, &mut statuses).await;
     let _ = crate::home_hydrate_ranked::attach_ask_identities(&db, &mut statuses).await;
+    let _ = crate::status_emoji::attach_custom_emojis(&db, &mut statuses).await;
     if !extra_parents.is_empty() {
         let keys: Vec<String> = extra_parents.keys().cloned().collect();
         let mut vals = Vec::with_capacity(keys.len());
@@ -784,6 +785,7 @@ pub async fn profile_html_fill(
         }
         let _ = crate::home_hydrate_ranked::attach_polls(&db, &mut vals, &viewer_actor).await;
         let _ = crate::home_hydrate_ranked::attach_ask_identities(&db, &mut vals).await;
+        let _ = crate::status_emoji::attach_custom_emojis(&db, &mut vals).await;
         for (key, value) in keys.into_iter().zip(vals) {
             extra_parents.insert(key, value);
         }

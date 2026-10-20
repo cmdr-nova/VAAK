@@ -1272,6 +1272,30 @@ fn replace_labels_plain(text: &str, reps: &[(String, String)]) -> String {
 
 /// Prepare Mastodon/AP content HTML for lean feed paint: normalize paragraphs,
 /// rewrite mention/hashtag/ext anchors in-app, and linkify bare URLs.
+/// Swap known `:shortcode:` text for custom-emoji images in text nodes only,
+/// so attribute values (alt/title/href) are never rewritten.
+fn emoji_text_nodes(html: &str, map: &std::collections::HashMap<String, String>) -> String {
+    if map.is_empty() || !html.contains(':') {
+        return html.to_string();
+    }
+    let mut out = String::with_capacity(html.len() + 128);
+    let mut rest = html;
+    while !rest.is_empty() {
+        let Some(start) = rest.find('<') else {
+            out.push_str(&crate::library::body::emojis(rest, map, false));
+            break;
+        };
+        out.push_str(&crate::library::body::emojis(&rest[..start], map, false));
+        let Some(end_rel) = rest[start..].find('>') else {
+            out.push_str(&rest[start..]);
+            break;
+        };
+        out.push_str(&rest[start..start + end_rel + 1]);
+        rest = &rest[start + end_rel + 1..];
+    }
+    out
+}
+
 fn prepare_feed_body_html(html: &str, from: &str) -> String {
     let collapsed = normalize_feed_paragraphs(html);
     let mut out = String::with_capacity(collapsed.len() + 64);
@@ -3825,6 +3849,10 @@ pub fn paint_lean_embed_from(
         .and_then(|v| v.as_str())
         .or_else(|| account.get("url").and_then(|v| v.as_str()))
         .unwrap_or("");
+    // Custom emoji come from hydrate (status_emoji::attach_custom_emojis).
+    let body_emoji = vaak_types::emoji::status_emoji_map(status);
+    let name_emoji = vaak_types::emoji::account_emoji_map(&account);
+    let display_html = crate::library::body::emojis(display, &name_emoji, true);
     let uri_owned = resolvable_status_uri(status);
     let uri = uri_owned.as_str();
     let created = status
@@ -3977,7 +4005,7 @@ pub fn paint_lean_embed_from(
                 esc(&profile_href),
                 esc(actor_ref),
                 hover_meta,
-                esc(display),
+                display_html,
                 esc(&profile_href),
                 esc(actor_ref),
                 hover_meta,
@@ -3986,7 +4014,7 @@ pub fn paint_lean_embed_from(
         } else {
             format!(
                 "<span class=\"who\">{}</span><span class=\"meta\"> @{}</span>",
-                esc(display),
+                display_html,
                 esc(acct)
             )
         };
@@ -4049,12 +4077,12 @@ pub fn paint_lean_embed_from(
         body_inner.push_str(&ask_html);
         body_inner.push_str(&ask_answer_html(&answer, from));
     } else if content_looks_like_html(content_trim) {
-        let prepared = prepare_feed_body_html(content_trim, from);
+        let prepared = emoji_text_nodes(&prepare_feed_body_html(content_trim, from), &body_emoji);
         body_inner.push_str(&format!(
             "<div class=\"body feed-body feed-body--html\">{prepared}</div>"
         ));
     } else if !plain.is_empty() {
-        let linked = linkify_text_segment(&esc(&plain), from);
+        let linked = emoji_text_nodes(&linkify_text_segment(&esc(&plain), from), &body_emoji);
         body_inner.push_str(&format!(
             "<div class=\"body feed-body\" style=\"white-space:pre-wrap\">{linked}</div>"
         ));
@@ -4110,7 +4138,7 @@ pub fn paint_lean_embed_from(
         };
         inner.push_str(&format!(
             "<details class=\"cw-gate\"><summary class=\"cw-summary\">{}</summary><div class=\"cw-body\">{}</div></details>",
-            esc(&label),
+            crate::library::body::emojis(&label, &body_emoji, true),
             body_inner
         ));
     } else {
@@ -4334,6 +4362,34 @@ mod tests {
         let k = frag_key(1, "https://example.com/a/", true, false, false, false, "");
         assert!(k.starts_with("vaak:notif-embed:v2:"));
         assert_eq!(k.len(), "vaak:notif-embed:v2:".len() + 64);
+    }
+
+    #[test]
+    fn paint_renders_custom_emoji_in_body_name_and_cw() {
+        let st = json!({
+            "id": "1",
+            "uri": "https://transfem.social/notes/asjpkdwk5a7i2ob1",
+            "content": "<p>You're all wonderful :menhera_happy_hearts: <img alt=\":menhera_happy_hearts:\" src=\"https://x.test/a.png\"> :nope:</p>",
+            "spoiler_text": "cw :menhera_happy_hearts:",
+            "sensitive": true,
+            "created_at": "2026-10-20T04:00:00.000Z",
+            "emojis": [{"shortcode": "menhera_happy_hearts", "url": "https://cdn.transfem.social/e/m.webp"}],
+            "account": {
+                "acct": "ari@transfem.social",
+                "display_name": "Ari :verifiedtrans: <b>",
+                "uri": "https://transfem.social/users/9x",
+                "emojis": [{"shortcode": "verifiedtrans", "url": "https://cdn.transfem.social/e/v.webp"}]
+            },
+            "media_attachments": []
+        });
+        let html = paint_lean_embed_from(&st, false, "home", "", true);
+        let img = "<img class=\"custom-emoji\" src=\"https://cdn.transfem.social/e/m.webp\"";
+        // Once in the body text, once in the CW label; the existing alt is untouched.
+        assert_eq!(html.matches(img).count(), 2, "{html}");
+        assert!(html.contains("alt=\":menhera_happy_hearts:\" src=\"https://x.test/a.png\""), "{html}");
+        assert!(html.contains(":nope:"), "{html}");
+        assert!(html.contains("src=\"https://cdn.transfem.social/e/v.webp\""), "{html}");
+        assert!(html.contains("&lt;b&gt;") && !html.contains("Ari :verifiedtrans:"), "{html}");
     }
 
     #[test]

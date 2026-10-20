@@ -22,6 +22,7 @@ mod link_preview;
 mod mentions_html;
 mod notif;
 mod notif_embed;
+mod status_emoji;
 mod quote_media;
 mod notif_list;
 mod profile_html;

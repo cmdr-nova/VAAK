@@ -17336,32 +17336,44 @@ function ap_remote_emoji_upsert_batch(string $host, array $items): void
            static_url = COALESCE(excluded.static_url, remote_custom_emojis.static_url),
            updated_at = excluded.updated_at'
     );
-    foreach ($items as $it) {
-        $code = trim((string) ($it['shortcode'] ?? ''), ": \t\n\r");
-        $url = ap_profile_sanitize_https_url($it['url'] ?? null);
-        if ($code === '' || $url === null) {
-            continue;
+    // Host catalogs (Misskey /api/emojis) can hold thousands of rows.
+    $pdo = ap_db();
+    $ownTx = count($items) > 20 && !$pdo->inTransaction() && $pdo->beginTransaction();
+    try {
+        foreach ($items as $it) {
+            $code = trim((string) ($it['shortcode'] ?? ''), ": \t\n\r");
+            $url = ap_profile_sanitize_https_url($it['url'] ?? null);
+            if ($code === '' || $url === null) {
+                continue;
+            }
+            if (!preg_match('/^[A-Za-z0-9_-]{1,80}$/', $code)) {
+                continue;
+            }
+            $static = ap_profile_sanitize_https_url($it['static_url'] ?? null);
+            $st->execute([$host, $code, $url, $static, $now]);
         }
-        if (!preg_match('/^[A-Za-z0-9_-]{1,80}$/', $code)) {
-            continue;
+        if ($ownTx) {
+            $pdo->commit();
         }
-        $static = ap_profile_sanitize_https_url($it['static_url'] ?? null);
-        $st->execute([$host, $code, $url, $static, $now]);
+    } catch (Throwable $e) {
+        if ($ownTx && $pdo->inTransaction()) {
+            $pdo->rollBack();
+        }
+        throw $e;
     }
     ap_remote_emoji_map_for_host($host, true);
 }
 
-/** Pull Emoji tags from an AS2 actor/Note document into the host emoji cache. */
-function ap_remote_emoji_ingest_actor_doc(string $actorId, array $doc): int
+/**
+ * Emoji tags on an AS2 actor/Note document.
+ *
+ * @return list<array{shortcode:string,url:string,static_url:string}>
+ */
+function ap_as2_emoji_items(array $doc): array
 {
-    $host = parse_url($actorId, PHP_URL_HOST);
-    $host = is_string($host) ? strtolower($host) : '';
-    if ($host === '') {
-        return 0;
-    }
     $tags = $doc['tag'] ?? [];
     if (!is_array($tags)) {
-        return 0;
+        return [];
     }
     if (isset($tags['type'])) {
         $tags = [$tags];
@@ -17375,19 +17387,35 @@ function ap_remote_emoji_ingest_actor_doc(string $actorId, array $doc): int
         if ($type !== 'Emoji' && !str_ends_with($type, 'Emoji')) {
             continue;
         }
-        $name = (string) ($tag['name'] ?? '');
+        $name = trim((string) ($tag['name'] ?? ''), ": \t\n\r");
         $icon = $tag['icon'] ?? null;
+        if (is_array($icon) && array_is_list($icon)) {
+            $icon = $icon[0] ?? null;
+        }
         $url = null;
         if (is_array($icon) && !empty($icon['url']) && is_string($icon['url'])) {
             $url = $icon['url'];
         } elseif (is_string($icon)) {
             $url = $icon;
         }
-        if ($name === '' || $url === null) {
+        if ($name === '' || $url === null || !preg_match('/^[A-Za-z0-9_-]{1,80}$/', $name)
+            || !str_starts_with($url, 'https://')) {
             continue;
         }
         $items[] = ['shortcode' => $name, 'url' => $url, 'static_url' => $url];
     }
+    return $items;
+}
+
+/** Pull Emoji tags from an AS2 actor/Note document into the host emoji cache. */
+function ap_remote_emoji_ingest_actor_doc(string $actorId, array $doc): int
+{
+    $host = parse_url($actorId, PHP_URL_HOST);
+    $host = is_string($host) ? strtolower($host) : '';
+    if ($host === '') {
+        return 0;
+    }
+    $items = ap_as2_emoji_items($doc);
     if (!$items) {
         return 0;
     }
@@ -17504,6 +17532,25 @@ function ap_remote_emoji_ensure_host(string $host, bool $force = false, bool $al
             $source = 'masto';
         }
     }
+    // Misskey / Sharkey / Firefish: notes from these hosts usually name local
+    // emoji only by shortcode (no tag), so the catalog is the only source.
+    if ($items === []) {
+        $mk = ap_remote_emoji_http_json('https://' . $host . '/api/emojis');
+        $list = is_array($mk) && is_array($mk['emojis'] ?? null) ? $mk['emojis'] : [];
+        foreach ($list as $em) {
+            if (!is_array($em)) {
+                continue;
+            }
+            $items[] = [
+                'shortcode' => (string) ($em['name'] ?? ''),
+                'url' => (string) ($em['url'] ?? ''),
+                'static_url' => (string) ($em['url'] ?? ''),
+            ];
+        }
+        if ($items) {
+            $source = 'misskey';
+        }
+    }
     // Pleroma / Akkoma sometimes expose packs here when /api/v1/custom_emojis is thin.
     if ($items === []) {
         $pleroma = ap_remote_emoji_http_json('https://' . $host . '/api/pleroma/emoji');
@@ -17541,6 +17588,89 @@ function ap_remote_emoji_ensure_host(string $host, bool $force = false, bool $al
         'INSERT INTO remote_emoji_host_meta (host, fetched_at, source) VALUES (?, ?, ?)
          ON CONFLICT(host) DO UPDATE SET fetched_at = excluded.fetched_at, source = excluded.source'
     )->execute([$host, ap_db_now(), $source]);
+}
+
+/**
+ * Make sure `:shortcode:` tokens seen in a post are cached for its host.
+ * Refetches the host catalog when any are unknown, at most once an hour per
+ * host (the 7-day catalog freshness would otherwise hide new emoji).
+ * Only call with $allowFetch from ingest/background paths, never a render.
+ *
+ * @param list<string> $codes
+ * @return list<string> codes still unknown afterwards
+ */
+function ap_remote_emoji_ensure_codes(string $host, array $codes, bool $allowFetch = false): array
+{
+    $host = strtolower(trim($host));
+    $codes = array_values(array_unique(array_filter(
+        $codes,
+        static fn ($c) => is_string($c) && preg_match('/^[A-Za-z0-9_-]{1,80}$/', $c) === 1
+    )));
+    if ($host === '' || $codes === []) {
+        return [];
+    }
+    $map = ap_remote_emoji_map_for_host($host);
+    $missing = array_values(array_filter($codes, static fn ($c) => !isset($map[$c])));
+    if ($missing === [] || !$allowFetch) {
+        return $missing;
+    }
+    $meta = ap_db()->prepare('SELECT fetched_at FROM remote_emoji_host_meta WHERE host = ?');
+    $meta->execute([$host]);
+    $fetchedAt = $meta->fetchColumn();
+    $age = is_string($fetchedAt) && $fetchedAt !== '' ? time() - (strtotime($fetchedAt) ?: 0) : PHP_INT_MAX;
+    if ($age >= 0 && $age < 3600) {
+        return $missing;
+    }
+    ap_remote_emoji_ensure_host($host, true, true);
+    $map = ap_remote_emoji_map_for_host($host, true);
+    return array_values(array_filter($missing, static fn ($c) => !isset($map[$c])));
+}
+
+/**
+ * Queue {@see ap_remote_emoji_ensure_codes} for after the response, so a web
+ * request (status page, inbox POST) never waits on a host catalog fetch. CLI
+ * workers run it at exit. At most 3 hosts per request.
+ *
+ * @param list<string> $codes
+ */
+function ap_remote_emoji_ensure_codes_deferred(string $host, array $codes): void
+{
+    $host = strtolower(trim($host));
+    if ($host === '' || $codes === [] || ap_remote_emoji_ensure_codes($host, $codes, false) === []) {
+        return;
+    }
+    static $pending = [];
+    static $registered = false;
+    if (!isset($pending[$host]) && count($pending) >= 3) {
+        return;
+    }
+    $pending[$host] = array_values(array_unique(array_merge($pending[$host] ?? [], $codes)));
+    if ($registered) {
+        return;
+    }
+    $registered = true;
+    register_shutdown_function(static function () use (&$pending): void {
+        if (PHP_SAPI !== 'cli' && function_exists('fastcgi_finish_request')) {
+            @fastcgi_finish_request();
+        }
+        foreach ($pending as $h => $c) {
+            try {
+                ap_remote_emoji_ensure_codes($h, $c, true);
+            } catch (Throwable $e) {
+                error_log('[ap-db] deferred emoji refresh: ' . $e->getMessage());
+            }
+        }
+        $pending = [];
+    });
+}
+
+/** Unique `:shortcode:` tokens in text or HTML. @return list<string> */
+function ap_emoji_shortcodes_in(string $text): array
+{
+    if (!str_contains($text, ':') || !preg_match_all('/:([A-Za-z0-9_-]{1,80}):/', $text, $mm)) {
+        return [];
+    }
+    return array_values(array_unique($mm[1]));
 }
 
 /**

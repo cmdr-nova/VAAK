@@ -35,6 +35,7 @@ BIN_ALLOW=(
   phyrian-decay.php
   phyrian-sync.php
   ranked-warm.php
+  remote-emoji-backfill.php
 )
 
 assemble() {
