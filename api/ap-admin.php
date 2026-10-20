@@ -32379,6 +32379,7 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
           }());
         </script>
 
+        <?php if (($settingsNativeAi = ap_settings_native_body('settings_ai', !empty($vaakIsAdmin))) !== null): ?><?= $settingsNativeAi ?><?php else: ?>
         <h2 style="font-size:1rem;margin:2rem 0 .5rem">AI alt-text settings</h2>
         <?php
           $aiConfigured = function_exists('ap_auth_user_has_xai_key') && ap_auth_user_has_xai_key($vaakUser);
@@ -32424,6 +32425,7 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
             <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
             <button class="btn btn-ghost" type="submit">Clear API key</button>
           </form>
+        <?php endif; ?>
         <?php endif; ?>
 
         <?php if (empty($vaakIsAdmin)): ?>
