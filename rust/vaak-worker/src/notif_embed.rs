@@ -3264,7 +3264,8 @@ fn media_row_html(st: &Value) -> String {
             let source = if is_hls {
                 format!(" data-hls-src=\"{}\"", esc(url))
             } else {
-                format!(" src=\"{}\"", esc(url))
+                // `poster` is the rendered attribute; empty means no image poster.
+                format!(" src=\"{}\"", esc(&crate::library::card::first_frame_src(url, &poster)))
             };
             // preload=metadata helps progressive MP4s show a first frame when
             // no image poster is available (PHP parity).
@@ -4303,6 +4304,13 @@ pub async fn set_embed_html_many(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn posterless_video_gets_first_frame_fragment() {
+        let bare = super::media_row_html(&serde_json::json!({"media_attachments":[{"type":"video","url":"https://media.example/v/clip.mp4"}]}));
+        assert!(bare.contains(" src=\"https://media.example/v/clip.mp4#t=0.001\""), "{bare}");
+        let masto = super::media_row_html(&serde_json::json!({"media_attachments":[{"type":"video","url":"https://m.example/original/clip.mp4"}]}));
+        assert!(masto.contains(" src=\"https://m.example/original/clip.mp4\"") && masto.contains("poster=\"https://m.example/small/clip.png\""), "{masto}");
+    }
     #[test]
     #[ignore = "finite painter timing comparison, no source or authority IO"]
     fn literal_regex_same_card_paint_cohort() {
