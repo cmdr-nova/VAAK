@@ -238,6 +238,12 @@ fn image_poster(url: &str) -> bool {
     matches!(path.rsplit('.').next().unwrap_or("").to_ascii_lowercase().as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp" | "avif") || url.contains("cdn.bsky.app/") || url.contains("/img/") || url.contains("thumbnail")
 }
 
+/// iOS Safari ignores preload=metadata and paints a black box until play.
+/// A tiny media fragment makes it draw a frame; desktop shows the same frame.
+pub(crate) fn first_frame_src(url: &str, poster: &str) -> String {
+    if poster.is_empty() && !url.contains('#') { format!("{url}#t=0.001") } else { url.to_owned() }
+}
+
 pub(crate) fn media_row(media: &[Value], lazy: bool) -> String {media_row_mode(media,lazy,false)}
 fn media_row_mode(media: &[Value], lazy: bool, silent:bool) -> String {
     let mut cells = Vec::new();
@@ -255,7 +261,7 @@ fn media_row_mode(media: &[Value], lazy: bool, silent:bool) -> String {
                 if let Some(c) = re.captures(url) { poster = format!("{}/small/{}.png", &c[1], &c[2]); }
             }
             let hls = url.split(['?', '#']).next().unwrap_or("").to_ascii_lowercase().ends_with(".m3u8") || matches!(mime.as_str(), "application/x-mpegurl" | "application/vnd.apple.mpegurl");
-            let source = if hls { format!(" data-hls-src=\"{}\"{}", esc(url), if lazy { " preload=\"none\"" } else { "" }) } else if lazy { format!(" data-src=\"{}\" preload=\"none\"", esc(url)) } else { format!(" src=\"{}\"", esc(url)) };
+            let source = if hls { format!(" data-hls-src=\"{}\"{}", esc(url), if lazy { " preload=\"none\"" } else { "" }) } else if lazy { format!(" data-src=\"{}\" preload=\"none\"", esc(url)) } else { format!(" src=\"{}\"", esc(&first_frame_src(url, &poster))) };
             cells.push(format!("<video class=\"media-video\" data-media-warm-url=\"{}\"{source} controls loop playsinline{}{}{} referrerpolicy=\"no-referrer\"></video>", esc(if poster.is_empty() { url } else { &poster }), if lazy { "" } else { " preload=\"metadata\"" }, if silent { " muted" } else { "" }, if poster.is_empty() { String::new() } else { format!(" poster=\"{}\"", esc(&poster)) }));
         } else if media_kind(url, &mime, "audio") {
             cells.push(format!("<div class=\"media-audio-card\" role=\"group\" aria-label=\"Audio post\"><img class=\"media-audio-art\" src=\"/api/assets/audio-post-default.jpg\" alt=\"\" loading=\"lazy\" decoding=\"async\"><audio class=\"media-audio\" src=\"{}\" controls preload=\"metadata\"></audio></div>", esc(url)));
@@ -752,6 +758,18 @@ pub(crate) fn render_direct_admitted(status:&crate::direct_context::AdmittedDire
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn posterless_video_gets_first_frame_fragment() {
+        let bare = media_row(&[serde_json::json!({"url":"https://media.example/v/clip.mp4","mediaType":"video/mp4"})], false);
+        assert!(bare.contains(" src=\"https://media.example/v/clip.mp4#t=0.001\""), "{bare}");
+        assert!(bare.contains("data-media-warm-url=\"https://media.example/v/clip.mp4\""), "{bare}");
+        let postered = media_row(&[serde_json::json!({"url":"https://media.example/v/clip.mp4","mediaType":"video/mp4","preview_url":"https://media.example/v/clip.jpg"})], false);
+        assert!(postered.contains(" src=\"https://media.example/v/clip.mp4\""), "{postered}");
+        let lazy = media_row(&[serde_json::json!({"url":"https://media.example/v/clip.mp4","mediaType":"video/mp4"})], true);
+        assert!(!lazy.contains("#t="), "{lazy}");
+        let hls = media_row(&[serde_json::json!({"url":"https://video.example/playlist.m3u8"})], false);
+        assert!(!hls.contains("#t="), "{hls}");
+    }
     #[test]
     #[ignore = "requires independent genuine production SQL/helper capture"]
     fn genuine_production_object_urls_match_actual_php() {

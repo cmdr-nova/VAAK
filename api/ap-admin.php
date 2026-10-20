@@ -14815,7 +14815,10 @@ function admin_media_row_html(array $items, string $hint = ''): string
                     ? ' data-hls-src="' . h($url) . '" preload="none"'
                     : ' data-src="' . h($url) . '" preload="none"';
             } else {
-                $sourceAttr = $isHls ? ' data-hls-src="' . h($url) . '"' : ' src="' . h($url) . '"';
+                // iOS Safari ignores preload=metadata; a tiny media fragment
+                // makes it paint a frame when there is no image poster.
+                $srcUrl = (!admin_media_is_image_poster_url($preview) && !str_contains($url, '#')) ? $url . '#t=0.001' : $url;
+                $sourceAttr = $isHls ? ' data-hls-src="' . h($url) . '"' : ' src="' . h($srcUrl) . '"';
             }
             $posterAttr = admin_media_is_image_poster_url($preview) ? ' poster="' . h($preview) . '"' : '';
             $warmUrl = admin_media_is_image_poster_url($preview) ? $preview : $url;
