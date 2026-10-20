@@ -29,6 +29,7 @@ done
 BIN_ALLOW=(
   bsky-jetstream-media-backfill.php
   bsky-notif-subject-backfill.php
+  bsky-own-repost-profile-backfill.php
   deploy-canary.php
   home-timeline-warm.php
   notif-projection-fill.php

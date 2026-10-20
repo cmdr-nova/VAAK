@@ -251,12 +251,18 @@ function ap_action_queue_execute(array $row, array $payload, array $receipt): ar
                             ap_bsky_favourite_cache_clear($owner, (string) ($payload['uri'] ?? $target));
                         }
                     }
+                    if ($kind === 'boost') {
+                        ap_bsky_own_repost_profile_sync($owner, (string) ($payload['uri'] ?? $target), true);
+                    }
                     return ['ok' => true, 'receipt' => ['record_uri' => (string) ($res['uri'] ?? $receipt['record_uri'] ?? ''), 'collection' => $collection]];
                 }
                 if ($recordUri === '' && $kind === 'boost') {
                     $res = ap_bsky_unrepost_object($owner, (string) ($payload['uri'] ?? $target));
                     if (!empty($res['ok']) && function_exists('ap_masto_reblog_remove_by_object_id')) {
                         ap_masto_reblog_remove_by_object_id((string) ($payload['object_id'] ?? $target), $owner);
+                    }
+                    if (!empty($res['ok'])) {
+                        ap_bsky_own_repost_profile_sync($owner, (string) ($payload['uri'] ?? $target), false);
                     }
                     return !empty($res['ok']) ? ['ok' => true, 'receipt' => []]
                         : ['ok' => false, 'error' => (string) ($res['error'] ?? 'Bluesky repost removal failed.')];
@@ -267,6 +273,7 @@ function ap_action_queue_execute(array $row, array $payload, array $receipt): ar
                 $alreadyGone = ap_action_queue_remote_state_already_applied($err, false);
                 if ((!empty($res['ok']) || $alreadyGone) && $kind === 'boost' && function_exists('ap_masto_reblog_remove_by_object_id')) {
                     ap_masto_reblog_remove_by_object_id((string) ($payload['object_id'] ?? $target), $owner);
+                    ap_bsky_own_repost_profile_sync($owner, (string) ($payload['uri'] ?? $target), false);
                 }
                 if ((!empty($res['ok']) || $alreadyGone) && $kind === 'like' && function_exists('ap_masto_favourite_remove')) {
                     $unlikeSid = (string) ($payload['status_id'] ?? '');
