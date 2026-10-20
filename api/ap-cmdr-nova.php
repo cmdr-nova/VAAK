@@ -1444,7 +1444,7 @@ function ap_cmdr_note_html(array $row, array $create): void
     echo '<div class="row" style="margin-bottom:1rem">';
     echo '<img class="av" src="' . $avatar . '" alt="" width="72" height="72" referrerpolicy="no-referrer">';
     $automatedBadge = !empty($p['automated'])
-        ? ' <span class="automated-flare" title="Automated account">Automated</span>'
+        ? ' <span class="automated-flare" title="Automated account">🤖 Automated</span>'
         : '';
     echo '<div><h1 style="font-size:1.1rem">' . $name . $vanityBadge . $automatedBadge . '</h1>';
     echo '<p class="muted" style="margin:0"><a href="/users/cmdr_nova">@cmdr_nova@mkultra.monster</a></p></div></div>';
@@ -1830,7 +1830,7 @@ function ap_cmdr_html(): void
         echo '<img class="av" src="' . htmlspecialchars($p['icon_url'], ENT_QUOTES, 'UTF-8') . '" alt="" loading="lazy" referrerpolicy="no-referrer">';
     }
     $automatedBadge = !empty($p['automated'])
-        ? ' <span class="automated-flare" title="Automated account">Automated</span>'
+        ? ' <span class="automated-flare" title="Automated account">🤖 Automated</span>'
         : '';
     echo '<div><h1>' . $name . $vanityBadge . $operatorBadge . $resonantBadge . $automatedBadge . '</h1>';
     echo '<p class="muted" style="margin:0">@cmdr_nova@mkultra.monster</p>';
