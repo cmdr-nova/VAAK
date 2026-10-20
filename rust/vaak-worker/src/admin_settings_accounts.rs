@@ -20,7 +20,7 @@ pub(super) struct FollowRequest {id:i64,actor_id:String,username:Option<String>}
 #[derive(Debug,Clone,Serialize)]
 pub(super) struct Featured {id:i64,actor_id:String,acct:String,display_name:String,avatar:String}
 #[derive(Debug,Clone,Serialize)]
-pub(super) struct Mute {actor_id:String,created_at:String,#[serde(skip)]avatar:String,#[serde(skip)]who:String,#[serde(skip)]handle:String,#[serde(skip)]pub(super) warm:Option<String>}
+pub(super) struct Mute {actor_id:String,created_at:String,#[serde(skip)]avatar:String,#[serde(skip)]who:String,#[serde(skip)]handle:String,#[serde(skip)]pub(super) warm:Option<String>,#[serde(skip)]pub(super) media_warm:Option<String>}
 pub(super) struct Owner {pub(super) actor_id:String,actor_key:String}
 pub(super) async fn owner(db:&tokio_postgres::Client,id:i64)->Result<Owner>{
  let row=db.query_one("SELECT actor_id::text,actor_key::text FROM ap_users WHERE id::bigint=$1",&[&id]).await?;
@@ -103,13 +103,15 @@ fn epoch(s:&str)->Result<i64>{
   .or_else(|_|chrono::DateTime::parse_from_str(s,"%Y-%m-%d %H:%M:%S%.f%#z").map(|v|v.timestamp()))
   .map_err(|_|anyhow::anyhow!("unproven PHP date format"))
 }
+/// ap_feature_enabled('remote_media_warm', true)
+fn media_warm_enabled()->bool{std::env::var("VAAK_FEATURE_REMOTE_MEDIA_WARM").ok().map(|v|php_trim(&v).to_ascii_lowercase()).filter(|v|!v.is_empty()).is_none_or(|v|!matches!(v.as_str(),"0"|"false"|"off"|"no"))}
 pub(super) async fn mutes(db:&tokio_postgres::Client,cfg:&crate::config::Config,owner:i64,now:i64)->Result<Vec<Mute>>{
  let mut out=Vec::new();
  for row in db.query("SELECT actor_id::text,created_at::text FROM ap_mutes WHERE owner_user_id::bigint=$1 ORDER BY created_at DESC, actor_id DESC LIMIT 1001",&[&owner]).await?{
   let raw:Option<String>=row.get(0);let created:Option<String>=row.get(1);let raw=raw.unwrap_or_default();
   let actor=raw.trim_end_matches('/').to_string();
   if raw.is_empty()||php_trim(&raw)!=raw||!actor.starts_with("https://")||local_host(&actor){bail!("PHP-only muted actor");}
-  let h=host(&actor);if h=="bsky.app"||h.ends_with(".bsky.app"){bail!("Bluesky muted actor");}
+  let mut media_warm=None;
   let avatar=match actor.as_str(){
    "https://waffles.baeddel.social/fediverse/blog/admin"|"https://app.wafrn.net/fediverse/blog/admin"=>"https://mkultra.monster/img/avatar/wafrn-approvals.webp".to_string(),
    _=>{
@@ -117,7 +119,8 @@ pub(super) async fn mutes(db:&tokio_postgres::Client,cfg:&crate::config::Config,
     let url:Option<String>=c.get(0);let fetched:Option<String>=c.get(1);
     let Some(url)=url.filter(|u|!u.is_empty()&&u!="0").and_then(|u|crate::profile_identity::sanitized_profile_url(&u)) else {bail!("PHP would refresh this avatar")};
     let fetched=fetched.unwrap_or_default();let at=if fetched.is_empty(){0}else{epoch(&fetched)?};
-    if at>0&&at<now-7*86400{bail!("PHP would rewarm this stale avatar");}
+    // admin_actor_avatar_url still paints a stale cached avatar and queues ap_remote_media_warm_async.
+    if at>0&&at<now-7*86400&&media_warm_enabled(){media_warm=Some(actor.clone());}
     url
    }
   };
@@ -128,7 +131,7 @@ pub(super) async fn mutes(db:&tokio_postgres::Client,cfg:&crate::config::Config,
   let display=php_trim(label["display_name"].as_str().unwrap_or("")).to_string();
   let who=if display.is_empty()||crate::profile_identity::placeholder(&display){handle.clone()}else{display};
   if who.contains(':'){bail!("PHP would look up custom emoji");}
-  out.push(Mute{actor_id:raw,created_at:created.unwrap_or_default(),avatar,who,handle,warm});
+  out.push(Mute{actor_id:raw,created_at:created.unwrap_or_default(),avatar,who,handle,warm,media_warm});
  }
  if out.len()>MAX_ROWS{bail!("mutes beyond bridge bound");}
  Ok(out)
