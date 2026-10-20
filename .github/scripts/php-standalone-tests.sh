@@ -63,6 +63,7 @@ php_tests=(
   api/bin/inbox-signature-smoke.php
   api/bin/inbox-ownership-smoke.php
   api/bin/inbox-flood-smoke.php
+  api/bin/inbox-quote-notify-dedupe-smoke.php
   api/bin/library-deletion-smoke.php
   api/bin/library-folder-capture.php
   api/bin/library-page-capture.php

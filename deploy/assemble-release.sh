@@ -35,6 +35,7 @@ BIN_ALLOW=(
   notif-projection-fill.php
   phyrian-decay.php
   phyrian-sync.php
+  quote-notify-dedupe-cleanup.php
   ranked-warm.php
   remote-emoji-backfill.php
 )
