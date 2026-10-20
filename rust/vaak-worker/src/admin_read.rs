@@ -6,8 +6,8 @@ use serde_json::{json,Value};
 use crate::library::actions::{esc,query};
 #[derive(Clone,Debug,Deserialize,Serialize,PartialEq)]
 #[serde(rename_all="snake_case")]
-enum View {Invites,Approvals,Users,Relays,Policies,Blocks,Moderation,SettingsLists,SettingsFollowRequests,SettingsFeatured,SettingsMutes,SettingsProfile,SettingsLinks,SettingsAi}
-impl View{fn settings(&self)->bool{matches!(self,View::SettingsLists|View::SettingsFollowRequests|View::SettingsFeatured|View::SettingsMutes|View::SettingsProfile|View::SettingsLinks|View::SettingsAi)}}
+enum View {Invites,Approvals,Users,Relays,Policies,Blocks,Moderation,SettingsLists,SettingsFollowRequests,SettingsFeatured,SettingsMutes,SettingsProfile,SettingsLinks,SettingsAi,SettingsTokens,SettingsTwoFactor}
+impl View{fn settings(&self)->bool{matches!(self,View::SettingsLists|View::SettingsFollowRequests|View::SettingsFeatured|View::SettingsMutes|View::SettingsProfile|View::SettingsLinks|View::SettingsAi|View::SettingsTokens|View::SettingsTwoFactor)}}
 #[derive(Clone,Debug,Deserialize,Serialize,PartialEq)]
 #[serde(rename_all="snake_case")]
 enum Mode {Full,Shell}
@@ -92,12 +92,13 @@ async fn paint(cfg:&crate::config::Config,r:&Request)->Result<Value>{
  if r.view==View::SettingsProfile&&std::env::var("VAAK_SETTINGS_PROFILE_NATIVE").ok().as_deref()!=Some("1"){bail!("native Settings profile disabled");}
  if r.view==View::SettingsLinks&&std::env::var("VAAK_SETTINGS_LINKS_NATIVE").ok().as_deref()!=Some("1"){bail!("native Settings links disabled");}
  if r.view==View::SettingsAi&&std::env::var("VAAK_SETTINGS_AI_NATIVE").ok().as_deref()!=Some("1"){bail!("native Settings AI disabled");}
+ if matches!(r.view,View::SettingsTokens|View::SettingsTwoFactor)&&std::env::var("VAAK_SETTINGS_SECURITY_NATIVE").ok().as_deref()!=Some("1"){bail!("native Settings security disabled");}
  let db=crate::db::connect(&cfg.database_url).await?;
  db.batch_execute("BEGIN READ ONLY ISOLATION LEVEL READ COMMITTED").await?;
  role(&db,r).await?;
  let configured=std::env::var("VAAK_REGISTRATION_APPROVALS").ok().as_deref()==Some("1");
  if r.approvals_enabled!=configured{bail!("approval mode mismatch");}
- enum Collected { Invites(Vec<Invite>), Applications(Vec<Application>), Users(users::Collected), Relays(Vec<relays::Relay>), Policies(policies::Collected), Blocks(Vec<blocks::Row>), Moderation(moderation::Collected), SettingsLists(settings_lists::Collected), FollowRequests(Vec<settings_accounts::FollowRequest>), Featured(Vec<settings_accounts::Featured>,settings_accounts::Owner), Mutes(Vec<settings_accounts::Mute>), Profile(settings_profile::Collected), Links(settings_links::Collected), Ai(settings_ai::Collected) }
+ enum Collected { Invites(Vec<Invite>), Applications(Vec<Application>), Users(users::Collected), Relays(Vec<relays::Relay>), Policies(policies::Collected), Blocks(Vec<blocks::Row>), Moderation(moderation::Collected), SettingsLists(settings_lists::Collected), FollowRequests(Vec<settings_accounts::FollowRequest>), Featured(Vec<settings_accounts::Featured>,settings_accounts::Owner), Mutes(Vec<settings_accounts::Mute>), Profile(settings_profile::Collected), Links(settings_links::Collected), Ai(settings_ai::Collected), Tokens(settings_security::Tokens), TwoFactor(bool) }
  let collected=match r.view{
   View::Invites=>{
    let mut rows=Vec::new();for row in db.query("SELECT jsonb_build_object('id',id::bigint,'code',code,'created_at',created_at,'used_at',used_at,'note',note) FROM ap_invite_codes ORDER BY created_at DESC,id DESC LIMIT 100",&[]).await?{rows.push(serde_json::from_value::<Invite>(row.get(0))?);}
@@ -115,6 +116,8 @@ async fn paint(cfg:&crate::config::Config,r:&Request)->Result<Value>{
   View::SettingsProfile=>Collected::Profile(settings_profile::collect(&db,cfg,r.owner_id).await?),
   View::SettingsLinks=>Collected::Links(settings_links::collect(&db,r.owner_id,r.now).await?),
   View::SettingsAi=>Collected::Ai(settings_ai::collect(&db,r.owner_id).await?),
+  View::SettingsTokens=>Collected::Tokens(settings_security::tokens(&db,r.owner_id,r.now,r.viewer_admin==Some(true)).await?),
+  View::SettingsTwoFactor=>Collected::TwoFactor(settings_security::two_factor(&db,r.owner_id).await?),
   View::Approvals=>{
    let mut rows=Vec::new();for row in db.query("SELECT jsonb_build_object('id',id::bigint,'username',username,'email',email,'status',status,'created_at',created_at,'decided_at',decided_at) FROM ap_registration_applications ORDER BY id DESC LIMIT 100 OFFSET $1",&[&r.offset]).await?{rows.push(serde_json::from_value::<Application>(row.get(0))?);}
    Collected::Applications(rows)
@@ -155,6 +158,8 @@ async fn paint(cfg:&crate::config::Config,r:&Request)->Result<Value>{
   Collected::Profile(c)=>settings_profile::paint(c,r)?,
   Collected::Links(c)=>settings_links::paint(c,r)?,
   Collected::Ai(c)=>settings_ai::paint(c,r)?,
+  Collected::Tokens(t)=>settings_security::paint_tokens(t,r)?,
+  Collected::TwoFactor(on)=>settings_security::paint_two_factor(on,r)?,
  };
  if html.len()>1024*1024 || serde_json::to_vec(&rows)?.len()>512*1024 { bail!("admin response bound"); }
 
@@ -187,6 +192,8 @@ mod settings_profile;
 mod settings_links;
 #[path="admin_settings_ai.rs"]
 mod settings_ai;
+#[path="admin_settings_security.rs"]
+mod settings_security;
 #[cfg(test)]mod tests{
  use super::*;
  #[test]fn strict_admin_read_envelope(){let good=json!({"protocol_version":1,"owner_id":1,"csrf":"session","view":"invites","mode":"full","offset":0,"approvals_enabled":false,"now":100,"php_timezone":"UTC"});assert!(decode(&serde_json::to_vec(&good).unwrap()).is_ok());for(k,v)in[("owner_id",json!(0)),("is_admin",json!(true)),("view",json!("users")),("offset",json!(1)),("csrf",json!("")),("rows",json!([]))]{let mut bad=good.clone();bad[k]=v;assert!(decode(&serde_json::to_vec(&bad).unwrap()).is_err());}}
@@ -195,7 +202,7 @@ mod settings_ai;
  #[test]fn settings_lists_envelope_needs_viewer_role(){let good=json!({"protocol_version":1,"owner_id":2,"csrf":"session","view":"settings_lists","mode":"full","offset":0,"approvals_enabled":false,"now":100,"php_timezone":"UTC","viewer_admin":false});assert!(decode(&serde_json::to_vec(&good).unwrap()).is_ok());for(k,v)in[("offset",json!(1)),("search",json!("")),("viewer_admin",Value::Null)]{let mut bad=good.clone();bad[k]=v;assert!(decode(&serde_json::to_vec(&bad).unwrap()).is_err());}let mut admin_view=good.clone();admin_view["view"]=json!("blocks");assert!(decode(&serde_json::to_vec(&admin_view).unwrap()).is_err());}
  #[test]fn personal_row_models_are_closed(){assert!(serde_json::from_value::<settings_lists::UserBlock>(json!({"id":1,"scope":"actor","value":"x","kind":"block","reason":null,"created_at":"a","owner_user_id":2})).is_err());assert!(serde_json::from_value::<settings_lists::MutedWord>(json!({"id":1,"phrase":"x","created_at":"a","note":null,"owner_user_id":2})).is_err());}
  #[test]fn relative_accepts_postgres_timestamptz_text(){for(s,want)in[("2026-10-19 12:00:00.123456+00","10s"),("2026-10-19 12:00:00+00","10s"),("2026-10-19 14:00:00.5+02","10s"),("2026-10-19 12:00:00.999999+00:00","10s")]{assert_eq!(relative(s,chrono::DateTime::parse_from_rfc3339("2026-10-19T12:00:10Z").unwrap().timestamp()).unwrap(),want,"{s}");}assert!(relative("yesterday",0).is_err());}
- #[test]fn settings_account_views_need_viewer_role(){for view in["settings_follow_requests","settings_featured","settings_mutes","settings_profile","settings_links","settings_ai"]{let good=json!({"protocol_version":1,"owner_id":2,"csrf":"session","view":view,"mode":"full","offset":0,"approvals_enabled":false,"now":100,"php_timezone":"UTC","viewer_admin":false});assert!(decode(&serde_json::to_vec(&good).unwrap()).is_ok());for(k,v)in[("offset",json!(1)),("viewer_admin",Value::Null),("search",json!(""))]{let mut bad=good.clone();bad[k]=v;assert!(decode(&serde_json::to_vec(&bad).unwrap()).is_err(),"{view} {k}");}}}
+ #[test]fn settings_account_views_need_viewer_role(){for view in["settings_follow_requests","settings_featured","settings_mutes","settings_profile","settings_links","settings_ai","settings_tokens","settings_two_factor"]{let good=json!({"protocol_version":1,"owner_id":2,"csrf":"session","view":view,"mode":"full","offset":0,"approvals_enabled":false,"now":100,"php_timezone":"UTC","viewer_admin":false});assert!(decode(&serde_json::to_vec(&good).unwrap()).is_ok());for(k,v)in[("offset",json!(1)),("viewer_admin",Value::Null),("search",json!(""))]{let mut bad=good.clone();bad[k]=v;assert!(decode(&serde_json::to_vec(&bad).unwrap()).is_err(),"{view} {k}");}}}
  #[test]fn moderation_envelope_needs_a_known_filter(){let good=json!({"protocol_version":1,"owner_id":1,"csrf":"session","view":"moderation","mode":"full","offset":0,"approvals_enabled":false,"now":100,"php_timezone":"UTC","filter":"open"});assert!(decode(&serde_json::to_vec(&good).unwrap()).is_ok());for(k,v)in[("offset",json!(1)),("filter",Value::Null),("filter",json!("bogus")),("viewer_admin",json!(true)),("search",json!(""))]{let mut bad=good.clone();bad[k]=v;assert!(decode(&serde_json::to_vec(&bad).unwrap()).is_err(),"{k}");}let mut other=good.clone();other["view"]=json!("blocks");assert!(decode(&serde_json::to_vec(&other).unwrap()).is_err());}
  #[test]fn report_row_model_is_closed(){assert!(serde_json::from_value::<moderation::Report>(json!({"id":1,"direction":"in","state":"open","reporter_actor_id":"https://r/u","target_actor_id":null,"status_uris_json":null,"comment":null,"about_us":"0","admin_notes":"","created_at":"a","activity_id":"x"})).is_err());}
  #[test]fn block_row_model_is_closed(){assert!(serde_json::from_value::<blocks::Block>(json!({"id":1,"scope":"domain","value":"x","kind":"block","reason":null,"created_at":"a","created_by":"admin"})).is_err());}

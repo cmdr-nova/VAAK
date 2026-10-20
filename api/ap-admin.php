@@ -31302,17 +31302,7 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
         </section>
 
       <?php elseif ($view === 'security'): ?>
-        <?php
-          $oauthTokens = ap_oauth_tokens_list(40, 7, $vaakOwnerId);
-          $nowTs = time();
-          $oauthRevokedShown = 0;
-          foreach ($oauthTokens as $_t) {
-              if (!empty($_t['revoked_at'])) {
-                  $oauthRevokedShown++;
-              }
-          }
-          $isCmdrSecurity = ($vaakActorKey === 'cmdr_nova');
-        ?>
+        <?php $isCmdrSecurity = ($vaakActorKey === 'cmdr_nova'); ?>
         <div class="tweet" style="margin-bottom:1rem">
           <div class="who">Your account · <?= h($vaakHandle) ?></div>
           <div class="body meta" style="margin-top:.5rem">
@@ -31362,6 +31352,7 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
         </div>
         <script src="https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/qrcode.min.js"></script>
         <script>function vaakShowTotpQr(uri){var box=document.getElementById('vaak-totp-qr'),out=document.getElementById('vaak-totp-qr-image');if(!window.qrcode){alert('QR generator is unavailable. Use the Base32 setup key instead.');return;}var qr=qrcode(0,'M');qr.addData(uri);qr.make();out.innerHTML=qr.createSvgTag(5,0);box.hidden=false;box.style.display='grid';}</script>
+        <?php elseif (($settingsNativeTwoFactor = ap_settings_native_body('settings_two_factor', !empty($vaakIsAdmin))) !== null): ?><?= $settingsNativeTwoFactor ?>
         <?php elseif (!$twoFaEnabled): ?>
         <div class="tweet" style="margin-bottom:1.25rem">
           <div class="who">Two-factor authentication</div>
@@ -31425,6 +31416,17 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
         </form>
         <?php endif; ?>
 
+        <?php if (($settingsNativeTokens = ap_settings_native_body('settings_tokens', !empty($vaakIsAdmin))) !== null): ?><?= $settingsNativeTokens ?><?php else: ?>
+        <?php
+          $oauthTokens = ap_oauth_tokens_list(40, 7, $vaakOwnerId);
+          $nowTs = time();
+          $oauthRevokedShown = 0;
+          foreach ($oauthTokens as $_t) {
+              if (!empty($_t['revoked_at'])) {
+                  $oauthRevokedShown++;
+              }
+          }
+        ?>
         <div class="tweet" style="margin-top:.5rem">
           <div class="who">Your OAuth tokens</div>
           <div class="body meta" style="margin-top:.5rem">
@@ -31476,6 +31478,7 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
               </div>
             </article>
           <?php endforeach; ?>
+        <?php endif; ?>
         <?php endif; ?>
 
       <?php elseif ($view === 'profile' || $view === 'atmosphere'): ?>
