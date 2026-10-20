@@ -123,6 +123,7 @@ async fn stamp_ask_identities(
     extra: &mut std::collections::HashMap<String, serde_json::Value>,
 ) {
     let _ = crate::home_hydrate_ranked::attach_ask_identities(db, slice).await;
+    let _ = crate::status_emoji::attach_custom_emojis(db, slice).await;
     let _ = crate::wafrn_crosspost::stamp_text_asks(db, slice).await;
     if extra.is_empty() {
         return;
@@ -135,6 +136,7 @@ async fn stamp_ask_identities(
         }
     }
     let _ = crate::home_hydrate_ranked::attach_ask_identities(db, &mut vals).await;
+    let _ = crate::status_emoji::attach_custom_emojis(db, &mut vals).await;
     let _ = crate::wafrn_crosspost::stamp_text_asks(db, &mut vals).await;
     for (key, value) in keys.into_iter().zip(vals) {
         extra.insert(key, value);

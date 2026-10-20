@@ -1910,7 +1910,10 @@ function ap_masto_status_from_as2_note(array $note, string $fallbackUrl): ?array
         'media_attachments' => $media,
         'mentions' => $mentions,
         'tags' => $tags,
-        'emojis' => [],
+        // The note's own Emoji tags (painters merge these over the host cache).
+        'emojis' => function_exists('ap_as2_emoji_items')
+            ? array_map(static fn (array $e): array => $e + ['visible_in_picker' => false], ap_as2_emoji_items($note))
+            : [],
         'card' => null,
         'poll' => null,
         // Explicit null prevents clients from carrying a stale native quote

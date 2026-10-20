@@ -492,6 +492,7 @@ async fn shadow_notif_embed(
             std::slice::from_mut(&mut status),
         )
         .await;
+        let _ = crate::status_emoji::attach_custom_emojis(&db, std::slice::from_mut(&mut status)).await;
     }
     let html = crate::notif_embed::paint_lean_embed_from(&status, hide, "mentions", &viewer, true);
     if html.is_empty() {

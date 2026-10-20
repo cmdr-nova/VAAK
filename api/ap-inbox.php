@@ -2999,6 +2999,14 @@ function ap_enrich_activity_for_feed(array $activity, string $type, ?string $obj
                 }
                 if (is_string($hostRef) && $hostRef !== '') {
                     ap_remote_emoji_ingest_actor_doc($hostRef, $noteDoc);
+                    // Misskey/Sharkey local emoji often arrive without a tag.
+                    $noteText = (string) ($noteDoc['content'] ?? '') . ' ' . (string) ($summary ?? '');
+                    $emojiHost = strtolower((string) (parse_url($hostRef, PHP_URL_HOST) ?: ''));
+                    $noteCodes = ap_emoji_shortcodes_in($noteText);
+                    if ($noteCodes !== [] && $emojiHost !== '' && $emojiHost !== 'mkultra.monster'
+                        && function_exists('ap_remote_emoji_ensure_codes_deferred')) {
+                        ap_remote_emoji_ensure_codes_deferred($emojiHost, $noteCodes);
+                    }
                 }
             }
         }
@@ -3225,12 +3233,51 @@ function ap_fetch_as2_object(string $url): ?array
         }
     }
     $doc = ap_fetch_remote_as2($url);
-    if (is_array($doc)) {
-        return $doc;
+    if (!is_array($doc)) {
+        // Misskey/Sharkey often require authorized fetch for AS2 while still
+        // exposing public notes via /api/notes/show — use that for boost cards.
+        $doc = ap_misskey_note_as2_from_url($url);
     }
-    // Misskey/Sharkey often require authorized fetch for AS2 while still
-    // exposing public notes via /api/notes/show — use that for boost cards.
-    return ap_misskey_note_as2_from_url($url);
+    if (is_array($doc)) {
+        ap_fetched_note_emoji_ingest($doc);
+    }
+    return $doc;
+}
+
+/**
+ * Cache a fetched Note's custom emoji under its author's host, and refresh
+ * that host's catalog when the text names shortcodes the note did not tag
+ * (Misskey/Sharkey local emoji). Every fetch path goes through here, so boosts,
+ * threads and status pages learn emoji, not only inbox Creates.
+ */
+function ap_fetched_note_emoji_ingest(array $doc): void
+{
+    if (!function_exists('ap_remote_emoji_ingest_actor_doc')) {
+        return;
+    }
+    try {
+        if (isset($doc['object']) && is_array($doc['object'])
+            && in_array((string) ($doc['type'] ?? ''), ['Create', 'Announce', 'Update'], true)) {
+            $doc = $doc['object'];
+        }
+        $type = (string) ($doc['type'] ?? '');
+        if (!in_array($type, ['Note', 'Article', 'Question', 'Page', 'Event', 'Video', 'Image', 'Audio'], true)) {
+            return;
+        }
+        $author = ap_as_id($doc['attributedTo'] ?? null);
+        if (!is_string($author) || !str_starts_with($author, 'https://')) {
+            return;
+        }
+        ap_remote_emoji_ingest_actor_doc($author, $doc);
+        $text = (string) ($doc['content'] ?? '') . ' ' . (is_string($doc['summary'] ?? null) ? $doc['summary'] : '');
+        $codes = ap_emoji_shortcodes_in($text);
+        $host = strtolower((string) (parse_url($author, PHP_URL_HOST) ?: ''));
+        if ($codes !== [] && $host !== '' && $host !== 'mkultra.monster') {
+            ap_remote_emoji_ensure_codes_deferred($host, $codes);
+        }
+    } catch (Throwable $e) {
+        error_log('[ap-inbox] note emoji ingest: ' . $e->getMessage());
+    }
 }
 
 /**
@@ -3389,6 +3436,27 @@ function ap_misskey_note_as2_from_url(string $url): ?array
         $quoteUrl = 'https://' . $host . '/notes/' . rawurlencode((string) $note['renoteId']);
     }
 
+    // Misskey returns { name: url } (or a list of {name,url}) for emoji it
+    // resolved; keep them as AS2 Emoji tags so the cache can learn them.
+    $emojiTags = [];
+    $noteEmojis = is_array($note['emojis'] ?? null) ? $note['emojis'] : [];
+    foreach ($noteEmojis as $k => $v) {
+        $name = is_array($v) ? (string) ($v['name'] ?? '') : (is_string($k) ? $k : '');
+        $iconUrl = is_array($v) ? (string) ($v['url'] ?? '') : (is_string($v) ? $v : '');
+        // "name@host" means another host's emoji; "name@." is the note host's own.
+        if (str_ends_with($name, '@.')) {
+            $name = substr($name, 0, -2);
+        }
+        if ($name === '' || str_contains($name, '@') || !str_starts_with($iconUrl, 'https://')) {
+            continue;
+        }
+        $emojiTags[] = [
+            'type' => 'Emoji',
+            'name' => ':' . $name . ':',
+            'icon' => ['type' => 'Image', 'url' => $iconUrl],
+        ];
+    }
+
     $doc = [
         'type' => 'Note',
         'id' => 'https://' . $host . '/notes/' . rawurlencode($noteId),
@@ -3408,6 +3476,9 @@ function ap_misskey_note_as2_from_url(string $url): ?array
     if ($quoteUrl !== null) {
         $doc['quoteUrl'] = $quoteUrl;
         $doc['_misskey_quote'] = $quoteUrl;
+    }
+    if ($emojiTags !== []) {
+        $doc['tag'] = $emojiTags;
     }
     return $doc;
 }

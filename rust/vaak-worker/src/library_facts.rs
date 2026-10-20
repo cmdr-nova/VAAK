@@ -193,6 +193,15 @@ pub(crate) async fn emoji_maps(db:&Client,status:&Value)->Result<std::collection
     }
     let mut actors=Vec::new();collect(status,&mut actors);let mut maps=std::collections::HashMap::new();
     for actor in actors {let rows=db.query("SELECT shortcode,url FROM remote_custom_emojis WHERE host=$1",&[&host(&actor)]).await?;let mut map=std::collections::HashMap::new();for row in rows {let code:String=row.get(0);let url:String=row.get(1);if !code.is_empty()&&url.starts_with("https://"){map.insert(code,url);}}maps.insert(actor,map);}
+    // Emoji carried on the status/account itself (Mastodon API shape) fill
+    // gaps the host cache has not learned yet.
+    fn carried(value:&Value,maps:&mut std::collections::HashMap<String,std::collections::HashMap<String,String>>){
+        match value {
+            Value::Object(object)=>{if let Some(account)=object.get("account"){let actor=s(account,"uri");if let Some(map)=maps.get_mut(actor){for source in [vaak_types::emoji::status_emoji_map(value),vaak_types::emoji::account_emoji_map(account)]{for (code,url) in source{map.entry(code).or_insert(url);}}}}for child in object.values().filter(|v|v.is_object()||v.is_array()){carried(child,maps);}},
+            Value::Array(items)=>for child in items{carried(child,maps)},_=>{}
+        }
+    }
+    carried(status,&mut maps);
     Ok(maps)
 }
 

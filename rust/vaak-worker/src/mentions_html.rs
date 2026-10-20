@@ -1017,6 +1017,7 @@ pub async fn mentions_html_fill(
         .await;
         let _ = crate::home_hydrate_ranked::attach_bsky_link_facets(&policy_db, &mut nested).await;
         let _ = crate::home_hydrate_ranked::attach_ask_identities(&policy_db, &mut nested).await;
+        let _ = crate::status_emoji::attach_custom_emojis(&policy_db, &mut nested).await;
         for (idx, st) in nested_at.into_iter().zip(nested) {
             if let Some(slot) = report.items[idx].get_mut("status") {
                 *slot = st;
