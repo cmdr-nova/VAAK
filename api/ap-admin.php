@@ -109,8 +109,11 @@ if ($vaakAdminLibOnly) {
 ap_auth_bootstrap();
 $vaakUser = ap_auth_current_user();
 $vaakGuestMethod = strtoupper((string) ($_SERVER['REQUEST_METHOD'] ?? 'GET'));
+// Guests (no session) get two read-only pages: a public local profile and a
+// shared post link (?view=status). Everything else still requires login.
+$vaakGuestView = strtolower(trim((string) ($_GET['view'] ?? '')));
 $vaakGuestProfile = !empty($GLOBALS['vaak_guest_profile'])
-    && strtolower(trim((string) ($_GET['view'] ?? ''))) === 'remote_profile'
+    && ($vaakGuestView === 'remote_profile' || $vaakGuestView === 'status')
     && ($vaakGuestMethod === 'GET' || $vaakGuestMethod === 'HEAD');
 if ($vaakUser === null && !$vaakGuestProfile) {
     $loginQs = '/vaak/?mode=login';
@@ -174,6 +177,8 @@ $GLOBALS['vaak_user'] = $vaakUser;
 $GLOBALS['vaak_is_admin'] = $vaakIsAdmin;
 $GLOBALS['vaak_owner_id'] = $vaakOwnerId;
 $GLOBALS['vaak_guest_profile'] = $vaakGuestProfile;
+$GLOBALS['vaak_guest_status'] = $vaakGuestProfile && $vaakUser !== null && !empty($vaakUser['is_guest'])
+    && $vaakGuestView === 'status';
 if ($vaakOwnerId > 0 && function_exists('ap_rss_migrate')) {
     ap_rss_migrate();
 }
@@ -287,9 +292,10 @@ $twoFaSetup = null;
 $twoFaRecoveryCodes = [];
 $view = preg_replace('/[^a-z_]/', '', (string) ($_GET['view'] ?? 'home')) ?: 'home';
 if (!empty($GLOBALS['vaak_guest_profile'])) {
-    // Guests may only see public local profiles — never the rest of the app.
-    $view = 'remote_profile';
-    $_GET['view'] = 'remote_profile';
+    // Guests may only see public local profiles and shared post links,
+    // never the rest of the app.
+    $view = !empty($GLOBALS['vaak_guest_status']) ? 'status' : 'remote_profile';
+    $_GET['view'] = $view;
 }
 // Canonicalize local on-VAAK profile URLs before any HTML is emitted.
 // vaak.monster → /users/{key}; mkultra.monster → /vaak/users/{key}.
@@ -21802,7 +21808,7 @@ function admin_bsky_thread_like_literal(string $value): string
 }
 
 /** Resolve only the requested identity, never a same-rkey cache fallback. */
-function admin_bsky_thread_target_uri(string $object): ?string
+function admin_bsky_thread_target_uri(string $object, bool $allowNetwork = true): ?string
 {
     $object=trim($object);if(str_starts_with($object,'bsky:'))$object=substr($object,5);
     $embedded=admin_bsky_thread_extract_at($object);
@@ -21821,6 +21827,7 @@ function admin_bsky_thread_target_uri(string $object): ?string
         }
         $matches=$q->fetchAll(PDO::FETCH_COLUMN);
         if(count($matches)===1)return admin_bsky_thread_extract_at((string)$matches[0]);
+        if(!$allowNetwork)return null;
         $r=ap_bsky_xrpc(AP_BSKY_PUBLIC_API,'com.atproto.identity.resolveHandle','GET',['handle'=>$actor],null,null,4);
         $did=!empty($r['ok'])?($r['json']['did']??null):null;
     }
@@ -33730,6 +33737,9 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
               }
           }
           $stFrom = preg_replace('/[^a-z_]/', '', (string) ($_GET['from'] ?? 'home')) ?: 'home';
+          // Logged-out visitor on a shared link: paint only what this instance
+          // already stores (cache-only, no remote fetches, no thread AJAX).
+          $stGuest = !empty($GLOBALS['vaak_guest_status']);
           $stBackHref = match ($stFrom) {
               'mentions' => '?view=mentions',
               'feed' => '?view=feed',
@@ -33760,6 +33770,11 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
               'queue' => '',
               default => 'home',
           };
+          if ($stGuest) {
+              $stBackHref = '/vaak/';
+              $stBackLabel = '← VAAK';
+              $stBackView = '';
+          }
           if (!defined('AP_INBOX_LIB_ONLY')) {
               define('AP_INBOX_LIB_ONLY', true);
           }
@@ -33781,11 +33796,16 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
           }
           $stIsBskyObject = $stObject !== '' && function_exists('admin_object_is_bluesky_post')
               && admin_object_is_bluesky_post($stObject);
-          if ($stIsBskyObject && function_exists('ap_bsky_feed_item_from_any_url')) {
+          // Guests only see Bluesky posts this instance already indexed.
+          $stBskyGuestMissing = $stGuest && $stIsBskyObject
+              && !(function_exists('admin_bsky_thread_target_uri') && function_exists('ap_bsky_post_item_by_uri')
+                  && is_string($stGuestAt = admin_bsky_thread_target_uri($stObject, false))
+                  && is_array(ap_bsky_post_item_by_uri($stGuestAt)));
+          if ($stIsBskyObject && !$stBskyGuestMissing && function_exists('ap_bsky_feed_item_from_any_url')) {
               try {
                   // Status focus: allow a small sync AppView repair so NSFW/thin
                   // media paints behind a CW instead of waiting on warm.
-                  $GLOBALS['admin_bsky_gallery_repair_budget'] = 2;
+                  $GLOBALS['admin_bsky_gallery_repair_budget'] = $stGuest ? 0 : 2;
                   $stBskyFocusHtml = admin_bsky_thread_fragment($stObject, 'focus', $stFrom, $followingIds);
               } catch (Throwable $e) {
                   error_log('[ap-admin] status bsky hydrate: ' . $e->getMessage());
@@ -33836,7 +33856,7 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
                           break;
                       }
                   }
-                  if ($stEvent === null
+                  if ($stEvent === null && !$stGuest
                       && function_exists('ap_masto_url_looks_like_status')
                       && ap_masto_url_looks_like_status($stObject)
                       && function_exists('ap_masto_resolve_pasted_status_url')) {
@@ -33869,6 +33889,7 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
                   // Skip synthetic bite URLs (they aren't AS2 Notes and remote fetch 404s).
                   if (
                       !$isSyntheticBite
+                      && !$stGuest
                       && $stLocalStatus === null
                       && function_exists('ap_masto_ensure_remote_note_event')
                       && (!is_array($stEvent) || !in_array($stType, ['create', 'update'], true))
@@ -33974,8 +33995,13 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
                   $stMaybeHydrateFocus = true;
               }
           }
+          if ($stGuest) {
+              $stMaybeMoreThread = false;
+              $stMaybeMoreReplies = false;
+              $stMaybeHydrateFocus = false;
+          }
           // Explicit retry from failed AJAX
-          if (isset($_GET['refresh_thread']) && (string) $_GET['refresh_thread'] === '1' && $stStatusId !== '') {
+          if (!$stGuest && isset($_GET['refresh_thread']) && (string) $_GET['refresh_thread'] === '1' && $stStatusId !== '') {
               if (function_exists('ap_masto_fetch_remote_context_uris') && $stObject !== '') {
                   try {
                       ap_masto_fetch_remote_context_uris($stObject);
@@ -34005,8 +34031,17 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
           $stContentBlocked = is_array($stLocalStatus)
               ? admin_direct_status_content_blocked($stLocalStatus)
               : (is_array($stEvent) && admin_direct_event_content_blocked($stEvent));
+          // A guest sees the post only when its stored source is public or
+          // unlisted (owner 0 has no audience grants); otherwise nothing paints.
+          $stGuestHidden = false;
+          if ($stGuest && !$stIsBskyObject && (is_array($stEvent) || is_array($stLocalStatus))) {
+              $stGuestSource = ap_masto_lookup_status_by_object_url($stObject, 0, false, true);
+              $stGuestHidden = !is_array($stGuestSource) || !admin_direct_status_allowed($stGuestSource, 0);
+          }
         ?>
-        <?php if ($stContentBlocked): ?>
+        <?php if ($stGuest && ($stContentBlocked || $stGuestHidden)): ?>
+          <div class="empty">This post isn’t available.</div>
+        <?php elseif ($stContentBlocked): ?>
           <div class="empty">
             This post is hidden because you blocked the author
             <?php if (function_exists('ap_is_blocked_actor') && ap_is_blocked_actor($stAuthor)): ?>
@@ -34020,6 +34055,10 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
         <?php elseif ($stIsBskyObject): ?>
           <?php if ($stBskyFocusHtml === null): ?>
             <?= admin_status_bsky_unavailable_html($stObject) ?>
+          <?php elseif ($stGuest): ?>
+          <div id="status-focus">
+            <?= $stBskyFocusHtml ?>
+          </div>
           <?php else: ?>
           <div id="status-thread-ancestors" data-object="<?= h($stObject) ?>" data-from="<?= h($stFrom) ?>" data-need-more="1">
             <div class="meta status-thread-loading" style="margin-bottom:.5rem">Loading earlier posts…</div>
@@ -34038,7 +34077,7 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
             <?php
               // Last-chance sync ensure across URL candidates (Pleroma /posts/,
               // Mastodon /statuses/, /@user/id web forms) before showing failure.
-              if ($stObject !== '' && str_starts_with($stObject, 'https://')
+              if ($stObject !== '' && str_starts_with($stObject, 'https://') && !$stGuest
                   && function_exists('ap_masto_ensure_remote_note_event')) {
                   $ensureCands = function_exists('ap_masto_object_url_lookup_candidates')
                       ? ap_masto_object_url_lookup_candidates($stObject)
@@ -34091,6 +34130,8 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
                 <?php if ($stFrom === 'queue'): ?>
                   <div class="meta" style="margin-top:.5rem">Queue history still lists the old note id after a delete.</div>
                 <?php endif; ?>
+              <?php elseif ($stGuest): ?>
+                This post isn’t available here.
               <?php else: ?>
                 Couldn’t load that post in this instance’s store.
               <?php endif; ?>
@@ -39379,6 +39420,8 @@ window.vaakStopStatusThread = function () { if (stopThread) stopThread(); stopTh
 window.vaakBootStatusThread = function () {
   window.vaakStopStatusThread();
   if (!document.querySelector('.status-back')) return false;
+  // Guests get the server-painted, cache-only thread; thread partials need a session.
+  if (window.vaakGuestProfile) return false;
   /** Cancel all thread hydrate/poll fetches when leaving Status (Home click, back, etc.). */
   let threadAlive = true;
   let threadAbort = new AbortController();
@@ -42820,6 +42863,9 @@ window.vaakBootStatusThread();
 
   document.addEventListener('click', (ev) => {
     if (ev.defaultPrevented || ev.metaKey || ev.ctrlKey || ev.shiftKey || ev.altKey || ev.button !== 0) return;
+    // Soft-nav shells need a session; guests follow links as full page loads
+    // (a shared post or public profile then opens in the guest view).
+    if (window.vaakGuestProfile) return;
     const link = ev.target && ev.target.closest ? ev.target.closest('a[href]') : null;
     if (!link || link.target === '_blank') return;
     const view = link.getAttribute('data-vaak-soft-nav') || statusViewFromAnchor(link);
@@ -42847,6 +42893,7 @@ window.vaakBootStatusThread();
   // lands on the Mentions feed and Home appears to do nothing.
   document.addEventListener('pointerup', (ev) => {
     if (ev.pointerType === 'mouse' || ev.button !== 0) return;
+    if (window.vaakGuestProfile) return;
     const rail = document.getElementById('admin-rail-left');
     if (!rail || !rail.classList.contains('mobile-open')) return;
     const link = ev.target && ev.target.closest ? ev.target.closest('a[href]') : null;

@@ -485,6 +485,21 @@ if ($user === null) {
             exit;
         }
     }
+    // A shared post link (/vaak/?view=status&object=…) opens read-only for
+    // visitors without an account. ap-admin.php keeps it to public/unlisted
+    // posts already on this instance and never fetches remotely for a guest.
+    $guestMethod = strtoupper((string) ($_SERVER['REQUEST_METHOD'] ?? 'GET'));
+    if ($mode === '' && !$isPartial && !$isAjaxGet && !$isFetch
+        && ($guestMethod === 'GET' || $guestMethod === 'HEAD')
+        && strtolower(trim((string) ($_GET['view'] ?? ''))) === 'status'
+        && trim((string) ($_GET['object'] ?? '')) !== '') {
+        // Shared links are for people, not crawlers.
+        header('X-Robots-Tag: noindex, nofollow');
+        $GLOBALS['vaak_guest_profile'] = true;
+        $_GET['view'] = 'status';
+        require dirname(__DIR__) . '/api/ap-admin.php';
+        exit;
+    }
     if ($isPartial || $isAjaxGet || $isFetch) {
         $loginQs = '/vaak/?mode=login';
         $returnView = preg_replace('/[^a-z_]/', '', (string) ($_GET['view'] ?? ''));
