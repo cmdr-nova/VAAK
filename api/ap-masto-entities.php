@@ -3180,6 +3180,11 @@ function ap_masto_unglue_bare_handles(string $text): string
                 if (str_contains($rest, '.')) {
                     continue;
                 }
+                // Underscores belong to handles, never to a glued prose word:
+                // "@shana_flux" must not become "@sha na_flux".
+                if (str_contains($rest, '_') || str_ends_with($prefix, '_')) {
+                    continue;
+                }
                 if (ap_masto_resolve_bare_username($prefix) !== null) {
                     return $m[1] . '@' . $prefix . ' ' . $rest;
                 }
@@ -3272,8 +3277,8 @@ function ap_masto_resolve_bare_username(string $username): ?array
         }
         // Local instance account
         if (preg_match('/^[A-Za-z0-9_]{2,32}$/', $username)
-            && function_exists('ap_auth_user_by_username')) {
-            $local = ap_auth_user_by_username($username);
+            && function_exists('ap_local_user_by_username')) {
+            $local = ap_local_user_by_username($username);
             if (is_array($local) && !empty($local['actor_id'])) {
                 return $cache[$needle] = ap_masto_mention_from_actor((string) $local['actor_id']);
             }

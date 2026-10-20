@@ -1653,7 +1653,8 @@ function ap_auth_notify_operator_registration(string $username, int $userId, boo
     $actorId = 'https://mkultra.monster/users/' . rawurlencode($username);
     $objectId = $actorId . '#registration-' . $userId;
     $activityId = 'https://mkultra.monster/vaak/registrations/' . $userId;
-    $registrationText = 'New VAAK user @' . $username . ($approved ? ' registered with administrator approval.' : ' registered using an invite.');
+    // Full acct so bare-handle repair can never re-split the new username.
+    $registrationText = 'New VAAK user @' . $username . '@mkultra.monster' . ($approved ? ' registered with administrator approval.' : ' registered using an invite.');
     try {
         ap_mention_store([
             'owner_user_id' => $operatorUserId,
