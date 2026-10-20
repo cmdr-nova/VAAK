@@ -10813,7 +10813,10 @@ function ap_db_default_owner_user_id(): int
         return $sessionId;
     }
     if (ap_db_session_bound()) {
-        error_log('[ap-db] session bound but owner user id missing — refusing cmdr_nova fallback');
+        // Logged-out guest pages are owner 0 by design; only log real misses.
+        if (empty($GLOBALS['vaak_guest_profile'])) {
+            error_log('[ap-db] session bound but owner user id missing — refusing cmdr_nova fallback');
+        }
         return 0;
     }
     return ap_db_cmdr_nova_user_id();
