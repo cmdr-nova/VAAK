@@ -31770,6 +31770,7 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
         </form>
         <?php endif; ?>
 
+        <?php if (($settingsNativeLinks = ap_settings_native_body('settings_links', !empty($vaakIsAdmin))) !== null): ?><?= $settingsNativeLinks ?><?php else: ?>
         <?php
           $slLink = function_exists('ap_sl_link_for_user')
               ? ap_sl_link_for_user((int) ($vaakUser['id'] ?? 0))
@@ -31899,6 +31900,7 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
             </form>
           <?php endif; ?>
         </div>
+        <?php endif; ?>
 
         <?php if (($settingsNativeFeatured = ap_settings_native_body('settings_featured', !empty($vaakIsAdmin))) !== null): ?><?= $settingsNativeFeatured ?><?php else: ?>
         <?php
