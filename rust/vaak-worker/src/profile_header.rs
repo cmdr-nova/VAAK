@@ -268,7 +268,7 @@ fn world_html(f:&HeaderFacts)->String{
  out.push_str("</div>");out
 }
 fn tabs_html(f:&HeaderFacts)->String{
- let c=&f.counts;let tabs=[("pinned","Pinned",c.pinned,c.pinned>0),("posts","Posts",c.posts,true),("replies","Replies",c.replies,!card::boolean(&f.profile,"hide_profile_replies")),("boosts","Boosts",c.boosts,!card::boolean(&f.profile,"hide_profile_boosts")),("media","Media",c.media,true),("featured","Featured",c.featured,c.featured>0),("blog","Blog",c.blog,c.blog>0||f.blog_post.is_some())];
+ let c=&f.counts;let tabs=[("pinned","Pinned",c.pinned,c.pinned>0),("posts","Posts",c.posts,true),("replies","Replies",c.replies,!card::boolean(&f.profile,"hide_profile_replies")),("boosts","Boosts",c.boosts,!card::boolean(&f.profile,"hide_profile_boosts")),("media","Media",c.media,true),("asks","Asks",c.asks,c.asks>0),("featured","Featured",c.featured,c.featured>0),("blog","Blog",c.blog,c.blog>0||f.blog_post.is_some())];
  let mut out=String::from("<nav class=\"remote-profile-tabs\" aria-label=\"Profile posts\"><button type=\"button\" class=\"remote-profile-tabs-scroll-btn\" data-profile-tabs-scroll=\"left\" aria-label=\"Scroll profile tabs left\">&lt;</button><div class=\"remote-profile-tabs-scroll\">");
  for(key,label,count,visible)in tabs{if visible{let active=f.effective_tab==key;out.push_str(&format!("<a href=\"{}{}\" class=\"{}\" {}>{label}<span class=\"tab-count\">{count}</span></a>",h(&f.tab_href),q(key),if active{"is-active"}else{""},if active{"aria-current=\"page\""}else{""}));}}
  out.push_str("</div><button type=\"button\" class=\"remote-profile-tabs-scroll-btn\" data-profile-tabs-scroll=\"right\" aria-label=\"Scroll profile tabs right\">&gt;</button></nav>");out

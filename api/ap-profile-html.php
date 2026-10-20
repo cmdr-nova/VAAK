@@ -11,7 +11,7 @@ if (!function_exists('ap_profile_order_tabs')) {
      */
     function ap_profile_order_tabs(array $tabs): array
     {
-        $order = ['pinned', 'posts', 'replies', 'boosts', 'media', 'featured', 'blog'];
+        $order = ['pinned', 'posts', 'replies', 'boosts', 'media', 'asks', 'featured', 'blog'];
         $out = [];
         foreach ($order as $key) {
             if (array_key_exists($key, $tabs) && $tabs[$key] !== null) {
