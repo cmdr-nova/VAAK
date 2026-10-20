@@ -2204,6 +2204,13 @@ fn b64_encode(s: &str) -> String {
     out
 }
 
+/// Local URI under the viewer's actor (or no known viewer, so ownership is unknown).
+fn viewer_owns_uri(uri: &str, viewer_actor: &str) -> bool {
+    let viewer = viewer_actor.trim().trim_end_matches('/');
+    let uri = uri.trim().trim_end_matches('/');
+    viewer.is_empty() || uri == viewer || uri.starts_with(&format!("{viewer}/"))
+}
+
 fn is_own_note(uri: &str, viewer_actor: &str) -> bool {
     let viewer = viewer_actor.trim().trim_end_matches('/');
     if viewer.is_empty() || uri.is_empty() {
@@ -3026,8 +3033,9 @@ fn paint_lean_timeline_actions(status: &Value, from: &str, viewer_actor: &str) -
                 &action_count_html(rb_n),
                 &format!(" {eng_attr}=\"1\" data-eng-count=\"{rb_n}\""),
             ));
-            // Bite is Fediverse-remote only — never on own/local notes.
-            if !local && !is_own {
+            // Bite any Fediverse post, including other local accounts' notes;
+            // never the viewer's own posts.
+            if !is_own && !(local && viewer_owns_uri(uri, viewer_actor)) {
                 actions.push_str(&format!(
                     "<form method=\"post\" action=\"{base}\" style=\"display:inline\" onsubmit=\"return confirm('Bite this post?');\">\
                      <input type=\"hidden\" name=\"action\" value=\"bite_remote\">\
@@ -5594,7 +5602,7 @@ mod tests {
         assert!(!html.contains("delete_status"), "must not Delete peer note: {html}");
         assert!(!html.contains("js-edit-post"), "must not Edit peer note: {html}");
         assert!(!html.contains("pin_status"), "must not Pin peer note: {html}");
-        assert!(!html.contains("bite_remote"), "local peer skips Bite: {html}");
+        assert!(html.contains("bite_remote") && html.contains("ph-tooth"), "local peer can be bitten: {html}");
     }
 
     #[test]
