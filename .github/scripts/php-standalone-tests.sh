@@ -35,6 +35,7 @@ php_tests=(
   api/bin/account-acct-key-error-smoke.php
   api/bin/avatar-refresh-smoke.php
   api/bin/bite-queue-smoke.php
+  api/bin/deprioritize-queue-smoke.php
   api/bin/bsky-thread-fragment-smoke.php
   api/bin/bsky-observation-refresh-smoke.php
   api/bin/classic-profile-redirect-smoke.php

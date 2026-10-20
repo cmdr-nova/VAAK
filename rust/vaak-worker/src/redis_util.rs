@@ -40,6 +40,31 @@ pub async fn json_get(
     }
 }
 
+/// PHP `ap_redis_delete_pattern`: SCAN in batches of 100 and DEL each batch.
+pub async fn delete_pattern(conn: &mut redis::aio::MultiplexedConnection, pattern: &str) -> Result<usize> {
+    let mut cursor: u64 = 0;
+    let mut deleted = 0usize;
+    loop {
+        let (next, keys): (u64, Vec<String>) = redis::cmd("SCAN")
+            .arg(cursor)
+            .arg("MATCH")
+            .arg(pattern)
+            .arg("COUNT")
+            .arg(100)
+            .query_async(conn)
+            .await
+            .with_context(|| format!("redis SCAN {pattern}"))?;
+        if !keys.is_empty() {
+            let n: usize = redis::cmd("DEL").arg(&keys).query_async(conn).await.unwrap_or(0);
+            deleted += n;
+        }
+        if next == 0 {
+            return Ok(deleted);
+        }
+        cursor = next;
+    }
+}
+
 /// PHP `ap_redis_lock` shape: key `vaak:lock:{name}` SET NX EX.
 pub async fn lock(
     conn: &mut redis::aio::MultiplexedConnection,

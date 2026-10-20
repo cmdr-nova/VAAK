@@ -3613,6 +3613,10 @@ $vaakAdminOnlyActions = [
             $view = 'profile';
         }
         $returnActor = trim((string) ($_POST['return_actor'] ?? ''));
+        $wantJson = !empty($_POST['ajax'])
+            || str_contains((string) ($_SERVER['HTTP_ACCEPT'] ?? ''), 'application/json')
+            || strtolower((string) ($_SERVER['HTTP_X_REQUESTED_WITH'] ?? '')) === 'xmlhttprequest';
+        $deprioritizedNow = null;
         if ($target === '') {
             $error = 'Missing actor to deprioritize.';
         } elseif (!str_starts_with($target, 'https://')) {
@@ -3633,7 +3637,11 @@ $vaakAdminOnlyActions = [
                     ? ap_deprioritize_upsert($target, $vaakOwnerId)
                     : ['ok' => false, 'error' => 'Deprioritize unavailable.'];
                 if (!empty($result['ok'])) {
-                    admin_tl_cache_clear();
+                    // One row saved; the Home rebuild goes to the fan-out
+                    // queue instead of clearing every user's timeline cache
+                    // and repainting Home inside this request.
+                    admin_home_rank_pref_rewarm((int) $vaakOwnerId);
+                    $deprioritizedNow = true;
                     $notice = !empty($result['already'])
                         ? 'Already deprioritized on Home.'
                         : 'Deprioritized on Home (still shows on Federated / Local).';
@@ -3645,12 +3653,26 @@ $vaakAdminOnlyActions = [
                     ? ap_deprioritize_remove($target, $vaakOwnerId)
                     : ['ok' => false, 'error' => 'Deprioritize unavailable.'];
                 if (!empty($result['ok'])) {
-                    admin_tl_cache_clear();
+                    admin_home_rank_pref_rewarm((int) $vaakOwnerId);
+                    $deprioritizedNow = false;
                     $notice = 'Removed Home deprioritize.';
                 } else {
                     $error = $result['error'] ?? 'Could not remove deprioritize.';
                 }
             }
+        }
+        if ($wantJson) {
+            header('Content-Type: application/json; charset=utf-8');
+            header('Cache-Control: no-store');
+            http_response_code($error === null ? 200 : 422);
+            echo json_encode([
+                'ok' => $error === null,
+                'actor_id' => rtrim($target, '/'),
+                'deprioritized' => $deprioritizedNow,
+                'notice' => $error === null ? (string) $notice : '',
+                'error' => $error,
+            ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+            exit;
         }
         if ($returnActor === '' && str_starts_with($target, 'https://')) {
             $returnActor = $target;
@@ -9785,6 +9807,37 @@ function admin_tl_cache_put(string $key, array $ranked): void
 }
 
 /** Drop short-lived Home/Federated ranked caches (e.g. after muted-words change). */
+/**
+ * A Home ranking preference changed for one owner (Deprioritize). Queue the
+ * native Home rebuild on the timeline fan-out worker, which rewrites the
+ * ranked list and then drops this owner's hydrate and HTML fragments. If the
+ * queue is unavailable, invalidate only this owner's caches after the
+ * response is sent; the ranked-warm loop rebuilds within a minute.
+ */
+function admin_home_rank_pref_rewarm(int $ownerUserId): void
+{
+    if ($ownerUserId < 1) {
+        return;
+    }
+    if (function_exists('ap_timeline_fanout_enqueue')
+        && ap_timeline_fanout_enqueue(['op' => 'owner_rewarm', 'owner' => $ownerUserId])) {
+        return;
+    }
+    register_shutdown_function(static function () use ($ownerUserId): void {
+        try {
+            if (function_exists('fastcgi_finish_request')) {
+                @fastcgi_finish_request();
+            }
+            admin_tl_cache_clear_owner($ownerUserId);
+            if (function_exists('ap_timeline_home_hydrate_invalidate_owner')) {
+                ap_timeline_home_hydrate_invalidate_owner($ownerUserId);
+            }
+        } catch (Throwable $e) {
+            error_log('[ap-admin] home rank pref rewarm: ' . $e->getMessage());
+        }
+    });
+}
+
 function admin_tl_cache_clear(): void
 {
     if (function_exists('ap_redis_delete_pattern')) {
@@ -38635,6 +38688,58 @@ window.apAdminToast = function (msg, isErr) {
     }
   });
 
+  // Deprioritize on Home: save in the background and flip every menu for
+  // that author in place. The Home rebuild runs on the fan-out queue.
+  document.addEventListener('submit', async (ev) => {
+    const form = ev.target;
+    if (!(form instanceof HTMLFormElement) || ev.defaultPrevented) return;
+    const actionInput = form.querySelector('input[name="action"]');
+    const action = actionInput ? actionInput.value : '';
+    if (action !== 'deprioritize_remote' && action !== 'undeprioritize_remote') return;
+    ev.preventDefault();
+    if (typeof window.vaakHideLoading === 'function') window.vaakHideLoading();
+    window.__vaakNavigationPending = false;
+    if (form.dataset.busy === '1') return;
+    form.dataset.busy = '1';
+    const fd = new FormData(form);
+    fd.set('ajax', '1');
+    if (window.VAAK_CSRF) fd.set('csrf', window.VAAK_CSRF);
+    const menu = form.closest('details.post-action-menu');
+    if (menu) menu.removeAttribute('open');
+    try {
+      const res = await fetch(form.getAttribute('action') || (window.location.pathname + window.location.search), {
+        method: 'POST', body: fd, credentials: 'same-origin',
+        headers: { 'Accept': 'application/json', 'X-Requested-With': 'XMLHttpRequest' }
+      });
+      const data = await res.json().catch(() => null);
+      if (!data || !data.ok) {
+        window.apAdminToast((data && data.error) || 'Could not update Deprioritize.', true);
+        return;
+      }
+      const actor = String(data.actor_id || fd.get('actor_id') || '').replace(/\/+$/, '');
+      const on = data.deprioritized === true;
+      document.querySelectorAll('form').forEach((f) => {
+        const a = f.querySelector('input[name="action"]');
+        const t = f.querySelector('input[name="actor_id"]');
+        if (!a || !t || (a.value !== 'deprioritize_remote' && a.value !== 'undeprioritize_remote')) return;
+        if (String(t.value || '').replace(/\/+$/, '') !== actor) return;
+        // Settings > Deprioritized list: the row goes away once removed.
+        if (!on && f.closest('.profile-list-section')) {
+          const row = f.closest('article.tweet');
+          if (row) { row.remove(); return; }
+        }
+        a.value = on ? 'undeprioritize_remote' : 'deprioritize_remote';
+        const b = f.querySelector('button[type="submit"]');
+        if (b) b.textContent = on ? 'Stop deprioritizing' : 'Deprioritize on Home';
+      });
+      window.apAdminToast(data.notice || (on ? 'Deprioritized on Home.' : 'Removed Home deprioritize.'), false);
+    } catch (e) {
+      window.apAdminToast('Could not update Deprioritize. Check your connection and try again.', true);
+    } finally {
+      delete form.dataset.busy;
+    }
+  });
+
   document.addEventListener('submit', async (ev) => {
     const form = ev.target;
     if (!(form instanceof HTMLFormElement)) return;
@@ -47065,7 +47170,7 @@ if (VIEW === 'analytics') loadAnalytics();
       'rss_favourite', 'rss_bookmark',
       'poll_vote', 'action_queue_status',
       'delete_status', 'delete_bsky_post',
-      'bite_remote',
+      'bite_remote', 'deprioritize_remote', 'undeprioritize_remote',
     ].includes(action)) {
       return;
     }

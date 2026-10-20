@@ -9,6 +9,9 @@
 //! - `home_bsky` — new Bluesky post → observers' Home
 //! - `public_feed` — public firehose → active owners' Federated (+ Local)
 //! - `owner_status` — local compose/boost → one owner's views
+//! - `owner_rewarm` — a Home ranking preference changed (Deprioritize):
+//!   rebuild that owner's Home ranked list, then drop its hydrate and HTML
+//!   fragments so the next paint uses it
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -803,7 +806,13 @@ async fn process_home_bsky(
             continue;
         }
         let weights = load_home_rank_weights(cache, *owner).await;
-        let sort = home_placement_sort(&weights, did, job.ts);
+        let mut sort = home_placement_sort(&weights, did, job.ts);
+        // Older rank weights only list the profile URL the menu saved.
+        if !weights.deprioritized.contains(&did.to_ascii_lowercase())
+            && weights.deprioritized.contains(&bsky_profile.to_ascii_lowercase())
+        {
+            sort -= 6 * 3600;
+        }
         let n = prepend_owner(cache, *owner, k, uri, s, &["home"], Some(sort)).await?;
         if n > 0 {
             stats.touched_owners += 1;
@@ -930,8 +939,54 @@ async fn process_owner_status(
     Ok(stats)
 }
 
+/// Home hydrate limits PHP `ap_timeline_home_hydrate_invalidate_owner` drops.
+const HOME_HYDRATE_LIMITS: [i64; 8] = [15, 40, 50, 80, 160, 240, 20, 30];
+
+/// Inline on purpose: toggles are rare, and the CLI (`run_once_cli`) must
+/// not exit before the rebuild lands.
+async fn process_owner_rewarm(cfg: &Config, job: &FanoutJob) -> Result<FanoutStats> {
+    if job.owner < 1 {
+        return Ok(FanoutStats {
+            skipped: 1,
+            ..Default::default()
+        });
+    }
+    owner_rewarm(cfg, job.owner).await?;
+    Ok(FanoutStats {
+        touched_owners: 1,
+        ..Default::default()
+    })
+}
+
+async fn owner_rewarm(cfg: &Config, owner: i64) -> Result<()> {
+    let started = Instant::now();
+    let summary = crate::ranked_warm::warm_owner(cfg, owner, "home").await?;
+    let mut cache = redis_util::connect(&cfg.redis_url).await?;
+    let mut del = redis::cmd("DEL");
+    for limit in HOME_HYDRATE_LIMITS {
+        del.arg(home_hydrate_redis_key(owner, limit));
+    }
+    let _: Result<i64, _> = del.query_async(&mut cache).await;
+    for pattern in [
+        format!("vaak:fragment:tl:v1:{owner}:*"),
+        format!("vaak:fragment:tl-shell:v1:{owner}:*"),
+    ] {
+        let _ = redis_util::delete_pattern(&mut cache, &pattern).await;
+    }
+    maybe_spawn_home_hydrate_warm(cfg, owner, true).await;
+    tracing::info!(
+        op = "owner_rewarm",
+        owner,
+        ms = started.elapsed().as_millis() as u64,
+        summary = %summary,
+        "timeline fanout"
+    );
+    Ok(())
+}
+
 pub async fn process_job(cfg: &Config, job: &FanoutJob) -> Result<FanoutStats> {
-    if !ingest_enabled() {
+    // The ingest switch gates post fan-out, not preference rebuilds.
+    if job.op != "owner_rewarm" && !ingest_enabled() {
         return Ok(FanoutStats {
             skipped: 1,
             ..Default::default()
@@ -952,7 +1007,7 @@ struct LoopConnections {
 
 impl LoopConnections {
     async fn run(&mut self, cfg: &Config, hidden_cache: &mut HiddenCache, job: &FanoutJob) -> Result<FanoutStats> {
-        if !ingest_enabled() {
+        if job.op != "owner_rewarm" && !ingest_enabled() {
             return Ok(FanoutStats {
                 skipped: 1,
                 ..Default::default()
@@ -988,6 +1043,7 @@ async fn dispatch_job(
         "home_bsky" => process_home_bsky(cfg, db, cache, hidden_cache, job).await,
         "public_feed" => process_public_feed(cfg, db, cache, hidden_cache, job).await,
         "owner_status" => process_owner_status(cfg, cache, job).await,
+        "owner_rewarm" => process_owner_rewarm(cfg, job).await,
         other => {
             tracing::warn!(op = %other, "unknown timeline fanout op");
             Ok(FanoutStats {
