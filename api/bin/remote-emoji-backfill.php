@@ -55,6 +55,13 @@ foreach (array_slice($argv, 1) as $arg) {
     exit(1);
 }
 
+// Production Postgres; CLI runs do not inherit PHP-FPM's env.
+if (getenv('AP_DB_DSN') === false || getenv('AP_DB_DSN') === '') {
+    putenv('AP_DB_DSN=pgsql:dbname=novalandia');
+    $_ENV['AP_DB_DSN'] = 'pgsql:dbname=novalandia';
+    $_SERVER['AP_DB_DSN'] = 'pgsql:dbname=novalandia';
+}
+
 if (!defined('AP_INBOX_LIB_ONLY')) {
     define('AP_INBOX_LIB_ONLY', true);
 }
