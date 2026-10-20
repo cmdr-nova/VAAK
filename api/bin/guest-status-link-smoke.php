@@ -6,7 +6,8 @@ declare(strict_types=1);
  * AJAX, no soft-nav shells (those need a session). Source-level checks; no
  * database. The rendered page was checked against PostgreSQL by hand: public
  * and unlisted posts paint, followers-only/direct posts and server-blocked
- * authors show "This post isn't available.", CWs stay folded.
+ * authors show "This post isn't available.", CWs stay folded, and images
+ * open in the lightbox.
  */
 $root = getenv('VAAK_GUEST_STATUS_ROOT') ?: dirname(__DIR__, 2);
 $checks = 0;
@@ -55,5 +56,10 @@ guest_status_check(str_contains($status, "<?php if (\$stGuest && (\$stContentBlo
 guest_status_check(str_contains($admin, "if (!document.querySelector('.status-back')) return false;\n  // Guests get the server-painted, cache-only thread; thread partials need a session.\n  if (window.vaakGuestProfile) return false;"), 'status thread JS stays off for guests');
 guest_status_check(substr_count($admin, "    if (window.vaakGuestProfile) return;\n    const link = ev.target") === 1
     && str_contains($admin, "if (ev.pointerType === 'mouse' || ev.button !== 0) return;\n    if (window.vaakGuestProfile) return;"), 'guests follow links as full page loads');
+
+// The image lightbox is outside the compose-FAB gate, so guests can open images.
+$lightbox = strpos($admin, '<div class="img-lightbox" id="img-lightbox"');
+$fabGate = strpos($admin, '<?php if ($showComposeFab): ?>');
+guest_status_check($lightbox !== false && $fabGate !== false && $lightbox < $fabGate, 'image lightbox renders for guests');
 
 echo "guest-status-link-smoke: {$checks} checks passed\n";

@@ -43764,8 +43764,7 @@ window.vaakBootStatusThread();
 $showComposeFab = empty($GLOBALS['vaak_guest_profile'])
     && !in_array($view, ['guestbook', 'support', 'analytics', 'security'], true);
 ?>
-<?php if ($showComposeFab): ?>
-<button type="button" class="compose-fab" id="compose-fab" title="Compose" aria-label="Compose"><i class="ph ph-pencil-simple" aria-hidden="true"></i></button>
+<!-- Image lightbox: every page that paints media, guest views included. -->
 <div class="img-lightbox" id="img-lightbox" aria-hidden="true" role="dialog" aria-modal="true" aria-label="Image preview">
   <button type="button" class="img-lightbox__close" id="img-lightbox-close" aria-label="Close">×</button>
   <img id="img-lightbox-img" src="" alt="">
@@ -43801,6 +43800,8 @@ $showComposeFab = empty($GLOBALS['vaak_guest_profile'])
   });
 })();
 </script>
+<?php if ($showComposeFab): ?>
+<button type="button" class="compose-fab" id="compose-fab" title="Compose" aria-label="Compose"><i class="ph ph-pencil-simple" aria-hidden="true"></i></button>
 <script>
 (() => {
   const rail = document.getElementById('admin-rail-left');
