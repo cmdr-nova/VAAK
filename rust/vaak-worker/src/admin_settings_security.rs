@@ -23,11 +23,13 @@ pub(super) async fn tokens(db:&tokio_postgres::Client,owner:i64,now:i64,viewer_a
  for row in db.query(&sql,&[&cutoff,&owner]).await?{rows.push(serde_json::from_value::<TokenRow>(row.get(0))?);}
  Ok(Tokens{rows,operator:key=="cmdr_nova"&&viewer_admin})
 }
-/// strtotime for gmdate('c') and offset-bearing Postgres text. A zoneless date would
-/// follow PHP's default timezone, so it and anything else is PHP's to judge.
+/// strtotime for gmdate('c'), offset-bearing Postgres text, and a zoneless "Y-m-d H:i:s",
+/// which strtotime reads in PHP's default timezone: decode() only admits UTC. Anything
+/// else is PHP's to judge.
 fn timestamp(s:&str)->Result<i64>{
  chrono::DateTime::parse_from_rfc3339(s).map(|v|v.timestamp())
   .or_else(|_|chrono::DateTime::parse_from_str(s,"%Y-%m-%d %H:%M:%S%.f%#z").map(|v|v.timestamp()))
+  .or_else(|_|chrono::NaiveDateTime::parse_from_str(s,"%Y-%m-%d %H:%M:%S").map(|v|v.and_utc().timestamp()))
   .map_err(|_|anyhow::anyhow!("unproven PHP date format"))
 }
 pub(super) fn paint_tokens(t:Tokens,r:&Request)->Result<(String,usize,Value)>{
@@ -72,7 +74,7 @@ fn mojibake_guard(h:&str)->Result<()>{
  use super::*;
  #[test]fn stored_token_dates_parse_or_refuse(){
   let t=timestamp("2026-10-20T00:00:00+00:00").unwrap();
-  for s in["2026-10-20 00:00:00+00","2026-10-20 02:00:00.5+02","2026-10-20T00:00:00Z"]{assert_eq!(timestamp(s).unwrap(),t,"{s}");}
-  for s in["2026-10-20 00:00:00","next week",""]{assert!(timestamp(s).is_err(),"{s}");}
+  for s in["2026-10-20 00:00:00+00","2026-10-20 02:00:00.5+02","2026-10-20T00:00:00Z","2026-10-20 00:00:00"]{assert_eq!(timestamp(s).unwrap(),t,"{s}");}
+  for s in["2026-10-20T00:00:00","next week",""]{assert!(timestamp(s).is_err(),"{s}");}
  }
 }

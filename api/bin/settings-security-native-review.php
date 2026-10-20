@@ -20,6 +20,7 @@ if (PHP_SAPI !== 'cli') { http_response_code(403); exit('CLI only'); }
 if (!$dsn || !in_array($idType, ['INTEGER', 'BIGINT'], true) || !$url || strlen((string) $secret) < 32) {
     fwrite(STDERR, "usage: dsn INTEGER|BIGINT url secret\n"); exit(2);
 }
+date_default_timezone_set('UTC'); // strtotime reads zoneless dates in this zone, and requests report it
 if (!str_contains($dsn, 'fixture')) { fwrite(STDERR, "refusing a database without 'fixture' in its name\n"); exit(2); }
 
 $api = dirname(__DIR__);
@@ -189,12 +190,18 @@ for ($i = 100; $i < 150; $i++) $st->execute([$i, 'TOKEN_HASH_DECOY_' . $i, at(-6
 $reply = compare('settings_tokens', 2, false, 'full', 'cap');
 check(count($reply['rows'] ?? []) === 40 && ($reply['rows'][0]['id'] ?? null) === 149, 'cap keeps the 40 newest');
 
+// A zoneless expiry reads as UTC, PHP's default timezone here; the envelope refuses any other zone.
+schema(); $db->exec("UPDATE oauth_tokens SET expires_at='2099-01-01 00:00:00' WHERE id=1; UPDATE oauth_tokens SET expires_at='2020-01-01 00:00:00' WHERE id=9");
+$reply = compare('settings_tokens', 1, true, 'full', 'zoneless expiry');
+check(array_column($reply['rows'] ?? [], 'status', 'id')[1] === 'active' && array_column($reply['rows'] ?? [], 'status', 'id')[9] === 'expired', 'zoneless expiry status');
+$berlin = request('settings_tokens', 1, true); $berlin['php_timezone'] = 'Europe/Berlin';
+[$status] = native($berlin, $secret); check($status === 400, "PHP timezone outside UTC -> $status");
+
 // Fallbacks: text PHP would repair, dates strtotime reads by PHP rules, and a missing 2FA table.
 foreach ([
     'mojibake app name' => ['settings_tokens', "UPDATE oauth_apps SET client_name='CafÃ©' WHERE client_id='ice'"],
     'mojibake scopes' => ['settings_tokens', "UPDATE oauth_tokens SET scopes='CafÃ©' WHERE id=1"],
     'relative expiry' => ['settings_tokens', "UPDATE oauth_tokens SET expires_at='next week' WHERE id=1"],
-    'zoneless expiry' => ['settings_tokens', "UPDATE oauth_tokens SET expires_at='2027-01-01 00:00:00' WHERE id=1"],
     'no 2FA table' => ['settings_two_factor', 'DROP TABLE ap_user_2fa'],
     'no tokens table' => ['settings_tokens', 'DROP TABLE oauth_tokens'],
 ] as $name => [$view, $sql]) {
