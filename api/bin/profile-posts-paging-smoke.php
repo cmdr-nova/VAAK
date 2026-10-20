@@ -575,7 +575,7 @@ $check($askSeen === $askExpected, 'asks window starts at the newest answer and s
 $check(count($askSeen) === count(array_unique($askSeen)), 'asks window has no duplicate answers');
 
 $order = (string) file_get_contents($root . '/api/ap-profile-html.php');
-$check(str_contains($order, "['pinned', 'posts', 'replies', 'boosts', 'media', 'featured', 'blog']"), 'shared profile tab order has no likes tab');
+$check(str_contains($order, "['pinned', 'posts', 'replies', 'boosts', 'media', 'asks', 'featured', 'blog']"), 'shared profile tab order has no likes tab');
 $check(str_contains($user, "['pinned', 'posts', 'media', 'replies', 'boosts', 'featured', 'blog']"), 'classic profile has no likes tab');
 $check(str_contains($admin, "['pinned', 'posts', 'replies', 'boosts', 'media', 'asks', 'featured', 'blog']"), 'in-app profile adds asks and has no likes tab');
 
