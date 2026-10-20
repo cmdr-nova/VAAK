@@ -93,6 +93,8 @@ struct Facts {
     item_boosts: i64,
     item_media: i64,
     item_asks: i64,
+    ask_count: i64,
+    ask_rows: i64,
     outbox_total: i64,
     replies_total: i64,
     boost_total: Option<i64>,
@@ -473,6 +475,8 @@ fn tabs(w: &mut W, f: &Facts) {
     if !f.hide_replies { defs.push(("replies", "Replies", replies)); }
     if !f.hide_boosts { defs.push(("boosts", "Boosts", boosts)); }
     defs.push(("media", "Media", media));
+    let asks = if f.ask_count > 0 { f.ask_count } else if f.ask_rows > 0 { f.ask_rows } else { f.item_asks };
+    if asks > 0 { defs.push(("asks", "Asks", asks)); }
     if f.featured_rows > 0 || f.featured_count > 0 {
         defs.push(("featured", "Featured", if f.featured_rows > 0 { f.featured_rows } else { f.featured_count }));
     }
@@ -905,6 +909,7 @@ fn load(input: &Value) -> Result<Facts, String> {
         posts_stat: num(input, "posts_stat"), following_stat: num(input, "following_stat"), followers_stat: num(input, "followers_stat"),
         item_posts: num(input, "item_posts"), item_replies: num(input, "item_replies"), item_boosts: num(input, "item_boosts"),
         item_media: num(input, "item_media"), item_asks: num(input, "item_asks"),
+        ask_count: num(input, "ask_count"), ask_rows: num(input, "ask_rows"),
         outbox_total: num(input, "outbox_total"), replies_total: num(input, "replies_total"),
         boost_total: input.get("boost_total").map(|_| num(input, "boost_total")),
         hide_replies: flag(input, "hide_replies"), hide_boosts: flag(input, "hide_boosts"), bsky_posts: num(input, "bsky_posts"),

@@ -35243,6 +35243,8 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
                     'item_boosts' => count($rpTabItems['boosts'] ?? []),
                     'item_media' => count($rpTabItems['media'] ?? []),
                     'item_asks' => count($rpTabItems['asks'] ?? []),
+                    'ask_count' => (int) $rpAnsweredAskCount,
+                    'ask_rows' => count($rpAnsweredAskRows),
                     'outbox_total' => (int) ($rpOutboxTotal ?? 0),
                     'replies_total' => (int) ($rpOutboxRepliesTotal ?? 0),
                     'boost_total' => (int) ($rpBoostTotal ?? 0),

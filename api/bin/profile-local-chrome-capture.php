@@ -218,8 +218,8 @@ foreach ($cases as $case) {
     if ($chrome === '' || !str_contains($chrome, 'remote-profile-tabs') || !str_contains($chrome, '>local<')) {
         throw new RuntimeException($case['id'] . ' did not paint a local profile header');
     }
-    if (str_contains($chrome, '>Asks<')) {
-        throw new RuntimeException($case['id'] . ' put Asks in the tab bar; the live order omits it');
+    if (str_contains($chrome, '>Asks<') !== ((int) $case['ask_count'] > 0 || (int) $case['ask_rows'] > 0)) {
+        throw new RuntimeException($case['id'] . ' Asks tab must show exactly when the account has answered Asks');
     }
     $out[] = [
         'id' => $case['id'],
