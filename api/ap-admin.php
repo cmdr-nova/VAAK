@@ -31483,6 +31483,7 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
           <button type="submit">Redeem Supporter code</button>
         </form>
         <?php endif; ?>
+        <?php if (($settingsNativeProfile = ap_settings_native_body('settings_profile', !empty($vaakIsAdmin))) !== null): ?><?= $settingsNativeProfile ?><?php else: ?>
         <form class="composer profile-form" method="post" action="?view=profile" enctype="multipart/form-data">
           <input type="hidden" name="action" value="save_profile">
           <div class="profile-preview">
@@ -31714,6 +31715,7 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
             <button class="btn btn-primary" type="submit">Save profile</button>
           </div>
         </form>
+        <?php endif; ?>
 
         <?php
           $slLink = function_exists('ap_sl_link_for_user')

@@ -204,7 +204,7 @@ fn profile_defaults(key:&str)->Value{
 }
 fn sanitized_url(raw:&str)->Option<String>{crate::profile_identity::sanitized_profile_url(raw)}
 fn normalize_badges(value:&Value)->Vec<String>{normalize_selected_badges(value,true)}
-fn normalize_selected_badges(value:&Value,reserved:bool)->Vec<String>{let decoded=if let Some(raw)=value.as_str(){serde_json::from_str::<Value>(raw).unwrap_or(Value::Null)}else{value.clone()};let mut result=Vec::new();if reserved&&decoded.as_array().is_some_and(|v|v.iter().any(|b|b.as_str().is_some_and(|s|card::php_trim(s)=="supporter"))){result.push("supporter".to_string());}if reserved&&decoded.as_array().is_some_and(|v|v.iter().any(|b|b.as_str().is_some_and(|s|card::php_trim(s)=="admin"))){result.push("admin".to_string());}let limit=6+result.len();for v in decoded.as_array().into_iter().flatten(){let k=card::php_trim(v.as_str().unwrap_or(""));if (reserved||!matches!(k,"admin"|"supporter"))&&BADGES.iter().any(|b|b.0==k)&&!result.iter().any(|v|v==k){result.push(k.into());}if result.len()==limit{break;}}result}
+pub(crate) fn normalize_selected_badges(value:&Value,reserved:bool)->Vec<String>{let decoded=if let Some(raw)=value.as_str(){serde_json::from_str::<Value>(raw).unwrap_or(Value::Null)}else{value.clone()};let mut result=Vec::new();if reserved&&decoded.as_array().is_some_and(|v|v.iter().any(|b|b.as_str().is_some_and(|s|card::php_trim(s)=="supporter"))){result.push("supporter".to_string());}if reserved&&decoded.as_array().is_some_and(|v|v.iter().any(|b|b.as_str().is_some_and(|s|card::php_trim(s)=="admin"))){result.push("admin".to_string());}let limit=6+result.len();for v in decoded.as_array().into_iter().flatten(){let k=card::php_trim(v.as_str().unwrap_or(""));if (reserved||!matches!(k,"admin"|"supporter"))&&BADGES.iter().any(|b|b.0==k)&&!result.iter().any(|v|v==k){result.push(k.into());}if result.len()==limit{break;}}result}
 fn hidden(name:&str,value:&str)->String{format!("<input type=\"hidden\" name=\"{name}\" value=\"{}\">",h(value))}
 fn post_form(f:&HeaderFacts,action:&str,extra:&str,attrs:&str,button:&str)->String{
  format!("<form method=\"post\" action=\"?view=remote_profile&amp;actor={}&amp;from={}\" style=\"display:inline\"{attrs}>{}{}{}{}{}{extra}{button}</form>",form_query(&f.actor),form_query(&f.from),hidden("action",action),hidden("return_view","remote_profile"),hidden("return_actor",&f.actor),hidden("return_from",&f.from),if action=="bite_remote"{String::new()}else{hidden("actor_id",&f.actor)})
@@ -427,7 +427,7 @@ mod tests{
  }
 }
 
-const BADGES:&[(&str,&str,&str)]=&[
+pub(crate) const BADGES:&[(&str,&str,&str)]=&[
  ("admin","Admin","🛡️"),
  ("supporter","Supporter","💜"),
  ("rainbow","Rainbow pride","🏳️‍🌈"),
