@@ -126,7 +126,13 @@ async fn paint(cfg:&crate::config::Config,r:&Request)->Result<Value>{
  let mut warms=tokio::task::JoinSet::new();
  for actor in warm{let cfg=cfg.clone();warms.spawn(async move{crate::profile_warm::actor_warm(&cfg,&actor,&crate::profile_warm::ProcessWarmTransport::configured()).await;});}
  while warms.join_next().await.is_some(){}
- db.batch_execute("COMMIT").await?;role(&db,r).await?;
+ db.batch_execute("COMMIT").await?;
+ // ap_remote_media_warm_async writes ap_media_warm_queue, so it runs after the READ ONLY transaction.
+ if let Collected::Mutes(rows)=&collected{
+  let mut seen=Vec::new();
+  for actor in rows.iter().filter_map(|row|row.media_warm.as_deref()){if seen.contains(&actor){continue;}seen.push(actor);crate::profile_warm::media_warm(cfg,&db,actor,&crate::profile_warm::ProcessWarmTransport::configured()).await;}
+ }
+ role(&db,r).await?;
  // The final painter is synchronous: no I/O follows the final fresh role admission.
  let (html,count,rows)=match collected{
   Collected::Invites(rows)=>(invites(&rows,r.now)?,rows.len(),serde_json::to_value(rows)?),
