@@ -329,6 +329,25 @@ function ap_bite_store(array $row): int
 }
 
 /**
+ * Local account that owns a bitten actor URL, or null when no such account
+ * is active.
+ *
+ * @return array{owner_user_id:int,owner_actor_id:string}|null
+ */
+function ap_bite_target_owner(string $selfActor): ?array
+{
+    $selfActor = rtrim($selfActor, '/');
+    $user = function_exists('ap_local_user_by_actor_id') ? ap_local_user_by_actor_id($selfActor) : null;
+    if (!is_array($user) || (int) ($user['id'] ?? 0) < 1) {
+        return null;
+    }
+    return [
+        'owner_user_id' => (int) $user['id'],
+        'owner_actor_id' => rtrim((string) ($user['actor_id'] ?? '') ?: $selfActor, '/'),
+    ];
+}
+
+/**
  * Ingest inbound Bite activity (Wafrn-compatible).
  *
  * @return array{ok:bool,kind?:string,error?:string}
@@ -344,10 +363,6 @@ function ap_bite_ingest(array $activity): array
         return ['ok' => false, 'error' => 'Missing actor'];
     }
     $actorId = rtrim($actorId, '/');
-    // Ignore self-bites from any local actor (not only cmdr_nova)
-    if (preg_match('#^https://mkultra\.monster/users/[A-Za-z0-9_]+$#', $actorId)) {
-        return ['ok' => false, 'error' => 'Ignore self'];
-    }
     $target = function_exists('ap_as_id')
         ? (ap_as_id($activity['target'] ?? null) ?: ap_as_id($activity['object'] ?? null))
         : null;
@@ -370,6 +385,11 @@ function ap_bite_ingest(array $activity): array
         ($kind === 'user' && $target === $self)
         || ($kind === 'post' && str_starts_with($target, $self . '/'))
     );
+    // Only a bite on yourself or your own post is ignored. Other local
+    // accounts (Juno, Shana, ...) biting each other must still notify.
+    if ($self !== null && $actorId === $self) {
+        return ['ok' => false, 'error' => 'Ignore self'];
+    }
 
     if (!$isUs || $self === null) {
         // Still log non-targeting bites that somehow arrived (rare)
@@ -391,6 +411,13 @@ function ap_bite_ingest(array $activity): array
         'target_id' => $target,
     ]);
 
+    // The bitten account owns the notification. Bites often arrive on the
+    // shared inbox with no `to`, so the request actor cannot be trusted here.
+    $biteOwner = ap_bite_target_owner($self);
+    if ($biteOwner === null) {
+        return ['ok' => true, 'kind' => $kind];
+    }
+
     // Surface in notifications via mentions table (activity_type=Bite)
     if (function_exists('ap_mention_store')) {
         $storeObjectId = $kind === 'post'
@@ -402,9 +429,6 @@ function ap_bite_ingest(array $activity): array
         } else {
             $storeObjectId .= '#bite-' . substr(sha1($actorId), 0, 8);
         }
-        $biteOwner = function_exists('ap_inbox_recipient_owner')
-            ? ap_inbox_recipient_owner(['object' => $target, 'actor' => $self])
-            : null;
         ap_mention_store([
             'activity_id' => $activityId,
             'activity_type' => 'Bite',
@@ -416,21 +440,20 @@ function ap_bite_ingest(array $activity): array
             'media_urls' => [],
             'spoiler_text' => '',
             'sensitive' => false,
-            'owner_user_id' => is_array($biteOwner) ? (int) ($biteOwner['owner_user_id'] ?? 0) : 0,
-            'owner_actor_id' => is_array($biteOwner) ? (string) ($biteOwner['owner_actor_id'] ?? '') : $self,
+            'owner_user_id' => $biteOwner['owner_user_id'],
+            'owner_actor_id' => $biteOwner['owner_actor_id'],
         ]);
     }
 
     if (function_exists('ap_webpush_notify_event')) {
         try {
             require_once __DIR__ . '/ap-webpush.php';
-            $biteOwnerId = is_array($biteOwner) ? (int) ($biteOwner['owner_user_id'] ?? 0) : 0;
             ap_webpush_notify_event(
                 'bite',
                 $actorId,
                 null,
                 $kind === 'user' ? 'bit you' : 'bit your post',
-                $biteOwnerId > 0 ? $biteOwnerId : null
+                $biteOwner['owner_user_id']
             );
         } catch (Throwable $e) {
             // ignore
