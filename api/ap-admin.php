@@ -918,6 +918,47 @@ if (
     exit;
 }
 
+// Grid → VAAK refresh for a linked Phyrian body. The Strains page renders
+// from the mirrored row straight away, then asks for this in the background
+// so a monolith click or decay on the grid shows up without waiting for the
+// five-minute phyrian-sync job. The bridge's own TTL (60s) throttles grid
+// calls; this never claims a daily check-in or writes to the grid.
+if (
+    ($_SERVER['REQUEST_METHOD'] ?? '') === 'POST'
+    && isset($_GET['ajax'])
+    && (string) $_GET['ajax'] === 'phyrian_sync'
+) {
+    header('Content-Type: application/json; charset=utf-8');
+    header('Cache-Control: no-store');
+    $csrfPhy = (string) ($_POST['csrf'] ?? $_SERVER['HTTP_X_VAAK_CSRF'] ?? '');
+    if (!ap_auth_csrf_ok($csrfPhy)) {
+        http_response_code(403);
+        echo json_encode(['ok' => false, 'error' => 'Session expired.']);
+        exit;
+    }
+    if ($vaakOwnerId < 1 || !empty($GLOBALS['vaak_guest_profile'])) {
+        http_response_code(401);
+        echo json_encode(['ok' => false, 'error' => 'login_required']);
+        exit;
+    }
+    if (function_exists('ap_auth_session_write_close')) {
+        ap_auth_session_write_close();
+    } elseif (session_status() === PHP_SESSION_ACTIVE) {
+        session_write_close();
+    }
+    $phySync = function_exists('ap_phyrian_bridge_sync_from_opensim')
+        ? ap_phyrian_bridge_sync_from_opensim((int) $vaakOwnerId, false)
+        : ['ok' => false, 'skipped' => true, 'error' => 'Bridge unavailable'];
+    $phySyncPlayer = is_array($phySync['player'] ?? null) ? $phySync['player'] : [];
+    echo json_encode([
+        'ok' => !empty($phySync['ok']),
+        'skipped' => !empty($phySync['skipped']),
+        'changed' => !empty($phySync['changed']),
+        'resonance' => isset($phySyncPlayer['resonance']) ? (int) $phySyncPlayer['resonance'] : null,
+    ], JSON_UNESCAPED_SLASHES);
+    exit;
+}
+
 if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
     $vaakAvatarPoll = (string) ($_POST['action'] ?? '') === 'avatar_resolve';
     if (!empty($GLOBALS['vaak_guest_profile']) && !$vaakAvatarPoll) {
@@ -36413,7 +36454,11 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
               return '?view=phyrian&page=dossier&owner=' . $ownerId;
           };
         ?>
-        <section class="phyrian">
+        <?php
+          $phyLinkedSelf = $vaakOwnerId > 0 && function_exists('ap_phyrian_bridge_is_linked')
+              && ap_phyrian_bridge_is_linked((int) $vaakOwnerId);
+        ?>
+        <section class="phyrian"<?= $phyLinkedSelf ? ' data-phyrian-sync="1"' : '' ?>>
           <header class="phyrian-hero">
             <img src="<?= h($phyAsset('title-header.jpg')) ?>" alt="" width="900" height="583" decoding="async">
             <div class="phyrian-hero-copy">
@@ -42699,6 +42744,8 @@ window.vaakBootStatusThread();
       } else if (view === 'mentions') {
         bindNotifScroll(main, mentionsPrefetch);
         mentionsPrefetchHeld = true;
+      } else if (view === 'phyrian') {
+        if (typeof window.vaakBootPhyrianSync === 'function') window.vaakBootPhyrianSync(main);
       } else if (['favourites', 'bookmarks'].includes(view)) {
         bootLibraryView(view, main);
       } else if (['following', 'followers', 'search'].includes(view)) {
@@ -43104,6 +43151,35 @@ window.vaakBootStatusThread();
     };
     load(true);
   };
+
+  // Linked OpenSim bodies: the page paints from the mirrored row, then asks
+  // the grid for fresh stats once. Reload only when something changed; the
+  // bridge TTL makes the reloaded page's own request a no-op, so it can't loop.
+  window.vaakBootPhyrianSync = function (main) {
+    const root = main || document;
+    const section = root.querySelector ? root.querySelector('section.phyrian[data-phyrian-sync="1"]') : null;
+    if (!section || section.dataset.phyrianSyncStarted === '1' || !window.VAAK_CSRF) return;
+    section.dataset.phyrianSyncStarted = '1';
+    const fd = new FormData();
+    fd.set('csrf', window.VAAK_CSRF);
+    fetch('/vaak/?view=phyrian&ajax=phyrian_sync', {
+      method: 'POST',
+      body: fd,
+      credentials: 'same-origin',
+      headers: { 'Accept': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
+    })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data) => {
+        if (!data || !data.ok || !data.changed || !section.isConnected) return;
+        window.location.reload();
+      })
+      .catch(() => {});
+  };
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', () => window.vaakBootPhyrianSync(document), { once: true });
+  } else {
+    window.vaakBootPhyrianSync(document);
+  }
 
   window.vaakBootSearch = function (main) {
     const root = main || document.querySelector('section.main');
