@@ -27812,6 +27812,10 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       font-size: .72em; font-weight: 800; line-height: 1;
       vertical-align: middle; position: relative; top: -0.05em;
     }
+    .automated-badge {
+      display: inline-block; margin-left: .15rem;
+      font-size: .9em; line-height: 1; vertical-align: middle;
+    }
     .resonant-badge {
       display: inline-flex; align-items: center; gap: .28rem;
       margin: .2rem .2rem .4rem .45rem; padding: .18rem .5rem;
@@ -31600,7 +31604,7 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
             ?>
               <img class="av" src="<?= h($previewAv) ?>" alt="" loading="lazy" referrerpolicy="no-referrer">
             <div>
-              <div class="who"><?= h($profile['name']) ?><?php if (!empty($profile['vanity_verified'])): ?> <span class="vanity-verified" title="Vanity verified (just for fun)" aria-label="Verified">✓</span><?php endif; ?></div>
+              <div class="who"><?= h($profile['name']) ?><?php if (!empty($profile['vanity_verified'])): ?> <span class="vanity-verified" title="Vanity verified (just for fun)" aria-label="Verified">✓</span><?php endif; ?><?php if (!empty($profile['automated'])): ?> <span class="automated-badge" title="Automated account" aria-label="Automated account">🤖</span><?php endif; ?></div>
               <div class="meta"><?= h($vaakHandle) ?></div>
               <?php if (!empty($profile['updated_at'])): ?>
                 <div class="meta">Updated <?= h(relative_time((string) $profile['updated_at'])) ?> ago</div>
@@ -31767,7 +31771,7 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
             <label><input type="checkbox" name="auto_follow_back" value="1" <?= !empty($profile['auto_follow_back']) ? 'checked' : '' ?>> Automatically follow back new followers</label>
             <label><input type="checkbox" name="auto_unblur_sensitive" value="1" <?= !empty($profile['auto_unblur_sensitive']) ? 'checked' : '' ?>> Automatically show sensitive media</label>
             <label><input type="checkbox" name="auto_delete_posts_7d" value="1" <?= !empty($profile['auto_delete_posts_7d']) ? 'checked' : '' ?>> Automatically delete my posts older than 7 days</label>
-            <label><input type="checkbox" name="automated" value="1" <?= !empty($profile['automated']) ? 'checked' : '' ?>> Mark this account as automated</label>
+            <label><input type="checkbox" name="automated" value="1" <?= !empty($profile['automated']) ? 'checked' : '' ?>> Mark this account as automated <span class="automated-badge" aria-hidden="true">🤖</span></label>
             <label><input type="checkbox" name="collection_consent" value="1" <?= !empty($profile['collection_consent']) ? 'checked' : '' ?>> Allow featuring in Collections</label>
             <label><input type="checkbox" name="vanity_verified" value="1" <?= !empty($profile['vanity_verified']) ? 'checked' : '' ?>> Vanity verified checkmark <span class="vanity-verified" aria-hidden="true">✓</span></label>
           </div>
@@ -31796,7 +31800,7 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
           </div>
           <div class="meta" style="margin:.35rem 0 .75rem">
             <b style="color:var(--primary)">Automated account</b> —
-            show an automated-account indicator on your public profile and to compatible remote clients.
+            show a 🤖 next to your name (beside any vanity ✓), an automated-account indicator on your public profile, and the bot flag to compatible remote clients.
           </div>
           <div class="meta" style="margin:.35rem 0 .75rem">
             <b style="color:var(--primary)">Vanity verified</b> —

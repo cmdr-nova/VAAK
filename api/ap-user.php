@@ -732,8 +732,11 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
         ? ap_local_avatar_url($p['icon_url'] ?? null)
         : ((string) ($p['icon_url'] ?? '') ?: '/img/avatar/local-default.webp');
     echo '<img class="av" src="' . htmlspecialchars($avUrl, ENT_QUOTES, 'UTF-8') . '" alt="" loading="lazy" referrerpolicy="no-referrer">';
+    $vanityBadge = !empty($p['vanity_verified'])
+        ? ' <span class="vanity-verified" title="Vanity verified (just for fun)" aria-label="Verified">✓</span>'
+        : '';
     $automatedBadge = !empty($p['automated'])
-        ? ' <span class="automated-flare" title="Automated account">Automated</span>'
+        ? ' <span class="automated-flare" title="Automated account">🤖 Automated</span>'
         : '';
     if (!function_exists('ap_phyrian_bridge_link_for_actor_key')) {
         $bridgeFile = __DIR__ . '/ap-phyrian-bridge.php';
@@ -745,7 +748,7 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
     if (function_exists('ap_phyrian_bridge_link_for_actor_key') && function_exists('ap_phyrian_bridge_resonant_badge_html')) {
         $resonantBadge = ap_phyrian_bridge_resonant_badge_html(ap_phyrian_bridge_link_for_actor_key($actorKey));
     }
-    echo '<div><h1>' . $name . $resonantBadge . $automatedBadge . '</h1>';
+    echo '<div><h1>' . $name . $vanityBadge . $resonantBadge . $automatedBadge . '</h1>';
     echo '<p class="muted" style="margin:0">@' . $safe . '@mkultra.monster</p>';
     $slLink = function_exists('ap_sl_link_for_actor_key') ? ap_sl_link_for_actor_key($actorKey) : null;
     $wowLink = function_exists('ap_wow_link_for_actor_key') ? ap_wow_link_for_actor_key($actorKey) : null;
@@ -1977,6 +1980,7 @@ function ap_user_html_shell_start(string $title, array $meta = []): void
       .posts{margin-top:1.25rem;border-top:1px solid #2a2a2a;padding-top:.5rem}
       .profile-pager{display:flex;justify-content:center;align-items:center;gap:.8rem;margin:1rem 0;color:#999;font-size:.85rem}.profile-pager a{color:#7ee0ff;text-decoration:none}
       .profile-top-btn{position:fixed;right:1.25rem;bottom:1.25rem;z-index:20;border:1px solid #333;border-radius:999px;background:#161616;color:#8bf;width:2.8rem;height:2.8rem;font-size:1.2rem;cursor:pointer;box-shadow:0 5px 18px #0008}.profile-top-btn:hover{border-color:#8bf}
+      .vanity-verified{display:inline-flex;align-items:center;justify-content:center;width:1.05em;height:1.05em;margin-left:.2rem;border-radius:50%;background:#1d9bf0;color:#fff;font-size:.72em;font-weight:800;line-height:1;vertical-align:middle;position:relative;top:-.08em}
       .automated-flare{display:inline-block;margin-left:.45rem;padding:.15rem .5rem;border:1px solid var(--primary,#53e68b);border-radius:999px;color:var(--primary,#53e68b);font-size:.58em;font-weight:600;vertical-align:middle}
       .resonant-badge{display:inline-flex;align-items:center;gap:.28rem;margin:.2rem .2rem .4rem .45rem;padding:.18rem .5rem;border:1px solid rgba(180,120,255,.5);border-radius:999px;background:rgba(140,80,255,.12);color:#d4b8ff;font-size:.55em;font-weight:650;line-height:1.25;vertical-align:middle;white-space:nowrap}
       .post{padding:.9rem 0;border-bottom:1px solid #222;min-width:0;overflow-wrap:anywhere}

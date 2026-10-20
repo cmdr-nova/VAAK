@@ -144,7 +144,7 @@ async fn resolve_local(db:&Client,key:&str,actor:&str,owner:i64,owner_actor:Stri
   let rows=db.query("SELECT to_jsonb(b) FROM ap_user_blocks b WHERE owner_user_id::bigint=$1 ORDER BY created_at DESC,id DESC",&[&owner]).await?.iter().map(|r|r.get::<_,Value>(0)).collect::<Vec<_>>();moderation.personal_block_id=facts::personal_block(&rows,actor).map(|r|card::integer(r,"id"));
   for(table,target)in[("ap_mutes",&mut moderation.muted),("ap_deprioritized_actors",&mut moderation.deprioritized)]{*target=db.query(&format!("SELECT actor_id FROM {table} WHERE owner_user_id::bigint=$1"),&[&owner]).await?.iter().any(|r|{let a:String=r.get(0);if table=="ap_mutes"{crate::hidden::actor_aliases(&a).iter().any(|a|crate::hidden::actor_aliases(actor).contains(a))}else{a.trim_end_matches('/')==actor.trim_end_matches('/')}});}
  }
- let mut name=card::php_trim(s(&profile,"name")).to_owned();if name.is_empty(){name=key.into();}if card::boolean(&profile,"vanity_verified"){name.push_str(" ✓");}
+ let mut name=card::php_trim(s(&profile,"name")).to_owned();if name.is_empty(){name=key.into();}if card::boolean(&profile,"vanity_verified"){name.push_str(" ✓");}if card::boolean(&profile,"automated"){name.push_str(" 🤖");}
  let avatar=sanitized_url(s(&profile,"icon_url"));let banner=sanitized_url(s(&profile,"image_url")).or_else(||avatar.clone());
  let fields=profile["attachment"].as_array().cloned().unwrap_or_default();
  let badges=authorized_badges(db,key,&profile["profile_badges"]).await?;

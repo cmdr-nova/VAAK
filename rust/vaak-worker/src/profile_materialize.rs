@@ -659,7 +659,7 @@ impl Projector<'_>{
             count=self.primary_public_count(&api_root).await?;
         }
         let username=if user.get("username").is_some(){s(user,"username")}else{&key};
-        let mut display=crate::library::card::php_trim(s(profile,"name")).to_owned();if display.is_empty(){display=key.clone()};if truth(&profile["vanity_verified"]){display.push_str(" ✓")}
+        let mut display=crate::library::card::php_trim(s(profile,"name")).to_owned();if display.is_empty(){display=key.clone()};if truth(&profile["vanity_verified"]){display.push_str(" ✓")}if truth(&profile["automated"]){display.push_str(" 🤖")}
         let avatar=crate::profile_enrichment::sanitize_profile_url(s(profile,"icon_url"))?.unwrap_or("https://mkultra.monster/img/avatar/local-default.webp".into());
         let header=if truth(&profile["image_url"]){s(profile,"image_url")}else{"https://mkultra.monster/img/gifs/waves.gif"};
         self.graphs.push(DeferredFollowGraph{source_index:self.source_index,actor:actor.clone()});

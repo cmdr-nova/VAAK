@@ -1121,6 +1121,7 @@ struct AskContext {
 struct LocalProfile {
     display_name: String,
     icon_url: String,
+    vanity_verified: bool,
     automated: bool,
     discoverable: bool,
     indexable: bool,
@@ -1892,11 +1893,14 @@ fn local_account_from_profile(
 ) -> Value {
     let key = username.to_ascii_lowercase();
     let (display, avatar) = if let Some(p) = profiles.get(&key) {
-        let d = if p.display_name.trim().is_empty() {
+        let mut d = if p.display_name.trim().is_empty() {
             username.to_string()
         } else {
             p.display_name.trim().to_string()
         };
+        // Mirrors ap_profile_display_name: vanity ✓ then automated 🤖.
+        if p.vanity_verified { d.push_str(" ✓"); }
+        if p.automated { d.push_str(" 🤖"); }
         let a = if p.icon_url.starts_with("https://") {
             p.icon_url.clone()
         } else {
@@ -3218,7 +3222,7 @@ async fn fetch_local_profiles_map(
     keys.dedup();
     let rows = db
         .query(
-            "SELECT lower(actor_key), COALESCE(name, ''), COALESCE(icon_url, ''), COALESCE(automated,0)::integer, COALESCE(discoverable,1)::integer, COALESCE(indexable,1)::integer
+            "SELECT lower(actor_key), COALESCE(name, ''), COALESCE(icon_url, ''), COALESCE(automated,0)::integer, COALESCE(discoverable,1)::integer, COALESCE(indexable,1)::integer, COALESCE(vanity_verified,0)::integer
              FROM actor_profile
              WHERE lower(actor_key) = ANY($1)",
             &[&keys],
@@ -3232,6 +3236,7 @@ async fn fetch_local_profiles_map(
             LocalProfile {
                 display_name: row.get(1),
                 icon_url: row.get(2),
+                vanity_verified: row.get::<_, i32>(6) != 0,
                 automated: row.get::<_, i32>(3) != 0,
                 discoverable: row.get::<_, i32>(4) != 0,
                 indexable: row.get::<_, i32>(5) != 0,
@@ -6165,7 +6170,7 @@ mod settings_regression_tests {
     use super::*;
     #[test]
     fn connected_bluesky_quote_uses_local_avatar_without_rewriting_identity() {
-        let profiles = HashMap::from([("alice".into(), LocalProfile { display_name:"Alice".into(), icon_url:"https://example.test/local.webp".into(), automated:false, discoverable:true, indexable:true })]);
+        let profiles = HashMap::from([("alice".into(), LocalProfile { display_name:"Alice".into(), icon_url:"https://example.test/local.webp".into(), vanity_verified:false, automated:false, discoverable:true, indexable:true })]);
         let aliases = HashMap::from([("alice.bsky.test".into(), "alice".into()), ("did:plc:alice".into(), "alice".into())]);
         let mut notification = json!({"account":{"url":"https://bsky.app/profile/stranger.test","avatar":"https://example.test/remote.webp"}, "status":{"quote":{"quoted_status":{"uri":"https://bsky.app/profile/alice.bsky.test/post/abc", "account":{"url":"https://bsky.app/profile/alice.bsky.test","acct":"alice.bsky.test","id":"bsky:alice"}}}}});
         refresh_account_tree(&mut notification, &profiles, &aliases, 0);
@@ -6194,10 +6199,11 @@ mod settings_regression_tests {
     }
     #[test]
     fn local_quote_account_uses_saved_identity_and_preferences() {
-        let profiles = HashMap::from([("alice".into(), LocalProfile { display_name:"Alice".into(), icon_url:"https://example.test/avatar.png".into(), automated:true, discoverable:false, indexable:false })]);
+        let profiles = HashMap::from([("alice".into(), LocalProfile { display_name:"Alice".into(), icon_url:"https://example.test/avatar.png".into(), vanity_verified:true, automated:true, discoverable:false, indexable:false })]);
         let account = local_account_from_profile("https://mkultra.monster/users/alice", "alice", &profiles);
         assert_eq!(account["acct"], "alice");
         assert_eq!(account["avatar"], "https://example.test/avatar.png");
+        assert_eq!(account["display_name"], "Alice ✓ 🤖");
         assert_eq!(account["bot"], true);
         assert_eq!(account["discoverable"], false);
         assert_eq!(account["indexable"], false);

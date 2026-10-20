@@ -3512,7 +3512,7 @@ $cached['profile_badges']=ap_profile_authorized_badges($cached['profile_badges']
     return $profile;
 }
 
-/** Display name for clients (optional vanity ✓ when enabled). */
+/** Display name for clients (optional vanity ✓ and automated 🤖 when enabled). */
 function ap_profile_display_name(string $actorKey = 'cmdr_nova', bool $withVanity = true): string
 {
     $p = ap_profile_get($actorKey);
@@ -3523,6 +3523,10 @@ function ap_profile_display_name(string $actorKey = 'cmdr_nova', bool $withVanit
     if ($withVanity && !empty($p['vanity_verified'])) {
         // Ice Cubes / Mastodon show this in the name string (no native account badge)
         $name .= ' ✓';
+    }
+    if ($withVanity && !empty($p['automated'])) {
+        // Same in-name treatment as the vanity ✓, so both sit side by side.
+        $name .= ' 🤖';
     }
     return $name;
 }
