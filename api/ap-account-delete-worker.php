@@ -37,8 +37,11 @@ try {
 
     // Delete local posts in bounded batches. Each Delete activity uses the
     // existing delivery queue, so remote federation never blocks this worker.
-    $st = ap_db()->prepare('SELECT local_id FROM masto_statuses WHERE note_id LIKE ? ORDER BY local_id LIMIT 2000');
-    $st->execute([$actorId . '/notes/%']);
+    // Exact prefix match: in LIKE, the `_` allowed in actor keys matches any
+    // character, so deleting j_doe would also take jxdoe's posts.
+    $prefix = $actorId . '/notes/';
+    $st = ap_db()->prepare('SELECT local_id FROM masto_statuses WHERE substr(note_id, 1, length(?)) = ? ORDER BY local_id LIMIT 2000');
+    $st->execute([$prefix, $prefix]);
     foreach ($st->fetchAll() ?: [] as $row) {
         $localId = (int) ($row['local_id'] ?? 0);
         if ($localId > 0) {
