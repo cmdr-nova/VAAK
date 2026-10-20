@@ -1131,6 +1131,35 @@ fn apply_bsky_deprioritized(keys: &mut [BskyKey], actors: &HashSet<String>) {
     }
 }
 
+/// PHP parity (`Cap deprioritized authors to ~1 in 5 Home slots`): the six
+/// hour shift alone leaves a flooding author's run of posts back to back, so
+/// keep at most one deprioritized card per five, with four others between.
+fn cap_deprioritized(ranked: Vec<Value>, deprioritized_ids: &HashSet<String>) -> Vec<Value> {
+    if deprioritized_ids.is_empty() {
+        return ranked;
+    }
+    let mut capped = Vec::with_capacity(ranked.len());
+    let mut emitted = 0usize;
+    let mut since = 0usize;
+    for row in ranked {
+        let id = row.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        if deprioritized_ids.contains(id) {
+            if since < 4 && !capped.is_empty() {
+                continue;
+            }
+            if (emitted + 1) as f64 / (capped.len() + 1) as f64 > 0.2 {
+                continue;
+            }
+            emitted += 1;
+            since = 0;
+        } else {
+            since += 1;
+        }
+        capped.push(row);
+    }
+    capped
+}
+
 /// The toxicity downrank, run over Bluesky posts through the same
 /// suppression state fediverse authors use.
 async fn apply_bsky_toxicity_downrank(db: &Client, owner: i64, keys: &mut [BskyKey]) -> Result<()> {
@@ -2995,6 +3024,19 @@ pub async fn warm_home_native(cfg: &Config, owner_user_id: i64) -> Result<String
         apply_favourite_rank(&mut timeline, &actor_weights, &tag_weights);
     }
 
+    // Remember which cards are deprioritized before ranking drops the actor.
+    let mut deprioritized_ids: HashSet<String> = if deprioritized.is_empty() {
+        HashSet::new()
+    } else {
+        timeline
+            .iter()
+            .filter(|item| {
+                let actor = item.pref_actor.trim().trim_end_matches('/').to_ascii_lowercase();
+                !actor.is_empty() && deprioritized.contains(&actor)
+            })
+            .map(|item| item.id.clone())
+            .collect()
+    };
     let mut ranked = rank_from_timeline_capped(timeline, None);
 
     let own_did = load_own_did(&db, owner_user_id).await?;
@@ -3022,6 +3064,15 @@ pub async fn warm_home_native(cfg: &Config, owner_user_id: i64) -> Result<String
     // Bluesky gets the same treatment as fediverse posts above: Deprioritize,
     // recommendations and the toxicity downrank.
     apply_bsky_deprioritized(&mut bsky, &deprioritized);
+    // Live fan-out only knows a Bluesky author's DID, while the menu saves the
+    // handle profile URL. Publish the DID forms too so new posts stay down.
+    let mut weight_deprioritized = deprioritized.clone();
+    for key in &bsky {
+        if bsky_author_keys(key).iter().any(|k| deprioritized.contains(k)) {
+            deprioritized_ids.insert(key.uri.clone());
+            weight_deprioritized.extend(bsky_author_keys(key));
+        }
+    }
     if algorithm_on {
         let existing: HashSet<String> = bsky.iter().map(|row| row.uri.clone()).collect();
         match fetch_bsky_recommendation_keys(
@@ -3070,6 +3121,8 @@ pub async fn warm_home_native(cfg: &Config, owner_user_id: i64) -> Result<String
         );
     }
 
+    ranked = cap_deprioritized(ranked, &deprioritized_ids);
+
     if algorithm_on {
         match fetch_rss_keys(&db, owner_user_id, 32).await {
             Ok(rss) => ranked = queue_rss_after_first_page(ranked, &rss, 5),
@@ -3091,7 +3144,7 @@ pub async fn warm_home_native(cfg: &Config, owner_user_id: i64) -> Result<String
         algorithm_on,
         &actor_weights,
         &tag_weights,
-        &deprioritized,
+        &weight_deprioritized,
     )
     .await
     {
@@ -4010,6 +4063,52 @@ mod tests {
         set.insert(actor);
         apply_deprioritized_rank(&mut timeline, &set);
         assert_eq!(timeline[0].sort, 100_000 - 6 * 3600);
+    }
+
+    #[test]
+    fn deprioritized_flood_keeps_one_in_five_slots() {
+        let row = |id: &str| json!({"k": "bsky", "id": id, "s": "bluesky"});
+        let mut ranked = Vec::new();
+        let mut dep = HashSet::new();
+        for i in 0..12 {
+            let id = format!("at://loud/{i}");
+            dep.insert(id.clone());
+            ranked.push(row(&id));
+        }
+        for i in 0..12 {
+            ranked.push(row(&format!("at://friend/{i}")));
+        }
+        let capped = cap_deprioritized(ranked, &dep);
+        let ids: Vec<&str> = capped.iter().map(|r| r["id"].as_str().unwrap()).collect();
+        let loud: Vec<usize> = ids
+            .iter()
+            .enumerate()
+            .filter(|(_, id)| id.starts_with("at://loud/"))
+            .map(|(i, _)| i)
+            .collect();
+        // A run of twelve back-to-back posts no longer leads Home.
+        assert!(!ids[0].starts_with("at://loud/"), "{ids:?}");
+        assert!(loud.len() <= 3, "{ids:?}");
+        assert!(loud.windows(2).all(|w| w[1] - w[0] >= 5), "{ids:?}");
+        assert_eq!(ids.iter().filter(|id| id.starts_with("at://friend/")).count(), 12);
+    }
+
+    #[test]
+    fn deprioritized_handle_url_matches_bluesky_did_forms() {
+        let key = BskyKey {
+            uri: "at://did:plc:loud/app.bsky.feed.post/1".into(),
+            fedi: String::new(),
+            author_did: "did:plc:loud".into(),
+            author_handle: "Loud.bsky.social".into(),
+            text: String::new(),
+            external: String::new(),
+            indexed_at: 0,
+            sort: 0,
+        };
+        let keys = bsky_author_keys(&key);
+        assert!(keys.contains(&"https://bsky.app/profile/loud.bsky.social".to_string()));
+        assert!(keys.contains(&"did:plc:loud".to_string()));
+        assert!(keys.contains(&"https://bsky.app/profile/did:plc:loud".to_string()));
     }
 
     #[test]
