@@ -232,7 +232,7 @@ function ap_ie_export_mutes_rows(): array
 function ap_ie_export_blocked_accounts_rows(): array
 {
     $rows = [];
-    foreach (ap_block_list() as $b) {
+    foreach (ap_user_blocks_list(ap_db_default_owner_user_id()) as $b) {
         if (($b['scope'] ?? '') !== 'actor') {
             continue;
         }
@@ -253,7 +253,7 @@ function ap_ie_export_blocked_accounts_rows(): array
 function ap_ie_export_blocked_domains_rows(): array
 {
     $rows = [];
-    foreach (ap_block_list() as $b) {
+    foreach (ap_user_blocks_list(ap_db_default_owner_user_id()) as $b) {
         if (($b['scope'] ?? '') !== 'domain') {
             continue;
         }
@@ -450,7 +450,7 @@ function ap_ie_import_blocks(array $rows): array
             $errors[] = "Could not resolve @$acct";
             continue;
         }
-        $res = ap_block_upsert('actor', $actor, 'block', 'csv import');
+        $res = ap_user_block_add(ap_db_default_owner_user_id(), 'actor', $actor, 'block', 'csv import');
         if (!empty($res['ok'])) {
             $imported++;
         } else {
@@ -488,7 +488,7 @@ function ap_ie_import_blocked_domains(array $rows): array
             $errors[] = "Invalid domain: $raw";
             continue;
         }
-        $res = ap_block_upsert('domain', $dom, 'block', 'csv import');
+        $res = ap_user_block_add(ap_db_default_owner_user_id(), 'domain', $dom, 'block', 'csv import');
         if (!empty($res['ok'])) {
             $imported++;
         } else {
