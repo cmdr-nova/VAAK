@@ -133,10 +133,14 @@ async fn after_save(cfg:&crate::config::Config,db:&tokio_postgres::Client,actor_
   let _:i64=del.query_async(&mut cache).await?;
  }
  if let Some(json)=export{
+  // Best effort, as PHP's @mkdir/@file_put_contents: a directory the worker
+  // cannot write must not hand the rest of the after-save work back to PHP,
+  // which would only fail the same write again.
   let root=std::env::var_os("VAAK_API_ROOT").map(std::path::PathBuf::from).unwrap_or_else(||"/srv/mkultra/html/api".into());
   let dir=root.parent().context("site root")?.join("assets/data");
-  std::fs::create_dir_all(&dir)?;
-  std::fs::write(dir.join("ap-cmdr-nova.json"),json)?;
+  if let Err(e)=std::fs::create_dir_all(&dir).and_then(|_|std::fs::write(dir.join("ap-cmdr-nova.json"),json)){
+   tracing::info!(error=%e,"native profile homepage snapshot not written");
+  }
  }
  let doc=format!("https://mkultra.monster/users/{}",rawurlencode(&php_trim(actor_key).to_ascii_lowercase()));
  let _:i64=redis::cmd("DEL").arg(format!("vaak:apdoc:v1:{}",sha256(php_trim(&doc).trim_end_matches('/')))).query_async(&mut cache).await?;
