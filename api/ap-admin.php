@@ -6085,7 +6085,7 @@ function admin_follow_rows_for_network(array $rows, string $network): array
     if ($network === 'fedi') {
         return array_values(array_filter($rows, static fn(array $r): bool => ($r['host'] ?? '') !== 'bsky.app' && !str_contains((string) ($r['actor_id'] ?? ''), 'bsky.app')));
     }
-    return $rows;
+    return function_exists('ap_bsky_collapse_twin_rows') ? ap_bsky_collapse_twin_rows($rows) : $rows;
 }
 
 /** @return list<array<string,mixed>> */
@@ -7589,7 +7589,8 @@ if (isset($_GET['partial'], $_GET['shell'])
         $rowsSrc = $view === 'followers' ? $followers : $following;
         $followNet = $shellNet;
         $followLimit = 40;
-        $filtered = $rowsSrc;
+        $filtered = function_exists('ap_bsky_collapse_twin_rows') ? ap_bsky_collapse_twin_rows($rowsSrc) : $rowsSrc;
+        $nAll = count($filtered);
         if ($followNet === 'bsky') {
             $filtered = array_values(array_filter($rowsSrc, static fn(array $r): bool => ($r['host'] ?? '') === 'bsky.app' || str_contains((string) ($r['actor_id'] ?? ''), 'bsky.app')));
         } elseif ($followNet === 'fedi') {
@@ -7597,9 +7598,8 @@ if (isset($_GET['partial'], $_GET['shell'])
         }
         $shown = array_slice($filtered, 0, $followLimit);
         $shown = admin_follow_rows_resolve_bsky_handles($shown, $vaakOwnerId);
-        $nAll = count($rowsSrc);
         $nBsky = count(array_filter($rowsSrc, static fn(array $r): bool => ($r['host'] ?? '') === 'bsky.app' || str_contains((string) ($r['actor_id'] ?? ''), 'bsky.app')));
-        $nFedi = $nAll - $nBsky;
+        $nFedi = count($rowsSrc) - $nBsky;
         echo '<nav class="notification-tabs" aria-label="' . h($shellTitle) . ' network" style="display:flex;gap:.5rem;flex-wrap:wrap;margin:0 0 1rem">';
         foreach (['all' => ['All', $nAll], 'fedi' => ['Fediverse', $nFedi], 'bsky' => ['Bluesky', $nBsky]] as $netKey => $netMeta) {
             echo '<a class="btn ' . ($followNet === $netKey ? 'btn-primary' : 'btn-ghost')
@@ -33659,7 +33659,8 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
               $followNet = 'all';
           }
           $followLimit = 40;
-          $followersFiltered = $followers;
+          $followersFiltered = function_exists('ap_bsky_collapse_twin_rows') ? ap_bsky_collapse_twin_rows($followers) : $followers;
+          $followersTwins = count($followers) - count($followersFiltered);
           if ($followNet === 'bsky') {
               $followersFiltered = array_values(array_filter($followers, static fn(array $r): bool => ($r['host'] ?? '') === 'bsky.app' || str_contains((string) ($r['actor_id'] ?? ''), 'bsky.app')));
           } elseif ($followNet === 'fedi') {
@@ -33672,13 +33673,13 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
                   . '" data-vaak-soft-nav="' . h($viewName) . '" data-follow-network="' . h($net)
                   . '" style="padding:.3rem .7rem;font-size:.82rem">' . h($label) . ' <span class="meta">(' . $count . ')</span></a>';
           };
-          $nAll = is_array($followersShadow) ? (int) ($followersShadow['total'] ?? count($followers)) : count($followers);
+          $nAll = (is_array($followersShadow) ? (int) ($followersShadow['total'] ?? count($followers)) : count($followers)) - $followersTwins;
           $nBsky = is_array($followersShadow)
               ? (int) ($followersShadow['bsky_count'] ?? 0)
               : count(array_filter($followers, static fn(array $r): bool => ($r['host'] ?? '') === 'bsky.app' || str_contains((string) ($r['actor_id'] ?? ''), 'bsky.app')));
           $nFedi = is_array($followersShadow)
-              ? (int) ($followersShadow['fedi_count'] ?? max(0, $nAll - $nBsky))
-              : $nAll - $nBsky;
+              ? (int) ($followersShadow['fedi_count'] ?? max(0, $nAll + $followersTwins - $nBsky))
+              : $nAll + $followersTwins - $nBsky;
         ?>
         <nav class="notification-tabs" aria-label="Follower network" style="display:flex;gap:.5rem;flex-wrap:wrap;margin:0 0 1rem">
           <?= $followTab('followers', 'all', 'All', $nAll, $followNet) ?>
@@ -33713,20 +33714,21 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
               $followNet = 'all';
           }
           $followLimit = 40;
-          $followingFiltered = $following;
+          $followingFiltered = function_exists('ap_bsky_collapse_twin_rows') ? ap_bsky_collapse_twin_rows($following) : $following;
+          $followingTwins = count($following) - count($followingFiltered);
           if ($followNet === 'bsky') {
               $followingFiltered = array_values(array_filter($following, static fn(array $r): bool => ($r['host'] ?? '') === 'bsky.app' || str_contains((string) ($r['actor_id'] ?? ''), 'bsky.app')));
           } elseif ($followNet === 'fedi') {
               $followingFiltered = array_values(array_filter($following, static fn(array $r): bool => ($r['host'] ?? '') !== 'bsky.app' && !str_contains((string) ($r['actor_id'] ?? ''), 'bsky.app')));
           }
           $followingShown = admin_follow_rows_resolve_bsky_handles(array_slice($followingFiltered, 0, $followLimit), $vaakOwnerId);
-          $nAll = is_array($followingShadow) ? (int) ($followingShadow['total'] ?? count($following)) : count($following);
+          $nAll = (is_array($followingShadow) ? (int) ($followingShadow['total'] ?? count($following)) : count($following)) - $followingTwins;
           $nBsky = is_array($followingShadow)
               ? (int) ($followingShadow['bsky_count'] ?? 0)
               : count(array_filter($following, static fn(array $r): bool => ($r['host'] ?? '') === 'bsky.app' || str_contains((string) ($r['actor_id'] ?? ''), 'bsky.app')));
           $nFedi = is_array($followingShadow)
-              ? (int) ($followingShadow['fedi_count'] ?? max(0, $nAll - $nBsky))
-              : $nAll - $nBsky;
+              ? (int) ($followingShadow['fedi_count'] ?? max(0, $nAll + $followingTwins - $nBsky))
+              : $nAll + $followingTwins - $nBsky;
         ?>
         <nav class="notification-tabs" aria-label="Following network" style="display:flex;gap:.5rem;flex-wrap:wrap;margin:0 0 1rem">
           <a class="btn <?= $followNet === 'all' ? 'btn-primary' : 'btn-ghost' ?>" href="?view=following&amp;network=all" data-vaak-soft-nav="following" data-follow-network="all" style="padding:.3rem .7rem;font-size:.82rem">All <span class="meta">(<?= $nAll ?>)</span></a>

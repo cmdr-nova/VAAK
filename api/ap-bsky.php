@@ -5839,6 +5839,44 @@ function ap_bsky_admin_follower_rows(int $ownerUserId, string $ownerActorId): ar
     return $out;
 }
 
+/**
+ * Local VAAK actor whose connected Bluesky account is $actorRef
+ * (https://bsky.app/profile/{handle|did}, a handle, or a DID), or ''.
+ * Used to count a linked VAAK + Bluesky pair as one person.
+ */
+function ap_bsky_twin_local_actor_id(string $actorRef): string
+{
+    $ref = rtrim(trim($actorRef), '/');
+    if (preg_match('~^https://bsky\.app/profile/([^/?#]+)$~i', $ref, $m)) {
+        $ref = rawurldecode($m[1]);
+    } elseif (str_starts_with($ref, 'https://')) {
+        return '';
+    }
+    $ref = strtolower(ltrim($ref, '@'));
+    if ($ref === '') return '';
+    static $twins = null;
+    if ($twins === null) {
+        $twins = [];
+        try {
+            $st = ap_db()->query(
+                'SELECT s.handle, s.did, u.actor_id FROM bsky_sessions s
+                 JOIN ap_users u ON u.id = s.owner_user_id'
+            );
+            foreach ($st ? $st->fetchAll() : [] as $row) {
+                $local = rtrim((string) ($row['actor_id'] ?? ''), '/');
+                if ($local === '') continue;
+                foreach (['handle', 'did'] as $col) {
+                    $k = strtolower(trim((string) ($row[$col] ?? '')));
+                    if ($k !== '') $twins[$k] = $local;
+                }
+            }
+        } catch (Throwable $e) {
+            $twins = [];
+        }
+    }
+    return $twins[$ref] ?? '';
+}
+
 function ap_bsky_merge_follow_rows(array $base, array $extra): array
 {
     $seen = [];
@@ -5862,6 +5900,40 @@ function ap_bsky_merge_follow_rows(array $base, array $extra): array
         return $tb <=> $ta;
     });
     return $base;
+}
+
+/**
+ * For the "All" Followers/Following list: drop a Bluesky row when the same
+ * person's local VAAK account is already in $rows, so a linked pair lists
+ * once. The Fediverse and Bluesky tabs, and relationship id sets, keep both.
+ *
+ * @param list<array<string,mixed>> $rows
+ * @return list<array<string,mixed>>
+ */
+function ap_bsky_collapse_twin_rows(array $rows): array
+{
+    $local = [];
+    foreach ($rows as $row) {
+        $aid = rtrim((string) ($row['actor_id'] ?? ''), '/');
+        if (str_starts_with($aid, 'https://mkultra.monster/users/')) {
+            $local[$aid] = true;
+        }
+    }
+    if ($local === []) {
+        return array_values($rows);
+    }
+    $out = [];
+    foreach ($rows as $row) {
+        $aid = rtrim((string) ($row['actor_id'] ?? ''), '/');
+        if (str_starts_with($aid, 'https://bsky.app/profile/')) {
+            $twin = ap_bsky_twin_local_actor_id($aid);
+            if ($twin !== '' && isset($local[$twin])) {
+                continue;
+            }
+        }
+        $out[] = $row;
+    }
+    return $out;
 }
 
 /** Queue connected-profile public counts without making profile HTML wait on XRPC. */
@@ -13764,6 +13836,21 @@ function ap_bsky_ingest_follow_notification(
     }
 
     $pushed = false;
+    // Mentions hides a linked VAAK user's Bluesky twin follow when their local
+    // account already follows; do not push it either.
+    $twin = ap_bsky_twin_local_actor_id($actorId);
+    if ($pushNew && $twin !== '') {
+        try {
+            $owner = rtrim($ownerActorId, '/');
+            $tw = ap_db()->prepare('SELECT 1 FROM followers WHERE (owner_actor_id = ? OR owner_actor_id = ?) AND (actor_id = ? OR actor_id = ?) LIMIT 1');
+            $tw->execute([$owner, $owner . '/', $twin, $twin . '/']);
+            if ($tw->fetchColumn() !== false) {
+                $pushNew = false;
+            }
+        } catch (Throwable $e) {
+            // push as before
+        }
+    }
     if ($pushNew && function_exists('ap_webpush_notify_event')) {
         $nid = null;
         try {

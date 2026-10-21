@@ -3,7 +3,8 @@ declare(strict_types=1);
 /**
  * When a VAAK user creates a Bluesky account, only their accepted local
  * followers who have Bluesky connected and opted in get a queued Bluesky
- * follow. No network; SQLite in memory; the action queue is recorded.
+ * follow, and the resulting Bluesky twin follower lists once under "All".
+ * No network; SQLite in memory; the action queue is recorded.
  */
 $api = getenv('VAAK_BSKY_FOLLOW_CARRY_API') ?: dirname(__DIR__);
 if (!function_exists('reference_load')) {
@@ -22,7 +23,7 @@ function ap_action_queue_enqueue(int $owner, string $platform, string $kind, str
 }
 
 require_once $api . '/ap-bsky-urls.php';
-reference_load($api . '/ap-bsky.php', ['ap_bsky_follow_carry_enabled', 'ap_bsky_follow_carry_set', 'ap_bsky_follow_carry_enqueue']);
+reference_load($api . '/ap-bsky.php', ['ap_bsky_follow_carry_enabled', 'ap_bsky_follow_carry_set', 'ap_bsky_follow_carry_enqueue', 'ap_bsky_twin_local_actor_id', 'ap_bsky_collapse_twin_rows']);
 
 $checks = 0;
 function carry_check(bool $condition, string $message): void
@@ -42,7 +43,7 @@ carry_check(ap_bsky_follow_carry_enqueue(5, $newDid) === 0, 'missing table queue
 $db = ap_db();
 $db->exec('CREATE TABLE ap_users (id INTEGER PRIMARY KEY, actor_id TEXT NOT NULL, disabled_at TEXT)');
 $db->exec('CREATE TABLE followers (owner_actor_id TEXT, actor_id TEXT)');
-$db->exec('CREATE TABLE bsky_sessions (owner_user_id BIGINT PRIMARY KEY, did TEXT NOT NULL)');
+$db->exec('CREATE TABLE bsky_sessions (owner_user_id BIGINT PRIMARY KEY, handle TEXT NOT NULL, did TEXT NOT NULL)');
 $db->exec((string) preg_replace('/GRANT[^;]*;/', '', (string) file_get_contents($api . '/migrations/20261021_bsky_follow_carry_postgres.sql')));
 
 $u = static fn (string $k): string => 'https://mkultra.monster/users/' . $k;
@@ -50,7 +51,7 @@ foreach ([1 => 'cmdr_nova', 2 => 'no_bsky', 3 => 'opted_out', 4 => 'disabled', 5
     $db->prepare('INSERT INTO ap_users (id, actor_id, disabled_at) VALUES (?, ?, ?)')->execute([$id, $u($key), $id === 4 ? '2026-10-01' : null]);
 }
 foreach ([1, 3, 4, 5, 6] as $id) {
-    $db->prepare('INSERT INTO bsky_sessions (owner_user_id, did) VALUES (?, ?)')->execute([$id, $id === 5 ? $newDid : 'did:plc:u' . $id]);
+    $db->prepare('INSERT INTO bsky_sessions (owner_user_id, handle, did) VALUES (?, ?, ?)')->execute([$id, 'u' . $id . '.bsky.mkultra.monster', $id === 5 ? $newDid : 'did:plc:u' . $id]);
 }
 // Accepted local followers of shana_flux, plus one remote follower.
 foreach (['cmdr_nova', 'no_bsky', 'opted_out', 'disabled'] as $key) {
@@ -77,6 +78,26 @@ carry_check(ap_bsky_follow_carry_set(1, false)['ok'] === true && ap_bsky_follow_
 $GLOBALS['queued'] = [];
 carry_check(ap_bsky_follow_carry_enqueue(5, $newDid) === 0 && $GLOBALS['queued'] === [], 'opted-out follower is skipped');
 carry_check(ap_bsky_follow_carry_enqueue(5, 'not-a-did') === 0, 'a non-DID is refused');
+
+// Twin dedupe: cmdr_nova (local) and her Bluesky account follow shana_flux.
+carry_check(ap_bsky_twin_local_actor_id('https://bsky.app/profile/U1.bsky.mkultra.monster') === $u('cmdr_nova'), 'handle URL maps to the local twin');
+carry_check(ap_bsky_twin_local_actor_id('https://bsky.app/profile/did%3Aplc%3Au1') === $u('cmdr_nova'), 'DID URL maps to the local twin');
+carry_check(ap_bsky_twin_local_actor_id('did:plc:u1') === $u('cmdr_nova'), 'bare DID maps to the local twin');
+carry_check(ap_bsky_twin_local_actor_id('https://bsky.app/profile/stranger.bsky.social') === '', 'unlinked Bluesky account has no twin');
+carry_check(ap_bsky_twin_local_actor_id($u('cmdr_nova')) === '', 'a local actor is not a Bluesky ref');
+$listed = [
+    ['actor_id' => $u('cmdr_nova'), 'host' => 'mkultra.monster'],
+    ['actor_id' => 'https://bsky.app/profile/u1.bsky.mkultra.monster', 'host' => 'bsky.app'],
+    ['actor_id' => 'https://bsky.app/profile/u6.bsky.mkultra.monster', 'host' => 'bsky.app'],
+    ['actor_id' => 'https://bsky.app/profile/stranger.bsky.social', 'host' => 'bsky.app'],
+];
+$collapsed = array_column(ap_bsky_collapse_twin_rows($listed), 'actor_id');
+carry_check($collapsed === [$u('cmdr_nova'), 'https://bsky.app/profile/u6.bsky.mkultra.monster', 'https://bsky.app/profile/stranger.bsky.social'], 'All drops only the Bluesky twin whose local account is listed');
+carry_check(count(ap_bsky_collapse_twin_rows(array_slice($listed, 1))) === 3, 'a Bluesky follower whose local account does not follow stays');
+$entities = (string) file_get_contents($api . '/ap-masto-entities.php');
+carry_check(substr_count($entities, '$twin = ap_bsky_twin_local_actor_id($fa);') === 2, 'Mentions list and badge both skip twin follows');
+$rust = (string) file_get_contents(dirname($api) . '/rust/vaak-worker/src/notif/mod.rs');
+carry_check(str_contains($rust, 'bsky_twin_local_actor(&actor_id, &twins)'), 'Rust unread count skips twin follows too');
 
 $src = (string) file_get_contents($api . '/ap-bsky.php');
 carry_check(str_contains($src, '$carried = ap_bsky_follow_carry_enqueue($ownerUserId, $did);'), 'account creation runs the carry');
