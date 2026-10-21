@@ -2282,13 +2282,98 @@ function ap_bsky_create_account(
         return ['ok' => false, 'error' => 'The PDS account was created, but VAAK could not save its connection. Contact the operator before retrying.'];
     }
     $sync = ap_bsky_sync_profile_from_vaak($ownerUserId);
+    $carried = ap_bsky_follow_carry_enqueue($ownerUserId, $did);
     return [
         'ok' => true,
         'handle' => $actualHandle,
         'did' => $did,
         'profile_synced' => !empty($sync['ok']),
         'profile_sync_error' => empty($sync['ok']) ? (string) ($sync['error'] ?? '') : '',
+        'carried_follows' => $carried,
     ];
+}
+
+/**
+ * Whether this user wants to follow, on Bluesky, the people they follow on
+ * VAAK when those people create a VAAK Bluesky account. Off by default: the
+ * follow is a record in this user's own repo, so only they can opt in.
+ * The table ships in api/migrations/20261021_bsky_follow_carry_postgres.sql;
+ * until it exists this reads as off.
+ */
+function ap_bsky_follow_carry_enabled(int $ownerUserId): bool
+{
+    if ($ownerUserId < 1) return false;
+    try {
+        $st = ap_db()->prepare('SELECT 1 FROM bsky_follow_carry_optin WHERE owner_user_id = ? LIMIT 1');
+        $st->execute([$ownerUserId]);
+        return $st->fetchColumn() !== false;
+    } catch (Throwable $e) {
+        return false;
+    }
+}
+
+/** @return array{ok:bool,error?:string} */
+function ap_bsky_follow_carry_set(int $ownerUserId, bool $enabled): array
+{
+    if ($ownerUserId < 1) return ['ok' => false, 'error' => 'Not signed in'];
+    try {
+        $db = ap_db();
+        if ($enabled) {
+            $db->prepare('INSERT INTO bsky_follow_carry_optin (owner_user_id, enabled_at) VALUES (?, ?) ON CONFLICT (owner_user_id) DO NOTHING')
+                ->execute([$ownerUserId, gmdate('c')]);
+        } else {
+            $db->prepare('DELETE FROM bsky_follow_carry_optin WHERE owner_user_id = ?')->execute([$ownerUserId]);
+        }
+        return ['ok' => true];
+    } catch (Throwable $e) {
+        error_log('[ap-bsky] follow carry setting: ' . $e->getMessage());
+        return ['ok' => false, 'error' => 'This setting is not available until the next deploy migration runs.'];
+    }
+}
+
+/**
+ * A VAAK user just created a Bluesky account with $did. Queue a Bluesky
+ * follow of it for each local VAAK follower who has Bluesky connected and
+ * opted in. The follows go through ap_action_queue so the account creation
+ * request never waits on other users' PDS writes, and failures retry.
+ *
+ * @return int follows queued
+ */
+function ap_bsky_follow_carry_enqueue(int $newOwnerUserId, string $did): int
+{
+    $did = trim($did);
+    if ($newOwnerUserId < 1 || !str_starts_with($did, 'did:')) return 0;
+    if (!function_exists('ap_action_queue_enqueue')) require_once __DIR__ . '/ap-action-queue.php';
+    try {
+        $db = ap_db();
+        $st = $db->prepare('SELECT actor_id FROM ap_users WHERE id = ? LIMIT 1');
+        $st->execute([$newOwnerUserId]);
+        $actorId = rtrim((string) ($st->fetchColumn() ?: ''), '/');
+        if ($actorId === '') return 0;
+        // Accepted local followers only; pending requests live in ap_follow_requests.
+        $st = $db->prepare(
+            "SELECT DISTINCT u.id, s.did
+             FROM followers f
+             JOIN ap_users u ON u.actor_id = f.actor_id OR u.actor_id || '/' = f.actor_id
+             JOIN bsky_sessions s ON s.owner_user_id = u.id
+             JOIN bsky_follow_carry_optin o ON o.owner_user_id = u.id
+             WHERE (f.owner_actor_id = ? OR f.owner_actor_id = ?)
+               AND u.id <> ? AND u.disabled_at IS NULL"
+        );
+        $st->execute([$actorId, $actorId . '/', $newOwnerUserId]);
+        $rows = $st->fetchAll();
+    } catch (Throwable $e) {
+        error_log('[ap-bsky] follow carry lookup: ' . $e->getMessage());
+        return 0;
+    }
+    $queued = 0;
+    foreach ($rows ?: [] as $row) {
+        $followerId = (int) ($row['id'] ?? 0);
+        if ($followerId < 1 || (string) ($row['did'] ?? '') === $did) continue;
+        $q = ap_action_queue_enqueue($followerId, 'bsky', 'follow', $did, true, ['actor' => $did, 'source' => 'local_follow_carry']);
+        if (!empty($q['ok'])) $queued++;
+    }
+    return $queued;
 }
 
 /** Read the local PDS admin credentials without exposing them to callers. */

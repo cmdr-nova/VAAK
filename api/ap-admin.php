@@ -4174,7 +4174,7 @@ $vaakAdminOnlyActions = [
             echo json_encode($ajaxOut, JSON_UNESCAPED_SLASHES);
             exit;
         }
-    } elseif ($action === 'bsky_create_account' || $action === 'bsky_connect' || $action === 'bsky_disconnect' || $action === 'bsky_sync_profile' || $action === 'bsky_refresh_follow_sync') {
+    } elseif ($action === 'bsky_create_account' || $action === 'bsky_connect' || $action === 'bsky_disconnect' || $action === 'bsky_sync_profile' || $action === 'bsky_refresh_follow_sync' || $action === 'bsky_follow_carry_save') {
         $view = preg_replace('/[^a-z_]/', '', (string) ($_POST['return_view'] ?? 'profile')) ?: 'profile';
         if (!function_exists('ap_bsky_tab_enabled') || !ap_bsky_tab_enabled()) {
             $error = 'Bluesky tab is disabled on this instance.';
@@ -4191,8 +4191,25 @@ $vaakAdminOnlyActions = [
                 if (!empty($res['profile_synced'])) {
                     $notice .= ' Your VAAK avatar, header, and bio were synced.';
                 }
+                $carried = (int) ($res['carried_follows'] ?? 0);
+                if ($carried > 0) {
+                    $notice .= ' ' . number_format($carried) . ($carried === 1 ? ' VAAK follower' : ' VAAK followers')
+                        . ' will follow you on Bluesky shortly.';
+                }
             } else {
                 $error = $res['error'] ?? 'Could not create the VAAK Bluesky account.';
+            }
+        } elseif ($action === 'bsky_follow_carry_save') {
+            $carryOn = !empty($_POST['bsky_follow_carry']);
+            $res = function_exists('ap_bsky_follow_carry_set')
+                ? ap_bsky_follow_carry_set($vaakOwnerId, $carryOn)
+                : ['ok' => false, 'error' => 'Bluesky follow carry unavailable.'];
+            if (!empty($res['ok'])) {
+                $notice = $carryOn
+                    ? 'You will follow people you follow on VAAK when they create a VAAK Bluesky account.'
+                    : 'New VAAK Bluesky accounts will no longer be followed for you.';
+            } else {
+                $error = $res['error'] ?? 'Could not save the setting.';
             }
         } elseif ($action === 'bsky_disconnect') {
             ap_bsky_disconnect($vaakOwnerId);
@@ -32203,6 +32220,19 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
                 <button class="btn btn-ghost" type="submit">Disconnect Bluesky</button>
               </form>
             </div>
+            <?php $bskyFollowCarry = function_exists('ap_bsky_follow_carry_enabled') && ap_bsky_follow_carry_enabled($vaakOwnerId); ?>
+            <form method="post" action="?view=atmosphere" style="margin-top:1rem">
+              <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
+              <input type="hidden" name="action" value="bsky_follow_carry_save">
+              <input type="hidden" name="return_view" value="atmosphere">
+              <label style="display:flex;gap:.5rem;align-items:flex-start;line-height:1.45">
+                <input type="checkbox" name="bsky_follow_carry" value="1" <?= $bskyFollowCarry ? 'checked' : '' ?> style="margin-top:.2rem">
+                <span>When someone I follow on VAAK creates a VAAK Bluesky account, follow them on Bluesky too.</span>
+              </label>
+              <div class="composer-actions" style="margin-top:.5rem">
+                <button class="btn btn-ghost" type="submit">Save</button>
+              </div>
+            </form>
             <form class="composer" method="post" action="?view=atmosphere" style="margin-top:1rem">
               <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
               <input type="hidden" name="action" value="bsky_connect">
