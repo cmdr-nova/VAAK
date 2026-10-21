@@ -3862,9 +3862,6 @@ function ap_profile_save_unlocked(array $fields, string $actorKey = 'cmdr_nova')
         ap_db_now(),
     ]);
 
-    if (function_exists('ap_redis_delete')) {
-        ap_redis_delete('vaak:profile:v1:' . hash('sha256', trim($actorKey)));
-    }
     $trendsPrefChanged = false;
     if (array_key_exists('trending_enabled', $fields)) {
         $prevTrending = !array_key_exists('trending_enabled', $existingProfile) || $existingProfile['trending_enabled'] === null
@@ -3878,6 +3875,24 @@ function ap_profile_save_unlocked(array $fields, string $actorKey = 'cmdr_nova')
             : (!empty($existingProfile['downranking_enabled']) ? 1 : 0);
         $trendsPrefChanged = $trendsPrefChanged || (int) $downrankingEnabled !== $prevDownrank;
     }
+    ap_profile_after_save(
+        $actorKey,
+        $trendsPrefChanged,
+        (bool) ($existingProfile['algorithm_enabled'] ?? true) !== (bool) $algorithmEnabled
+    );
+
+    return ['ok' => true];
+}
+
+/**
+ * Cache and export work after a profile row changed, shared by the PHP save
+ * and the native one (ap_settings_profile_save_native).
+ */
+function ap_profile_after_save(string $actorKey, bool $trendsPrefChanged, bool $algorithmChanged): void
+{
+    if (function_exists('ap_redis_delete')) {
+        ap_redis_delete('vaak:profile:v1:' . hash('sha256', trim($actorKey)));
+    }
     if ($trendsPrefChanged && function_exists('ap_trends_policy_epoch_bump')) {
         try {
             $trendOwnerQuery = ap_db()->prepare('SELECT id FROM ap_users WHERE actor_key = ?');
@@ -3888,7 +3903,7 @@ function ap_profile_save_unlocked(array $fields, string $actorKey = 'cmdr_nova')
             error_log('[ap-db] trends preference epoch: ' . $e->getMessage());
         }
     }
-    if ((bool) ($existingProfile['algorithm_enabled'] ?? true) !== (bool) $algorithmEnabled) {
+    if ($algorithmChanged) {
         $ownerQuery = ap_db()->prepare('SELECT id FROM ap_users WHERE actor_key = ?');
         $ownerQuery->execute([$actorKey]);
         $ownerUserId = (int) $ownerQuery->fetchColumn();
@@ -3900,8 +3915,6 @@ function ap_profile_save_unlocked(array $fields, string $actorKey = 'cmdr_nova')
     if (function_exists('ap_public_doc_invalidate_actor')) {
         ap_public_doc_invalidate_actor($actorKey);
     }
-
-    return ['ok' => true];
 }
 
 /** Canonical local profile URL used for rel=me verification. */

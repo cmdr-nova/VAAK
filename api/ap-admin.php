@@ -2417,24 +2417,11 @@ $vaakAdminOnlyActions = [
             }
         }
 
+        $profileFields = [];
+        $nativeSave = null;
         if ($error === null) {
             $emailIn = trim((string) ($_POST['email'] ?? ''));
-            if (function_exists('ap_auth_user_set_email')) {
-                $emailRes = ap_auth_user_set_email($vaakOwnerId, $emailIn);
-                if (empty($emailRes['ok'])) {
-                    $error = $emailRes['error'] ?? 'Could not save email.';
-                } else {
-                    $freshUser = ap_auth_user_by_id($vaakOwnerId);
-                    if (is_array($freshUser)) {
-                        $vaakUser = $freshUser;
-                        $GLOBALS['vaak_user'] = $freshUser;
-                    }
-                }
-            }
-        }
-
-        if ($error === null) {
-            $saved = ap_profile_save([
+            $profileFields = [
                 'name' => (string) ($_POST['name'] ?? ''),
                 'summary' => (string) ($_POST['summary'] ?? ''),
                 'attachment' => $attachment,
@@ -2463,7 +2450,38 @@ $vaakAdminOnlyActions = [
                 'webmentions_enabled' => !empty($_POST['webmentions_enabled']),
                 'forum_signature' => (string) ($_POST['forum_signature'] ?? ''),
                 'profile_badges' => is_array($_POST['profile_badges'] ?? null) ? $_POST['profile_badges'] : [],
-            ], $vaakActorKey);
+            ];
+            // Settings > Profile save in the worker (S4a) when switched on; null means PHP saves.
+            $nativeSave = ap_settings_profile_save_native($vaakOwnerId, $vaakActorKey, $emailIn, $profileFields);
+            if ($nativeSave !== null) {
+                if ($nativeSave['email_saved']) {
+                    $freshUser = ap_auth_user_by_id($vaakOwnerId);
+                    if (is_array($freshUser)) {
+                        $vaakUser = $freshUser;
+                        $GLOBALS['vaak_user'] = $freshUser;
+                    }
+                }
+                if (!$nativeSave['ok']) {
+                    $error = (string) $nativeSave['error'];
+                } elseif (!$nativeSave['after_save']) {
+                    ap_profile_after_save($vaakActorKey, $nativeSave['trends_changed'], $nativeSave['algorithm_changed']);
+                }
+            } elseif (function_exists('ap_auth_user_set_email')) {
+                $emailRes = ap_auth_user_set_email($vaakOwnerId, $emailIn);
+                if (empty($emailRes['ok'])) {
+                    $error = $emailRes['error'] ?? 'Could not save email.';
+                } else {
+                    $freshUser = ap_auth_user_by_id($vaakOwnerId);
+                    if (is_array($freshUser)) {
+                        $vaakUser = $freshUser;
+                        $GLOBALS['vaak_user'] = $freshUser;
+                    }
+                }
+            }
+        }
+
+        if ($error === null) {
+            $saved = $nativeSave !== null ? ['ok' => true] : ap_profile_save($profileFields, $vaakActorKey);
             if (empty($saved['ok'])) {
                 $error = $saved['error'] ?? 'Profile save failed.';
             } else {

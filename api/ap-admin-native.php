@@ -8,11 +8,11 @@ function ap_admin_native_enabled(): bool
 {
     return getenv('VAAK_ADMIN_READ_NATIVE') === '1' && strlen((string)getenv('VAAK_ADMIN_READ_SECRET')) >= 32;
 }
-function ap_admin_native_url_allowed(string $url): bool
+function ap_admin_native_url_allowed(string $url,string $path='/internal/admin/read'): bool
 {
     $p=parse_url($url);
     return is_array($p) && ($p['scheme']??'')==='http' && in_array($p['host']??'', ['127.0.0.1','[::1]'],true)
-        && ($p['path']??'')==='/internal/admin/read'
+        && ($p['path']??'')===$path
         && !isset($p['user']) && !isset($p['pass']) && !isset($p['query']) && !isset($p['fragment']);
 }
 function ap_admin_native_reply(array $reply,array $request): ?string
@@ -212,4 +212,54 @@ function ap_admin_native_read_body(string $view,int $offset=0,?string $filter=nu
     }catch(Throwable $e){return null;}
     $rows=$replyRows;
     return $html;
+}
+/**
+ * Settings > Profile save through the worker (S4a). $fields is the array the
+ * save_profile action passes to ap_profile_save, after uploads. Returns null so
+ * PHP saves itself (switch off, worker refusal, anything unproven), otherwise
+ * ['ok','error','email_saved','trends_changed','algorithm_changed','after_save'].
+ * The caller has checked the session and CSRF, and runs ap_profile_after_save
+ * on success unless the worker already did (after_save).
+ */
+function ap_settings_profile_save_native(int $owner,string $actorKey,string $email,array $fields): ?array
+{
+    if(!ap_admin_native_enabled() || getenv('VAAK_SETTINGS_PROFILE_SAVE_NATIVE')!=='1' || $owner<1 || $actorKey==='')return null;
+    $strings=['name','summary','icon_url','image_url','reply_policy','quote_policy','forum_signature'];
+    $flags=['manually_approves','discoverable','indexable','collection_consent','vanity_verified','auto_follow_back','anti_ai_marker','auto_unblur_sensitive',
+        'auto_delete_posts_7d','automated','hide_profile_replies','hide_profile_boosts','algorithm_enabled','trending_enabled','downranking_enabled','asks_enabled','webmentions_enabled'];
+    $keys=array_keys($fields);sort($keys);$expected=array_merge($strings,$flags,['attachment','profile_badges']);sort($expected);if($keys!==$expected)return null;
+    foreach($strings as $key)if(!is_string($fields[$key]))return null;
+    foreach($flags as $key)if(!is_bool($fields[$key]))return null;
+    if(!is_array($fields['attachment']) || !array_is_list($fields['attachment']) || count($fields['attachment'])>8 || !is_array($fields['profile_badges']))return null;
+    foreach($fields['attachment'] as $item){if(!is_array($item) || array_keys($item)!==['name','value'] || !is_string($item['name']) || !is_string($item['value']))return null;}
+    $fields['profile_badges']=array_values($fields['profile_badges']);
+    $user=ap_auth_current_user();if((int)($user['id']??0)!==$owner || (string)($user['actor_key']??'')!==$actorKey)return null;
+    $url=(string)(getenv('VAAK_SETTINGS_PROFILE_SAVE_URL')?:'http://127.0.0.1:8787/internal/settings/profile-save');
+    if(!ap_admin_native_url_allowed($url,'/internal/settings/profile-save'))return null;
+    try{
+        $payload=json_encode(['protocol_version'=>1,'owner_id'=>$owner,'actor_key'=>$actorKey,'email'=>$email,'fields'=>$fields],JSON_THROW_ON_ERROR);
+        $curl=curl_init($url);if($curl===false)return null;$body='';
+        // rel=me checks fetch each linked page, so this waits longer than a read.
+        curl_setopt_array($curl,[CURLOPT_POST=>true,CURLOPT_POSTFIELDS=>$payload,CURLOPT_RETURNTRANSFER=>false,
+            CURLOPT_CONNECTTIMEOUT_MS=>250,CURLOPT_TIMEOUT_MS=>60000,CURLOPT_FOLLOWLOCATION=>false,
+            CURLOPT_WRITEFUNCTION=>static function($handle,string $chunk)use(&$body):int{if(strlen($body)+strlen($chunk)>65536)return 0;$body.=$chunk;return strlen($chunk);},
+            CURLOPT_HTTPHEADER=>['Content-Type: application/json','X-Vaak-Admin-Token: '.(string)getenv('VAAK_ADMIN_READ_SECRET')]]);
+        $success=curl_exec($curl);$status=(int)curl_getinfo($curl,CURLINFO_RESPONSE_CODE);curl_close($curl);
+        if($success!==true || $status!==200)return null;
+        $reply=json_decode($body,true,16,JSON_THROW_ON_ERROR);
+    }catch(Throwable $e){return null;}
+    return ap_settings_profile_save_native_reply($reply,$owner,$actorKey);
+}
+/** The closed reply shape of /internal/settings/profile-save, bound to this request. */
+function ap_settings_profile_save_native_reply(mixed $reply,int $owner,string $actorKey): ?array
+{
+    if(!is_array($reply))return null;
+    $keys=array_keys($reply);sort($keys);$expected=['protocol_version','ok','error','email_saved','trends_changed','algorithm_changed','after_save','request_binding'];sort($expected);
+    if($keys!==$expected || $reply['protocol_version']!==1 || !is_bool($reply['ok']) || !is_bool($reply['email_saved'])
+        || !is_bool($reply['trends_changed']) || !is_bool($reply['algorithm_changed']) || !is_bool($reply['after_save']))return null;
+    $binding=$reply['request_binding'];
+    if(!is_array($binding) || count($binding)!==2 || ($binding['owner_id']??null)!==$owner || ($binding['actor_key']??null)!==$actorKey)return null;
+    if($reply['ok']){if($reply['error']!==null || !$reply['email_saved'])return null;}
+    elseif(!is_string($reply['error']) || $reply['error']==='' || strlen($reply['error'])>200 || $reply['trends_changed'] || $reply['algorithm_changed'] || $reply['after_save'])return null;
+    return ['ok'=>$reply['ok'],'error'=>$reply['error'],'email_saved'=>$reply['email_saved'],'trends_changed'=>$reply['trends_changed'],'algorithm_changed'=>$reply['algorithm_changed'],'after_save'=>$reply['after_save']];
 }

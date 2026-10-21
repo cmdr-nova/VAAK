@@ -24,6 +24,12 @@ struct Invite {id:i64,code:String,created_at:String,used_at:Option<String>,note:
 struct Application {id:i64,username:String,email:Option<String>,status:String,created_at:String,decided_at:Option<String>}
 fn secret()->Option<String>{if std::env::var("VAAK_ADMIN_READ_NATIVE").ok().as_deref()!=Some("1"){return None;}std::env::var("VAAK_ADMIN_READ_SECRET").ok().filter(|s|s.len()>=32)}
 pub(crate) fn enabled()->bool{secret().is_some()}
+/// Constant-time check of the loopback token PHP sends with every native call.
+pub(crate) fn token_ok(headers:&HeaderMap)->bool{
+ let Some(secret)=secret()else{return false;};
+ let supplied=headers.get("x-vaak-admin-token").and_then(|h|h.to_str().ok()).unwrap_or("");
+ supplied.len()==secret.len()&&supplied.bytes().zip(secret.bytes()).fold(0u8,|d,(a,b)|d|(a^b))==0
+}
 fn decode(bytes:&[u8])->Result<Request>{
  if bytes.is_empty()||bytes.len()>16384{bail!("admin envelope size");}
  let r:Request=serde_json::from_slice(bytes)?;
@@ -184,9 +190,8 @@ async fn paint(cfg:&crate::config::Config,r:&Request)->Result<Value>{
  Ok(json!({"protocol_version":1,"ok":true,"request_binding":Binding{owner_id:r.owner_id,view:&r.view,mode:&r.mode,offset:r.offset,approvals_enabled:r.approvals_enabled,search:r.search.as_deref(),viewer_admin:r.viewer_admin,filter:r.filter.as_deref()},"source_count":count,"rows":rows,"html":html}))
 }
 pub(crate) async fn render(cfg:&crate::config::Config,headers:HeaderMap,bytes:Bytes)->Response{
- let Some(secret)=secret()else{return StatusCode::NOT_FOUND.into_response();};
- let supplied=headers.get("x-vaak-admin-token").and_then(|h|h.to_str().ok()).unwrap_or("");
- if supplied.len()!=secret.len()||supplied.bytes().zip(secret.bytes()).fold(0u8,|d,(a,b)|d|(a^b))!=0{return StatusCode::UNAUTHORIZED.into_response();}
+ if secret().is_none(){return StatusCode::NOT_FOUND.into_response();}
+ if !token_ok(&headers){return StatusCode::UNAUTHORIZED.into_response();}
  let request=match decode(&bytes){Ok(r)=>r,Err(_)=>return StatusCode::BAD_REQUEST.into_response()};
  match paint(cfg,&request).await{Ok(reply)=>(StatusCode::OK,axum::Json(reply)).into_response(),Err(_)=>(StatusCode::UNPROCESSABLE_ENTITY,axum::Json(json!({"fallback":true}))).into_response()}
 }
