@@ -4464,6 +4464,12 @@ $vaakAdminOnlyActions = [
                 $error = $res['error'] ?? 'Could not save notice.';
             }
         }
+    } elseif (($action === 'registration_open' || $action === 'registration_close') && $vaakIsAdmin
+        && ($registrationNative = ap_admin_action_native($action, (int) $vaakOwnerId, (string) $vaakActorKey, [])) !== null) {
+        // A10e: the worker changed the registration switch (or found it not ready).
+        $view = 'approvals';
+        if ($registrationNative['outcome'] === 'registration_not_ready') $error = 'Could not change registration. Check registration control readiness.';
+        else $notice = $registrationNative['outcome'] === 'registration_opened' ? (ap_registration_approvals_enabled() ? 'Registration reopened. Applications still require approval.' : 'Registration reopened. Invites are required.') : 'Registration closed. Pending applications remain reviewable.';
     } elseif ($action === 'registration_open' || $action === 'registration_close') {
         $view = 'approvals';
         $res = ap_registration_set_accepting($action === 'registration_open', $csrfToken);
@@ -4481,6 +4487,11 @@ $vaakAdminOnlyActions = [
             'not_provisioned' => ' Approval email skipped until provisioning is complete.',
             default => ' Approval email could not be sent; account approval is saved.',
         };
+    } elseif ($action === 'invite_create' && $vaakIsAdmin
+        && ($inviteNative = ap_admin_action_native($action, (int) $vaakOwnerId, (string) $vaakActorKey, ['note' => is_string($_POST['note'] ?? '') ? trim((string) ($_POST['note'] ?? '')) : $_POST['note']])) !== null) {
+        // A10e: the worker created the invite.
+        $view = 'invites';
+        $notice = 'Invite created: ' . $inviteNative['code'];
     } elseif ($action === 'invite_create') {
         $view = 'invites';
         if (!$vaakIsAdmin) {

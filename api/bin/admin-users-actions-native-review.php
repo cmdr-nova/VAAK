@@ -151,7 +151,7 @@ check($r['fell_back'] && $db->query('SELECT disabled_at FROM ap_users WHERE id =
 // The bridge validator.
 $big1 = 1 + $big;
 $GLOBALS['current_user'] = ['id' => $big1, 'actor_key' => 'cmdr_nova', 'is_admin' => 1];
-$good = ['protocol_version' => 1, 'ok' => true, 'outcome' => 'banned', 'preview' => null, 'php_epoch_bump' => false, 'count' => null,
+$good = ['protocol_version' => 1, 'ok' => true, 'outcome' => 'banned', 'preview' => null, 'php_epoch_bump' => false, 'count' => null, 'code' => null,
     'request_binding' => ['owner_id' => $big1, 'actor_key' => 'cmdr_nova', 'action' => 'user_ban']];
 check(ap_admin_action_native_reply($good, 'user_ban', $big1, 'cmdr_nova') !== null, 'bridge accepts a ban');
 foreach ([

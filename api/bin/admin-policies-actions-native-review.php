@@ -162,9 +162,9 @@ check($r['fell_back'], 'missing rules table reaches PHP');
 // The bridge validator.
 $big1 = 1 + $big;
 $GLOBALS['current_user'] = ['id' => $big1, 'actor_key' => 'cmdr_nova', 'is_admin' => 1];
-$good = ['protocol_version' => 1, 'ok' => true, 'outcome' => 'rules_saved', 'preview' => null, 'php_epoch_bump' => false, 'count' => 3,
+$good = ['protocol_version' => 1, 'ok' => true, 'outcome' => 'rules_saved', 'preview' => null, 'php_epoch_bump' => false, 'count' => 3, 'code' => null,
     'request_binding' => ['owner_id' => $big1, 'actor_key' => 'cmdr_nova', 'action' => 'policies_save_rules']];
-check(ap_admin_action_native_reply($good, 'policies_save_rules', $big1, 'cmdr_nova') === ['outcome' => 'rules_saved', 'preview' => null, 'php_epoch_bump' => false, 'count' => 3], 'bridge accepts saved rules');
+check(ap_admin_action_native_reply($good, 'policies_save_rules', $big1, 'cmdr_nova') === ['outcome' => 'rules_saved', 'preview' => null, 'php_epoch_bump' => false, 'count' => 3, 'code' => null], 'bridge accepts saved rules');
 foreach ([
     'missing count' => static function (array $t): array { $t['count'] = null; return $t; },
     'count past 40' => static function (array $t): array { $t['count'] = 41; return $t; },
@@ -175,7 +175,7 @@ foreach ([
     'epoch bump' => static function (array $t): array { $t['php_epoch_bump'] = true; return $t; },
     'other action binding' => static function (array $t): array { $t['request_binding']['action'] = 'policies_save_privacy'; return $t; },
 ] as $name => $mutate) check(ap_admin_action_native_reply($mutate($good), 'policies_save_rules', $big1, 'cmdr_nova') === null, "bridge rejects $name");
-$doc = ['protocol_version' => 1, 'ok' => true, 'outcome' => 'doc_saved', 'preview' => null, 'php_epoch_bump' => false, 'count' => null,
+$doc = ['protocol_version' => 1, 'ok' => true, 'outcome' => 'doc_saved', 'preview' => null, 'php_epoch_bump' => false, 'count' => null, 'code' => null,
     'request_binding' => ['owner_id' => $big1, 'actor_key' => 'cmdr_nova', 'action' => 'policies_save_conduct']];
 check(ap_admin_action_native_reply($doc, 'policies_save_conduct', $big1, 'cmdr_nova') !== null, 'bridge accepts a saved document');
 check(ap_admin_action_native('policies_save_rules', $big1, 'cmdr_nova', ['title' => 'x', 'body' => 'y']) === null, 'bridge refuses document fields for rules');

@@ -9,7 +9,10 @@
 //! moderation reports: report_note, report_dismiss, report_ignore and
 //! report_reopen, copied from ap_report_set_state and
 //! ap_report_append_admin_note. A10d is user_ban and user_unban, copied from
-//! ap_auth_user_set_disabled.
+//! ap_auth_user_set_disabled. A10e is invite_create and registration_open /
+//! registration_close, copied from ap_auth_invite_create and
+//! ap_registration_set_accepting; deciding applications (account provisioning
+//! and the approval mail) stays PHP.
 //!
 //! PHP keeps the session, CSRF, the admin-only gate, the notice text and the
 //! page. The worker checks again inside its write transaction that the account
@@ -44,6 +47,9 @@ enum Action {
  #[serde(rename="report_reopen")]ReportReopen(Report),
  #[serde(rename="user_ban")]UserBan(UserTarget),
  #[serde(rename="user_unban")]UserUnban(UserTarget),
+ #[serde(rename="invite_create")]InviteCreate(Invite),
+ #[serde(rename="registration_open")]RegistrationOpen(NoFields),
+ #[serde(rename="registration_close")]RegistrationClose(NoFields),
 }
 #[derive(Debug,Deserialize)]#[serde(deny_unknown_fields)]struct TermAdd {phrase:String,category:String}
 #[derive(Debug,Deserialize)]#[serde(deny_unknown_fields)]struct TermDelete {term_id:i64}
@@ -53,16 +59,20 @@ enum Action {
 #[derive(Debug,Deserialize)]#[serde(deny_unknown_fields)]struct RulesSave {rules_text:String}
 #[derive(Debug,Deserialize)]#[serde(deny_unknown_fields)]struct Report {report_id:i64,admin_note:String,admin_handle:String}
 #[derive(Debug,Deserialize)]#[serde(deny_unknown_fields)]struct UserTarget {user_id:i64}
+#[derive(Debug,Deserialize)]#[serde(deny_unknown_fields)]struct Invite {note:String}
+#[derive(Debug,Deserialize)]#[serde(deny_unknown_fields)]struct NoFields {}
 impl Action {
  fn name(&self)->&'static str{match self{Action::TermAdd(_)=>"downrank_term_add",Action::TermDelete(_)=>"downrank_term_delete",Action::SignalClear(_)=>"downrank_signal_clear",Action::TermPreview(_)=>"downrank_term_preview",
   Action::SavePrivacy(_)=>"policies_save_privacy",Action::SaveConduct(_)=>"policies_save_conduct",Action::SaveRules(_)=>"policies_save_rules",
   Action::ReportNote(_)=>"report_note",Action::ReportDismiss(_)=>"report_dismiss",Action::ReportIgnore(_)=>"report_ignore",Action::ReportReopen(_)=>"report_reopen",
-  Action::UserBan(_)=>"user_ban",Action::UserUnban(_)=>"user_unban"}}
+  Action::UserBan(_)=>"user_ban",Action::UserUnban(_)=>"user_unban",
+  Action::InviteCreate(_)=>"invite_create",Action::RegistrationOpen(_)=>"registration_open",Action::RegistrationClose(_)=>"registration_close"}}
  fn family_enabled(&self)->bool{
   let switch=match self{Action::TermAdd(_)|Action::TermDelete(_)|Action::SignalClear(_)|Action::TermPreview(_)=>"VAAK_ADMIN_DOWNRANKING_ACTIONS_NATIVE",
    Action::SavePrivacy(_)|Action::SaveConduct(_)|Action::SaveRules(_)=>"VAAK_ADMIN_POLICIES_ACTIONS_NATIVE",
    Action::ReportNote(_)|Action::ReportDismiss(_)|Action::ReportIgnore(_)|Action::ReportReopen(_)=>"VAAK_ADMIN_REPORTS_ACTIONS_NATIVE",
-   Action::UserBan(_)|Action::UserUnban(_)=>"VAAK_ADMIN_USERS_ACTIONS_NATIVE"};
+   Action::UserBan(_)|Action::UserUnban(_)=>"VAAK_ADMIN_USERS_ACTIONS_NATIVE",
+   Action::InviteCreate(_)|Action::RegistrationOpen(_)|Action::RegistrationClose(_)=>"VAAK_ADMIN_INVITES_ACTIONS_NATIVE"};
   std::env::var(switch).ok().as_deref()==Some("1")
  }
 }
@@ -80,12 +90,13 @@ pub(crate) async fn action_route(cfg:&crate::config::Config,headers:HeaderMap,by
  match run(cfg,&request).await{Ok(reply)=>(StatusCode::OK,axum::Json(reply)).into_response(),Err(e)=>{tracing::info!(error=%e,action=request.action.name(),"native admin action fell back to PHP");(StatusCode::UNPROCESSABLE_ENTITY,axum::Json(json!({"fallback":true}))).into_response()}}
 }
 /// The reply: a closed outcome PHP turns into its notice or error, the preview
-/// for downrank_term_preview, the saved rule count for policies_save_rules, and
-/// whether PHP still has to bump the server trends epoch (only after a signal
-/// clear whose bump did not happen here).
-fn reply(r:&Request,outcome:&str,preview:Value,php_epoch_bump:bool)->Value{reply_count(r,outcome,preview,php_epoch_bump,None)}
-fn reply_count(r:&Request,outcome:&str,preview:Value,php_epoch_bump:bool,count:Option<usize>)->Value{
- json!({"protocol_version":1,"ok":true,"outcome":outcome,"preview":preview,"php_epoch_bump":php_epoch_bump,"count":count,
+/// for downrank_term_preview, the saved rule count for policies_save_rules, the
+/// new code for invite_create, and whether PHP still has to bump the server
+/// trends epoch (only after a signal clear whose bump did not happen here).
+fn reply(r:&Request,outcome:&str,preview:Value,php_epoch_bump:bool)->Value{reply_full(r,outcome,preview,php_epoch_bump,None,None)}
+fn reply_count(r:&Request,outcome:&str,preview:Value,php_epoch_bump:bool,count:Option<usize>)->Value{reply_full(r,outcome,preview,php_epoch_bump,count,None)}
+fn reply_full(r:&Request,outcome:&str,preview:Value,php_epoch_bump:bool,count:Option<usize>,code:Option<&str>)->Value{
+ json!({"protocol_version":1,"ok":true,"outcome":outcome,"preview":preview,"php_epoch_bump":php_epoch_bump,"count":count,"code":code,
   "request_binding":{"owner_id":r.owner_id,"actor_key":r.actor_key,"action":r.action.name()}})
 }
 fn now_c()->String{chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S+00:00").to_string()}
@@ -240,6 +251,33 @@ async fn run(cfg:&crate::config::Config,r:&Request)->Result<Value>{
    }
    tx.commit().await?;
    Ok(reply(r,if disable{"banned"}else{"unbanned"},Value::Null,false))
+  },
+  Action::InviteCreate(a)=>{
+   // ap-admin.php trims the note; ap_auth_invite_create keeps 200 characters, NULL when empty.
+   if a.note.contains('\0'){bail!("PHP fallback: NUL in invite note");}
+   let note=php_trim(&a.note);
+   let note:Option<String>=(!note.is_empty()).then(||note.chars().take(200).collect());
+   let code={use rand::RngCore;let mut b=[0u8;6];rand::rngs::OsRng.fill_bytes(&mut b);format!("{}-{}",hex::encode_upper(&b[..4]),hex::encode_upper(&b[4..]))};
+   let tx=admin_tx(&mut db,r).await?;
+   tx.execute("INSERT INTO ap_invite_codes (code, created_by, created_at, expires_at, note) VALUES ($1, $2::bigint, $3, NULL, $4)",&[&code,&r.owner_id,&now_c(),&note]).await?;
+   tx.commit().await?;
+   Ok(reply_full(r,"invite_created",Value::Null,false,None,Some(&code)))
+  },
+  Action::RegistrationOpen(_)|Action::RegistrationClose(_)=>{
+   let accepting=matches!(r.action,Action::RegistrationOpen(_));
+   // ap_registration_approvals_schema may create or alter the applications
+   // table; anything short of its finished shape stays in PHP.
+   let ready:bool=db.query_one("SELECT to_regclass('ap_registration_control') IS NOT NULL AND EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='ap_registration_applications' AND column_name='supporter_hash')",&[]).await?.get(0);
+   if !ready{bail!("PHP fallback: registration schema not finished");}
+   // PHP's order: the table lock, then the admin row, so the two never deadlock.
+   let tx=db.transaction().await?;
+   tx.batch_execute("LOCK TABLE ap_users, ap_registration_applications IN SHARE ROW EXCLUSIVE MODE").await?;
+   let admin=tx.query_opt("SELECT actor_key::text FROM ap_users WHERE id::bigint = $1 AND is_admin = 1 AND disabled_at IS NULL FOR UPDATE",&[&r.owner_id]).await?;
+   if admin.and_then(|row|row.get::<_,Option<String>>(0)).as_deref()!=Some(r.actor_key.as_str()){bail!("active admin required");}
+   let rows=tx.execute("UPDATE ap_registration_control SET accepting=$1, updated_at=$2, updated_by=$3::bigint WHERE id=1",&[&i32::from(accepting),&now_c(),&r.owner_id]).await?;
+   if rows!=1{return Ok(reply(r,"registration_not_ready",Value::Null,false));}
+   tx.commit().await?;
+   Ok(reply(r,if accepting{"registration_opened"}else{"registration_closed"},Value::Null,false))
   },
  }
 }
