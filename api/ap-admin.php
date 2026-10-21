@@ -5006,7 +5006,8 @@ $vaakAdminOnlyActions = [
     } elseif ($action === 'revoke_oauth_token') {
         $view = 'security';
         $tid = (int) ($_POST['token_id'] ?? 0);
-        if ($tid > 0 && ap_oauth_token_revoke_by_id($tid, $vaakOwnerId)) {
+        $nativeRevoke = ap_settings_action_native('revoke_oauth_token', (int) $vaakOwnerId, (string) ($vaakUser['actor_key'] ?? ''), ['token_id' => $tid]);
+        if ($nativeRevoke !== null ? !empty($nativeRevoke['ok']) : ($tid > 0 && ap_oauth_token_revoke_by_id($tid, $vaakOwnerId))) {
             $notice = 'OAuth token #' . $tid . ' revoked. Re-authorize the app if you still use it.';
         } else {
             $error = 'Could not revoke that token (already revoked, missing, or not yours).';

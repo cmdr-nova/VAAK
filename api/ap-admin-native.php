@@ -328,7 +328,8 @@ function ap_admin_action_native(string $action,int $owner,string $actorKey,array
 function ap_settings_action_native(string $action,int $owner,string $actorKey,array $fields): ?array
 {
     $families=['muted_word_add'=>['VAAK_SETTINGS_MUTED_WORDS_ACTIONS_NATIVE',['phrase'=>'string','note'=>'string']],
-        'muted_word_remove'=>['VAAK_SETTINGS_MUTED_WORDS_ACTIONS_NATIVE',['id'=>'integer']]];
+        'muted_word_remove'=>['VAAK_SETTINGS_MUTED_WORDS_ACTIONS_NATIVE',['id'=>'integer']],
+        'revoke_oauth_token'=>['VAAK_SETTINGS_TOKENS_ACTIONS_NATIVE',['token_id'=>'integer']]];
     if(!isset($families[$action]) || !ap_admin_native_enabled() || getenv($families[$action][0])!=='1' || $owner<1 || $actorKey==='')return null;
     $shape=$families[$action][1];if(array_keys($fields)!==array_keys($shape))return null;
     foreach($shape as $key=>$type)if(gettype($fields[$key])!==$type)return null;
@@ -379,6 +380,10 @@ function ap_settings_action_native_reply(mixed $reply,string $action,int $owner,
     if($action==='muted_word_add' && in_array($outcome,['added','already'],true)){
         if($phrase===null || $id===null || !in_array($cache,$outcome==='added'?[null,'full']:[null,'global'],true))return null;
         return $outcome==='added'?['ok'=>true,'id'=>$id,'phrase'=>$phrase]:['ok'=>true,'already'=>true,'id'=>$id,'phrase'=>$phrase];
+    }
+    if($action==='revoke_oauth_token' && in_array($outcome,['revoked','not_revoked'],true)){
+        if($phrase!==null || $cache!==null || ($outcome==='revoked')!==($id!==null))return null;
+        return ['ok'=>$outcome==='revoked'];
     }
     if($action==='muted_word_remove' && $outcome==='removed'){
         if($phrase!==null || $id===null || !in_array($cache,[null,'full'],true))return null;
