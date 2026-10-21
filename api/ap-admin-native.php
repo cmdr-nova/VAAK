@@ -317,6 +317,75 @@ function ap_admin_action_native(string $action,int $owner,string $actorKey,array
     }catch(Throwable $e){return null;}
     return ap_admin_action_native_reply($reply,$action,$owner,$actorKey);
 }
+/**
+ * One personal Settings action through the worker (S7). Open to every active
+ * account, never admin-gated. Returns null so PHP runs the action itself
+ * (switch off, worker refusal, anything unproven); otherwise the array the PHP
+ * helper would have returned, plus 'tl_cache_done' telling the handler whether
+ * its admin_tl_cache_clear() already ran. Owner muted-word caches the worker
+ * left undone are cleared here.
+ */
+function ap_settings_action_native(string $action,int $owner,string $actorKey,array $fields): ?array
+{
+    $families=['muted_word_add'=>['VAAK_SETTINGS_MUTED_WORDS_ACTIONS_NATIVE',['phrase'=>'string','note'=>'string']],
+        'muted_word_remove'=>['VAAK_SETTINGS_MUTED_WORDS_ACTIONS_NATIVE',['id'=>'integer']]];
+    if(!isset($families[$action]) || !ap_admin_native_enabled() || getenv($families[$action][0])!=='1' || $owner<1 || $actorKey==='')return null;
+    $shape=$families[$action][1];if(array_keys($fields)!==array_keys($shape))return null;
+    foreach($shape as $key=>$type)if(gettype($fields[$key])!==$type)return null;
+    $user=ap_auth_current_user();
+    if((int)($user['id']??0)!==$owner || (string)($user['actor_key']??'')!==$actorKey || !function_exists('admin_owner_user_id') || admin_owner_user_id()!==$owner)return null;
+    $url=(string)(getenv('VAAK_SETTINGS_ACTION_URL')?:'http://127.0.0.1:8787/internal/settings/action');
+    if(!ap_admin_native_url_allowed($url,'/internal/settings/action'))return null;
+    try{
+        $payload=json_encode(['protocol_version'=>1,'owner_id'=>$owner,'actor_key'=>$actorKey,'action'=>$action,'fields'=>$fields],JSON_THROW_ON_ERROR);
+        if(strlen($payload)>65536)return null;
+        $curl=curl_init($url);if($curl===false)return null;$body='';
+        curl_setopt_array($curl,[CURLOPT_POST=>true,CURLOPT_POSTFIELDS=>$payload,CURLOPT_RETURNTRANSFER=>false,
+            CURLOPT_CONNECTTIMEOUT_MS=>250,CURLOPT_TIMEOUT_MS=>15000,CURLOPT_FOLLOWLOCATION=>false,
+            CURLOPT_WRITEFUNCTION=>static function($handle,string $chunk)use(&$body):int{if(strlen($body)+strlen($chunk)>65536)return 0;$body.=$chunk;return strlen($chunk);},
+            CURLOPT_HTTPHEADER=>['Content-Type: application/json','X-Vaak-Admin-Token: '.(string)getenv('VAAK_ADMIN_READ_SECRET')]]);
+        $success=curl_exec($curl);$status=(int)curl_getinfo($curl,CURLINFO_RESPONSE_CODE);curl_close($curl);
+        if($success!==true || $status!==200)return null;
+        $reply=json_decode($body,true,16,JSON_THROW_ON_ERROR);
+    }catch(Throwable $e){return null;}
+    $result=ap_settings_action_native_reply($reply,$action,$owner,$actorKey);
+    if($result===null)return null;
+    $cache=$reply['php_cache'];
+    if(($cache==='full' || $cache==='owner') && function_exists('ap_muted_words_cache_clear'))ap_muted_words_cache_clear($owner);
+    $result['tl_cache_done']=$cache!=='full' && $cache!=='global';
+    return $result;
+}
+/** The closed reply shape of /internal/settings/action, bound to this request, as the PHP helper's array. */
+function ap_settings_action_native_reply(mixed $reply,string $action,int $owner,string $actorKey): ?array
+{
+    if(!is_array($reply))return null;
+    $keys=array_keys($reply);sort($keys);$expected=['protocol_version','ok','outcome','phrase','id','php_cache','request_binding'];sort($expected);
+    if($keys!==$expected || $reply['protocol_version']!==1 || $reply['ok']!==true || !is_string($reply['outcome']))return null;
+    $binding=$reply['request_binding'];
+    if(!is_array($binding) || count($binding)!==3 || ($binding['owner_id']??null)!==$owner || ($binding['actor_key']??null)!==$actorKey || ($binding['action']??null)!==$action)return null;
+    $phrase=$reply['phrase'];$id=$reply['id'];$cache=$reply['php_cache'];
+    if(!in_array($cache,[null,'full','global','owner'],true))return null;
+    if($phrase!==null && (!is_string($phrase) || $phrase===''))return null;
+    if($id!==null && (!is_int($id) || $id<1))return null;
+    $errors=['muted_word_add'=>['phrase_empty'=>'Enter a word or phrase to mute.','phrase_short'=>'Phrase must be at least 2 characters.',
+        'phrase_long'=>'Phrase too long (max 200 characters).','note_long'=>'Note too long (max 300 characters).'],
+        'muted_word_remove'=>['missing_id'=>'Missing phrase id.','not_found'=>'Phrase not found.']];
+    $outcome=$reply['outcome'];
+    if(isset($errors[$action][$outcome])){
+        $owned=$outcome==='not_found'?'owner':null;
+        if($phrase!==null || $id!==null || $cache!==$owned)return null;
+        return ['ok'=>false,'error'=>$errors[$action][$outcome]];
+    }
+    if($action==='muted_word_add' && in_array($outcome,['added','already'],true)){
+        if($phrase===null || $id===null || !in_array($cache,$outcome==='added'?[null,'full']:[null,'global'],true))return null;
+        return $outcome==='added'?['ok'=>true,'id'=>$id,'phrase'=>$phrase]:['ok'=>true,'already'=>true,'id'=>$id,'phrase'=>$phrase];
+    }
+    if($action==='muted_word_remove' && $outcome==='removed'){
+        if($phrase!==null || $id===null || !in_array($cache,[null,'full'],true))return null;
+        return ['ok'=>true];
+    }
+    return null;
+}
 /** The closed reply shape of /internal/admin/action, bound to this request. */
 function ap_admin_action_native_reply(mixed $reply,string $action,int $owner,string $actorKey): ?array
 {
