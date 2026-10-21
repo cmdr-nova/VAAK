@@ -190,6 +190,7 @@ pub async fn serve(cfg: Config, bind: SocketAddr) -> Result<()> {
     if crate::profile_bridge::enabled(){app=app.route("/internal/profile/full",post(internal_profile_full).layer(axum::extract::DefaultBodyLimit::max(64*1024)).layer(axum::middleware::map_response(crate::profile_bridge::no_store)));}
     if crate::admin_read::enabled(){app=app.route("/internal/admin/read",post(internal_admin_read).layer(axum::extract::DefaultBodyLimit::max(16*1024)).layer(axum::middleware::map_response(crate::profile_bridge::no_store)));}
     if crate::admin_read::enabled(){app=app.route("/internal/settings/profile-save",post(internal_settings_profile_save).layer(axum::extract::DefaultBodyLimit::max(64*1024)).layer(axum::middleware::map_response(crate::profile_bridge::no_store)));}
+    if crate::admin_read::enabled(){app=app.route("/internal/admin/action",post(internal_admin_action).layer(axum::extract::DefaultBodyLimit::max(16*1024)).layer(axum::middleware::map_response(crate::profile_bridge::no_store)));}
     let app=app.with_state(state);
 
     tracing::info!(%bind, "vaak-worker shadow HTTP listening");
@@ -1333,5 +1334,6 @@ async fn internal_profile_bsky(State(state):State<AppState>,headers:axum::http::
 async fn internal_profile_full(State(state):State<AppState>,headers:axum::http::HeaderMap,bytes:axum::body::Bytes)->axum::response::Response{crate::profile_bridge::render_full(&state.cfg,headers,bytes).await}
 async fn internal_profile_page(State(state):State<AppState>,headers:axum::http::HeaderMap,bytes:axum::body::Bytes)->axum::response::Response{crate::profile_bridge::render(&state.cfg,headers,bytes).await}
 
+async fn internal_admin_action(State(state):State<AppState>,headers:axum::http::HeaderMap,bytes:axum::body::Bytes)->axum::response::Response{crate::admin_actions::action_route(&state.cfg,headers,bytes).await}
 async fn internal_settings_profile_save(State(state):State<AppState>,headers:axum::http::HeaderMap,bytes:axum::body::Bytes)->axum::response::Response{crate::settings_profile_save::save_route(&state.cfg,headers,bytes).await}
 async fn internal_admin_read(State(state):State<AppState>,headers:axum::http::HeaderMap,bytes:axum::body::Bytes)->axum::response::Response{crate::admin_read::render(&state.cfg,headers,bytes).await}

@@ -263,3 +263,68 @@ function ap_settings_profile_save_native_reply(mixed $reply,int $owner,string $a
     elseif(!is_string($reply['error']) || $reply['error']==='' || strlen($reply['error'])>200 || $reply['trends_changed'] || $reply['algorithm_changed'] || $reply['after_save'])return null;
     return ['ok'=>$reply['ok'],'error'=>$reply['error'],'email_saved'=>$reply['email_saved'],'trends_changed'=>$reply['trends_changed'],'algorithm_changed'=>$reply['algorithm_changed'],'after_save'=>$reply['after_save']];
 }
+/**
+ * Default-off native admin action (A10): null means PHP runs the action itself
+ * (switch off, worker refusal, anything unproven), otherwise
+ * ['outcome','preview','php_epoch_bump']. The caller has checked the session,
+ * CSRF and the admin role; the worker checks the role again in its write.
+ */
+function ap_admin_action_native(string $action,int $owner,string $actorKey,array $fields): ?array
+{
+    $families=['downrank_term_add'=>['VAAK_ADMIN_DOWNRANKING_ACTIONS_NATIVE',['phrase'=>'string','category'=>'string']],
+        'downrank_term_delete'=>['VAAK_ADMIN_DOWNRANKING_ACTIONS_NATIVE',['term_id'=>'integer']],
+        'downrank_signal_clear'=>['VAAK_ADMIN_DOWNRANKING_ACTIONS_NATIVE',['actor_id'=>'string']],
+        'downrank_term_preview'=>['VAAK_ADMIN_DOWNRANKING_ACTIONS_NATIVE',['preview_phrase'=>'string']]];
+    if(!isset($families[$action]) || !ap_admin_native_enabled() || getenv($families[$action][0])!=='1' || $owner<1 || $actorKey==='')return null;
+    $shape=$families[$action][1];if(array_keys($fields)!==array_keys($shape))return null;
+    foreach($shape as $key=>$type)if(gettype($fields[$key])!==$type)return null;
+    $user=ap_auth_current_user();if((int)($user['id']??0)!==$owner || (string)($user['actor_key']??'')!==$actorKey || !ap_auth_is_admin($user))return null;
+    $url=(string)(getenv('VAAK_ADMIN_ACTION_URL')?:'http://127.0.0.1:8787/internal/admin/action');
+    if(!ap_admin_native_url_allowed($url,'/internal/admin/action'))return null;
+    try{
+        $payload=json_encode(['protocol_version'=>1,'owner_id'=>$owner,'actor_key'=>$actorKey,'action'=>$action,'fields'=>$fields],JSON_THROW_ON_ERROR);
+        if(strlen($payload)>16384)return null;
+        $curl=curl_init($url);if($curl===false)return null;$body='';
+        curl_setopt_array($curl,[CURLOPT_POST=>true,CURLOPT_POSTFIELDS=>$payload,CURLOPT_RETURNTRANSFER=>false,
+            CURLOPT_CONNECTTIMEOUT_MS=>250,CURLOPT_TIMEOUT_MS=>15000,CURLOPT_FOLLOWLOCATION=>false,
+            CURLOPT_WRITEFUNCTION=>static function($handle,string $chunk)use(&$body):int{if(strlen($body)+strlen($chunk)>65536)return 0;$body.=$chunk;return strlen($chunk);},
+            CURLOPT_HTTPHEADER=>['Content-Type: application/json','X-Vaak-Admin-Token: '.(string)getenv('VAAK_ADMIN_READ_SECRET')]]);
+        $success=curl_exec($curl);$status=(int)curl_getinfo($curl,CURLINFO_RESPONSE_CODE);curl_close($curl);
+        if($success!==true || $status!==200)return null;
+        $reply=json_decode($body,true,16,JSON_THROW_ON_ERROR);
+    }catch(Throwable $e){return null;}
+    return ap_admin_action_native_reply($reply,$action,$owner,$actorKey);
+}
+/** The closed reply shape of /internal/admin/action, bound to this request. */
+function ap_admin_action_native_reply(mixed $reply,string $action,int $owner,string $actorKey): ?array
+{
+    if(!is_array($reply))return null;
+    $keys=array_keys($reply);sort($keys);$expected=['protocol_version','ok','outcome','preview','php_epoch_bump','request_binding'];sort($expected);
+    if($keys!==$expected || $reply['protocol_version']!==1 || $reply['ok']!==true || !is_string($reply['outcome']) || !is_bool($reply['php_epoch_bump']))return null;
+    $binding=$reply['request_binding'];
+    if(!is_array($binding) || count($binding)!==3 || ($binding['owner_id']??null)!==$owner || ($binding['actor_key']??null)!==$actorKey || ($binding['action']??null)!==$action)return null;
+    $outcomes=['downrank_term_add'=>['term_saved','bad_phrase'],'downrank_term_delete'=>['term_removed','invalid_term'],
+        'downrank_signal_clear'=>['signal_cleared','missing_actor'],'downrank_term_preview'=>['previewed','bad_preview_phrase']];
+    if(!in_array($reply['outcome'],$outcomes[$action]??[],true))return null;
+    if($reply['php_epoch_bump'] && $reply['outcome']!=='signal_cleared')return null;
+    $preview=$reply['preview'];
+    if($action!=='downrank_term_preview'){if($preview!==null)return null;}
+    else{
+        $previewKeys=is_array($preview)?array_keys($preview):[];sort($previewKeys);
+        if($previewKeys!==['count','phrase','samples'] || !is_string($preview['phrase']) || strlen($preview['phrase'])>16384
+            || !is_int($preview['count']) || $preview['count']<0 || $preview['count']>2000 || !is_array($preview['samples']) || !array_is_list($preview['samples'])
+            || count($preview['samples'])>min(8,$preview['count']))return null;
+        $phraseOk=$preview['phrase']!=='' && mb_strlen($preview['phrase'])<=120;
+        if($reply['outcome']==='bad_preview_phrase' && ($preview['count']!==0 || $preview['samples']!==[] || $phraseOk))return null;
+        if($reply['outcome']==='previewed' && !$phraseOk)return null;
+        foreach($preview['samples'] as $sample){
+            $sampleKeys=is_array($sample)?array_keys($sample):[];sort($sampleKeys);
+            if($sampleKeys!==['actor_id','created_at','host'])return null;
+            foreach($sample as $value)if(!is_string($value))return null;
+        }
+    }
+    if(is_array($preview)){
+        $preview=['phrase'=>$preview['phrase'],'count'=>$preview['count'],'samples'=>array_map(static fn(array $x):array=>['actor_id'=>$x['actor_id'],'host'=>$x['host'],'created_at'=>$x['created_at']],$preview['samples'])];
+    }
+    return ['outcome'=>$reply['outcome'],'preview'=>$preview,'php_epoch_bump'=>$reply['php_epoch_bump']];
+}

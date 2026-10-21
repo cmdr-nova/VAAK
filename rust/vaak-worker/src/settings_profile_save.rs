@@ -96,7 +96,7 @@ async fn save(cfg:&crate::config::Config,r:&Request)->Result<Value>{
  let after=match after_save(cfg,&db,&r.actor_key,trends,algorithm).await{Ok(done)=>done,Err(e)=>{tracing::info!(error=%e,"native profile after-save left to PHP");false}};
  Ok(reply(r,None,true,trends,algorithm,after))
 }
-fn redis_enabled()->bool{std::env::var("VAAK_REDIS_ENABLED").map(|v|!matches!(php_trim(&v).to_ascii_lowercase().as_str(),"0"|"false"|"off"|"no")).unwrap_or(true)}
+pub(crate) fn redis_enabled()->bool{std::env::var("VAAK_REDIS_ENABLED").map(|v|!matches!(php_trim(&v).to_ascii_lowercase().as_str(),"0"|"false"|"off"|"no")).unwrap_or(true)}
 fn sha256(s:&str)->String{use sha2::Digest;hex::encode(sha2::Sha256::digest(s.as_bytes()))}
 /// PHP rawurlencode.
 fn rawurlencode(s:&str)->String{s.bytes().map(|b|if b.is_ascii_alphanumeric()||matches!(b,b'-'|b'_'|b'.'|b'~'){char::from(b).to_string()}else{format!("%{b:02X}")}).collect()}
@@ -236,7 +236,7 @@ fn fix_utf8(s:&str)->Result<&str>{
 fn php_isspace(b:u8)->bool{matches!(b,b' '|b'\t'|b'\n'|0x0B|0x0C|b'\r')}
 /// PHP php_strip_tags_ex (ext/standard/string.c) with allow_tag_spaces off:
 /// the same states, quote and depth tracking, comment, <? and <!DOCTYPE rules.
-fn strip_tags(buf:&[u8],allow:Option<&str>)->Vec<u8>{
+pub(crate) fn strip_tags(buf:&[u8],allow:Option<&str>)->Vec<u8>{
  let allow=allow.map(|a|a.to_ascii_lowercase());
  let end=buf.len();let at=|i:usize|->u8{if i<end{buf[i]}else{0}};
  let mut out=Vec::with_capacity(end);let mut tbuf:Vec<u8>=Vec::new();
@@ -537,7 +537,7 @@ async fn redirect_location(url:&str)->Option<String>{
 }
 
 /// json_encode with JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE.
-fn json_string(s:&str)->String{
+pub(crate) fn json_string(s:&str)->String{
  let mut out=String::from("\"");
  for c in s.chars(){match c{
   '"'=>out.push_str("\\\""),'\\'=>out.push_str("\\\\"),'\u{8}'=>out.push_str("\\b"),'\u{c}'=>out.push_str("\\f"),'\n'=>out.push_str("\\n"),'\r'=>out.push_str("\\r"),'\t'=>out.push_str("\\t"),

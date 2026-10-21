@@ -226,7 +226,7 @@ mod queue_health;
 #[path="admin_downranking.rs"]
 mod downranking;
 #[path="admin_downranked.rs"]
-mod downranked;
+pub(crate) mod downranked;
 #[cfg(test)]mod tests{
  use super::*;
  #[test]fn strict_admin_read_envelope(){let good=json!({"protocol_version":1,"owner_id":1,"csrf":"session","view":"invites","mode":"full","offset":0,"approvals_enabled":false,"now":100,"php_timezone":"UTC"});assert!(decode(&serde_json::to_vec(&good).unwrap()).is_ok());for(k,v)in[("owner_id",json!(0)),("is_admin",json!(true)),("view",json!("users")),("offset",json!(1)),("csrf",json!("")),("rows",json!([]))]{let mut bad=good.clone();bad[k]=v;assert!(decode(&serde_json::to_vec(&bad).unwrap()).is_err());}}
