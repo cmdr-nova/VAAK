@@ -136,7 +136,7 @@ jobs:
             bash /src/deploy/ci-build-worker.sh
 
       - name: Upload the worker binary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: vaak-worker-bin
           path: vaak-worker.bin
