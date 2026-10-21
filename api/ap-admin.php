@@ -3586,6 +3586,27 @@ $vaakAdminOnlyActions = [
         } else {
             $error = $res['error'] ?? 'Remove failed.';
         }
+    } elseif (in_array($action, ['report_note', 'report_dismiss', 'report_ignore', 'report_reopen'], true) && $vaakIsAdmin
+        && ($reportNative = ap_admin_action_native($action, (int) $vaakOwnerId, (string) $vaakActorKey, [
+            'report_id' => (int) ($_POST['report_id'] ?? 0),
+            'admin_note' => $_POST['admin_note'] ?? '',
+            'admin_handle' => (string) ($vaakHandle ?? 'admin'),
+        ])) !== null) {
+        // A10c: the worker changed the report (or answered the validation error).
+        $view = 'moderation';
+        match ($reportNative['outcome']) {
+            'note_saved' => $notice = 'Private admin note saved.',
+            'note_empty' => $error = 'Enter a note first.',
+            'note_report_not_found' => $error = 'Report not found.',
+            'state_set' => $notice = $action === 'report_ignore'
+                ? 'Report ignored — cleared from open queue.'
+                : ($action === 'report_reopen' ? 'Report returned to the open queue.' : 'Report dismissed — cleared from open queue.'),
+            'report_not_found' => $error = 'Report not found',
+            default => null,
+        };
+        if (!empty($_POST['filter'])) {
+            $_GET['filter'] = preg_replace('/[^a-z_]/', '', (string) $_POST['filter']) ?: 'open';
+        }
     } elseif ($action === 'report_note') {
         $view = 'moderation';
         $rid = (int) ($_POST['report_id'] ?? 0);

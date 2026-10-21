@@ -5,7 +5,10 @@
 //! admin_home_downrank_audit, ap_downrank_phrase_matches_text and
 //! ap_trends_policy_epoch_bump(null). A10b is the instance policies:
 //! policies_save_privacy, policies_save_conduct and policies_save_rules, copied
-//! from ap_instance_doc_save and ap_instance_rules_save_from_text.
+//! from ap_instance_doc_save and ap_instance_rules_save_from_text. A10c is
+//! moderation reports: report_note, report_dismiss, report_ignore and
+//! report_reopen, copied from ap_report_set_state and
+//! ap_report_append_admin_note.
 //!
 //! PHP keeps the session, CSRF, the admin-only gate, the notice text and the
 //! page. The worker checks again inside its write transaction that the account
@@ -34,6 +37,10 @@ enum Action {
  #[serde(rename="policies_save_privacy")]SavePrivacy(DocSave),
  #[serde(rename="policies_save_conduct")]SaveConduct(DocSave),
  #[serde(rename="policies_save_rules")]SaveRules(RulesSave),
+ #[serde(rename="report_note")]ReportNote(Report),
+ #[serde(rename="report_dismiss")]ReportDismiss(Report),
+ #[serde(rename="report_ignore")]ReportIgnore(Report),
+ #[serde(rename="report_reopen")]ReportReopen(Report),
 }
 #[derive(Debug,Deserialize)]#[serde(deny_unknown_fields)]struct TermAdd {phrase:String,category:String}
 #[derive(Debug,Deserialize)]#[serde(deny_unknown_fields)]struct TermDelete {term_id:i64}
@@ -41,12 +48,15 @@ enum Action {
 #[derive(Debug,Deserialize)]#[serde(deny_unknown_fields)]struct TermPreview {preview_phrase:String}
 #[derive(Debug,Deserialize)]#[serde(deny_unknown_fields)]struct DocSave {title:String,body:String}
 #[derive(Debug,Deserialize)]#[serde(deny_unknown_fields)]struct RulesSave {rules_text:String}
+#[derive(Debug,Deserialize)]#[serde(deny_unknown_fields)]struct Report {report_id:i64,admin_note:String,admin_handle:String}
 impl Action {
  fn name(&self)->&'static str{match self{Action::TermAdd(_)=>"downrank_term_add",Action::TermDelete(_)=>"downrank_term_delete",Action::SignalClear(_)=>"downrank_signal_clear",Action::TermPreview(_)=>"downrank_term_preview",
-  Action::SavePrivacy(_)=>"policies_save_privacy",Action::SaveConduct(_)=>"policies_save_conduct",Action::SaveRules(_)=>"policies_save_rules"}}
+  Action::SavePrivacy(_)=>"policies_save_privacy",Action::SaveConduct(_)=>"policies_save_conduct",Action::SaveRules(_)=>"policies_save_rules",
+  Action::ReportNote(_)=>"report_note",Action::ReportDismiss(_)=>"report_dismiss",Action::ReportIgnore(_)=>"report_ignore",Action::ReportReopen(_)=>"report_reopen"}}
  fn family_enabled(&self)->bool{
   let switch=match self{Action::TermAdd(_)|Action::TermDelete(_)|Action::SignalClear(_)|Action::TermPreview(_)=>"VAAK_ADMIN_DOWNRANKING_ACTIONS_NATIVE",
-   Action::SavePrivacy(_)|Action::SaveConduct(_)|Action::SaveRules(_)=>"VAAK_ADMIN_POLICIES_ACTIONS_NATIVE"};
+   Action::SavePrivacy(_)|Action::SaveConduct(_)|Action::SaveRules(_)=>"VAAK_ADMIN_POLICIES_ACTIONS_NATIVE",
+   Action::ReportNote(_)|Action::ReportDismiss(_)|Action::ReportIgnore(_)|Action::ReportReopen(_)=>"VAAK_ADMIN_REPORTS_ACTIONS_NATIVE"};
   std::env::var(switch).ok().as_deref()==Some("1")
  }
 }
@@ -181,7 +191,76 @@ async fn run(cfg:&crate::config::Config,r:&Request)->Result<Value>{
    tx.commit().await?;
    Ok(reply_count(r,"rules_saved",Value::Null,false,Some(rules.len())))
   },
+  Action::ReportNote(a)=>{
+   let note=report_note_text(&a.admin_note)?;
+   if a.report_id<=0||note.is_empty(){return Ok(reply(r,"note_empty",Value::Null,false));}
+   let tx=admin_tx(&mut db,r).await?;
+   report_handle_check(&tx,r,&a.admin_handle).await?;
+   report_id_check(&tx,a.report_id).await?;
+   let outcome=if append_report_note(&tx,a.report_id,&note,&a.admin_handle).await?{"note_saved"}else{"note_report_not_found"};
+   tx.commit().await?;
+   Ok(reply(r,outcome,Value::Null,false))
+  },
+  Action::ReportDismiss(a)|Action::ReportIgnore(a)|Action::ReportReopen(a)=>{
+   let state=match r.action{Action::ReportIgnore(_)=>"ignored",Action::ReportReopen(_)=>"open",_=>"dismissed"};
+   let note=report_note_text(&a.admin_note)?;
+   let tx=admin_tx(&mut db,r).await?;
+   report_handle_check(&tx,r,&a.admin_handle).await?;
+   report_id_check(&tx,a.report_id).await?;
+   let rows=tx.execute("UPDATE ap_reports SET state = $1, updated_at = $2 WHERE id::bigint = $3",&[&state,&now_c(),&a.report_id]).await?;
+   if rows<1{return Ok(reply(r,"report_not_found",Value::Null,false));}
+   // PHP appends the note as a second step after the state change; the row
+   // was just updated, so only a failed query (a 422 here) can stop it.
+   if !note.is_empty()&&!append_report_note(&tx,a.report_id,&note,&a.admin_handle).await?{bail!("report vanished inside the transaction");}
+   tx.commit().await?;
+   Ok(reply(r,"state_set",Value::Null,false))
+  },
  }
+}
+/// trim($note) and mb_substr($note, 0, 5000).
+fn report_note_text(raw:&str)->Result<String>{
+ if raw.contains('\0'){bail!("PHP fallback: NUL in report note");}
+ Ok(php_trim(raw).chars().take(5000).collect())
+}
+/// The note's signature is PHP's $vaakHandle: the account's trimmed username
+/// (or actor key) as @name@mkultra.monster. The worker derives it from the
+/// account row it holds and accepts only the same value.
+async fn report_handle_check(tx:&tokio_postgres::Transaction<'_>,r:&Request,handle:&str)->Result<()>{
+ let row=tx.query_one("SELECT username::text FROM ap_users WHERE id::bigint=$1",&[&r.owner_id]).await?;
+ let name=row.get::<_,Option<String>>(0).unwrap_or_default();
+ let name=php_trim(&name);
+ let name=if name.is_empty(){php_trim(&r.actor_key)}else{name};
+ let want=if name.is_empty(){String::new()}else{format!("@{name}@mkultra.monster")};
+ if handle!=want{bail!("PHP fallback: admin handle differs from the account");}
+ Ok(())
+}
+/// PHP binds the id as text; past int4 an INTEGER column raises, which PHP
+/// reports as its own error.
+async fn report_id_check(tx:&tokio_postgres::Transaction<'_>,id:i64)->Result<()>{
+ if id>i64::from(i32::MAX){
+  let kind:String=tx.query_one("SELECT format_type(atttypid, atttypmod) FROM pg_attribute WHERE attrelid = 'ap_reports'::regclass AND attname = 'id'",&[]).await?.get(0);
+  if kind!="bigint"{bail!("PHP fallback: report id past int4");}
+ }
+ Ok(())
+}
+/// ap_report_append_admin_note after its checks: false when the report is gone.
+async fn append_report_note(tx:&tokio_postgres::Transaction<'_>,id:i64,note:&str,handle:&str)->Result<bool>{
+ let Some(row)=tx.query_opt("SELECT admin_notes::text FROM ap_reports WHERE id::bigint = $1",&[&id]).await? else {return Ok(false)};
+ let existing=row.get::<_,Option<String>>(0).unwrap_or_default();
+ let admin=php_trim(handle);
+ let admin=if admin.is_empty(){"admin"}else{admin};
+ let entry=format!("[{} UTC · {admin}]\n{note}",chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"));
+ let existing=php_trim(&existing);
+ let mut combined=if existing.is_empty(){entry}else{format!("{existing}\n\n{entry}")};
+ if combined.len()>50000{
+  // substr($combined, -50000) counts bytes; a cut inside a character makes
+  // PHP's update fail, which it reports as its own error.
+  let at=combined.len()-50000;
+  if !combined.is_char_boundary(at){bail!("PHP fallback: note history cut inside a character");}
+  combined=combined[at..].to_string();
+ }
+ tx.execute("UPDATE ap_reports SET admin_notes = $1, updated_at = $2 WHERE id::bigint = $3",&[&combined,&now_c(),&id]).await?;
+ Ok(true)
 }
 /// ap_instance_rules_save_from_text's parse: split on PCRE2's \R, trim each
 /// line, drop a leading "1." or "1)" list marker, skip empty lines, at most 40
