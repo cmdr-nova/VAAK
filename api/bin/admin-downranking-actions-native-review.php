@@ -221,9 +221,9 @@ check($r['fell_back'] && (int) $db->query("SELECT count(*) FROM ap_home_downrank
 // The bridge validator.
 reset_state();
 $GLOBALS['current_user'] = ['id' => $big1, 'actor_key' => 'cmdr_nova', 'is_admin' => 1];
-$good = ['protocol_version' => 1, 'ok' => true, 'outcome' => 'previewed', 'preview' => ['count' => 1, 'phrase' => 'x', 'samples' => [['host' => 'h', 'actor_id' => 'a', 'created_at' => 'c']]], 'php_epoch_bump' => false,
+$good = ['protocol_version' => 1, 'ok' => true, 'outcome' => 'previewed', 'preview' => ['count' => 1, 'phrase' => 'x', 'samples' => [['host' => 'h', 'actor_id' => 'a', 'created_at' => 'c']]], 'php_epoch_bump' => false, 'count' => null,
     'request_binding' => ['owner_id' => $big1, 'actor_key' => 'cmdr_nova', 'action' => 'downrank_term_preview']];
-check(ap_admin_action_native_reply($good, 'downrank_term_preview', $big1, 'cmdr_nova') === ['outcome' => 'previewed', 'preview' => ['phrase' => 'x', 'count' => 1, 'samples' => [['actor_id' => 'a', 'host' => 'h', 'created_at' => 'c']]], 'php_epoch_bump' => false], 'bridge accepts and orders a preview');
+check(ap_admin_action_native_reply($good, 'downrank_term_preview', $big1, 'cmdr_nova') === ['outcome' => 'previewed', 'preview' => ['phrase' => 'x', 'count' => 1, 'samples' => [['actor_id' => 'a', 'host' => 'h', 'created_at' => 'c']]], 'php_epoch_bump' => false, 'count' => null], 'bridge accepts and orders a preview');
 foreach ([
     'wrong action binding' => static function (array $t): array { $t['request_binding']['action'] = 'downrank_term_add'; return $t; },
     'other owner' => static function (array $t): array { $t['request_binding']['owner_id'] = 2; return $t; },
@@ -237,7 +237,7 @@ foreach ([
     'previewed empty phrase' => static function (array $t): array { $t['preview']['phrase'] = ''; return $t; },
     'not ok' => static function (array $t): array { $t['ok'] = false; return $t; },
 ] as $name => $mutate) check(ap_admin_action_native_reply($mutate($good), 'downrank_term_preview', $big1, 'cmdr_nova') === null, "bridge rejects $name");
-$clear = ['protocol_version' => 1, 'ok' => true, 'outcome' => 'signal_cleared', 'preview' => null, 'php_epoch_bump' => true, 'request_binding' => ['owner_id' => $big1, 'actor_key' => 'cmdr_nova', 'action' => 'downrank_signal_clear']];
+$clear = ['protocol_version' => 1, 'ok' => true, 'outcome' => 'signal_cleared', 'preview' => null, 'php_epoch_bump' => true, 'count' => null, 'request_binding' => ['owner_id' => $big1, 'actor_key' => 'cmdr_nova', 'action' => 'downrank_signal_clear']];
 check(ap_admin_action_native_reply($clear, 'downrank_signal_clear', $big1, 'cmdr_nova') !== null, 'bridge accepts an epoch bump left to PHP');
 $clear['preview'] = []; check(ap_admin_action_native_reply($clear, 'downrank_signal_clear', $big1, 'cmdr_nova') === null, 'bridge rejects a preview on another action');
 check(ap_admin_action_native('downrank_term_add', $big1, 'cmdr_nova', ['phrase' => 'x']) === null, 'bridge refuses a short field set');

@@ -266,7 +266,7 @@ function ap_settings_profile_save_native_reply(mixed $reply,int $owner,string $a
 /**
  * Default-off native admin action (A10): null means PHP runs the action itself
  * (switch off, worker refusal, anything unproven), otherwise
- * ['outcome','preview','php_epoch_bump']. The caller has checked the session,
+ * ['outcome','preview','php_epoch_bump','count']. The caller has checked the session,
  * CSRF and the admin role; the worker checks the role again in its write.
  */
 function ap_admin_action_native(string $action,int $owner,string $actorKey,array $fields): ?array
@@ -274,7 +274,10 @@ function ap_admin_action_native(string $action,int $owner,string $actorKey,array
     $families=['downrank_term_add'=>['VAAK_ADMIN_DOWNRANKING_ACTIONS_NATIVE',['phrase'=>'string','category'=>'string']],
         'downrank_term_delete'=>['VAAK_ADMIN_DOWNRANKING_ACTIONS_NATIVE',['term_id'=>'integer']],
         'downrank_signal_clear'=>['VAAK_ADMIN_DOWNRANKING_ACTIONS_NATIVE',['actor_id'=>'string']],
-        'downrank_term_preview'=>['VAAK_ADMIN_DOWNRANKING_ACTIONS_NATIVE',['preview_phrase'=>'string']]];
+        'downrank_term_preview'=>['VAAK_ADMIN_DOWNRANKING_ACTIONS_NATIVE',['preview_phrase'=>'string']],
+        'policies_save_privacy'=>['VAAK_ADMIN_POLICIES_ACTIONS_NATIVE',['title'=>'string','body'=>'string']],
+        'policies_save_conduct'=>['VAAK_ADMIN_POLICIES_ACTIONS_NATIVE',['title'=>'string','body'=>'string']],
+        'policies_save_rules'=>['VAAK_ADMIN_POLICIES_ACTIONS_NATIVE',['rules_text'=>'string']]];
     if(!isset($families[$action]) || !ap_admin_native_enabled() || getenv($families[$action][0])!=='1' || $owner<1 || $actorKey==='')return null;
     $shape=$families[$action][1];if(array_keys($fields)!==array_keys($shape))return null;
     foreach($shape as $key=>$type)if(gettype($fields[$key])!==$type)return null;
@@ -283,7 +286,7 @@ function ap_admin_action_native(string $action,int $owner,string $actorKey,array
     if(!ap_admin_native_url_allowed($url,'/internal/admin/action'))return null;
     try{
         $payload=json_encode(['protocol_version'=>1,'owner_id'=>$owner,'actor_key'=>$actorKey,'action'=>$action,'fields'=>$fields],JSON_THROW_ON_ERROR);
-        if(strlen($payload)>16384)return null;
+        if(strlen($payload)>524288)return null;
         $curl=curl_init($url);if($curl===false)return null;$body='';
         curl_setopt_array($curl,[CURLOPT_POST=>true,CURLOPT_POSTFIELDS=>$payload,CURLOPT_RETURNTRANSFER=>false,
             CURLOPT_CONNECTTIMEOUT_MS=>250,CURLOPT_TIMEOUT_MS=>15000,CURLOPT_FOLLOWLOCATION=>false,
@@ -299,13 +302,17 @@ function ap_admin_action_native(string $action,int $owner,string $actorKey,array
 function ap_admin_action_native_reply(mixed $reply,string $action,int $owner,string $actorKey): ?array
 {
     if(!is_array($reply))return null;
-    $keys=array_keys($reply);sort($keys);$expected=['protocol_version','ok','outcome','preview','php_epoch_bump','request_binding'];sort($expected);
+    $keys=array_keys($reply);sort($keys);$expected=['protocol_version','ok','outcome','preview','php_epoch_bump','count','request_binding'];sort($expected);
     if($keys!==$expected || $reply['protocol_version']!==1 || $reply['ok']!==true || !is_string($reply['outcome']) || !is_bool($reply['php_epoch_bump']))return null;
     $binding=$reply['request_binding'];
     if(!is_array($binding) || count($binding)!==3 || ($binding['owner_id']??null)!==$owner || ($binding['actor_key']??null)!==$actorKey || ($binding['action']??null)!==$action)return null;
     $outcomes=['downrank_term_add'=>['term_saved','bad_phrase'],'downrank_term_delete'=>['term_removed','invalid_term'],
-        'downrank_signal_clear'=>['signal_cleared','missing_actor'],'downrank_term_preview'=>['previewed','bad_preview_phrase']];
+        'downrank_signal_clear'=>['signal_cleared','missing_actor'],'downrank_term_preview'=>['previewed','bad_preview_phrase'],
+        'policies_save_privacy'=>['doc_saved','title_too_long','body_too_long'],'policies_save_conduct'=>['doc_saved','title_too_long','body_too_long'],
+        'policies_save_rules'=>['rules_saved','rule_too_long','too_many_rules','no_rules']];
     if(!in_array($reply['outcome'],$outcomes[$action]??[],true))return null;
+    if($reply['outcome']==='rules_saved'){if(!is_int($reply['count']) || $reply['count']<1 || $reply['count']>40)return null;}
+    elseif($reply['count']!==null)return null;
     if($reply['php_epoch_bump'] && $reply['outcome']!=='signal_cleared')return null;
     $preview=$reply['preview'];
     if($action!=='downrank_term_preview'){if($preview!==null)return null;}
@@ -326,5 +333,5 @@ function ap_admin_action_native_reply(mixed $reply,string $action,int $owner,str
     if(is_array($preview)){
         $preview=['phrase'=>$preview['phrase'],'count'=>$preview['count'],'samples'=>array_map(static fn(array $x):array=>['actor_id'=>$x['actor_id'],'host'=>$x['host'],'created_at'=>$x['created_at']],$preview['samples'])];
     }
-    return ['outcome'=>$reply['outcome'],'preview'=>$preview,'php_epoch_bump'=>$reply['php_epoch_bump']];
+    return ['outcome'=>$reply['outcome'],'preview'=>$preview,'php_epoch_bump'=>$reply['php_epoch_bump'],'count'=>$reply['count']];
 }

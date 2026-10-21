@@ -1,8 +1,11 @@
-//! Default-off native admin actions (A10), one action family per step. A10a is
-//! the Home downranking vocabulary: downrank_term_add, downrank_term_delete,
-//! downrank_signal_clear and downrank_term_preview, copied from their
-//! ap-admin.php handlers, admin_home_downrank_audit, ap_downrank_phrase_matches_text
-//! and ap_trends_policy_epoch_bump(null).
+//! Default-off native admin actions (A10), one action family per step, each
+//! behind its own switch. A10a is the Home downranking vocabulary:
+//! downrank_term_add, downrank_term_delete, downrank_signal_clear and
+//! downrank_term_preview, copied from their ap-admin.php handlers,
+//! admin_home_downrank_audit, ap_downrank_phrase_matches_text and
+//! ap_trends_policy_epoch_bump(null). A10b is the instance policies:
+//! policies_save_privacy, policies_save_conduct and policies_save_rules, copied
+//! from ap_instance_doc_save and ap_instance_rules_save_from_text.
 //!
 //! PHP keeps the session, CSRF, the admin-only gate, the notice text and the
 //! page. The worker checks again inside its write transaction that the account
@@ -28,18 +31,28 @@ enum Action {
  #[serde(rename="downrank_term_delete")]TermDelete(TermDelete),
  #[serde(rename="downrank_signal_clear")]SignalClear(SignalClear),
  #[serde(rename="downrank_term_preview")]TermPreview(TermPreview),
+ #[serde(rename="policies_save_privacy")]SavePrivacy(DocSave),
+ #[serde(rename="policies_save_conduct")]SaveConduct(DocSave),
+ #[serde(rename="policies_save_rules")]SaveRules(RulesSave),
 }
 #[derive(Debug,Deserialize)]#[serde(deny_unknown_fields)]struct TermAdd {phrase:String,category:String}
 #[derive(Debug,Deserialize)]#[serde(deny_unknown_fields)]struct TermDelete {term_id:i64}
 #[derive(Debug,Deserialize)]#[serde(deny_unknown_fields)]struct SignalClear {actor_id:String}
 #[derive(Debug,Deserialize)]#[serde(deny_unknown_fields)]struct TermPreview {preview_phrase:String}
+#[derive(Debug,Deserialize)]#[serde(deny_unknown_fields)]struct DocSave {title:String,body:String}
+#[derive(Debug,Deserialize)]#[serde(deny_unknown_fields)]struct RulesSave {rules_text:String}
 impl Action {
- fn name(&self)->&'static str{match self{Action::TermAdd(_)=>"downrank_term_add",Action::TermDelete(_)=>"downrank_term_delete",Action::SignalClear(_)=>"downrank_signal_clear",Action::TermPreview(_)=>"downrank_term_preview"}}
- fn family_enabled(&self)->bool{std::env::var("VAAK_ADMIN_DOWNRANKING_ACTIONS_NATIVE").ok().as_deref()==Some("1")}
+ fn name(&self)->&'static str{match self{Action::TermAdd(_)=>"downrank_term_add",Action::TermDelete(_)=>"downrank_term_delete",Action::SignalClear(_)=>"downrank_signal_clear",Action::TermPreview(_)=>"downrank_term_preview",
+  Action::SavePrivacy(_)=>"policies_save_privacy",Action::SaveConduct(_)=>"policies_save_conduct",Action::SaveRules(_)=>"policies_save_rules"}}
+ fn family_enabled(&self)->bool{
+  let switch=match self{Action::TermAdd(_)|Action::TermDelete(_)|Action::SignalClear(_)|Action::TermPreview(_)=>"VAAK_ADMIN_DOWNRANKING_ACTIONS_NATIVE",
+   Action::SavePrivacy(_)|Action::SaveConduct(_)|Action::SaveRules(_)=>"VAAK_ADMIN_POLICIES_ACTIONS_NATIVE"};
+  std::env::var(switch).ok().as_deref()==Some("1")
+ }
 }
 
 fn decode(bytes:&[u8])->Result<Request>{
- if bytes.is_empty()||bytes.len()>16384{bail!("admin action envelope size");}
+ if bytes.is_empty()||bytes.len()>524288{bail!("admin action envelope size");}
  let r:Request=serde_json::from_slice(bytes)?;
  if r.protocol_version!=1||r.owner_id<1||r.actor_key.is_empty()||r.actor_key.len()>200{bail!("admin action envelope");}
  Ok(r)
@@ -51,10 +64,12 @@ pub(crate) async fn action_route(cfg:&crate::config::Config,headers:HeaderMap,by
  match run(cfg,&request).await{Ok(reply)=>(StatusCode::OK,axum::Json(reply)).into_response(),Err(e)=>{tracing::info!(error=%e,action=request.action.name(),"native admin action fell back to PHP");(StatusCode::UNPROCESSABLE_ENTITY,axum::Json(json!({"fallback":true}))).into_response()}}
 }
 /// The reply: a closed outcome PHP turns into its notice or error, the preview
-/// for downrank_term_preview, and whether PHP still has to bump the server
-/// trends epoch (only after a signal clear whose bump did not happen here).
-fn reply(r:&Request,outcome:&str,preview:Value,php_epoch_bump:bool)->Value{
- json!({"protocol_version":1,"ok":true,"outcome":outcome,"preview":preview,"php_epoch_bump":php_epoch_bump,
+/// for downrank_term_preview, the saved rule count for policies_save_rules, and
+/// whether PHP still has to bump the server trends epoch (only after a signal
+/// clear whose bump did not happen here).
+fn reply(r:&Request,outcome:&str,preview:Value,php_epoch_bump:bool)->Value{reply_count(r,outcome,preview,php_epoch_bump,None)}
+fn reply_count(r:&Request,outcome:&str,preview:Value,php_epoch_bump:bool,count:Option<usize>)->Value{
+ json!({"protocol_version":1,"ok":true,"outcome":outcome,"preview":preview,"php_epoch_bump":php_epoch_bump,"count":count,
   "request_binding":{"owner_id":r.owner_id,"actor_key":r.actor_key,"action":r.action.name()}})
 }
 fn now_c()->String{chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S+00:00").to_string()}
@@ -143,7 +158,49 @@ async fn run(cfg:&crate::config::Config,r:&Request)->Result<Value>{
    tx.commit().await?;
    Ok(reply(r,"previewed",json!({"phrase":phrase,"count":count,"samples":samples}),false))
   },
+  Action::SavePrivacy(d)|Action::SaveConduct(d)=>{
+   let key=if matches!(r.action,Action::SaveConduct(_)){"conduct"}else{"privacy"};
+   let title=php_trim(&d.title);
+   let title=if title.is_empty(){if key=="conduct"{"Code of Conduct"}else{"Privacy Policy"}}else{title};
+   if title.chars().count()>120{return Ok(reply(r,"title_too_long",Value::Null,false));}
+   if d.body.chars().count()>100000{return Ok(reply(r,"body_too_long",Value::Null,false));}
+   if d.body.contains('\0')||title.contains('\0'){bail!("PHP fallback: NUL in policy text");}
+   let tx=admin_tx(&mut db,r).await?;
+   tx.execute("INSERT INTO ap_instance_docs (doc_key, title, body, updated_at) VALUES ($1, $2, $3, $4) ON CONFLICT(doc_key) DO UPDATE SET title = excluded.title, body = excluded.body, updated_at = excluded.updated_at",&[&key,&title,&d.body,&now_c()]).await?;
+   tx.commit().await?;
+   Ok(reply(r,"doc_saved",Value::Null,false))
+  },
+  Action::SaveRules(d)=>{
+   let rules=match parse_rules(&d.rules_text)?{Ok(rules)=>rules,Err(outcome)=>return Ok(reply(r,outcome,Value::Null,false))};
+   let tx=admin_tx(&mut db,r).await?;
+   tx.execute("DELETE FROM ap_instance_rules",&[]).await?;
+   let now=now_c();
+   for (i,text) in rules.iter().enumerate(){
+    tx.execute("INSERT INTO ap_instance_rules (sort_order, text, updated_at) VALUES ($1::bigint, $2, $3)",&[&(i as i64+1),text,&now]).await?;
+   }
+   tx.commit().await?;
+   Ok(reply_count(r,"rules_saved",Value::Null,false,Some(rules.len())))
+  },
  }
+}
+/// ap_instance_rules_save_from_text's parse: split on PCRE2's \R, trim each
+/// line, drop a leading "1." or "1)" list marker, skip empty lines, at most 40
+/// rules of at most 500 characters, checked in order as PHP does.
+fn parse_rules(raw:&str)->Result<std::result::Result<Vec<String>,&'static str>>{
+ if raw.contains('\0'){bail!("PHP fallback: NUL in rules");}
+ static MARKER:std::sync::LazyLock<regex::Regex>=std::sync::LazyLock::new(||regex::Regex::new(r"^[0-9]+[.)][ \t\n\x0B\x0C\r]+").unwrap());
+ let mut rules=Vec::new();
+ let normalized=raw.replace("\r\n","\n");
+ for line in normalized.split(['\n','\r','\u{0B}','\u{0C}','\u{85}','\u{2028}','\u{2029}']){
+  let line=php_trim(line);
+  let line=MARKER.replace(line,"");
+  if line.is_empty(){continue;}
+  if line.chars().count()>500{return Ok(Err("rule_too_long"));}
+  rules.push(line.into_owned());
+  if rules.len()>40{return Ok(Err("too_many_rules"));}
+ }
+ if rules.is_empty(){return Ok(Err("no_rules"));}
+ Ok(Ok(rules))
 }
 /// The write transaction, holding the acting account's row: it must still be
 /// the active admin PHP checked, with the actor key PHP sent.
@@ -185,6 +242,14 @@ mod tests{
   assert!(decode(&serde_json::to_vec(&env("user_ban",json!({"user_id":2}))).unwrap()).is_err());
   assert!(decode(&serde_json::to_vec(&env("downrank_term_delete",json!({"term_id":"3"}))).unwrap()).is_err());
   let mut zero=env("downrank_term_delete",json!({"term_id":3}));zero["owner_id"]=json!(0);assert!(decode(&serde_json::to_vec(&zero).unwrap()).is_err());
+ }
+ #[test]fn rules_parse_like_php(){
+  assert_eq!(parse_rules("1. Be kind\r\n\r\n2) No spam \u{2028}  3.no space\n12.  \t Twelve\n1.").unwrap().unwrap(),vec!["Be kind","No spam","3.no space","Twelve","1."]);
+  assert_eq!(parse_rules(" \n \r ").unwrap().unwrap_err(),"no_rules");
+  assert_eq!(parse_rules(&"r\n".repeat(41)).unwrap().unwrap_err(),"too_many_rules");
+  assert_eq!(parse_rules(&format!("ok\n{}\n","é".repeat(501))).unwrap().unwrap_err(),"rule_too_long");
+  assert_eq!(parse_rules(&"é".repeat(500)).unwrap().unwrap().len(),1);
+  assert!(parse_rules("a\0b").is_err());
  }
  #[test]fn phrase_normalizing_matches_php(){
   assert_eq!(normalize_phrase("  a \t\n b  ").unwrap(),"a b");
