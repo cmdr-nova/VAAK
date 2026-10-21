@@ -4608,6 +4608,22 @@ $vaakAdminOnlyActions = [
                 error_log('[vaak] downranking vocabulary: ' . $e->getMessage());
             }
         }
+    } elseif (in_array($action, ['policies_save_privacy', 'policies_save_conduct', 'policies_save_rules'], true) && $vaakIsAdmin
+        && ($policiesNative = ap_admin_action_native($action, (int) $vaakOwnerId, (string) $vaakActorKey, $action === 'policies_save_rules'
+            ? ['rules_text' => $_POST['rules_text'] ?? '']
+            : ['title' => $_POST['title'] ?? '', 'body' => $_POST['body'] ?? ''])) !== null) {
+        // A10b: the worker saved the document or rules (or answered the validation error).
+        $view = 'policies';
+        match ($policiesNative['outcome']) {
+            'doc_saved' => $notice = ($action === 'policies_save_conduct' ? 'Code of Conduct' : 'Privacy Policy') . ' saved.',
+            'rules_saved' => $notice = 'Server rules saved (' . (int) $policiesNative['count'] . '). Shown on /vaak/conduct/ and in Mastodon apps.',
+            'title_too_long' => $error = 'Title is too long.',
+            'body_too_long' => $error = 'Body is too long.',
+            'rule_too_long' => $error = 'Each rule must be 500 characters or fewer.',
+            'too_many_rules' => $error = 'Too many rules (max 40).',
+            'no_rules' => $error = 'Add at least one rule.',
+            default => null,
+        };
     } elseif ($action === 'policies_save_privacy' || $action === 'policies_save_conduct' || $action === 'policies_save_rules') {
         $view = 'policies';
         if (!$vaakIsAdmin) {

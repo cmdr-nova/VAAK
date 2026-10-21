@@ -190,7 +190,7 @@ pub async fn serve(cfg: Config, bind: SocketAddr) -> Result<()> {
     if crate::profile_bridge::enabled(){app=app.route("/internal/profile/full",post(internal_profile_full).layer(axum::extract::DefaultBodyLimit::max(64*1024)).layer(axum::middleware::map_response(crate::profile_bridge::no_store)));}
     if crate::admin_read::enabled(){app=app.route("/internal/admin/read",post(internal_admin_read).layer(axum::extract::DefaultBodyLimit::max(16*1024)).layer(axum::middleware::map_response(crate::profile_bridge::no_store)));}
     if crate::admin_read::enabled(){app=app.route("/internal/settings/profile-save",post(internal_settings_profile_save).layer(axum::extract::DefaultBodyLimit::max(64*1024)).layer(axum::middleware::map_response(crate::profile_bridge::no_store)));}
-    if crate::admin_read::enabled(){app=app.route("/internal/admin/action",post(internal_admin_action).layer(axum::extract::DefaultBodyLimit::max(16*1024)).layer(axum::middleware::map_response(crate::profile_bridge::no_store)));}
+    if crate::admin_read::enabled(){app=app.route("/internal/admin/action",post(internal_admin_action).layer(axum::extract::DefaultBodyLimit::max(512*1024)).layer(axum::middleware::map_response(crate::profile_bridge::no_store)));}
     let app=app.with_state(state);
 
     tracing::info!(%bind, "vaak-worker shadow HTTP listening");
