@@ -26,7 +26,7 @@ function ap_profile_export_public_cache(string $key): void {
 }
 function ap_timeline_cache_invalidate_owner(int $owner): void { $GLOBALS['fixture_ranked'][]=$owner; }
 function ap_timeline_home_hydrate_invalidate_owner(int $owner): void { $GLOBALS['fixture_hydrated'][]=$owner; }
-foreach (['ap_profile_save_unlocked','ap_profile_sanitize_https_url','ap_profile_normalize_summary_html','ap_profile_normalize_badges','ap_profile_badge_catalog','ap_actor_as2_document','ap_as2_federation_plaintext','ap_cmdr_actor_attachments_with_policies','ap_webmention_target_enabled','ap_profile_collection_consent','ap_profile_authorized_badges','ap_profile_supporter_awarded'] as $name) fixture_load_function($source,$name);
+foreach (['ap_profile_save_unlocked','ap_profile_after_save','ap_profile_sanitize_https_url','ap_profile_normalize_summary_html','ap_profile_normalize_badges','ap_profile_badge_catalog','ap_actor_as2_document','ap_as2_federation_plaintext','ap_cmdr_actor_attachments_with_policies','ap_webmention_target_enabled','ap_profile_collection_consent','ap_profile_authorized_badges','ap_profile_supporter_awarded'] as $name) fixture_load_function($source,$name);
 $db=new PDO('sqlite::memory:'); $GLOBALS['fixture_db']=$db;
 $db->setAttribute(PDO::ATTR_ERRMODE,PDO::ERRMODE_EXCEPTION);
 $db->setAttribute(PDO::ATTR_DEFAULT_FETCH_MODE,PDO::FETCH_ASSOC);

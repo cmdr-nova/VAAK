@@ -17,7 +17,7 @@ function ap_profile_export_public_cache(string $key): void {
 function ap_timeline_cache_invalidate_owner(int $owner): void { $GLOBALS['ranked'][]=$owner; }
 function ap_timeline_home_hydrate_invalidate_owner(int $owner): void { $GLOBALS['hydrated'][]=$owner; }
 reference_load(dirname(__DIR__).'/ap-db.php',['ap_profile_supporter_awarded','ap_profile_authorized_badges','ap_db_driver']);
-reference_load(dirname(__DIR__).'/ap-db.php',['ap_profile_defaults','ap_profile_get','ap_profile_save','ap_profile_save_unlocked','ap_fix_utf8','ap_profile_sanitize_https_url','ap_profile_normalize_summary_html','ap_profile_normalize_badges','ap_profile_badge_catalog','ap_profile_verify_attachments','ap_profile_actor_url','ap_db_now','ap_profile_collection_consent','ap_webmention_target_enabled']);
+reference_load(dirname(__DIR__).'/ap-db.php',['ap_profile_defaults','ap_profile_get','ap_profile_save','ap_profile_save_unlocked','ap_profile_after_save','ap_fix_utf8','ap_profile_sanitize_https_url','ap_profile_normalize_summary_html','ap_profile_normalize_badges','ap_profile_badge_catalog','ap_profile_verify_attachments','ap_profile_actor_url','ap_db_now','ap_profile_collection_consent','ap_webmention_target_enabled']);
 $pgSchema=(string)getenv('SUPPORTER_SETTINGS_PG_SCHEMA');
 $db=$pgSchema!=='' ? new PDO('pgsql:host='.getenv('LIBRARY_FIXTURE_SOCKET').' dbname=postgres','postgres',null,[PDO::ATTR_ERRMODE=>PDO::ERRMODE_EXCEPTION,PDO::ATTR_DEFAULT_FETCH_MODE=>PDO::FETCH_ASSOC]) : new PDO('sqlite::memory:',null,null,[PDO::ATTR_ERRMODE=>PDO::ERRMODE_EXCEPTION,PDO::ATTR_DEFAULT_FETCH_MODE=>PDO::FETCH_ASSOC]);$GLOBALS['fixture_db']=$db;
 if($pgSchema!==''){
