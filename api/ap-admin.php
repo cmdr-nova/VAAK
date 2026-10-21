@@ -27609,6 +27609,15 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       background: transparent; color: var(--muted);
       border: 1px solid var(--border);
     }
+    /* Settings > Profile Supporter code: input and Redeem button share one row. */
+    .supporter-reward-form label { display: block; font-weight: 600; }
+    .supporter-reward-row {
+      display: flex; gap: .5rem; align-items: center; margin: .5rem 0 .45rem;
+    }
+    .composer .supporter-reward-row input:not([type="checkbox"]):not([type="radio"]):not([type="hidden"]) {
+      flex: 1 1 auto; min-width: 0; width: auto; margin-top: 0;
+    }
+    .supporter-reward-row .btn { flex: 0 0 auto; white-space: nowrap; }
     /* Shared compact control sizing for secondary actions across views. */
     .btn-compact {
       min-height: 2rem;
@@ -31627,13 +31636,15 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
           </div>
         <?php endif; ?>
         <?php if (getenv('VAAK_SUPPORTER_CODES') === '1'): ?>
-        <form method="post" class="supporter-reward-form">
+        <form method="post" class="composer supporter-reward-form">
           <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
           <input type="hidden" name="action" value="redeem_supporter">
           <label for="supporter-code">Supporter reward code</label>
-          <input id="supporter-code" name="supporter_code" autocomplete="off" maxlength="64" required>
+          <div class="supporter-reward-row">
+            <input id="supporter-code" name="supporter_code" autocomplete="off" maxlength="64" required>
+            <button class="btn btn-primary" type="submit">Redeem</button>
+          </div>
           <div class="meta">Paid Clearance supporters can redeem their code using the same account email. This awards a local Supporter badge.</div>
-          <button type="submit">Redeem Supporter code</button>
         </form>
         <?php endif; ?>
         <?php if (($settingsNativeProfile = ap_settings_native_body('settings_profile', !empty($vaakIsAdmin))) !== null): ?><?= $settingsNativeProfile ?><?php else: ?>
