@@ -25,13 +25,13 @@ fn word(c:char)->bool{
 /// under UCP, not Unicode White_Space).
 fn unproven_text(s:&str)->bool{s.contains(['<','\0','\u{180E}'])}
 /// preg_replace('/\s+/u', ' ', ...): every Unicode whitespace run becomes one space.
-fn squash(s:&str)->String{
+pub(crate) fn squash(s:&str)->String{
  static WS:std::sync::LazyLock<regex::Regex>=std::sync::LazyLock::new(||regex::Regex::new(r"\s+").unwrap());
  WS.replace_all(s," ").into_owned()
 }
 /// ap_downrank_phrase_matches_text on text already strip_tags'd: whole-token,
 /// caseless (/iu), with complete hashtag tokens blanked first.
-fn phrase_matches(text:&str,phrase:&str)->bool{
+pub(crate) fn phrase_matches(text:&str,phrase:&str)->bool{
  let phrase=php_trim(&squash(phrase)).to_string();
  if phrase.is_empty(){return false;}
  let chars:Vec<char>=text.chars().collect();

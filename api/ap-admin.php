@@ -4498,6 +4498,27 @@ $vaakAdminOnlyActions = [
                 $error = $res['error'] ?? 'Could not update user status.';
             }
         }
+    } elseif (in_array($action, ['downrank_term_add', 'downrank_term_delete', 'downrank_signal_clear', 'downrank_term_preview'], true) && $vaakIsAdmin
+        && ($downrankNative = ap_admin_action_native($action, (int) $vaakOwnerId, (string) $vaakActorKey, match ($action) {
+            'downrank_term_add' => ['phrase' => $_POST['phrase'] ?? '', 'category' => $_POST['category'] ?? 'custom'],
+            'downrank_term_delete' => ['term_id' => (int) ($_POST['term_id'] ?? 0)],
+            'downrank_signal_clear' => ['actor_id' => $_POST['actor_id'] ?? ''],
+            'downrank_term_preview' => ['preview_phrase' => $_POST['preview_phrase'] ?? ''],
+        })) !== null) {
+        // A10a: the worker made the change (or answered the validation error).
+        $view = $action === 'downrank_signal_clear' ? 'downranked' : 'downranking';
+        if ($downrankNative['preview'] !== null) $downrankPreview = $downrankNative['preview'];
+        if ($downrankNative['php_epoch_bump'] && function_exists('ap_trends_policy_epoch_bump')) ap_trends_policy_epoch_bump(null);
+        match ($downrankNative['outcome']) {
+            'term_saved' => $notice = 'Downranking phrase saved.',
+            'term_removed' => $notice = 'Downranking phrase removed.',
+            'signal_cleared' => $notice = 'Temporary downranking signal removed for this actor.',
+            'invalid_term' => $error = 'Invalid vocabulary entry.',
+            'bad_phrase' => $error = 'Enter a phrase between 2 and 120 characters.',
+            'missing_actor' => $error = 'Missing actor.',
+            'bad_preview_phrase' => $error = 'Enter a phrase between 2 and 120 characters to preview.',
+            default => null,
+        };
     } elseif ($action === 'downrank_term_preview') {
         $view = 'downranking';
         if (!$vaakIsAdmin) {
@@ -4510,7 +4531,7 @@ $vaakAdminOnlyActions = [
                 $error = 'Enter a phrase between 2 and 120 characters to preview.';
             } else {
                 try {
-                    $st = ap_db()->prepare("SELECT actor_id, object_id, host, summary, content, created_at FROM events WHERE type = 'Create' AND action_taken IN ('log','local_observe') AND visibility IN ('public','unlisted') AND created_at >= ? ORDER BY created_at DESC LIMIT 2000");
+                    $st = ap_db()->prepare("SELECT actor_id, object_id, host, summary, content, created_at FROM events WHERE type = 'Create' AND action_taken IN ('log','local_observe') AND visibility IN ('public','unlisted') AND created_at >= ? ORDER BY created_at DESC, id DESC LIMIT 2000");
                     $st->execute([gmdate('c', time() - 30 * 86400)]);
                     foreach ($st->fetchAll() ?: [] as $row) {
                         $text = implode("\n", array_map(static fn(string $key): string => (string) ($row[$key] ?? ''), ['summary', 'content']));

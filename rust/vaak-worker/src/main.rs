@@ -13,6 +13,7 @@ mod account_switch;
 mod admin_health;
 mod admin_read;
 mod settings_profile_save;
+mod admin_actions;
 mod home_html;
 mod home_bsky_mirrors;
 mod wafrn_crosspost;
