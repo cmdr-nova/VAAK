@@ -163,7 +163,7 @@ else compare('report id past int4', 'report_dismiss', ['report_id' => '300000000
 // The bridge validator.
 $big1 = 1 + $big;
 $GLOBALS['current_user'] = ['id' => $big1, 'actor_key' => 'cmdr_nova', 'is_admin' => 1];
-$good = ['protocol_version' => 1, 'ok' => true, 'outcome' => 'state_set', 'preview' => null, 'php_epoch_bump' => false, 'count' => null,
+$good = ['protocol_version' => 1, 'ok' => true, 'outcome' => 'state_set', 'preview' => null, 'php_epoch_bump' => false, 'count' => null, 'code' => null,
     'request_binding' => ['owner_id' => $big1, 'actor_key' => 'cmdr_nova', 'action' => 'report_ignore']];
 check(ap_admin_action_native_reply($good, 'report_ignore', $big1, 'cmdr_nova') !== null, 'bridge accepts a state change');
 foreach ([

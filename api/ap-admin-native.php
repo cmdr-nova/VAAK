@@ -266,7 +266,7 @@ function ap_settings_profile_save_native_reply(mixed $reply,int $owner,string $a
 /**
  * Default-off native admin action (A10): null means PHP runs the action itself
  * (switch off, worker refusal, anything unproven), otherwise
- * ['outcome','preview','php_epoch_bump','count']. The caller has checked the session,
+ * ['outcome','preview','php_epoch_bump','count','code']. The caller has checked the session,
  * CSRF and the admin role; the worker checks the role again in its write.
  */
 function ap_admin_action_native(string $action,int $owner,string $actorKey,array $fields): ?array
@@ -281,6 +281,8 @@ function ap_admin_action_native(string $action,int $owner,string $actorKey,array
     foreach(['report_note','report_dismiss','report_ignore','report_reopen'] as $reportAction)
         $families[$reportAction]=['VAAK_ADMIN_REPORTS_ACTIONS_NATIVE',['report_id'=>'integer','admin_note'=>'string','admin_handle'=>'string']];
     $families['user_ban']=$families['user_unban']=['VAAK_ADMIN_USERS_ACTIONS_NATIVE',['user_id'=>'integer']];
+    $families['invite_create']=['VAAK_ADMIN_INVITES_ACTIONS_NATIVE',['note'=>'string']];
+    $families['registration_open']=$families['registration_close']=['VAAK_ADMIN_INVITES_ACTIONS_NATIVE',[]];
     if(!isset($families[$action]) || !ap_admin_native_enabled() || getenv($families[$action][0])!=='1' || $owner<1 || $actorKey==='')return null;
     $shape=$families[$action][1];if(array_keys($fields)!==array_keys($shape))return null;
     foreach($shape as $key=>$type)if(gettype($fields[$key])!==$type)return null;
@@ -288,7 +290,7 @@ function ap_admin_action_native(string $action,int $owner,string $actorKey,array
     $url=(string)(getenv('VAAK_ADMIN_ACTION_URL')?:'http://127.0.0.1:8787/internal/admin/action');
     if(!ap_admin_native_url_allowed($url,'/internal/admin/action'))return null;
     try{
-        $payload=json_encode(['protocol_version'=>1,'owner_id'=>$owner,'actor_key'=>$actorKey,'action'=>$action,'fields'=>$fields],JSON_THROW_ON_ERROR);
+        $payload=json_encode(['protocol_version'=>1,'owner_id'=>$owner,'actor_key'=>$actorKey,'action'=>$action,'fields'=>$fields===[]?new stdClass():$fields],JSON_THROW_ON_ERROR);
         if(strlen($payload)>524288)return null;
         $curl=curl_init($url);if($curl===false)return null;$body='';
         curl_setopt_array($curl,[CURLOPT_POST=>true,CURLOPT_POSTFIELDS=>$payload,CURLOPT_RETURNTRANSFER=>false,
@@ -305,7 +307,7 @@ function ap_admin_action_native(string $action,int $owner,string $actorKey,array
 function ap_admin_action_native_reply(mixed $reply,string $action,int $owner,string $actorKey): ?array
 {
     if(!is_array($reply))return null;
-    $keys=array_keys($reply);sort($keys);$expected=['protocol_version','ok','outcome','preview','php_epoch_bump','count','request_binding'];sort($expected);
+    $keys=array_keys($reply);sort($keys);$expected=['protocol_version','ok','outcome','preview','php_epoch_bump','count','code','request_binding'];sort($expected);
     if($keys!==$expected || $reply['protocol_version']!==1 || $reply['ok']!==true || !is_string($reply['outcome']) || !is_bool($reply['php_epoch_bump']))return null;
     $binding=$reply['request_binding'];
     if(!is_array($binding) || count($binding)!==3 || ($binding['owner_id']??null)!==$owner || ($binding['actor_key']??null)!==$actorKey || ($binding['action']??null)!==$action)return null;
@@ -315,10 +317,13 @@ function ap_admin_action_native_reply(mixed $reply,string $action,int $owner,str
         'policies_save_rules'=>['rules_saved','rule_too_long','too_many_rules','no_rules'],
         'report_note'=>['note_saved','note_empty','note_report_not_found'],'report_dismiss'=>['state_set','report_not_found'],
         'report_ignore'=>['state_set','report_not_found'],'report_reopen'=>['state_set','report_not_found'],
-        'user_ban'=>['banned','invalid_user','user_not_found','protected_user'],'user_unban'=>['unbanned','invalid_user','user_not_found','protected_user']];
+        'user_ban'=>['banned','invalid_user','user_not_found','protected_user'],'user_unban'=>['unbanned','invalid_user','user_not_found','protected_user'],
+        'invite_create'=>['invite_created'],'registration_open'=>['registration_opened','registration_not_ready'],'registration_close'=>['registration_closed','registration_not_ready']];
     if(!in_array($reply['outcome'],$outcomes[$action]??[],true))return null;
     if($reply['outcome']==='rules_saved'){if(!is_int($reply['count']) || $reply['count']<1 || $reply['count']>40)return null;}
     elseif($reply['count']!==null)return null;
+    if($reply['outcome']==='invite_created'){if(!is_string($reply['code']) || preg_match('/^[0-9A-F]{8}-[0-9A-F]{4}$/D',$reply['code'])!==1)return null;}
+    elseif($reply['code']!==null)return null;
     if($reply['php_epoch_bump'] && $reply['outcome']!=='signal_cleared')return null;
     $preview=$reply['preview'];
     if($action!=='downrank_term_preview'){if($preview!==null)return null;}
@@ -339,5 +344,5 @@ function ap_admin_action_native_reply(mixed $reply,string $action,int $owner,str
     if(is_array($preview)){
         $preview=['phrase'=>$preview['phrase'],'count'=>$preview['count'],'samples'=>array_map(static fn(array $x):array=>['actor_id'=>$x['actor_id'],'host'=>$x['host'],'created_at'=>$x['created_at']],$preview['samples'])];
     }
-    return ['outcome'=>$reply['outcome'],'preview'=>$preview,'php_epoch_bump'=>$reply['php_epoch_bump'],'count'=>$reply['count']];
+    return ['outcome'=>$reply['outcome'],'preview'=>$preview,'php_epoch_bump'=>$reply['php_epoch_bump'],'count'=>$reply['count'],'code'=>$reply['code']];
 }
