@@ -3801,11 +3801,14 @@ $vaakAdminOnlyActions = [
         $view = 'profile';
         $phrase = (string) ($_POST['phrase'] ?? '');
         $note = (string) ($_POST['note'] ?? '');
-        $result = function_exists('ap_muted_word_add')
-            ? ap_muted_word_add($phrase, $note, $vaakOwnerId)
-            : ['ok' => false, 'error' => 'Muted words unavailable.'];
+        $result = ap_settings_action_native('muted_word_add', (int) $vaakOwnerId, (string) ($vaakUser['actor_key'] ?? ''), ['phrase' => $phrase, 'note' => $note])
+            ?? (function_exists('ap_muted_word_add')
+                ? ap_muted_word_add($phrase, $note, $vaakOwnerId)
+                : ['ok' => false, 'error' => 'Muted words unavailable.']);
         if (!empty($result['ok'])) {
-            admin_tl_cache_clear();
+            if (empty($result['tl_cache_done'])) {
+                admin_tl_cache_clear();
+            }
             $notice = !empty($result['already'])
                 ? 'Already muting “' . ($result['phrase'] ?? $phrase) . '”.'
                 : 'Muted “' . ($result['phrase'] ?? $phrase) . '” — matching posts hide from Home & Federated.';
@@ -3815,11 +3818,14 @@ $vaakAdminOnlyActions = [
     } elseif ($action === 'muted_word_remove') {
         $view = 'profile';
         $wid = (int) ($_POST['id'] ?? 0);
-        $result = function_exists('ap_muted_word_remove')
-            ? ap_muted_word_remove($wid, $vaakOwnerId)
-            : ['ok' => false, 'error' => 'Muted words unavailable.'];
+        $result = ap_settings_action_native('muted_word_remove', (int) $vaakOwnerId, (string) ($vaakUser['actor_key'] ?? ''), ['id' => $wid])
+            ?? (function_exists('ap_muted_word_remove')
+                ? ap_muted_word_remove($wid, $vaakOwnerId)
+                : ['ok' => false, 'error' => 'Muted words unavailable.']);
         if (!empty($result['ok'])) {
-            admin_tl_cache_clear();
+            if (empty($result['tl_cache_done'])) {
+                admin_tl_cache_clear();
+            }
             $notice = 'Removed muted phrase.';
         } else {
             $error = $result['error'] ?? 'Could not remove phrase.';

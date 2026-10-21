@@ -102,7 +102,7 @@ fn reply_full(r:&Request,outcome:&str,preview:Value,php_epoch_bump:bool,count:Op
 fn now_c()->String{chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S+00:00").to_string()}
 /// trim(preg_replace('/\s+/u', ' ', $s)). A NUL or U+180E (PCRE2 \s under UCP,
 /// not Unicode White_Space) is unproven.
-fn normalize_phrase(s:&str)->Result<String>{
+pub(crate) fn normalize_phrase(s:&str)->Result<String>{
  if s.contains(['\0','\u{180E}']){bail!("PHP fallback: unproven whitespace");}
  Ok(php_trim(&squash(s)).to_string())
 }
@@ -301,7 +301,7 @@ async fn report_handle_check(tx:&tokio_postgres::Transaction<'_>,r:&Request,hand
 async fn report_id_check(tx:&tokio_postgres::Transaction<'_>,id:i64)->Result<()>{int4_guard(tx,"ap_reports",id).await}
 /// PHP binds an id as text; past int4 an INTEGER id column raises, which PHP
 /// reports its own way (or not at all), so those ids stay in PHP.
-async fn int4_guard(tx:&tokio_postgres::Transaction<'_>,table:&'static str,id:i64)->Result<()>{
+pub(crate) async fn int4_guard(tx:&tokio_postgres::Transaction<'_>,table:&'static str,id:i64)->Result<()>{
  if id>i64::from(i32::MAX){
   let kind:String=tx.query_one("SELECT format_type(atttypid, atttypmod) FROM pg_attribute WHERE attrelid = $1::text::regclass AND attname = 'id'",&[&table]).await?.get(0);
   if kind!="bigint"{bail!("PHP fallback: {table} id past int4");}
