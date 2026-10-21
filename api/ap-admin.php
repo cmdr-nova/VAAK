@@ -9342,7 +9342,8 @@ function admin_home_downranked_actor_rows(): array
 {
     try {
         admin_home_downrank_purge_stale();
-        $rows = ap_db()->query('SELECT actor_id, owner_user_id, score, categories_json, suppressed_until, last_object_id, updated_at FROM ap_home_suppression ORDER BY suppressed_until DESC, score DESC')->fetchAll() ?: [];
+        // The primary key breaks ties so the grouped order and category order are stable.
+        $rows = ap_db()->query('SELECT actor_id, owner_user_id, score, categories_json, suppressed_until, last_object_id, updated_at FROM ap_home_suppression ORDER BY suppressed_until DESC, score DESC, actor_id ASC, owner_user_id ASC')->fetchAll() ?: [];
         $out = [];
         $now = time();
         foreach ($rows as $row) {
@@ -9398,7 +9399,7 @@ function admin_home_downrank_evidence_rows(string $actorId, array $categories, i
             FROM events
             WHERE rtrim(actor_id, '/') = rtrim(?, '/')
               AND visibility IN ('public', 'unlisted')
-            ORDER BY created_at DESC
+            ORDER BY created_at DESC, id DESC
             LIMIT 100");
         $st->execute([$actorId]);
         $out = [];
@@ -30855,7 +30856,13 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
         <?php else: ?>
           <?php
             $downrankedQuery = trim((string) ($_GET['q'] ?? ''));
-            $allDownrankedActors = admin_home_downranked_actor_rows();
+            $downrankedNativeBody = null;
+            if ($downrankedQuery === '') {
+                // The cleanup DELETE stays PHP; the native read runs after it.
+                admin_home_downrank_purge_stale();
+                $downrankedNativeBody = ap_admin_native_read_body('downranked');
+            }
+            $allDownrankedActors = $downrankedNativeBody !== null ? [] : admin_home_downranked_actor_rows();
             if ($downrankedQuery !== '') {
                 $needle = strtolower($downrankedQuery);
                 $allDownrankedActors = array_values(array_filter($allDownrankedActors, static function (array $row) use ($needle): bool {
@@ -30865,7 +30872,7 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
             }
             $downrankedPerPage = 25;
             $downrankedTotal = count($allDownrankedActors);
-            $downrankAuditRows = admin_home_downrank_audit_rows();
+            $downrankAuditRows = $downrankedNativeBody !== null ? [] : admin_home_downrank_audit_rows();
           ?>
           <div class="meta" style="margin-bottom:1rem">
             Private, temporary Home-ranking signals grouped by actor. These are not public labels or moderation decisions.
@@ -30878,7 +30885,7 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
             <button class="btn btn-ghost" type="submit">Search</button>
             <?php if ($downrankedQuery !== ''): ?><a class="btn btn-ghost" href="?view=downranked">Clear</a><?php endif; ?>
           </form>
-          <?php if (!$allDownrankedActors): ?>
+          <?php if ($downrankedNativeBody !== null): ?><?= $downrankedNativeBody ?><?php elseif (!$allDownrankedActors): ?>
             <div class="empty">No active temporary downranking signals.</div>
           <?php else: ?>
             <div id="downranked-panel" class="downranked-panel" data-per-page="<?= (int) $downrankedPerPage ?>" data-total="<?= (int) $downrankedTotal ?>" style="border:1px solid var(--border);border-radius:12px;padding:.75rem;background:rgba(0,0,0,.12)">
@@ -30990,6 +30997,7 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
             })();
             </script>
           <?php endif; ?>
+          <?php if ($downrankedNativeBody === null): ?>
           <details class="blocks-section" style="margin-top:1.5rem">
             <summary><span class="who">Recent audit trail</span><span class="meta">admin vocabulary and escalation actions</span></summary>
             <div class="blocks-section-body">
@@ -31005,6 +31013,7 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
               <?php endif; ?>
             </div>
           </details>
+          <?php endif; ?>
         <?php endif; ?>
 
       <?php elseif ($view === 'downranking'): ?>

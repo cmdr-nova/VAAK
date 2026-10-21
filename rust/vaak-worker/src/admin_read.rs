@@ -6,7 +6,7 @@ use serde_json::{json,Value};
 use crate::library::actions::{esc,query};
 #[derive(Clone,Debug,Deserialize,Serialize,PartialEq)]
 #[serde(rename_all="snake_case")]
-enum View {Invites,Approvals,Users,Relays,Policies,Blocks,Moderation,SettingsLists,SettingsFollowRequests,SettingsFeatured,SettingsMutes,SettingsProfile,SettingsLinks,SettingsAi,SettingsTokens,SettingsTwoFactor,SettingsAliases,SettingsMove,Stats,QueueHealth,Downranking}
+enum View {Invites,Approvals,Users,Relays,Policies,Blocks,Moderation,SettingsLists,SettingsFollowRequests,SettingsFeatured,SettingsMutes,SettingsProfile,SettingsLinks,SettingsAi,SettingsTokens,SettingsTwoFactor,SettingsAliases,SettingsMove,Stats,QueueHealth,Downranking,Downranked}
 impl View{fn settings(&self)->bool{matches!(self,View::SettingsLists|View::SettingsFollowRequests|View::SettingsFeatured|View::SettingsMutes|View::SettingsProfile|View::SettingsLinks|View::SettingsAi|View::SettingsTokens|View::SettingsTwoFactor|View::SettingsAliases|View::SettingsMove)}}
 #[derive(Clone,Debug,Deserialize,Serialize,PartialEq)]
 #[serde(rename_all="snake_case")]
@@ -29,7 +29,7 @@ fn decode(bytes:&[u8])->Result<Request>{
  let r:Request=serde_json::from_slice(bytes)?;
  if r.protocol_version!=1||r.owner_id<1||r.csrf.is_empty()||r.csrf.len()>4096||r.offset<0||r.offset>i64::MAX-100||r.now<0{bail!("admin envelope");}
  if r.php_timezone!="UTC" { bail!("unproven PHP timezone"); }
- if (matches!(r.view,View::Invites|View::Relays|View::Policies|View::Blocks|View::Moderation|View::Stats|View::QueueHealth|View::Downranking)||r.view.settings())&&r.offset!=0{bail!("invite selector");}
+ if (matches!(r.view,View::Invites|View::Relays|View::Policies|View::Blocks|View::Moderation|View::Stats|View::QueueHealth|View::Downranking|View::Downranked)||r.view.settings())&&r.offset!=0{bail!("invite selector");}
  if r.view==View::Users{if r.offset<1||r.search.as_ref().is_none_or(|s|s.len()>4096||crate::library::card::php_trim(s)!=s){bail!("users selector");}}else if r.search.is_some(){bail!("unexpected users selector");}
  if r.view.settings()!=r.viewer_admin.is_some(){bail!("viewer role selector");}
  if (r.view==View::Moderation)!=r.filter.is_some()||r.filter.as_deref().is_some_and(|f|!moderation::FILTERS.contains(&f)){bail!("moderation filter selector");}
@@ -97,12 +97,13 @@ async fn paint(cfg:&crate::config::Config,r:&Request)->Result<Value>{
  if r.view==View::Stats&&std::env::var("VAAK_ADMIN_STATS_NATIVE").ok().as_deref()!=Some("1"){bail!("native Stats disabled");}
  if r.view==View::QueueHealth&&std::env::var("VAAK_ADMIN_QUEUE_HEALTH_NATIVE").ok().as_deref()!=Some("1"){bail!("native Queue health disabled");}
  if r.view==View::Downranking&&std::env::var("VAAK_ADMIN_DOWNRANKING_NATIVE").ok().as_deref()!=Some("1"){bail!("native Home downranking disabled");}
+ if r.view==View::Downranked&&std::env::var("VAAK_ADMIN_DOWNRANKED_NATIVE").ok().as_deref()!=Some("1"){bail!("native Downranked disabled");}
  let db=crate::db::connect(&cfg.database_url).await?;
  db.batch_execute("BEGIN READ ONLY ISOLATION LEVEL READ COMMITTED").await?;
  role(&db,r).await?;
  let configured=std::env::var("VAAK_REGISTRATION_APPROVALS").ok().as_deref()==Some("1");
  if r.approvals_enabled!=configured{bail!("approval mode mismatch");}
- enum Collected { Invites(Vec<Invite>), Applications(Vec<Application>), Users(users::Collected), Relays(Vec<relays::Relay>), Policies(policies::Collected), Blocks(Vec<blocks::Row>), Moderation(moderation::Collected), SettingsLists(settings_lists::Collected), FollowRequests(Vec<settings_accounts::FollowRequest>), Featured(Vec<settings_accounts::Featured>,settings_accounts::Owner), Mutes(Vec<settings_accounts::Mute>), Profile(settings_profile::Collected), Links(settings_links::Collected), Ai(settings_ai::Collected), Tokens(settings_security::Tokens), TwoFactor(bool), Aliases(Vec<settings_migration::Alias>), Move(Option<settings_migration::Move>), Stats(stats::Collected), QueueHealth(queue_health::Collected), Downranking(Vec<downranking::Term>) }
+ enum Collected { Invites(Vec<Invite>), Applications(Vec<Application>), Users(users::Collected), Relays(Vec<relays::Relay>), Policies(policies::Collected), Blocks(Vec<blocks::Row>), Moderation(moderation::Collected), SettingsLists(settings_lists::Collected), FollowRequests(Vec<settings_accounts::FollowRequest>), Featured(Vec<settings_accounts::Featured>,settings_accounts::Owner), Mutes(Vec<settings_accounts::Mute>), Profile(settings_profile::Collected), Links(settings_links::Collected), Ai(settings_ai::Collected), Tokens(settings_security::Tokens), TwoFactor(bool), Aliases(Vec<settings_migration::Alias>), Move(Option<settings_migration::Move>), Stats(stats::Collected), QueueHealth(queue_health::Collected), Downranking(Vec<downranking::Term>), Downranked(downranked::Collected) }
  let collected=match r.view{
   View::Invites=>{
    let mut rows=Vec::new();for row in db.query("SELECT jsonb_build_object('id',id::bigint,'code',code,'created_at',created_at,'used_at',used_at,'note',note) FROM ap_invite_codes ORDER BY created_at DESC,id DESC LIMIT 100",&[]).await?{rows.push(serde_json::from_value::<Invite>(row.get(0))?);}
@@ -127,6 +128,7 @@ async fn paint(cfg:&crate::config::Config,r:&Request)->Result<Value>{
   View::Stats=>Collected::Stats(stats::collect(&db,r.now).await?),
   View::QueueHealth=>Collected::QueueHealth(queue_health::collect(&db).await?),
   View::Downranking=>Collected::Downranking(downranking::collect(&db).await?),
+  View::Downranked=>Collected::Downranked(downranked::collect(&db,cfg,r.now).await?),
   View::Approvals=>{
    let mut rows=Vec::new();for row in db.query("SELECT jsonb_build_object('id',id::bigint,'username',username,'email',email,'status',status,'created_at',created_at,'decided_at',decided_at) FROM ap_registration_applications ORDER BY id DESC LIMIT 100 OFFSET $1",&[&r.offset]).await?{rows.push(serde_json::from_value::<Application>(row.get(0))?);}
    Collected::Applications(rows)
@@ -139,6 +141,7 @@ async fn paint(cfg:&crate::config::Config,r:&Request)->Result<Value>{
   Collected::Blocks(rows)=>rows.iter().filter_map(|row|row.warm.clone()).collect(),
   Collected::Mutes(rows)=>rows.iter().filter_map(|row|row.warm.clone()).collect(),
   Collected::Moderation(c)=>c.warm.clone(),
+  Collected::Downranked(c)=>c.warm.clone(),
   _=>Vec::new(),
  };
  let mut warms=tokio::task::JoinSet::new();
@@ -174,6 +177,7 @@ async fn paint(cfg:&crate::config::Config,r:&Request)->Result<Value>{
   Collected::Stats(c)=>stats::paint(c)?,
   Collected::QueueHealth(c)=>queue_health::paint(c,r)?,
   Collected::Downranking(t)=>downranking::paint(t,r)?,
+  Collected::Downranked(c)=>downranked::paint(c,r)?,
  };
  if html.len()>1024*1024 || serde_json::to_vec(&rows)?.len()>512*1024 { bail!("admin response bound"); }
 
@@ -216,11 +220,13 @@ mod stats;
 mod queue_health;
 #[path="admin_downranking.rs"]
 mod downranking;
+#[path="admin_downranked.rs"]
+mod downranked;
 #[cfg(test)]mod tests{
  use super::*;
  #[test]fn strict_admin_read_envelope(){let good=json!({"protocol_version":1,"owner_id":1,"csrf":"session","view":"invites","mode":"full","offset":0,"approvals_enabled":false,"now":100,"php_timezone":"UTC"});assert!(decode(&serde_json::to_vec(&good).unwrap()).is_ok());for(k,v)in[("owner_id",json!(0)),("is_admin",json!(true)),("view",json!("users")),("offset",json!(1)),("csrf",json!("")),("rows",json!([]))]{let mut bad=good.clone();bad[k]=v;assert!(decode(&serde_json::to_vec(&bad).unwrap()).is_err());}}
  #[test]fn relays_envelope_has_no_selectors(){let good=json!({"protocol_version":1,"owner_id":1,"csrf":"session","view":"relays","mode":"shell","offset":0,"approvals_enabled":false,"now":100,"php_timezone":"UTC"});assert!(decode(&serde_json::to_vec(&good).unwrap()).is_ok());for(k,v)in[("offset",json!(1)),("search",json!(""))]{let mut bad=good.clone();bad[k]=v;assert!(decode(&serde_json::to_vec(&bad).unwrap()).is_err());}}
- #[test]fn stats_envelope_has_no_selectors(){for view in["stats","queue_health","downranking"]{let good=json!({"protocol_version":1,"owner_id":1,"csrf":"session","view":view,"mode":"full","offset":0,"approvals_enabled":false,"now":100,"php_timezone":"UTC"});assert!(decode(&serde_json::to_vec(&good).unwrap()).is_ok());for(k,v)in[("offset",json!(1)),("search",json!("")),("viewer_admin",json!(true)),("filter",json!("open"))]{let mut bad=good.clone();bad[k]=v;assert!(decode(&serde_json::to_vec(&bad).unwrap()).is_err(),"{view} {k}");}}}
+ #[test]fn stats_envelope_has_no_selectors(){for view in["stats","queue_health","downranking","downranked"]{let good=json!({"protocol_version":1,"owner_id":1,"csrf":"session","view":view,"mode":"full","offset":0,"approvals_enabled":false,"now":100,"php_timezone":"UTC"});assert!(decode(&serde_json::to_vec(&good).unwrap()).is_ok());for(k,v)in[("offset",json!(1)),("search",json!("")),("viewer_admin",json!(true)),("filter",json!("open"))]{let mut bad=good.clone();bad[k]=v;assert!(decode(&serde_json::to_vec(&bad).unwrap()).is_err(),"{view} {k}");}}}
  #[test]fn policies_envelope_has_no_selectors(){let good=json!({"protocol_version":1,"owner_id":1,"csrf":"session","view":"policies","mode":"full","offset":0,"approvals_enabled":false,"now":100,"php_timezone":"UTC"});assert!(decode(&serde_json::to_vec(&good).unwrap()).is_ok());for(k,v)in[("offset",json!(1)),("search",json!(""))]{let mut bad=good.clone();bad[k]=v;assert!(decode(&serde_json::to_vec(&bad).unwrap()).is_err());}}
  #[test]fn settings_lists_envelope_needs_viewer_role(){let good=json!({"protocol_version":1,"owner_id":2,"csrf":"session","view":"settings_lists","mode":"full","offset":0,"approvals_enabled":false,"now":100,"php_timezone":"UTC","viewer_admin":false});assert!(decode(&serde_json::to_vec(&good).unwrap()).is_ok());for(k,v)in[("offset",json!(1)),("search",json!("")),("viewer_admin",Value::Null)]{let mut bad=good.clone();bad[k]=v;assert!(decode(&serde_json::to_vec(&bad).unwrap()).is_err());}let mut admin_view=good.clone();admin_view["view"]=json!("blocks");assert!(decode(&serde_json::to_vec(&admin_view).unwrap()).is_err());}
  #[test]fn personal_row_models_are_closed(){assert!(serde_json::from_value::<settings_lists::UserBlock>(json!({"id":1,"scope":"actor","value":"x","kind":"block","reason":null,"created_at":"a","owner_user_id":2})).is_err());assert!(serde_json::from_value::<settings_lists::MutedWord>(json!({"id":1,"phrase":"x","created_at":"a","note":null,"owner_user_id":2})).is_err());}
