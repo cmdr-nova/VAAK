@@ -8,7 +8,8 @@
 //! from ap_instance_doc_save and ap_instance_rules_save_from_text. A10c is
 //! moderation reports: report_note, report_dismiss, report_ignore and
 //! report_reopen, copied from ap_report_set_state and
-//! ap_report_append_admin_note.
+//! ap_report_append_admin_note. A10d is user_ban and user_unban, copied from
+//! ap_auth_user_set_disabled.
 //!
 //! PHP keeps the session, CSRF, the admin-only gate, the notice text and the
 //! page. The worker checks again inside its write transaction that the account
@@ -41,6 +42,8 @@ enum Action {
  #[serde(rename="report_dismiss")]ReportDismiss(Report),
  #[serde(rename="report_ignore")]ReportIgnore(Report),
  #[serde(rename="report_reopen")]ReportReopen(Report),
+ #[serde(rename="user_ban")]UserBan(UserTarget),
+ #[serde(rename="user_unban")]UserUnban(UserTarget),
 }
 #[derive(Debug,Deserialize)]#[serde(deny_unknown_fields)]struct TermAdd {phrase:String,category:String}
 #[derive(Debug,Deserialize)]#[serde(deny_unknown_fields)]struct TermDelete {term_id:i64}
@@ -49,14 +52,17 @@ enum Action {
 #[derive(Debug,Deserialize)]#[serde(deny_unknown_fields)]struct DocSave {title:String,body:String}
 #[derive(Debug,Deserialize)]#[serde(deny_unknown_fields)]struct RulesSave {rules_text:String}
 #[derive(Debug,Deserialize)]#[serde(deny_unknown_fields)]struct Report {report_id:i64,admin_note:String,admin_handle:String}
+#[derive(Debug,Deserialize)]#[serde(deny_unknown_fields)]struct UserTarget {user_id:i64}
 impl Action {
  fn name(&self)->&'static str{match self{Action::TermAdd(_)=>"downrank_term_add",Action::TermDelete(_)=>"downrank_term_delete",Action::SignalClear(_)=>"downrank_signal_clear",Action::TermPreview(_)=>"downrank_term_preview",
   Action::SavePrivacy(_)=>"policies_save_privacy",Action::SaveConduct(_)=>"policies_save_conduct",Action::SaveRules(_)=>"policies_save_rules",
-  Action::ReportNote(_)=>"report_note",Action::ReportDismiss(_)=>"report_dismiss",Action::ReportIgnore(_)=>"report_ignore",Action::ReportReopen(_)=>"report_reopen"}}
+  Action::ReportNote(_)=>"report_note",Action::ReportDismiss(_)=>"report_dismiss",Action::ReportIgnore(_)=>"report_ignore",Action::ReportReopen(_)=>"report_reopen",
+  Action::UserBan(_)=>"user_ban",Action::UserUnban(_)=>"user_unban"}}
  fn family_enabled(&self)->bool{
   let switch=match self{Action::TermAdd(_)|Action::TermDelete(_)|Action::SignalClear(_)|Action::TermPreview(_)=>"VAAK_ADMIN_DOWNRANKING_ACTIONS_NATIVE",
    Action::SavePrivacy(_)|Action::SaveConduct(_)|Action::SaveRules(_)=>"VAAK_ADMIN_POLICIES_ACTIONS_NATIVE",
-   Action::ReportNote(_)|Action::ReportDismiss(_)|Action::ReportIgnore(_)|Action::ReportReopen(_)=>"VAAK_ADMIN_REPORTS_ACTIONS_NATIVE"};
+   Action::ReportNote(_)|Action::ReportDismiss(_)|Action::ReportIgnore(_)|Action::ReportReopen(_)=>"VAAK_ADMIN_REPORTS_ACTIONS_NATIVE",
+   Action::UserBan(_)|Action::UserUnban(_)=>"VAAK_ADMIN_USERS_ACTIONS_NATIVE"};
   std::env::var(switch).ok().as_deref()==Some("1")
  }
 }
@@ -215,6 +221,26 @@ async fn run(cfg:&crate::config::Config,r:&Request)->Result<Value>{
    tx.commit().await?;
    Ok(reply(r,"state_set",Value::Null,false))
   },
+  Action::UserBan(a)|Action::UserUnban(a)=>{
+   let disable=matches!(r.action,Action::UserBan(_));
+   if a.user_id<1{return Ok(reply(r,"invalid_user",Value::Null,false));}
+   let tx=admin_tx(&mut db,r).await?;
+   int4_guard(&tx,"ap_users",a.user_id).await?;
+   // The target row is locked so its role cannot change between the check and the update.
+   let Some(row)=tx.query_opt("SELECT actor_key::text, COALESCE(is_admin,0)<>0 FROM ap_users WHERE id::bigint = $1 LIMIT 1 FOR UPDATE",&[&a.user_id]).await? else {
+    return Ok(reply(r,"user_not_found",Value::Null,false));
+   };
+   if row.get::<_,Option<String>>(0).as_deref()==Some("cmdr_nova")||row.get::<_,bool>(1){return Ok(reply(r,"protected_user",Value::Null,false));}
+   let now=now_c();
+   let when=disable.then(||now.clone());
+   tx.execute("UPDATE ap_users SET disabled_at = $1, updated_at = $2 WHERE id::bigint = $3",&[&when,&now,&a.user_id]).await?;
+   if disable{
+    // Cut off API clients immediately as well as blocking future web logins.
+    tx.execute("UPDATE oauth_tokens SET revoked_at = $1 WHERE user_id::bigint = $2 AND revoked_at IS NULL",&[&now,&a.user_id]).await?;
+   }
+   tx.commit().await?;
+   Ok(reply(r,if disable{"banned"}else{"unbanned"},Value::Null,false))
+  },
  }
 }
 /// trim($note) and mb_substr($note, 0, 5000).
@@ -234,12 +260,13 @@ async fn report_handle_check(tx:&tokio_postgres::Transaction<'_>,r:&Request,hand
  if handle!=want{bail!("PHP fallback: admin handle differs from the account");}
  Ok(())
 }
-/// PHP binds the id as text; past int4 an INTEGER column raises, which PHP
-/// reports as its own error.
-async fn report_id_check(tx:&tokio_postgres::Transaction<'_>,id:i64)->Result<()>{
+async fn report_id_check(tx:&tokio_postgres::Transaction<'_>,id:i64)->Result<()>{int4_guard(tx,"ap_reports",id).await}
+/// PHP binds an id as text; past int4 an INTEGER id column raises, which PHP
+/// reports its own way (or not at all), so those ids stay in PHP.
+async fn int4_guard(tx:&tokio_postgres::Transaction<'_>,table:&'static str,id:i64)->Result<()>{
  if id>i64::from(i32::MAX){
-  let kind:String=tx.query_one("SELECT format_type(atttypid, atttypmod) FROM pg_attribute WHERE attrelid = 'ap_reports'::regclass AND attname = 'id'",&[]).await?.get(0);
-  if kind!="bigint"{bail!("PHP fallback: report id past int4");}
+  let kind:String=tx.query_one("SELECT format_type(atttypid, atttypmod) FROM pg_attribute WHERE attrelid = $1::text::regclass AND attname = 'id'",&[&table]).await?.get(0);
+  if kind!="bigint"{bail!("PHP fallback: {table} id past int4");}
  }
  Ok(())
 }
@@ -318,7 +345,8 @@ mod tests{
    let mut extra=f.clone();extra["is_admin"]=json!(true);assert!(decode(&serde_json::to_vec(&env(a,extra)).unwrap()).is_err(),"{a} extra field");
    let mut top=env(a,f.clone());top["csrf"]=json!("x");assert!(decode(&serde_json::to_vec(&top).unwrap()).is_err(),"{a} extra key");
   }
-  assert!(decode(&serde_json::to_vec(&env("user_ban",json!({"user_id":2}))).unwrap()).is_err());
+  assert!(decode(&serde_json::to_vec(&env("relay_remove",json!({"relay_id":2}))).unwrap()).is_err());
+  assert!(decode(&serde_json::to_vec(&env("user_ban",json!({"user_id":2}))).unwrap()).is_ok());
   assert!(decode(&serde_json::to_vec(&env("downrank_term_delete",json!({"term_id":"3"}))).unwrap()).is_err());
   let mut zero=env("downrank_term_delete",json!({"term_id":3}));zero["owner_id"]=json!(0);assert!(decode(&serde_json::to_vec(&zero).unwrap()).is_err());
  }

@@ -280,6 +280,7 @@ function ap_admin_action_native(string $action,int $owner,string $actorKey,array
         'policies_save_rules'=>['VAAK_ADMIN_POLICIES_ACTIONS_NATIVE',['rules_text'=>'string']]];
     foreach(['report_note','report_dismiss','report_ignore','report_reopen'] as $reportAction)
         $families[$reportAction]=['VAAK_ADMIN_REPORTS_ACTIONS_NATIVE',['report_id'=>'integer','admin_note'=>'string','admin_handle'=>'string']];
+    $families['user_ban']=$families['user_unban']=['VAAK_ADMIN_USERS_ACTIONS_NATIVE',['user_id'=>'integer']];
     if(!isset($families[$action]) || !ap_admin_native_enabled() || getenv($families[$action][0])!=='1' || $owner<1 || $actorKey==='')return null;
     $shape=$families[$action][1];if(array_keys($fields)!==array_keys($shape))return null;
     foreach($shape as $key=>$type)if(gettype($fields[$key])!==$type)return null;
@@ -313,7 +314,8 @@ function ap_admin_action_native_reply(mixed $reply,string $action,int $owner,str
         'policies_save_privacy'=>['doc_saved','title_too_long','body_too_long'],'policies_save_conduct'=>['doc_saved','title_too_long','body_too_long'],
         'policies_save_rules'=>['rules_saved','rule_too_long','too_many_rules','no_rules'],
         'report_note'=>['note_saved','note_empty','note_report_not_found'],'report_dismiss'=>['state_set','report_not_found'],
-        'report_ignore'=>['state_set','report_not_found'],'report_reopen'=>['state_set','report_not_found']];
+        'report_ignore'=>['state_set','report_not_found'],'report_reopen'=>['state_set','report_not_found'],
+        'user_ban'=>['banned','invalid_user','user_not_found','protected_user'],'user_unban'=>['unbanned','invalid_user','user_not_found','protected_user']];
     if(!in_array($reply['outcome'],$outcomes[$action]??[],true))return null;
     if($reply['outcome']==='rules_saved'){if(!is_int($reply['count']) || $reply['count']<1 || $reply['count']>40)return null;}
     elseif($reply['count']!==null)return null;
