@@ -111,6 +111,7 @@ function vaak_migrate_deploy_sql_files(string $apiRoot): array
         '20261014_event_quote_targets_postgres.sql',
         '20261016_wafrn_bsky_actors_postgres.sql',
         '20261019_phyrian_grid_lineage_postgres.sql',
+        '20261021_bsky_follow_carry_postgres.sql',
     ];
     $files = [];
     $migrations = $root . DIRECTORY_SEPARATOR . 'migrations' . DIRECTORY_SEPARATOR;

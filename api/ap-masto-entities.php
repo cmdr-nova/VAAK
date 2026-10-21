@@ -8040,6 +8040,13 @@ function ap_masto_notifications_fetch(int $limit = 40, ?string $maxId = null, ?s
                 && $fa !== '' && $followerSet !== [] && empty($followerSet[$fa])) {
                 continue;
             }
+            // A linked VAAK user's Bluesky twin following too is not news.
+            if ($action === $bskyFollowAction && $fa !== '' && function_exists('ap_bsky_twin_local_actor_id')) {
+                $twin = ap_bsky_twin_local_actor_id($fa);
+                if ($twin !== '' && !empty($followerSet[$twin])) {
+                    continue;
+                }
+            }
             $nid = 1000000 + (int) $row['id'];
             $items[] = [
                 'sort' => strtotime((string) ($row['created_at'] ?? '')) ?: $nid,
@@ -8598,6 +8605,12 @@ function ap_masto_notifications_unread_state(int $scan = 80, bool $bypassCache =
             if ($action === 'local_accept_followback'
                 && $fa !== '' && $followerSet !== [] && empty($followerSet[$fa])) {
                 continue;
+            }
+            if ($action === $bskyFollowAction && $fa !== '' && function_exists('ap_bsky_twin_local_actor_id')) {
+                $twin = ap_bsky_twin_local_actor_id($fa);
+                if ($twin !== '' && !empty($followerSet[$twin])) {
+                    continue;
+                }
             }
             if ($fa !== '' && function_exists('ap_row_is_hidden')
                 && ap_row_is_hidden($fa, null, $ownerUserId)) {

@@ -2282,13 +2282,98 @@ function ap_bsky_create_account(
         return ['ok' => false, 'error' => 'The PDS account was created, but VAAK could not save its connection. Contact the operator before retrying.'];
     }
     $sync = ap_bsky_sync_profile_from_vaak($ownerUserId);
+    $carried = ap_bsky_follow_carry_enqueue($ownerUserId, $did);
     return [
         'ok' => true,
         'handle' => $actualHandle,
         'did' => $did,
         'profile_synced' => !empty($sync['ok']),
         'profile_sync_error' => empty($sync['ok']) ? (string) ($sync['error'] ?? '') : '',
+        'carried_follows' => $carried,
     ];
+}
+
+/**
+ * Whether this user wants to follow, on Bluesky, the people they follow on
+ * VAAK when those people create a VAAK Bluesky account. Off by default: the
+ * follow is a record in this user's own repo, so only they can opt in.
+ * The table ships in api/migrations/20261021_bsky_follow_carry_postgres.sql;
+ * until it exists this reads as off.
+ */
+function ap_bsky_follow_carry_enabled(int $ownerUserId): bool
+{
+    if ($ownerUserId < 1) return false;
+    try {
+        $st = ap_db()->prepare('SELECT 1 FROM bsky_follow_carry_optin WHERE owner_user_id = ? LIMIT 1');
+        $st->execute([$ownerUserId]);
+        return $st->fetchColumn() !== false;
+    } catch (Throwable $e) {
+        return false;
+    }
+}
+
+/** @return array{ok:bool,error?:string} */
+function ap_bsky_follow_carry_set(int $ownerUserId, bool $enabled): array
+{
+    if ($ownerUserId < 1) return ['ok' => false, 'error' => 'Not signed in'];
+    try {
+        $db = ap_db();
+        if ($enabled) {
+            $db->prepare('INSERT INTO bsky_follow_carry_optin (owner_user_id, enabled_at) VALUES (?, ?) ON CONFLICT (owner_user_id) DO NOTHING')
+                ->execute([$ownerUserId, gmdate('c')]);
+        } else {
+            $db->prepare('DELETE FROM bsky_follow_carry_optin WHERE owner_user_id = ?')->execute([$ownerUserId]);
+        }
+        return ['ok' => true];
+    } catch (Throwable $e) {
+        error_log('[ap-bsky] follow carry setting: ' . $e->getMessage());
+        return ['ok' => false, 'error' => 'This setting is not available until the next deploy migration runs.'];
+    }
+}
+
+/**
+ * A VAAK user just created a Bluesky account with $did. Queue a Bluesky
+ * follow of it for each local VAAK follower who has Bluesky connected and
+ * opted in. The follows go through ap_action_queue so the account creation
+ * request never waits on other users' PDS writes, and failures retry.
+ *
+ * @return int follows queued
+ */
+function ap_bsky_follow_carry_enqueue(int $newOwnerUserId, string $did): int
+{
+    $did = trim($did);
+    if ($newOwnerUserId < 1 || !str_starts_with($did, 'did:')) return 0;
+    if (!function_exists('ap_action_queue_enqueue')) require_once __DIR__ . '/ap-action-queue.php';
+    try {
+        $db = ap_db();
+        $st = $db->prepare('SELECT actor_id FROM ap_users WHERE id = ? LIMIT 1');
+        $st->execute([$newOwnerUserId]);
+        $actorId = rtrim((string) ($st->fetchColumn() ?: ''), '/');
+        if ($actorId === '') return 0;
+        // Accepted local followers only; pending requests live in ap_follow_requests.
+        $st = $db->prepare(
+            "SELECT DISTINCT u.id, s.did
+             FROM followers f
+             JOIN ap_users u ON u.actor_id = f.actor_id OR u.actor_id || '/' = f.actor_id
+             JOIN bsky_sessions s ON s.owner_user_id = u.id
+             JOIN bsky_follow_carry_optin o ON o.owner_user_id = u.id
+             WHERE (f.owner_actor_id = ? OR f.owner_actor_id = ?)
+               AND u.id <> ? AND u.disabled_at IS NULL"
+        );
+        $st->execute([$actorId, $actorId . '/', $newOwnerUserId]);
+        $rows = $st->fetchAll();
+    } catch (Throwable $e) {
+        error_log('[ap-bsky] follow carry lookup: ' . $e->getMessage());
+        return 0;
+    }
+    $queued = 0;
+    foreach ($rows ?: [] as $row) {
+        $followerId = (int) ($row['id'] ?? 0);
+        if ($followerId < 1 || (string) ($row['did'] ?? '') === $did) continue;
+        $q = ap_action_queue_enqueue($followerId, 'bsky', 'follow', $did, true, ['actor' => $did, 'source' => 'local_follow_carry']);
+        if (!empty($q['ok'])) $queued++;
+    }
+    return $queued;
 }
 
 /** Read the local PDS admin credentials without exposing them to callers. */
@@ -5754,6 +5839,44 @@ function ap_bsky_admin_follower_rows(int $ownerUserId, string $ownerActorId): ar
     return $out;
 }
 
+/**
+ * Local VAAK actor whose connected Bluesky account is $actorRef
+ * (https://bsky.app/profile/{handle|did}, a handle, or a DID), or ''.
+ * Used to count a linked VAAK + Bluesky pair as one person.
+ */
+function ap_bsky_twin_local_actor_id(string $actorRef): string
+{
+    $ref = rtrim(trim($actorRef), '/');
+    if (preg_match('~^https://bsky\.app/profile/([^/?#]+)$~i', $ref, $m)) {
+        $ref = rawurldecode($m[1]);
+    } elseif (str_starts_with($ref, 'https://')) {
+        return '';
+    }
+    $ref = strtolower(ltrim($ref, '@'));
+    if ($ref === '') return '';
+    static $twins = null;
+    if ($twins === null) {
+        $twins = [];
+        try {
+            $st = ap_db()->query(
+                'SELECT s.handle, s.did, u.actor_id FROM bsky_sessions s
+                 JOIN ap_users u ON u.id = s.owner_user_id'
+            );
+            foreach ($st ? $st->fetchAll() : [] as $row) {
+                $local = rtrim((string) ($row['actor_id'] ?? ''), '/');
+                if ($local === '') continue;
+                foreach (['handle', 'did'] as $col) {
+                    $k = strtolower(trim((string) ($row[$col] ?? '')));
+                    if ($k !== '') $twins[$k] = $local;
+                }
+            }
+        } catch (Throwable $e) {
+            $twins = [];
+        }
+    }
+    return $twins[$ref] ?? '';
+}
+
 function ap_bsky_merge_follow_rows(array $base, array $extra): array
 {
     $seen = [];
@@ -5777,6 +5900,40 @@ function ap_bsky_merge_follow_rows(array $base, array $extra): array
         return $tb <=> $ta;
     });
     return $base;
+}
+
+/**
+ * For the "All" Followers/Following list: drop a Bluesky row when the same
+ * person's local VAAK account is already in $rows, so a linked pair lists
+ * once. The Fediverse and Bluesky tabs, and relationship id sets, keep both.
+ *
+ * @param list<array<string,mixed>> $rows
+ * @return list<array<string,mixed>>
+ */
+function ap_bsky_collapse_twin_rows(array $rows): array
+{
+    $local = [];
+    foreach ($rows as $row) {
+        $aid = rtrim((string) ($row['actor_id'] ?? ''), '/');
+        if (str_starts_with($aid, 'https://mkultra.monster/users/')) {
+            $local[$aid] = true;
+        }
+    }
+    if ($local === []) {
+        return array_values($rows);
+    }
+    $out = [];
+    foreach ($rows as $row) {
+        $aid = rtrim((string) ($row['actor_id'] ?? ''), '/');
+        if (str_starts_with($aid, 'https://bsky.app/profile/')) {
+            $twin = ap_bsky_twin_local_actor_id($aid);
+            if ($twin !== '' && isset($local[$twin])) {
+                continue;
+            }
+        }
+        $out[] = $row;
+    }
+    return $out;
 }
 
 /** Queue connected-profile public counts without making profile HTML wait on XRPC. */
@@ -13679,6 +13836,21 @@ function ap_bsky_ingest_follow_notification(
     }
 
     $pushed = false;
+    // Mentions hides a linked VAAK user's Bluesky twin follow when their local
+    // account already follows; do not push it either.
+    $twin = ap_bsky_twin_local_actor_id($actorId);
+    if ($pushNew && $twin !== '') {
+        try {
+            $owner = rtrim($ownerActorId, '/');
+            $tw = ap_db()->prepare('SELECT 1 FROM followers WHERE (owner_actor_id = ? OR owner_actor_id = ?) AND (actor_id = ? OR actor_id = ?) LIMIT 1');
+            $tw->execute([$owner, $owner . '/', $twin, $twin . '/']);
+            if ($tw->fetchColumn() !== false) {
+                $pushNew = false;
+            }
+        } catch (Throwable $e) {
+            // push as before
+        }
+    }
     if ($pushNew && function_exists('ap_webpush_notify_event')) {
         $nid = null;
         try {

@@ -163,6 +163,23 @@ pub async fn compute_unread(db: &Client, owner_user_id: i64, scan: i64) -> Resul
         }
     }
 
+    // Linked VAAK user -> Bluesky account (PHP ap_bsky_twin_local_actor_id).
+    let twin_rows = db.query(
+        "SELECT s.handle, s.did, u.actor_id FROM bsky_sessions s JOIN ap_users u ON u.id = s.owner_user_id",
+        &[],
+    ).await.context("select linked bluesky accounts")?;
+    let mut twins = std::collections::HashMap::new();
+    for row in twin_rows {
+        let local: Option<String> = row.try_get(2)?;
+        let local = local.unwrap_or_default().trim_end_matches('/').to_string();
+        if local.is_empty() { continue; }
+        for col in 0..2 {
+            let key: Option<String> = row.try_get(col)?;
+            let key = key.unwrap_or_default().trim().to_lowercase();
+            if !key.is_empty() { twins.insert(key, local.clone()); }
+        }
+    }
+
     let follow_rows = db
         .query(
             "SELECT id::bigint, created_at, actor_id, action_taken FROM events
@@ -187,6 +204,14 @@ pub async fn compute_unread(db: &Client, owner_user_id: i64, scan: i64) -> Resul
         if action == "local_accept_followback" && !actor_id.is_empty()
             && !followers.is_empty() && !followers.contains(&actor_id) {
             continue;
+        }
+        // A linked VAAK user's Bluesky twin following too is not news.
+        if action == "bsky_follow" {
+            if let Some(local) = bsky_twin_local_actor(&actor_id, &twins) {
+                if followers.contains(local) {
+                    continue;
+                }
+            }
         }
         // Skip self.
         if !actor_id.is_empty() && actor_id == owner_actor_trim {
@@ -340,6 +365,20 @@ fn mention_notif_type(
 }
 
 /// PHP `ap_masto_snowflake_id`: seconds * 1e9 + (type%10)*1e8 + (dbId%1e8).
+/// Local actor whose connected Bluesky account is `actor_id`
+/// (`https://bsky.app/profile/{handle|did}`), keyed by lowercase handle/DID.
+fn bsky_twin_local_actor<'a>(
+    actor_id: &str,
+    twins: &'a std::collections::HashMap<String, String>,
+) -> Option<&'a String> {
+    let rest = actor_id.trim_end_matches('/').strip_prefix("https://bsky.app/profile/")?;
+    if rest.is_empty() || rest.contains(['/', '?', '#']) {
+        return None;
+    }
+    let decoded = rest.replace("%3A", ":").replace("%3a", ":");
+    twins.get(&decoded.trim_start_matches('@').to_lowercase())
+}
+
 pub fn snowflake_id(created_at: Option<&str>, db_id: i64, type_num: i64) -> String {
     let secs = created_at
         .and_then(parse_epoch_secs)
@@ -617,6 +656,18 @@ pub async fn run_loop(
 #[cfg(test)]
 mod tests {
     use super::{snowflake_id, snowflake_is_unread};
+
+    #[test]
+    fn bluesky_twin_maps_handle_and_did_to_local_actor() {
+        let mut twins = std::collections::HashMap::new();
+        twins.insert("valerie.bsky.mkultra.monster".to_string(), "https://mkultra.monster/users/cmdr_nova".to_string());
+        twins.insert("did:plc:abc".to_string(), "https://mkultra.monster/users/cmdr_nova".to_string());
+        let local = "https://mkultra.monster/users/cmdr_nova";
+        assert_eq!(super::bsky_twin_local_actor("https://bsky.app/profile/Valerie.bsky.mkultra.monster", &twins).map(String::as_str), Some(local));
+        assert_eq!(super::bsky_twin_local_actor("https://bsky.app/profile/did%3Aplc%3Aabc/", &twins).map(String::as_str), Some(local));
+        assert!(super::bsky_twin_local_actor("https://bsky.app/profile/someone.bsky.social", &twins).is_none());
+        assert!(super::bsky_twin_local_actor("https://mkultra.monster/users/cmdr_nova", &twins).is_none());
+    }
 
     #[test]
     fn snowflake_matches_php_shape() {

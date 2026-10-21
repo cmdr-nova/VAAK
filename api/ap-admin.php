@@ -4174,7 +4174,7 @@ $vaakAdminOnlyActions = [
             echo json_encode($ajaxOut, JSON_UNESCAPED_SLASHES);
             exit;
         }
-    } elseif ($action === 'bsky_create_account' || $action === 'bsky_connect' || $action === 'bsky_disconnect' || $action === 'bsky_sync_profile' || $action === 'bsky_refresh_follow_sync') {
+    } elseif ($action === 'bsky_create_account' || $action === 'bsky_connect' || $action === 'bsky_disconnect' || $action === 'bsky_sync_profile' || $action === 'bsky_refresh_follow_sync' || $action === 'bsky_follow_carry_save') {
         $view = preg_replace('/[^a-z_]/', '', (string) ($_POST['return_view'] ?? 'profile')) ?: 'profile';
         if (!function_exists('ap_bsky_tab_enabled') || !ap_bsky_tab_enabled()) {
             $error = 'Bluesky tab is disabled on this instance.';
@@ -4191,8 +4191,25 @@ $vaakAdminOnlyActions = [
                 if (!empty($res['profile_synced'])) {
                     $notice .= ' Your VAAK avatar, header, and bio were synced.';
                 }
+                $carried = (int) ($res['carried_follows'] ?? 0);
+                if ($carried > 0) {
+                    $notice .= ' ' . number_format($carried) . ($carried === 1 ? ' VAAK follower' : ' VAAK followers')
+                        . ' will follow you on Bluesky shortly.';
+                }
             } else {
                 $error = $res['error'] ?? 'Could not create the VAAK Bluesky account.';
+            }
+        } elseif ($action === 'bsky_follow_carry_save') {
+            $carryOn = !empty($_POST['bsky_follow_carry']);
+            $res = function_exists('ap_bsky_follow_carry_set')
+                ? ap_bsky_follow_carry_set($vaakOwnerId, $carryOn)
+                : ['ok' => false, 'error' => 'Bluesky follow carry unavailable.'];
+            if (!empty($res['ok'])) {
+                $notice = $carryOn
+                    ? 'You will follow people you follow on VAAK when they create a VAAK Bluesky account.'
+                    : 'New VAAK Bluesky accounts will no longer be followed for you.';
+            } else {
+                $error = $res['error'] ?? 'Could not save the setting.';
             }
         } elseif ($action === 'bsky_disconnect') {
             ap_bsky_disconnect($vaakOwnerId);
@@ -6068,7 +6085,7 @@ function admin_follow_rows_for_network(array $rows, string $network): array
     if ($network === 'fedi') {
         return array_values(array_filter($rows, static fn(array $r): bool => ($r['host'] ?? '') !== 'bsky.app' && !str_contains((string) ($r['actor_id'] ?? ''), 'bsky.app')));
     }
-    return $rows;
+    return function_exists('ap_bsky_collapse_twin_rows') ? ap_bsky_collapse_twin_rows($rows) : $rows;
 }
 
 /** @return list<array<string,mixed>> */
@@ -7572,7 +7589,8 @@ if (isset($_GET['partial'], $_GET['shell'])
         $rowsSrc = $view === 'followers' ? $followers : $following;
         $followNet = $shellNet;
         $followLimit = 40;
-        $filtered = $rowsSrc;
+        $filtered = function_exists('ap_bsky_collapse_twin_rows') ? ap_bsky_collapse_twin_rows($rowsSrc) : $rowsSrc;
+        $nAll = count($filtered);
         if ($followNet === 'bsky') {
             $filtered = array_values(array_filter($rowsSrc, static fn(array $r): bool => ($r['host'] ?? '') === 'bsky.app' || str_contains((string) ($r['actor_id'] ?? ''), 'bsky.app')));
         } elseif ($followNet === 'fedi') {
@@ -7580,9 +7598,8 @@ if (isset($_GET['partial'], $_GET['shell'])
         }
         $shown = array_slice($filtered, 0, $followLimit);
         $shown = admin_follow_rows_resolve_bsky_handles($shown, $vaakOwnerId);
-        $nAll = count($rowsSrc);
         $nBsky = count(array_filter($rowsSrc, static fn(array $r): bool => ($r['host'] ?? '') === 'bsky.app' || str_contains((string) ($r['actor_id'] ?? ''), 'bsky.app')));
-        $nFedi = $nAll - $nBsky;
+        $nFedi = count($rowsSrc) - $nBsky;
         echo '<nav class="notification-tabs" aria-label="' . h($shellTitle) . ' network" style="display:flex;gap:.5rem;flex-wrap:wrap;margin:0 0 1rem">';
         foreach (['all' => ['All', $nAll], 'fedi' => ['Fediverse', $nFedi], 'bsky' => ['Bluesky', $nBsky]] as $netKey => $netMeta) {
             echo '<a class="btn ' . ($followNet === $netKey ? 'btn-primary' : 'btn-ghost')
@@ -32203,6 +32220,19 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
                 <button class="btn btn-ghost" type="submit">Disconnect Bluesky</button>
               </form>
             </div>
+            <?php $bskyFollowCarry = function_exists('ap_bsky_follow_carry_enabled') && ap_bsky_follow_carry_enabled($vaakOwnerId); ?>
+            <form method="post" action="?view=atmosphere" style="margin-top:1rem">
+              <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
+              <input type="hidden" name="action" value="bsky_follow_carry_save">
+              <input type="hidden" name="return_view" value="atmosphere">
+              <label style="display:flex;gap:.5rem;align-items:flex-start;line-height:1.45">
+                <input type="checkbox" name="bsky_follow_carry" value="1" <?= $bskyFollowCarry ? 'checked' : '' ?> style="margin-top:.2rem">
+                <span>When someone I follow on VAAK creates a VAAK Bluesky account, follow them on Bluesky too.</span>
+              </label>
+              <div class="composer-actions" style="margin-top:.5rem">
+                <button class="btn btn-ghost" type="submit">Save</button>
+              </div>
+            </form>
             <form class="composer" method="post" action="?view=atmosphere" style="margin-top:1rem">
               <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
               <input type="hidden" name="action" value="bsky_connect">
@@ -33629,7 +33659,8 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
               $followNet = 'all';
           }
           $followLimit = 40;
-          $followersFiltered = $followers;
+          $followersFiltered = function_exists('ap_bsky_collapse_twin_rows') ? ap_bsky_collapse_twin_rows($followers) : $followers;
+          $followersTwins = count($followers) - count($followersFiltered);
           if ($followNet === 'bsky') {
               $followersFiltered = array_values(array_filter($followers, static fn(array $r): bool => ($r['host'] ?? '') === 'bsky.app' || str_contains((string) ($r['actor_id'] ?? ''), 'bsky.app')));
           } elseif ($followNet === 'fedi') {
@@ -33642,13 +33673,13 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
                   . '" data-vaak-soft-nav="' . h($viewName) . '" data-follow-network="' . h($net)
                   . '" style="padding:.3rem .7rem;font-size:.82rem">' . h($label) . ' <span class="meta">(' . $count . ')</span></a>';
           };
-          $nAll = is_array($followersShadow) ? (int) ($followersShadow['total'] ?? count($followers)) : count($followers);
+          $nAll = (is_array($followersShadow) ? (int) ($followersShadow['total'] ?? count($followers)) : count($followers)) - $followersTwins;
           $nBsky = is_array($followersShadow)
               ? (int) ($followersShadow['bsky_count'] ?? 0)
               : count(array_filter($followers, static fn(array $r): bool => ($r['host'] ?? '') === 'bsky.app' || str_contains((string) ($r['actor_id'] ?? ''), 'bsky.app')));
           $nFedi = is_array($followersShadow)
-              ? (int) ($followersShadow['fedi_count'] ?? max(0, $nAll - $nBsky))
-              : $nAll - $nBsky;
+              ? (int) ($followersShadow['fedi_count'] ?? max(0, $nAll + $followersTwins - $nBsky))
+              : $nAll + $followersTwins - $nBsky;
         ?>
         <nav class="notification-tabs" aria-label="Follower network" style="display:flex;gap:.5rem;flex-wrap:wrap;margin:0 0 1rem">
           <?= $followTab('followers', 'all', 'All', $nAll, $followNet) ?>
@@ -33683,20 +33714,21 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
               $followNet = 'all';
           }
           $followLimit = 40;
-          $followingFiltered = $following;
+          $followingFiltered = function_exists('ap_bsky_collapse_twin_rows') ? ap_bsky_collapse_twin_rows($following) : $following;
+          $followingTwins = count($following) - count($followingFiltered);
           if ($followNet === 'bsky') {
               $followingFiltered = array_values(array_filter($following, static fn(array $r): bool => ($r['host'] ?? '') === 'bsky.app' || str_contains((string) ($r['actor_id'] ?? ''), 'bsky.app')));
           } elseif ($followNet === 'fedi') {
               $followingFiltered = array_values(array_filter($following, static fn(array $r): bool => ($r['host'] ?? '') !== 'bsky.app' && !str_contains((string) ($r['actor_id'] ?? ''), 'bsky.app')));
           }
           $followingShown = admin_follow_rows_resolve_bsky_handles(array_slice($followingFiltered, 0, $followLimit), $vaakOwnerId);
-          $nAll = is_array($followingShadow) ? (int) ($followingShadow['total'] ?? count($following)) : count($following);
+          $nAll = (is_array($followingShadow) ? (int) ($followingShadow['total'] ?? count($following)) : count($following)) - $followingTwins;
           $nBsky = is_array($followingShadow)
               ? (int) ($followingShadow['bsky_count'] ?? 0)
               : count(array_filter($following, static fn(array $r): bool => ($r['host'] ?? '') === 'bsky.app' || str_contains((string) ($r['actor_id'] ?? ''), 'bsky.app')));
           $nFedi = is_array($followingShadow)
-              ? (int) ($followingShadow['fedi_count'] ?? max(0, $nAll - $nBsky))
-              : $nAll - $nBsky;
+              ? (int) ($followingShadow['fedi_count'] ?? max(0, $nAll + $followingTwins - $nBsky))
+              : $nAll + $followingTwins - $nBsky;
         ?>
         <nav class="notification-tabs" aria-label="Following network" style="display:flex;gap:.5rem;flex-wrap:wrap;margin:0 0 1rem">
           <a class="btn <?= $followNet === 'all' ? 'btn-primary' : 'btn-ghost' ?>" href="?view=following&amp;network=all" data-vaak-soft-nav="following" data-follow-network="all" style="padding:.3rem .7rem;font-size:.82rem">All <span class="meta">(<?= $nAll ?>)</span></a>

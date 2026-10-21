@@ -41,6 +41,7 @@ $check(
         '20261014_event_quote_targets_postgres.sql',
         '20261016_wafrn_bsky_actors_postgres.sql',
         '20261019_phyrian_grid_lineage_postgres.sql',
+        '20261021_bsky_follow_carry_postgres.sql',
     ],
     'deploy runner picks up the clans migration and the quote-target table'
 );
