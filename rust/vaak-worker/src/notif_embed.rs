@@ -1734,6 +1734,118 @@ fn normalized_quote_preview(quote: &Value) -> Value {
     nested
 }
 
+/// A quoted status the painter can show: it names an author or carries a
+/// body or media. State-only envelopes (`{"state":"pending","quoted_status":null}`
+/// from PHP's `ap_masto_quote_entity` when the target is not cached) and
+/// alias-only stubs are not, and used to paint as an empty "?" / "@?" card.
+fn quote_status_paintable(q: &Value) -> bool {
+    let account = q.get("account").filter(|v| v.is_object());
+    let named = account.is_some_and(|a| {
+        ["acct", "display_name", "username"].iter().any(|key| {
+            a.get(*key)
+                .and_then(Value::as_str)
+                .map(|v| v.trim().trim_start_matches('@'))
+                .is_some_and(|v| !v.is_empty() && v != "?")
+        })
+    });
+    let body = q
+        .get("content")
+        .and_then(Value::as_str)
+        .is_some_and(|c| !strip_tags(c).trim().is_empty());
+    let media = q
+        .get("media_attachments")
+        .and_then(Value::as_array)
+        .is_some_and(|a| !a.is_empty());
+    named || body || media
+}
+
+/// Best known URL of an unresolved quote target: the status `quote_url` PHP
+/// sets beside a pending envelope, then whatever the envelope still names.
+fn unresolved_quote_url(status: &Value, quote: &Value) -> String {
+    let https = |v: Option<&Value>| {
+        v.and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|u| u.starts_with("https://"))
+            .map(str::to_string)
+    };
+    let nested = quote.get("quoted_status").filter(|v| v.is_object());
+    https(status.get("quote_url"))
+        .or_else(|| https(quote.get("quoted_status_id")))
+        .or_else(|| nested.and_then(|q| https(q.get("vaak_quote_requested_uri"))))
+        .or_else(|| nested.and_then(|q| https(q.get("uri"))))
+        .or_else(|| nested.and_then(|q| https(q.get("url"))))
+        .or_else(|| https(quote.get("url")))
+        .or_else(|| https(quote.get("uri")))
+        .or_else(|| https(status.get("vaak_quote_preview").and_then(|p| p.get("url"))))
+        .unwrap_or_default()
+}
+
+/// Nested quote inside a timeline card. A resolved quote paints as a lean
+/// embed; an unresolved one paints PHP's pending/unavailable quote chrome
+/// (`admin_render_masto_status_card`) instead of an anonymous empty card.
+fn paint_nested_quote(status: &Value, q_raw: &Value, from: &str, viewer_actor: &str) -> String {
+    let wrap = |inner: String| {
+        format!(
+            "<div class=\"quote-block\" style=\"margin-top:.55rem;background:transparent;border:0;padding:0;border-radius:0;color:inherit\">{inner}</div>"
+        )
+    };
+    let q = normalized_quote_preview(q_raw);
+    if quote_status_paintable(&q) {
+        return wrap(paint_lean_embed_from(&q, false, from, viewer_actor, false));
+    }
+    // `quote` wins over `vaak_quote_preview`, so a pending envelope used to
+    // hide a usable preview. Fall back to it before giving up.
+    if let Some(preview) = status.get("vaak_quote_preview").filter(|v| v.is_object() && *v != q_raw) {
+        let p = normalized_quote_preview(preview);
+        if quote_status_paintable(&p) {
+            return wrap(paint_lean_embed_from(&p, false, from, viewer_actor, false));
+        }
+        let text = preview.get("text").and_then(Value::as_str).unwrap_or("").trim();
+        if !text.is_empty() {
+            let acct = preview.get("acct").and_then(Value::as_str).unwrap_or("").trim();
+            let url = unresolved_quote_url(status, q_raw);
+            let mut html = String::from("<div class=\"quote-block\" style=\"margin-top:.55rem\">");
+            if !acct.is_empty() {
+                html.push_str(&format!("<div class=\"meta\" style=\"margin-top:.3rem\">{}</div>", esc(acct)));
+            }
+            html.push_str(&format!("<div style=\"margin-top:.25rem;white-space:pre-wrap\">{}</div>", esc(text)));
+            if !url.is_empty() {
+                html.push_str(&format!(
+                    "<div class=\"meta\" style=\"margin-top:.35rem\"><a href=\"?view=status&amp;object={}&amp;from={}\">Open quoted</a></div>",
+                    urlencoding_encode(&url),
+                    urlencoding_encode(from)
+                ));
+            }
+            html.push_str("</div>");
+            return html;
+        }
+    }
+    let url = unresolved_quote_url(status, q_raw);
+    let state = q_raw.get("state").and_then(Value::as_str).unwrap_or("");
+    let gone = matches!(state, "deleted" | "rejected" | "revoked" | "unauthorized");
+    let mut html = String::from("<div class=\"quote-block quote-block--unresolved\" style=\"margin-top:.55rem\">");
+    if url.is_empty() || gone {
+        html.push_str("<div class=\"meta\" style=\"margin-top:.3rem\">Quoted post unavailable</div>");
+        if !url.is_empty() {
+            html.push_str(&format!(
+                "<div class=\"meta\" style=\"margin-top:.35rem\"><a href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\">Open original</a></div>",
+                esc(&url)
+            ));
+        }
+    } else {
+        // The status view may fetch the target (detail quote hydration);
+        // timelines stay cache-only.
+        html.push_str(&format!(
+            "<div class=\"meta\" style=\"margin-top:.35rem\"><a href=\"?view=status&amp;object={}&amp;from={}\">Quoted post (not cached yet) — open</a> · <a href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\">Open original</a></div>",
+            urlencoding_encode(&url),
+            urlencoding_encode(from),
+            esc(&url)
+        ));
+    }
+    html.push_str("</div>");
+    html
+}
+
 fn paint_status_link_card(st: &Value) -> String {
     if status_has_media(st) {
         return String::new();
@@ -4126,14 +4238,10 @@ pub fn paint_lean_embed_from(
         .filter(|v| v.is_object())
         .or_else(|| status.get("vaak_quote_preview").filter(|v| v.is_object()))
     {
-        let q = normalized_quote_preview(q_raw);
         // The quoted post is context. Its reply, boost, like, and overflow
         // rows stay on the quote-boost that contains it.
         let quote_from = if from.is_empty() { "mentions" } else { from };
-        let q_html = paint_lean_embed_from(&q, false, quote_from, viewer_actor, false);
-        body_inner.push_str(&format!(
-            "<div class=\"quote-block\" style=\"margin-top:.55rem;background:transparent;border:0;padding:0;border-radius:0;color:inherit\">{q_html}</div>"
-        ));
+        body_inner.push_str(&paint_nested_quote(status, q_raw, quote_from, viewer_actor));
     }
 
     // Older Bluesky envelopes used a synthetic warning as spoiler text.
@@ -5255,6 +5363,62 @@ mod tests {
             1,
             "timeline quote-boosts keep actions on the quoting post only: {html}"
         );
+    }
+
+    /// Boost of a Misskey/Sharkey CW quote whose target is not cached: PHP
+    /// hands over a state-only `pending` envelope plus `quote_url`.
+    fn pending_quote_boost(quote: Value, quote_url: Option<&str>) -> Value {
+        let mut inner = json!({
+            "id": "inner", "uri": "https://misskey.test/notes/abc", "url": "https://misskey.test/notes/abc",
+            "content": "", "spoiler_text": "Boost CW - Urgent mutual aid", "sensitive": true,
+            "account": {"acct": "maddy@misskey.test", "display_name": "Maddy", "uri": "https://misskey.test/users/m"},
+            "media_attachments": [], "quote": quote
+        });
+        if let Some(url) = quote_url { inner["quote_url"] = json!(url); }
+        json!({
+            "id": "outer", "uri": "https://misskey.test/notes/abc#announce-1", "content": "",
+            "account": {"acct": "ahri@enby.test", "display_name": "Ahri Enby", "uri": "https://enby.test/users/ahri"},
+            "media_attachments": [], "reblog": inner
+        })
+    }
+
+    #[test]
+    fn pending_quote_envelope_never_paints_an_anonymous_card() {
+        let target = "https://misskey.test/notes/target1";
+        let st = pending_quote_boost(json!({"state":"pending","quoted_status":null,"quoted_status_id":null}), Some(target));
+        let html = paint_lean_feed_card(&st);
+        assert!(!html.contains("@?"), "empty quote must not paint as @?: {html}");
+        assert!(!html.contains(">?<"), "empty quote must not paint a ? name: {html}");
+        assert!(html.contains("Quoted post (not cached yet) — open"), "{html}");
+        assert!(html.contains(&urlencoding_encode(target)), "in-app open link: {html}");
+        assert!(html.contains("Boost CW - Urgent mutual aid"), "CW stays: {html}");
+    }
+
+    #[test]
+    fn unresolved_quote_without_url_or_gone_says_unavailable() {
+        let html = paint_lean_feed_card(&pending_quote_boost(json!({"state":"pending","quoted_status":null}), None));
+        assert!(html.contains("Quoted post unavailable") && !html.contains("@?"), "{html}");
+        let html = paint_lean_feed_card(&pending_quote_boost(
+            json!({"state":"deleted","quoted_status":null}), Some("https://misskey.test/notes/gone")));
+        assert!(html.contains("Quoted post unavailable") && html.contains("Open original"), "{html}");
+        assert!(!html.contains("not cached yet"), "{html}");
+    }
+
+    #[test]
+    fn alias_only_quote_stub_uses_its_requested_uri() {
+        let target = "https://misskey.test/notes/stub";
+        let html = paint_lean_feed_card(&pending_quote_boost(
+            json!({"state":"accepted","quoted_status":{"vaak_quote_requested_uri":target}}), None));
+        assert!(!html.contains("@?") && html.contains("not cached yet") && html.contains(&urlencoding_encode(target)), "{html}");
+    }
+
+    #[test]
+    fn pending_quote_falls_back_to_summary_preview() {
+        let mut st = pending_quote_boost(json!({"state":"pending","quoted_status":null}), Some("https://misskey.test/notes/p"));
+        st["reblog"]["vaak_quote_preview"] = json!({"acct":"@helper@misskey.test","text":"Rent is due, any help counts","url":"https://misskey.test/notes/p"});
+        let html = paint_lean_feed_card(&st);
+        assert!(html.contains("Rent is due, any help counts") && html.contains("@helper@misskey.test"), "{html}");
+        assert!(!html.contains("@?") && !html.contains("not cached yet"), "{html}");
     }
 
     #[test]
