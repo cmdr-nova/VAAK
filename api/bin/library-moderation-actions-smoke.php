@@ -1,6 +1,7 @@
 <?php
 declare(strict_types=1);
 require __DIR__.'/migration-reference-functions.php';
+require dirname(__DIR__).'/ap-admin-native.php'; // the controller's native branches; their switches are off here
 if(!extension_loaded('mbstring')||!extension_loaded('pdo_sqlite'))throw new RuntimeException('Use php-policy-test');
 const AP_AUTH_CSRF_KEY='_vaak_csrf';const LOCAL_ACTOR='https://mkultra.monster/users/alice';const LOCAL_KEY_ID=LOCAL_ACTOR.'#key';const LOCAL_PRIV='/tmp/unused-fixture-key';const LOCAL_FOLLOW_BACK_MAX_PER_HOUR=30;
 function ap_auth_start_session(): void {}
