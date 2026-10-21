@@ -31013,7 +31013,8 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
         <?php else: ?>
           <?php
             $downrankTerms = [];
-            try {
+            $downrankingNativeBody = ap_admin_native_read_body('downranking');
+            if ($downrankingNativeBody === null) try {
                 $downrankTerms = ap_db()->query('SELECT id, phrase, category, enabled, created_at, updated_at FROM ap_home_downrank_terms ORDER BY category ASC, phrase ASC')->fetchAll() ?: [];
             } catch (Throwable $e) {
                 $error = 'Downranking vocabulary is not available until its database migration is applied.';
@@ -31056,7 +31057,7 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
               <?php if (!empty($downrankPreview['samples'])): ?><div class="meta" style="margin-top:.35rem">Sample actors: <?= h(implode(', ', array_map(static fn(array $s): string => (string) ($s['actor_id'] ?? $s['host'] ?? ''), (array) $downrankPreview['samples']))) ?></div><?php endif; ?>
             </div>
           <?php endif; ?>
-          <?php if (!$downrankTerms): ?>
+          <?php if ($downrankingNativeBody !== null): ?><?= $downrankingNativeBody ?><?php elseif (!$downrankTerms): ?>
             <div class="empty">No admin-managed phrases yet.</div>
           <?php else: ?>
             <div style="display:flex;flex-direction:column;gap:.6rem">
