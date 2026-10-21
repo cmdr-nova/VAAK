@@ -2463,7 +2463,7 @@ $vaakAdminOnlyActions = [
                 }
                 if (!$nativeSave['ok']) {
                     $error = (string) $nativeSave['error'];
-                } else {
+                } elseif (!$nativeSave['after_save']) {
                     ap_profile_after_save($vaakActorKey, $nativeSave['trends_changed'], $nativeSave['algorithm_changed']);
                 }
             } elseif (function_exists('ap_auth_user_set_email')) {

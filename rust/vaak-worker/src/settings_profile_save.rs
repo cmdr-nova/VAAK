@@ -54,8 +54,8 @@ pub(crate) async fn save_route(cfg:&crate::config::Config,headers:HeaderMap,byte
  let request=match decode(&bytes){Ok(r)=>r,Err(_)=>return StatusCode::BAD_REQUEST.into_response()};
  match save(cfg,&request).await{Ok(reply)=>(StatusCode::OK,axum::Json(reply)).into_response(),Err(e)=>{tracing::info!(error=%e,"native profile save fell back to PHP");(StatusCode::UNPROCESSABLE_ENTITY,axum::Json(json!({"fallback":true}))).into_response()}}
 }
-fn reply(r:&Request,error:Option<&str>,email_saved:bool,trends_changed:bool,algorithm_changed:bool)->Value{
- json!({"protocol_version":1,"ok":error.is_none(),"error":error,"email_saved":email_saved,"trends_changed":trends_changed,"algorithm_changed":algorithm_changed,"request_binding":{"owner_id":r.owner_id,"actor_key":r.actor_key}})
+fn reply(r:&Request,error:Option<&str>,email_saved:bool,trends_changed:bool,algorithm_changed:bool,after_save:bool)->Value{
+ json!({"protocol_version":1,"ok":error.is_none(),"error":error,"email_saved":email_saved,"trends_changed":trends_changed,"algorithm_changed":algorithm_changed,"after_save":after_save,"request_binding":{"owner_id":r.owner_id,"actor_key":r.actor_key}})
 }
 
 async fn save(cfg:&crate::config::Config,r:&Request)->Result<Value>{
@@ -66,8 +66,8 @@ async fn save(cfg:&crate::config::Config,r:&Request)->Result<Value>{
  // PHP returns its error without touching the profile.
  let email=php_trim(&r.email);
  if !email.is_empty(){
-  if !email_valid(email)?{return Ok(reply(r,Some("Enter a valid email address."),false,false,false));}
-  if email_taken(&db,email,r.owner_id).await?{return Ok(reply(r,Some("That email is already used by another account."),false,false,false));}
+  if !email_valid(email)?{return Ok(reply(r,Some("Enter a valid email address."),false,false,false,false));}
+  if email_taken(&db,email,r.owner_id).await?{return Ok(reply(r,Some("That email is already used by another account."),false,false,false,false));}
  }
  if db.query_opt("SELECT 1 FROM actor_profile WHERE actor_key=$1",&[&r.actor_key]).await?.is_none(){bail!("PHP fallback: no stored profile row");}
  let planned=plan(&r.fields)?;
@@ -83,15 +83,74 @@ async fn save(cfg:&crate::config::Config,r:&Request)->Result<Value>{
  }else{
   let updated=db.execute("UPDATE ap_users SET email=$1,updated_at=$2 WHERE id::bigint=$3 AND NOT EXISTS (SELECT 1 FROM ap_users o WHERE lower(o.email)=lower($1) AND o.id::bigint<>$3 AND o.disabled_at IS NULL)",&[&email,&now,&r.owner_id]).await;
   match updated{
-   Ok(0)=>return Ok(reply(r,Some("That email is already used by another account."),false,false,false)),
+   Ok(0)=>return Ok(reply(r,Some("That email is already used by another account."),false,false,false,false)),
    Ok(_)=>{},
-   Err(e) if e.code()==Some(&tokio_postgres::error::SqlState::UNIQUE_VIOLATION)=>return Ok(reply(r,Some("Could not save email."),false,false,false)),
+   Err(e) if e.code()==Some(&tokio_postgres::error::SqlState::UNIQUE_VIOLATION)=>return Ok(reply(r,Some("Could not save email."),false,false,false,false)),
    Err(e)=>return Err(e.into()),
   }
  }
- let plan=match planned{Ok(p)=>p,Err(message)=>return Ok(reply(r,Some(message),true,false,false))};
+ let plan=match planned{Ok(p)=>p,Err(message)=>return Ok(reply(r,Some(message),true,false,false,false))};
  let (trends,algorithm)=write(&db,r,&plan).await?;
- Ok(reply(r,None,true,trends,algorithm))
+ // The row is committed: from here nothing may answer 422, so a failed
+ // after-save step only hands that work back to PHP.
+ let after=match after_save(cfg,&db,&r.actor_key,trends,algorithm).await{Ok(done)=>done,Err(e)=>{tracing::info!(error=%e,"native profile after-save left to PHP");false}};
+ Ok(reply(r,None,true,trends,algorithm,after))
+}
+fn redis_enabled()->bool{std::env::var("VAAK_REDIS_ENABLED").map(|v|!matches!(php_trim(&v).to_ascii_lowercase().as_str(),"0"|"false"|"off"|"no")).unwrap_or(true)}
+fn sha256(s:&str)->String{use sha2::Digest;hex::encode(sha2::Sha256::digest(s.as_bytes()))}
+/// PHP rawurlencode.
+fn rawurlencode(s:&str)->String{s.bytes().map(|b|if b.is_ascii_alphanumeric()||matches!(b,b'-'|b'_'|b'.'|b'~'){char::from(b).to_string()}else{format!("%{b:02X}")}).collect()}
+/// ap_profile_after_save (S4b): the profile cache delete, the trends epoch,
+/// admin_tl_cache_clear_owner and the Home hydrate keys when the algorithm
+/// switch changed, the homepage export for cmdr_nova and the public actor
+/// document. Ok(false) leaves all of it to PHP (Redis off, or export text the
+/// copy cannot prove); every step is idempotent, so PHP may redo a part.
+async fn after_save(cfg:&crate::config::Config,db:&tokio_postgres::Client,actor_key:&str,trends:bool,algorithm:bool)->Result<bool>{
+ if !redis_enabled(){return Ok(false);}
+ let export=if actor_key=="cmdr_nova"{match export_json(db).await?{Some(json)=>Some(json),None=>return Ok(false)}}else{None};
+ let mut cache=tokio::time::timeout(Duration::from_millis(250),crate::redis_util::connect(&cfg.redis_url)).await.context("redis connect timeout")??;
+ let _:i64=redis::cmd("DEL").arg(format!("vaak:profile:v1:{}",sha256(php_trim(actor_key)))).query_async(&mut cache).await?;
+ let owner=if trends||algorithm{db.query_opt("SELECT id::bigint FROM ap_users WHERE actor_key=$1",&[&actor_key]).await?.map(|row|row.get::<_,i64>(0)).unwrap_or(0)}else{0};
+ if trends&&owner>0{
+  let key=format!("vaak:trends:policy-epoch:v1:{owner}");
+  let _:i64=redis::cmd("INCR").arg(&key).query_async(&mut cache).await?;
+  let _:i64=redis::cmd("EXPIRE").arg(&key).arg(86400*30).query_async(&mut cache).await?;
+ }
+ if algorithm&&owner>0{
+  let index=format!("vaak:timeline:owner-index:v1:{owner}");
+  let dir=std::env::var("VAAK_ADMIN_TL_CACHE_DIR").unwrap_or_else(|_|"/var/lib/mkultra/ap/admin-tl-cache".into());
+  let keys=match crate::redis_util::json_get(&mut cache,&index).await?{Some(Value::Array(keys))=>keys,Some(Value::Object(map))=>map.into_iter().map(|(_,v)|v).collect(),_=>Vec::new()};
+  for key in keys.iter().filter_map(Value::as_str).filter(|k|!k.is_empty()){
+   let _:i64=redis::cmd("DEL").arg(format!("vaak:timeline:ranked:v2:{}",sha256(key))).query_async(&mut cache).await?;
+   let safe=key.chars().filter(|c|c.is_ascii_lowercase()||c.is_ascii_digit()||*c=='_').collect::<String>();
+   let safe=if safe.is_empty()||safe=="0"{"tl".to_owned()}else{safe};
+   let _=std::fs::remove_file(std::path::Path::new(&dir).join(format!("tl_{safe}.json")));
+  }
+  let _:i64=redis::cmd("DEL").arg(&index).query_async(&mut cache).await?;
+  crate::redis_util::delete_pattern(&mut cache,&format!("vaak:fragment:tl:v1:{owner}:*")).await?;
+  let mut del=redis::cmd("DEL");
+  for limit in [15,40,50,80,160,240,20,30]{del.arg(crate::timeline::home_timeline_redis_key(owner,limit,None));}
+  let _:i64=del.query_async(&mut cache).await?;
+ }
+ if let Some(json)=export{
+  let root=std::env::var_os("VAAK_API_ROOT").map(std::path::PathBuf::from).unwrap_or_else(||"/srv/mkultra/html/api".into());
+  let dir=root.parent().context("site root")?.join("assets/data");
+  std::fs::create_dir_all(&dir)?;
+  std::fs::write(dir.join("ap-cmdr-nova.json"),json)?;
+ }
+ let doc=format!("https://mkultra.monster/users/{}",rawurlencode(&php_trim(actor_key).to_ascii_lowercase()));
+ let _:i64=redis::cmd("DEL").arg(format!("vaak:apdoc:v1:{}",sha256(php_trim(&doc).trim_end_matches('/')))).query_async(&mut cache).await?;
+ Ok(true)
+}
+/// ap_profile_export_public_cache payload for the homepage, from the row just
+/// written. None when ap_fix_utf8 could repair the stored name or bio.
+async fn export_json(db:&tokio_postgres::Client)->Result<Option<String>>{
+ let row=db.query_one("SELECT name::text,summary::text,icon_url::text,image_url::text,updated_at::text FROM actor_profile WHERE actor_key='cmdr_nova'",&[]).await?;
+ let (name,summary):(String,String)=(row.get(0),row.get(1));
+ if fix_utf8(&name).is_err()||fix_utf8(&summary).is_err(){return Ok(None);}
+ let url=|v:Option<String>|v.filter(|v|!v.is_empty()).map(|v|json_string(&v)).unwrap_or_else(||"null".into());
+ let updated=row.get::<_,Option<String>>(4).map(|v|json_string(&v)).context("export updated_at")?;
+ Ok(Some(format!("{{\n    \"name\": {},\n    \"summary\": {},\n    \"icon_url\": {},\n    \"image_url\": {},\n    \"url\": \"https://mkultra.monster/users/cmdr_nova\",\n    \"preferredUsername\": \"cmdr_nova\",\n    \"updated_at\": {}\n}}\n",json_string(&name),json_string(&summary),url(row.get(2)),url(row.get(3)),updated)))
 }
 async fn email_taken(db:&tokio_postgres::Client,email:&str,owner:i64)->Result<bool>{
  Ok(db.query_opt("SELECT 1 FROM ap_users WHERE lower(email)=lower($1) AND id::bigint<>$2 AND disabled_at IS NULL LIMIT 1",&[&email,&owner]).await?.is_some())

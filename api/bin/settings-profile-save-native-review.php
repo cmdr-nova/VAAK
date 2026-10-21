@@ -9,12 +9,14 @@
  *     over generated and hand-picked inputs and writes the answers for the Rust
  *     test settings_profile_save::tests::actual_php_helper_corpus.
  *
- *   DSN INTEGER|BIGINT URL SECRET
+ *   DSN INTEGER|BIGINT URL SECRET   (env PROFILE_SAVE_REDIS, PROFILE_SAVE_SCRATCH)
  *     For each scenario, seeds a PostgreSQL fixture, runs the genuine save path of
  *     the save_profile action (ap_auth_user_set_email, then ap_profile_save) and
- *     records the ap_users and actor_profile rows, the result and the after-save
- *     flags; reseeds, runs ap_settings_profile_save_native against a running
- *     worker and compares. Fallback scenarios must answer null and leave the rows
+ *     records the ap_users and actor_profile rows, the result, the after-save
+ *     flags and what ap_profile_after_save left in Redis and on disk; reseeds,
+ *     runs ap_settings_profile_save_native against a running worker (started
+ *     with the same Redis as VAAK_REDIS_URL, VAAK_API_ROOT=SCRATCH/site/api and
+ *     VAAK_ADMIN_TL_CACHE_DIR=SCRATCH/tl) and compares. Fallback scenarios must answer null and leave the rows
  *     untouched. rel=me pages are not fetched (link preview is stubbed off in PHP
  *     and fixture hosts are .invalid for the worker); the scan itself is in the
  *     corpus. Never point it at production: it drops and recreates its tables.
@@ -49,7 +51,11 @@ function ap_profile_url_redirects_to(string $url, string $target): bool { return
 function ap_link_preview_url_allowed(string $url): bool { return false; }
 function ap_link_preview_http_get(string $url, int $t = 4, int $m = 524288): ?string { return null; }
 $GLOBALS['after_save'] = null;
-function ap_profile_after_save(string $actorKey, bool $trends, bool $algorithm): void { $GLOBALS['after_save'] = [$actorKey, $trends, $algorithm]; }
+// Records the flags; in fixture mode also runs the genuine after-save work (renamed).
+function ap_profile_after_save(string $actorKey, bool $trends, bool $algorithm): void {
+    $GLOBALS['after_save'] = [$actorKey, $trends, $algorithm];
+    if (function_exists('genuine_profile_after_save')) genuine_profile_after_save($actorKey, $trends, $algorithm);
+}
 
 /** The inline `<a ...>` rewrite of ap_profile_save_unlocked, cut from its source. */
 function links_callback_source(string $dbSource): string {
@@ -124,6 +130,23 @@ if (!str_contains($dsn, 'fixture')) { fwrite(STDERR, "refusing a database withou
 putenv('VAAK_ADMIN_READ_NATIVE=1'); putenv('VAAK_ADMIN_READ_SECRET=' . $secret); putenv('VAAK_SETTINGS_PROFILE_SAVE_NATIVE=1');
 putenv('VAAK_SETTINGS_PROFILE_SAVE_URL=' . $url);
 require $api . '/ap-admin-native.php';
+// After-save work (S4b) runs for real against Redis and a scratch site and
+// timeline cache directory. The worker must use the same three (see usage).
+$redisDsn = (string) (getenv('PROFILE_SAVE_REDIS') ?: 'redis://127.0.0.1:6390/5');
+$scratch = (string) (getenv('PROFILE_SAVE_SCRATCH') ?: sys_get_temp_dir() . '/vaak-profile-save');
+$site = $scratch . '/site'; $tlDir = $scratch . '/tl';
+putenv('VAAK_REDIS_DSN=' . $redisDsn); putenv('VAAK_REDIS_ENABLED=1');
+require $api . '/ap-redis.php';
+$adminSource = (string) file_get_contents($api . '/ap-admin.php');
+$docSource = (string) file_get_contents($api . '/ap-public-doc.php');
+foreach (['admin_tl_redis_key', 'admin_tl_owner_index_key', 'admin_tl_cache_clear_owner'] as $fn) eval(declaration($adminSource, $fn));
+eval(str_replace("'/var/lib/mkultra/ap/admin-tl-cache'", var_export($tlDir, true), declaration($adminSource, 'admin_tl_cache_dir')));
+foreach (['ap_timeline_cache_invalidate_owner', 'ap_timeline_ranked_redis_key', 'ap_timeline_home_hydrate_redis_key', 'ap_timeline_home_hydrate_invalidate_owner'] as $fn) eval(declaration($dbSource, $fn));
+eval(str_replace('dirname(__DIR__)', var_export($site, true), declaration($dbSource, 'ap_profile_export_public_cache')));
+foreach (['ap_public_doc_cache_key', 'ap_public_doc_local_actor_id', 'ap_public_doc_cache_forget', 'ap_public_doc_invalidate_actor'] as $fn) eval(declaration($docSource, $fn));
+eval(preg_replace('/^function ap_profile_after_save\(/', 'function genuine_profile_after_save(', declaration($dbSource, 'ap_profile_after_save')));
+$redis = ap_redis_client('cache');
+if (!$redis) { fwrite(STDERR, "Redis at $redisDsn is required\n"); exit(2); }
 $db = new PDO($dsn, null, null, [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION, PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC]);
 function ap_db(): PDO { return $GLOBALS['db']; }
 $GLOBALS['current_user'] = null;
@@ -153,6 +176,44 @@ function seed(array $over = []): void {
     }
     $db->exec("CREATE TABLE ap_supporter_codes (id $idType PRIMARY KEY, code_hash TEXT, used_by $idType, used_at TEXT)");
     if (!empty($over['supporter'])) $db->exec("INSERT INTO ap_supporter_codes VALUES (1,'h',2,'2026-03-01T00:00:00+00:00')");
+    seed_caches();
+}
+/** Redis keys and files every after-save step touches, plus neighbours it must leave. */
+function seed_caches(): void {
+    global $redis, $site, $tlDir;
+    $redis->flushDB();
+    foreach ([1, 2] as $owner) {
+        $redis->set(admin_tl_owner_index_key($owner), json_encode(["home:$owner:a", "feed:$owner", '', '0']));
+        foreach (["home:$owner:a", "feed:$owner"] as $logical) $redis->set(admin_tl_redis_key($logical), 'ranked');
+        $redis->set("vaak:fragment:tl:v1:$owner:x", 'f'); $redis->set("vaak:fragment:tl:v1:{$owner}2:y", 'neighbour');
+        foreach ([15, 50, 240, 99] as $limit) $redis->set(ap_timeline_home_hydrate_redis_key($owner, $limit), 'hydrate');
+        $redis->set('vaak:trends:policy-epoch:v1:' . $owner, '4');
+    }
+    foreach (['val', 'cmdr_nova', 'other'] as $key) $redis->set(ap_public_doc_cache_key(ap_public_doc_local_actor_id($key)), 'doc');
+    // A pre-save snapshot: any successful save must delete it.
+    $redis->set('vaak:profile:v1:' . hash('sha256', 'val'), json_encode(['actor_key' => 'val', 'name' => 'Old val', 'summary' => '<p>old</p>']));
+    @mkdir($tlDir, 0755, true); @mkdir($site . '/assets/data', 0755, true);
+    foreach (glob($tlDir . '/*') ?: [] as $f) unlink($f);
+    foreach (['tl_home1a.json', 'tl_feed1.json', 'tl_home2a.json', 'tl_feed2.json', 'tl_tl.json', 'tl_other.json'] as $f) file_put_contents($tlDir . '/' . $f, '{}');
+    file_put_contents($site . '/assets/data/ap-cmdr-nova.json', "old\n");
+}
+function cache_snapshot(): array {
+    global $redis, $site, $tlDir;
+    $keys = $redis->keys('*'); sort($keys); $out = [];
+    foreach ($keys as $k) {
+        // ap_profile_get may refill the profile cache from the new row; only its absence or freshness matters.
+        if (str_starts_with($k, 'vaak:profile:v1:')) continue;
+        $out[$k] = [$redis->get($k), $redis->ttl($k) > 0];
+    }
+    // ap_profile_get may refill a profile cache from the current row; only a snapshot older than the row is wrong.
+    foreach (ap_db()->query('SELECT actor_key, name FROM actor_profile')->fetchAll() as $row) {
+        $cached = json_decode((string) $redis->get('vaak:profile:v1:' . hash('sha256', $row['actor_key'])), true);
+        if (is_array($cached) && ($cached['name'] ?? null) !== $row['name']) $out['profile cache ' . $row['actor_key']] = 'STALE';
+    }
+    $files = array_map('basename', glob($tlDir . '/*') ?: []); sort($files);
+    // The export carries the row's updated_at; the two runs write it in different seconds.
+    $export = (string) preg_replace('/"updated_at": "\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\+00:00"/', '"updated_at": "now"', (string) @file_get_contents($site . '/assets/data/ap-cmdr-nova.json'));
+    return ['redis' => $out, 'tl' => $files, 'export' => $export];
 }
 function snapshot(): array {
     global $db;
@@ -160,7 +221,7 @@ function snapshot(): array {
     $profiles = $db->query('SELECT * FROM actor_profile ORDER BY actor_key')->fetchAll();
     foreach ($users as &$u) { $u['updated_at'] = $u['updated_at'] === '2026-01-01T00:00:00+00:00' ? 'seed' : (preg_match('/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\+00:00$/', (string) $u['updated_at']) ? 'now' : 'BAD ' . $u['updated_at']); }
     foreach ($profiles as &$p) { $p['updated_at'] = $p['updated_at'] === '2026-01-01T00:00:00+00:00' ? 'seed' : (preg_match('/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\+00:00$/', (string) $p['updated_at']) ? 'now' : 'BAD ' . $p['updated_at']); }
-    return ['users' => $users, 'profiles' => $profiles];
+    return ['users' => $users, 'profiles' => $profiles, 'caches' => cache_snapshot()];
 }
 function form(array $over = []): array {
     return array_merge(['name' => 'Val', 'summary' => 'Hello there', 'attachment' => [], 'icon_url' => '', 'image_url' => '', 'manually_approves' => false, 'discoverable' => true,
@@ -181,9 +242,24 @@ function native_save(int $owner, string $key, string $email, array $fields): ?ar
     $GLOBALS['current_user'] = ['id' => $owner, 'actor_key' => $key];
     $r = ap_settings_profile_save_native($owner, $key, trim($email), $fields);
     if ($r === null) return null;
+    // As the save_profile action does: PHP runs the after-save work only when the worker left it.
+    if ($r['ok'] && !$r['after_save']) { $GLOBALS['native_after_save_left']++; genuine_profile_after_save($key, $r['trends_changed'], $r['algorithm_changed']); }
     return ['ok' => $r['ok'], 'error' => $r['error'], 'after' => $r['ok'] ? [$key, $r['trends_changed'], $r['algorithm_changed']] : null];
 }
 
+/** @return list<string> paths where two snapshots differ, with both values. */
+function differences(mixed $a, mixed $b, string $path = ''): array {
+    if (is_array($a) && is_array($b)) {
+        $out = [];
+        foreach (array_unique(array_merge(array_keys($a), array_keys($b))) as $k) {
+            if (!array_key_exists($k, $a) || !array_key_exists($k, $b)) { $out[] = "$path/$k: php " . json_encode($a[$k] ?? '(none)', JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) . ' rust ' . json_encode($b[$k] ?? '(none)', JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE); continue; }
+            array_push($out, ...differences($a[$k], $b[$k], "$path/$k"));
+        }
+        if ($out === [] && array_keys($a) !== array_keys($b)) $out[] = "$path: key order";
+        return $out;
+    }
+    return $a === $b ? [] : ["$path: php " . json_encode($a, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) . ' rust ' . json_encode($b, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE)];
+}
 $long = str_repeat('x', 101);
 $scenarios = [
     'plain bio' => [2, 'val', 'new@x.test', form(['summary' => "Line one\nline two\n\n\n\nPara & <tag> \"q\""])],
@@ -207,6 +283,7 @@ $scenarios = [
     'entities in fields' => [2, 'val', '', form(['attachment' => [['name' => 'Q', 'value' => 'a.invalid/?a=1&amp;b=2'], ['name' => 'Tom & Jerry', 'value' => 'AT&T <3 "quoted"']]])],
     'badges' => [2, 'val', '', form(['profile_badges' => ['admin', 'supporter', 'cat', ' dog ', 'cat', 'nope', 'coffee', 'tea', 'bookworm', 'gamer', 'music', 'artist', ['x']]])],
     'admin badges' => [1, 'cmdr_nova', 'op@mkultra.monster', form(['name' => 'Nova', 'profile_badges' => ['wizard']])],
+    'homepage export and algorithm off' => [1, 'cmdr_nova', '', form(['name' => 'Nova "N" é/💜', 'summary' => "<p>Bio\u{2028}line</p>", 'icon_url' => 'https://mkultra.monster/img/profile/avatar-1.png', 'algorithm_enabled' => false, 'trending_enabled' => false])],
     'supporter badge' => [2, 'val', '', form(['profile_badges' => ['wizard']]), ['supporter' => true]],
     'policies kept' => [2, 'val', '', form(['reply_policy' => 'bogus', 'quote_policy' => 'followers'])],
     'trends and algorithm change' => [2, 'val', '', form(['trending_enabled' => false, 'downranking_enabled' => true, 'algorithm_enabled' => false])],
@@ -227,7 +304,7 @@ $fallbacks = [
     'other account' => [2, 'cmdr_nova', '', form()],
     'disabled account' => [3, 'gone', '', form()],
 ];
-$failures = 0; $compared = 0;
+$failures = 0; $compared = 0; $GLOBALS['native_after_save_left'] = 0;
 foreach ($scenarios as $label => $s) {
     [$owner, $key, $email, $fields] = $s; $over = $s[4] ?? [];
     seed($over); $php = php_save($owner, $key, $email, $fields); $phpRows = snapshot();
@@ -236,18 +313,21 @@ foreach ($scenarios as $label => $s) {
     if (getenv('PROFILE_SAVE_DUMP') === $label) fwrite(STDOUT, json_encode(['result' => $native, 'rows' => $nativeRows], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) . "\n");
     if ($native === null) { $failures++; fwrite(STDOUT, "FAIL $label: worker fell back\n"); continue; }
     if ($php !== $native) { $failures++; fwrite(STDOUT, "FAIL $label result\n php: " . json_encode($php) . "\n rust: " . json_encode($native) . "\n"); }
-    if ($phpRows !== $nativeRows) { $failures++; fwrite(STDOUT, "FAIL $label rows\n php: " . json_encode($phpRows, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) . "\n rust: " . json_encode($nativeRows, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) . "\n"); }
+    if ($phpRows !== $nativeRows) { $failures++; fwrite(STDOUT, "FAIL $label rows\n" . implode('', array_map(static fn(string $d): string => "  $d\n", differences($phpRows, $nativeRows)))); }
 }
 foreach ($fallbacks as $label => $s) {
     [$owner, $key, $email, $fields] = $s;
     seed(); $before = snapshot(); $native = native_save($owner, $key, $email, $fields); $after = snapshot(); $compared++;
     if ($native !== null || $before !== $after) { $failures++; fwrite(STDOUT, "FAIL $label: expected a fallback with no writes, got " . json_encode($native) . "\n"); }
 }
+$compared++;
+if ($GLOBALS['native_after_save_left'] !== 0) { $failures++; fwrite(STDOUT, "FAIL worker left the after-save work to PHP {$GLOBALS['native_after_save_left']} times\n"); }
 // Bridge validator: a reply bound to another request, or an inconsistent one, is refused.
-$good = ['protocol_version' => 1, 'ok' => true, 'error' => null, 'email_saved' => true, 'trends_changed' => false, 'algorithm_changed' => true, 'request_binding' => ['actor_key' => 'val', 'owner_id' => 2]];
+$good = ['protocol_version' => 1, 'ok' => true, 'error' => null, 'email_saved' => true, 'trends_changed' => false, 'algorithm_changed' => true, 'after_save' => true, 'request_binding' => ['actor_key' => 'val', 'owner_id' => 2]];
 $checks = [[$good, true], [array_merge($good, ['request_binding' => ['actor_key' => 'val', 'owner_id' => 3]]), false], [array_merge($good, ['error' => 'x']), false],
-    [array_merge($good, ['ok' => false, 'error' => 'Bad', 'algorithm_changed' => false]), true], [array_merge($good, ['ok' => false, 'error' => '', 'algorithm_changed' => false]), false],
-    [array_merge($good, ['extra' => 1]), false], [array_merge($good, ['email_saved' => false]), false]];
+    [array_merge($good, ['ok' => false, 'error' => 'Bad', 'algorithm_changed' => false, 'after_save' => false]), true], [array_merge($good, ['ok' => false, 'error' => '', 'algorithm_changed' => false]), false],
+    [array_merge($good, ['extra' => 1]), false], [array_merge($good, ['email_saved' => false]), false],
+    [array_merge($good, ['ok' => false, 'error' => 'Bad', 'algorithm_changed' => false, 'after_save' => true]), false], [array_merge($good, ['after_save' => 1]), false]];
 foreach ($checks as $i => [$reply, $want]) { $compared++; if ((ap_settings_profile_save_native_reply($reply, 2, 'val') !== null) !== $want) { $failures++; fwrite(STDOUT, "FAIL validator case $i\n"); } }
 // Field shapes PHP does not send are refused before any request.
 $GLOBALS['current_user'] = ['id' => 2, 'actor_key' => 'val'];

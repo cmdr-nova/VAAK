@@ -217,8 +217,9 @@ function ap_admin_native_read_body(string $view,int $offset=0,?string $filter=nu
  * Settings > Profile save through the worker (S4a). $fields is the array the
  * save_profile action passes to ap_profile_save, after uploads. Returns null so
  * PHP saves itself (switch off, worker refusal, anything unproven), otherwise
- * ['ok','error','email_saved','trends_changed','algorithm_changed']. The caller
- * has checked the session and CSRF and runs ap_profile_after_save on success.
+ * ['ok','error','email_saved','trends_changed','algorithm_changed','after_save'].
+ * The caller has checked the session and CSRF, and runs ap_profile_after_save
+ * on success unless the worker already did (after_save).
  */
 function ap_settings_profile_save_native(int $owner,string $actorKey,string $email,array $fields): ?array
 {
@@ -253,12 +254,12 @@ function ap_settings_profile_save_native(int $owner,string $actorKey,string $ema
 function ap_settings_profile_save_native_reply(mixed $reply,int $owner,string $actorKey): ?array
 {
     if(!is_array($reply))return null;
-    $keys=array_keys($reply);sort($keys);$expected=['protocol_version','ok','error','email_saved','trends_changed','algorithm_changed','request_binding'];sort($expected);
+    $keys=array_keys($reply);sort($keys);$expected=['protocol_version','ok','error','email_saved','trends_changed','algorithm_changed','after_save','request_binding'];sort($expected);
     if($keys!==$expected || $reply['protocol_version']!==1 || !is_bool($reply['ok']) || !is_bool($reply['email_saved'])
-        || !is_bool($reply['trends_changed']) || !is_bool($reply['algorithm_changed']))return null;
+        || !is_bool($reply['trends_changed']) || !is_bool($reply['algorithm_changed']) || !is_bool($reply['after_save']))return null;
     $binding=$reply['request_binding'];
     if(!is_array($binding) || count($binding)!==2 || ($binding['owner_id']??null)!==$owner || ($binding['actor_key']??null)!==$actorKey)return null;
     if($reply['ok']){if($reply['error']!==null || !$reply['email_saved'])return null;}
-    elseif(!is_string($reply['error']) || $reply['error']==='' || strlen($reply['error'])>200 || $reply['trends_changed'] || $reply['algorithm_changed'])return null;
-    return ['ok'=>$reply['ok'],'error'=>$reply['error'],'email_saved'=>$reply['email_saved'],'trends_changed'=>$reply['trends_changed'],'algorithm_changed'=>$reply['algorithm_changed']];
+    elseif(!is_string($reply['error']) || $reply['error']==='' || strlen($reply['error'])>200 || $reply['trends_changed'] || $reply['algorithm_changed'] || $reply['after_save'])return null;
+    return ['ok'=>$reply['ok'],'error'=>$reply['error'],'email_saved'=>$reply['email_saved'],'trends_changed'=>$reply['trends_changed'],'algorithm_changed'=>$reply['algorithm_changed'],'after_save'=>$reply['after_save']];
 }
