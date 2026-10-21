@@ -7076,6 +7076,7 @@ $healthDb = ['ok' => false, 'latency_ms' => null, 'error' => null];
 $healthRedisCache = [];
 $healthRedisQueue = [];
 $rustAdminHealth = null;
+$queueHealthNativeBody = null;
 if ($view === 'queue_health') {
     // Read-only measurements; this view never claims jobs or changes worker concurrency.
     $healthDbStarted = microtime(true);
@@ -7089,7 +7090,13 @@ if ($view === 'queue_health') {
         $healthRedisCache = ap_redis_health_check('cache');
         $healthRedisQueue = ap_redis_health_check('queue');
     }
-    $queueDefs = [
+    // A native Queue classes body brings the per-queue counts the totals grid sums;
+    // the queue and dependency queries then never run here.
+    $queueHealthNativeBody = ap_admin_native_read_body('queue_health', 0, null, $queueHealthNativeRows);
+    if ($queueHealthNativeBody !== null) {
+        $queueHealthRows = $queueHealthNativeRows;
+    }
+    $queueDefs = $queueHealthNativeBody !== null ? [] : [
         ['name' => 'User actions', 'table' => 'ap_action_queue', 'state' => 'status', 'queued' => ['pending'], 'active' => ['processing'], 'success' => ['succeeded'], 'failed' => ['failed'], 'time' => 'next_attempt_at', 'active_time' => 'claimed_at', 'created' => 'created_at'],
         ['name' => 'Federation delivery', 'table' => 'ap_publish_delivery_queue', 'state' => 'status', 'queued' => ['pending'], 'active' => ['processing'], 'success' => ['succeeded'], 'failed' => ['failed'], 'time' => 'next_attempt_at', 'active_time' => 'claimed_at', 'created' => 'created_at'],
         ['name' => 'Federation fan-out', 'table' => 'ap_fanout_delivery_queue', 'state' => 'status', 'queued' => ['pending'], 'active' => ['processing'], 'success' => ['succeeded'], 'failed' => ['failed'], 'time' => 'next_attempt_at', 'active_time' => 'claimed_at', 'created' => 'created_at'],
@@ -7139,7 +7146,7 @@ if ($view === 'queue_health') {
     // Parent/child visibility for durable federation publication. A parent
     // activity may have one child per remote inbox; this summary is read-only
     // and deliberately tolerates older installs without the fan-out table.
-    try {
+    if ($queueHealthNativeBody === null) try {
         $dep = $db->query(
             "SELECT activity_key,
                     COUNT(*) AS children,
@@ -7152,7 +7159,7 @@ if ($view === 'queue_health') {
                     MAX(updated_at) AS updated_at
              FROM ap_fanout_delivery_queue
              GROUP BY activity_key
-             ORDER BY MAX(updated_at) DESC
+             ORDER BY MAX(updated_at) DESC, activity_key ASC
              LIMIT 25"
         );
         foreach ($dep->fetchAll() ?: [] as $row) {
@@ -37234,6 +37241,7 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
           </div>
         </div>
         <?php endif; ?>
+        <?php if ($queueHealthNativeBody !== null): ?><?= $queueHealthNativeBody ?><?php else: ?>
         <div class="side-card" style="margin-top:1rem">
           <h3>Queue classes</h3>
           <div style="overflow-x:auto">
@@ -37295,6 +37303,7 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
             </tbody>
           </table></div>
         </div>
+        <?php endif; ?>
         <?php endif; ?>
         <?php if ($timingMetrics): ?>
         <div class="side-card" style="margin-top:1rem">
