@@ -20,7 +20,7 @@ function ap_admin_native_reply(array $reply,array $request): ?string
     $keys=array_keys($reply);sort($keys);$expected=['protocol_version','ok','request_binding','source_count','rows','html'];sort($expected);
     if($keys!==$expected || $reply['protocol_version']!==1 || $reply['ok']!==true || !is_string($reply['html'])
         || strlen($reply['html'])>2*1024*1024 || !is_int($reply['source_count']) || !is_array($reply['rows'])
-        || !array_is_list($reply['rows']) || count($reply['rows'])!==$reply['source_count'] || count($reply['rows'])>match($request['view']){'users'=>20,'blocks'=>1000,'settings_lists'=>3000,'settings_follow_requests'=>1000,'settings_mutes'=>1000,'settings_featured'=>40,'settings_profile'=>1,'settings_links'=>2,'settings_ai'=>1,'settings_tokens'=>40,'settings_two_factor'=>1,'settings_aliases'=>1000,'settings_move'=>1,'stats'=>1000,'moderation'=>80,default=>100}) return null;
+        || !array_is_list($reply['rows']) || count($reply['rows'])!==$reply['source_count'] || count($reply['rows'])>match($request['view']){'users'=>20,'blocks'=>1000,'settings_lists'=>3000,'settings_follow_requests'=>1000,'settings_mutes'=>1000,'settings_featured'=>40,'settings_profile'=>1,'settings_links'=>2,'settings_ai'=>1,'settings_tokens'=>40,'settings_two_factor'=>1,'settings_aliases'=>1000,'settings_move'=>1,'stats'=>1000,'queue_health'=>6,'moderation'=>80,default=>100}) return null;
     $binding=[];foreach(['owner_id','view','mode','offset','approvals_enabled'] as $key)$binding[$key]=$request[$key];
     if($request['view']==='users')$binding['search']=$request['search'];
     if(str_starts_with($request['view'],'settings_'))$binding['viewer_admin']=$request['viewer_admin'];
@@ -32,6 +32,7 @@ function ap_admin_native_reply(array $reply,array $request): ?string
     if(str_starts_with($request['view'],'settings_'))return ap_settings_native_account_rows_valid($request['view'],$reply['rows'])?$reply['html']:null;
     if($request['view']==='moderation')return ap_moderation_native_rows_valid($reply['rows'])?$reply['html']:null;
     if($request['view']==='stats')return ap_admin_stats_native_rows_valid($reply['rows'])?$reply['html']:null;
+    if($request['view']==='queue_health')return ap_admin_queue_health_native_rows_valid($reply['rows'])?$reply['html']:null;
     $required=match($request['view']){'users'=>['id','username','email','actor_key','actor_id','is_admin','created_at','updated_at','disabled_at','profile_name','icon_url'],
         'invites'=>['id','code','created_at','used_at','note'],'relays'=>['id','inbox_url','state','follow_activity_id','created_at','updated_at'],'policies'=>['id','text'],'blocks'=>['id','scope','value','kind','reason','created_at'],
         default=>['id','username','email','status','created_at','decided_at']};sort($required);
@@ -52,6 +53,18 @@ function ap_admin_stats_native_rows_valid(array $rows): bool
         if(!is_array($row))return false;$keys=array_keys($row);sort($keys);if($keys!==$required)return false;
         if(!is_int($row['id']) || $row['id']<=$last || !is_string($row['username']) || !is_bool($row['is_admin']) || !is_bool($row['disabled']))return false;$last=$row['id'];
         foreach(['posts','followers','following','mentions'] as $key)if(!is_int($row[$key]) || $row[$key]<0)return false;
+    }
+    return true;
+}
+/** Queue health rows: the six PHP queue classes in order, with their counts and availability. */
+function ap_admin_queue_health_native_rows_valid(array $rows): bool
+{
+    $names=['User actions','Federation delivery','Federation fan-out','Remote media warming','Scheduled posts','Actor/profile refresh'];
+    $required=['name','ok','queued','active','failed','retries'];sort($required);
+    if(count($rows)!==count($names))return false;
+    foreach($rows as $i=>$row){
+        if(!is_array($row))return false;$keys=array_keys($row);sort($keys);if($keys!==$required || $row['name']!==$names[$i] || !is_bool($row['ok']))return false;
+        foreach(['queued','active','failed','retries'] as $key)if(!is_int($row[$key]) || $row[$key]<0 || (!$row['ok'] && $row[$key]!==0))return false;
     }
     return true;
 }
@@ -103,7 +116,8 @@ function ap_moderation_native_rows_valid(array $rows): bool
     }
     return true;
 }
-function ap_admin_native_post(string $url,array $request): ?string
+/** @param-out list<array<string,mixed>>|null $rows the validated reply rows when HTML is returned */
+function ap_admin_native_post(string $url,array $request,?array &$rows=null): ?string
 {
     try{
         $payload=json_encode($request,JSON_THROW_ON_ERROR);
@@ -115,8 +129,8 @@ function ap_admin_native_post(string $url,array $request): ?string
         $success=curl_exec($curl);$status=(int)curl_getinfo($curl,CURLINFO_RESPONSE_CODE);curl_close($curl);
         if($success!==true || $status!==200 || !is_string($body) || strlen($body)>2*1024*1024)return null;
         $reply=json_decode($body,true,512,JSON_THROW_ON_ERROR);if(!is_array($reply))return null;
-        return ap_admin_native_reply($reply,$request);
-    }catch(Throwable $e){return null;}
+        $html=ap_admin_native_reply($reply,$request);$rows=$html===null?null:$reply['rows'];return $html;
+    }catch(Throwable $e){$rows=null;return null;}
 }
 /**
  * Settings personal lists (Deprioritized, Muted words, Your blocks) for the signed-in
@@ -143,14 +157,16 @@ function ap_settings_native_body(string $view,bool $viewerAdmin): ?string
     if((int)($current['id']??0)!==$owner || ap_auth_is_admin($current)!==$viewerAdmin)return null;
     return $html;
 }
-function ap_admin_native_read_body(string $view,int $offset=0,?string $filter=null): ?string
+function ap_admin_native_read_body(string $view,int $offset=0,?string $filter=null,?array &$rows=null): ?string
 {
-    if(!ap_admin_native_enabled() || !in_array($view,['invites','approvals','users','relays','policies','blocks','moderation','stats'],true) || $offset<0 || $offset>PHP_INT_MAX-100)return null;
+    $rows=null;
+    if(!ap_admin_native_enabled() || !in_array($view,['invites','approvals','users','relays','policies','blocks','moderation','stats','queue_health'],true) || $offset<0 || $offset>PHP_INT_MAX-100)return null;
     if($view==='users' && getenv('VAAK_ADMIN_USERS_NATIVE')!=='1')return null;
     if($view==='relays' && (getenv('VAAK_ADMIN_RELAYS_NATIVE')!=='1' || $offset!==0))return null;
     if($view==='policies' && (getenv('VAAK_ADMIN_POLICIES_NATIVE')!=='1' || $offset!==0))return null;
     if($view==='blocks' && (getenv('VAAK_ADMIN_BLOCKS_NATIVE')!=='1' || $offset!==0))return null;
     if($view==='stats' && (getenv('VAAK_ADMIN_STATS_NATIVE')!=='1' || $offset!==0))return null;
+    if($view==='queue_health' && (getenv('VAAK_ADMIN_QUEUE_HEALTH_NATIVE')!=='1' || $offset!==0))return null;
     if($view==='moderation' && (getenv('VAAK_ADMIN_MODERATION_NATIVE')!=='1' || $offset!==0 || !in_array($filter,['open','about_us','outbound','closed','all'],true)))return null;
     if($view!=='moderation' && $filter!==null)return null;
     if(!ap_registration_current_admin(ap_db()))return null;
@@ -165,10 +181,11 @@ function ap_admin_native_read_body(string $view,int $offset=0,?string $filter=nu
         $request['search']=trim((string)($_GET['q']??$_POST['users_q']??''));
         if(strlen($request['search'])>4096 || $request['offset']>PHP_INT_MAX-100)return null;
     }
-    $html=ap_admin_native_post($url,$request);if($html===null)return null;
+    $html=ap_admin_native_post($url,$request,$replyRows);if($html===null)return null;
     try{
         $current=ap_auth_current_user();
         if((int)($current['id']??0)!==$owner || !ap_registration_current_admin(ap_db()))return null;
     }catch(Throwable $e){return null;}
+    $rows=$replyRows;
     return $html;
 }
