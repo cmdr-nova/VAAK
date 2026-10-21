@@ -4505,6 +4505,18 @@ $vaakAdminOnlyActions = [
         } else {
             $error = $res['error'] ?? 'Could not create a PDS invite code.';
         }
+    } elseif (($action === 'user_ban' || $action === 'user_unban') && $vaakIsAdmin
+        && ($usersNative = ap_admin_action_native($action, (int) $vaakOwnerId, (string) $vaakActorKey, ['user_id' => (int) ($_POST['user_id'] ?? 0)])) !== null) {
+        // A10d: the worker changed the account (or answered why not).
+        $view = 'users';
+        match ($usersNative['outcome']) {
+            'banned' => $notice = 'User banned and OAuth tokens revoked.',
+            'unbanned' => $notice = 'User unbanned.',
+            'invalid_user' => $error = 'Invalid user.',
+            'user_not_found' => $error = 'User not found.',
+            'protected_user' => $error = 'The operator account cannot be banned here.',
+            default => null,
+        };
     } elseif ($action === 'user_ban' || $action === 'user_unban') {
         $view = 'users';
         if (!$vaakIsAdmin) {
