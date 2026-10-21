@@ -2,6 +2,8 @@
 //! its own switch. S7a is muted words: muted_word_add and muted_word_remove,
 //! copied from ap_muted_word_add, ap_muted_word_remove, ap_muted_words_cache_clear
 //! and the admin_tl_cache_clear their ap-admin.php handlers run on success.
+//! S7c is revoke_oauth_token from Settings > Security, copied from
+//! ap_oauth_token_revoke_by_id with the owner's scope.
 //!
 //! Settings are never admin-gated: the worker requires the signed-in account to
 //! be active, holding its row for the write. PHP keeps the session, CSRF, the
@@ -24,13 +26,16 @@ struct Request {protocol_version:u8,owner_id:i64,actor_key:String,#[serde(flatte
 enum Action {
  #[serde(rename="muted_word_add")]MutedWordAdd(MutedWordAdd),
  #[serde(rename="muted_word_remove")]MutedWordRemove(MutedWordRemove),
+ #[serde(rename="revoke_oauth_token")]TokenRevoke(TokenRevoke),
 }
 #[derive(Debug,Deserialize)]#[serde(deny_unknown_fields)]struct MutedWordAdd {phrase:String,note:String}
 #[derive(Debug,Deserialize)]#[serde(deny_unknown_fields)]struct MutedWordRemove {id:i64}
+#[derive(Debug,Deserialize)]#[serde(deny_unknown_fields)]struct TokenRevoke {token_id:i64}
 impl Action {
- fn name(&self)->&'static str{match self{Action::MutedWordAdd(_)=>"muted_word_add",Action::MutedWordRemove(_)=>"muted_word_remove"}}
+ fn name(&self)->&'static str{match self{Action::MutedWordAdd(_)=>"muted_word_add",Action::MutedWordRemove(_)=>"muted_word_remove",Action::TokenRevoke(_)=>"revoke_oauth_token"}}
  fn family_enabled(&self)->bool{
-  let switch=match self{Action::MutedWordAdd(_)|Action::MutedWordRemove(_)=>"VAAK_SETTINGS_MUTED_WORDS_ACTIONS_NATIVE"};
+  let switch=match self{Action::MutedWordAdd(_)|Action::MutedWordRemove(_)=>"VAAK_SETTINGS_MUTED_WORDS_ACTIONS_NATIVE",
+   Action::TokenRevoke(_)=>"VAAK_SETTINGS_TOKENS_ACTIONS_NATIVE"};
   std::env::var(switch).ok().as_deref()==Some("1")
  }
 }
@@ -112,6 +117,23 @@ async fn run(cfg:&crate::config::Config,r:&Request)->Result<Value>{
    let cache=clear(cfg,&db,r.owner_id,true).await;
    Ok(reply(r,"removed",None,Some(a.id),cache))
   },
+  Action::TokenRevoke(a)=>{
+   // The handler short-circuits on a non-positive id before the helper runs.
+   if a.token_id<1{return Ok(reply(r,"not_revoked",None,None,Cache::Done));}
+   let tx=owner_tx(&mut db,r).await?;
+   crate::admin_actions::int4_guard(&tx,"oauth_tokens",a.token_id).await?;
+   // ap_db_cmdr_nova_user_id: the cmdr_nova row's id, else 1. Legacy rows with
+   // no user_id belong to that account.
+   // PHP's LIMIT 1 has no order, so two such rows are unproven.
+   let rows=tx.query("SELECT id::bigint FROM ap_users WHERE actor_key = 'cmdr_nova' LIMIT 2",&[]).await?;
+   if rows.len()>1{bail!("PHP fallback: two cmdr_nova rows");}
+   let cmdr=rows.first().map(|row|row.get::<_,i64>(0)).filter(|id|*id>0).unwrap_or(1);
+   let sql=if r.owner_id==cmdr{"UPDATE oauth_tokens SET revoked_at = $1 WHERE id::bigint = $2 AND revoked_at IS NULL AND (user_id::bigint = $3 OR user_id IS NULL)"}
+    else{"UPDATE oauth_tokens SET revoked_at = $1 WHERE id::bigint = $2 AND revoked_at IS NULL AND user_id::bigint = $3"};
+   let revoked=tx.execute(sql,&[&now_c(),&a.token_id,&r.owner_id]).await?;
+   tx.commit().await?;
+   Ok(reply(r,if revoked>0{"revoked"}else{"not_revoked"},None,(revoked>0).then_some(a.token_id),Cache::Done))
+  },
  }
 }
 /// The write transaction, holding the signed-in account's row: it must still be
@@ -187,6 +209,8 @@ mod tests{
  #[test]fn envelope_is_closed(){
   assert!(decode(&serde_json::to_vec(&env("muted_word_add",json!({"phrase":"x","note":""}))).unwrap()).is_ok());
   assert!(decode(&serde_json::to_vec(&env("muted_word_remove",json!({"id":3}))).unwrap()).is_ok());
+  assert!(decode(&serde_json::to_vec(&env("revoke_oauth_token",json!({"token_id":3}))).unwrap()).is_ok());
+  assert!(decode(&serde_json::to_vec(&env("revoke_oauth_token",json!({"id":3}))).unwrap()).is_err());
   for bad in[env("muted_word_add",json!({"phrase":"x"})),env("muted_word_add",json!({"phrase":"x","note":"","owner":1})),env("muted_word_remove",json!({"id":"3"})),env("user_ban",json!({"user_id":1})),json!({"protocol_version":1,"owner_id":0,"actor_key":"a","action":"muted_word_remove","fields":{"id":1}})]{
    assert!(decode(&serde_json::to_vec(&bad).unwrap()).is_err(),"{bad}");
   }
