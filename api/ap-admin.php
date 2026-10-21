@@ -7181,7 +7181,9 @@ if ($view === 'queue_health') {
     }
     $rustAdminHealth = admin_shadow_admin_health_fetch();
 }
-if ($view === 'stats') {
+// A native AP stats body replaces the whole page; its queries then never run here.
+$statsNativeBody = $view === 'stats' ? ap_admin_native_read_body('stats') : null;
+if ($view === 'stats' && $statsNativeBody === null) {
     try {
         $st = ap_db_execute_retry('SELECT COUNT(*) AS c FROM events WHERE created_at >= ?', [$since7]);
         if ($st) {
@@ -7192,17 +7194,17 @@ if ($view === 'stats') {
             $total24 = (int) ($st->fetch()['c'] ?? 0);
         }
         $st = ap_db_execute_retry(
-            'SELECT type, COUNT(*) AS c FROM events WHERE created_at >= ? GROUP BY type ORDER BY c DESC LIMIT 12',
+            'SELECT type, COUNT(*) AS c FROM events WHERE created_at >= ? GROUP BY type ORDER BY c DESC, type ASC LIMIT 12',
             [$since24]
         );
         $typeRows = $st ? ($st->fetchAll() ?: []) : [];
         $st = ap_db_execute_retry(
-            'SELECT action_taken, COUNT(*) AS c FROM events WHERE created_at >= ? GROUP BY action_taken ORDER BY c DESC LIMIT 12',
+            'SELECT action_taken, COUNT(*) AS c FROM events WHERE created_at >= ? GROUP BY action_taken ORDER BY c DESC, action_taken ASC LIMIT 12',
             [$since24]
         );
         $actionRows = $st ? ($st->fetchAll() ?: []) : [];
         $st = ap_db_execute_retry(
-            'SELECT host, COUNT(*) AS c FROM events WHERE created_at >= ? AND host IS NOT NULL GROUP BY host ORDER BY c DESC LIMIT 12',
+            'SELECT host, COUNT(*) AS c FROM events WHERE created_at >= ? AND host IS NOT NULL GROUP BY host ORDER BY c DESC, host ASC LIMIT 12',
             [$since24]
         );
         $hostRows = $st ? ($st->fetchAll() ?: []) : [];
@@ -37318,6 +37320,7 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
         </div>
 
       <?php elseif ($view === 'stats'): ?>
+        <?php if ($statsNativeBody !== null): ?><?= $statsNativeBody ?><?php else: ?>
         <div class="meta" style="margin-bottom:.85rem">
           Instance-wide ActivityPub stats across <b>all local users</b>, plus the shared federation firehose.
         </div>
@@ -37400,6 +37403,7 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
             <div class="bar-row"><span><?= h((string) $r['host']) ?></span><span><?= (int) $r['c'] ?></span></div>
           <?php endforeach; ?>
         </div>
+        <?php endif; ?>
 
       <?php elseif ($view === 'about'): ?>
         <article class="about-vaak">

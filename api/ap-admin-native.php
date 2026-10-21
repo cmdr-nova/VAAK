@@ -20,7 +20,7 @@ function ap_admin_native_reply(array $reply,array $request): ?string
     $keys=array_keys($reply);sort($keys);$expected=['protocol_version','ok','request_binding','source_count','rows','html'];sort($expected);
     if($keys!==$expected || $reply['protocol_version']!==1 || $reply['ok']!==true || !is_string($reply['html'])
         || strlen($reply['html'])>2*1024*1024 || !is_int($reply['source_count']) || !is_array($reply['rows'])
-        || !array_is_list($reply['rows']) || count($reply['rows'])!==$reply['source_count'] || count($reply['rows'])>match($request['view']){'users'=>20,'blocks'=>1000,'settings_lists'=>3000,'settings_follow_requests'=>1000,'settings_mutes'=>1000,'settings_featured'=>40,'settings_profile'=>1,'settings_links'=>2,'settings_ai'=>1,'settings_tokens'=>40,'settings_two_factor'=>1,'settings_aliases'=>1000,'settings_move'=>1,'moderation'=>80,default=>100}) return null;
+        || !array_is_list($reply['rows']) || count($reply['rows'])!==$reply['source_count'] || count($reply['rows'])>match($request['view']){'users'=>20,'blocks'=>1000,'settings_lists'=>3000,'settings_follow_requests'=>1000,'settings_mutes'=>1000,'settings_featured'=>40,'settings_profile'=>1,'settings_links'=>2,'settings_ai'=>1,'settings_tokens'=>40,'settings_two_factor'=>1,'settings_aliases'=>1000,'settings_move'=>1,'stats'=>1000,'moderation'=>80,default=>100}) return null;
     $binding=[];foreach(['owner_id','view','mode','offset','approvals_enabled'] as $key)$binding[$key]=$request[$key];
     if($request['view']==='users')$binding['search']=$request['search'];
     if(str_starts_with($request['view'],'settings_'))$binding['viewer_admin']=$request['viewer_admin'];
@@ -31,6 +31,7 @@ function ap_admin_native_reply(array $reply,array $request): ?string
     if($request['view']==='settings_lists')return ap_settings_native_rows_valid($reply['rows'])?$reply['html']:null;
     if(str_starts_with($request['view'],'settings_'))return ap_settings_native_account_rows_valid($request['view'],$reply['rows'])?$reply['html']:null;
     if($request['view']==='moderation')return ap_moderation_native_rows_valid($reply['rows'])?$reply['html']:null;
+    if($request['view']==='stats')return ap_admin_stats_native_rows_valid($reply['rows'])?$reply['html']:null;
     $required=match($request['view']){'users'=>['id','username','email','actor_key','actor_id','is_admin','created_at','updated_at','disabled_at','profile_name','icon_url'],
         'invites'=>['id','code','created_at','used_at','note'],'relays'=>['id','inbox_url','state','follow_activity_id','created_at','updated_at'],'policies'=>['id','text'],'blocks'=>['id','scope','value','kind','reason','created_at'],
         default=>['id','username','email','status','created_at','decided_at']};sort($required);
@@ -42,6 +43,17 @@ function ap_admin_native_reply(array $reply,array $request): ?string
         if($request['view']==='approvals'&&!in_array($row['status'],['pending','approved','rejected'],true))return null;
     }
     return $reply['html'];
+}
+/** AP stats per-user rows: account identity, four counts and two flags. */
+function ap_admin_stats_native_rows_valid(array $rows): bool
+{
+    $required=['id','username','posts','followers','following','mentions','is_admin','disabled'];sort($required);$last=0;
+    foreach($rows as $row){
+        if(!is_array($row))return false;$keys=array_keys($row);sort($keys);if($keys!==$required)return false;
+        if(!is_int($row['id']) || $row['id']<=$last || !is_string($row['username']) || !is_bool($row['is_admin']) || !is_bool($row['disabled']))return false;$last=$row['id'];
+        foreach(['posts','followers','following','mentions'] as $key)if(!is_int($row[$key]) || $row[$key]<0)return false;
+    }
+    return true;
 }
 /** Personal list rows: deprioritized accounts carry no id; muted words and personal blocks do. */
 function ap_settings_native_rows_valid(array $rows): bool
@@ -133,11 +145,12 @@ function ap_settings_native_body(string $view,bool $viewerAdmin): ?string
 }
 function ap_admin_native_read_body(string $view,int $offset=0,?string $filter=null): ?string
 {
-    if(!ap_admin_native_enabled() || !in_array($view,['invites','approvals','users','relays','policies','blocks','moderation'],true) || $offset<0 || $offset>PHP_INT_MAX-100)return null;
+    if(!ap_admin_native_enabled() || !in_array($view,['invites','approvals','users','relays','policies','blocks','moderation','stats'],true) || $offset<0 || $offset>PHP_INT_MAX-100)return null;
     if($view==='users' && getenv('VAAK_ADMIN_USERS_NATIVE')!=='1')return null;
     if($view==='relays' && (getenv('VAAK_ADMIN_RELAYS_NATIVE')!=='1' || $offset!==0))return null;
     if($view==='policies' && (getenv('VAAK_ADMIN_POLICIES_NATIVE')!=='1' || $offset!==0))return null;
     if($view==='blocks' && (getenv('VAAK_ADMIN_BLOCKS_NATIVE')!=='1' || $offset!==0))return null;
+    if($view==='stats' && (getenv('VAAK_ADMIN_STATS_NATIVE')!=='1' || $offset!==0))return null;
     if($view==='moderation' && (getenv('VAAK_ADMIN_MODERATION_NATIVE')!=='1' || $offset!==0 || !in_array($filter,['open','about_us','outbound','closed','all'],true)))return null;
     if($view!=='moderation' && $filter!==null)return null;
     if(!ap_registration_current_admin(ap_db()))return null;
