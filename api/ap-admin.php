@@ -30167,6 +30167,9 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
         </div>
 
       <?php elseif ($view === 'friend_servers'): ?>
+        <?php if (($adminNativeBody = ap_admin_native_read_body('friend_servers')) !== null): ?>
+          <?= $adminNativeBody ?>
+        <?php else: ?>
         <?php
           $friendRows = [];
           try { $friendRows = ap_db()->query('SELECT host,note,updated_at FROM ap_wafrn_friend_servers WHERE enabled=1 ORDER BY host')->fetchAll() ?: []; } catch (Throwable $e) {}
@@ -30210,6 +30213,7 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
         </form>
         <?php if (!$friendRows): ?><div class="empty">No admin overrides. The official Wafrn directory is still used.</div><?php endif; ?>
         <?php foreach ($friendRows as $friend): ?><div class="tweet" style="display:flex;align-items:center;gap:.75rem;justify-content:space-between"><div><b><?= h((string) $friend['host']) ?></b><div class="meta"><?= h((string) ($friend['note'] ?? '')) ?></div></div><form method="post" action="?view=friend_servers"><input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>"><input type="hidden" name="action" value="wafrn_friend_remove"><input type="hidden" name="host" value="<?= h((string) $friend['host']) ?>"><button class="btn btn-ghost" type="submit">Remove</button></form></div><?php endforeach; ?>
+        <?php endif; ?>
 
       <?php elseif ($view === 'dms'): ?>
         <?php

@@ -35,6 +35,7 @@ function ap_admin_native_reply(array $reply,array $request): ?string
     if($request['view']==='queue_health')return ap_admin_queue_health_native_rows_valid($reply['rows'])?$reply['html']:null;
     if($request['view']==='downranking')return ap_admin_downranking_native_rows_valid($reply['rows'])?$reply['html']:null;
     if($request['view']==='downranked')return ap_admin_downranked_native_rows_valid($reply['rows'])?$reply['html']:null;
+    if($request['view']==='friend_servers')return ap_admin_friend_servers_native_rows_valid($reply['rows'])?$reply['html']:null;
     $required=match($request['view']){'users'=>['id','username','email','actor_key','actor_id','is_admin','created_at','updated_at','disabled_at','profile_name','icon_url'],
         'invites'=>['id','code','created_at','used_at','note'],'relays'=>['id','inbox_url','state','follow_activity_id','created_at','updated_at'],'policies'=>['id','text'],'blocks'=>['id','scope','value','kind','reason','created_at'],
         default=>['id','username','email','status','created_at','decided_at']};sort($required);
@@ -46,6 +47,17 @@ function ap_admin_native_reply(array $reply,array $request): ?string
         if($request['view']==='approvals'&&!in_array($row['status'],['pending','approved','rejected'],true))return null;
     }
     return $reply['html'];
+}
+/** Wafrn friend override rows: host, optional note and update time, no duplicate hosts. */
+function ap_admin_friend_servers_native_rows_valid(array $rows): bool
+{
+    $required=['host','note','updated_at'];$seen=[];
+    foreach($rows as $row){
+        if(!is_array($row))return false;$keys=array_keys($row);sort($keys);if($keys!==$required)return false;
+        if(!is_string($row['host']) || $row['host']==='' || isset($seen[$row['host']]))return false;$seen[$row['host']]=true;
+        foreach(['note','updated_at'] as $key)if($row[$key]!==null && !is_string($row[$key]))return false;
+    }
+    return true;
 }
 /** AP stats per-user rows: account identity, four counts and two flags. */
 function ap_admin_stats_native_rows_valid(array $rows): bool
@@ -182,7 +194,7 @@ function ap_settings_native_body(string $view,bool $viewerAdmin): ?string
 function ap_admin_native_read_body(string $view,int $offset=0,?string $filter=null,?array &$rows=null): ?string
 {
     $rows=null;
-    if(!ap_admin_native_enabled() || !in_array($view,['invites','approvals','users','relays','policies','blocks','moderation','stats','queue_health','downranking','downranked'],true) || $offset<0 || $offset>PHP_INT_MAX-100)return null;
+    if(!ap_admin_native_enabled() || !in_array($view,['invites','approvals','users','relays','policies','blocks','moderation','stats','queue_health','downranking','downranked','friend_servers'],true) || $offset<0 || $offset>PHP_INT_MAX-100)return null;
     if($view==='users' && getenv('VAAK_ADMIN_USERS_NATIVE')!=='1')return null;
     if($view==='relays' && (getenv('VAAK_ADMIN_RELAYS_NATIVE')!=='1' || $offset!==0))return null;
     if($view==='policies' && (getenv('VAAK_ADMIN_POLICIES_NATIVE')!=='1' || $offset!==0))return null;
@@ -191,6 +203,8 @@ function ap_admin_native_read_body(string $view,int $offset=0,?string $filter=nu
     if($view==='queue_health' && (getenv('VAAK_ADMIN_QUEUE_HEALTH_NATIVE')!=='1' || $offset!==0))return null;
     if($view==='downranking' && (getenv('VAAK_ADMIN_DOWNRANKING_NATIVE')!=='1' || $offset!==0))return null;
     if($view==='downranked' && (getenv('VAAK_ADMIN_DOWNRANKED_NATIVE')!=='1' || $offset!==0))return null;
+    // The worker cannot see PHP-FPM's env, so a host override keeps the page in PHP.
+    if($view==='friend_servers' && (getenv('VAAK_ADMIN_FRIEND_SERVERS_NATIVE')!=='1' || $offset!==0 || (is_string($wafrnHosts=getenv('VAAK_WAFRN_FRIEND_HOSTS')) && trim($wafrnHosts)!=='')))return null;
     if($view==='moderation' && (getenv('VAAK_ADMIN_MODERATION_NATIVE')!=='1' || $offset!==0 || !in_array($filter,['open','about_us','outbound','closed','all'],true)))return null;
     if($view!=='moderation' && $filter!==null)return null;
     if(!ap_registration_current_admin(ap_db()))return null;
