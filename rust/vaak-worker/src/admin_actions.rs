@@ -257,7 +257,7 @@ async fn run(cfg:&crate::config::Config,r:&Request)->Result<Value>{
    if a.note.contains('\0'){bail!("PHP fallback: NUL in invite note");}
    let note=php_trim(&a.note);
    let note:Option<String>=(!note.is_empty()).then(||note.chars().take(200).collect());
-   let code={use rand::RngCore;let mut b=[0u8;6];rand::rngs::OsRng.fill_bytes(&mut b);format!("{}-{}",hex::encode_upper(&b[..4]),hex::encode_upper(&b[4..]))};
+   let code={use rand::TryRng;let mut b=[0u8;6];rand::rngs::SysRng.try_fill_bytes(&mut b).expect("os rng");format!("{}-{}",hex::encode_upper(&b[..4]),hex::encode_upper(&b[4..]))};
    let tx=admin_tx(&mut db,r).await?;
    tx.execute("INSERT INTO ap_invite_codes (code, created_by, created_at, expires_at, note) VALUES ($1, $2::bigint, $3, NULL, $4)",&[&code,&r.owner_id,&now_c(),&note]).await?;
    tx.commit().await?;
