@@ -302,6 +302,83 @@ pub(crate) fn status_urls_equivalent(a:&str,b:&str)->bool {
     !status_candidates(a).is_disjoint(&status_candidates(b))
 }
 
+/// Status/thread quote. Same stored account fields the Home lean card paints:
+/// avatar, display name, handle, and time, inside the feed's nested post chrome.
+/// Library and profile quotes stay on [`quote_card`].
+fn feed_quote_embed(status: &Value, facts: &CardFacts, silent: bool) -> Result<String> {
+    let account = status.get("account").unwrap_or(&Value::Null);
+    let acct = string(account, "acct").trim().trim_start_matches('@').to_string();
+    let display = {
+        let raw = php_trim(string(account, "display_name"));
+        if !raw.is_empty() { raw.to_string() } else if !acct.is_empty() { acct.clone() } else { "?".into() }
+    };
+    let actor = account_actor_ref(account);
+    let avatar = [string(account, "avatar"), string(account, "avatar_static")].into_iter().find(|url| url.starts_with("https://")).unwrap_or("https://mkultra.monster/img/avatar/default.webp").to_string();
+    let view = facts.return_view.as_str();
+    let profile = if actor.starts_with("https://") { profile_href(&actor, view) } else { String::new() };
+    let actor_attr = if actor.starts_with("https://") { format!(" data-profile-hover-actor=\"{}\"", esc(&actor)) } else { String::new() };
+    let av_img = format!("<img class=\"tweet-av\" src=\"{}\" alt=\"\" width=\"40\" height=\"40\" loading=\"lazy\" decoding=\"async\" referrerpolicy=\"no-referrer\" onerror=\"this.onerror=null;this.src='https://mkultra.monster/img/avatar/default.webp'\"{actor_attr}>", esc(&avatar));
+    let av_block = if profile.is_empty() { av_img } else { format!("<a href=\"{}\"{actor_attr} style=\"text-decoration:none\">{av_img}</a>", esc(&profile)) };
+    let emoji_map = facts.emoji_by_actor.get(&actor).cloned().unwrap_or_default();
+    let display_html = super::body::emojis(&display, &emoji_map, true);
+    let who = if profile.is_empty() {
+        let mut who = format!("<span class=\"who\">{display_html}</span>");
+        if !acct.is_empty() { who.push_str(&format!("<span class=\"meta\"> @{}</span>", esc(&acct))); }
+        who
+    } else {
+        let mut who = format!("<a class=\"who\" href=\"{}\"{actor_attr} style=\"color:inherit;text-decoration:none\">{display_html}</a>", esc(&profile));
+        if !acct.is_empty() { who.push_str(&format!("<a class=\"meta\" href=\"{}\"{actor_attr} style=\"color:var(--muted);text-decoration:none\"> @{}</a>", esc(&profile), esc(&acct))); }
+        who
+    };
+    let mut uri = string(status, "uri");
+    if !uri.starts_with("https://") { uri = string(status, "url"); }
+    let created = string(status, "created_at");
+    let rel = if created.is_empty() { String::new() } else { relative_time(&created, facts.now) };
+    let when = if rel.is_empty() { String::new() } else if uri.starts_with("https://") {
+        let href = status_href(&uri, view);
+        if href.is_empty() || href == "#" { format!("<span class=\"meta\"> · {}</span>", esc(&rel)) } else { format!("<a class=\"meta tweet-time\" href=\"{}\" title=\"Open post\"> · {}</a>", esc(&href), esc(&rel)) }
+    } else { format!("<span class=\"meta\"> · {}</span>", esc(&rel)) };
+    let header = format!("<div class=\"tweet-hd\">{av_block}<div class=\"tweet-hd-main tweet-hd-main--fedi\"><div>{who}{when}</div></div></div>");
+    let scrubbed = super::body::scrub_as2(&plain(string(status, "content")));
+    let text = php_trim(&scrubbed);
+    let mut body = String::new();
+    if !text.is_empty() { body.push_str(&format!("<div class=\"body feed-body\" style=\"white-space:pre-wrap\">{}</div>", body_text(&text, view, status.get("mentions").and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[]), &facts.owner_actor)?)); }
+    let media = status.get("media_attachments").and_then(Value::as_array).cloned().unwrap_or_default();
+    if !media.is_empty() {
+        let normalized = media.iter().filter(|item| item.is_object()).map(|item| {
+            let mut item = item.clone();
+            if item.get("url").is_some_and(Value::is_object) { item["url"] = item["url"].get("href").or_else(|| item["url"].get("url")).cloned().unwrap_or(Value::Null); }
+            if string(&item, "preview_url").is_empty() { if let Some(preview) = item.get("preview").or_else(|| item.get("thumbnail")).and_then(Value::as_str).filter(|preview| preview.starts_with("https://")) { item["preview_url"] = Value::String(preview.into()); } }
+            if string(&item, "mediaType").is_empty() {
+                let mime = match string(&item, "type").to_ascii_lowercase().as_str() { "video" | "gifv" => "video/mp4", "audio" => "audio/*", "image" => "image/jpeg", _ => "" };
+                item["mediaType"] = Value::String(mime.into());
+            }
+            item
+        }).collect::<Vec<_>>();
+        let row = media_row_mode(&normalized, facts.lazy_media, silent);
+        if !row.is_empty() {
+            if boolean(status, "sensitive") || !php_trim(string(status, "spoiler_text")).is_empty() {
+                body.push_str(&cw_gate(if php_trim(string(status, "spoiler_text")).is_empty() { "Sensitive content" } else { string(status, "spoiler_text") }, true, &row, facts.auto_unblur_sensitive));
+            } else { body.push_str(&row); }
+        }
+    } else if let Some(card) = status.get("card").filter(|card| card.is_object()) {
+        let mut card = card.clone();
+        card["status"] = Value::String("ok".into());
+        let preview = link_preview_mode(&card, false)?;
+        if !preview.is_empty() { body.push_str(&format!("<div class=\"quote-link-card\" data-quote-chrome=\"1\" style=\"margin-top:.45rem;pointer-events:none\">{preview}</div>")); }
+    }
+    let bsky = string(status, "source").eq_ignore_ascii_case("bluesky") || string(status, "id").starts_with("bsky:") || string(status, "uri").contains("bsky.app/") || string(status, "url").contains("bsky.app/") || string(status, "uri").starts_with("at://") || acct.to_ascii_lowercase().ends_with("@bsky.app");
+    let sid = scalar_string(status, "id").trim().trim_end_matches('/').to_string();
+    let mut attrs = String::new();
+    if !sid.is_empty() { attrs.push_str(&format!(" data-timeline-key=\"{}\" data-status-id=\"{}\"", esc(&sid), esc(&sid))); }
+    let note = uri.trim().trim_end_matches('/');
+    if note.starts_with("https://") { attrs.push_str(&format!(" data-note-id=\"{}\"", esc(note))); }
+    let sort = crate::timeline::status_created_ts(status);
+    if sort > 0 { attrs.push_str(&format!(" data-sort=\"{sort}\"")); }
+    let class = if bsky { "tweet tweet-bsky" } else { "tweet" };
+    Ok(format!("<div class=\"quote-block\" style=\"margin-top:.55rem;background:transparent;border:0;padding:0;border-radius:0;color:inherit\"><div class=\"notif-status-embed\"><article class=\"{class}\"{attrs}>{header}{body}</article></div></div>"))
+}
+
 fn quote_card(status: &Value, facts: &CardFacts) -> Result<String> {quote_card_mode(status,facts,false)}
 fn quote_card_mode(status: &Value, facts: &CardFacts,silent:bool) -> Result<String> {
     if let Some(row)=facts.rss_quote_row.as_ref() {
@@ -689,7 +766,10 @@ fn render_core_mode(status:&Value,facts:&CardFacts,direct:Option<&crate::direct_
         .map(|quoted| crate::quote_media::outer_attachments_for_quote(st, quoted)).unwrap_or_else(|| media.clone());
     body.push_str(&media_row_mode(&paint_media, facts.lazy_media,silent));
     if let Some(quote) = st.get("quote").filter(|quote|quote.is_object()) {
-        if let Some(quoted) = quote.get("quoted_status").filter(|v| v.is_object()) { body.push_str(&quote_card_mode(quoted, facts,silent)?); }
+        if let Some(quoted) = quote.get("quoted_status").filter(|v| v.is_object()) {
+            if direct.is_some_and(|presentation| presentation.feed_quote()) && facts.rss_quote_row.is_none() { body.push_str(&feed_quote_embed(quoted, facts, silent)?); }
+            else { body.push_str(&quote_card_mode(quoted, facts,silent)?); }
+        }
         else if let Some(pending)=direct.and_then(|presentation|presentation.pending_quote()){body.push_str(&pending.render(facts)?);}
         else if direct.is_some_and(|presentation|presentation.pending_quote_suppressed()) {}
         else { bail!("pending/synthetic/fallback quote branch not yet ported"); }
@@ -880,6 +960,63 @@ mod tests {
         assert!(cw_gate("", true, "payload", true).starts_with("<div class=\"tweet-content\""));
         assert!(cw_gate("", true, "", false).contains("sensitive media"));
     }
+    #[test]
+    fn status_quote_embed_matches_actual_php_capture() {
+        let file = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../api/bin/status-quote-embed-capture.php");
+        let output = std::process::Command::new(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../api/bin/php-policy-test")).arg(file).output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        let reference: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let now = chrono::DateTime::from_timestamp(integer(&reference, "now"), 0).unwrap();
+        for case in reference["cases"].as_array().unwrap() {
+            let facts = CardFacts { current_action_counts: None, bsky: None, owner_id: 1, owner_actor: "https://mkultra.monster/users/fixture".into(), return_view: "local".into(), auto_unblur_sensitive: false, resolved_avatar: String::new(), csrf: String::new(), favourited: false, bookmarked: false, boosted: false, own: None, rss_row: None, rss_quote_row: None, rss_quoted: false, emoji_by_actor: Default::default(), reply_mentions: Vec::new(), moderation: Default::default(), poll_row: None, ask_row: None, now, lazy_media: false };
+            let status = &case["status"];
+            let html = feed_quote_embed(status, &facts, false).unwrap();
+            assert_eq!(html, string(case, "html"), "status quote embed {}", string(case, "id"));
+            let legacy = quote_card(status, &facts).unwrap();
+            assert!(!legacy.contains("tweet-av"), "library quote card {}", string(case, "id"));
+            assert_eq!(legacy.contains("qt-label"), true);
+        }
+    }
+
+    #[test]
+    fn status_surface_paints_the_feed_quote_and_profile_keeps_the_compact_card() {
+        let quoted_avatar = "https://cdn.example/avatars/quoted.webp";
+        let quoted = serde_json::json!({
+            "id":"https://remote.test/users/quoted/statuses/9",
+            "uri":"https://remote.test/users/quoted/statuses/9",
+            "url":"https://remote.test/users/quoted/statuses/9",
+            "created_at":"2020-01-01T00:00:00Z",
+            "content":"<p>hello quote</p>",
+            "visibility":"public",
+            "account":{"uri":"https://remote.test/users/quoted","url":"https://remote.test/users/quoted","acct":"quoted@remote.test","display_name":"Quoted Person","avatar":quoted_avatar,"avatar_static":quoted_avatar},
+            "media_attachments":[]
+        });
+        let outer = serde_json::json!({
+            "id":"https://remote.test/users/quoter/statuses/1",
+            "uri":"https://remote.test/users/quoter/statuses/1",
+            "url":"https://remote.test/users/quoter/statuses/1",
+            "created_at":"2020-01-02T00:00:00Z",
+            "content":"<p>quoting</p>",
+            "visibility":"public",
+            "account":{"id":"https://remote.test/users/quoter","uri":"https://remote.test/users/quoter","url":"https://remote.test/users/quoter","acct":"quoter@remote.test","username":"quoter","display_name":"Quoter","avatar":"https://cdn.example/avatars/quoter.webp"},
+            "media_attachments":[],
+            "quote":{"state":"accepted","quoted_status":quoted}
+        });
+        let facts = CardFacts { current_action_counts: None, bsky: None, owner_id: 1, owner_actor: "https://mkultra.monster/users/fixture".into(), return_view: "local".into(), auto_unblur_sensitive: false, resolved_avatar: "https://mkultra.monster/img/avatar/default.webp".into(), csrf: "csrf".into(), favourited: false, bookmarked: false, boosted: false, own: None, rss_row: None, rss_quote_row: None, rss_quoted: false, emoji_by_actor: Default::default(), reply_mentions: Vec::new(), moderation: Default::default(), poll_row: None, ask_row: None, now: chrono::DateTime::from_timestamp(1792627200, 0).unwrap(), lazy_media: false };
+        let status_view = crate::direct_context::DirectPresentation::fixture(true);
+        let html = render_core_mode(&outer, &facts, Some(&status_view), None, false, true).unwrap();
+        assert!(html.contains("notif-status-embed") && html.contains(quoted_avatar) && html.contains("Quoted Person"), "{html}");
+        assert!(!html.contains("qt-label"), "{html}");
+        let profile = crate::direct_context::DirectPresentation::fixture(false);
+        let compact = render_core_mode(&outer, &facts, Some(&profile), None, false, true).unwrap();
+        assert!(compact.contains("qt-label") && compact.contains("@quoted@remote.test"), "{compact}");
+        assert!(!compact.contains(quoted_avatar) && !compact.contains("notif-status-embed"), "{compact}");
+        let mut library = facts.clone();
+        library.return_view = "bookmarks".into();
+        let saved = render(&outer, &library).unwrap();
+        assert!(saved.contains("qt-label") && !saved.contains(quoted_avatar), "{saved}");
+    }
+
     /// Library, search and status pages paint with this card. These pin the
     /// same media/quote/poll contract the Home builders are tested against.
     mod card_contract {

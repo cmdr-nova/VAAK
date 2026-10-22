@@ -489,6 +489,10 @@ function ap_normalize_from_bsky_post(array $postOrItem): ?array
                 $qHandle = trim((string) ($qPrev['handle'] ?? ''));
                 $qText = trim((string) ($qPrev['text'] ?? ''));
                 $qUrl = trim((string) ($qPrev['url'] ?? ''));
+                $qAvatar = trim((string) ($qPrev['avatar'] ?? ''));
+                if (!str_starts_with($qAvatar, 'https://')) {
+                    $qAvatar = '';
+                }
                 $synthId = $qUrl !== '' ? $qUrl : ('bsky-quote:' . substr(hash('sha256', $qText . $qHandle), 0, 16));
                 $qSt = [
                     'id' => $synthId,
@@ -497,13 +501,16 @@ function ap_normalize_from_bsky_post(array $postOrItem): ?array
                     'content' => $qText !== ''
                         ? ('<p>' . nl2br(htmlspecialchars($qText, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'), false) . '</p>')
                         : '',
-                    'created_at' => gmdate('c'),
+                    'created_at' => trim((string) ($qPrev['created_at'] ?? '')) !== ''
+                        ? (string) $qPrev['created_at']
+                        : gmdate('c'),
                     'account' => [
                         'acct' => $qHandle,
                         'username' => $qHandle,
                         'display_name' => trim((string) ($qPrev['display'] ?? $qHandle)),
                         'url' => $qHandle !== '' ? ('https://bsky.app/profile/' . rawurlencode($qHandle)) : '',
-                        'avatar' => '',
+                        'avatar' => $qAvatar,
+                        'avatar_static' => $qAvatar,
                     ],
                     'media_attachments' => function_exists('ap_masto_bsky_preview_media_as_attachments')
                         ? ap_masto_bsky_preview_media_as_attachments($prevMedia, $synthId)
@@ -517,6 +524,15 @@ function ap_normalize_from_bsky_post(array $postOrItem): ?array
                 // trend_status succeeded but may lack media while the quote preview
                 // still has images/video from the embedded record — merge them in.
                 $qMedia = is_array($qSt['media_attachments'] ?? null) ? $qSt['media_attachments'] : [];
+                $qCachedAvatar = trim((string) ($qPrev['avatar'] ?? ''));
+                if (str_starts_with($qCachedAvatar, 'https://')
+                    && !str_starts_with(trim((string) ($qSt['account']['avatar'] ?? '')), 'https://')) {
+                    if (!is_array($qSt['account'] ?? null)) {
+                        $qSt['account'] = [];
+                    }
+                    $qSt['account']['avatar'] = $qCachedAvatar;
+                    $qSt['account']['avatar_static'] = $qCachedAvatar;
+                }
                 if ($qMedia === [] && $prevMedia !== []) {
                     $qSt['media_attachments'] = function_exists('ap_masto_bsky_preview_media_as_attachments')
                         ? ap_masto_bsky_preview_media_as_attachments($prevMedia, (string) ($qSt['id'] ?? 'bsky-quote'))

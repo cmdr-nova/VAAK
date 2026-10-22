@@ -1487,6 +1487,7 @@ function ap_masto_quote_entity(?string $quoteObjectUrl, int $depth = 0, bool $al
                             : ('https://bsky.app/profile/' . rawurlencode($handle)))
                         : 'https://bsky.app/',
                 ],
+                'created_at' => (string) ($prev['created_at'] ?? ''),
                 // Quote cards + Ice Cubes need nested media (images/video on the quoted post).
                 'media_attachments' => function_exists('ap_masto_bsky_preview_media_as_attachments')
                     ? ap_masto_bsky_preview_media_as_attachments(
@@ -1496,6 +1497,13 @@ function ap_masto_quote_entity(?string $quoteObjectUrl, int $depth = 0, bool $al
                     : [],
                 'source' => 'bluesky',
             ];
+            // Cached author avatar from the preview already loaded above.
+            // A connected local owner still replaces this below.
+            $cachedAvatar = trim((string) ($prev['avatar'] ?? ''));
+            if ($cachedAvatar !== '' && str_starts_with($cachedAvatar, 'https://')) {
+                $quoted['account']['avatar'] = $cachedAvatar;
+                $quoted['account']['avatar_static'] = $cachedAvatar;
+            }
             // A quote of a connected Bluesky copy uses the owner's saved avatar.
             // Keep the Bluesky account/status IDs and URLs intact.
             $linkedOwner = ap_masto_notif_bsky_owner_user_id($quoteObjectUrl);

@@ -8,7 +8,7 @@ use tokio_postgres::Client;
 pub(crate) enum DirectRoute {Status,RemoteProfile}
 /// Presentation intent only. No role, recipient, mute or permission decision.
 #[derive(Clone)]
-pub(crate) struct DirectPresentation {focused:bool,show_open:bool,hide_header:bool,profile_actor:String,root_preview:Option<Value>,pending_quote:Option<std::sync::Arc<crate::profile_quote_warm::PendingQuotePresentation>>,pending_quote_suppressed:bool}
+pub(crate) struct DirectPresentation {focused:bool,show_open:bool,hide_header:bool,profile_actor:String,root_preview:Option<Value>,pending_quote:Option<std::sync::Arc<crate::profile_quote_warm::PendingQuotePresentation>>,pending_quote_suppressed:bool,feed_quote:bool}
 impl DirectPresentation {
  pub(crate) fn pending_quote_suppressed(&self)->bool{self.pending_quote_suppressed}
  pub(crate) fn pending_quote(&self)->Option<&crate::profile_quote_warm::PendingQuotePresentation>{self.pending_quote.as_deref()}
@@ -17,6 +17,10 @@ impl DirectPresentation {
  pub(crate) fn show_open(&self)->bool{self.show_open}
  pub(crate) fn hide_header(&self)->bool{self.hide_header}
  pub(crate) fn profile_actor(&self)->&str{&self.profile_actor}
+ /// Status/thread quotes use the feed's nested post card. Profiles keep the compact card.
+ pub(crate) fn feed_quote(&self)->bool{self.feed_quote}
+ #[cfg(test)]
+ pub(crate) fn fixture(feed_quote:bool)->Self{Self{focused:true,show_open:false,hide_header:false,profile_actor:String::new(),root_preview:None,pending_quote:None,pending_quote_suppressed:false,feed_quote}}
 }
 #[derive(Clone)]
 pub(crate) struct DirectSession {route:DirectRoute,owner:i64,csrf:String,return_view:String,lazy_media:bool,status_preview_budget:i64,quote_preview_budget:Option<i64>,warm_context:Option<std::sync::Arc<crate::profile_enrichment::WarmContext>>,profile_bsky:Option<crate::profile_bsky::ProfileBskyPresentation>,presentation:DirectPresentation}
@@ -27,7 +31,7 @@ impl DirectSession {
   if focused&&!matches!(route,DirectRoute::Status){bail!("invalid canonical direct focus")}
   if matches!(route,DirectRoute::RemoteProfile)&&return_view!="remote_profile"{bail!("profile painter requires canonical direct return context")}
   if !profile_actor.is_empty(){let url=reqwest::Url::parse(&profile_actor).context("invalid profile presentation origin")?;if profile_actor.len()>2048||!matches!(url.scheme(),"https"|"http")||!url.username().is_empty()||url.password().is_some()||url.fragment().is_some(){bail!("invalid profile presentation origin")}}
-  Ok(Self{route,owner,csrf,return_view,lazy_media,status_preview_budget:3,quote_preview_budget:None,warm_context:None,profile_bsky:None,presentation:DirectPresentation{focused,show_open,hide_header,profile_actor,root_preview:None,pending_quote:None,pending_quote_suppressed:false}})
+  Ok(Self{route,owner,csrf,return_view,lazy_media,status_preview_budget:3,quote_preview_budget:None,warm_context:None,profile_bsky:None,presentation:DirectPresentation{focused,show_open,hide_header,profile_actor,root_preview:None,pending_quote:None,pending_quote_suppressed:false,feed_quote:matches!(route,DirectRoute::Status)}})
  }
  pub(crate) fn with_suppressed_pending_quote(mut self)->Self{self.presentation.pending_quote_suppressed=true;self}
  pub(crate) fn with_profile_bsky(mut self,context:crate::profile_bsky::ProfileBskyPresentation)->Result<Self>{if !matches!(self.route,DirectRoute::RemoteProfile)||context.owner()!=self.owner{bail!("profile protocol capability requires bound owner/profile route")}self.profile_bsky=Some(context);Ok(self)}
@@ -230,7 +234,9 @@ mod tests {
  #[test] fn direct_context_is_intent_not_audience(){
   assert!(DirectSession::from_php_session(0,"csrf".into(),DirectRoute::RemoteProfile,"remote_profile".into(),false,true,false,false,"".into()).is_err());
   assert!(DirectSession::from_php_session(1,"csrf".into(),DirectRoute::RemoteProfile,"home".into(),true,true,false,false,"".into()).is_err());
-  for origin in ["home","search","bookmarks","favourites","status","remote_profile","outbox","mentions"]{let session=DirectSession::from_php_session(1,"csrf".into(),DirectRoute::Status,origin.into(),false,false,true,true,"".into()).unwrap();assert!(!session.presentation.focused());assert!(session.presentation.hide_header());assert_eq!(session.return_view,origin);}
+  for origin in ["home","search","bookmarks","favourites","status","remote_profile","outbox","mentions"]{let session=DirectSession::from_php_session(1,"csrf".into(),DirectRoute::Status,origin.into(),false,false,true,true,"".into()).unwrap();assert!(!session.presentation.focused());assert!(session.presentation.hide_header());assert!(session.presentation.feed_quote());assert_eq!(session.return_view,origin);}
+  let profile=DirectSession::from_php_session(1,"csrf".into(),DirectRoute::RemoteProfile,"remote_profile".into(),false,true,false,false,"".into()).unwrap();
+  assert!(!profile.presentation.feed_quote());
  }
  async fn insert_rows(db:&Client,table:&str,rows:&Value)->Result<()> {
   db.batch_execute(&format!("DELETE FROM {table}")).await?;
