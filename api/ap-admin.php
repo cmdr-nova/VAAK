@@ -61,6 +61,7 @@ require_once __DIR__ . '/ap-wow-link.php'; // Profile → Link World of Warcraft
 require_once __DIR__ . '/ap-featured.php'; // Profile → Featured accounts (endorsements)
 require_once __DIR__ . '/ap-profile-html.php'; // Shared profile tab order / HTML helpers
 require_once __DIR__ . '/ap-vaak-profile-route.php'; // Pretty /vaak/users/{key} + vaak.monster/users/{key}
+require_once __DIR__ . '/ap-vaak-status-route.php'; // /vaak/@{key}/{id} local post permalinks
 require_once __DIR__ . '/ap-notices.php'; // Local-only operator notices
 require_once __DIR__ . '/ap-discuss.php'; // Local-only discussion forums
 require_once __DIR__ . '/ap-webpush.php'; // Browser + Ice Cubes Web Push
@@ -102,6 +103,12 @@ if (!defined('LOCAL_ACTOR')) {
 // still registered (PHP compiles the whole include); only top-level page code is skipped.
 if ($vaakAdminLibOnly) {
     return;
+}
+
+// Short /vaak/@{key}/{id} permalinks, including a Caddy rewrite that hits this
+// file directly. vaak/index.php applies the same plan before the guest gate.
+if (function_exists('ap_vaak_apply_short_status_request')) {
+    ap_vaak_apply_short_status_request();
 }
 
 // --- Session gate (login at /vaak/) ---
@@ -13757,11 +13764,15 @@ function admin_object_is_bluesky_post(string $objectUrl): bool
 function admin_post_copy_button(string $objectUrl, string $from = 'home'): string
 {
     $href = admin_status_href($objectUrl, $from);
-    if (!str_starts_with($href, '?view=status')) {
+    $copy = function_exists('ap_vaak_status_copy_url') ? ap_vaak_status_copy_url($href) : '';
+    if ($copy === '' && str_starts_with($href, '?view=status')) {
+        $copy = 'https://mkultra.monster/vaak/' . $href;
+    }
+    if ($copy === '') {
         return '';
     }
     return '<button type="button" class="menu-action" data-copy-value="'
-        . h('https://mkultra.monster/vaak/' . $href)
+        . h($copy)
         . '" title="Copy link to post">Copy link</button>';
 }
 
@@ -13789,6 +13800,15 @@ function admin_status_href(string $objectUrl, string $from = 'home'): string
         return '#';
     }
     $from = preg_replace('/[^a-z_]/', '', $from) ?: 'home';
+    if (!function_exists('ap_vaak_local_status_href') && is_file(__DIR__ . '/ap-vaak-status-route.php')) {
+        require_once __DIR__ . '/ap-vaak-status-route.php';
+    }
+    if (function_exists('ap_vaak_local_status_href')) {
+        $short = ap_vaak_local_status_href($objectUrl, $from);
+        if (is_string($short) && $short !== '') {
+            return $short;
+        }
+    }
     return '?view=status&object=' . rawurlencode($objectUrl) . '&from=' . rawurlencode($from);
 }
 
@@ -17392,10 +17412,17 @@ function admin_post_navigation_menu_html(string $openHref, string $remoteHref = 
     if (str_starts_with($remoteHref, 'https://') || str_starts_with($remoteHref, 'http://')) {
         $menu .= '<a class="menu-action" href="' . h($remoteHref) . '" target="_blank" rel="noopener noreferrer">Remote</a>';
     }
-    $copySource = $copyHref !== '' ? $copyHref : ((!$externalOpen && str_starts_with($openHref, '?view=status')) ? $openHref : '');
-    if (str_starts_with($copySource, '?view=status')) {
+    $copySource = $copyHref !== '' ? $copyHref : (!$externalOpen ? $openHref : '');
+    if (!function_exists('ap_vaak_status_copy_url') && is_file(__DIR__ . '/ap-vaak-status-route.php')) {
+        require_once __DIR__ . '/ap-vaak-status-route.php';
+    }
+    $copyUrl = function_exists('ap_vaak_status_copy_url') ? ap_vaak_status_copy_url($copySource) : '';
+    if ($copyUrl === '' && str_starts_with($copySource, '?view=status')) {
+        $copyUrl = 'https://mkultra.monster/vaak/' . $copySource;
+    }
+    if ($copyUrl !== '') {
         $menu .= '<button type="button" class="menu-action" data-copy-value="'
-            . h('https://mkultra.monster/vaak/' . $copySource)
+            . h($copyUrl)
             . '" title="Copy link to post">Copy link</button>';
     }
     return $menu !== '' ? '<details class="post-action-menu">'
@@ -22274,8 +22301,7 @@ if ($isPartial && $view === 'status' && isset($_GET['thread'])) {
             $emitThread();
         }
         echo '<div class="meta">Couldn’t load this post yet. '
-            . '<a href="?view=status&amp;object=' . h(urlencode($stObject))
-            . '&amp;from=' . h($stFrom) . '&amp;refresh_thread=1">Retry</a></div>';
+            . '<a href="' . h(ap_vaak_status_retry_href($stObject, $stFrom)) . '">Retry</a></div>';
         $emitThread();
     }
     if (function_exists('ap_masto_status_flags_prefetch')) {
@@ -23861,6 +23887,19 @@ if ($isPartial && $view === 'mentions') {
 if (!$isPartial && $view === 'search') {
     $earlyPostUrl = trim((string) ($_GET['q'] ?? ''));
     if ($earlyPostUrl !== '' && str_starts_with($earlyPostUrl, 'https://')) {
+        // A copied local permalink is not an ActivityPub id. Rebuild the note
+        // from the path and redirect. Do not look it up or fetch it.
+        if (str_contains($earlyPostUrl, '/vaak/@') && function_exists('ap_vaak_local_note_parts')) {
+            $permalinkParts = ap_vaak_local_note_parts($earlyPostUrl);
+            if (is_array($permalinkParts)) {
+                $resolvedHref = admin_status_href((string) $permalinkParts['object'], 'search');
+                if (!str_starts_with($resolvedHref, '/')) {
+                    $resolvedHref = '/vaak/' . $resolvedHref;
+                }
+                header('Location: ' . $resolvedHref, true, 302);
+                exit;
+            }
+        }
         require_once __DIR__ . '/ap-masto-entities.php';
         if (function_exists('ap_masto_url_looks_like_status') && ap_masto_url_looks_like_status($earlyPostUrl)) {
             // Default-off native lookup of an already stored post; a miss
@@ -23888,11 +23927,11 @@ if (!$isPartial && $view === 'search') {
                     && ap_actor_is_content_blocked($blockAuthor, null, admin_owner_user_id())) {
                     $error = 'That post is hidden because you blocked the author (or they are blocked server-wide).';
                 } else {
-                    header(
-                        'Location: /vaak/?view=status&object=' . rawurlencode($resolvedPost) . '&from=search',
-                        true,
-                        302
-                    );
+                    $resolvedHref = admin_status_href($resolvedPost, 'search');
+                    if (!str_starts_with($resolvedHref, '/')) {
+                        $resolvedHref = '/vaak/' . $resolvedHref;
+                    }
+                    header('Location: ' . $resolvedHref, true, 302);
                     exit;
                 }
             }
@@ -24590,7 +24629,7 @@ function admin_render_notification_card(array $n, array $followingIds, array $fo
                             $nParentSnippet = $nParentHasMedia ? '📷 your post' : 'your post';
                         }
                     }
-                    $nParentHref = '?view=status&object=' . rawurlencode($nParentUrl) . '&from=mentions';
+                    $nParentHref = admin_status_href($nParentUrl, 'mentions');
                 } elseif (function_exists('ap_bsky_subject_post_preview_text')) {
                     $nParentSnippet = ap_bsky_subject_post_preview_text(
                         $nParentUrl,
@@ -34296,7 +34335,7 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
                  data-need-more="1">
               <div class="meta status-thread-loading" style="padding:1rem 0">Loading this post…</div>
               <div class="meta" style="margin-top:.35rem">
-                <a href="?view=status&amp;object=<?= urlencode($stObject) ?>&amp;from=<?= urlencode($stFrom) ?>&amp;refresh_thread=1">Retry</a>
+                <a href="<?= h(ap_vaak_status_retry_href($stObject, $stFrom)) ?>">Retry</a>
                 · <a href="<?= h(admin_remote_object_href($stObject)) ?>" target="_blank" rel="noopener noreferrer">Open on remote</a>
               </div>
             </div>
@@ -37736,6 +37775,61 @@ if (!empty($GLOBALS['vaak_profile_shell'])) {
     }
     return u.pathname + u.search + (u.hash || '');
   };
+  // Local notes: https://mkultra.monster/users/{key}/notes/{id}
+  // becomes /vaak/@{key}/{id}. Remote posts stay on ?view=status&object=.
+  window.vaakLocalStatusParts = function (objectUrl) {
+    var raw = String(objectUrl || '').trim().replace(/#announce-\d+$/, '').replace(/\/+$/, '');
+    var m = raw.match(/^https:\/\/mkultra\.monster\/users\/([A-Za-z0-9_]+)\/notes\/([A-Za-z0-9_-]+)$/);
+    if (!m) return null;
+    var key = m[1].toLowerCase();
+    return { key: key, id: m[2], object: 'https://mkultra.monster/users/' + key + '/notes/' + m[2] };
+  };
+  window.vaakStatusHref = function (objectUrl, from, extra) {
+    extra = extra && typeof extra === 'object' ? extra : {};
+    var parts = window.vaakLocalStatusParts(objectUrl);
+    var href;
+    if (parts) {
+      var localFrom = String(from || 'home').replace(/[^a-z_]/g, '') || 'home';
+      href = '/vaak/@' + parts.key + '/' + parts.id + '?from=' + encodeURIComponent(localFrom);
+    } else {
+      var remoteFrom = (from == null || from === '') ? 'home' : String(from);
+      href = '/vaak/?view=status&object=' + encodeURIComponent(String(objectUrl || ''))
+        + '&from=' + encodeURIComponent(remoteFrom);
+    }
+    Object.keys(extra).forEach(function (k) {
+      if (k === 'object' || k === 'from' || k === 'view') return;
+      if (extra[k] != null && extra[k] !== '') {
+        href += '&' + encodeURIComponent(k) + '=' + encodeURIComponent(String(extra[k]));
+      }
+    });
+    return href;
+  };
+  window.vaakShortStatusTarget = function (url) {
+    try {
+      var u = (url && url.searchParams) ? url : new URL(String(url || ''), window.location.href);
+      if (window.location && window.location.origin && u.origin !== window.location.origin) return null;
+      var m = String(u.pathname || '').match(/^\/vaak\/@([A-Za-z0-9_]+)\/([A-Za-z0-9_-]+)\/?$/);
+      if (!m) return null;
+      var explicit = String(u.searchParams.get('view') || '').replace(/[^a-z_]/g, '');
+      if (explicit && explicit !== 'status') return null;
+      var object = u.searchParams.get('object') || '';
+      if (!/^https:\/\//.test(object)) {
+        object = 'https://mkultra.monster/users/' + m[1].toLowerCase() + '/notes/' + m[2];
+      }
+      var from = String(u.searchParams.get('from') || 'home').replace(/[^a-z_]/g, '') || 'home';
+      return {
+        object: object,
+        from: from,
+        refresh_thread: u.searchParams.get('refresh_thread') ? '1' : ''
+      };
+    } catch (e) {
+      return null;
+    }
+  };
+  window.vaakStatusRetryHtml = function (objectUrl, from) {
+    var href = window.vaakStatusHref(objectUrl, from, { refresh_thread: '1' });
+    return '<a href="' + href.replace(/&/g, '&amp;') + '">Retry</a>';
+  };
   // Address for a soft-nav destination, built from the destination alone.
   // Editing the current URL instead carried a profile's actor/tab/post (and
   // the pretty /users/{key} path) onto every page opened after it, so the
@@ -37747,6 +37841,11 @@ if (!empty($GLOBALS['vaak_profile_shell'])) {
     const p = new URLSearchParams();
     p.set('view', view);
     if (view === 'status') {
+      // refresh_thread stays off the address bar. The fallback (no helper)
+      // keeps the historical query form for remote posts.
+      if (typeof window.vaakStatusHref === 'function') {
+        return window.vaakStatusHref(extra.object || '', extra.from || 'home');
+      }
       p.set('object', String(extra.object || ''));
       p.set('from', String(extra.from || 'home'));
     }
@@ -37784,6 +37883,8 @@ if (!empty($GLOBALS['vaak_profile_shell'])) {
         var path = window.location.pathname || '';
         if (/^(\/vaak)?\/users\/[A-Za-z0-9_]+\/?$/.test(path)) {
           nextPath = '&next_path=' + encodeURIComponent(path);
+        } else if (/^\/vaak\/@[A-Za-z0-9_]+\/[A-Za-z0-9_-]+\/?$/.test(path)) {
+          nextPath = '&next_path=' + encodeURIComponent(path + (window.location.search || ''));
         }
       } catch (e) {}
       window.location.replace(window.vaakLoginUrl + next + nextPath);
@@ -39640,6 +39741,7 @@ window.vaakBootStatusThread = function () {
     if (/[?&](?:compose=|view=compose(?:&|$))/.test(href)) return;
     // Same-page status refresh / Retry — keep work alive.
     if (href.indexOf('view=status') !== -1 && href.indexOf('object=') !== -1) return;
+    if (/(?:^|\/)vaak\/@[A-Za-z0-9_]+\/[A-Za-z0-9_-]+/.test(href)) return;
     killThreadWork();
   }, { capture: true, signal: threadEvents.signal });
 
@@ -39726,9 +39828,7 @@ window.vaakBootStatusThread = function () {
         box.dataset.loading = '0';
         if (isAbort(err)) return;
         if (loading) {
-          loading.innerHTML = failMsg + ' '
-            + '<a href="?view=status&object=' + encodeURIComponent(objectUrl)
-            + '&from=' + encodeURIComponent(from) + '&amp;refresh_thread=1">Retry</a>';
+          loading.innerHTML = failMsg + ' ' + window.vaakStatusRetryHtml(objectUrl, from);
         }
       });
   }
@@ -39801,9 +39901,7 @@ window.vaakBootStatusThread = function () {
         box.dataset.loading = '0';
         if (!html || !html.trim() || !html.includes('article')) {
           if (loading) {
-            loading.innerHTML = 'Couldn’t load this post. '
-              + '<a href="?view=status&object=' + encodeURIComponent(objectUrl)
-              + '&from=' + encodeURIComponent(from) + '&amp;refresh_thread=1">Retry</a>';
+            loading.innerHTML = 'Couldn’t load this post. ' + window.vaakStatusRetryHtml(objectUrl, from);
           }
           return;
         }
@@ -39825,9 +39923,7 @@ window.vaakBootStatusThread = function () {
         box.dataset.loading = '0';
         if (isAbort(err)) return;
         if (loading) {
-          loading.innerHTML = 'Couldn’t load this post. '
-            + '<a href="?view=status&object=' + encodeURIComponent(objectUrl)
-            + '&from=' + encodeURIComponent(from) + '&amp;refresh_thread=1">Retry</a>';
+          loading.innerHTML = 'Couldn’t load this post. ' + window.vaakStatusRetryHtml(objectUrl, from);
         }
       });
   }
@@ -39837,9 +39933,12 @@ window.vaakBootStatusThread = function () {
     if (!el || !el.querySelector) return '';
     const sourceKey = el.dataset.noteId || el.dataset.objectId;
     if (sourceKey) return sourceKey;
-    for (const link of el.querySelectorAll('a[href*="object="]')) {
+    for (const link of el.querySelectorAll('a[href*="object="], a[href*="/vaak/@"]')) {
       try {
-        const object = new URL(link.href, window.location.href).searchParams.get('object');
+        const url = new URL(link.href, window.location.href);
+        const short = window.vaakShortStatusTarget && window.vaakShortStatusTarget(url);
+        if (short && short.object) return short.object;
+        const object = url.searchParams.get('object');
         if (object) return object;
       } catch (e) {}
     }
@@ -40354,9 +40453,15 @@ window.vaakBootStatusThread();
     // original look already-shown, and skipping it is what let a repainted
     // copy of a visible post through when its id spelling differed.
     if (boost) return;
-    el.querySelectorAll('a[href*="object="]').forEach((link) => {
-      const m = (link.getAttribute('href') || '').match(/[?&]object=([^&]+)/);
-      if (m) { try { map[decodeURIComponent(m[1]).replace(/\/$/, '')] = true; } catch (e) {} }
+    el.querySelectorAll('a[href*="object="], a[href*="/vaak/@"]').forEach((link) => {
+      const raw = link.getAttribute('href') || '';
+      const m = raw.match(/[?&]object=([^&]+)/);
+      if (m) { try { map[decodeURIComponent(m[1]).replace(/\/$/, '')] = true; } catch (e) {} return; }
+      try {
+        const u = new URL(raw, window.location.href);
+        const short = window.vaakShortStatusTarget && window.vaakShortStatusTarget(u);
+        if (short && short.object) map[short.object.replace(/\/$/, '')] = true;
+      } catch (e2) {}
     });
   }
 
@@ -41861,6 +41966,8 @@ window.vaakBootStatusThread();
       window.location.reload();
       return;
     }
+    // A short permalink has no ?view=. The later listener loads the post.
+    if (typeof window.vaakShortStatusTarget === 'function' && window.vaakShortStatusTarget(u)) return;
     const next = u.searchParams.get('view') || 'home';
     if (['home', 'local', 'feed'].includes(next) && next !== viewName) {
       swapTimelineView(next, false);
@@ -41913,14 +42020,19 @@ window.vaakBootStatusThread();
     if (typeof window.vaakShowLoading === 'function') window.vaakShowLoading('Loading…');
     // Absolute /vaak/ path: relative ?view= on /users/{key} would reload the profile
     // when <base> is missing; with <base href="/vaak/"> it works, but stay explicit.
-    let url = '/vaak/?view=' + encodeURIComponent(view);
-    if (view === 'mentions' && filter && filter !== 'all') {
-      url += '&notification_filter=' + encodeURIComponent(filter);
-    }
-    if (extra && typeof extra === 'object') {
-      Object.keys(extra).forEach((k) => {
-        if (extra[k] != null && extra[k] !== '') url += '&' + encodeURIComponent(k) + '=' + encodeURIComponent(String(extra[k]));
-      });
+    let url;
+    if (view === 'status' && typeof window.vaakStatusHref === 'function') {
+      url = window.vaakStatusHref((extra && extra.object) || '', (extra && extra.from) || 'home', extra || {});
+    } else {
+      url = '/vaak/?view=' + encodeURIComponent(view);
+      if (view === 'mentions' && filter && filter !== 'all') {
+        url += '&notification_filter=' + encodeURIComponent(filter);
+      }
+      if (extra && typeof extra === 'object') {
+        Object.keys(extra).forEach((k) => {
+          if (extra[k] != null && extra[k] !== '') url += '&' + encodeURIComponent(k) + '=' + encodeURIComponent(String(extra[k]));
+        });
+      }
     }
     // Same view in the address bar (common after Mentions soft-nav left a
     // stale home URL, or hardNav retry) needs a real navigation. ?_r= busts
@@ -42229,7 +42341,9 @@ window.vaakBootStatusThread();
     if (!link || link.hasAttribute('download') || (link.target && link.target !== '_self')) return '';
     try {
       const u = new URL(link.href, window.location.href);
-      if (u.origin !== window.location.origin || !['/vaak/', '/vaak'].includes(u.pathname)) return '';
+      if (u.origin !== window.location.origin) return '';
+      if (typeof window.vaakShortStatusTarget === 'function' && window.vaakShortStatusTarget(u)) return 'status';
+      if (!['/vaak/', '/vaak'].includes(u.pathname)) return '';
       return u.searchParams.get('view') === 'status' && u.searchParams.get('object') ? 'status' : '';
     } catch (e) { return ''; }
   }
@@ -42240,9 +42354,16 @@ window.vaakBootStatusThread();
     const linkUrl = new URL(link.href, window.location.href);
     const view = link.getAttribute('data-vaak-soft-nav') || statusViewFromAnchor(link);
     if (view === 'status') {
-      extra.object = linkUrl.searchParams.get('object') || '';
-      extra.from = linkUrl.searchParams.get('from') || 'home';
-      if (linkUrl.searchParams.get('refresh_thread')) extra.refresh_thread = '1';
+      const short = typeof window.vaakShortStatusTarget === 'function' ? window.vaakShortStatusTarget(linkUrl) : null;
+      if (short) {
+        extra.object = short.object;
+        extra.from = short.from;
+        if (short.refresh_thread) extra.refresh_thread = '1';
+      } else {
+        extra.object = linkUrl.searchParams.get('object') || '';
+        extra.from = linkUrl.searchParams.get('from') || 'home';
+        if (linkUrl.searchParams.get('refresh_thread')) extra.refresh_thread = '1';
+      }
     }
     if (view === 'favourites') {
       extra.network = link.getAttribute('data-fav-network')
@@ -42427,8 +42548,10 @@ window.vaakBootStatusThread();
       if (link.closest('article.tweet') !== card || link.closest('.quote-post, .tweet-quote')) continue;
       try {
         const url = new URL(link.getAttribute('href'), location.href);
-        if (url.origin === location.origin && url.searchParams.get('view') === 'status'
-            && url.searchParams.get('object')) return url.searchParams.get('object');
+        if (url.origin !== location.origin) continue;
+        const short = typeof window.vaakShortStatusTarget === 'function' ? window.vaakShortStatusTarget(url) : null;
+        if (short && short.object) return short.object;
+        if (url.searchParams.get('view') === 'status' && url.searchParams.get('object')) return url.searchParams.get('object');
       } catch (e) {}
     }
     return card.id || '';
@@ -43109,6 +43232,13 @@ window.vaakBootStatusThread();
         return;
       }
       softNavProfile(u.href, false);
+      return;
+    }
+    const shortStatus = typeof window.vaakShortStatusTarget === 'function' ? window.vaakShortStatusTarget(u) : null;
+    if (shortStatus) {
+      const extra = { object: shortStatus.object, from: shortStatus.from };
+      if (shortStatus.refresh_thread) extra.refresh_thread = '1';
+      softNavTo('status', false, '', extra);
       return;
     }
     const view = u.searchParams.get('view') || 'home';

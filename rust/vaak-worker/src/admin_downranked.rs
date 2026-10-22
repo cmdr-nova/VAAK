@@ -111,7 +111,7 @@ fn status_href(object:&str)->String{
  let stripped=ANNOUNCE.replace(&url,"").to_string();
  if stripped!=url{url=stripped.trim_end_matches('/').to_string();}
  if url.is_empty()||!url.starts_with("https://"){return "#".into();}
- format!("?view=status&object={}&from=downranked",query(&url))
+ crate::library::actions::in_app_status_href(&url, "downranked")
 }
 async fn evidence(db:&tokio_postgres::Client,actor:&str,wanted:&[String],last:&str,terms:&[(String,String)])->Result<Vec<Evidence>>{
  if wanted.is_empty(){return Ok(Vec::new());}

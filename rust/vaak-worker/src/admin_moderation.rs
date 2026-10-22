@@ -108,7 +108,7 @@ fn status_href(raw:&str)->String{
  let stripped=ANNOUNCE.replace(&url,"").to_string();
  if stripped!=url{url=stripped.trim_end_matches('/').to_string();}
  if url.is_empty()||!url.starts_with("https://"){return "#".into();}
- format!("?view=status&object={}&from=moderation",query(&url))
+ crate::library::actions::in_app_status_href(&url, "moderation")
 }
 fn row(h:&mut String,row:&Row,r:&Request,filter:&str){
  let rep=&row.report;let id=rep.id;let csrf=esc(&r.csrf);let f=esc(filter);

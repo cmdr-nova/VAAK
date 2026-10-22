@@ -66,6 +66,7 @@ require_once dirname(__DIR__) . '/api/ap-auth.php';
 require_once dirname(__DIR__) . '/api/ap-registration-approvals.php';
 require_once dirname(__DIR__) . '/api/ap-version.php';
 require_once dirname(__DIR__) . '/api/ap-vaak-profile-route.php';
+require_once dirname(__DIR__) . '/api/ap-vaak-status-route.php';
 
 ap_auth_bootstrap();
 ap_auth_start_session();
@@ -252,6 +253,13 @@ function vaak_login_text_html(string $text): string
     }, $html) ?? $html;
     $html = preg_replace('/(^|\s)(#[a-z0-9_]+)/i', '$1<a href="/vaak/?view=search&amp;q=$2">$2</a>', $html) ?? $html;
     return nl2br($html, false);
+}
+
+// Short local permalinks: /vaak/@{key}/{id} (and Caddy ?vaak_status_key= rewrites).
+// Resolved before the profile boot and the guest status gate so the rest of
+// the app still sees ?view=status&object={activitypub id}. No database lookup.
+if (function_exists('ap_vaak_apply_short_status_request')) {
+    ap_vaak_apply_short_status_request();
 }
 
 // A tiny JSON endpoint used only by the logged-out background preview.

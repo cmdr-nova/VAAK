@@ -83,4 +83,38 @@ const notFoundBody = source.slice(notFound, source.indexOf('return;', notFound))
 check(notFound >= 0 && /pushSoftHistory\(view, filter, extra\)/.test(notFoundBody),
   'an unavailable post still updates the address bar');
 
+const helperStart = source.indexOf('window.vaakLocalStatusParts = function');
+check(helperStart >= 0 && helperStart < start, 'local permalink helpers sit above the address builder');
+const withHelpers = source.slice(helperStart, end + '\n  };'.length);
+const win2 = {
+  location: {
+    href: 'https://mkultra.monster/vaak/users/valerie?tab=media&post=abc#x',
+    origin: 'https://mkultra.monster',
+  },
+};
+vm.runInNewContext(withHelpers, { window: win2, URLSearchParams, URL });
+const localGot = parse(win2.vaakSoftViewHref('status', '', {
+  object: 'https://mkultra.monster/users/Shana_Flux/notes/eb1e9cc40f1996e6#announce-4',
+  from: 'local',
+  refresh_thread: '1',
+}));
+check(localGot.path === '/vaak/@shana_flux/eb1e9cc40f1996e6'
+  && JSON.stringify(localGot.params) === JSON.stringify({ from: 'local' })
+  && localGot.hash === '',
+  'a local post uses /vaak/@name/id and drops refresh_thread');
+const remoteStill = parse(win2.vaakSoftViewHref('status', '', {
+  object: 'https://ex.social/@a/1',
+  from: 'remote_profile',
+}));
+check(remoteStill.path === '/vaak/' && remoteStill.params.view === 'status'
+  && remoteStill.params.object === 'https://ex.social/@a/1'
+  && remoteStill.params.from === 'remote_profile',
+  'a remote post stays on the query form');
+const back = win2.vaakShortStatusTarget('https://mkultra.monster/vaak/@shana_flux/eb1e9cc40f1996e6?from=local');
+check(back && back.object === 'https://mkultra.monster/users/shana_flux/notes/eb1e9cc40f1996e6' && back.from === 'local',
+  'the short path reconstructs the ActivityPub id');
+check(source.includes('window.vaakShortStatusTarget(u)) return;')
+  && source.includes("softNavTo('status', false, '', extra);"),
+  'Back onto a short permalink loads the post instead of Home');
+
 console.log(JSON.stringify({ file, passed: true, checks }, null, 2));

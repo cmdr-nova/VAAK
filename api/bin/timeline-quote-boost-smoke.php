@@ -15,6 +15,7 @@ reference_load(dirname(__DIR__) . '/ap-masto-entities.php', [
     'ap_masto_mention_target_object_id',
 ]);
 require_once dirname(__DIR__) . '/ap-bsky-urls.php';
+require_once dirname(__DIR__) . '/ap-vaak-status-route.php';
 
 $checks = 0;
 function timeline_quote_assert(bool $ok, string $message): void
@@ -61,15 +62,15 @@ function timeline_quote_assert_media(string $html, string $quotedUrl, ?string $p
 
 function timeline_quote_assert_copy(string $html, string $object, string $view, string $label): void
 {
-    $href = 'https://mkultra.monster/vaak/?view=status&object=' . rawurlencode($object) . '&from=' . rawurlencode($view);
-    timeline_quote_assert(str_contains($html, 'data-copy-value="' . h($href) . '"'), $label . ' copy target');
+    $href = ap_vaak_status_copy_url(admin_status_href($object, $view));
+    timeline_quote_assert($href !== '' && str_contains($html, 'data-copy-value="' . h($href) . '"'), $label . ' copy target');
     timeline_quote_assert(str_contains($html, '>Copy link</button>'), $label . ' copy label');
     timeline_quote_assert(!str_contains($html, '#announce-') && !str_contains($html, '%23announce-'), $label . ' boost id leaked');
 }
 
 function timeline_quote_assert_open(string $html, string $object, string $view, string $label): void
 {
-    $href = '?view=status&object=' . rawurlencode($object) . '&from=' . rawurlencode($view);
+    $href = admin_status_href($object, $view);
     timeline_quote_assert(str_contains($html, h($href)), $label . ' open target');
 }
 

@@ -140,9 +140,7 @@ fn ask_profile_href(actor: &str) -> String {
     }
 }
 fn status_href(uri: &str, view: &str) -> String {
-    let translated=uri.strip_prefix("at://").and_then(|rest| rest.split_once("/app.bsky.feed.post/"))
-        .map(|(did,key)|format!("https://bsky.app/profile/{did}/post/{key}"));
-    format!("?view=status&object={}&from={}", query(translated.as_deref().unwrap_or(uri)), query(view))
+    super::actions::in_app_status_href(uri, view)
 }
 
 /// Cache-independent branches of the production ap_remote_object_web_url.
