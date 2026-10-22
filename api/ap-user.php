@@ -691,7 +691,7 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
         : null;
     $profileSession = ($profileOwnerId > 0 && function_exists('ap_bsky_session_row'))
         ? ap_bsky_session_row($profileOwnerId) : null;
-    $profileDid = is_array($profileSession) ? trim((string) ($profileSession['did'] ?? '')) : '';
+    $profileDid = function_exists('ap_bsky_session_did') ? ap_bsky_session_did(is_array($profileSession) ? $profileSession : null) : '';
     if ($profileDid !== '') {
         // Keep both the historical backfill and the incremental author-feed
         // refresh queued. Neither path performs a live Bluesky request here.

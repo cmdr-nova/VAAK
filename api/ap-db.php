@@ -4920,9 +4920,11 @@ function ap_actor_as2_document(string $actorKey, string $publicKeyPem, bool $ric
     }
     // Linked Bluesky identity (Wafrn / multi-protocol clients merge AP+AT follows).
     // FEP-fffd / alsoKnownAs: at://did:plc:… is the ATProto actor URI.
-    // ap_as2_pleroma_document moves that alias onto blueskyDid before a public
-    // GET or a signed delivery. Pre-2.10 Pleroma rejects any non-http value in
-    // alsoKnownAs and then fetches the actor forever.
+    // A Pleroma or Akkoma GET moves that alias onto blueskyDid. Other fetchers
+    // and signed delivery keep it, so Wafrn and Bridgy Fed can still see the
+    // DID. Pre-2.10 Pleroma rejects any non-http alsoKnownAs value and then
+    // fetches the actor forever. The linked session in bsky_sessions is the
+    // DID the mirror, backfill, and notification poller use.
     try {
         if (!function_exists('ap_profile_bsky_handle')) {
             // defined in this file further below — always available after load

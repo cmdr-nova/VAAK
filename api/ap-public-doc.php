@@ -12,9 +12,11 @@
  * Pre-2.10 Pleroma stores alsoKnownAs as an array of http(s) object ids.
  * An at:// actor alias fails that cast, the user is never saved, and
  * discovery fetches the actor, featured collection, pins, WebFinger, and
- * host-meta again. Note alsoKnownAs is left alone: that validator applies
- * to users, not objects. The October note-url fix is separate and still
- * collapses url to one https string.
+ * host-meta again. That alias is removed only for a Pleroma or Akkoma
+ * fetcher. Everyone else, including Wafrn and Bridgy Fed, still receives
+ * it. Note alsoKnownAs is left alone: that validator applies to users,
+ * not objects. The October note-url fix is separate and still collapses
+ * url to one https string.
  */
 declare(strict_types=1);
 
@@ -23,11 +25,28 @@ require_once __DIR__ . '/ap-redis.php';
 const AP_PUBLIC_DOC_CACHE_TTL = 90;
 const AP_PUBLIC_DOC_MAX_AGE = 60;
 
-function ap_public_doc_cache_key(string $id): string
+function ap_public_doc_is_pleroma_fetcher(?string $userAgent = null): bool
 {
+    if ($userAgent === null) {
+        $userAgent = (string) ($_SERVER['HTTP_USER_AGENT'] ?? '');
+    }
+    $userAgent = strtolower(trim($userAgent));
+    if ($userAgent === '') {
+        return false;
+    }
+    // Product token only. Akkoma kept the same http(s)-only alsoKnownAs cast.
+    return (bool) preg_match('/(?:^|[^a-z])(?:pleroma|akkoma)(?:[^a-z]|$)/', $userAgent);
+}
+
+function ap_public_doc_cache_key(string $id, ?bool $pleroma = null): string
+{
+    if ($pleroma === null) {
+        $pleroma = ap_public_doc_is_pleroma_fetcher();
+    }
     $id = rtrim(trim($id), '/');
-    // v2 drops the cached actor that still advertised an at:// alias.
-    return 'vaak:apdoc:v2:' . hash('sha256', $id);
+    // v2 separates the Pleroma copy (no at:// actor alias) from the public copy.
+    $variant = $pleroma ? "\npleroma" : "\npublic";
+    return 'vaak:apdoc:v2:' . hash('sha256', $id . $variant);
 }
 
 function ap_public_doc_local_actor_id(string $actorKey): string
@@ -174,7 +193,7 @@ function ap_public_doc_cache_forget(string $id): void
     if ($id === '' || !class_exists('Redis') || !function_exists('ap_redis_delete')) {
         return;
     }
-    ap_redis_delete(ap_public_doc_cache_key($id));
+    ap_redis_delete(ap_public_doc_cache_key($id, false), ap_public_doc_cache_key($id, true));
 }
 
 function ap_public_doc_invalidate_actor(string $actorKey): void
@@ -211,7 +230,7 @@ function ap_public_doc_respond_if_cached(string $cacheId, string $accept): bool
     if ($hit === null) {
         return false;
     }
-    ap_public_doc_write($hit['body'], $accept, $hit['etag'], $hit['last_modified'], true);
+    ap_public_doc_write($hit['body'], $accept, $hit['etag'], $hit['last_modified'], true, ap_public_doc_is_pleroma_fetcher());
     return true;
 }
 
@@ -345,7 +364,8 @@ function ap_public_doc_conditional_headers(string $body, string $contentType, in
 
 function ap_public_doc_emit(array $doc, string $accept, string $cacheId, bool $shared, ?string $modifiedIso = null): void
 {
-    $doc = ap_as2_pleroma_document($doc);
+    $pleroma = ap_public_doc_is_pleroma_fetcher();
+    $doc = ap_as2_pleroma_document($doc, $pleroma);
     $body = json_encode($doc, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
     if (!is_string($body) || $body === '') {
         http_response_code(500);
@@ -358,10 +378,10 @@ function ap_public_doc_emit(array $doc, string $accept, string $cacheId, bool $s
     if ($shared && $cacheId !== '') {
         ap_public_doc_cache_put($cacheId, $body, $etag, $lastModified);
     }
-    ap_public_doc_write($body, $accept, $etag, $lastModified, $shared);
+    ap_public_doc_write($body, $accept, $etag, $lastModified, $shared, $pleroma);
 }
 
-function ap_public_doc_write(string $body, string $accept, string $etag, string $lastModified, bool $shared): void
+function ap_public_doc_write(string $body, string $accept, string $etag, string $lastModified, bool $shared, bool $pleromaVariant = false): void
 {
     $status = $shared
         ? ap_public_doc_conditional_status(
@@ -376,7 +396,10 @@ function ap_public_doc_write(string $body, string $accept, string $etag, string 
     }
     header('Content-Type: ' . ap_public_doc_content_type($accept));
     header('Vary: Accept');
-    if ($shared) {
+    if ($shared && $pleromaVariant) {
+        // Private so a shared cache cannot store this copy and hand it to Wafrn.
+        header('Cache-Control: private, max-age=' . AP_PUBLIC_DOC_MAX_AGE);
+    } elseif ($shared) {
         header('Cache-Control: public, max-age=' . AP_PUBLIC_DOC_MAX_AGE);
         header('ETag: ' . $etag);
         if ($lastModified !== '') {
@@ -519,7 +542,7 @@ function ap_as2_has_attachment(array $node): bool
  * @param array<string,mixed> $node
  * @return array<string,mixed>
  */
-function ap_as2_pleroma_node(array $node): array
+function ap_as2_pleroma_node(array $node, bool $stripActorAliases = true): array
 {
     if (array_key_exists('url', $node)) {
         $node = ap_as2_pleroma_apply_url($node);
@@ -532,19 +555,22 @@ function ap_as2_pleroma_node(array $node): array
         if (array_is_list($node[$key])) {
             foreach ($node[$key] as $index => $item) {
                 if (is_array($item)) {
-                    $node[$key][$index] = ap_as2_pleroma_node($item);
+                    $node[$key][$index] = ap_as2_pleroma_node($item, $stripActorAliases);
                 }
             }
         } else {
-            $node[$key] = ap_as2_pleroma_node($node[$key]);
+            $node[$key] = ap_as2_pleroma_node($node[$key], $stripActorAliases);
         }
     }
     if (isset($node['orderedItems']) && is_array($node['orderedItems'])) {
         foreach ($node['orderedItems'] as $index => $item) {
             if (is_array($item)) {
-                $node['orderedItems'][$index] = ap_as2_pleroma_node($item);
+                $node['orderedItems'][$index] = ap_as2_pleroma_node($item, $stripActorAliases);
             }
         }
+    }
+    if (!$stripActorAliases) {
+        return $node;
     }
     return ap_as2_pleroma_actor_aliases($node);
 }
@@ -633,9 +659,9 @@ function ap_as2_pleroma_actor_aliases(array $node): array
  * @param array<string,mixed> $doc
  * @return array<string,mixed>
  */
-function ap_as2_pleroma_document(array $doc): array
+function ap_as2_pleroma_document(array $doc, bool $stripActorAliases = true): array
 {
-    return ap_as2_pleroma_node($doc);
+    return ap_as2_pleroma_node($doc, $stripActorAliases);
 }
 
 /**

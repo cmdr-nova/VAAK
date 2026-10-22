@@ -79,6 +79,26 @@ $check($actor['url'] === 'https://mkultra.monster/users/cmdr_nova', 'actor url s
 $check(!array_key_exists('alsoKnownAs', $actor), 'an actor at:// alias is not left on alsoKnownAs');
 $check(($actor['blueskyDid'] ?? '') === 'at://did:plc:example', 'an actor at:// alias is kept on blueskyDid');
 $check(($actor['attachment'][0]['value'] ?? '') === 'https://example.com', 'profile fields are not rewritten');
+$kept = ap_as2_pleroma_document([
+    'type' => 'Person',
+    'id' => 'https://mkultra.monster/users/cmdr_nova',
+    'alsoKnownAs' => ['https://example.com/users/other', 'at://did:plc:example'],
+], false);
+$check($kept['alsoKnownAs'] === ['https://example.com/users/other', 'at://did:plc:example'], 'non-Pleroma delivery keeps the at:// actor alias');
+$check(!isset($kept['blueskyDid']), 'keeping the alias does not invent blueskyDid');
+$check(ap_public_doc_is_pleroma_fetcher('Pleroma 2.6.0; https://example.test <a@example.test>'), 'a Pleroma fetcher is recognized');
+$check(ap_public_doc_is_pleroma_fetcher('Akkoma 3.13.2; https://example.test'), 'an Akkoma fetcher is recognized');
+$check(!ap_public_doc_is_pleroma_fetcher('Wafrn/1.0'), 'Wafrn still receives the at:// alias');
+$check(!ap_public_doc_is_pleroma_fetcher('Bridgy Fed (https://fed.brid.gy/)'), 'Bridgy Fed still receives the at:// alias');
+$check(!ap_public_doc_is_pleroma_fetcher('Mastodon/4.3.0'), 'Mastodon still receives the at:// alias');
+$check(!ap_public_doc_is_pleroma_fetcher('Misskey/2026.1.0'), 'Misskey still receives the at:// alias');
+$check(!ap_public_doc_is_pleroma_fetcher(''), 'a missing user agent still receives the at:// alias');
+$_SERVER['HTTP_USER_AGENT'] = 'Pleroma 2.6.0';
+$pleromaKey = ap_public_doc_cache_key('https://mkultra.monster/users/cmdr_nova');
+$_SERVER['HTTP_USER_AGENT'] = 'Wafrn/1.0';
+$publicKey = ap_public_doc_cache_key('https://mkultra.monster/users/cmdr_nova');
+unset($_SERVER['HTTP_USER_AGENT']);
+$check($pleromaKey !== $publicKey, 'Pleroma and public actor documents do not share a cache entry');
 $actorAgain = ap_as2_pleroma_document($actor);
 $check($actorAgain === $actor, 'actor alias normalizer is idempotent');
 
@@ -248,7 +268,7 @@ $check(
         && substr_count($entities, 'AND (target_actor = ? OR target_actor = ?)') >= 2,
     'Bluesky follow notification lookups still filter on the target actor'
 );
-$check(str_contains($inbox, 'ap_as2_pleroma_document($activity)'), 'delivery normalizes a copy before signing');
+$check(str_contains($inbox, 'ap_as2_pleroma_document($activity, false)'), 'delivery keeps at:// aliases while still fixing note urls');
 $userFront = (string) file_get_contents($api . '/ap-user.php');
 $cmdrFront = (string) file_get_contents($api . '/ap-cmdr-nova.php');
 $webfinger = (string) file_get_contents($api . '/ap-webfinger.php');
@@ -268,6 +288,32 @@ $check(str_contains($hostMeta, 'ap_public_doc_conditional_headers'), 'host-meta 
 $check(str_contains($hostMeta, '3600'), 'host-meta is cacheable for an hour');
 $check(!str_contains($hostMeta, 'ap-db.php'), 'host-meta does not load the database');
 $check(str_contains($schema, 'ap_actor_updated_iso('), 'actor documents omit updated when the profile timestamp is missing');
+
+$linkedDid = 'did:plc:linkedaccount';
+$session = ['did' => $linkedDid, 'handle' => 'linked.bsky.social'];
+$check(ap_bsky_session_did($session) === $linkedDid, 'the mirror reads the DID from the linked session');
+$check(ap_bsky_session_did(null) === '', 'a missing Bluesky session has no DID');
+$check(ap_bsky_session_did(['did' => 'at://did:plc:nope']) === '', 'an at:// alias is not a session DID');
+$served = ap_as2_pleroma_document([
+    'type' => 'Person',
+    'alsoKnownAs' => ['at://' . $linkedDid],
+], true);
+$check(ap_bsky_session_did($session) === $linkedDid, 'stripping the served actor alias does not change the linked DID');
+$check(!array_key_exists('alsoKnownAs', $served), 'the Pleroma copy of that actor has no alsoKnownAs');
+$cursor = 'appview-page-2';
+$ref = ap_bsky_own_posts_backfill_ref($linkedDid, $cursor);
+$parsed = ap_bsky_own_posts_backfill_parse($ref);
+$check($parsed['did'] === $linkedDid && $parsed['cursor'] === $cursor, 'own-post backfill round-trips the session DID and cursor');
+$check(ap_bsky_own_posts_backfill_parse(ap_bsky_own_posts_backfill_ref($linkedDid))['did'] === $linkedDid, 'the first backfill page keeps the session DID');
+$check(ap_bsky_own_posts_backfill_parse('https://mkultra.monster/users/cmdr_nova')['did'] === '', 'an actor URL is not a backfill DID');
+$bsky = (string) file_get_contents($api . '/ap-bsky.php');
+$check(str_contains($bsky, 'ap_bsky_session_did($row)'), 'crosspost uses the session DID');
+$check(str_contains($bsky, 'ap_bsky_own_posts_backfill_parse($actorRef)'), 'the backfill worker parses the queued session DID');
+$check(str_contains($bsky, 'ap_bsky_session_did(is_array($session) ? $session : null)'), 'notification hydration uses the session DID');
+$jetstream = (string) file_get_contents($api . '/ap-bsky-jetstream-wanted.php');
+$check(str_contains($jetstream, 'SELECT did FROM bsky_sessions'), 'jetstream subscriptions come from linked sessions');
+$check(str_contains($userFront, 'ap_bsky_session_did('), 'profile backfill uses the session DID');
+$check(str_contains($cmdrFront, 'ap_bsky_session_did('), 'cmdr_nova backfill uses the session DID');
 $check(!str_contains($indexSql, 'password') && !str_contains($indexSql, 'postgres://'), 'index file has no credentials');
 
 final class EventsIndexTxPdo extends PDO

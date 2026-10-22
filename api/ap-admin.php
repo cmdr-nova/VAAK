@@ -8394,7 +8394,7 @@ if ($needOutboxBuild) {
 if ($view === 'outbox' && !$wantNewerPoll && !$isPartial && function_exists('ap_bsky_session_row')) {
     try {
         $bskySession = ap_bsky_session_row((int) ($GLOBALS['vaak_owner_id'] ?? 0));
-        $ownBskyDid = trim((string) ($bskySession['did'] ?? ''));
+        $ownBskyDid = function_exists('ap_bsky_session_did') ? ap_bsky_session_did(is_array($bskySession) ? $bskySession : null) : '';
         if ($ownBskyDid !== '' && function_exists('ap_bsky_own_posts_backfill_maybe_enqueue')) {
             ap_bsky_own_posts_backfill_maybe_enqueue((int) $GLOBALS['vaak_owner_id'], $ownBskyDid);
         }
