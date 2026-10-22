@@ -86,6 +86,32 @@ pub(crate) fn strip_announce_fragment(value: &str) -> &str {
     if !rest.is_empty() && rest.bytes().all(|byte| byte.is_ascii_digit()) { &value[..hash] } else { value }
 }
 
+/// Actor key and note id of a local ActivityPub note, or none.
+/// The key is lowercased. The id keeps its original spelling.
+pub(crate) fn local_note_parts(object: &str) -> Option<(String, String)> {
+    let object = strip_announce_fragment(object.trim());
+    let object = object.split(['?', '#']).next().unwrap_or(object).trim_end_matches('/');
+    let (key, id) = if let Some(rest) = object.strip_prefix("https://mkultra.monster/users/") {
+        rest.split_once("/notes/")?
+    } else if let Some(rest) = object.strip_prefix("https://mkultra.monster/vaak/@") {
+        // The human permalink is not an object id. Fold it back so a pasted
+        // copy does not get fetched as a remote post.
+        rest.split_once('/')?
+    } else {
+        return None;
+    };
+    if key.is_empty() || id.is_empty() || key.contains('/') || id.contains('/') {
+        return None;
+    }
+    if !key.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'_') {
+        return None;
+    }
+    if !id.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-') {
+        return None;
+    }
+    Some((key.to_ascii_lowercase(), id.to_owned()))
+}
+
 fn open_target(object:&str)->String {
     let trimmed = object.trim();
     let stripped = strip_announce_fragment(trimmed);
@@ -93,8 +119,25 @@ fn open_target(object:&str)->String {
     object.strip_prefix("at://").and_then(|rest|rest.split_once("/app.bsky.feed.post/"))
         .map(|(did,key)|format!("https://bsky.app/profile/{did}/post/{key}")).unwrap_or_else(||object.to_owned())
 }
+
+/// PHP `preg_replace('/[^a-z_]/', '', $from)` for the short permalink only.
+fn local_from_token(from: &str) -> String {
+    let cleaned: String = from.chars().filter(|c| c.is_ascii_lowercase() || *c == '_').collect();
+    if cleaned.is_empty() { "home".into() } else { cleaned }
+}
+
+/// In-app status href. Local notes use `/vaak/@{key}/{id}`.
+/// Remote posts stay `?view=status&object=…`, including an empty `from`.
+pub(crate) fn in_app_status_href(object: &str, from: &str) -> String {
+    let target = open_target(object);
+    if let Some((key, id)) = local_note_parts(&target) {
+        return format!("/vaak/@{key}/{id}?from={}", query(&local_from_token(from)));
+    }
+    format!("?view=status&object={}&from={}", query(&target), query(from))
+}
+
 fn status_href(object: &str, view: &str) -> String {
-    format!("?view=status&object={}&from={}", query(&open_target(object)), query(view))
+    in_app_status_href(object, view)
 }
 
 /// Canonical in-app URL for the overflow Copy link. Unsafe schemes are omitted.
@@ -108,7 +151,11 @@ pub(crate) fn copy_link_button(object: &str, view: &str) -> String {
     let target = open_target(object);
     if !target.starts_with("https://") || target == "https://bsky.app/" { return String::new(); }
     let view = if view.is_empty() { "home" } else { view };
-    let href = format!("https://mkultra.monster/vaak/{}", status_href(object, view));
+    // Shared local permalinks drop the in-app ?from= hint. Remote stays the query form.
+    let href = match local_note_parts(&target) {
+        Some((key, id)) => format!("https://mkultra.monster/vaak/@{key}/{id}"),
+        None => format!("https://mkultra.monster/vaak/{}", status_href(object, view)),
+    };
     format!("<button type=\"button\" class=\"menu-action\" data-copy-value=\"{}\" title=\"Copy link to post\">Copy link</button>", esc(&href))
 }
 
@@ -372,6 +419,38 @@ mod tests {
         let php_actions = html[begin..end].trim();
         let tokenize = |s: &str| regex::Regex::new(r"<[^>]+>|[^<]+").unwrap().find_iter(s).map(|m| m.as_str().trim().to_owned()).filter(|s| !s.is_empty()).collect::<Vec<_>>();
         assert_eq!(tokenize(&render_fedi_actions(&ctx, 1).unwrap()), tokenize(php_actions));
+    }
+    #[test]
+    fn local_permalinks_are_short_and_remote_query_form_is_unchanged() {
+        assert_eq!(
+            in_app_status_href("https://mkultra.monster/users/Shana_Flux/notes/eb1e9cc40f1996e6", "local"),
+            "/vaak/@shana_flux/eb1e9cc40f1996e6?from=local"
+        );
+        assert_eq!(
+            in_app_status_href("https://mkultra.monster/users/alice/notes/abc#announce-9", "Home"),
+            "/vaak/@alice/abc?from=ome"
+        );
+        assert_eq!(
+            in_app_status_href("https://mkultra.monster/users/fixture/notes/dm-1/", ""),
+            "/vaak/@fixture/dm-1?from=home"
+        );
+        let copy = copy_link_button("https://mkultra.monster/users/alice/notes/abc", "local");
+        assert!(copy.contains("data-copy-value=\"https://mkultra.monster/vaak/@alice/abc\""));
+        assert!(!copy.contains("from="));
+        assert_eq!(
+            in_app_status_href("https://remote.test/users/alice/statuses/123", "bookmarks"),
+            "?view=status&object=https%3A%2F%2Fremote.test%2Fusers%2Falice%2Fstatuses%2F123&from=bookmarks"
+        );
+        assert_eq!(
+            in_app_status_href("at://did:plc:fixture/app.bsky.feed.post/example", "home"),
+            "?view=status&object=https%3A%2F%2Fbsky.app%2Fprofile%2Fdid%3Aplc%3Afixture%2Fpost%2Fexample&from=home"
+        );
+        assert!(in_app_status_href("https://remote.test/x", "").ends_with("&from="));
+        assert!(local_note_parts("https://bsky.app/profile/alice/post/abc").is_none());
+        assert_eq!(
+            in_app_status_href("https://mkultra.monster/vaak/@Shana_Flux/eb1e9cc40f1996e6?from=local", "search"),
+            "/vaak/@shana_flux/eb1e9cc40f1996e6?from=search"
+        );
     }
 }
 

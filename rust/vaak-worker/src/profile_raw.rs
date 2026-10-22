@@ -86,7 +86,7 @@ pub(crate) fn current_plain(raw:&Value,facts:&RawProfileFacts)->String{
  if let Some(row)=&facts.masto_row{let text=string(row,"content_text");if !text.is_empty()&&!matches!(text,"(quote)"|"(media)"|"(poll)"){plain=text.into();}}
  plain
 }
-fn status_href(note:&str,view:&str)->String{format!("?view=status&object={}&from={}",query(note),query(view))}
+fn status_href(note:&str,view:&str)->String{crate::library::actions::in_app_status_href(note,view)}
 fn hidden(key:&str,value:&str)->String{format!("<input type=\"hidden\" name=\"{key}\" value=\"{}\">",esc(value))}
 fn form_query(s:&str)->String{query(s).replace("%20","+")}
 fn visibility(value:&str)->(&str,&str){match value.trim().to_ascii_lowercase().as_str(){

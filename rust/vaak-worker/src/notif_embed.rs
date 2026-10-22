@@ -264,11 +264,7 @@ fn rewrite_anchor_open(tag: &str, from: &str) -> String {
 
     if href.starts_with("https://") {
         if looks_like_status_url(&href) {
-            let new_href = format!(
-                "?view=status&object={}&from={}",
-                urlencoding_encode(&href),
-                urlencoding_encode(from_q)
-            );
+            let new_href = crate::library::actions::in_app_status_href(&href, from_q);
             let target = if profile_surface {
                 " target=\"_blank\" rel=\"noopener noreferrer\""
             } else {
@@ -742,11 +738,7 @@ fn linkify_text_segment_raw(text: &str, from: &str) -> String {
                 }
                 let label = esc(core);
                 let anchor = if looks_like_status_url(&href) {
-                    let new_href = format!(
-                        "?view=status&object={}&from={}",
-                        urlencoding_encode(&href),
-                        urlencoding_encode(from_q)
-                    );
+                    let new_href = crate::library::actions::in_app_status_href(&href, from_q);
                     let target = if from_q.contains("profile") {
                         " target=\"_blank\" rel=\"noopener noreferrer\""
                     } else {
@@ -1811,9 +1803,8 @@ fn paint_nested_quote(status: &Value, q_raw: &Value, from: &str, viewer_actor: &
             html.push_str(&format!("<div style=\"margin-top:.25rem;white-space:pre-wrap\">{}</div>", esc(text)));
             if !url.is_empty() {
                 html.push_str(&format!(
-                    "<div class=\"meta\" style=\"margin-top:.35rem\"><a href=\"?view=status&amp;object={}&amp;from={}\">Open quoted</a></div>",
-                    urlencoding_encode(&url),
-                    urlencoding_encode(from)
+                    "<div class=\"meta\" style=\"margin-top:.35rem\"><a href=\"{}\">Open quoted</a></div>",
+                    esc(&crate::library::actions::in_app_status_href(&url, from))
                 ));
             }
             html.push_str("</div>");
@@ -1836,9 +1827,8 @@ fn paint_nested_quote(status: &Value, q_raw: &Value, from: &str, viewer_actor: &
         // The status view may fetch the target (detail quote hydration);
         // timelines stay cache-only.
         html.push_str(&format!(
-            "<div class=\"meta\" style=\"margin-top:.35rem\"><a href=\"?view=status&amp;object={}&amp;from={}\">Quoted post (not cached yet) — open</a> · <a href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\">Open original</a></div>",
-            urlencoding_encode(&url),
-            urlencoding_encode(from),
+            "<div class=\"meta\" style=\"margin-top:.35rem\"><a href=\"{}\">Quoted post (not cached yet) — open</a> · <a href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\">Open original</a></div>",
+            esc(&crate::library::actions::in_app_status_href(&url, from)),
             esc(&url)
         ));
     }
@@ -2211,11 +2201,7 @@ fn paint_reply_context(status: &Value, from: &str) -> String {
         ""
     };
     let return_view = if from.is_empty() { "home" } else { from };
-    let href = format!(
-        "?view=status&object={}&from={}",
-        urlencoding_encode(&parent),
-        urlencoding_encode(return_view)
-    );
+    let href = crate::library::actions::in_app_status_href(&parent, return_view);
     let parent_label = parent_label.trim_start_matches('@');
     let parent_label = if parent_label.starts_with("did:") { "" } else { parent_label };
     let label = if parent_label.is_empty() {
@@ -2516,11 +2502,7 @@ fn paint_moderation_overflow(
         ));
     }
     if object.starts_with("https://") {
-        let open = format!(
-            "?view=status&object={}&from={}",
-            urlencoding_encode(object),
-            urlencoding_encode(from_q)
-        );
+        let open = crate::library::actions::in_app_status_href(object, from_q);
         menu.push_str(&format!(
             "<a class=\"menu-action\" href=\"{}\">Open</a>",
             esc(&open)
@@ -2702,11 +2684,7 @@ fn paint_own_post_controls(status: &Value, from_q: &str, uri: &str, sid: &str) -
         nid = esc(uri),
     ));
 
-    let open_href = format!(
-        "?view=status&object={}&from={}",
-        urlencoding_encode(uri),
-        urlencoding_encode(from_q)
-    );
+    let open_href = crate::library::actions::in_app_status_href(uri, from_q);
     let edit_href = format!(
         "?view={}&compose=1&edit_note={}",
         urlencoding_encode(from_q),
@@ -4143,11 +4121,7 @@ pub fn paint_lean_embed_from(
         let when_html = if when.is_empty() {
             String::new()
         } else if !uri.is_empty() {
-            let status_href = format!(
-                "?view=status&object={}&from={}",
-                urlencoding_encode(&status_open_ref(status, uri)),
-                urlencoding_encode(from_q)
-            );
+            let status_href = crate::library::actions::in_app_status_href(&status_open_ref(status, uri), from_q);
             format!(
                 "<a class=\"meta tweet-time\" href=\"{}\" title=\"Open post\"> · {}</a>",
                 esc(&status_href),
@@ -5899,11 +5873,15 @@ mod tests {
     }
 
     fn assert_copy(html: &str, object: &str, view: &str) {
-        let value = format!(
-            "data-copy-value=\"https://mkultra.monster/vaak/?view=status&amp;object={}&amp;from={}\"",
-            urlencoding_encode(object),
-            urlencoding_encode(view)
-        );
+        let value = if let Some((key, id)) = crate::library::actions::local_note_parts(object) {
+            format!("data-copy-value=\"https://mkultra.monster/vaak/@{key}/{id}\"")
+        } else {
+            format!(
+                "data-copy-value=\"https://mkultra.monster/vaak/?view=status&amp;object={}&amp;from={}\"",
+                urlencoding_encode(object),
+                urlencoding_encode(view)
+            )
+        };
         assert!(html.contains(&value), "copy link missing for {object} on {view}: {html}");
         assert!(html.contains(">Copy link</button>"), "{html}");
         assert!(!html.contains("%23announce-") && !html.contains("#announce-"), "boost wrapper id leaked: {html}");
@@ -6106,11 +6084,12 @@ mod tests {
             let local = paint_lean_feed_card_opts(&local_quote, view, viewer);
             assert_quote_media_inside(&local, quoted_media, None);
             assert_copy(&local, quote_post, view);
-            assert!(local.contains(&urlencoding_encode(local_note)), "{local}");
+            assert!(local.contains("/vaak/@alice/abc"), "{local}");
 
             let own = paint_lean_feed_card_opts(&own_boost, view, viewer);
             assert_quote_media_inside(&own, quoted_media, None);
             assert_copy(&own, own_note, view);
+            assert!(own.contains("/vaak/@fixture/ownquote"), "{own}");
         }
 
         let mut unresolved = plain_quote.clone();

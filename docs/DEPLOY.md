@@ -287,6 +287,19 @@ These are not deploys of the VAAK app and this workflow does not replace them:
 - `deploy/vaak-integrity-check.sh`
 - The systemd units and cron files under `deploy/` and `ops/`. Installing or changing a unit is still a root edit under `/etc/systemd/system`. This workflow does not copy unit files and it cannot `daemon-reload`.
 
+## Local post permalinks
+
+A local post’s address in the app is `/vaak/@{name}/{id}`, for example `/vaak/@shana_flux/eb1e9cc40f1996e6`. That path is only the human-facing page. The ActivityPub object id stays `https://mkultra.monster/users/{name}/notes/{id}`, and `/vaak/?view=status&object=…` keeps opening the same post. Remote posts stay on that query form.
+
+PHP reads the path from the request URI, so a front server that already sends unknown `/vaak/…` paths to `vaak/index.php` and keeps the original URI needs no new rule. Production Caddy rewrites known `/vaak` paths into `index.php` query params, the same way `/vaak/users/{key}` becomes `?local_key=`. Add this next to that profile rewrite:
+
+```
+@vaak_local_status path_regexp vaakstatus ^/vaak/@([A-Za-z0-9_]+)/([A-Za-z0-9_-]+)/?$
+rewrite @vaak_local_status /vaak/index.php?vaak_status_key={re.vaakstatus.1}&vaak_status_id={re.vaakstatus.2}&{http.request.uri.query}
+```
+
+There is no nginx config in this repository. This deploy does not change `NovaLandia/update_site.sh`. That script still excludes `api/` and `vaak/`.
+
 ## Local checks
 
 ```bash

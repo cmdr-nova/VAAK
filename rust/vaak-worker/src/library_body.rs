@@ -215,7 +215,7 @@ pub(crate) fn linked_text(text: &str, view: &str) -> Result<String> {
                     let (core, trail) = if core.ends_with('/') { (raw, "") } else { (core, &raw[core.len()..]) };
                     let target = format!("{prefix}{core}");
                     if is_status_url(&target) {
-                        output.push_str(&format!("<a class=\"status-link\" href=\"{}\">{}</a>", esc(&format!("?view=status&object={}&from={}", query(&target), query(view))), esc(&target)));
+                        output.push_str(&format!("<a class=\"status-link\" href=\"{}\">{}</a>", esc(&super::actions::in_app_status_href(&target, view)), esc(&target)));
                     } else {
                         output.push_str(&format!("<a class=\"ext-link\" href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\">{}</a>", esc(&target), esc(&target)));
                     }

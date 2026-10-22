@@ -39,7 +39,7 @@ Library is the shelf. Favourites, bookmarks with folders, followers and followin
 
 The blog composer is for the long one. You write Markdown, with buttons for bold, italic, headings, lists, and links, save a draft, and publish. The full post lives on your profile's Blog tab. The timeline gets the title as a content warning and a short excerpt, so the essay stays on the blog.
 
-Profiles are at `/vaak/users/{name}`, including a view for people who are logged out. The ActivityPub actor document stays at `https://mkultra.monster/users/{name}`. Tabs cover posts, replies, boosts, media, Asks, pins, featured accounts, and the blog.
+Profiles are at `/vaak/users/{name}`, including a view for people who are logged out. The ActivityPub actor document stays at `https://mkultra.monster/users/{name}`. A local post’s permalink in the app is `/vaak/@{name}/{id}`. The ActivityPub id stays `https://mkultra.monster/users/{name}/notes/{id}`, and older `?view=status` links still open that post. Tabs cover posts, replies, boosts, media, Asks, pins, featured accounts, and the blog.
 
 There are notifications, direct messages, two-factor authentication, and an account switcher. Import and export covers follows, mutes, blocks, bookmarks, lists, and followed hashtags. RSS lives under You and mixes into Home. An item that is only video is skipped. Notices, a local Discuss board, and the Phyrian Strains hub sit alongside the usual account stuff.
 
