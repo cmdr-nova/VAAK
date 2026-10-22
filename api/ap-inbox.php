@@ -6368,7 +6368,8 @@ function ap_deliver_signed_json(string $inboxUrl, array $activity, string $keyId
     }
 
     if (function_exists('ap_as2_pleroma_document')) {
-        $activity = ap_as2_pleroma_document($activity);
+        // Keep at:// on alsoKnownAs for Wafrn and Bridgy. Pleroma GETs strip it.
+        $activity = ap_as2_pleroma_document($activity, false);
     }
     $body = json_encode($activity, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
     if (!is_string($body)) {

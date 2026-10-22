@@ -4876,13 +4876,9 @@ function ap_actor_as2_document(string $actorKey, string $publicKeyPem, bool $ric
     } else {
         $actor['featured'] = $id . '/collections/featured';
     }
-    $updatedRaw = (string) ($p['updated_at'] ?? '');
-    try {
-        $actor['updated'] = $updatedRaw !== ''
-            ? (new DateTimeImmutable($updatedRaw))->format('Y-m-d\TH:i:s\Z')
-            : gmdate('Y-m-d\TH:i:s\Z');
-    } catch (Throwable $e) {
-        $actor['updated'] = gmdate('Y-m-d\TH:i:s\Z');
+    $updatedIso = ap_actor_updated_iso((string) ($p['updated_at'] ?? ''));
+    if ($updatedIso !== null) {
+        $actor['updated'] = $updatedIso;
     }
     $iconUrl = function_exists('ap_local_avatar_url')
         ? ap_local_avatar_url($p['icon_url'] ?? null)
@@ -4924,6 +4920,11 @@ function ap_actor_as2_document(string $actorKey, string $publicKeyPem, bool $ric
     }
     // Linked Bluesky identity (Wafrn / multi-protocol clients merge AP+AT follows).
     // FEP-fffd / alsoKnownAs: at://did:plc:… is the ATProto actor URI.
+    // A Pleroma or Akkoma GET moves that alias onto blueskyDid. Other fetchers
+    // and signed delivery keep it, so Wafrn and Bridgy Fed can still see the
+    // DID. Pre-2.10 Pleroma rejects any non-http alsoKnownAs value and then
+    // fetches the actor forever. The linked session in bsky_sessions is the
+    // DID the mirror, backfill, and notification poller use.
     try {
         if (!function_exists('ap_profile_bsky_handle')) {
             // defined in this file further below — always available after load

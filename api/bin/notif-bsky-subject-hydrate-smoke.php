@@ -69,7 +69,11 @@ function ap_masto_animated_media_from_url(string $url, string $preview): array
 function ap_bsky_https_url_from_at_uri(string $at, ?string $handle = null): string { return 'https://bsky.app/profile/x/post/' . basename($at); }
 function ap_bsky_actor_profile_url(string $h): string { return 'https://bsky.app/profile/' . $h; }
 
-reference_load($api . '/ap-bsky.php', ['ap_bsky_notification_subjects_warm', 'ap_bsky_cached_at_uri_for_web_url']);
+reference_load($api . '/ap-bsky.php', [
+    'ap_bsky_session_did',
+    'ap_bsky_notification_subjects_warm',
+    'ap_bsky_cached_at_uri_for_web_url',
+]);
 reference_load($api . '/ap-masto-entities.php', ['ap_masto_notif_bsky_subject_enrich', 'ap_masto_bsky_media_attachments', 'ap_masto_bsky_trend_status']);
 
 $checks = 0;

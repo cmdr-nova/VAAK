@@ -2179,15 +2179,63 @@ function ap_bsky_connect(int $ownerUserId, string $identifier, string $appPasswo
     ];
 }
 
+/** DID from a bsky_sessions row. The served actor document is not consulted. */
+function ap_bsky_session_did(?array $session): string
+{
+    $did = is_array($session) ? trim((string) ($session['did'] ?? '')) : '';
+    return str_starts_with($did, 'did:') ? $did : '';
+}
+
+/** Queue key for one page of the linked account's own Bluesky posts. */
+function ap_bsky_own_posts_backfill_ref(string $did, ?string $cursor = null): string
+{
+    $did = trim($did);
+    $cursor = trim((string) $cursor);
+    $ref = '__vaak_own_posts__:' . $did;
+    if ($cursor !== '') {
+        $ref .= ':' . rtrim(strtr(base64_encode($cursor), '+/', '-_'), '=');
+    }
+    return $ref;
+}
+
+/**
+ * @return array{did:string,cursor:?string}
+ */
+function ap_bsky_own_posts_backfill_parse(string $actorRef): array
+{
+    $empty = ['did' => '', 'cursor' => null];
+    if (!str_starts_with($actorRef, '__vaak_own_posts__:')) {
+        return $empty;
+    }
+    $payload = substr($actorRef, strlen('__vaak_own_posts__:'));
+    if (!preg_match('/^(did:(?:plc|web):[^:]+)(?::([A-Za-z0-9_-]+))?$/', $payload, $m)) {
+        return $empty;
+    }
+    $did = trim((string) ($m[1] ?? ''));
+    if (!str_starts_with($did, 'did:')) {
+        return $empty;
+    }
+    $cursor = null;
+    $cursorToken = (string) ($m[2] ?? '');
+    if ($cursorToken !== '') {
+        $b64 = strtr($cursorToken, '-_', '+/');
+        $b64 .= str_repeat('=', (4 - (strlen($b64) % 4)) % 4);
+        $decoded = base64_decode($b64, true);
+        if (is_string($decoded) && $decoded !== '') {
+            $cursor = $decoded;
+        }
+    }
+    return ['did' => $did, 'cursor' => $cursor];
+}
+
 /** Queue a paginated import of a connected account's existing Bluesky posts. */
 function ap_bsky_own_posts_backfill_enqueue(int $ownerUserId, string $did, ?string $cursor = null, int $delaySeconds = 0): void
 {
-    $did = trim($did);
-    if ($ownerUserId < 1 || !str_starts_with($did, 'did:') || !ap_bsky_actor_refresh_migrate()) {
+    $did = ap_bsky_session_did(['did' => $did]);
+    if ($ownerUserId < 1 || $did === '' || !ap_bsky_actor_refresh_migrate()) {
         return;
     }
-    $cursor = trim((string) $cursor);
-    $actorRef = '__vaak_own_posts__:' . $did . ($cursor !== '' ? ':' . rtrim(strtr(base64_encode($cursor), '+/', '-_'), '=') : '');
+    $actorRef = ap_bsky_own_posts_backfill_ref($did, $cursor);
     $now = gmdate('c');
     $nextAttempt = gmdate('c', time() + max(0, min(300, $delaySeconds)));
     try {
@@ -2742,7 +2790,7 @@ function ap_bsky_get_author_feed(int $ownerUserId, int $limit = 40, ?string $cur
     }
     $pds = rtrim((string) ($row['pds_host'] ?? AP_BSKY_DEFAULT_PDS), '/');
     $handle = (string) ($row['handle'] ?? '');
-    $did = (string) ($row['did'] ?? '');
+    $did = ap_bsky_session_did($row);
     $actor = is_string($actor) && trim($actor) !== '' ? trim($actor) : ($handle !== '' ? $handle : $did);
     if ($actor === '') {
         return ['ok' => false, 'error' => 'Missing Bluesky actor'];
@@ -9661,26 +9709,10 @@ function ap_bsky_actor_refresh_worker_run(int $limit = 3): array
                 continue;
             }
             if (str_starts_with($actorRef, '__vaak_own_posts__:')) {
-                $payload = substr($actorRef, strlen('__vaak_own_posts__:'));
-                $did = '';
-                $cursorToken = '';
-                // DIDs themselves contain colons (did:plc:<id>, did:web:<host>),
-                // so split only after the DID's identifier rather than at the
-                // first colon. The optional trailing token is the page cursor.
-                if (preg_match('/^(did:(?:plc|web):[^:]+)(?::([A-Za-z0-9_-]+))?$/', $payload, $m)) {
-                    $did = trim((string) ($m[1] ?? ''));
-                    $cursorToken = (string) ($m[2] ?? '');
-                }
-                $cursor = null;
-                if ($cursorToken !== '') {
-                    $b64 = strtr($cursorToken, '-_', '+/');
-                    $b64 .= str_repeat('=', (4 - (strlen($b64) % 4)) % 4);
-                    $decoded = base64_decode($b64, true);
-                    if (is_string($decoded) && $decoded !== '') {
-                        $cursor = $decoded;
-                    }
-                }
-                if (!str_starts_with($did, 'did:')) {
+                $parsed = ap_bsky_own_posts_backfill_parse($actorRef);
+                $did = $parsed['did'];
+                $cursor = $parsed['cursor'];
+                if ($did === '') {
                     throw new RuntimeException('Invalid Bluesky author for post backfill');
                 }
                 // Keep migration work deliberately incremental: one small page
@@ -12466,7 +12498,7 @@ function ap_bsky_crosspost_status_inner(
     }
     $access = (string) $tok['access'];
     $pds = rtrim((string) ($row['pds_host'] ?? AP_BSKY_DEFAULT_PDS), '/');
-    $did = (string) ($row['did'] ?? '');
+    $did = ap_bsky_session_did($row);
     if ($did === '') {
         return ['ok' => false, 'error' => 'Missing DID'];
     }
@@ -13926,7 +13958,7 @@ function ap_bsky_notification_subjects_warm(int $ownerUserId, array $notifs): in
         return 0;
     }
     $session = ap_bsky_session_row($ownerUserId);
-    $selfDid = is_array($session) ? trim((string) ($session['did'] ?? '')) : '';
+    $selfDid = ap_bsky_session_did(is_array($session) ? $session : null);
     // Own posts already cached (seen on Home) but not yet copied to the VAAK
     // profile by the backfill queue: import them now from the cache.
     if ($selfDid !== '') {

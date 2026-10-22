@@ -116,7 +116,7 @@
     {
       "id": "ap-public-doc",
       "area": "ActivityPub",
-      "summary": "Pleroma-safe public Note, actor, and featured documents. url is a single http(s) string, at:// stays on blueskyUri, alsoKnownAs is left alone, and empty media text becomes a zero-width space. No database.",
+      "summary": "Pleroma-safe public Note, actor, and featured documents. url is a single http(s) string, at:// stays on blueskyUri, note alsoKnownAs stays, actor alsoKnownAs keeps only http(s) and moves the first at:// onto blueskyDid, and empty media text becomes a zero-width space. No database.",
       "php": {"script": "parity/php/ap-public-doc.php", "args": []}
     }
   ]

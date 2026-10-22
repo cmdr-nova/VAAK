@@ -18,6 +18,11 @@ ap_csp_send_headers('app');
 const CMDR_ACTOR_ID = 'https://mkultra.monster/users/cmdr_nova';
 const CMDR_PUB = '/etc/mkultra/ap-inbox/cmdr_nova_public.pem';
 
+require_once __DIR__ . '/ap-public-doc.php';
+if (ap_public_doc_respond_early()) {
+    exit;
+}
+
 require_once __DIR__ . '/ap-db.php';
 require_once __DIR__ . '/ap-asks.php';
 require_once __DIR__ . '/ap-collections.php';
@@ -1772,7 +1777,7 @@ function ap_cmdr_html(): void
     if (function_exists('ap_bsky_session_row') && function_exists('ap_bsky_own_posts_backfill_maybe_enqueue')) {
         $cmdrUid = function_exists('ap_db_cmdr_nova_user_id') ? ap_db_cmdr_nova_user_id() : 0;
         $cmdrSession = $cmdrUid > 0 ? ap_bsky_session_row($cmdrUid) : null;
-        $cmdrDid = is_array($cmdrSession) ? trim((string) ($cmdrSession['did'] ?? '')) : '';
+        $cmdrDid = function_exists('ap_bsky_session_did') ? ap_bsky_session_did(is_array($cmdrSession) ? $cmdrSession : null) : '';
         if ($cmdrDid !== '') {
             ap_bsky_own_posts_backfill_maybe_enqueue($cmdrUid, $cmdrDid);
             if (function_exists('ap_bsky_background_sync_enqueue')) {

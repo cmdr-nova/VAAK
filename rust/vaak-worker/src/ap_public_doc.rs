@@ -6,6 +6,11 @@
 //! Note never inserts and the actor, featured collection, and note are fetched
 //! again. Bluesky links stay on `blueskyUri`. Empty media text becomes a
 //! zero-width space so a scrubber cannot turn the content into a blank string.
+//!
+//! Pre-2.10 Pleroma also stores `alsoKnownAs` as `{:array, ObjectID}`, which
+//! accepts only http(s). An `at://` actor alias fails the user changeset, so
+//! the user is never saved and discovery repeats. Actor aliases keep http(s)
+//! and move the first `at://` onto `blueskyDid`. Note `alsoKnownAs` stays.
 
 use serde_json::{Map, Value};
 
@@ -35,7 +40,84 @@ fn normalize_object(map: &Map<String, Value>) -> Map<String, Value> {
             Value::Array(items.into_iter().map(normalize_child).collect()),
         );
     }
+    apply_actor_aliases(&mut node);
     node
+}
+
+fn apply_actor_aliases(node: &mut Map<String, Value>) {
+    if !is_actor_type(node.get("type")) {
+        return;
+    }
+    let Some(raw) = node.get("alsoKnownAs").cloned() else {
+        return;
+    };
+    let Some(items) = alias_items(&raw) else {
+        return;
+    };
+    let mut https = Vec::new();
+    let mut at = Vec::new();
+    for item in items {
+        let Some(text) = alias_string(&item) else {
+            continue;
+        };
+        if text.starts_with("at://") {
+            if !at.iter().any(|have: &String| have == &text) {
+                at.push(text);
+            }
+            continue;
+        }
+        if is_http_url(&text) && !https.iter().any(|have: &String| have == &text) {
+            https.push(text);
+        }
+    }
+    let did_empty = node
+        .get("blueskyDid")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("")
+        .is_empty();
+    if did_empty {
+        if let Some(uri) = at.first() {
+            node.insert("blueskyDid".to_string(), Value::String(uri.clone()));
+        }
+    }
+    if https.is_empty() {
+        node.remove("alsoKnownAs");
+    } else {
+        node.insert(
+            "alsoKnownAs".to_string(),
+            Value::Array(https.into_iter().map(Value::String).collect()),
+        );
+    }
+}
+
+fn alias_items(raw: &Value) -> Option<Vec<Value>> {
+    match raw {
+        Value::String(text) => Some(vec![Value::String(text.clone())]),
+        Value::Array(items) => Some(items.clone()),
+        Value::Object(map) if map.get("href").and_then(Value::as_str).is_some() => Some(vec![raw.clone()]),
+        _ => None,
+    }
+}
+
+fn alias_string(item: &Value) -> Option<String> {
+    match item {
+        Value::String(text) => Some(text.clone()),
+        Value::Object(map) => map.get("href").and_then(Value::as_str).map(str::to_string),
+        _ => None,
+    }
+}
+
+fn is_actor_type(value: Option<&Value>) -> bool {
+    match value {
+        Some(Value::String(text)) => actor_type_name(text),
+        Some(Value::Array(items)) => items.iter().any(|item| item.as_str().is_some_and(actor_type_name)),
+        _ => false,
+    }
+}
+
+fn actor_type_name(text: &str) -> bool {
+    matches!(text, "Person" | "Service" | "Application" | "Group" | "Organization")
 }
 
 fn normalize_child(value: Value) -> Value {
@@ -223,5 +305,62 @@ mod tests {
         assert_eq!(out["content"], MEDIA_CONTENT);
         assert_eq!(out["alsoKnownAs"][0], "at://did:plc:example");
         assert_eq!(out["attachment"][0]["url"], "https://cdn.example/video.mp4");
+    }
+
+    #[test]
+    fn actor_at_alias_moves_to_bluesky_did_and_keeps_https() {
+        let actor = json!({
+            "type": "Person",
+            "id": "https://mkultra.monster/users/cmdr_nova",
+            "alsoKnownAs": [
+                "https://example.com/users/other",
+                "at://did:plc:example",
+                "https://example.com/users/other",
+                "did:plc:skip"
+            ]
+        });
+        let out = pleroma_document(&actor);
+        assert_eq!(out["alsoKnownAs"], json!(["https://example.com/users/other"]));
+        assert_eq!(out["blueskyDid"], "at://did:plc:example");
+        let again = pleroma_document(&out);
+        assert_eq!(again, out);
+    }
+
+    #[test]
+    fn actor_only_at_alias_drops_also_known_as() {
+        let actor = json!({
+            "type": ["Service", "Person"],
+            "alsoKnownAs": "at://did:plc:example"
+        });
+        let out = pleroma_document(&actor);
+        assert!(out.get("alsoKnownAs").is_none());
+        assert_eq!(out["blueskyDid"], "at://did:plc:example");
+    }
+
+    #[test]
+    fn actor_keeps_existing_bluesky_did() {
+        let actor = json!({
+            "type": "Group",
+            "blueskyDid": "at://did:plc:keep",
+            "alsoKnownAs": ["at://did:plc:other", {"href": "https://example.com/users/other"}]
+        });
+        let out = pleroma_document(&actor);
+        assert_eq!(out["blueskyDid"], "at://did:plc:keep");
+        assert_eq!(out["alsoKnownAs"], json!(["https://example.com/users/other"]));
+    }
+
+    #[test]
+    fn profile_update_normalizes_the_nested_actor() {
+        let update = json!({
+            "type": "Update",
+            "object": {
+                "type": "Person",
+                "alsoKnownAs": ["https://example.com/users/other", "at://did:plc:example"]
+            }
+        });
+        let out = pleroma_document(&update);
+        assert_eq!(out["type"], "Update");
+        assert_eq!(out["object"]["alsoKnownAs"], json!(["https://example.com/users/other"]));
+        assert_eq!(out["object"]["blueskyDid"], "at://did:plc:example");
     }
 }
