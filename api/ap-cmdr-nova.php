@@ -18,6 +18,11 @@ ap_csp_send_headers('app');
 const CMDR_ACTOR_ID = 'https://mkultra.monster/users/cmdr_nova';
 const CMDR_PUB = '/etc/mkultra/ap-inbox/cmdr_nova_public.pem';
 
+require_once __DIR__ . '/ap-public-doc.php';
+if (ap_public_doc_respond_early()) {
+    exit;
+}
+
 require_once __DIR__ . '/ap-db.php';
 require_once __DIR__ . '/ap-asks.php';
 require_once __DIR__ . '/ap-collections.php';

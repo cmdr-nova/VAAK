@@ -4876,13 +4876,9 @@ function ap_actor_as2_document(string $actorKey, string $publicKeyPem, bool $ric
     } else {
         $actor['featured'] = $id . '/collections/featured';
     }
-    $updatedRaw = (string) ($p['updated_at'] ?? '');
-    try {
-        $actor['updated'] = $updatedRaw !== ''
-            ? (new DateTimeImmutable($updatedRaw))->format('Y-m-d\TH:i:s\Z')
-            : gmdate('Y-m-d\TH:i:s\Z');
-    } catch (Throwable $e) {
-        $actor['updated'] = gmdate('Y-m-d\TH:i:s\Z');
+    $updatedIso = ap_actor_updated_iso((string) ($p['updated_at'] ?? ''));
+    if ($updatedIso !== null) {
+        $actor['updated'] = $updatedIso;
     }
     $iconUrl = function_exists('ap_local_avatar_url')
         ? ap_local_avatar_url($p['icon_url'] ?? null)
@@ -4924,6 +4920,9 @@ function ap_actor_as2_document(string $actorKey, string $publicKeyPem, bool $ric
     }
     // Linked Bluesky identity (Wafrn / multi-protocol clients merge AP+AT follows).
     // FEP-fffd / alsoKnownAs: at://did:plc:… is the ATProto actor URI.
+    // ap_as2_pleroma_document moves that alias onto blueskyDid before a public
+    // GET or a signed delivery. Pre-2.10 Pleroma rejects any non-http value in
+    // alsoKnownAs and then fetches the actor forever.
     try {
         if (!function_exists('ap_profile_bsky_handle')) {
             // defined in this file further below — always available after load

@@ -15,6 +15,11 @@ if (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') {
 require_once __DIR__ . '/ap-csp.php';
 ap_csp_send_headers('app');
 
+require_once __DIR__ . '/ap-public-doc.php';
+if (ap_public_doc_respond_early()) {
+    exit;
+}
+
 require_once __DIR__ . '/ap-db.php';
 require_once __DIR__ . '/ap-auth.php';
 require_once __DIR__ . '/ap-import-export.php'; // alsoKnownAs / movedTo on multi-user actor docs

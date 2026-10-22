@@ -5,8 +5,16 @@
  *
  * Redis is optional. A missing client still emits Cache-Control and
  * validators so a shared HTTP cache can absorb repeats. Signed fetch and
- * Accept negotiation stay with the front controllers; this file only runs
- * after those decisions.
+ * Accept negotiation stay with the front controllers. A cache hit for a
+ * public actor, featured collection, or note can answer before the database
+ * layer loads.
+ *
+ * Pre-2.10 Pleroma stores alsoKnownAs as an array of http(s) object ids.
+ * An at:// actor alias fails that cast, the user is never saved, and
+ * discovery fetches the actor, featured collection, pins, WebFinger, and
+ * host-meta again. Note alsoKnownAs is left alone: that validator applies
+ * to users, not objects. The October note-url fix is separate and still
+ * collapses url to one https string.
  */
 declare(strict_types=1);
 
@@ -18,7 +26,8 @@ const AP_PUBLIC_DOC_MAX_AGE = 60;
 function ap_public_doc_cache_key(string $id): string
 {
     $id = rtrim(trim($id), '/');
-    return 'vaak:apdoc:v1:' . hash('sha256', $id);
+    // v2 drops the cached actor that still advertised an at:// alias.
+    return 'vaak:apdoc:v2:' . hash('sha256', $id);
 }
 
 function ap_public_doc_local_actor_id(string $actorKey): string
@@ -43,15 +52,50 @@ function ap_public_doc_content_type(string $accept): string
 
 function ap_public_doc_http_date(?string $iso): string
 {
+    $iso = trim((string) $iso);
+    if ($iso === '') {
+        return '';
+    }
     try {
-        $dt = new DateTimeImmutable(
-            $iso !== null && trim($iso) !== '' ? trim($iso) : 'now',
-            new DateTimeZone('UTC')
-        );
+        $dt = new DateTimeImmutable($iso, new DateTimeZone('UTC'));
     } catch (Throwable $e) {
-        $dt = new DateTimeImmutable('now', new DateTimeZone('UTC'));
+        return '';
     }
     return $dt->setTimezone(new DateTimeZone('GMT'))->format('D, d M Y H:i:s') . ' GMT';
+}
+
+/**
+ * Profile updated_at, or null when the row has no usable timestamp.
+ * Callers omit `updated` in that case. Filling it with the request time
+ * makes a remote treat the actor as changed on every fetch.
+ */
+function ap_actor_updated_iso(string $updatedRaw): ?string
+{
+    $updatedRaw = trim($updatedRaw);
+    if ($updatedRaw === '') {
+        return null;
+    }
+    try {
+        return (new DateTimeImmutable($updatedRaw))->format('Y-m-d\TH:i:s\Z');
+    } catch (Throwable $e) {
+        return null;
+    }
+}
+
+/**
+ * Last-Modified for a public document. Empty when neither the caller nor
+ * the document has a real timestamp, so a featured collection does not
+ * advertise a fresh modification every time the cache is rebuilt.
+ *
+ * @param array<string,mixed> $doc
+ */
+function ap_public_doc_last_modified(?string $modifiedIso, array $doc): string
+{
+    if ($modifiedIso === null || trim($modifiedIso) === '') {
+        $fromDoc = $doc['updated'] ?? $doc['published'] ?? null;
+        $modifiedIso = is_string($fromDoc) ? $fromDoc : '';
+    }
+    return ap_public_doc_http_date($modifiedIso);
 }
 
 /**
@@ -107,7 +151,7 @@ function ap_public_doc_cache_get(string $id): ?array
     $body = $cached['body'] ?? null;
     $etag = $cached['etag'] ?? null;
     $modified = $cached['last_modified'] ?? null;
-    if (!is_string($body) || $body === '' || !is_string($etag) || $etag === '' || !is_string($modified) || $modified === '') {
+    if (!is_string($body) || $body === '' || !is_string($etag) || $etag === '' || !is_string($modified)) {
         return null;
     }
     return ['body' => $body, 'etag' => $etag, 'last_modified' => $modified];
@@ -171,6 +215,134 @@ function ap_public_doc_respond_if_cached(string $cacheId, string $accept): bool
     return true;
 }
 
+/**
+ * activity+json strictly outranks text/html and xhtml. A tie does not win,
+ * matching the profile front controllers, which serve HTML on a tie.
+ * ld+json alone is not this fast path.
+ */
+function ap_public_doc_activityjson_wins(string $accept): bool
+{
+    $accept = strtolower(trim($accept));
+    if ($accept === '' || !str_contains($accept, 'application/activity+json')) {
+        return false;
+    }
+    $score = static function (string $haystack, string $type): float {
+        $best = -1.0;
+        foreach (explode(',', $haystack) as $part) {
+            $part = trim($part);
+            if ($part === '') {
+                continue;
+            }
+            $semi = strpos($part, ';');
+            $media = trim($semi === false ? $part : substr($part, 0, $semi));
+            if ($media !== $type) {
+                continue;
+            }
+            $q = 1.0;
+            if (preg_match('/(?:^|;)\s*q\s*=\s*([0-9.]+)/', $part, $m)) {
+                $q = (float) $m[1];
+            }
+            if ($q > $best) {
+                $best = $q;
+            }
+        }
+        return $best;
+    };
+    $browserQ = max($score($accept, 'text/html'), $score($accept, 'application/xhtml+xml'));
+    $activityQ = $score($accept, 'application/activity+json');
+    if ($activityQ < 0) {
+        return false;
+    }
+    if ($browserQ < 0) {
+        return true;
+    }
+    return $activityQ > $browserQ;
+}
+
+/** Public cache id for this request, or null when the URL is not a cached document. */
+function ap_public_doc_request_cache_id(): ?string
+{
+    $method = strtoupper((string) ($_SERVER['REQUEST_METHOD'] ?? 'GET'));
+    if ($method !== 'GET' && $method !== 'HEAD') {
+        return null;
+    }
+    $uri = (string) ($_SERVER['REQUEST_URI'] ?? '/');
+    $path = parse_url($uri, PHP_URL_PATH);
+    if (!is_string($path) || $path === '') {
+        $path = '/';
+    }
+    $path = rtrim($path, '/') ?: '/';
+    $username = '';
+    $sub = '';
+    if (preg_match('#^/@([a-zA-Z][a-zA-Z0-9_]{1,29})(?:/(.*))?$#', $path, $m)) {
+        $username = strtolower($m[1]);
+        $sub = isset($m[2]) ? trim((string) $m[2], '/') : '';
+    } elseif (preg_match('#^/users/([a-zA-Z][a-zA-Z0-9_]{1,29})(?:/(.*))?$#', $path, $m)) {
+        $username = strtolower($m[1]);
+        $sub = isset($m[2]) ? trim((string) $m[2], '/') : '';
+    } else {
+        return null;
+    }
+    $actor = ap_public_doc_local_actor_id($username);
+    if ($sub === '') {
+        return $actor;
+    }
+    if ($sub === 'featured' || $sub === 'collections/featured') {
+        return $actor . '/collections/featured';
+    }
+    if (preg_match('#^(notes|creates)/([a-f0-9]+)$#', $sub, $note)) {
+        return $actor . '/' . $note[1] . '/' . $note[2];
+    }
+    return null;
+}
+
+/**
+ * Answer a repeated ActivityPub GET from Redis before the database layer
+ * loads. Returns false on a miss or when the client did not ask for
+ * activity+json ahead of HTML.
+ */
+function ap_public_doc_respond_early(): bool
+{
+    if (!ap_public_doc_activityjson_wins((string) ($_SERVER['HTTP_ACCEPT'] ?? ''))) {
+        return false;
+    }
+    $id = ap_public_doc_request_cache_id();
+    if ($id === null) {
+        return false;
+    }
+    return ap_public_doc_respond_if_cached($id, (string) ($_SERVER['HTTP_ACCEPT'] ?? ''));
+}
+
+/**
+ * Cache-Control, ETag, and 304 for a small static or cached GET body
+ * (WebFinger, host-meta). Last-Modified is sent only for a real timestamp.
+ */
+function ap_public_doc_conditional_headers(string $body, string $contentType, int $maxAge, ?string $modifiedIso = null): void
+{
+    $etag = '"' . hash('sha256', $body) . '"';
+    $lastModified = ap_public_doc_http_date($modifiedIso);
+    $status = ap_public_doc_conditional_status(
+        $etag,
+        $lastModified,
+        isset($_SERVER['HTTP_IF_NONE_MATCH']) ? (string) $_SERVER['HTTP_IF_NONE_MATCH'] : null,
+        isset($_SERVER['HTTP_IF_MODIFIED_SINCE']) ? (string) $_SERVER['HTTP_IF_MODIFIED_SINCE'] : null
+    );
+    if ($status === 304) {
+        http_response_code(304);
+    }
+    header('Content-Type: ' . $contentType);
+    header('Cache-Control: public, max-age=' . max(0, $maxAge));
+    header('ETag: ' . $etag);
+    if ($lastModified !== '') {
+        header('Last-Modified: ' . $lastModified);
+    }
+    $method = strtoupper((string) ($_SERVER['REQUEST_METHOD'] ?? 'GET'));
+    if ($status === 304 || $method === 'HEAD') {
+        return;
+    }
+    echo $body;
+}
+
 function ap_public_doc_emit(array $doc, string $accept, string $cacheId, bool $shared, ?string $modifiedIso = null): void
 {
     $doc = ap_as2_pleroma_document($doc);
@@ -181,12 +353,8 @@ function ap_public_doc_emit(array $doc, string $accept, string $cacheId, bool $s
         echo '{"error":"encode failed"}';
         return;
     }
-    if ($modifiedIso === null || trim($modifiedIso) === '') {
-        $fromDoc = $doc['updated'] ?? $doc['published'] ?? null;
-        $modifiedIso = is_string($fromDoc) ? $fromDoc : gmdate('c');
-    }
     $etag = '"' . hash('sha256', $body) . '"';
-    $lastModified = ap_public_doc_http_date($modifiedIso);
+    $lastModified = ap_public_doc_last_modified($modifiedIso, $doc);
     if ($shared && $cacheId !== '') {
         ap_public_doc_cache_put($cacheId, $body, $etag, $lastModified);
     }
@@ -211,7 +379,9 @@ function ap_public_doc_write(string $body, string $accept, string $etag, string 
     if ($shared) {
         header('Cache-Control: public, max-age=' . AP_PUBLIC_DOC_MAX_AGE);
         header('ETag: ' . $etag);
-        header('Last-Modified: ' . $lastModified);
+        if ($lastModified !== '') {
+            header('Last-Modified: ' . $lastModified);
+        }
     } else {
         header('Cache-Control: no-cache, max-age=0, must-revalidate');
     }
@@ -375,6 +545,86 @@ function ap_as2_pleroma_node(array $node): array
                 $node['orderedItems'][$index] = ap_as2_pleroma_node($item);
             }
         }
+    }
+    return ap_as2_pleroma_actor_aliases($node);
+}
+
+function ap_as2_pleroma_actor_type(mixed $type): bool
+{
+    $names = ['Person', 'Service', 'Application', 'Group', 'Organization'];
+    if (is_string($type)) {
+        return in_array($type, $names, true);
+    }
+    if (!is_array($type)) {
+        return false;
+    }
+    foreach ($type as $item) {
+        if (is_string($item) && in_array($item, $names, true)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+function ap_as2_pleroma_alias_string(mixed $item): ?string
+{
+    if (is_string($item)) {
+        return $item;
+    }
+    if (is_array($item) && isset($item['href']) && is_string($item['href'])) {
+        return $item['href'];
+    }
+    return null;
+}
+
+/**
+ * Keep http(s) actor aliases. Move the first at:// alias onto blueskyDid
+ * and drop every other non-http value. Notes are not actors, so their
+ * alsoKnownAs is unchanged. https aliases stay, in their original order.
+ *
+ * @param array<string,mixed> $node
+ * @return array<string,mixed>
+ */
+function ap_as2_pleroma_actor_aliases(array $node): array
+{
+    if (!ap_as2_pleroma_actor_type($node['type'] ?? null) || !array_key_exists('alsoKnownAs', $node)) {
+        return $node;
+    }
+    $raw = $node['alsoKnownAs'];
+    if (is_string($raw)) {
+        $values = [$raw];
+    } elseif (is_array($raw) && array_is_list($raw)) {
+        $values = $raw;
+    } elseif (is_array($raw) && isset($raw['href'])) {
+        $values = [$raw];
+    } else {
+        return $node;
+    }
+    $https = [];
+    $at = [];
+    foreach ($values as $item) {
+        $text = ap_as2_pleroma_alias_string($item);
+        if ($text === null) {
+            continue;
+        }
+        if (str_starts_with($text, 'at://')) {
+            if (!in_array($text, $at, true)) {
+                $at[] = $text;
+            }
+            continue;
+        }
+        if (ap_as2_http_url($text) && !in_array($text, $https, true)) {
+            $https[] = $text;
+        }
+    }
+    $existingDid = $node['blueskyDid'] ?? null;
+    if ($at !== [] && (!is_string($existingDid) || trim($existingDid) === '')) {
+        $node['blueskyDid'] = $at[0];
+    }
+    if ($https === []) {
+        unset($node['alsoKnownAs']);
+    } else {
+        $node['alsoKnownAs'] = array_values($https);
     }
     return $node;
 }

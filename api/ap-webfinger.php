@@ -9,7 +9,7 @@ declare(strict_types=1);
 header('X-Content-Type-Options: nosniff');
 header('X-Robots-Tag: noindex, nofollow');
 
-require_once __DIR__ . '/ap-db.php';
+require_once __DIR__ . '/ap-public-doc.php';
 
 $resource = (string) ($_GET['resource'] ?? '');
 $resource = trim(rawurldecode($resource));
@@ -17,12 +17,11 @@ $norm = strtolower($resource);
 $wfCacheKey = 'vaak:webfinger:' . hash('sha256', $norm);
 $wfCached = ap_redis_json_get($wfCacheKey);
 if (is_array($wfCached) && isset($wfCached['subject'], $wfCached['links'])) {
-    header('Content-Type: application/jrd+json; charset=utf-8');
-    header('Access-Control-Allow-Origin: *');
-    header('Cache-Control: public, max-age=60');
-    echo json_encode($wfCached, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+    ap_webfinger_emit($wfCached);
     exit;
 }
+
+require_once __DIR__ . '/ap-db.php';
 
 $username = null;
 
@@ -105,7 +104,17 @@ $jrd = [
 
 ap_redis_json_set($wfCacheKey, $jrd, 300);
 
-header('Content-Type: application/jrd+json; charset=utf-8');
-header('Access-Control-Allow-Origin: *');
-header('Cache-Control: public, max-age=60');
-echo json_encode($jrd, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+ap_webfinger_emit($jrd);
+
+function ap_webfinger_emit(array $jrd): void
+{
+    header('Access-Control-Allow-Origin: *');
+    $body = json_encode($jrd, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+    if (!is_string($body) || $body === '') {
+        http_response_code(500);
+        header('Content-Type: application/json; charset=utf-8');
+        echo '{"error":"encode failed"}';
+        return;
+    }
+    ap_public_doc_conditional_headers($body, 'application/jrd+json; charset=utf-8', 60);
+}

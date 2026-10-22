@@ -19,6 +19,12 @@ function ap_fix_utf8(?string $s): string { return $s ?? ''; }
 if (!function_exists('mb_strlen')) { function mb_strlen(string $s): int { return strlen($s); } }
 function ap_profile_verify_attachments(array $a, bool $fetch, string $key): array { return $a; }
 function ap_alias_also_known_as_urls(string $key): array { return []; }
+function ap_actor_updated_iso(string $updatedRaw): ?string {
+    $updatedRaw = trim($updatedRaw);
+    if ($updatedRaw === '') return null;
+    try { return (new DateTimeImmutable($updatedRaw))->format('Y-m-d\TH:i:s\Z'); }
+    catch (Throwable $e) { return null; }
+}
 function ap_db_now(): string { return '2026-10-10T12:00:00Z'; }
 function ap_redis_delete(string ...$keys): void { foreach ($keys as $k) $GLOBALS['fixture_deletes'][]=$k; }
 function ap_profile_export_public_cache(string $key): void {

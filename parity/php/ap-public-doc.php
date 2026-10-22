@@ -69,6 +69,26 @@ $cases = [
             'value' => '<a href="https://bsky.app/profile/x">x</a>',
         ]],
     ],
+    'actor-only-at' => [
+        'type' => ['Service', 'Person'],
+        'id' => 'https://mkultra.monster/users/cmdr_nova',
+        'alsoKnownAs' => 'at://did:plc:example',
+    ],
+    'actor-keeps-bluesky-did' => [
+        'type' => 'Group',
+        'id' => 'https://mkultra.monster/users/cmdr_nova',
+        'blueskyDid' => 'at://did:plc:keep',
+        'alsoKnownAs' => ['at://did:plc:other', ['href' => 'https://example.com/users/other']],
+    ],
+    'update-actor' => [
+        'type' => 'Update',
+        'actor' => 'https://mkultra.monster/users/cmdr_nova',
+        'object' => [
+            'type' => 'Person',
+            'id' => 'https://mkultra.monster/users/cmdr_nova',
+            'alsoKnownAs' => ['https://example.com/users/other', 'at://did:plc:example', 'did:plc:skip'],
+        ],
+    ],
     'featured-ids' => [
         'type' => 'OrderedCollection',
         'id' => 'https://mkultra.monster/users/cmdr_nova/collections/featured',
