@@ -7420,6 +7420,15 @@ function ap_bsky_post_as_quote_preview(array $post): ?array
         'url' => $url,
         'media' => $media,
     ];
+    // Already on this post view (cache column or the response just read). No extra lookup.
+    $avatar = trim((string) ($author['avatar'] ?? ''));
+    if (str_starts_with($avatar, 'https://')) {
+        $out['avatar'] = $avatar;
+    }
+    $created = trim((string) ($record['createdAt'] ?? $post['indexedAt'] ?? ''));
+    if ($created !== '') {
+        $out['created_at'] = $created;
+    }
     if (is_array($external)) {
         $out['external'] = $external;
         $out['card'] = [

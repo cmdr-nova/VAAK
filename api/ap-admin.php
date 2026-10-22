@@ -14576,6 +14576,238 @@ function admin_split_quote_summary(string $summaryRaw): ?array
  *   open_external?:bool
  * } $opts
  */
+/** Status/thread pages paint quotes with the feed's nested post card. */
+function admin_status_quote_surface(): bool
+{
+    return ($GLOBALS['view'] ?? '') === 'status';
+}
+
+function admin_quote_https_avatar(array $account): string
+{
+    foreach (['avatar', 'avatar_static'] as $key) {
+        $url = trim((string) ($account[$key] ?? ''));
+        if (str_starts_with($url, 'https://')) {
+            return $url;
+        }
+    }
+    return 'https://mkultra.monster/img/avatar/default.webp';
+}
+
+function admin_quote_status_paintable(array $st): bool
+{
+    $account = is_array($st['account'] ?? null) ? $st['account'] : [];
+    foreach (['acct', 'display_name', 'username'] as $key) {
+        $value = ltrim(trim((string) ($account[$key] ?? '')), '@');
+        if ($value !== '' && $value !== '?') {
+            return true;
+        }
+    }
+    $text = function_exists('admin_html_to_plain')
+        ? trim(admin_html_to_plain((string) ($st['content'] ?? '')))
+        : trim(strip_tags((string) ($st['content'] ?? '')));
+    if ($text !== '') {
+        return true;
+    }
+    $media = $st['media_attachments'] ?? null;
+    return is_array($media) && $media !== [];
+}
+
+/**
+ * Already-cached Bluesky preview → a status the feed-style quote card can paint.
+ * No AppView or remote fetch; avatar comes from the preview when it is https.
+ *
+ * @param array<string,mixed> $prev
+ * @return array<string,mixed>
+ */
+function admin_quote_status_from_bsky_preview(array $prev, string $fallbackUrl = ''): array
+{
+    $handle = ltrim(trim((string) ($prev['handle'] ?? '')), '@');
+    $display = trim((string) ($prev['display'] ?? ''));
+    if ($display === '') {
+        $display = $handle;
+    }
+    $url = trim((string) ($prev['url'] ?? $fallbackUrl));
+    $avatar = trim((string) ($prev['avatar'] ?? ''));
+    if (!str_starts_with($avatar, 'https://')) {
+        $avatar = '';
+    }
+    $text = trim((string) ($prev['text'] ?? ''));
+    $account = [
+        'acct' => $handle,
+        'username' => $handle,
+        'display_name' => $display,
+        'url' => $handle !== '' ? ('https://bsky.app/profile/' . rawurlencode($handle)) : '',
+    ];
+    if ($avatar !== '') {
+        $account['avatar'] = $avatar;
+        $account['avatar_static'] = $avatar;
+    }
+    $status = [
+        'id' => $url !== '' ? $url : ('bsky-quote:' . substr(hash('sha256', $text . $handle), 0, 16)),
+        'uri' => $url,
+        'url' => $url,
+        'content' => $text,
+        'created_at' => (string) ($prev['created_at'] ?? ''),
+        'account' => $account,
+        'media_attachments' => is_array($prev['media'] ?? null) ? $prev['media'] : [],
+        'source' => 'bluesky',
+    ];
+    if (is_array($prev['card'] ?? null)) {
+        $status['card'] = $prev['card'];
+    }
+    return $status;
+}
+
+/**
+ * Feed quote card for a resolved status: avatar, name, handle, time, body, media.
+ * Uses fields already on the status. Library/search keep admin_quote_card_html.
+ *
+ * @param array<string,mixed> $st
+ * @param array<string,mixed> $opts
+ */
+function admin_feed_quote_embed_html(array $st, string $returnView, array $opts): string
+{
+    if (function_exists('ap_masto_quoted_display_status')) {
+        $st = ap_masto_quoted_display_status($st);
+    }
+    $account = is_array($st['account'] ?? null) ? $st['account'] : [];
+    $acct = trim((string) ($account['acct'] ?? ''));
+    $display = trim((string) ($account['display_name'] ?? ''));
+    if ($display === '') {
+        $display = $acct !== '' ? ltrim($acct, '@') : '?';
+    }
+    $actor = function_exists('admin_account_actor_ref') ? admin_account_actor_ref($account) : '';
+    $avatar = admin_quote_https_avatar($account);
+    $from = preg_replace('/[^a-z_]/', '', $returnView) ?: 'home';
+    $profile = ($actor !== '' && str_starts_with($actor, 'https://') && function_exists('admin_profile_app_href'))
+        ? admin_profile_app_href($actor, $from)
+        : '';
+    $actorAttr = ($actor !== '' && str_starts_with($actor, 'https://'))
+        ? ' data-profile-hover-actor="' . h($actor) . '"'
+        : '';
+    $fallback = 'https://mkultra.monster/img/avatar/default.webp';
+    $avImg = '<img class="tweet-av" src="' . h($avatar) . '" alt="" width="40" height="40" loading="lazy" decoding="async" referrerpolicy="no-referrer" onerror="this.onerror=null;this.src=\'' . h($fallback) . '\'"' . $actorAttr . '>';
+    $avBlock = $profile !== ''
+        ? '<a href="' . h($profile) . '"' . $actorAttr . ' style="text-decoration:none">' . $avImg . '</a>'
+        : $avImg;
+    $displayHtml = function_exists('admin_emoji_html') ? admin_emoji_html($display, $actor !== '' ? $actor : null) : h($display);
+    if ($profile !== '') {
+        $who = '<a class="who" href="' . h($profile) . '"' . $actorAttr . ' style="color:inherit;text-decoration:none">' . $displayHtml . '</a>';
+        if ($acct !== '') {
+            $who .= '<a class="meta" href="' . h($profile) . '"' . $actorAttr . ' style="color:var(--muted);text-decoration:none"> @' . h(ltrim($acct, '@')) . '</a>';
+        }
+    } else {
+        $who = '<span class="who">' . $displayHtml . '</span>';
+        if ($acct !== '') {
+            $who .= '<span class="meta"> @' . h(ltrim($acct, '@')) . '</span>';
+        }
+    }
+    $uri = trim((string) ($opts['url'] ?? ''));
+    if ($uri === '' || !str_starts_with($uri, 'https://')) {
+        $uri = trim((string) ($st['uri'] ?? ''));
+        if ($uri === '' || !str_starts_with($uri, 'https://')) {
+            $uri = trim((string) ($st['url'] ?? ''));
+        }
+    }
+    $when = '';
+    $created = trim((string) ($st['created_at'] ?? ''));
+    if ($created !== '') {
+        $rel = relative_time($created);
+        if ($rel !== '') {
+            $openHref = ($uri !== '' && function_exists('admin_status_href')) ? admin_status_href($uri, $from) : '';
+            if ($openHref !== '' && $openHref !== '#') {
+                $when = '<a class="meta tweet-time" href="' . h($openHref) . '" title="Open post"> · ' . h($rel) . '</a>';
+            } else {
+                $when = '<span class="meta"> · ' . h($rel) . '</span>';
+            }
+        }
+    }
+    $header = '<div class="tweet-hd">' . $avBlock . '<div class="tweet-hd-main tweet-hd-main--fedi"><div>' . $who . $when . '</div></div></div>';
+    $text = trim((string) ($opts['text'] ?? ''));
+    $mentions = is_array($opts['mentions'] ?? null) ? $opts['mentions'] : [];
+    $body = '';
+    if ($text !== '') {
+        $body .= '<div class="body feed-body" style="white-space:pre-wrap">'
+            . admin_linkify_body_html($text, $from, $mentions, $actor !== '' ? $actor : null) . '</div>';
+    }
+    $media = is_array($opts['media'] ?? null) ? $opts['media'] : [];
+    if ($media !== [] && function_exists('admin_media_row_html')) {
+        $mediaHtml = admin_media_row_html($media);
+        $spoiler = trim((string) ($opts['spoiler_text'] ?? ''));
+        $sensitive = !empty($opts['sensitive']) || $spoiler !== '';
+        if ($sensitive && $mediaHtml !== '' && function_exists('admin_cw_gate_html')) {
+            $mediaHtml = admin_cw_gate_html($spoiler !== '' ? $spoiler : 'Sensitive content', true, $mediaHtml);
+        }
+        $body .= $mediaHtml;
+    }
+    if ($media === [] && function_exists('ap_link_preview_html')) {
+        $card = is_array($opts['card'] ?? null) ? $opts['card'] : null;
+        if ($card === null && $text !== '' && function_exists('ap_link_preview_card_for_status_text')) {
+            $card = ap_link_preview_card_for_status_text($text, false, false);
+            if ($card === null) {
+                $budget = &$GLOBALS['admin_quote_link_preview_budget'];
+                if (!isset($budget) || !is_int($budget)) {
+                    $budget = 2;
+                }
+                if ($budget > 0) {
+                    $budget--;
+                    $card = ap_link_preview_card_for_status_text($text, false, true);
+                }
+            }
+            if ($card === null && function_exists('ap_link_preview_extract_url') && function_exists('ap_link_preview_warm_async')) {
+                $warmUrl = ap_link_preview_extract_url($text);
+                if (is_string($warmUrl) && $warmUrl !== '') {
+                    ap_link_preview_warm_async($warmUrl);
+                }
+            }
+        }
+        if (is_array($card)) {
+            $cardHtml = ap_link_preview_html(array_merge($card, ['status' => 'ok']), false);
+            if ($cardHtml !== '') {
+                $body .= '<div class="quote-link-card" data-quote-chrome="1" style="margin-top:.45rem;pointer-events:none">'
+                    . $cardHtml . '</div>';
+            }
+        }
+    }
+    $bsky = ($st['source'] ?? '') === 'bluesky'
+        || str_starts_with((string) ($st['id'] ?? ''), 'bsky:')
+        || str_contains((string) ($st['uri'] ?? $st['url'] ?? ''), 'bsky.app/')
+        || str_starts_with((string) ($st['uri'] ?? ''), 'at://')
+        || str_ends_with(strtolower($acct), '@bsky.app');
+    $sid = rtrim(trim((string) ($st['id'] ?? '')), '/');
+    $note = rtrim($uri, '/');
+    $attrs = '';
+    if ($sid !== '') {
+        $attrs .= ' data-timeline-key="' . h($sid) . '" data-status-id="' . h($sid) . '"';
+    }
+    if ($note !== '' && str_starts_with($note, 'https://')) {
+        $attrs .= ' data-note-id="' . h($note) . '"';
+    }
+    $sort = $created !== '' ? strtotime($created) : false;
+    if ($sort !== false && $sort > 0) {
+        $attrs .= ' data-sort="' . (int) $sort . '"';
+    }
+    $article = '<div class="notif-status-embed"><article class="tweet' . ($bsky ? ' tweet-bsky' : '') . '"' . $attrs . '>'
+        . $header . $body . '</article></div>';
+    return '<div class="quote-block" style="margin-top:.55rem;background:transparent;border:0;padding:0;border-radius:0;color:inherit">'
+        . $article . '</div>';
+}
+
+/**
+ * Status/thread resolved quotes use the feed card. Every other surface keeps
+ * the compact quote card so library/search captures stay stable.
+ *
+ * @param array<string,mixed> $opts
+ * @param array<string,mixed>|null $status
+ */
+function admin_paint_quote_html(array $opts, string $returnView, ?array $status = null): string
+{
+    if (is_array($status) && admin_status_quote_surface() && empty($opts['is_rss']) && admin_quote_status_paintable($status)) {
+        return admin_feed_quote_embed_html($status, $returnView, $opts);
+    }
+    return admin_quote_card_html($opts, $returnView);
+}
+
 function admin_quote_card_html(array $opts, string $returnView = 'home'): string
 {
     // A canonical source retained during quote assembly can have lost its
@@ -17146,7 +17378,11 @@ function admin_render_event_tweet(array $e, array $followingIds, string $returnV
                       if (!empty($quoteOpts['media']) && is_array($quoteOpts['media'])) {
                           $rememberQuotedMedia($quoteOpts['media']);
                       }
-                      $bodyChunk .= admin_quote_card_html($quoteOpts, $returnView);
+                      $quoteSource = is_array($quotedStatus) ? $quotedStatus : null;
+                      if ($quoteSource === null && is_array($quotedBsky)) {
+                          $quoteSource = admin_quote_status_from_bsky_preview($quotedBsky, $quotedStatusUrl);
+                      }
+                      $bodyChunk .= admin_paint_quote_html($quoteOpts, $returnView, $quoteSource);
                   } else {
                       $bodyChunk .= admin_quote_card_html([
                           'url' => $quotedStatusUrl,
@@ -17189,7 +17425,7 @@ function admin_render_event_tweet(array $e, array $followingIds, string $returnV
                           if (($lateOpts['acct'] ?? '') === '' && $qFallbackAcct !== '') {
                               $lateOpts['acct'] = '@' . ltrim($qFallbackAcct, '@');
                           }
-                          $bodyChunk .= admin_quote_card_html($lateOpts, $returnView);
+                          $bodyChunk .= admin_paint_quote_html($lateOpts, $returnView, $quotedStatus);
                       } else {
                           $bodyChunk .= admin_quote_card_html([
                               'acct' => $qFallbackAcct !== '' ? ('@' . ltrim($qFallbackAcct, '@')) : '',
@@ -18809,6 +19045,7 @@ function admin_render_masto_status_card(
     }
     $splitPlain = ($plain !== '') ? admin_split_quote_summary($plain) : null;
     $fallbackQuoteOpts = null;
+    $fallbackQuoteStatus = null;
     if (is_array($splitPlain)) {
         $quotedLine = (string) ($splitPlain['quoted'] ?? '');
         $needFallbackCard = !is_array($quote)
@@ -18835,6 +19072,7 @@ function admin_render_masto_status_card(
             if ($qFallbackUrl !== '' && function_exists('ap_masto_lookup_status_by_object_url')) {
                 $fbStatus = ap_masto_lookup_status_by_object_url($qFallbackUrl, 0, false, true);
                 if (is_array($fbStatus)) {
+                    $fallbackQuoteStatus = $fbStatus;
                     $fallbackQuoteOpts = admin_quote_opts_from_status($fbStatus, $qFallbackUrl);
                     if (($fallbackQuoteOpts['acct'] ?? '') === '' && $qFallbackAcct !== '') {
                         $fallbackQuoteOpts['acct'] = '@' . ltrim($qFallbackAcct, '@');
@@ -18943,12 +19181,33 @@ function admin_render_masto_status_card(
             if (($qOpts['acct'] ?? '') === '' && is_array($bskyQ) && trim((string) ($bskyQ['handle'] ?? '')) !== '') {
                 $qOpts['acct'] = '@' . ltrim((string) $bskyQ['handle'], '@');
             }
+            if (is_array($bskyQ)) {
+                $cachedAvatar = trim((string) ($bskyQ['avatar'] ?? ''));
+                $haveAvatar = str_starts_with(trim((string) ($qst['account']['avatar'] ?? '')), 'https://')
+                    || str_starts_with(trim((string) ($qst['account']['avatar_static'] ?? '')), 'https://');
+                if ($cachedAvatar !== '' && str_starts_with($cachedAvatar, 'https://') && !$haveAvatar) {
+                    if (!is_array($qst['account'] ?? null)) {
+                        $qst['account'] = [];
+                    }
+                    $qst['account']['avatar'] = $cachedAvatar;
+                    $qst['account']['avatar_static'] = $cachedAvatar;
+                }
+                if (trim((string) ($qst['account']['display_name'] ?? '')) === '' && trim((string) ($bskyQ['display'] ?? '')) !== '') {
+                    if (!is_array($qst['account'] ?? null)) {
+                        $qst['account'] = [];
+                    }
+                    $qst['account']['display_name'] = trim((string) $bskyQ['display']);
+                }
+                if (trim((string) ($qst['created_at'] ?? '')) === '' && trim((string) ($bskyQ['created_at'] ?? '')) !== '') {
+                    $qst['created_at'] = (string) $bskyQ['created_at'];
+                }
+            }
         }
         $paintedQuoteUrl = trim((string) ($qOpts['url'] ?? $quri));
         if ($paintedQuoteUrl === '' && !empty($st['quote_url']) && is_string($st['quote_url'])) {
             $paintedQuoteUrl = (string) $st['quote_url'];
         }
-        $bodyInner .= admin_quote_card_html($qOpts, $returnView);
+        $bodyInner .= admin_paint_quote_html($qOpts, $returnView, $qst);
     } elseif (is_array($quote) && ($quote['state'] ?? '') === 'pending') {
         // Recover quote URL from status fields / local outbox AS2 when pending.
         $pendingUrl = '';
@@ -18974,15 +19233,17 @@ function admin_render_masto_status_card(
                 || !ap_visibility_status_audience_allowed($pendingPolicySource, admin_owner_user_id()))) {
             $pendingUrl = '';
             $fallbackQuoteOpts = null;
+            $fallbackQuoteStatus = null;
         }
         // Cache hit for the quoted object → render a real quote card.
         // Includes GTS @handle/id → /ap/users/{numeric}/statuses/{id} bridge.
         if ($pendingUrl !== '' && function_exists('ap_masto_lookup_status_by_object_url')) {
             $pendingQuoted = ap_masto_lookup_status_by_object_url($pendingUrl, 0, false, true);
             if (is_array($pendingQuoted)) {
-                $bodyInner .= admin_quote_card_html(
+                $bodyInner .= admin_paint_quote_html(
                     admin_quote_opts_from_status($pendingQuoted, $pendingUrl),
-                    $returnView
+                    $returnView,
+                    $pendingQuoted
                 );
                 $paintedQuoteUrl = $pendingUrl;
                 $pendingUrl = ''; // done
@@ -19002,7 +19263,11 @@ function admin_render_masto_status_card(
         if (is_array($bskyPending) && (trim((string) ($bskyPending['text'] ?? '')) !== ''
             || trim((string) ($bskyPending['handle'] ?? '')) !== ''
             || !empty($bskyPending['media']))) {
-            $bodyInner .= admin_quote_card_html(admin_quote_opts_from_bsky($bskyPending, $pendingUrl), $returnView);
+            $bodyInner .= admin_paint_quote_html(
+                admin_quote_opts_from_bsky($bskyPending, $pendingUrl),
+                $returnView,
+                admin_quote_status_from_bsky_preview($bskyPending, $pendingUrl)
+            );
             $paintedQuoteUrl = $pendingUrl !== '' ? $pendingUrl : $paintedQuoteUrl;
         } elseif (is_array($preview) && trim((string) ($preview['text'] ?? '')) !== '') {
             // Summary still had the quoted snippet — paint a card now, warm async.
@@ -19010,17 +19275,34 @@ function admin_render_masto_status_card(
                 ap_quote_target_warm_async($pendingUrl);
             }
             $previewUrl = (string) ($preview['url'] ?? $pendingUrl);
-            $bodyInner .= admin_quote_card_html([
+            $previewOpts = [
                 'acct' => trim((string) ($preview['acct'] ?? '')),
                 'text' => trim((string) ($preview['text'] ?? '')),
                 'url' => $previewUrl,
                 'open_label' => 'Open quoted',
-            ], $returnView);
+            ];
+            $previewStatus = [
+                'uri' => $previewUrl,
+                'url' => $previewUrl,
+                'content' => trim((string) ($preview['text'] ?? '')),
+                'created_at' => (string) ($preview['created_at'] ?? ''),
+                'account' => [
+                    'acct' => ltrim(trim((string) ($preview['acct'] ?? '')), '@'),
+                    'display_name' => trim((string) ($preview['display'] ?? $preview['display_name'] ?? '')),
+                ],
+            ];
+            $previewAvatar = trim((string) ($preview['avatar'] ?? ''));
+            if (str_starts_with($previewAvatar, 'https://')) {
+                $previewStatus['account']['avatar'] = $previewAvatar;
+                $previewStatus['account']['avatar_static'] = $previewAvatar;
+            }
+            $bodyInner .= admin_paint_quote_html($previewOpts, $returnView, $previewStatus);
             $paintedQuoteUrl = $previewUrl !== '' ? $previewUrl : $paintedQuoteUrl;
         } elseif (is_array($fallbackQuoteOpts)) {
-            $bodyInner .= admin_quote_card_html($fallbackQuoteOpts, $returnView);
+            $bodyInner .= admin_paint_quote_html($fallbackQuoteOpts, $returnView, $fallbackQuoteStatus);
             $paintedQuoteUrl = trim((string) ($fallbackQuoteOpts['url'] ?? $pendingUrl));
             $fallbackQuoteOpts = null;
+            $fallbackQuoteStatus = null;
         } elseif ($pendingUrl !== '') {
             $unavail = function_exists('ap_object_target_unavailable_reason')
                 ? ap_object_target_unavailable_reason($pendingUrl)
@@ -19050,7 +19332,7 @@ function admin_render_masto_status_card(
     } elseif (is_array($fallbackQuoteOpts)) {
         // No structured quote on the status — paint from the ↪ QT line so
         // quote-boosts don't stay as raw text in the feed body.
-        $bodyInner .= admin_quote_card_html($fallbackQuoteOpts, $returnView);
+        $bodyInner .= admin_paint_quote_html($fallbackQuoteOpts, $returnView, $fallbackQuoteStatus);
         $paintedQuoteUrl = trim((string) ($fallbackQuoteOpts['url'] ?? ''));
     }
     // Status Open / masto cards: attach poll UI (timeline outbox path already does).

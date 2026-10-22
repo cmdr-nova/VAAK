@@ -16,7 +16,9 @@ function ap_masto_account_for_local_url(?string $url): array {
 }
 function ap_bsky_post_preview_from_url(string $url, int $owner, bool $fetch): array {
     if ($fetch) throw new RuntimeException('unexpected network');
-    return ['handle'=>$GLOBALS['fixture_handle'],'url'=>$url,'text'=>'A quote','display'=>'Old name'];
+    $out = ['handle'=>$GLOBALS['fixture_handle'],'url'=>$url,'text'=>'A quote','display'=>'Old name'];
+    if (!empty($GLOBALS['fixture_avatar'])) $out['avatar'] = $GLOBALS['fixture_avatar'];
+    return $out;
 }
 $db=new PDO('sqlite::memory:');$GLOBALS['fixture_db']=$db;
 $db->setAttribute(PDO::ATTR_ERRMODE,PDO::ERRMODE_EXCEPTION);
@@ -37,5 +39,17 @@ foreach (['alice.bsky.test','did:plc:alice'] as $ref) {
 $GLOBALS['fixture_handle']='unlinked.test';
 $q=ap_masto_quote_entity('https://bsky.app/profile/unlinked.test/post/xyz')['quoted_status'];
 $check(!isset($q['account']['avatar']),'unlinked author not replaced');
+$GLOBALS['fixture_avatar']='https://cdn.test/cached.webp';
+$q=ap_masto_quote_entity('https://bsky.app/profile/unlinked.test/post/cached')['quoted_status'];
+$check($q['account']['avatar']==='https://cdn.test/cached.webp','cached avatar kept');
+$check($q['account']['avatar_static']==='https://cdn.test/cached.webp','cached static avatar');
+$check($q['account']['acct']==='unlinked.test','cached avatar keeps Bluesky identity');
+$check($q['account']['display_name']==='Old name','cached avatar does not replace display');
+unset($GLOBALS['fixture_avatar']);
+$GLOBALS['fixture_handle']='alice.bsky.test';
+$GLOBALS['fixture_avatar']='https://cdn.test/cached.webp';
+$q=ap_masto_quote_entity('https://bsky.app/profile/alice.bsky.test/post/linked')['quoted_status'];
+$check($q['account']['avatar']==='https://example.test/local.webp','linked owner avatar still wins');
+unset($GLOBALS['fixture_avatar']);
 $check(ap_masto_quote_entity('https://bsky.app/profile/alice.bsky.test/post/x',0,false,false)['state']==='pending','authorization retained');
 printf("quote-avatar-behavior: PASS (%d checks)\n",$n);
