@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use reqwest::Client;
 use serde::Serialize;
 use serde_json::Value;
-use rand::Rng;
+use rand::RngExt;
 use sha2::{Digest, Sha256};
 
 use crate::{config::Config, db};
@@ -179,7 +179,7 @@ fn configured_origin_owner() -> i64 {
 }
 
 fn pick_origin_strain() -> String {
-    let index = rand::thread_rng().gen_range(0..ORIGIN_STRAINS.len());
+    let index = rand::rng().random_range(0..ORIGIN_STRAINS.len());
     ORIGIN_STRAINS[index].to_string()
 }
 
@@ -582,7 +582,7 @@ pub async fn bridge_challenge_start(cfg: &Config, owner: i64, identify: &str) ->
     if uuid::Uuid::parse_str(&uuid).is_err() { anyhow::bail!("OpenSim returned an invalid avatar UUID"); }
     let code: String = (0..8).map(|_| {
         const ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-        ALPHABET[rand::thread_rng().gen_range(0..ALPHABET.len())] as char
+        ALPHABET[rand::rng().random_range(0..ALPHABET.len())] as char
     }).collect();
     let expires = chrono::Utc::now() + chrono::Duration::seconds(600);
     let hash = sha256_hex(&format!("{code}|{uuid}|{owner}"));
