@@ -105,6 +105,16 @@ jobs:
     name: Rust build, clippy, and tests
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    services:
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
     steps:
       - uses: actions/checkout@v7
       - name: Install PHP 8.3
@@ -135,6 +145,9 @@ jobs:
       # Every other non-ignored test runs.
       - name: Test
         working-directory: rust
+        env:
+          # Disposable DB. redis_util's integration test no-ops without this.
+          VAAK_TEST_REDIS_URL: redis://127.0.0.1:6379/15
         run: cargo test --workspace --locked -- --skip profile_materialize::entities::tests::actual_canonical_entity_helpers
 
   php-rust-parity:
