@@ -663,8 +663,12 @@ fn render_core_mode(status:&Value,facts:&CardFacts,direct:Option<&crate::direct_
     if boolean(st, "vaak_from_followed_tag") { html.push_str("<span class=\"tag\" title=\"Matched a hashtag you follow\">followed tag</span>"); }
     html.push_str("</div>");
     if is_rss { if let Ok(url)=reqwest::Url::parse(uri) { if let Some(host)=url.host_str(){html.push_str(&format!("<div class=\"meta\">{}</div>",esc(host)));} } }
-    if let Some(label) = match string(st, "visibility") { "private" => Some("Followers-only"), "unlisted" => Some("Silent public"), "local" => Some("Local only"), _ => None } { html.push_str(&format!("<div class=\"meta\"><span class=\"tag\" title=\"Audience\">{label}</span></div>")); }
-    html.push_str("</div></div>");
+    html.push_str("</div>");
+    if !is_rss { html.push_str(&vaak_types::visibility_badge_html(if is_bsky { "public" } else { string(st, "visibility") })); }
+    html.push_str("</div>");
+    } else if !is_rss {
+        // Header-less embeds (Mentions nest) keep the audience in a chip row.
+        html.push_str(&format!("<div class=\"meta meta-row tweet-embed-chips\" style=\"margin:.15rem 0 .35rem\">{}</div>", vaak_types::visibility_badge_html(if is_bsky { "public" } else { string(st, "visibility") })));
     }
     html.push_str(&reply_meta(st,&facts.return_view)?);
     if !direct.is_some_and(|presentation|presentation.pending_quote_suppressed()) && direct.and_then(|presentation|presentation.pending_quote()).is_none() && !st.get("quote").and_then(|quote|quote.get("quoted_status")).is_some_and(Value::is_object) && static_regex!(r"↪\s*QT").is_match(&plain(string(st,"content"))) {

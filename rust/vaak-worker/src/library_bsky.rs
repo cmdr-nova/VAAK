@@ -285,7 +285,10 @@ pub(crate) fn render(item:&Value,facts:&CardFacts)->Result<String>{
     let created=if repost&&!s(reason,"indexedAt").trim().is_empty(){s(reason,"indexedAt").trim()}else{post.get("indexedAt").and_then(Value::as_str).unwrap_or(s(record,"createdAt"))};if !created.is_empty(){html.push_str(&format!("<span class=\"meta\"> · {}</span>",esc(&super::card::relative_time(created,facts.now))));}
     let quote_html=legacy_quote(post,facts)?;
     if quote_html.is_some(){html.push_str(&format!("<span class=\"tag\" title=\"{}\">quote</span>",if super::card::php_trim(s(record,"text")).is_empty()&&!repost{"Quote post"}else{"Quote with commentary"}));}
-    html.push_str("</div></div></div>");
+    html.push_str("</div></div>");
+    // Bluesky has no audience levels; every post is world-readable.
+    html.push_str(&vaak_types::visibility_badge_html("public"));
+    html.push_str("</div>");
     if let Some(parent)=item.get("reply").and_then(|r|r.get("parent")).filter(|p|p.is_object()){
         let kind=s(parent,"$type");let (text,url)=if kind.contains("Blocked")||kind.contains("NotFound"){("Unavailable".into(),"https://bsky.app/".into())}else{
             let handle=s(&parent["author"],"handle");let text=super::card::php_trim(s(&parent["record"],"text"));let label=if !text.is_empty(){text.chars().take(120).collect::<String>()}else if !handle.is_empty(){format!("@{handle}")}else{super::card::php_trim(s(&parent["author"],"displayName")).to_owned()};

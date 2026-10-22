@@ -14,4 +14,8 @@ mod timeline;
 
 pub mod emoji;
 
+mod audience;
+
+pub use audience::{visibility_badge_html, visibility_label};
+
 pub use timeline::{check_value as check_timeline_status, MediaAttachment, Poll, PollOption, PreviewCard, Quote, TimelineStatus, REMOTE_POLL_ID_BASE};
