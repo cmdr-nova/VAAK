@@ -17208,7 +17208,6 @@ function admin_render_event_tweet(array $e, array $followingIds, string $returnV
                     <?php endif; ?>
                   <?php endif; ?>
                   <span class="meta"> · <?= h(relative_time($e['created_at'])) ?></span>
-                  <?php $evVis = admin_visibility_meta($e['visibility'] ?? 'public'); ?>
                   <?php if ($fromFollowedTag || !empty($e['_from_followed_tag'])): ?>
                     <?php
                       $matchedTag = '';
@@ -17232,9 +17231,9 @@ function admin_render_event_tweet(array $e, array $followingIds, string $returnV
                 </div>
                 <div class="meta">
                   <?= h((string) $e['host']) ?>
-                  <?php if ($evVis['key'] !== 'public'): ?><span class="tag" style="margin-left:.35rem" title="Audience"><?= h($evVis['label']) ?></span><?php endif; ?>
                 </div>
               </div>
+              <?= admin_visibility_badge_html($e['visibility'] ?? 'public') ?>
             </div>
             <?php
               $replyParentUrl = rtrim((string) ($e['in_reply_to'] ?? ''), '/');
@@ -18691,6 +18690,20 @@ function admin_visibility_meta(mixed $visibility): array
 }
 
 /**
+ * Audience label pinned to the top right of a post card header. Every level
+ * shows, Public included; Bluesky posts pass 'public' (the network has no
+ * audience levels). Rust twin: vaak_types::visibility_badge_html.
+ */
+function admin_visibility_badge_html(mixed $visibility): string
+{
+    $meta = strtolower(trim((string) ($visibility ?? ''))) === 'direct'
+        ? ['key' => 'direct', 'label' => 'Direct']
+        : admin_visibility_meta($visibility);
+    return '<span class="tweet-vis tweet-vis--' . h($meta['key']) . '" title="Audience">'
+        . h($meta['label']) . '</span>';
+}
+
+/**
  * Render a Mastodon Status entity (search / thread / detail) with media,
  * link cards, Open, and reply/boost/fav/quote actions.
  *
@@ -19622,7 +19635,6 @@ function admin_render_masto_status_card(
                       <span class="meta" title="<?= h((string) $st['edited_at']) ?>"> · edited</span>
                     <?php endif; ?>
                     <?php if (!empty($st['vaak_from_followed_tag'])): ?><span class="tag" title="Matched a hashtag you follow">followed tag</span><?php endif; ?>
-                    <?php $stVis = admin_visibility_meta($st['visibility'] ?? 'public'); ?>
                     <?= admin_anti_ai_tag_html($plain, $actorRef !== '' ? $actorRef : null) ?>
                   <?php else: ?>
                     <span class="who"><?= admin_emoji_html($display, $actorRef !== '' ? $actorRef : null) ?></span>
@@ -19633,26 +19645,20 @@ function admin_render_masto_status_card(
                       <span class="meta" title="<?= h((string) $st['edited_at']) ?>"> · edited</span>
                     <?php endif; ?>
                     <?php if (!empty($st['vaak_from_followed_tag'])): ?><span class="tag" title="Matched a hashtag you follow">followed tag</span><?php endif; ?>
-                    <?php $stVis = admin_visibility_meta($st['visibility'] ?? 'public'); ?>
                     <?= admin_anti_ai_tag_html($plain, $actorRef !== '' ? $actorRef : null) ?>
                   <?php endif; ?>
                 </div>
                 <?php if ($isRss && $rssHost !== ''): ?>
                   <div class="meta"><?= h($rssHost) ?></div>
-                <?php elseif (!$isRss && (($stVis['key'] ?? 'public') !== 'public')): ?>
-                  <div class="meta"><span class="tag" title="Audience"><?= h($stVis['label']) ?></span></div>
                 <?php endif; ?>
               </div>
+              <?php if (!$isRss): ?><?= admin_visibility_badge_html($isBsky ? 'public' : ($st['visibility'] ?? 'public')) ?><?php endif; ?>
             </div>
             <?php else: ?>
               <?php
                 // Mentions nest: author lives on the notif header. Audience /
                 // anti-AI chips only — no Bluesky/RSS network badges.
-                $stVis = admin_visibility_meta($st['visibility'] ?? 'public');
-                $embedChips = '';
-                if (($stVis['key'] ?? 'public') !== 'public') {
-                    $embedChips .= '<span class="tag" title="Audience">' . h($stVis['label']) . '</span>';
-                }
+                $embedChips = $isRss ? '' : admin_visibility_badge_html($isBsky ? 'public' : ($st['visibility'] ?? 'public'));
                 $embedChips .= admin_anti_ai_tag_html($plain, $actorRef !== '' ? $actorRef : null);
                 if (trim(strip_tags($embedChips)) !== '') {
                     echo '<div class="meta meta-row tweet-embed-chips" style="margin:.15rem 0 .35rem">' . $embedChips . '</div>';
@@ -20256,6 +20262,7 @@ function admin_render_remote_boost_card(
                   <?php endif; ?>
                 </div>
               </div>
+              <?php if (is_array($innerEvent)): ?><?= admin_visibility_badge_html($innerEvent['visibility'] ?? 'public') ?><?php endif; ?>
             </div>
             <?php
               $boostInner = '';
@@ -20562,6 +20569,7 @@ function admin_render_boost_card(array $rb, array $followingIds, string $returnV
                   <?php if ($innerHost !== ''): ?><span class="meta"> · <?= h($innerHost) ?></span><?php endif; ?>
                 </div>
               </div>
+              <?php if (is_array($innerEvent)): ?><?= admin_visibility_badge_html($innerEvent['visibility'] ?? 'public') ?><?php endif; ?>
             </div>
             <?php
               $boostInner = '';
@@ -21091,8 +21099,6 @@ function admin_render_outbox_card(array $n, string $returnView): void
                           $ownVisRaw = $vrow;
                       }
                   }
-                  $ownVisMeta = admin_visibility_meta($ownVisRaw);
-                  $ownVisLabel = $ownVisMeta['label'];
                   $ownPinned = false;
                   if ($isOwnNote) {
                       if (is_array($srow) && function_exists('ap_masto_status_is_pinned')) {
@@ -21117,8 +21123,9 @@ function admin_render_outbox_card(array $n, string $returnView): void
                   <?php endif; ?>
                   <?= admin_anti_ai_tag_html($bodyPlain, $actor !== '' ? $actor : null) ?>
                 </div>
-                <div class="meta">mkultra.monster<?php if ($ownVisMeta['key'] !== 'public'): ?> <span class="tag" title="Audience"><?= h($ownVisLabel) ?></span><?php endif; ?></div>
+                <div class="meta">mkultra.monster</div>
               </div>
+              <?= admin_visibility_badge_html($ownVisRaw) ?>
             </div>
             <?php if (!is_array($askContext) && $replyTo !== '' && str_starts_with($replyTo, 'https://')): ?>
               <div class="meta" style="margin:.25rem 0 .35rem">
@@ -21725,6 +21732,7 @@ function admin_render_bsky_feed_item(array $item, string $feedKey = 'following',
             <?php endif; ?>
           </div>
         </div>
+        <?= admin_visibility_badge_html('public') ?>
       </div>
       <?= $replyMetaHtml ?>
       <?php if ($bodyHtml !== ''): ?>
@@ -28255,6 +28263,13 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     /* Fediverse audience belongs below the author row, never beside a long handle. */
     .tweet-hd-main--fedi { display: block; }
     .tweet-hd-main--fedi > .meta { margin-top: .15rem; }
+    /* Post audience, top right of the card header (Public, Silent public, ...). */
+    .tweet-vis {
+      flex: 0 0 auto; margin-left: auto; padding-top: .1rem;
+      font-size: .75rem; line-height: 1.2; color: var(--muted); white-space: nowrap;
+    }
+    .tweet-vis--private, .tweet-vis--direct { color: var(--primary); }
+    .tweet-embed-chips .tweet-vis { padding-top: 0; margin-right: .35rem; }
     .tweet-av {
       width: 40px; height: 40px; border-radius: 50%;
       object-fit: cover; flex-shrink: 0;

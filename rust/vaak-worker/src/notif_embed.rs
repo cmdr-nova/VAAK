@@ -3989,6 +3989,13 @@ pub fn paint_lean_embed_from(
         .and_then(|v| v.as_str())
         .map(|v| v.eq_ignore_ascii_case("rss"))
         .unwrap_or(false);
+    // Bluesky has no audience levels (every post is world-readable); RSS
+    // items are feed entries, not posts with an audience.
+    let vis_badge = if rss {
+        String::new()
+    } else {
+        vaak_types::visibility_badge_html(if bsky { "public" } else { visibility })
+    };
     let hover_meta = if rss {
         format!(
             " data-profile-hover-source=\"rss\" data-profile-hover-label=\"{}\"",
@@ -4131,20 +4138,15 @@ pub fn paint_lean_embed_from(
             format!("<span class=\"meta\"> · {}</span>", esc(&when))
         };
         inner.push_str(&format!(
-            "<div class=\"tweet-hd\">{av}<div class=\"tweet-hd-main tweet-hd-main--fedi\"><div>{who}{when}</div></div></div>",
+            "<div class=\"tweet-hd\">{av}<div class=\"tweet-hd-main tweet-hd-main--fedi\"><div>{who}{when}</div></div>{vis}</div>",
             av = av_block,
             who = who,
-            when = when_html
+            when = when_html,
+            vis = vis_badge
         ));
     } else {
         // Nest chips: keep audience only (no Bluesky/RSS network badges).
-        let mut chips = String::new();
-        if visibility != "public" {
-            chips.push_str(&format!(
-                "<span class=\"tag\" title=\"Audience\">{}</span>",
-                esc(visibility)
-            ));
-        }
+        let chips = vis_badge;
         if !chips.is_empty() {
             inner.push_str(&format!(
                 "<div class=\"meta meta-row tweet-embed-chips\" style=\"margin:.15rem 0 .35rem\">{chips}</div>"
@@ -4546,6 +4548,28 @@ mod tests {
             html.contains("class=\"meta tweet-time\"") && html.contains("title=\"Open post\""),
             "timestamp must deep-link to the status: {html}"
         );
+    }
+
+    #[test]
+    fn header_shows_audience_top_right_for_every_level() {
+        let card = |visibility: &str, uri: &str| {
+            paint_lean_feed_card(&json!({
+                "id": "1", "uri": uri, "visibility": visibility,
+                "content": "<p>hi</p>", "created_at": "2026-10-05T05:00:00.000Z",
+                "account": {"acct": "x", "display_name": "X", "avatar": "https://example.com/a.png",
+                    "uri": "https://example.com/users/x"},
+                "media_attachments": []
+            }))
+        };
+        for (vis, label) in [("public", "Public"), ("unlisted", "Silent public"),
+            ("private", "Followers-only"), ("local", "Local only")] {
+            let html = card(vis, "https://example.com/users/x/statuses/1");
+            let badge = vaak_types::visibility_badge_html(vis);
+            assert!(html.contains(&format!("</div></div>{badge}</div>")), "{label} badge closes the header: {html}");
+            assert_eq!(html.matches("title=\"Audience\"").count(), 1, "{html}");
+        }
+        let bsky = card("unlisted", "at://did:plc:abc/app.bsky.feed.post/1");
+        assert!(bsky.contains("tweet-vis--public") && !bsky.contains("tweet-vis--unlisted"), "Bluesky is always Public: {bsky}");
     }
 
     #[test]

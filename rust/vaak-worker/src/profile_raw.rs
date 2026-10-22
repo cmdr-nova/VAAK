@@ -161,9 +161,9 @@ fn render_core(n:&Value,f:&RawProfileFacts)->Result<String>{
  let mut html=format!("<article class=\"tweet tweet-own\"{rank} id=\"note-{}\" data-note-id=\"{}\"><div class=\"tweet-hd\">{avatar}<div class=\"tweet-hd-main tweet-hd-main--fedi\"><div><span class=\"who\">{}</span><span class=\"meta\"> @{}@mkultra.monster</span><span class=\"meta\"> · {}</span>",esc(&f.note_dom_id),esc(note),body::emojis(&esc(name),&emoji,true),esc(&f.actor_key),esc(&card::relative_time(string(n,"published"),facts.now)));
  if let Some(edited)=f.masto_row.as_ref().map(|r|string(r,"edited_at")).filter(|v|!v.is_empty()){html.push_str(&format!("<span class=\"meta\" title=\"{}\"> · edited</span>",esc(edited)));}
  if own_note&&facts.own.as_ref().is_some_and(|o|o.pinned){html.push_str("<span class=\"tag\" style=\"margin-left:.35rem\" title=\"Pinned on profile\">pinned</span>");}
- html.push_str("</div><div class=\"meta\">mkultra.monster");
- if vis_key!="public"{html.push_str(&format!(" <span class=\"tag\" title=\"Audience\">{vis_label}</span>"));}
- html.push_str("</div></div></div>");
+ html.push_str("</div><div class=\"meta\">mkultra.monster</div></div>");
+ html.push_str(&vaak_types::visibility_badge_html(vis));
+ html.push_str("</div>");
  let reply=string(n,"in_reply_to");
  if facts.ask_row.is_none()&&!reply.is_empty(){html.push_str(if reply.starts_with("https://"){"<div class=\"meta\" style=\"margin:.25rem 0 .35rem\">↩ reply to "}else{"<div class=\"meta\" style=\"margin:.25rem 0 .35rem\">↩ "});if reply.starts_with("https://"){html.push_str(&format!("<a href=\"{}\">parent post</a>",esc(&status_href(reply,view))));}else{html.push_str("parent post");}html.push_str("</div>");}
  if let Some(ask)=&facts.ask_row{
