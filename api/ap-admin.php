@@ -18406,6 +18406,11 @@ function admin_reply_mention_handle(?string $actorId, ?string $acctHint = null):
     if (function_exists('vaak_is_own_url') && vaak_is_own_url($actorId)) {
         return '';
     }
+    // Other local accounts are mentioned by bare username (VAAK resolves it),
+    // the same way remote authors get their acct seeded.
+    if (preg_match('#^https://mkultra\.monster/users/([A-Za-z0-9_]+)$#i', $actorId, $lm)) {
+        return admin_reply_mention_normalize('@' . $lm[1]);
+    }
     if (preg_match('#^https://mkultra\.monster/users/#i', $actorId)) {
         return '';
     }
@@ -45406,6 +45411,12 @@ $showComposeFab = empty($GLOBALS['vaak_guest_profile'])
     if (qb) qb.remove();
   }
 
+  function isOwnNoteUrl(url) {
+    const m = String(url || '').trim().match(/^https:\/\/mkultra\.monster\/users\/([^/]+)\/notes\//i);
+    const self = String(window.VAAK_ACTOR_KEY || '').trim().replace(/^@+/, '').toLowerCase();
+    return !!(m && self && self !== '__guest__' && m[1].toLowerCase() === self);
+  }
+
   function applyReplyQuoteChrome(opts) {
     opts = opts || {};
     if (typeof window.__apResetComposeChrome === 'function') {
@@ -45455,6 +45466,8 @@ $showComposeFab = empty($GLOBALS['vaak_guest_profile'])
       let p = String(part || '').trim();
       if (!p) return;
       if (p.charAt(0) !== '@') p = '@' + p;
+      // Local accounts are mentioned by bare username in the composer.
+      p = p.replace(/^(@[A-Za-z0-9_]+)@mkultra\.monster$/i, '$1');
       let key = p.slice(1).toLowerCase();
       const bskyAlias = key.match(/^(.+\.[a-z0-9.-]+)@bsky\.app$/i);
       if (bskyAlias) {
@@ -45465,6 +45478,12 @@ $showComposeFab = empty($GLOBALS['vaak_guest_profile'])
       mentionSeen[key] = true;
       mentionParts.push(p);
     });
+    // Peer local cards pass only to=<actor>; seed that author like a remote one.
+    if (!mentionParts.length && !quoteObject && !isOwnNoteUrl(replyUrl)) {
+      const peer = toUrl.match(/^https:\/\/mkultra\.monster\/users\/([A-Za-z0-9_]+)\/?$/i);
+      const self = String(window.VAAK_ACTOR_KEY || '').trim().replace(/^@+/, '').toLowerCase();
+      if (peer && peer[1].toLowerCase() !== self) mentionParts.push('@' + peer[1]);
+    }
     const mentionSeed = mentionParts.join(' ');
     if (ta) {
       delete ta.dataset.autoMention;
@@ -45505,8 +45524,10 @@ $showComposeFab = empty($GLOBALS['vaak_guest_profile'])
       if (typeof setComposePollOpen === 'function') setComposePollOpen(false);
       if (typeof window.vaakSyncComposePollChrome === 'function') window.vaakSyncComposePollChrome();
     } else {
-      const isSelf = !!replyUrl
-        && /https:\/\/mkultra\.monster\/users\/[^/]+\/notes\//i.test(replyUrl);
+      // Only the signed-in account's own notes are a thread continuation.
+      // Other local accounts (e.g. shana_flux) are ordinary replies that need
+      // the @mention seed and reply chrome, same as remote authors.
+      const isSelf = isOwnNoteUrl(replyUrl);
       if (replyTo) {
         replyTo.value = replyUrl;
         replyTo.style.display = '';
@@ -45580,8 +45601,7 @@ $showComposeFab = empty($GLOBALS['vaak_guest_profile'])
     const text = String(ta.value || '').toLowerCase();
     const authorPresent = required !== '' && new RegExp('(^|\\s)' + required.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&') + '(?=\\s|$)').test(text);
     const replyTo = String(document.getElementById('compose-in-reply-to')?.value || '').trim();
-    const repliesToOtherPost = replyTo !== ''
-      && !/^https:\/\/mkultra\.monster\/users\/[^/]+\/notes\//i.test(replyTo);
+    const repliesToOtherPost = replyTo !== '' && !isOwnNoteUrl(replyTo);
     // Followers-only replies are only valid for the author's own posts. Keep
     // this restriction visible even when a modal lacks participant metadata;
     // the publish endpoint enforces the same rule for bypassing clients.
