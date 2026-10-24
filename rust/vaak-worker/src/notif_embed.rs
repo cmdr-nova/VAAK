@@ -2345,7 +2345,15 @@ fn reply_mention_query(status: &Value, viewer_actor: &str) -> String {
         .unwrap_or(viewer)
         .trim_matches('/')
         .to_ascii_lowercase();
-    let viewer_keys = [viewer_key.clone(), format!("{viewer_key}@mkultra.monster")];
+    // Our accounts answer on every local host alias (vaak.monster mentions
+    // name the same person as mkultra.monster ones).
+    let viewer_keys = [
+        viewer_key.clone(),
+        format!("{viewer_key}@mkultra.monster"),
+        format!("{viewer_key}@www.mkultra.monster"),
+        format!("{viewer_key}@vaak.monster"),
+        format!("{viewer_key}@www.vaak.monster"),
+    ];
     let mut handles: Vec<String> = Vec::new();
     let mut seen = std::collections::HashSet::new();
     let mut push = |raw: &str| {
@@ -4899,6 +4907,16 @@ mod tests {
             "&mention=parent.example%2Cauthor%40remote.example%2Calice.bsky.social",
             "reply seeds must be stable, deduplicated, and viewer-safe"
         );
+    }
+
+    #[test]
+    fn reply_seed_skips_viewer_on_vaak_monster_alias() {
+        let st = json!({
+            "account": {"acct": "shana_flux"},
+            "mentions": [{"acct": "cmdr_nova@vaak.monster"}]
+        });
+        let query = reply_mention_query(&st, "https://mkultra.monster/users/cmdr_nova");
+        assert_eq!(query, "&mention=shana_flux");
     }
 
     #[test]
