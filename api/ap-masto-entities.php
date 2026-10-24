@@ -4265,8 +4265,20 @@ function ap_masto_context_dedupe_statuses(array $statuses): array
 {
     $out = [];
     $seen = [];
+    $localNotes = [];
+    foreach ($statuses as $st) {
+        foreach (['uri', 'url'] as $field) {
+            $v = is_array($st) && isset($st[$field]) ? rtrim((string) $st[$field], '/') : '';
+            if (str_starts_with($v, 'https://mkultra.monster/users/') && str_contains($v, '/notes/')) {
+                $localNotes[$v] = true;
+            }
+        }
+    }
     foreach ($statuses as $st) {
         if (!is_array($st)) {
+            continue;
+        }
+        if ($localNotes !== [] && ap_masto_context_status_is_mirror_of($st, $localNotes)) {
             continue;
         }
         $keys = [];
@@ -4292,6 +4304,39 @@ function ap_masto_context_dedupe_statuses(array $statuses): array
         $out[] = $st;
     }
     return $out;
+}
+
+/**
+ * True when a Bluesky status is the VAAK mirror of a local note (any local
+ * account) that is already in the same thread context. The fediverse note is
+ * canonical; a mirror whose note is absent stays as the only copy. Cache/DB only.
+ *
+ * @param array<string,mixed> $status
+ * @param array<string,true> $localNotes
+ */
+function ap_masto_context_status_is_mirror_of(array $status, array $localNotes): bool
+{
+    foreach (['uri', 'url'] as $field) {
+        $v = trim((string) ($status[$field] ?? ''));
+        if (!str_starts_with($v, 'at://') && !str_starts_with($v, 'https://bsky.app/')) {
+            continue;
+        }
+        if (!function_exists('ap_bsky_vaak_mirror_note_id_for_uri') && is_file(__DIR__ . '/ap-bsky.php')) {
+            require_once __DIR__ . '/ap-bsky.php';
+        }
+        if (!function_exists('ap_bsky_cached_at_uri_for_web_url') || !function_exists('ap_bsky_vaak_mirror_note_id_for_uri')) {
+            return false;
+        }
+        $at = ap_bsky_cached_at_uri_for_web_url($v);
+        if ($at === null) {
+            continue;
+        }
+        $note = ap_bsky_vaak_mirror_note_id_for_uri($at);
+        if ($note !== null && isset($localNotes[rtrim($note, '/')])) {
+            return true;
+        }
+    }
+    return false;
 }
 
 /**
