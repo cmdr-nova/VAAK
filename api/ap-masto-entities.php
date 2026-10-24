@@ -4321,17 +4321,17 @@ function ap_masto_context_status_is_mirror_of(array $status, array $localNotes):
         if (!str_starts_with($v, 'at://') && !str_starts_with($v, 'https://bsky.app/')) {
             continue;
         }
-        if (!function_exists('ap_bsky_vaak_mirror_note_id_for_uri') && is_file(__DIR__ . '/ap-bsky.php')) {
+        if (!function_exists('ap_bsky_own_mirror_note_id_for_uri') && is_file(__DIR__ . '/ap-bsky.php')) {
             require_once __DIR__ . '/ap-bsky.php';
         }
-        if (!function_exists('ap_bsky_cached_at_uri_for_web_url') || !function_exists('ap_bsky_vaak_mirror_note_id_for_uri')) {
+        if (!function_exists('ap_bsky_cached_at_uri_for_web_url') || !function_exists('ap_bsky_own_mirror_note_id_for_uri')) {
             return false;
         }
         $at = ap_bsky_cached_at_uri_for_web_url($v);
         if ($at === null) {
             continue;
         }
-        $note = ap_bsky_vaak_mirror_note_id_for_uri($at);
+        $note = ap_bsky_own_mirror_note_id_for_uri($at);
         if ($note !== null && isset($localNotes[rtrim($note, '/')])) {
             return true;
         }
