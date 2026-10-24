@@ -980,6 +980,36 @@ function ap_bsky_vaak_mirror_note_id_for_uri(string $bskyUri): ?string
     return $memo[$bskyUri] = null;
 }
 
+/**
+ * Strict variant for dedupe: the URI's own crosspost/link row, or a mirror
+ * segment authored by a VAAK-linked Bluesky account. The root-based fallback
+ * above alone would also match other people's replies inside a mirrored
+ * thread, which must never be hidden as duplicates.
+ */
+function ap_bsky_own_mirror_note_id_for_uri(string $bskyUri): ?string
+{
+    $bskyUri = trim($bskyUri);
+    if (!preg_match('~^at://(did:[^/]+)/app\.bsky\.feed\.post/[^/]+$~', $bskyUri, $m)) {
+        return null;
+    }
+    try {
+        $st = ap_db()->prepare('SELECT note_id FROM bsky_crossposts WHERE bsky_uri = ? LIMIT 1');
+        $st->execute([$bskyUri]);
+        $note = rtrim((string) ($st->fetchColumn() ?: ''), '/');
+        if (ap_bsky_is_local_note_id($note)) {
+            return $note;
+        }
+        $st = ap_db()->prepare('SELECT 1 FROM bsky_sessions WHERE did = ? LIMIT 1');
+        $st->execute([$m[1]]);
+        if (!$st->fetchColumn()) {
+            return null;
+        }
+    } catch (Throwable $e) {
+        return null;
+    }
+    return ap_bsky_vaak_mirror_note_id_for_uri($bskyUri);
+}
+
 function ap_bsky_is_vaak_mirror_segment(string $bskyUri): bool
 {
     return ap_bsky_vaak_mirror_note_id_for_uri($bskyUri) !== null;
@@ -13639,6 +13669,18 @@ function ap_bsky_notification_to_mention_row(int $ownerUserId, string $ownerActo
     }
 
     $record = is_array($notif['record'] ?? null) ? $notif['record'] : [];
+    // Another VAAK account's post mirrored to Bluesky (e.g. shana_flux →
+    // shana-flux.bsky.mkultra.monster). Its local note already notified this
+    // owner through VAAK, so the Bluesky copy would be a duplicate.
+    if (in_array($reason, ['mention', 'reply', 'quote'], true)) {
+        $mirrorOf = trim((string) ($record['fediverseId'] ?? ''));
+        if (($mirrorOf === '' || !ap_bsky_is_local_note_id($mirrorOf)) && str_starts_with($uri, 'at://')) {
+            $mirrorOf = (string) (ap_bsky_own_mirror_note_id_for_uri($uri) ?? '');
+        }
+        if ($mirrorOf !== '' && ap_bsky_is_local_note_id($mirrorOf)) {
+            return null;
+        }
+    }
     $text = trim((string) ($record['text'] ?? ''));
     $reasonSubject = trim((string) ($notif['reasonSubject'] ?? ''));
     $indexedAt = trim((string) ($notif['indexedAt'] ?? ''));
