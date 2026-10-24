@@ -74,8 +74,11 @@ fn reply_seeds(status: &Value, owner_actor: &str, owner_key: &str) -> Vec<String
     for (actor,hint) in candidates {
         if actor.trim_end_matches('/') == owner_actor.trim_end_matches('/') { continue; }
         let value = super::actions::reply_mention_handle(&actor,&hint,owner_actor);
-        let lower = value.to_lowercase();
-        if value.is_empty() || lower == owner_key.to_lowercase() || lower == format!("{}@mkultra.monster",owner_key.to_lowercase()) { continue; }
+        let lower = value.trim_start_matches('@').to_lowercase();
+        let owner = owner_key.trim_start_matches('@').to_lowercase();
+        // Self on any local host alias (vaak.monster mentions name us too).
+        let is_self = lower == owner || ["mkultra.monster","www.mkultra.monster","vaak.monster","www.vaak.monster"].iter().any(|h| lower == format!("{owner}@{h}"));
+        if value.is_empty() || is_self { continue; }
         if !out.iter().any(|v: &String| v.eq_ignore_ascii_case(&value)) { out.push(value); }
     }
     out
@@ -465,5 +468,7 @@ pub(crate) async fn resolve(db: &Client, owner_id: i64, owner_actor: &str, statu
     #[test] fn reply_seeds_include_participants_and_drop_self_duplicates() {
         let st=serde_json::json!({"account":{"uri":"https://remote.test/users/a","acct":"a@remote.test"},"mentions":[{"acct":"nova@mkultra.monster","url":"https://mkultra.monster/users/nova"},{"acct":"B@remote.test"},{"acct":"b@remote.test"}]});
         assert_eq!(reply_seeds(&st,"https://mkultra.monster/users/nova","nova"), vec!["a@remote.test","B@remote.test"]);
+        let st=serde_json::json!({"account":{"uri":"https://mkultra.monster/users/shana_flux","acct":"shana_flux"},"mentions":[{"acct":"nova@vaak.monster"}]});
+        assert!(!reply_seeds(&st,"https://mkultra.monster/users/nova","nova").iter().any(|h|h.to_lowercase().contains("nova@")), "vaak.monster self alias is dropped");
     }
 }

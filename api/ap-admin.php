@@ -18439,7 +18439,10 @@ function admin_reply_self_acct_keys(): array
     }
     if ($user !== '') {
         $keys[] = $user;
-        $keys[] = $user . '@mkultra.monster';
+        // Every local host alias names the same account (vaak.monster too).
+        foreach (admin_search_our_hosts() as $host) {
+            $keys[] = $user . '@' . $host;
+        }
     }
     return $keys;
 }
@@ -45466,9 +45469,13 @@ $showComposeFab = empty($GLOBALS['vaak_guest_profile'])
       let p = String(part || '').trim();
       if (!p) return;
       if (p.charAt(0) !== '@') p = '@' + p;
-      // Local accounts are mentioned by bare username in the composer.
-      p = p.replace(/^(@[A-Za-z0-9_]+)@mkultra\.monster$/i, '$1');
+      // Local accounts are mentioned by bare username in the composer, on
+      // either local host alias.
+      p = p.replace(/^(@[A-Za-z0-9_]+)@(?:www\.)?(?:mkultra|vaak)\.monster$/i, '$1');
       let key = p.slice(1).toLowerCase();
+      // Never mention yourself when a parent post already tagged you.
+      const selfKey = String(window.VAAK_ACTOR_KEY || '').trim().replace(/^@+/, '').toLowerCase();
+      if (selfKey && key === selfKey) return;
       const bskyAlias = key.match(/^(.+\.[a-z0-9.-]+)@bsky\.app$/i);
       if (bskyAlias) {
         key = bskyAlias[1].toLowerCase();
