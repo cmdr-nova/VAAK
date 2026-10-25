@@ -1375,6 +1375,10 @@ function ap_notification_projection_invalidate_owner(int $ownerUserId): void
 {
     if ($ownerUserId <= 0) return;
     try {
+        // Bump first: a hydrate already in flight then skips its write-back.
+        if (function_exists('ap_notification_list_epoch_bump')) {
+            ap_notification_list_epoch_bump($ownerUserId);
+        }
         ap_db()->prepare('DELETE FROM ap_notification_projection WHERE owner_user_id = ?')->execute([$ownerUserId]);
         if (function_exists('ap_redis_delete_pattern')) {
             ap_redis_delete_pattern('vaak:notifications:v1:' . $ownerUserId . ':*');
@@ -1401,6 +1405,9 @@ function ap_notification_projection_invalidate_status(string $statusId): void
 function ap_notification_projection_invalidate_all(): void
 {
     try {
+        if (function_exists('ap_notification_list_epoch_bump')) {
+            ap_notification_list_epoch_bump(null);
+        }
         ap_db()->exec('DELETE FROM ap_notification_projection');
         if (function_exists('ap_redis_delete_pattern')) {
             ap_redis_delete_pattern('vaak:notifications:v1:*');

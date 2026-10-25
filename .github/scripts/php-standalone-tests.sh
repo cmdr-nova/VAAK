@@ -92,6 +92,7 @@ php_tests=(
   api/bin/notif-bsky-subject-hydrate-smoke.php
   api/bin/notif-grouped-schema-smoke.php
   api/bin/notif-hidden-filter-smoke.php
+  api/bin/notif-list-epoch-smoke.php
   api/bin/notif-page-speed-smoke.php
   api/bin/notif-reply-content-smoke.php
   api/bin/notif-reply-preview-smoke.php

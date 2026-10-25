@@ -175,6 +175,7 @@ async fn maybe_fill_projection(
     redis: &mut redis::aio::MultiplexedConnection,
     owner_user_id: i64,
     limit: i64,
+    force: bool,
 ) -> Result<Option<String>> {
     if !projection_fill_enabled() {
         return Ok(None);
@@ -189,7 +190,7 @@ async fn maybe_fill_projection(
         .query_async(redis)
         .await
         .unwrap_or(None);
-    if cooling.is_some() {
+    if cooling.is_some() && !force {
         return Ok(Some(format!(
             "owner={owner_user_id} fill=skip_cooldown cooldown={cooldown}"
         )));
@@ -330,6 +331,54 @@ async fn projection_page(
     Ok(None)
 }
 
+/// PHP `ap_notification_list_epoch`: bumped by every list invalidation. `None`
+/// when Redis cannot answer, which disables the guard rather than the warm.
+async fn list_epoch(redis: &mut redis::aio::MultiplexedConnection, owner_user_id: i64) -> Option<String> {
+    let keys = [
+        "vaak:notifications:epoch:v1:server".to_string(),
+        format!("vaak:notifications:epoch:v1:{owner_user_id}"),
+    ];
+    let vals: Vec<Option<String>> = redis::cmd("MGET").arg(&keys).query_async(redis).await.ok()?;
+    let part = |i: usize| vals.get(i).cloned().flatten().unwrap_or_else(|| "0".into());
+    Some(format!("{}:{}", part(0), part(1)))
+}
+
+/// Newest-first snowflake order (length, then lexicographic), as PHP compares ids.
+fn snowflake_newer(a: &str, b: &str) -> bool {
+    a.len() > b.len() || (a.len() == b.len() && a > b)
+}
+
+/// The badge's newest notification when a healthy-looking projection lacks it
+/// and would paint an older head. That projection was written by a hydrate
+/// that started before the notification arrived, and it stays "recent" for
+/// 15 minutes, so the list and the badge disagree until it ages out.
+async fn projection_missing_badge_head(db: &Client, owner_user_id: i64) -> Result<Option<String>> {
+    let state = notif::compute_unread(db, owner_user_id, 80).await?;
+    let head = state.latest_id;
+    if head.is_empty() || head == "0" {
+        return Ok(None);
+    }
+    let rows = db
+        .query(
+            "SELECT notification_id FROM ap_notification_projection
+             WHERE owner_user_id = $1 AND updated_at >= $2",
+            &[&owner_user_id, &projection_cutoff()],
+        )
+        .await
+        .context("projection ids")?;
+    let ids: Vec<String> = rows
+        .iter()
+        .map(|r| r.get::<_, String>(0).chars().filter(|c| c.is_ascii_digit()).collect())
+        .collect();
+    Ok(projection_lacks_head(&head, &ids).then_some(head))
+}
+
+fn projection_lacks_head(head: &str, ids: &[String]) -> bool {
+    !ids.is_empty()
+        && !ids.iter().any(|id| id == head)
+        && ids.iter().all(|id| snowflake_newer(head, id))
+}
+
 async fn write_list_envelope(
     redis: &mut redis::aio::MultiplexedConnection,
     key: &str,
@@ -376,12 +425,49 @@ pub async fn warm_owner(cfg: &Config, owner_user_id: i64, limit: i64) -> Result<
     let mut lines: Vec<String> = Vec::new();
     let mut php_fill: u32 = 0;
 
+    // Before any projection read: a list invalidation after this point means
+    // what we read may predate the newest notification, so do not publish it.
+    let epoch = list_epoch(&mut redis, owner_user_id).await;
+
     // 0.6.66: if recent projection is thin, bootstrap from local PG via PHP once
     // (cooldown-gated), then continue with native Redis materialize.
     let proj_count = projection_recent_count(&db, owner_user_id).await.unwrap_or(0);
     let min_rows = projection_fill_min_rows();
-    if proj_count < min_rows {
-        match maybe_fill_projection(&mut redis, owner_user_id, limit.max(40)).await {
+
+    // A full projection missing the badge's newest notification is stale (the
+    // badge shows a follow the list cannot). Refill once per head id, past the
+    // cooldown, and rebuild every page instead of keeping "fresh" stale ones.
+    let mut heal = false;
+    if proj_count >= min_rows {
+        match projection_missing_badge_head(&db, owner_user_id).await {
+            Ok(Some(head)) => {
+                let heal_key = format!("vaak:notif:proj-heal:{owner_user_id}");
+                let prior: Option<String> = redis::cmd("GET")
+                    .arg(&heal_key)
+                    .query_async(&mut redis)
+                    .await
+                    .unwrap_or(None);
+                if prior.as_deref() != Some(head.as_str()) {
+                    let _: Result<(), _> = redis::cmd("SET")
+                        .arg(&heal_key)
+                        .arg(&head)
+                        .arg("EX")
+                        .arg(3600)
+                        .query_async(&mut redis)
+                        .await;
+                    heal = true;
+                    lines.push(format!("owner={owner_user_id} heal=stale_projection head={head}"));
+                }
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(owner = owner_user_id, error = %e, "notif projection head check failed");
+            }
+        }
+    }
+
+    if proj_count < min_rows || heal {
+        match maybe_fill_projection(&mut redis, owner_user_id, limit.max(40), heal).await {
             Ok(Some(line)) => {
                 if line.contains("fill=ok") {
                     php_fill = 1;
@@ -410,6 +496,14 @@ pub async fn warm_owner(cfg: &Config, owner_user_id: i64, limit: i64) -> Result<
         let want = expand_types(&job.types);
         let key = notifications_list_redis_key(owner_user_id, job.limit, None, None, &want);
 
+        if epoch.is_some() && list_epoch(&mut redis, owner_user_id).await != epoch {
+            lines.push(format!(
+                "owner={owner_user_id} job={} stop=invalidated_during_warm",
+                job.label
+            ));
+            break;
+        }
+
         // Derive all30 from a just-built all40 before skip-fresh.
         if job.label == "all30" {
             if let Some(ref items40) = all40_items {
@@ -425,7 +519,7 @@ pub async fn warm_owner(cfg: &Config, owner_user_id: i64, limit: i64) -> Result<
         }
 
         if let Some(age) = redis_list_age(&mut redis, &key).await? {
-            if age <= refresh {
+            if age <= refresh && !heal {
                 skip_fresh += 1;
                 lines.push(format!(
                     "owner={owner_user_id} job={} skip_fresh age={age} refresh={refresh} ms=0",
@@ -438,6 +532,13 @@ pub async fn warm_owner(cfg: &Config, owner_user_id: i64, limit: i64) -> Result<
         let t0 = Instant::now();
         match projection_page(&db, owner_user_id, &want, job.limit).await? {
             Some(items) => {
+                if epoch.is_some() && list_epoch(&mut redis, owner_user_id).await != epoch {
+                    lines.push(format!(
+                        "owner={owner_user_id} job={} stop=invalidated_during_warm",
+                        job.label
+                    ));
+                    break;
+                }
                 let n = items.len();
                 if job.label == "all40" {
                     all40_items = Some(items.clone());
@@ -1005,6 +1106,34 @@ mod reply_preview_projection_regression {
         }
         let mut fresh = original.clone(); fresh["_vaak_reply_preview_version"] = serde_json::json!(3);
         assert_eq!(super::projection_item(fresh), Some(original));
+    }
+}
+
+#[cfg(test)]
+mod stale_projection_head_tests {
+    use super::projection_lacks_head;
+
+    fn ids(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn newer_badge_head_missing_from_projection_is_stale() {
+        // Follow (type 6) landed after the projection's newest like.
+        let proj = ids(&["1792000000500000042", "1791999990500000041"]);
+        assert!(projection_lacks_head("1792000100600000007", &proj));
+    }
+
+    #[test]
+    fn head_already_in_projection_or_older_is_not_stale() {
+        let proj = ids(&["1792000100600000007", "1792000000500000042"]);
+        assert!(!projection_lacks_head("1792000100600000007", &proj));
+        // Older than the projection head: filtered by the list on purpose.
+        assert!(!projection_lacks_head("1791000000500000001", &proj));
+        // Shorter id compares older, not lexicographically.
+        assert!(!projection_lacks_head("999999999", &proj));
+        // Empty projection is the thin-fill path, not a heal.
+        assert!(!projection_lacks_head("1792000100600000007", &[]));
     }
 }
 

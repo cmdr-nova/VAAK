@@ -186,6 +186,41 @@ function ap_trends_policy_epoch_bump(?int $ownerUserId = null): void
     }
 }
 
+/**
+ * Generation for one owner's notification list caches (projection rows and
+ * Redis pages). Invalidation bumps it before deleting, so a hydrate that read
+ * mentions/events before a new notification landed cannot write its older
+ * page back afterwards. A missing Redis reads as '' and never blocks a write.
+ */
+function ap_notification_list_epoch(int $ownerUserId): string
+{
+    $redis = ap_redis_client('cache');
+    if (!$redis || $ownerUserId < 1) return '';
+    try {
+        $server = (string) ($redis->get('vaak:notifications:epoch:v1:server') ?: '0');
+        $user = (string) ($redis->get('vaak:notifications:epoch:v1:' . $ownerUserId) ?: '0');
+        return $server . ':' . $user;
+    } catch (Throwable $e) {
+        error_log('[ap-redis] notification epoch read failed: ' . $e->getMessage());
+        return '';
+    }
+}
+
+function ap_notification_list_epoch_bump(?int $ownerUserId = null): void
+{
+    $redis = ap_redis_client('cache');
+    if (!$redis) return;
+    $key = $ownerUserId !== null && $ownerUserId > 0
+        ? 'vaak:notifications:epoch:v1:' . $ownerUserId
+        : 'vaak:notifications:epoch:v1:server';
+    try {
+        $redis->incr($key);
+        $redis->expire($key, 86400 * 30);
+    } catch (Throwable $e) {
+        error_log('[ap-redis] notification epoch bump failed: ' . $e->getMessage());
+    }
+}
+
 function ap_redis_delete_pattern(string $pattern): void
 {
     $redis = ap_redis_client('cache');
