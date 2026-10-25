@@ -381,6 +381,12 @@ function ap_action_queue_execute(array $row, array $payload, array $receipt): ar
                 $res = ap_masto_reblog_perform($resolved, !$want,
                     $localActor . '/announces/queue-' . (int) $row['id'] . '-' . (int) $row['revision'],
                     $localActor . '/undos/queue-boost-' . (int) $row['id'] . '-' . (int) $row['revision'], true);
+                require_once __DIR__ . '/ap-bsky.php';
+                $boostObject = (string) ($resolved['object_id'] ?? '');
+                if (!empty($res['ok']) && $want && ap_bsky_is_local_note_id($boostObject)) {
+                    // A Bluesky repost row stored before this boost would now duplicate it.
+                    ap_bsky_drop_shadow_reposts_for_note($owner, $boostObject);
+                }
                 if (!empty($res['ok']) && function_exists('ap_bsky_resolve_strong_ref')) {
                     $ref = ap_bsky_resolve_strong_ref((string) ($resolved['object_id'] ?? ''), $owner);
                     if (is_array($ref) && !empty($ref['uri']) && !empty($ref['cid'])) {

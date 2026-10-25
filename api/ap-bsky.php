@@ -4811,6 +4811,61 @@ function ap_bsky_own_repost_status_id(string $selfDid, string $subjectUri): stri
 }
 
 /**
+ * True when a Bluesky repost of $subjectUri only mirrors a VAAK boost this
+ * owner already stored: the subject is the Bluesky mirror of a local note and
+ * masto_reblogs already has the owner's boost of that note. Boosting a local
+ * post queues the Bluesky repost of its mirror, so without this check the
+ * profile Boosts tab lists the same post twice (VAAK card + Bluesky card).
+ */
+function ap_bsky_repost_shadows_local_boost(int $ownerUserId, string $subjectUri): bool
+{
+    $subjectUri = trim($subjectUri);
+    if ($ownerUserId < 1 || !str_starts_with($subjectUri, 'at://')) {
+        return false;
+    }
+    $note = ap_bsky_own_mirror_note_id_for_uri($subjectUri);
+    if ($note === null || $note === '') {
+        return false;
+    }
+    try {
+        $st = ap_db()->prepare(
+            "SELECT 1 FROM masto_reblogs
+             WHERE owner_user_id = ? AND (object_id = ? OR object_id = ?)
+               AND status_id NOT LIKE 'bsky-repost-%'
+             LIMIT 1"
+        );
+        $st->execute([$ownerUserId, $note, $note . '/']);
+        return (bool) $st->fetchColumn();
+    } catch (Throwable $e) {
+        return false;
+    }
+}
+
+/**
+ * Drop the owner's Bluesky-repost profile rows that shadow their VAAK boost
+ * of $noteId (one per mirrored segment). Returns rows removed.
+ */
+function ap_bsky_drop_shadow_reposts_for_note(int $ownerUserId, string $noteId): int
+{
+    $session = ap_bsky_session_row($ownerUserId);
+    $selfDid = is_array($session) ? trim((string) ($session['did'] ?? '')) : '';
+    if ($selfDid === '') {
+        return 0;
+    }
+    $removed = 0;
+    foreach (ap_bsky_uris_for_note($noteId) as $uri) {
+        try {
+            $st = ap_db()->prepare('DELETE FROM masto_reblogs WHERE owner_user_id = ? AND status_id = ?');
+            $st->execute([$ownerUserId, ap_bsky_own_repost_status_id($selfDid, $uri)]);
+            $removed += $st->rowCount();
+        } catch (Throwable $e) {
+            // ignore
+        }
+    }
+    return $removed;
+}
+
+/**
  * Keep the owner's profile Boosts tab in step with a repost made from VAAK.
  * Uses the same row key as the author-feed import, so a later import of the
  * same repost updates this row instead of adding a second one.
@@ -4831,6 +4886,9 @@ function ap_bsky_own_repost_profile_sync(int $ownerUserId, string $subjectUri, b
         if (!$reposted) {
             ap_db()->prepare('DELETE FROM masto_reblogs WHERE owner_user_id = ? AND status_id = ?')
                 ->execute([$ownerUserId, $stable]);
+            return;
+        }
+        if (ap_bsky_repost_shadows_local_boost($ownerUserId, $subjectUri)) {
             return;
         }
         if (!function_exists('ap_masto_reblog_add')) {
@@ -4902,6 +4960,9 @@ function ap_bsky_import_own_feed_as_local(int $ownerUserId, array $feed): array
         $post = is_array($item['post'] ?? null) ? $item['post'] : [];
         $uri = trim((string) ($post['uri'] ?? ''));
         if (!str_contains($reasonType, 'reasonrepost') || $reasonBy !== $selfDid || !str_starts_with($uri, 'at://')) {
+            continue;
+        }
+        if (ap_bsky_repost_shadows_local_boost($ownerUserId, $uri)) {
             continue;
         }
         try {
