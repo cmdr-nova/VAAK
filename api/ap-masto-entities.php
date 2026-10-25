@@ -15784,6 +15784,51 @@ function ap_masto_resolve_announce_inner_interaction(int $statusId): ?array
 }
 
 /**
+ * Resolve a boost target from its status id, falling back to the canonical
+ * object URI. Rust cards (Home/Local/profile) paint local notes with synthetic
+ * snowflakes that PHP cannot map back to masto_statuses, so the web controller
+ * already fell back to the object URI. The action-queue worker must do the
+ * same, or local-to-local boosts stay stuck as "status no longer available"
+ * (no masto_reblogs row, no Announce, no Bluesky repost). Cache-only.
+ *
+ * @return array{status:array<string,mixed>,object_id:string,target_actor:?string,is_ours:bool}|null
+ */
+function ap_masto_resolve_boost_target(int $statusId, string $objectId): ?array
+{
+    $objectId = rtrim(trim($objectId), '/');
+    $objectId = preg_replace('/#announce-\d+$/', '', $objectId) ?? $objectId;
+    $resolved = $statusId > 0 ? ap_masto_resolve_status_interaction($statusId) : null;
+    if ($resolved !== null) {
+        $resolvedObject = rtrim((string) ($resolved['object_id'] ?? ''), '/');
+        $inner = $resolved['status']['reblog']['uri'] ?? null;
+        $innerObject = is_string($inner) ? rtrim($inner, '/') : '';
+        // A synthetic id can decode to an unrelated row; trust it only when
+        // it lands on the object the card actually submitted.
+        if ($objectId === '' || $resolvedObject === $objectId || $innerObject === $objectId) {
+            return $resolved;
+        }
+    }
+    if ($objectId === '' || !str_starts_with($objectId, 'https://')) {
+        return $resolved;
+    }
+    $cached = ap_masto_lookup_status_by_object_url($objectId, 0, false, true);
+    if (!is_array($cached)) {
+        return $resolved;
+    }
+    $actor = '';
+    if (is_array($cached['account'] ?? null)) {
+        $actor = (string) (($cached['account']['uri'] ?? '') ?: ($cached['account']['url'] ?? ''));
+    }
+    $session = rtrim((string) ap_masto_session_actor_id(), '/');
+    return [
+        'status' => $cached,
+        'object_id' => $objectId,
+        'target_actor' => $actor !== '' ? $actor : null,
+        'is_ours' => $session !== '' && str_starts_with($objectId, $session . '/'),
+    ];
+}
+
+/**
  * Resolve a public Mastodon status id for favourite/bookmark (local, event, mention, DM).
  *
  * @return array{status:array<string,mixed>,object_id:string,target_actor:?string,is_ours:bool}|null

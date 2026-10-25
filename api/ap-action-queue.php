@@ -374,7 +374,8 @@ function ap_action_queue_execute(array $row, array $payload, array $receipt): ar
             }
             if ($kind === 'boost') {
                 require_once __DIR__ . '/ap-inbox.php';
-                $resolved = ap_masto_resolve_status_interaction((int) ($payload['status_id'] ?? 0));
+                $resolved = ap_masto_resolve_boost_target((int) ($payload['status_id'] ?? 0),
+                    (string) ($payload['object_id'] ?? $target));
                 if (!$resolved) return ['ok' => false, 'error' => 'Fediverse status is no longer available.'];
                 $localActor = rtrim(ap_local_actor_id(), '/');
                 $res = ap_masto_reblog_perform($resolved, !$want,
