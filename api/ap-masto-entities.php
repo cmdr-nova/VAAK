@@ -2760,6 +2760,17 @@ function ap_masto_tag_url(string $name): string
 }
 
 /**
+ * Mastodon only treats #word as a hashtag when it has at least one letter, so
+ * "#842" or "#2026" stays plain text. Linking those as /tags/842 also breaks
+ * Ice Cubes: it reads any same-server link ending in digits as a status URL and
+ * embeds GET /api/v1/statuses/842, which is an unrelated local post here.
+ */
+function ap_masto_tag_name_linkable(string $name): bool
+{
+    return preg_match('/\p{L}/u', $name) === 1;
+}
+
+/**
  * Linkify #hashtags in already-escaped plain text (no HTML tags yet).
  * Returns [escapedHtmlFragment, tags[]].
  *
@@ -2773,6 +2784,9 @@ function ap_masto_linkify_hashtags_escaped(string $escaped): array
         '/(^|[^A-Za-z0-9_&\/%])#([\p{L}\p{N}_]{1,100})/u',
         static function (array $m) use (&$byName): string {
             $raw = $m[2];
+            if (!ap_masto_tag_name_linkable($raw)) {
+                return $m[0];
+            }
             $norm = function_exists('ap_masto_normalize_tag_name')
                 ? ap_masto_normalize_tag_name($raw)
                 : mb_strtolower($raw);
@@ -2804,11 +2818,17 @@ function ap_masto_linkify_hashtags_in_html(string $html): array
     }
     // Already has Mastodon hashtag links — just harvest tags[] from them / plain text
     if (str_contains($html, 'class="mention hashtag"') || str_contains($html, "class='mention hashtag'")) {
+        // Older stored HTML may still link digit-only tags; unwrap them back to text.
+        $html = preg_replace_callback(
+            '#<a\b[^>]*\bhref=["\']https://mkultra\.monster/tags/[0-9_]+["\'][^>]*>(.*?)</a>#isu',
+            static fn(array $m): string => strip_tags($m[1]),
+            $html
+        ) ?? $html;
         $tags = [];
         if (preg_match_all('#https://mkultra\.monster/tags/([^"\s]+)#i', $html, $tm)) {
             foreach ($tm[1] as $t) {
                 $n = ap_masto_normalize_tag_name(rawurldecode((string) $t));
-                if ($n !== '') {
+                if ($n !== '' && ap_masto_tag_name_linkable($n)) {
                     $tags[$n] = ['name' => $n, 'url' => ap_masto_tag_url($n)];
                 }
             }
@@ -2818,7 +2838,7 @@ function ap_masto_linkify_hashtags_in_html(string $html): array
             if (preg_match_all('/#([\p{L}\p{N}_]{1,100})/u', $plain, $pm)) {
                 foreach ($pm[1] as $t) {
                     $n = ap_masto_normalize_tag_name((string) $t);
-                    if ($n !== '') {
+                    if ($n !== '' && ap_masto_tag_name_linkable($n)) {
                         $tags[$n] = ['name' => $n, 'url' => ap_masto_tag_url($n)];
                     }
                 }
@@ -9236,6 +9256,9 @@ function ap_masto_status_from_event(array $row, ?string $profileBoostActor = nul
             '/(^|[^A-Za-z0-9_&\/%])#([\p{L}\p{N}_]{1,100})/u',
             static function (array $m): string {
                 $tag = $m[2];
+                if (!ap_masto_tag_name_linkable($tag)) {
+                    return $m[0];
+                }
                 $href = 'https://mkultra.monster/tags/' . rawurlencode(mb_strtolower($tag));
                 return $m[1] . '<a href="' . htmlspecialchars($href, ENT_QUOTES, 'UTF-8')
                     . '" class="mention hashtag" rel="tag">#<span>'
@@ -9254,7 +9277,7 @@ function ap_masto_status_from_event(array $row, ?string $profileBoostActor = nul
                 $tn = function_exists('ap_masto_normalize_tag_name')
                     ? ap_masto_normalize_tag_name((string) $rawTag)
                     : mb_strtolower((string) $rawTag);
-                if ($tn === '' || isset($seenTag[$tn])) {
+                if ($tn === '' || isset($seenTag[$tn]) || !ap_masto_tag_name_linkable($tn)) {
                     continue;
                 }
                 $seenTag[$tn] = true;

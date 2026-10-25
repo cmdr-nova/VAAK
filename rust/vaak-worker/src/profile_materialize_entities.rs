@@ -3,16 +3,19 @@ use super::*;
 pub(super) fn encode(raw:&str)->String{let mut out=String::new();for b in raw.bytes(){if b.is_ascii_alphanumeric()||b"-_.~".contains(&b){out.push(b as char)}else{out.push_str(&format!("%{b:02X}"))}}out}
 fn name(raw:&str)->String{let lowered=crate::library::card::php_trim(raw).trim_start_matches('#').to_lowercase();let allowed=re!(r"[^\p{L}\p{N}_]");allowed.replace_all(&lowered,"").chars().take(100).collect()}
 fn tag(raw:&str)->Value{let name=name(raw);json!({"url":format!("https://mkultra.monster/tags/{}",encode(&name)),"name":name})}
-fn retain(tags:&mut Vec<Value>,value:Value){if s(&value,"name").is_empty(){return}if let Some(old)=tags.iter_mut().find(|old|old["name"]==value["name"]){*old=value}else{tags.push(value)}}
+// Mastodon needs a letter in a hashtag; "#842" linked as /tags/842 makes Ice Cubes embed status 842.
+fn linkable(name:&str)->bool{name.chars().any(char::is_alphabetic)}
+fn retain(tags:&mut Vec<Value>,value:Value){if s(&value,"name").is_empty()||!linkable(s(&value,"name")){return}if let Some(old)=tags.iter_mut().find(|old|old["name"]==value["name"]){*old=value}else{tags.push(value)}}
 pub(super) fn escaped_tags(escaped:&str)->(String,Vec<Value>){
  let mut tags=vec![];let re=re!(r"(^|[^A-Za-z0-9_&/%])#([\p{L}\p{N}_]{1,100})");
- let html=re.replace_all(escaped,|c:&regex::Captures|{let value=tag(&c[2]);if s(&value,"name").is_empty(){return c[0].into()}let url=crate::library::actions::esc(s(&value,"url"));retain(&mut tags,value);format!("{}<a href=\"{url}\" class=\"mention hashtag\" rel=\"tag\">#<span>{}</span></a>",&c[1],crate::library::actions::esc(&c[2]))}).into_owned();(html,tags)
+ let html=re.replace_all(escaped,|c:&regex::Captures|{let value=tag(&c[2]);if s(&value,"name").is_empty()||!linkable(&c[2]){return c[0].into()}let url=crate::library::actions::esc(s(&value,"url"));retain(&mut tags,value);format!("{}<a href=\"{url}\" class=\"mention hashtag\" rel=\"tag\">#<span>{}</span></a>",&c[1],crate::library::actions::esc(&c[2]))}).into_owned();(html,tags)
 }
 fn protect(input:&str,re:&regex::Regex,hold:&mut Vec<(String,String)>,kind:&str)->String{re.replace_all(input,|c:&regex::Captures|{let key=format!("\u{1}{kind}{}\u{1}",hold.len());hold.push((key.clone(),c[0].into()));key}).into_owned()}
 fn restore(mut input:String,hold:&[(String,String)])->String{let mut keys=hold.iter().collect::<Vec<_>>();keys.sort_by_key(|(key,_)|std::cmp::Reverse(key.len()));for(key,value)in keys{input=input.replace(key,value)}input}
 pub(super) fn html_tags(html:&str)->(String,Vec<Value>){
  if html.is_empty()||!html.contains('#'){return(html.into(),vec![])}
  if html.contains("class=\"mention hashtag\"")||html.contains("class='mention hashtag'"){
+  let html=re!(r#"(?is)<a\b[^>]*\bhref=["']https://mkultra\.monster/tags/[0-9_]+["'][^>]*>(.*?)</a>"#).replace_all(html,|c:&regex::Captures|re!("<[^>]*>").replace_all(&c[1],"").into_owned()).into_owned();let html=html.as_str();
   let mut tags=vec![];for c in re!(r#"(?i)https://mkultra\.monster/tags/([^"\s]+)"#).captures_iter(html){retain(&mut tags,tag(&crate::hidden::raw_percent_decode(&c[1])))}
   if tags.is_empty(){let plain=crate::home_hydrate_ranked::html_entity_decode(&strip_html(html));for c in re!(r"#([\p{L}\p{N}_]{1,100})").captures_iter(&plain){retain(&mut tags,tag(&c[1]))}}
   return(html.into(),tags)
@@ -97,6 +100,19 @@ impl Projector<'_> {
 mod tests{
  use super::*;
  #[test]fn actual_canonical_entity_helpers(){let reference:Value=serde_json::from_slice(&std::fs::read("/tmp/vaak-profile-entity-helper-reference.json").unwrap()).unwrap();let cases=reference["captures"].as_array().unwrap();assert_eq!(cases.len(),28);let mut counts=std::collections::HashMap::<String,usize>::new();for row in cases{*counts.entry(s(row,"helper").into()).or_default()+=1;let output=match s(row,"helper"){"plain_pack"=>plain_pack(s(row,"input")).unwrap(),"escaped_tags"=>{let(html,tags)=escaped_tags(s(row,"input"));json!([html,tags])},"html_tags"=>{let(html,tags)=html_tags(s(row,"input"));json!({"html":html,"tags":tags})},_=>panic!("unknown actual entity helper")};assert_eq!(output,row["expected"],"{} {:?}",row["helper"],row["input"]);}assert_eq!(counts.get("plain_pack"),Some(&11));assert_eq!(counts.get("escaped_tags"),Some(&11));assert_eq!(counts.get("html_tags"),Some(&6));}
+ #[test]
+ fn digit_only_hashtags_stay_plain_text() {
+  // Ice Cubes embeds GET /statuses/842 for any same-server link ending in digits.
+  let (html, tags) = escaped_tags("ep #842 of #Vtuber in #2026");
+  assert!(!html.contains("/tags/842") && !html.contains("/tags/2026"), "{html}");
+  assert!(html.contains("/tags/vtuber"), "{html}");
+  assert_eq!(tags.len(), 1);
+  let stored = "<p><a href=\"https://mkultra.monster/tags/842\" class=\"mention hashtag\" rel=\"tag\">#<span>842</span></a> <a href=\"https://mkultra.monster/tags/vtuber\" class=\"mention hashtag\" rel=\"tag\">#<span>Vtuber</span></a></p>";
+  let (html, tags) = html_tags(stored);
+  assert!(!html.contains("/tags/842") && html.contains("#842"), "{html}");
+  assert!(html.contains("/tags/vtuber"), "{html}");
+  assert_eq!(tags.len(), 1);
+ }
  #[test]
  fn reply_context_cleanup_matches_api_plain_rules() {
   let misskey = "nice thread\n\nRE: https://misskey.example/notes/abc123\nhell yup, the goat as usual";
