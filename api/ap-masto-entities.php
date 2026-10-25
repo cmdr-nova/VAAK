@@ -7923,6 +7923,14 @@ function ap_masto_notifications_fetch(int $limit = 40, ?string $maxId = null, ?s
         : (string) ($GLOBALS['vaak_actor_id'] ?? 'https://mkultra.monster/users/cmdr_nova');
     $ownerActorId = rtrim($ownerActorId, '/');
     $redisKey = ap_masto_notifications_list_redis_key($ownerUserId, $limit, $maxId, $sinceId, $want, $exclude);
+    // Read before any source query. A hydrate takes seconds; if a follow or
+    // mention invalidated the caches meanwhile, this page is already older
+    // than the badge and must not be written back (see $listEpochCurrent).
+    $listEpoch = function_exists('ap_notification_list_epoch') ? ap_notification_list_epoch($ownerUserId) : '';
+    $listEpochCurrent = static function () use ($listEpoch, $ownerUserId): bool {
+        return $listEpoch === '' || !function_exists('ap_notification_list_epoch')
+            || ap_notification_list_epoch($ownerUserId) === $listEpoch;
+    };
     $notifStampedeLock = '';
     $holdNotifLock = false;
     // When Rust/PHP list-warm owns rebuilds, trust Redis longer so Mentions soft-nav
@@ -8021,7 +8029,7 @@ function ap_masto_notifications_fetch(int $limit = 40, ?string $maxId = null, ?s
         $projected = ap_notification_projection_read($ownerUserId, $limit, $want, $exclude);
         if ($projected !== []) {
             $recordNotifTiming('projection_hit', $projectionStartedAt);
-            if (function_exists('ap_redis_json_set')) {
+            if (function_exists('ap_redis_json_set') && $listEpochCurrent()) {
                 ap_redis_json_set($redisKey, ['ts' => time(), 'items' => $projected, 'source' => 'php-projection'], 300);
             }
             $recordNotifTiming('total', $notifStartedAt);
@@ -8296,8 +8304,15 @@ function ap_masto_notifications_fetch(int $limit = 40, ?string $maxId = null, ?s
     $recordNotifTiming('hydrate', $hydrateStartedAt);
     // Warm the durable projection only on a cache rebuild.  Cache hits remain
     // read-only and the projection is never authoritative for privacy rules.
-    ap_notification_projection_write($ownerUserId, $out);
-    if (function_exists('ap_redis_json_set')) {
+    // Skip both writes when an invalidation landed during the hydrate: this
+    // caller still gets $out, and the next read rebuilds with the new row.
+    $writeBack = $listEpochCurrent();
+    if ($writeBack) {
+        ap_notification_projection_write($ownerUserId, $out);
+    } elseif (function_exists('ap_timing_record')) {
+        ap_timing_record('notifications.stale_write_skipped', 0.0);
+    }
+    if ($writeBack && function_exists('ap_redis_json_set')) {
         $source = $listWarmMode ? 'vaak-worker-live' : 'php';
         // Keep 5–10 minutes for stale-while-revalidate; freshness is gated by ts.
         $ttl = $listRustPrimary ? 600 : 300;
