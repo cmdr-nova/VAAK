@@ -16383,9 +16383,15 @@ function ap_masto_reblog_perform(array $resolved, bool $undo = false, ?string $s
     if (!empty($original['account']['id']) && is_string($original['account']['id'])
         && str_starts_with((string) $original['account']['id'], 'https://')) {
         $targetActor = (string) $original['account']['id'];
+    } elseif (!empty($original['account']['uri']) && is_string($original['account']['uri'])
+        && str_starts_with((string) $original['account']['uri'], 'https://')) {
+        // Local accounts keep the actor IRI in `uri`; their `url` is the
+        // vaak.monster profile mask, which is not an ActivityPub actor.
+        $targetActor = (string) $original['account']['uri'];
     } elseif (!empty($original['account']['url']) && is_string($original['account']['url'])
         && str_starts_with((string) $original['account']['url'], 'https://')
-        && !preg_match('#https://[^/]+/@[^/]+/?$#', (string) $original['account']['url'])) {
+        && !preg_match('#https://[^/]+/@[^/]+/?$#', (string) $original['account']['url'])
+        && !preg_match('#^https://(www\.)?vaak\.monster/#i', (string) $original['account']['url'])) {
         $targetActor = (string) $original['account']['url'];
     }
     if ((!is_string($targetActor) || $targetActor === '' || preg_match('#https://[^/]+/@[^/]+/?$#', $targetActor))

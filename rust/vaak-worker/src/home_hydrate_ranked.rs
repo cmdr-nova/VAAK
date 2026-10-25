@@ -4009,12 +4009,28 @@ fn looks_like_object_url(url: &str) -> bool {
 /// URL cannot drive a hovercard.
 fn preferred_actor_iri(target_actor: &str, create_actor: &str) -> Option<String> {
     for raw in [target_actor, create_actor] {
-        let actor = raw.trim().trim_end_matches('/').to_string();
+        let actor = canonical_local_actor(raw.trim().trim_end_matches('/'));
         if actor.starts_with("https://") && !looks_like_object_url(&actor) {
             return Some(actor);
         }
     }
     None
+}
+
+/// Local boosts used to store the human profile URL
+/// (`https://vaak.monster/users/{key}`) as `target_actor`. vaak.monster is the
+/// UI mask for the same account, so map every local host alias back to the
+/// ActivityPub actor IRI; otherwise the card paints as an unknown remote
+/// `@key@vaak.monster` with no local profile.
+fn canonical_local_actor(actor: &str) -> String {
+    for host in ["mkultra.monster", "www.mkultra.monster", "vaak.monster", "www.vaak.monster"] {
+        if let Some(rest) = actor.strip_prefix(&format!("https://{host}/users/")) {
+            if !rest.is_empty() && rest.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                return format!("{LOCAL_ACTOR_PREFIX}{}", rest.to_ascii_lowercase());
+            }
+        }
+    }
+    actor.to_string()
 }
 
 fn boost_card_is_paintable(st: &Value) -> bool {
@@ -5665,6 +5681,23 @@ mod tests {
             "https://mastodon.social/notes/9"
         )
         .is_none());
+        // Local boost rows that stored the vaak.monster profile mask.
+        assert_eq!(
+            preferred_actor_iri(
+                "https://vaak.monster/users/shana_flux",
+                "https://mkultra.monster/users/shana_flux"
+            )
+            .as_deref(),
+            Some("https://mkultra.monster/users/shana_flux")
+        );
+        assert_eq!(
+            canonical_local_actor("https://www.vaak.monster/users/Shana_Flux"),
+            "https://mkultra.monster/users/shana_flux"
+        );
+        assert_eq!(
+            canonical_local_actor("https://vaak.monster.example/users/x"),
+            "https://vaak.monster.example/users/x"
+        );
     }
 
     #[test]
