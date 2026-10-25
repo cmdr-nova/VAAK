@@ -2760,17 +2760,6 @@ function ap_masto_tag_url(string $name): string
 }
 
 /**
- * Mastodon only treats #word as a hashtag when it has at least one letter, so
- * "#842" or "#2026" stays plain text. Linking those as /tags/842 also breaks
- * Ice Cubes: it reads any same-server link ending in digits as a status URL and
- * embeds GET /api/v1/statuses/842, which is an unrelated local post here.
- */
-function ap_masto_tag_name_linkable(string $name): bool
-{
-    return preg_match('/\p{L}/u', $name) === 1;
-}
-
-/**
  * Linkify #hashtags in already-escaped plain text (no HTML tags yet).
  * Returns [escapedHtmlFragment, tags[]].
  *
@@ -2784,7 +2773,9 @@ function ap_masto_linkify_hashtags_escaped(string $escaped): array
         '/(^|[^A-Za-z0-9_&\/%])#([\p{L}\p{N}_]{1,100})/u',
         static function (array $m) use (&$byName): string {
             $raw = $m[2];
-            if (!ap_masto_tag_name_linkable($raw)) {
+            // Mastodon only links a tag with at least one letter, so "#842" stays text.
+            // A /tags/842 link makes Ice Cubes embed GET /api/v1/statuses/842 as a quote.
+            if (preg_match('/\p{L}/u', $raw) !== 1) {
                 return $m[0];
             }
             $norm = function_exists('ap_masto_normalize_tag_name')
@@ -2828,7 +2819,7 @@ function ap_masto_linkify_hashtags_in_html(string $html): array
         if (preg_match_all('#https://mkultra\.monster/tags/([^"\s]+)#i', $html, $tm)) {
             foreach ($tm[1] as $t) {
                 $n = ap_masto_normalize_tag_name(rawurldecode((string) $t));
-                if ($n !== '' && ap_masto_tag_name_linkable($n)) {
+                if ($n !== '' && preg_match('/\p{L}/u', $n) === 1) {
                     $tags[$n] = ['name' => $n, 'url' => ap_masto_tag_url($n)];
                 }
             }
@@ -2838,7 +2829,7 @@ function ap_masto_linkify_hashtags_in_html(string $html): array
             if (preg_match_all('/#([\p{L}\p{N}_]{1,100})/u', $plain, $pm)) {
                 foreach ($pm[1] as $t) {
                     $n = ap_masto_normalize_tag_name((string) $t);
-                    if ($n !== '' && ap_masto_tag_name_linkable($n)) {
+                    if ($n !== '' && preg_match('/\p{L}/u', $n) === 1) {
                         $tags[$n] = ['name' => $n, 'url' => ap_masto_tag_url($n)];
                     }
                 }
@@ -9256,7 +9247,7 @@ function ap_masto_status_from_event(array $row, ?string $profileBoostActor = nul
             '/(^|[^A-Za-z0-9_&\/%])#([\p{L}\p{N}_]{1,100})/u',
             static function (array $m): string {
                 $tag = $m[2];
-                if (!ap_masto_tag_name_linkable($tag)) {
+                if (preg_match('/\p{L}/u', $tag) !== 1) {
                     return $m[0];
                 }
                 $href = 'https://mkultra.monster/tags/' . rawurlencode(mb_strtolower($tag));
@@ -9277,7 +9268,7 @@ function ap_masto_status_from_event(array $row, ?string $profileBoostActor = nul
                 $tn = function_exists('ap_masto_normalize_tag_name')
                     ? ap_masto_normalize_tag_name((string) $rawTag)
                     : mb_strtolower((string) $rawTag);
-                if ($tn === '' || isset($seenTag[$tn]) || !ap_masto_tag_name_linkable($tn)) {
+                if ($tn === '' || isset($seenTag[$tn]) || preg_match('/\p{L}/u', $tn) !== 1) {
                     continue;
                 }
                 $seenTag[$tn] = true;
