@@ -1522,28 +1522,17 @@ $vaakAdminOnlyActions = [
                 // synthetic status snowflake (deleted/hidden wrapper event),
                 // so use the cache-only object lookup before rejecting the
                 // interaction. Never fetch the network in this request.
-                if ($resolved === null && str_starts_with($objectId, 'https://')
-                    && function_exists('ap_masto_lookup_status_by_object_url')) {
-                    $cached = ap_masto_lookup_status_by_object_url($objectId, 0, false, true);
-                    if (is_array($cached)) {
-                        $cachedActor = '';
-                        if (is_array($cached['account'] ?? null)) {
-                            $cachedActor = (string) (($cached['account']['uri'] ?? '') ?: ($cached['account']['url'] ?? ''));
-                        }
-                        $resolved = [
-                            'status' => $cached,
-                            'object_id' => $objectId,
-                            'target_actor' => $cachedActor !== '' ? $cachedActor : null,
-                            'is_ours' => false,
-                        ];
-                    }
+                // The queue worker repeats this fallback from payload object_id.
+                if ($resolved === null) {
+                    $resolved = ap_masto_resolve_boost_target(0, $objectId);
                 }
                 if ($resolved === null) {
                     $error = 'Status not found in local store.';
                 } elseif ($wantJson) {
+                    $boostObjectId = (string) ($resolved['object_id'] ?? $objectId);
                     $queue = ap_action_queue_enqueue(
-                        $vaakOwnerId, 'fedi', 'boost', (string) ($resolved['object_id'] ?? $objectId),
-                        $action === 'reblog_status', ['status_id' => $sid]
+                        $vaakOwnerId, 'fedi', 'boost', $boostObjectId,
+                        $action === 'reblog_status', ['status_id' => $sid, 'object_id' => $boostObjectId]
                     );
                     if (!empty($queue['ok'])) {
                         header('Content-Type: application/json; charset=utf-8');
