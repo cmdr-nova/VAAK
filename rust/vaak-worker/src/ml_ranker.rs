@@ -102,6 +102,9 @@ struct RankScore {
 
 #[derive(Debug, Clone, Serialize)]
 struct Scorecard {
+    /// Kept on the row. Left out of the journal JSON: CodeQL treats an
+    /// account id in a log line as sensitive, and the column already has it.
+    #[serde(skip_serializing)]
     owner_user_id: i64,
     run_on: String,
     model_version: u32,
@@ -765,8 +768,7 @@ fn human_report(card: &Scorecard) -> String {
         .map(|delta| format!(" ndcg_delta={delta:.3}"))
         .unwrap_or_default();
     format!(
-        "ml-shadow scorecard owner={} day={} model={} holdout_days={}\n  train={} holdout_positives={} actors={} tags={}\n  overlap@{}={} jaccard={:.3}\n{}\n{}{actor_delta}\n{}\n{}{tag_delta}",
-        card.owner_user_id,
+        "ml-shadow scorecard day={} model={} holdout_days={}\n  train={} holdout_positives={} actors={} tags={}\n  overlap@{}={} jaccard={:.3}\n{}\n{}{actor_delta}\n{}\n{}{tag_delta}",
         card.run_on,
         card.model_version,
         card.holdout_days,
