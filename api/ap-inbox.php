@@ -3819,7 +3819,9 @@ function ap_dm_ingest_activity(array $activity): array
     $inReplyTo = null;
     $mediaUrls = [];
     $attachments = null;
+    $source = null;
     if (is_array($object)) {
+        $source = $object;
         if (isset($object['content']) && is_string($object['content'])) {
             $content = $object['content'];
         }
@@ -3837,6 +3839,7 @@ function ap_dm_ingest_activity(array $activity): array
         if (!str_starts_with($object, 'https://mkultra.monster/')) {
             $remote = ap_fetch_as2_object($object);
             if (is_array($remote)) {
+                $source = $remote;
                 if (isset($remote['content']) && is_string($remote['content'])) {
                     $content = $remote['content'];
                 }
@@ -3851,6 +3854,25 @@ function ap_dm_ingest_activity(array $activity): array
     // Bridgy sometimes puts attachments on the Create activity itself
     if ($attachments === null && isset($activity['attachment'])) {
         $attachments = $activity['attachment'];
+    }
+    $spoiler = '';
+    $sensitive = false;
+    if (is_array($source)) {
+        if (isset($source['summary']) && is_string($source['summary'])) {
+            $spoiler = $source['summary'];
+        }
+        $rawSens = $source['sensitive'] ?? false;
+        $sensitive = $rawSens === true || $rawSens === 1 || $rawSens === '1' || $rawSens === 'true';
+    }
+    $attachments = ap_dm_attachments_for_store(
+        is_array($attachments) ? $attachments : [],
+        $sensitive || trim(strip_tags($spoiler)) !== '',
+        $spoiler
+    );
+    $collectedUrls = $mediaUrls;
+    $mediaUrls = [];
+    foreach (ap_dm_media_items(['attachments' => $attachments ?? [], 'media_urls' => $collectedUrls]) as $item) {
+        $mediaUrls[] = (string) $item['url'];
     }
     if (!$objectId) {
         return ['ok' => false, 'error' => 'missing object id'];
@@ -8720,15 +8742,104 @@ function ap_delete_local_dm(int $dmId): array
 }
 
 /**
- * Send a direct message (no Public audience). Stored only in direct_messages.
+ * Create activity addressed only to one peer. Local warning markers are omitted.
  *
+ * @param list<array<string,mixed>> $attachments
+ * @return array<string,mixed>
+ */
+function ap_dm_build_activity(
+    string $actor,
+    string $peer,
+    string $contentHtml,
+    string $noteId,
+    string $createId,
+    string $published,
+    array $attachments,
+    string $inReplyTo,
+    bool $sensitive,
+    string $spoiler
+): array {
+    $peer = rtrim($peer, '/');
+    $path = parse_url($peer, PHP_URL_PATH);
+    $name = is_string($path) && $path !== '' ? ltrim((string) basename($path), '@') : 'user';
+    if ($name === '' || $name === '.' || $name === '..') {
+        $name = 'user';
+    }
+    $note = [
+        'id' => $noteId,
+        'type' => 'Note',
+        'published' => $published,
+        'attributedTo' => $actor,
+        'content' => $contentHtml !== '' ? $contentHtml : '<p></p>',
+        'to' => [$peer],
+        'cc' => [],
+        'tag' => [[
+            'type' => 'Mention',
+            'href' => $peer,
+            'name' => '@' . $name,
+        ]],
+        'url' => $noteId,
+    ];
+    if ($inReplyTo !== '') {
+        $note['inReplyTo'] = $inReplyTo;
+    }
+    $federated = function_exists('ap_dm_federation_attachments')
+        ? ap_dm_federation_attachments($attachments)
+        : $attachments;
+    if ($federated !== []) {
+        $note['attachment'] = array_values($federated);
+    }
+    $spoiler = trim(strip_tags($spoiler));
+    $spoiler = function_exists('mb_substr') ? mb_substr($spoiler, 0, 500) : substr($spoiler, 0, 500);
+    if ($sensitive || $spoiler !== '') {
+        $note['sensitive'] = true;
+        if ($spoiler !== '') {
+            $note['summary'] = $spoiler;
+        }
+    }
+    return [
+        '@context' => 'https://www.w3.org/ns/activitystreams',
+        'id' => $createId,
+        'type' => 'Create',
+        'actor' => $actor,
+        'published' => $published,
+        'to' => [$peer],
+        'cc' => [],
+        'object' => $note,
+    ];
+}
+
+/**
+ * Send a direct message (no public audience). Stored only in direct_messages.
+ * Media stays unattached to any status so it is not listed on a profile.
+ *
+ * @param list<int> $mediaLocalIds
  * @return array{ok:bool,error?:string,id?:int,note_id?:string,create_id?:string,delivered?:int,peer?:string}
  */
-function ap_dm_send(string $content, string $toActorOrHandle, ?string $inReplyTo = null): array
-{
+function ap_dm_send(
+    string $content,
+    string $toActorOrHandle,
+    ?string $inReplyTo = null,
+    array $mediaLocalIds = [],
+    string $spoilerText = '',
+    ?bool $sensitive = null
+): array {
     $content = trim(ap_fix_utf8($content));
-    if ($content === '' || mb_strlen($content) > 2000) {
-        return ['ok' => false, 'error' => 'DM text required (max 2000 chars)'];
+    if (mb_strlen($content) > 2000) {
+        return ['ok' => false, 'error' => 'DM text is too long (max 2000 chars)'];
+    }
+    $mediaLocalIds = array_values(array_unique(array_filter(
+        array_map('intval', $mediaLocalIds),
+        static fn(int $id): bool => $id > 0
+    )));
+    if (count($mediaLocalIds) > 4) {
+        return ['ok' => false, 'error' => 'Too many media attachments (max 4)'];
+    }
+    $spoilerText = trim(strip_tags(ap_fix_utf8($spoilerText)));
+    $spoilerText = mb_substr($spoilerText, 0, 500);
+    $sensitive = ($sensitive ?? false) || $spoilerText !== '';
+    if ($content === '' && $mediaLocalIds === []) {
+        return ['ok' => false, 'error' => 'DM text or an attachment is required (max 2000 chars)'];
     }
     $resolved = ap_resolve_actor_ref($toActorOrHandle);
     if (!$resolved) {
@@ -8771,45 +8882,68 @@ function ap_dm_send(string $content, string $toActorOrHandle, ?string $inReplyTo
         return ['ok' => false, 'error' => 'Recipient inbox is blocked'];
     }
 
-    $contentHtml = ap_plain_text_to_html($content);
+    $rows = [];
+    if ($mediaLocalIds !== []) {
+        if (!function_exists('ap_media_by_local_ids') || !function_exists('ap_media_as2_attachments')) {
+            require_once __DIR__ . '/ap-r2.php';
+        }
+        $byId = [];
+        foreach (ap_media_by_local_ids($mediaLocalIds) as $mediaRow) {
+            if (is_array($mediaRow)) {
+                $byId[(int) ($mediaRow['local_id'] ?? 0)] = $mediaRow;
+            }
+        }
+        foreach ($mediaLocalIds as $mediaId) {
+            if (!isset($byId[$mediaId])) {
+                return ['ok' => false, 'error' => 'Media attachment not found'];
+            }
+            $rows[] = $byId[$mediaId];
+        }
+    }
+    $as2 = $rows !== [] ? ap_media_as2_attachments($rows) : [];
+    $safeAs2 = [];
+    foreach ($as2 as $att) {
+        if (!is_array($att)) {
+            continue;
+        }
+        $href = function_exists('ap_dm_attachment_href') ? ap_dm_attachment_href($att) : null;
+        if (!is_string($href) || ap_profile_sanitize_https_url($href) === null) {
+            return ['ok' => false, 'error' => 'Media URL is not a safe https address'];
+        }
+        $mime = strtolower((string) ($att['mediaType'] ?? ''));
+        if (strcasecmp((string) ($att['type'] ?? ''), 'Document') === 0 && str_starts_with($mime, 'video/')) {
+            $att['type'] = 'Video';
+        }
+        $safeAs2[] = $att;
+    }
+    if (count($safeAs2) !== count($rows)) {
+        return ['ok' => false, 'error' => 'Media URL is not a safe https address'];
+    }
+
+    $contentHtml = $content !== '' ? ap_plain_text_to_html($content) : '<p></p>';
     $noteId = $actor . '/notes/' . bin2hex(random_bytes(8));
     $createId = $actor . '/creates/' . bin2hex(random_bytes(8));
     $published = gmdate('c');
-
-    // DM addressing: only the peer — never Public / followers
-    $to = [$peer];
-    $cc = [];
-    $tag = [[
-        'type' => 'Mention',
-        'href' => $peer,
-        'name' => '@' . (parse_url($peer, PHP_URL_PATH) ? ltrim((string) basename((string) parse_url($peer, PHP_URL_PATH)), '@') : 'user'),
-    ]];
-
-    $note = [
-        'id' => $noteId,
-        'type' => 'Note',
-        'published' => $published,
-        'attributedTo' => $actor,
-        'content' => $contentHtml,
-        'to' => $to,
-        'cc' => $cc,
-        'tag' => $tag,
-        'url' => $noteId,
-    ];
-    if ($inReplyTo !== '') {
-        $note['inReplyTo'] = $inReplyTo;
+    $create = ap_dm_build_activity(
+        $actor,
+        $peer,
+        $contentHtml,
+        $noteId,
+        $createId,
+        $published,
+        $safeAs2,
+        $inReplyTo,
+        $sensitive,
+        $spoilerText
+    );
+    if (!ap_dm_activity_audience_is_direct($create, $peer)) {
+        return ['ok' => false, 'error' => 'DM audience must be the recipient only'];
     }
-
-    $create = [
-        '@context' => 'https://www.w3.org/ns/activitystreams',
-        'id' => $createId,
-        'type' => 'Create',
-        'actor' => $actor,
-        'published' => $published,
-        'to' => $to,
-        'cc' => $cc,
-        'object' => $note,
-    ];
+    $storedAttachments = ap_dm_attachments_for_store($safeAs2, $sensitive, $spoilerText);
+    $mediaUrls = [];
+    foreach (ap_dm_media_items(['attachments' => $storedAttachments ?? []]) as $item) {
+        $mediaUrls[] = (string) $item['url'];
+    }
 
     $stored = ap_dm_store([
         'activity_id' => $createId,
@@ -8818,6 +8952,8 @@ function ap_dm_send(string $content, string $toActorOrHandle, ?string $inReplyTo
         'direction' => 'out',
         'content' => $content,
         'in_reply_to' => $inReplyTo !== '' ? $inReplyTo : null,
+        'media_urls' => $mediaUrls,
+        'attachments' => $storedAttachments,
         'created_at' => $published,
         'read_at' => $published,
         'owner_user_id' => $dmOwnerId,

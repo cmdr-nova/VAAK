@@ -2296,13 +2296,16 @@ function ap_masto_api(string $method, string $path): void
             if ($dmPeer === null || $dmPeer === '') {
                 ap_masto_json(['error' => 'Direct messages need a recipient (@user@host or reply to a DM)'], 422);
             }
-            if ($mediaIds) {
-                ap_masto_json(['error' => 'DM media attachments are not supported yet'], 422);
-            }
             if ($poll !== null) {
                 ap_masto_json(['error' => 'Polls are not supported in DMs'], 422);
             }
-            $res = ap_dm_send($status, $dmPeer, $inReplyTo);
+            $dmSpoiler = isset($in['spoiler_text']) ? (string) $in['spoiler_text'] : '';
+            $dmSensitive = null;
+            if (array_key_exists('sensitive', $in)) {
+                $rawDmSens = $in['sensitive'];
+                $dmSensitive = $rawDmSens === true || $rawDmSens === 1 || $rawDmSens === '1' || $rawDmSens === 'true';
+            }
+            $res = ap_dm_send($status, $dmPeer, $inReplyTo, $mediaIds, $dmSpoiler, $dmSensitive);
             if (empty($res['ok'])) {
                 ap_masto_json(['error' => $res['error'] ?? 'Could not send DM'], 422);
             }

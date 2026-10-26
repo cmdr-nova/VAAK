@@ -16084,6 +16084,445 @@ function ap_dm_linkify_html(string $html): string
  * @param array{activity_id?:?string,object_id:string,peer_actor_id:string,direction:string,content?:?string,in_reply_to?:?string,media_urls?:?list<string>|string,attachments?:mixed,created_at?:?string,read_at?:?string,owner_user_id?:int,owner_actor_id?:string} $row
  * @return array{ok:bool,error?:string,id?:int}
  */
+/**
+ * https URL from an AS2 url/href node. Prefers an original rendition over a preview.
+ */
+function ap_dm_href_from_node(mixed $node): ?string
+{
+    if (is_string($node)) {
+        return $node;
+    }
+    if (!is_array($node)) {
+        return null;
+    }
+    if (isset($node['href']) && is_string($node['href'])) {
+        return $node['href'];
+    }
+    $best = null;
+    $bestScore = -1000;
+    foreach ($node as $u) {
+        $href = null;
+        $score = 0;
+        if (is_string($u)) {
+            $href = $u;
+        } elseif (is_array($u) && isset($u['href']) && is_string($u['href'])) {
+            $href = $u['href'];
+            $name = strtolower((string) ($u['name'] ?? ''));
+            if (str_contains($name, 'original') || str_contains($href, '/original/')) {
+                $score += 50;
+            }
+            if (str_contains($name, 'small') || str_contains($href, '/small/') || str_contains($href, 'preview')) {
+                $score -= 30;
+            }
+        }
+        if (!is_string($href) || !str_starts_with($href, 'https://')) {
+            continue;
+        }
+        if ($score >= $bestScore) {
+            $best = $href;
+            $bestScore = $score;
+        }
+    }
+    return $best;
+}
+
+/** Primary https target of one ActivityPub attachment. Ignores Bridgy action properties. */
+function ap_dm_attachment_href(array $att): ?string
+{
+    if (array_key_exists('url', $att)) {
+        $href = ap_dm_href_from_node($att['url']);
+        if (is_string($href) && $href !== '') {
+            return $href;
+        }
+    }
+    if (array_key_exists('href', $att)) {
+        return ap_dm_href_from_node($att['href']);
+    }
+    return null;
+}
+
+function ap_dm_attachment_preview(array $att): string
+{
+    foreach (['preview_url', 'preview'] as $key) {
+        if (is_string($att[$key] ?? null) && str_starts_with((string) $att[$key], 'https://')) {
+            return (string) $att[$key];
+        }
+    }
+    foreach (['thumbnail', 'icon'] as $key) {
+        $node = $att[$key] ?? null;
+        if (is_string($node)) {
+            return $node;
+        }
+        if (is_array($node)) {
+            $href = ap_dm_href_from_node($node['url'] ?? ($node['href'] ?? $node));
+            if (is_string($href)) {
+                return $href;
+            }
+        }
+    }
+    return '';
+}
+
+/** True when an attachment should render in a DM (media or a downloadable file). */
+function ap_dm_attachment_is_displayable(array $att, string $url): bool
+{
+    $type = strtolower(trim((string) ($att['type'] ?? '')));
+    if (in_array($type, [
+        'mention', 'hashtag', 'emoji', 'propertyvalue', 'vaak:dmmeta',
+        'askquestion', 'person', 'note', 'create', 'announce', 'tombstone',
+    ], true)) {
+        return false;
+    }
+    if (in_array($type, ['image', 'video', 'audio', 'document', 'gifv'], true)) {
+        return true;
+    }
+    $mt = strtolower(trim((string) ($att['mediaType'] ?? '')));
+    if ($mt !== '' && (
+        str_starts_with($mt, 'image/')
+        || str_starts_with($mt, 'video/')
+        || str_starts_with($mt, 'audio/')
+        || str_starts_with($mt, 'application/')
+        || str_starts_with($mt, 'text/')
+    )) {
+        return $type !== 'link' || !str_starts_with($mt, 'text/html');
+    }
+    $path = (string) (parse_url($url, PHP_URL_PATH) ?? '');
+    if (preg_match('/\.(jpe?g|png|gif|webp|avif|heic|mp4|webm|mov|m4v|m3u8|mp3|m4a|aac|ogg|oga|wav|flac|pdf|zip|txt|csv|docx?|pptx?|xlsx?|bin)(\?|#|$)/i', $path)) {
+        return true;
+    }
+    return false;
+}
+
+/**
+ * image | gifv | video | audio | file
+ *
+ * @param array{url?:string,mediaType?:?string,asType?:string} $item
+ */
+function ap_dm_media_kind(array $item): string
+{
+    $mt = strtolower(trim((string) ($item['mediaType'] ?? '')));
+    $as = strtolower(trim((string) ($item['asType'] ?? '')));
+    $url = (string) ($item['url'] ?? '');
+    $path = (string) (parse_url($url, PHP_URL_PATH) ?? '');
+    if ($as === 'audio' || str_starts_with($mt, 'audio/')
+        || preg_match('/\.(mp3|m4a|aac|ogg|oga|wav|flac)(\?|#|$)/i', $path)) {
+        return 'audio';
+    }
+    if ($as === 'gifv') {
+        return 'gifv';
+    }
+    if ($as === 'video' || str_starts_with($mt, 'video/')
+        || $mt === 'application/x-mpegurl' || $mt === 'application/vnd.apple.mpegurl'
+        || preg_match('/\.(mp4|webm|mov|m4v|m3u8)(\?|#|$)/i', $path)) {
+        if ($as === 'document') {
+            return 'gifv';
+        }
+        return 'video';
+    }
+    if ($as === 'image' || str_starts_with($mt, 'image/')
+        || preg_match('/\.(jpe?g|png|gif|webp|avif|heic)(\?|#|$)/i', $path)) {
+        return 'image';
+    }
+    if ($mt === '' && $as === '' && !preg_match('/\.(pdf|zip|txt|csv|docx?|pptx?|xlsx?|bin)(\?|#|$)/i', $path)) {
+        // Older rows stored a bare CDN URL with no type. Timelines treat those as images.
+        return 'image';
+    }
+    return 'file';
+}
+
+function ap_dm_file_label(array $item): string
+{
+    $path = (string) (parse_url((string) ($item['url'] ?? ''), PHP_URL_PATH) ?? '');
+    $base = rawurldecode(basename($path));
+    $base = str_replace(["\0", "\r", "\n", '<', '>'], '', $base);
+    if ($base === '' || $base === '.' || $base === '..' || str_contains($base, '/') || str_contains($base, '\\')) {
+        $base = 'Download file';
+    }
+    $base = function_exists('mb_substr') ? mb_substr($base, 0, 120) : substr($base, 0, 120);
+    return $base !== '' ? $base : 'Download file';
+}
+
+/**
+ * Display items for one DM row. https only. Does not fetch remote bytes.
+ *
+ * @param array<string,mixed> $row
+ * @return list<array{url:string,mediaType:?string,preview_url:string,description:string,asType:string}>
+ */
+function ap_dm_media_items(array $row): array
+{
+    $items = [];
+    $seen = [];
+    $add = static function (string $url, ?string $mediaType, string $preview, string $alt, string $asType) use (&$items, &$seen): void {
+        if (count($items) >= 4) {
+            return;
+        }
+        $clean = function_exists('ap_profile_sanitize_https_url')
+            ? ap_profile_sanitize_https_url($url)
+            : (str_starts_with($url, 'https://') ? $url : null);
+        if ($clean === null || isset($seen[$clean])) {
+            return;
+        }
+        $previewClean = '';
+        if ($preview !== '') {
+            $previewClean = function_exists('ap_profile_sanitize_https_url')
+                ? (string) (ap_profile_sanitize_https_url($preview) ?? '')
+                : (str_starts_with($preview, 'https://') ? $preview : '');
+        }
+        $alt = trim(strip_tags($alt));
+        $alt = function_exists('mb_substr') ? mb_substr($alt, 0, 1500) : substr($alt, 0, 1500);
+        $seen[$clean] = true;
+        $items[] = [
+            'url' => $clean,
+            'mediaType' => $mediaType !== null && trim($mediaType) !== '' ? strtolower(trim($mediaType)) : null,
+            'preview_url' => $previewClean,
+            'description' => $alt,
+            'asType' => strtolower(trim($asType)),
+        ];
+    };
+
+    $atts = $row['attachments_json'] ?? ($row['attachments'] ?? null);
+    if (is_string($atts) && $atts !== '') {
+        $decoded = json_decode($atts, true);
+        $atts = is_array($decoded) ? $decoded : null;
+    }
+    if (is_array($atts)) {
+        if (isset($atts['type']) || isset($atts['url']) || isset($atts['href'])) {
+            $atts = [$atts];
+        }
+        foreach ($atts as $att) {
+            if (!is_array($att)) {
+                continue;
+            }
+            $href = ap_dm_attachment_href($att);
+            if (!is_string($href) || $href === '' || !ap_dm_attachment_is_displayable($att, $href)) {
+                continue;
+            }
+            $name = $att['name'] ?? ($att['summary'] ?? ($att['description'] ?? ''));
+            if (!is_string($name)) {
+                $name = '';
+            }
+            $mt = isset($att['mediaType']) && is_string($att['mediaType']) ? $att['mediaType'] : null;
+            $add($href, $mt, ap_dm_attachment_preview($att), $name, (string) ($att['type'] ?? ''));
+        }
+    }
+
+    $urls = $row['media_urls'] ?? null;
+    if (is_string($urls) && $urls !== '') {
+        $decoded = json_decode($urls, true);
+        $urls = is_array($decoded) ? $decoded : null;
+    }
+    if (is_array($urls)) {
+        foreach ($urls as $u) {
+            if (is_string($u)) {
+                $add($u, null, '', '', '');
+            }
+        }
+    }
+    return $items;
+}
+
+/**
+ * Local-only warning marker stored beside ActivityPub attachments.
+ * The marker is stripped before federation.
+ *
+ * @param array<mixed> $attachments
+ * @return array<int,array<string,mixed>>|null
+ */
+function ap_dm_attachments_for_store(array $attachments, bool $sensitive, string $spoiler): ?array
+{
+    if (isset($attachments['type']) || isset($attachments['url']) || isset($attachments['href'])) {
+        $attachments = [$attachments];
+    }
+    $out = [];
+    foreach ($attachments as $att) {
+        if (!is_array($att)) {
+            continue;
+        }
+        if (strcasecmp((string) ($att['type'] ?? ''), 'vaak:DmMeta') === 0) {
+            continue;
+        }
+        $out[] = $att;
+    }
+    $spoiler = trim(strip_tags($spoiler));
+    $spoiler = function_exists('mb_substr') ? mb_substr($spoiler, 0, 500) : substr($spoiler, 0, 500);
+    if ($sensitive || $spoiler !== '') {
+        $out[] = [
+            'type' => 'vaak:DmMeta',
+            'sensitive' => true,
+            'summary' => $spoiler,
+        ];
+    }
+    return $out === [] ? null : $out;
+}
+
+/**
+ * Attachments safe to put on an outbound Create. Drops the local warning marker.
+ *
+ * @param array<mixed> $attachments
+ * @return list<array<string,mixed>>
+ */
+function ap_dm_federation_attachments(array $attachments): array
+{
+    $stored = ap_dm_attachments_for_store($attachments, false, '');
+    return is_array($stored) ? array_values($stored) : [];
+}
+
+/**
+ * @param array<string,mixed> $row
+ * @return array{spoiler_text:string,sensitive:bool}
+ */
+function ap_dm_warning_from_row(array $row): array
+{
+    $atts = $row['attachments_json'] ?? ($row['attachments'] ?? null);
+    if (is_string($atts) && $atts !== '') {
+        $decoded = json_decode($atts, true);
+        $atts = is_array($decoded) ? $decoded : null;
+    }
+    if (is_array($atts)) {
+        if (isset($atts['type']) || isset($atts['url']) || isset($atts['href'])) {
+            $atts = [$atts];
+        }
+        foreach ($atts as $att) {
+            if (!is_array($att) || strcasecmp((string) ($att['type'] ?? ''), 'vaak:DmMeta') !== 0) {
+                continue;
+            }
+            $spoiler = trim(strip_tags((string) ($att['summary'] ?? '')));
+            $spoiler = function_exists('mb_substr') ? mb_substr($spoiler, 0, 500) : substr($spoiler, 0, 500);
+            return [
+                'spoiler_text' => $spoiler,
+                'sensitive' => !empty($att['sensitive']) || $spoiler !== '',
+            ];
+        }
+    }
+    return ['spoiler_text' => '', 'sensitive' => false];
+}
+
+/**
+ * Mastodon media_attachments for a DM. URLs are already https-only.
+ *
+ * @param array<string,mixed> $row
+ * @return list<array<string,mixed>>
+ */
+function ap_dm_masto_media_list(array $row): array
+{
+    $out = [];
+    $i = 0;
+    foreach (ap_dm_media_items($row) as $item) {
+        $i++;
+        $kind = ap_dm_media_kind($item);
+        $type = match ($kind) {
+            'gifv' => 'gifv',
+            'video' => 'video',
+            'audio' => 'audio',
+            'image' => 'image',
+            default => 'unknown',
+        };
+        $url = (string) $item['url'];
+        $preview = (string) ($item['preview_url'] ?? '');
+        if ($preview === '' && ($type === 'image' || $type === 'gifv' || $type === 'video')) {
+            $preview = $url;
+        }
+        $desc = trim((string) ($item['description'] ?? ''));
+        $out[] = [
+            'id' => 'dm-media-' . $i,
+            'type' => $type,
+            'url' => $url,
+            'preview_url' => $preview !== '' ? $preview : $url,
+            'remote_url' => $url,
+            'preview_remote_url' => null,
+            'text_url' => null,
+            'meta' => null,
+            'description' => $desc !== '' ? $desc : null,
+            'blurhash' => null,
+        ];
+    }
+    return $out;
+}
+
+/**
+ * True when every audience slot is exactly the one peer.
+ * Rejects Public, as:Public, and followers collections.
+ */
+function ap_dm_activity_audience_is_direct(array $activity, string $peer): bool
+{
+    $peer = rtrim(trim($peer), '/');
+    if ($peer === '' || !str_starts_with($peer, 'https://')) {
+        return false;
+    }
+    $docs = [$activity];
+    if (is_array($activity['object'] ?? null)) {
+        $docs[] = $activity['object'];
+    }
+    $ids = [];
+    foreach ($docs as $doc) {
+        foreach (['to', 'cc', 'bto', 'bcc', 'audience'] as $key) {
+            if (!array_key_exists($key, $doc)) {
+                continue;
+            }
+            $list = $doc[$key];
+            if (is_string($list)) {
+                $list = [$list];
+            }
+            if (!is_array($list)) {
+                return false;
+            }
+            foreach ($list as $item) {
+                $id = '';
+                if (is_string($item)) {
+                    $id = $item;
+                } elseif (is_array($item)) {
+                    $id = (string) ($item['id'] ?? $item['href'] ?? '');
+                }
+                $id = rtrim(trim($id), '/');
+                if ($id === '') {
+                    return false;
+                }
+                $ids[] = $id;
+            }
+        }
+    }
+    if ($ids === [] || !in_array($peer, $ids, true)) {
+        return false;
+    }
+    foreach ($ids as $id) {
+        $lower = strtolower($id);
+        if ($lower === 'https://www.w3.org/ns/activitystreams#public'
+            || $lower === 'as:public'
+            || $lower === 'public'
+            || str_ends_with($lower, '#public')
+            || str_ends_with($lower, '/followers')
+            || str_ends_with($lower, '/followers/')) {
+            return false;
+        }
+        if ($id !== $peer) {
+            return false;
+        }
+    }
+    // Message text, alt text, and the reply target may mention those words.
+    // Every other string (addresses, attachment URLs, tag hrefs) must not.
+    $forbidden = static function (mixed $node) use (&$forbidden): bool {
+        if (is_string($node)) {
+            $lower = strtolower($node);
+            return str_contains($lower, 'activitystreams#public')
+                || str_contains($lower, 'as:public')
+                || str_contains($node, '/followers');
+        }
+        if (!is_array($node)) {
+            return false;
+        }
+        foreach ($node as $key => $child) {
+            if (is_string($key) && in_array($key, ['content', 'summary', 'name', 'contentMap', 'inReplyTo'], true)) {
+                continue;
+            }
+            if ($forbidden($child)) {
+                return true;
+            }
+        }
+        return false;
+    };
+    return !$forbidden($activity);
+}
+
 function ap_dm_store(array $row): array
 {
     $objectId = trim((string) ($row['object_id'] ?? ''));
