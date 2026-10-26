@@ -24,10 +24,12 @@ function ap_masto_reblog_row_by_status(string $sid, int $owner): ?array
     return $st->fetch() ?: null;
 }
 function ap_bsky_session_row(int $owner): ?array { return $owner === 1 ? ['did' => 'did:plc:self'] : null; }
+// Not a mirror of a local note: shadow dedupe never applies here.
+function ap_bsky_own_mirror_note_id_for_uri(string $uri): ?string { return null; }
 
 require_once $api . '/ap-bsky-urls.php';
 reference_load($api . '/ap-db.php', ['ap_masto_reblog_add']);
-reference_load($api . '/ap-bsky.php', ['ap_bsky_own_repost_status_id', 'ap_bsky_own_repost_profile_sync']);
+reference_load($api . '/ap-bsky.php', ['ap_bsky_own_repost_status_id', 'ap_bsky_own_repost_profile_sync', 'ap_bsky_repost_shadows_local_boost']);
 
 $checks = 0;
 function repost_check(bool $condition, string $message): void
