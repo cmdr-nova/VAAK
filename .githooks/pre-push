@@ -1,0 +1,30 @@
+#!/bin/sh
+# Refuse to push commits built on an out-of-date main.
+# A branch that doesn't contain origin/main can carry old copies of files
+# back over newer work once merged or copied around.
+# Enable with: git config core.hooksPath .githooks
+#   (or copy this file to .git/hooks/pre-push to skip the gitleaks pre-commit)
+# One-off override: VAAK_ALLOW_STALE_PUSH=1 git push ...
+remote="$1"
+[ "${VAAK_ALLOW_STALE_PUSH:-0}" = "1" ] && exit 0
+
+if ! git fetch --quiet "$remote" main 2>/dev/null; then
+  echo "pre-push: could not fetch $remote/main, so freshness was not checked." >&2
+  echo "Fix the connection, or push with VAAK_ALLOW_STALE_PUSH=1 if you are sure." >&2
+  exit 1
+fi
+upstream=$(git rev-parse FETCH_HEAD)
+zero=0000000000000000000000000000000000000000
+status=0
+while read -r local_ref local_sha remote_ref remote_sha; do
+  [ "$local_sha" = "$zero" ] && continue   # branch deletion
+  case "$remote_ref" in refs/tags/*) continue ;; esac
+  if ! git merge-base --is-ancestor "$upstream" "$local_sha"; then
+    behind=$(git rev-list --count "$local_sha..$upstream")
+    echo "pre-push: ${local_ref#refs/heads/} is $behind commit(s) behind $remote/main." >&2
+    echo "  Update first:  git pull --rebase $remote main   (or: git merge $remote/main)" >&2
+    status=1
+  fi
+done
+[ $status -ne 0 ] && echo "pre-push: push refused. Override once with VAAK_ALLOW_STALE_PUSH=1." >&2
+exit $status
