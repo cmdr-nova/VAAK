@@ -9445,7 +9445,7 @@ function admin_home_downranked_actor_rows(): array
     try {
         admin_home_downrank_purge_stale();
         // The primary key breaks ties so the grouped order and category order are stable.
-        $rows = ap_db()->query('SELECT actor_id, owner_user_id, score, categories_json, suppressed_until, last_object_id, updated_at FROM ap_home_suppression ORDER BY suppressed_until DESC, score DESC, actor_id ASC, owner_user_id ASC')->fetchAll() ?: [];
+        $rows = ap_db()->query('SELECT actor_id, owner_user_id, score, categories_json, suppressed_until, last_object_id, seen_object_ids_json, updated_at FROM ap_home_suppression ORDER BY suppressed_until DESC, score DESC, actor_id ASC, owner_user_id ASC')->fetchAll() ?: [];
         $out = [];
         $now = time();
         foreach ($rows as $row) {
@@ -9466,6 +9466,7 @@ function admin_home_downranked_actor_rows(): array
                     'last_object_id' => '',
                     'updated_at' => '',
                     'categories' => [],
+                    'seen' => [],
                 ];
             }
             $item =& $out[$actor];
@@ -9478,6 +9479,11 @@ function admin_home_downranked_actor_rows(): array
             $item['updated_at'] = max((string) $item['updated_at'], (string) ($row['updated_at'] ?? ''));
             $cats = json_decode((string) ($row['categories_json'] ?? '[]'), true);
             if (is_array($cats)) $item['categories'] = array_values(array_unique(array_merge($item['categories'], array_map('strval', $cats))));
+            // Objects that raised the signal, newest first (PHP appends; Bluesky rkeys sort by time).
+            $seen = json_decode((string) ($row['seen_object_ids_json'] ?? '[]'), true);
+            $seen = is_array($seen) ? array_reverse(array_map('strval', $seen)) : [];
+            if ($seen === [] && (string) ($row['last_object_id'] ?? '') !== '') $seen = [(string) $row['last_object_id']];
+            $item['seen'] = array_slice(array_values(array_unique(array_merge($item['seen'], $seen))), 0, 20);
             unset($item);
         }
         return array_values($out);
@@ -9533,6 +9539,243 @@ function admin_home_downrank_evidence_rows(string $actorId, array $categories, i
     } catch (Throwable $e) {
         return [];
     }
+}
+
+/** did:... from a https://bsky.app/profile/<did> actor URL, else ''. */
+function admin_downranked_bsky_did(string $actorId): string
+{
+    $actorId = rtrim(trim($actorId), '/');
+    if (preg_match('~^https://bsky\.app/profile/(did(?::|%3A)[a-z0-9]+(?::|%3A)[A-Za-z0-9._:%-]+)$~i', $actorId, $m)) {
+        return rawurldecode($m[1]);
+    }
+    return '';
+}
+
+/** at://did/app.bsky.feed.post/rkey for a seen Bluesky object id by $did, else ''. */
+function admin_downranked_bsky_at_uri(string $objectId, string $did): string
+{
+    $objectId = rtrim(trim($objectId), '/');
+    if (str_starts_with($objectId, 'bsky:')) $objectId = substr($objectId, 5);
+    if (preg_match('#^at://([^/]+)/app\.bsky\.feed\.post/([A-Za-z0-9._~:-]+)$#', $objectId, $m)) {
+        return 'at://' . $m[1] . '/app.bsky.feed.post/' . $m[2];
+    }
+    // The profile segment may be a handle; the signal's actor is the DID either way.
+    if ($did !== '' && preg_match('#^https://bsky\.app/profile/[^/]+/post/([A-Za-z0-9._~:-]+)$#i', $objectId, $m)) {
+        return 'at://' . $did . '/app.bsky.feed.post/' . $m[1];
+    }
+    return '';
+}
+
+/** Public AppView GET with repeated array params (XRPC wants uris=a&uris=b, not uris[0]=). */
+function admin_downranked_appview_get(string $nsid, string $param, array $values, int $timeoutSec = 4): array
+{
+    if ($values === [] || (function_exists('ap_bsky_budget_exceeded') && ap_bsky_budget_exceeded())) return [];
+    $qs = implode('&', array_map(static fn($v) => $param . '=' . rawurlencode((string) $v), $values));
+    $ch = curl_init('https://public.api.bsky.app/xrpc/' . $nsid . '?' . $qs);
+    if ($ch === false) return [];
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_CONNECTTIMEOUT => 3,
+        CURLOPT_TIMEOUT => $timeoutSec,
+        CURLOPT_HTTPHEADER => [
+            'Accept: application/json',
+            'User-Agent: VAAK-Bluesky/1.0 (+https://mkultra.monster/vaak)',
+        ],
+    ]);
+    $body = curl_exec($ch);
+    $status = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+    if (!is_string($body) || $status < 200 || $status >= 300) return [];
+    $json = json_decode($body, true);
+    return is_array($json) ? $json : [];
+}
+
+/**
+ * Bluesky handles, display names and triggering post text for the Downranked page.
+ * Everything comes from local caches first (Redis, bsky_actor_profiles, bsky_posts);
+ * whatever is still missing gets a few batched public AppView calls, cached 24h.
+ *
+ * @param list<array<string,mixed>> $actors rows from admin_home_downranked_actor_rows()
+ * @return array{identities:array<string,array{handle:string,display_name:string}>,posts:array<string,array{text:string,created_at:string}>}
+ */
+function admin_downranked_bsky_prefetch(array $actors, int $ownerUserId, int $postsPerActor = 3): array
+{
+    $identities = [];
+    $posts = [];
+    $dids = [];
+    $wantUris = [];
+    foreach ($actors as $row) {
+        $did = admin_downranked_bsky_did((string) ($row['actor_id'] ?? ''));
+        if ($did === '') continue;
+        $dids[$did] = true;
+        $n = 0;
+        foreach ((array) ($row['seen'] ?? []) as $objectId) {
+            $at = admin_downranked_bsky_at_uri((string) $objectId, $did);
+            if ($at === '' || isset($wantUris[$at])) continue;
+            $wantUris[$at] = $did;
+            if (++$n >= $postsPerActor) break;
+        }
+    }
+    if ($dids === []) return ['identities' => [], 'posts' => []];
+    $redis = function_exists('ap_redis_json_get') && function_exists('ap_redis_json_set');
+    $idKey = static fn(string $did): string => 'vaak:downranked:bsky-id:v1:' . $did;
+    $postKey = static fn(string $uri): string => 'vaak:downranked:bsky-post:v1:' . hash('sha256', $uri);
+    $remember = static function (string $did, string $handle, string $display) use (&$identities, $redis, $idKey): void {
+        $handle = ltrim(trim($handle), '@');
+        if ($handle === '' || $handle === 'handle.invalid' || str_starts_with($handle, 'did:')) return;
+        $identities[$did] = ['handle' => $handle, 'display_name' => trim($display)];
+        if ($redis) ap_redis_json_set($idKey($did), $identities[$did], 86400);
+    };
+
+    foreach (array_keys($dids) as $did) {
+        if ($redis) {
+            $hit = ap_redis_json_get($idKey($did));
+            if (is_array($hit) && trim((string) ($hit['handle'] ?? '')) !== '') {
+                $identities[$did] = ['handle' => (string) $hit['handle'], 'display_name' => (string) ($hit['display_name'] ?? '')];
+                continue;
+            }
+        }
+        if (function_exists('ap_bsky_actor_profile_cache_get')) {
+            $cached = ap_bsky_actor_profile_cache_get($did, $ownerUserId);
+            $profile = is_array($cached['profile'] ?? null) ? $cached['profile'] : [];
+            $remember($did, (string) ($profile['handle'] ?? ''), (string) ($profile['displayName'] ?? ''));
+        }
+    }
+
+    try {
+        $db = ap_db();
+        $byAuthor = $db->prepare("SELECT author_handle, author_display FROM bsky_posts WHERE author_did = ? AND COALESCE(author_handle, '') <> '' ORDER BY indexed_at DESC LIMIT 1");
+        foreach (array_keys($dids) as $did) {
+            if (isset($identities[$did])) continue;
+            $byAuthor->execute([$did]);
+            $hit = $byAuthor->fetch();
+            if (is_array($hit)) $remember($did, (string) ($hit['author_handle'] ?? ''), (string) ($hit['author_display'] ?? ''));
+        }
+        foreach (array_chunk(array_keys($wantUris), 100) as $chunk) {
+            $st = $db->prepare('SELECT bsky_uri, text, published_at, indexed_at FROM bsky_posts WHERE bsky_uri IN (' . implode(',', array_fill(0, count($chunk), '?')) . ')');
+            $st->execute($chunk);
+            foreach ($st->fetchAll() ?: [] as $hit) {
+                $text = trim((string) ($hit['text'] ?? ''));
+                if ($text === '') continue;
+                $posts[(string) $hit['bsky_uri']] = ['text' => $text, 'created_at' => (string) (($hit['published_at'] ?? '') ?: ($hit['indexed_at'] ?? ''))];
+            }
+        }
+    } catch (Throwable $e) {
+        // Optional enrichment; the review page renders without it.
+    }
+
+    $missingPosts = [];
+    foreach (array_keys($wantUris) as $uri) {
+        if (isset($posts[$uri])) continue;
+        $hit = $redis ? ap_redis_json_get($postKey($uri)) : null;
+        if (is_array($hit) && isset($hit['text'])) {
+            if ((string) $hit['text'] !== '') $posts[$uri] = ['text' => (string) $hit['text'], 'created_at' => (string) ($hit['created_at'] ?? '')];
+            continue;
+        }
+        $missingPosts[] = $uri;
+    }
+    // Bounded: at most 4 getPosts + 4 getProfiles calls per page load; later loads hit the cache.
+    foreach (array_slice(array_chunk($missingPosts, 25), 0, 4) as $chunk) {
+        $json = admin_downranked_appview_get('app.bsky.feed.getPosts', 'uris', $chunk);
+        $found = [];
+        foreach (is_array($json['posts'] ?? null) ? $json['posts'] : [] as $post) {
+            if (!is_array($post)) continue;
+            $uri = (string) ($post['uri'] ?? '');
+            $text = trim((string) ($post['record']['text'] ?? ''));
+            $found[$uri] = true;
+            if ($redis) ap_redis_json_set($postKey($uri), ['text' => $text, 'created_at' => (string) ($post['record']['createdAt'] ?? '')], 86400);
+            if ($uri !== '' && $text !== '') $posts[$uri] = ['text' => $text, 'created_at' => (string) ($post['record']['createdAt'] ?? '')];
+            $author = is_array($post['author'] ?? null) ? $post['author'] : [];
+            $authorDid = (string) ($author['did'] ?? '');
+            if ($authorDid !== '' && isset($dids[$authorDid]) && !isset($identities[$authorDid])) {
+                $remember($authorDid, (string) ($author['handle'] ?? ''), (string) ($author['displayName'] ?? ''));
+            }
+        }
+        // Deleted posts: cache the miss briefly so every load doesn't ask again.
+        if ($redis && $json !== []) {
+            foreach ($chunk as $uri) {
+                if (!isset($found[$uri])) ap_redis_json_set($postKey($uri), ['text' => '', 'created_at' => ''], 3600);
+            }
+        }
+    }
+    $missingIds = array_values(array_filter(array_keys($dids), static fn(string $did): bool => !isset($identities[$did])));
+    foreach (array_slice(array_chunk($missingIds, 25), 0, 4) as $chunk) {
+        $json = admin_downranked_appview_get('app.bsky.actor.getProfiles', 'actors', $chunk);
+        foreach (is_array($json['profiles'] ?? null) ? $json['profiles'] : [] as $profile) {
+            if (!is_array($profile)) continue;
+            $did = (string) ($profile['did'] ?? '');
+            if ($did !== '' && isset($dids[$did])) $remember($did, (string) ($profile['handle'] ?? ''), (string) ($profile['displayName'] ?? ''));
+        }
+    }
+    if ($ownerUserId > 0 && function_exists('ap_bsky_actor_refresh_enqueue')) {
+        foreach (array_keys($dids) as $did) {
+            if (!isset($identities[$did])) ap_bsky_actor_refresh_enqueue($ownerUserId, $did);
+        }
+    }
+    return ['identities' => $identities, 'posts' => $posts];
+}
+
+/**
+ * Evidence for a Bluesky actor: the exact posts that raised the signal first
+ * (seen_object_ids, newest first), then recent cached posts that still match.
+ *
+ * @return list<array{object_id:string,created_at:string,summary:string,categories:list<string>}>
+ */
+function admin_downranked_bsky_evidence_rows(string $did, array $categories, array $seen, array $prefetchedPosts, int $limit = 3): array
+{
+    $wanted = array_values(array_filter(array_map('strval', $categories)));
+    if ($did === '' || $limit < 1) return [];
+    $out = [];
+    $used = [];
+    foreach ($seen as $objectId) {
+        $at = admin_downranked_bsky_at_uri((string) $objectId, $did);
+        if ($at === '' || isset($used[$at]) || !isset($prefetchedPosts[$at])) continue;
+        $used[$at] = true;
+        $text = (string) $prefetchedPosts[$at]['text'];
+        $matched = $wanted !== [] && function_exists('admin_home_toxicity_categories')
+            ? array_values(array_intersect($wanted, admin_home_toxicity_categories($text)))
+            : [];
+        $out[] = [
+            'object_id' => $at,
+            'created_at' => (string) ($prefetchedPosts[$at]['created_at'] ?? ''),
+            'summary' => $text,
+            'categories' => $matched !== [] ? $matched : $wanted,
+        ];
+        if (count($out) >= $limit) return $out;
+    }
+    if ($wanted === [] || !function_exists('admin_home_toxicity_categories')) return $out;
+    try {
+        $st = ap_db()->prepare("SELECT bsky_uri, text, published_at, indexed_at FROM bsky_posts WHERE author_did = ? AND COALESCE(text, '') <> '' ORDER BY indexed_at DESC LIMIT 100");
+        $st->execute([$did]);
+        foreach ($st->fetchAll() ?: [] as $row) {
+            $uri = (string) ($row['bsky_uri'] ?? '');
+            if ($uri === '' || isset($used[$uri])) continue;
+            $text = trim((string) ($row['text'] ?? ''));
+            $matched = array_values(array_intersect($wanted, admin_home_toxicity_categories($text)));
+            if ($matched === []) continue;
+            $used[$uri] = true;
+            $out[] = [
+                'object_id' => $uri,
+                'created_at' => (string) (($row['published_at'] ?? '') ?: ($row['indexed_at'] ?? '')),
+                'summary' => $text,
+                'categories' => $matched,
+            ];
+            if (count($out) >= $limit) break;
+        }
+    } catch (Throwable $e) {
+    }
+    return $out;
+}
+
+/** "in 31m" style label for a future expiry (relative_time() only counts backwards). */
+function admin_downranked_expires_label(int $until): string
+{
+    $d = $until - time();
+    if ($d <= 0) return 'now';
+    if ($d < 60) return 'in ' . $d . 's';
+    if ($d < 3600) return 'in ' . intdiv($d, 60) . 'm';
+    if ($d < 86400) return 'in ' . intdiv($d, 3600) . 'h ' . intdiv($d % 3600, 60) . 'm';
+    return 'in ' . intdiv($d, 86400) . 'd ' . intdiv($d % 86400, 3600) . 'h';
 }
 
 function admin_home_downrank_audit(string $action, string $actorId = '', int $termId = 0, string $phrase = '', array $details = []): void
@@ -31316,10 +31559,12 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
                 $downrankedNativeBody = ap_admin_native_read_body('downranked');
             }
             $allDownrankedActors = $downrankedNativeBody !== null ? [] : admin_home_downranked_actor_rows();
+            $downrankedBsky = admin_downranked_bsky_prefetch($allDownrankedActors, (int) ($GLOBALS['vaak_owner_id'] ?? 0));
             if ($downrankedQuery !== '') {
-                $needle = strtolower($downrankedQuery);
-                $allDownrankedActors = array_values(array_filter($allDownrankedActors, static function (array $row) use ($needle): bool {
-                    $hay = strtolower((string) ($row['actor_id'] ?? '') . ' ' . implode(' ', (array) ($row['categories'] ?? [])));
+                $needle = strtolower(ltrim($downrankedQuery, '@'));
+                $allDownrankedActors = array_values(array_filter($allDownrankedActors, static function (array $row) use ($needle, $downrankedBsky): bool {
+                    $ident = $downrankedBsky['identities'][admin_downranked_bsky_did((string) ($row['actor_id'] ?? ''))] ?? [];
+                    $hay = strtolower((string) ($row['actor_id'] ?? '') . ' ' . implode(' ', (array) ($row['categories'] ?? [])) . ' ' . ($ident['handle'] ?? '') . ' ' . ($ident['display_name'] ?? ''));
                     return str_contains($hay, $needle);
                 }));
             }
@@ -31351,28 +31596,33 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
                   $drUntil = (int) ($dr['until'] ?? 0);
                   $drCategoryList = array_values(array_filter(array_map('strval', (array) ($dr['categories'] ?? []))));
                   $drCats = implode(', ', $drCategoryList);
-                  $drEvidence = admin_home_downrank_evidence_rows($drActor, $drCategoryList, 5, (string) ($dr['last_object_id'] ?? ''));
+                  $drDid = admin_downranked_bsky_did($drActor);
+                  $drIdent = $drDid !== '' ? ($downrankedBsky['identities'][$drDid] ?? null) : null;
+                  if ($drIdent) $drName = $drIdent['display_name'] !== '' ? $drIdent['display_name'] : '@' . $drIdent['handle'];
+                  $drEvidence = $drDid !== ''
+                      ? admin_downranked_bsky_evidence_rows($drDid, $drCategoryList, (array) ($dr['seen'] ?? []), $downrankedBsky['posts'])
+                      : admin_home_downrank_evidence_rows($drActor, $drCategoryList, 5, (string) ($dr['last_object_id'] ?? ''));
                 ?>
                 <article class="tweet downranked-item" data-dr-index="<?= (int) $drIndex ?>" style="padding:.85rem 1rem;display:none">
                   <div class="tweet-hd">
                     <div style="min-width:0">
                       <div class="who" style="overflow-wrap:anywhere"><?= h($drName !== '' ? $drName : $drActor) ?></div>
-                      <div class="meta" style="overflow-wrap:anywhere"><?= h($drActor) ?></div>
+                      <div class="meta" style="overflow-wrap:anywhere"><?php if ($drIdent): ?>@<?= h($drIdent['handle']) ?> · <?php endif; ?><?= h($drActor) ?></div>
                     </div>
                     <span class="tag">active</span>
                   </div>
                   <div class="meta" style="margin-top:.55rem">
                     Categories: <?= h($drCats !== '' ? $drCats : 'uncategorized') ?> · score <?= (int) ($dr['score'] ?? 0) ?> · <?= (int) ($dr['viewers'] ?? 0) ?> viewer<?= ((int) ($dr['viewers'] ?? 0) === 1 ? '' : 's') ?>
-                    <?php if ($drUntil > 0): ?> · expires <?= h(relative_time(gmdate('c', $drUntil))) ?><?php endif; ?>
+                    <?php if ($drUntil > 0): ?> · expires <?= h(admin_downranked_expires_label($drUntil)) ?><?php endif; ?>
                   </div>
                   <?php if ($drEvidence): ?>
-                    <div class="meta" style="margin-top:.55rem">Recent matching evidence:</div>
+                    <div class="meta" style="margin-top:.55rem"><?= $drDid !== '' ? 'Posts behind this signal:' : 'Recent matching evidence:' ?></div>
                     <div style="display:flex;flex-direction:column;gap:.25rem;margin-top:.2rem">
                       <?php foreach ($drEvidence as $evidence): ?>
                         <?php
                           $evidenceSummary = preg_replace('/\s+/u', ' ', (string) ($evidence['summary'] ?? ''));
                           $evidenceSummary = is_string($evidenceSummary) ? trim($evidenceSummary) : '';
-                          $evidenceLabel = mb_substr($evidenceSummary, 0, 140);
+                          $evidenceLabel = mb_substr($evidenceSummary, 0, $drDid !== '' ? 280 : 140);
                           if ($evidenceLabel === '') $evidenceLabel = 'Open matching status';
                           $evidenceHref = admin_status_href((string) ($evidence['object_id'] ?? ''), 'downranked');
                         ?>

@@ -162,7 +162,8 @@ pub(super) async fn collect(db:&tokio_postgres::Client,cfg:&crate::config::Confi
   if !a.actor.starts_with("https://"){bail!("PHP-only actor label");}
   let host=authority(&a.actor)?;
   if matches!(host.as_str(),"mkultra.monster"|"www.mkultra.monster"|"vaak.monster"|"www.vaak.monster"){bail!("PHP-only local actor label");}
-  if host=="bsky.brid.gy"||matches!(host.as_str(),"threads.net"|"www.threads.net"|"threads.com"|"www.threads.com"){bail!("PHP-only profile link");}
+  // Bluesky actors get handle/post enrichment that only PHP renders.
+  if host=="bsky.app"||host=="bsky.brid.gy"||matches!(host.as_str(),"threads.net"|"www.threads.net"|"threads.com"|"www.threads.com"){bail!("PHP-only profile link");}
   let cached=crate::profile_identity::lookup_actor(db,cfg,&a.actor).await?;
   if cached.as_ref().is_none_or(|r|crate::profile_identity::placeholder(r["username"].as_str().unwrap_or(""))){warm.push(a.actor.clone());}
   let label=crate::profile_identity::label(&a.actor,cached.as_ref());
@@ -182,7 +183,12 @@ pub(super) async fn collect(db:&tokio_postgres::Client,cfg:&crate::config::Confi
  }
  Ok(Collected{actors,audit,warm})
 }
-fn gmdate_c(t:i64)->Result<String>{Ok(chrono::DateTime::from_timestamp(t,0).ok_or_else(||anyhow::anyhow!("date range"))?.format("%Y-%m-%dT%H:%M:%S+00:00").to_string())}
+/// admin_downranked_expires_label: "in 31m" for a future expiry.
+fn expires_label(until:i64,now:i64)->String{
+ let d=until-now;
+ if d<=0{"now".into()}else if d<60{format!("in {d}s")}else if d<3600{format!("in {}m",d/60)}
+ else if d<86400{format!("in {}h {}m",d/3600,d%3600/60)}else{format!("in {}d {}h",d/86400,d%86400/3600)}
+}
 pub(super) fn paint(c:Collected,r:&Request)->Result<(String,usize,Value)>{
  let mut h=String::new();let csrf=esc(&r.csrf);
  if c.actors.is_empty(){h.push_str(r#"<div class="empty">No active temporary downranking signals.</div> "#);}
@@ -194,7 +200,7 @@ pub(super) fn paint(c:Collected,r:&Request)->Result<(String,usize,Value)>{
    let cats=a.categories.join(", ");
    h.push_str(&format!(r#"<article class="tweet downranked-item" data-dr-index="{i}" style="padding:.85rem 1rem;display:none"> <div class="tweet-hd"> <div style="min-width:0"> <div class="who" style="overflow-wrap:anywhere">{}</div> <div class="meta" style="overflow-wrap:anywhere">{actor}</div> </div> <span class="tag">active</span> </div> <div class="meta" style="margin-top:.55rem"> Categories: {} · score {} · {} viewer{} "#,
     esc(&a.name),esc(if cats.is_empty(){"uncategorized"}else{&cats}),a.score,a.viewers,if a.viewers==1{""}else{"s"}));
-   if a.until>0{h.push_str(&format!("· expires {} ",esc(&relative(&gmdate_c(a.until)?,r.now)?)));}
+   if a.until>0{h.push_str(&format!("· expires {} ",esc(&expires_label(a.until,r.now))));}
    h.push_str("</div> ");
    if !a.evidence.is_empty(){
     h.push_str(r#"<div class="meta" style="margin-top:.55rem">Recent matching evidence:</div> <div style="display:flex;flex-direction:column;gap:.25rem;margin-top:.2rem"> "#);
