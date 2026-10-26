@@ -308,8 +308,89 @@ check(source.includes('if (selfKey && key === selfKey) return;'), 'a parent ment
 check(source.includes('const peer = toUrl.match(/^https:\\/\\/mkultra\\.monster\\/users\\/([A-Za-z0-9_]+)\\/?$/i);'), 'other local accounts still seed a bare @username');
 check(source.includes('Followers-only replies are available only on your own posts.'), 'followers-only replies stay limited to your own posts');
 check(source.includes('function isOwnNoteUrl(url)'), 'own-note detection is unchanged');
-check(source.includes('preview: replyTo && sourceEl ? vaakReplyPreviewFromCard(sourceEl) : null'), 'reply clicks pass the card into the composer');
+check(source.includes('preview: sourceEl && (replyTo || quoteObject) ? vaakReplyPreviewFromCard(sourceEl) : null'), 'reply and quote clicks pass the card into the composer');
 check(source.includes("title.textContent = isSelf ? 'Continue thread' : 'Reply'"), 'self replies still continue the thread');
 check(source.includes('vaakUpgradeServerReplyPreview'), 'a full navigation can still read a card on the page');
+check(source.includes("vaakPaintComposeReplyContext(form, 'Quoting', quoteObject, opts.preview || null)"), 'quote clicks paint the same summary');
+check(source.includes('a[href*="quote_object="]'), 'a full navigation can still read a quote card on the page');
+check(source.includes('function clearQuoteChrome()'), 'closing or switching still clears the quote chrome');
+check(source.includes("if (!/[?&](?:reply_to|quote_object)=/.test(href)) return;"), 'reply and quote clicks share the no-reload path');
+check(source.includes("if (parsed.protocol !== 'https:' || !parsed.host) return '';"), 'avatars stay https and name a host');
+
+function quoteAction(view, url) {
+  return replyLink('?view=' + view + '&compose=1&quote_object=' + encodeURIComponent(url));
+}
+[
+  ['home', 'https://mkultra.monster/users/cmdr_nova/notes/own1'],
+  ['local', remoteUrl],
+  ['federated', remoteUrl],
+  ['status', remoteUrl],
+  ['remote_profile', 'https://mkultra.monster/users/shana_flux/notes/peer1'],
+  ['search', 'https://bsky.app/profile/ada.bsky.social/post/backfill1'],
+  ['mentions', remoteUrl],
+  ['feed', 'https://bsky.app/profile/ada.bsky.social/post/backfill1'],
+].forEach((pair) => {
+  const surface = article('tweet');
+  surface.appendChild(header('Ada Lovelace', '@ada@remote.example', 'https://cdn.example/ada.webp'));
+  surface.appendChild(el('div', 'body feed-body', 'quoted from ' + pair[0]));
+  surface.appendChild(el('div', 'media-row'));
+  const surfaceActions = el('div', 'tweet-actions');
+  const surfaceLink = quoteAction(pair[0], pair[1]);
+  surfaceActions.appendChild(surfaceLink);
+  surface.appendChild(surfaceActions);
+  const found = fromCard(surfaceLink);
+  check(found && found.name === 'Ada Lovelace' && found.snippet === 'quoted from ' + pair[0], pair[0] + ' quote action reads the card');
+  check(found.media === true && found.avatar === 'https://cdn.example/ada.webp', pair[0] + ' quote action keeps the avatar and media hint');
+});
+
+const otherQuote = {
+  name: 'Other Person',
+  handle: '@other@host',
+  avatar: 'https://cdn.example/other.webp',
+  snippet: 'a different post',
+  media: false,
+  cw: false,
+  quote: false,
+};
+paint(form, 'Quoting', remoteUrl, remote);
+check(textOf(form.querySelector('.qt-label')) === 'Quoting', 'quote label');
+check(!!form.querySelector('.compose-reply-preview'), 'quote paint builds a preview');
+check(textOf(form.querySelector('.who')) === 'Ada Lovelace', 'quote painted name');
+check(textOf(form.querySelector('.compose-reply-preview__text')) === remote.snippet, 'quote painted snippet');
+check(form.querySelector('img').getAttribute('src') === 'https://cdn.example/ada.webp', 'quote painted avatar');
+check(form.querySelectorAll('.quote-block').length === 1, 'quote paint leaves one block');
+paint(form, 'Quoting', 'https://bsky.app/profile/other.host/post/abc', otherQuote);
+check(form.querySelectorAll('.quote-block').length === 1, 'quoting a different post replaces the preview');
+check(textOf(form.querySelector('.who')) === 'Other Person', 'replaced quote uses the new author');
+check(textOf(form.querySelector('.compose-reply-preview__text')) === 'a different post', 'replaced quote uses the new snippet');
+paint(form, 'Replying to', remoteUrl, remote);
+check(form.querySelectorAll('.quote-block').length === 1, 'switching from quote to reply replaces the preview');
+check(textOf(form.querySelector('.qt-label')) === 'Replying to', 'switch lands on the reply label');
+check(textOf(form.querySelector('.who')) === 'Ada Lovelace', 'switch uses the reply card');
+paint(form, 'Quoting', remoteUrl, remote);
+check(textOf(form.querySelector('.qt-label')) === 'Quoting', 'switching from reply to quote replaces the preview');
+paint(form, 'Quoting', remoteUrl, null);
+check(!form.querySelector('.compose-reply-preview'), 'clearing a quote summary drops the card');
+check(textOf(form.querySelector('.mono')) === remoteUrl, 'cleared quote keeps the url');
+check(textOf(form.querySelector('.qt-label')) === 'Quoting', 'cleared quote keeps the quoting label');
+['javascript:alert(1)', 'data:text/html,hi', 'vbscript:msgbox(1)'].forEach((bad) => {
+  const scheme = bad.slice(0, bad.indexOf(':'));
+  paint(form, 'Quoting', remoteUrl, {
+    name: '<img src=x onerror=alert(1)>',
+    handle: '@ada',
+    avatar: bad,
+    snippet: '<b>nope</b>',
+    media: true,
+    cw: false,
+    quote: true,
+  });
+  const src = form.querySelector('img').getAttribute('src');
+  let parsed;
+  try { parsed = new URL(src); } catch (e) { parsed = null; }
+  check(parsed && parsed.protocol === 'https:' && parsed.host && parsed.href === 'https://mkultra.monster/img/avatar/default.webp', scheme + ' quote avatar falls back to the https default');
+  check(textOf(form.querySelector('.who')) === '<img src=x onerror=alert(1)>', scheme + ' quote name stays text');
+  check(textOf(form.querySelector('.compose-reply-preview__text')) === '<b>nope</b>', scheme + ' quote snippet stays text');
+  check(textOf(form.querySelector('.tag')) === 'Media', scheme + ' quote media hint stays text');
+});
 
 console.log('reply preview regression: ' + checks.length + ' checks');
