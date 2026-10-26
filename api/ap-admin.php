@@ -48229,6 +48229,33 @@ if (VIEW === 'analytics') loadAnalytics();
   });
 })();
 </script>
+<script>
+// Desktop: the body never scrolls above the phone breakpoint (.feed is the
+// scroller), so a wheel over the empty page margins did nothing. Forward it
+// to the live timeline, like X/Twitter. Rails, modals and menus keep their
+// own wheel because only the bare page/shell/main surfaces are matched.
+(function () {
+  function isMargin(t) {
+    if (t === document.documentElement || t === document.body) return true;
+    return !!(t && t.classList && (t.classList.contains('shell') || t.classList.contains('main')));
+  }
+  document.addEventListener('wheel', function (event) {
+    if (event.defaultPrevented || event.ctrlKey || event.metaKey || !event.deltaY) return;
+    if (!isMargin(event.target)) return;
+    if (document.body.classList.contains('mobile-nav-open')) return;
+    const feed = document.querySelector('section.main > .feed') || document.querySelector('.main .feed');
+    if (!feed) return;
+    const overflowY = window.getComputedStyle(feed).overflowY;
+    if (overflowY !== 'auto' && overflowY !== 'scroll') return;
+    if (feed.scrollHeight <= feed.clientHeight) return;
+    let dy = event.deltaY;
+    if (event.deltaMode === 1) dy *= 16;
+    else if (event.deltaMode === 2) dy *= feed.clientHeight;
+    feed.scrollTop += dy;
+    event.preventDefault();
+  }, { passive: false });
+})();
+</script>
 <?php if (function_exists('ap_link_preview_youtube_script')) echo ap_link_preview_youtube_script(); ?>
 <script src="/api/assets/pluraldawn.js?v=20261009a" defer></script>
 </body>
