@@ -28108,6 +28108,79 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     select:hover { border-color: #4a4a4a; }
     select:focus-visible { outline: 2px solid var(--primary); outline-offset: 1px; }
     select option { background: var(--bg); color: var(--text); }
+    /* Native file inputs keep a light UA "Choose file" button under
+       color-scheme: dark, so its label disappears on this theme. Restyle
+       that button like a compact composer button (pill, weight, border,
+       theme colors) and keep the filename — "No file chosen" or the
+       selected name — in --text. One rule covers DM attachments, the post
+       composer, profile uploads, CSV import, and clan emblems.
+       The Firefox alias is a separate rule: an unknown pseudo-element
+       drops the whole selector list in the other browser. */
+    input[type="file"] {
+      color: var(--text);
+      background: #0c0c0c;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: .45rem .6rem;
+      font: inherit;
+      max-width: 100%;
+      cursor: pointer;
+    }
+    input[type="file"]:focus-visible {
+      outline: 2px solid var(--primary);
+      outline-offset: 1px;
+    }
+    input[type="file"]::file-selector-button {
+      appearance: none;
+      -webkit-appearance: none;
+      margin: 0 .7rem 0 0;
+      padding: .4rem .85rem;
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      background: var(--panel-2);
+      color: var(--text);
+      font: inherit;
+      font-weight: 600;
+      line-height: 1.2;
+      cursor: pointer;
+    }
+    input[type="file"]:hover::file-selector-button {
+      border-color: var(--primary);
+      color: var(--primary);
+    }
+    input[type="file"]:active::file-selector-button {
+      background: var(--primary-dim);
+    }
+    input[type="file"]::-moz-file-selector-button {
+      appearance: none;
+      -moz-appearance: none;
+      margin: 0 .7rem 0 0;
+      padding: .4rem .85rem;
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      background: var(--panel-2);
+      color: var(--text);
+      font: inherit;
+      font-weight: 600;
+      line-height: 1.2;
+      cursor: pointer;
+    }
+    input[type="file"]:hover::-moz-file-selector-button {
+      border-color: var(--primary);
+      color: var(--primary);
+    }
+    input[type="file"]:active::-moz-file-selector-button {
+      background: var(--primary-dim);
+    }
+    @media (forced-colors: active) {
+      input[type="file"] { color: CanvasText; background: Canvas; border-color: CanvasText; }
+      input[type="file"]::file-selector-button {
+        background: ButtonFace; color: ButtonText; border: 1px solid ButtonText;
+      }
+      input[type="file"]::-moz-file-selector-button {
+        background: ButtonFace; color: ButtonText; border: 1px solid ButtonText;
+      }
+    }
     .composer-check {
       display: flex;
       align-items: center;
@@ -30057,12 +30130,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       border: 1px solid var(--border); border-radius: 10px;
       padding: .65rem .75rem; font: inherit;
     }
-    .profile-form input[type="file"] { padding:.45rem .55rem; color:var(--muted); cursor:pointer; }
-    .profile-form input[type="file"]::file-selector-button {
-      margin-right:.65rem; padding:.4rem .7rem; border:1px solid var(--border);
-      border-radius:7px; background:var(--panel-2); color:var(--text); font:inherit; cursor:pointer;
-    }
-    .profile-form input[type="file"]::file-selector-button:hover { border-color:var(--primary); color:var(--primary); }
+    .profile-form input[type="file"] { padding:.45rem .55rem; color:var(--text); cursor:pointer; }
     .profile-form textarea { min-height: 140px; resize: vertical; }
     .profile-form .field-row {
       display: grid; grid-template-columns: 1fr 2fr auto; gap: .5rem; margin-top: .5rem; align-items: center;
