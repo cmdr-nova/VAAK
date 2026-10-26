@@ -8,6 +8,7 @@ function ap_bsky_xrpc(string $base,string $nsid,string $method,array $query=[],m
  if(is_callable($GLOBALS['thread_mutation']??null))($GLOBALS['thread_mutation'])();
  if($nsid==='app.bsky.feed.getPostThread')return $GLOBALS['thread_reply'];
  if($nsid==='app.bsky.feed.getPosts'&&!empty($GLOBALS['thread_posts_fault']))return ['ok'=>false];
+ if($nsid==='app.bsky.feed.getPosts'&&isset($GLOBALS['thread_posts_body']))return $GLOBALS['thread_posts_body'];
  if($nsid==='app.bsky.feed.getPosts')return ['ok'=>true,'json'=>['posts'=>[$GLOBALS['thread_focus']]]];
  return ['ok'=>false];
 }
@@ -136,16 +137,24 @@ foreach(['media','labels-only','scalar-embed','unknown-compact','fault'] as $vec
  thread_check(ap_bsky_post_item_by_uri($focus['uri'])['post']===$expectedStored,'durable post matches original '.$vector);
  if($vector==='media')thread_check($actual['post']['record']['text']==='Cached repair text'&&$expectedStored['record']['text']==='Live repair text','live durable refresh differs from cached returned paint');
 }
-$GLOBALS['thread_posts_fault']=false;unset($GLOBALS['admin_bsky_gallery_repair_budget']);
-foreach(['wrong-uri','wrong-author','malformed-record'] as $vector){
+$GLOBALS['thread_posts_fault']=false;unset($GLOBALS['admin_bsky_gallery_repair_budget'],$GLOBALS['thread_posts_body']);
+foreach(['wrong-uri','wrong-author','malformed-record','empty-posts'] as $vector){
  $incoming=$live;
  if($vector==='wrong-uri')$incoming['uri']=$child['uri'];
  if($vector==='wrong-author')$incoming['author']['did']='did:plc:impostor';
  if($vector==='malformed-record')$incoming['record']=null;
- ap_bsky_post_upsert_from_feed_item(['post'=>$thin],1);$beforePost=ap_bsky_post_item_by_uri($focus['uri'])['post'];$GLOBALS['thread_focus']=$incoming;
- thread_check(admin_bsky_thread_focus_item($focus['uri'],1,true)===null,'repair identity/shape rejected '.$vector);
+ ap_bsky_post_upsert_from_feed_item(['post'=>$thin],1);$beforePost=ap_bsky_post_item_by_uri($focus['uri'])['post'];
+ $GLOBALS['thread_focus']=$incoming;
+ if($vector==='empty-posts')$GLOBALS['thread_posts_body']=['ok'=>true,'json'=>['posts'=>[]]];
+ else unset($GLOBALS['thread_posts_body']);
+ $beforeCalls=count($GLOBALS['thread_calls']);
+ $kept=admin_bsky_thread_focus_item($focus['uri'],1,true);
+ $fetched=0;foreach(array_slice($GLOBALS['thread_calls'],$beforeCalls) as $call)if($call['nsid']==='app.bsky.feed.getPosts')$fetched++;
+ thread_check(is_array($kept)&&($kept['post']['uri']??'')===$focus['uri']&&($kept['post']['record']['text']??'')==='Cached repair text','bad AppView body keeps the cached focus '.$vector);
+ thread_check($fetched===1,'bad AppView body uses one getPosts '.$vector);
  thread_check(ap_bsky_post_item_by_uri($focus['uri'])['post']===$beforePost,'invalid repair has no durable post effect '.$vector);
 }
+unset($GLOBALS['thread_posts_body']);
 $GLOBALS['thread_focus']=$focus;ap_bsky_post_upsert_from_feed_item(['post'=>$focus],1);
 $GLOBALS['thread_reply']=['ok'=>false];thread_check(admin_bsky_thread_fragment($focus['uri'],'replies','home',[])===null,'transport fault refuses');
 // Labels read before Bluesky moderation acted: the focus re-reads them.
@@ -157,4 +166,85 @@ $got=admin_bsky_thread_focus_item($young['uri'],1,true);unset($GLOBALS['admin_bs
 thread_check(is_array($got)&&ap_bsky_post_is_sensitive($got['post'])&&($got['post']['author']['labels'][0]['val']??'')==='sexual','stale focus labels refreshed from AppView');
 thread_check(ap_bsky_post_is_sensitive(ap_bsky_post_item_by_uri($young['uri'])['post']),'refreshed labels stored');
 $GLOBALS['thread_focus']=$focus;
+// A valid cache survives an empty AppView body. A cold miss does not, and is not written.
+$staleKept=$young;$staleKept['uri']='at://did:plc:fixture/app.bsky.feed.post/stalekept';$staleKept['record']['text']='Stale cached text';unset($staleKept['indexedAt'],$staleKept['embed'],$staleKept['vaak_labels_at']);
+ap_bsky_post_upsert_from_feed_item(['post'=>$staleKept],1);$beforeStale=ap_bsky_post_item_by_uri($staleKept['uri'])['post'];
+$GLOBALS['thread_posts_body']=['ok'=>true,'json'=>['posts'=>[]]];$GLOBALS['admin_bsky_gallery_repair_budget']=2;
+$kept=admin_bsky_thread_focus_item($staleKept['uri'],1,true);unset($GLOBALS['admin_bsky_gallery_repair_budget']);
+thread_check(is_array($kept)&&($kept['post']['record']['text']??'')==='Stale cached text','label-stale cache survives empty getPosts');
+thread_check(ap_bsky_post_item_by_uri($staleKept['uri'])['post']===$beforeStale,'empty getPosts does not tombstone or rewrite the cache');
+$cold='at://did:plc:fixture/app.bsky.feed.post/coldempty';
+thread_check(admin_bsky_thread_focus_item($cold,1,true)===null,'cold empty getPosts stays unavailable');
+$q=ap_db()->prepare('SELECT COUNT(*) FROM bsky_posts WHERE bsky_uri=?');$q->execute([$cold]);thread_check((int)$q->fetchColumn()===0,'cold empty getPosts writes nothing');
+unset($GLOBALS['thread_posts_body']);
+// A stored row that is not a valid PostView still gets the one AppView read.
+$bad=$focus;$bad['uri']='at://did:plc:fixture/app.bsky.feed.post/badcache';$bad['record']['text']='Will be corrupted';
+ap_bsky_post_upsert_from_feed_item(['post'=>$bad],1);
+$broken=ap_bsky_post_item_by_uri($bad['uri'])['post'];$broken['record']['text']=null;
+ap_db()->prepare('UPDATE bsky_posts SET raw_json=? WHERE bsky_uri=?')->execute([json_encode($broken),$bad['uri']]);
+$restored=$bad;$restored['record']['text']='Restored from AppView';$GLOBALS['thread_focus']=$restored;
+$beforeCalls=count($GLOBALS['thread_calls']);
+$got=admin_bsky_thread_focus_item($bad['uri'],1,true);
+$fetched=0;foreach(array_slice($GLOBALS['thread_calls'],$beforeCalls) as $call)if($call['nsid']==='app.bsky.feed.getPosts')$fetched++;
+thread_check(is_array($got)&&($got['post']['record']['text']??'')==='Restored from AppView','invalid cache is one getPosts, then the live post');
+thread_check($fetched===1,'invalid cache does not fetch in a loop');
+thread_check((ap_bsky_post_item_by_uri($bad['uri'])['post']['record']['text']??'')==='Restored from AppView','valid live post replaces the invalid row');
+$GLOBALS['thread_focus']=$focus;
+if(!function_exists('ap_bsky_resolve_handle_did')){
+ function ap_bsky_resolve_handle_did(string $handle,int $ownerUserId=0):?string{
+  $GLOBALS['thread_calls'][]=['base'=>AP_BSKY_PUBLIC_API,'nsid'=>'com.atproto.identity.resolveHandle','method'=>'GET','query'=>['handle'=>$handle],'bearer'=>null,'timeout'=>4];
+  return null;
+ }
+}
+reference_load(dirname(__DIR__).'/ap-bsky.php',['ap_bsky_quote_preview','ap_bsky_tombstone_uri','ap_bsky_media_items_from_embeds']);
+$old=gmdate('c',time()-10000);
+$quoted=thread_post('quotedtarget','Quoted body text');
+$quoted['uri']='at://did:plc:quoted/app.bsky.feed.post/quotedtarget';
+$quoted['author']['did']='did:plc:quoted';$quoted['author']['handle']='quoted.bsky.test';
+$quoteEmbed=['$type'=>'app.bsky.embed.record#view','record'=>['uri'=>$quoted['uri'],'author'=>$quoted['author'],'value'=>['$type'=>'app.bsky.feed.post','text'=>'Quoted body text','createdAt'=>$old]]];
+$outer=thread_post('quotefocus','Outer quote post');
+$outer['record']['createdAt']=$old;unset($outer['indexedAt'],$outer['embed'],$outer['labels'],$outer['record']['embed']);
+$outer['embed']=$quoteEmbed;
+ap_bsky_post_upsert_from_feed_item(['post'=>$outer],1);
+$outboxBefore=(int)ap_db()->query('SELECT COUNT(*) FROM outbox_notes')->fetchColumn();
+$q=ap_db()->prepare('SELECT COUNT(*) FROM bsky_posts WHERE bsky_uri=?');$q->execute([$quoted['uri']]);thread_check((int)$q->fetchColumn()===0,'quoted target starts unstored');
+$beforeCalls=count($GLOBALS['thread_calls']);
+$GLOBALS['thread_focus']=$outer;
+$html=admin_bsky_thread_fragment($outer['uri'],'focus','home',[]);
+$fetched=0;foreach(array_slice($GLOBALS['thread_calls'],$beforeCalls) as $call)if($call['nsid']==='app.bsky.feed.getPosts')$fetched++;
+thread_check(is_string($html)&&str_contains($html,'Outer quote post')&&str_contains($html,'Quoted body text'),'cached quote whose target is not stored still opens');
+thread_check($fetched===1,'opening one quote post does the single focus getPosts');
+$GLOBALS['thread_posts_body']=['ok'=>true,'json'=>['posts'=>[]]];
+$beforeCalls=count($GLOBALS['thread_calls']);
+$html=admin_bsky_thread_fragment($outer['uri'],'focus','home',[]);
+$fetched=0;foreach(array_slice($GLOBALS['thread_calls'],$beforeCalls) as $call)if($call['nsid']==='app.bsky.feed.getPosts')$fetched++;
+thread_check(is_string($html)&&str_contains($html,'Outer quote post')&&str_contains($html,'Quoted body text'),'quote post still opens when AppView returns no post');
+thread_check($fetched===1,'empty AppView body is still one getPosts');
+unset($GLOBALS['thread_posts_body']);$GLOBALS['thread_focus']=$outer;
+$html=admin_bsky_thread_fragment('https://bsky.app/profile/did:plc:fixture/post/quotefocus','focus','home',[]);
+thread_check(is_string($html)&&str_contains($html,'Outer quote post'),'did permalink used by cards opens the quote post');
+$html=admin_bsky_thread_fragment('https://bsky.app/profile/alice.bsky.test/post/quotefocus','focus','home',[]);
+thread_check(is_string($html)&&str_contains($html,'Quoted body text'),'handle permalink opens the quote post');
+$withMedia=$outer;$withMedia['uri']='at://did:plc:fixture/app.bsky.feed.post/quotemedia';$withMedia['record']['text']='Quote with media';
+$withMedia['embed']=['$type'=>'app.bsky.embed.recordWithMedia#view','media'=>['$type'=>'app.bsky.embed.external#view','external'=>['uri'=>'https://example.test/story','title'=>'Story','description'=>'A story']],'record'=>['record'=>$quoteEmbed['record']]];
+ap_bsky_post_upsert_from_feed_item(['post'=>$withMedia],1);
+$html=admin_bsky_thread_fragment($withMedia['uri'],'focus','home',[]);
+thread_check(is_string($html)&&str_contains($html,'Quote with media')&&str_contains($html,'Quoted body text'),'quote-with-media whose target is not stored still opens');
+$missingQuote=$outer;$missingQuote['uri']='at://did:plc:fixture/app.bsky.feed.post/quotegone';$missingQuote['record']['text']='Parent of a missing quote';
+$missingQuote['embed']=['$type'=>'app.bsky.embed.record#view','record'=>['$type'=>'app.bsky.embed.record#viewNotFound','uri'=>$quoted['uri']]];
+ap_bsky_post_upsert_from_feed_item(['post'=>$missingQuote],1);
+$html=admin_bsky_thread_fragment($missingQuote['uri'],'focus','home',[]);
+thread_check(is_string($html)&&str_contains($html,'Parent of a missing quote'),'quote of a deleted post still opens the parent');
+$reason=['$type'=>'app.bsky.feed.defs#reasonRepost','by'=>['did'=>'did:plc:booster','handle'=>'booster.bsky.test','displayName'=>'Booster'],'indexedAt'=>$old];
+$reposted=$outer;$reposted['uri']='at://did:plc:fixture/app.bsky.feed.post/repostquote';$reposted['record']['text']='Reposted quote post';$reposted['embed']=$quoteEmbed;
+ap_bsky_post_upsert_from_feed_item(['post'=>$reposted,'reason'=>$reason],1);
+$html=admin_bsky_thread_fragment($reposted['uri'],'focus','home',[]);
+thread_check(is_string($html)&&str_contains($html,'Reposted quote post')&&str_contains($html,'Quoted body text'),'repost of a quote still opens');
+thread_check(!admin_direct_status_allowed(['uri'=>'at://did:plc:nobody/app.bsky.feed.post/missing','visibility'=>'public','bsky_post'=>['uri'=>'at://did:plc:nobody/app.bsky.feed.post/missing','author'=>['did'=>'did:plc:nobody'],'record'=>['text'=>'x','createdAt'=>$old]]],1),'unstored focus is still refused');
+thread_check(!admin_direct_status_allowed(['uri'=>'https://mkultra.monster/users/fixture/notes/nope','visibility'=>'public','source'=>'bluesky'],1),'missing local note is still refused');
+$nestedLocal=['uri'=>$outer['uri'],'visibility'=>'public','source'=>'bluesky','bsky_post'=>['uri'=>$outer['uri'],'author'=>['did'=>'did:plc:fixture'],'record'=>['text'=>'x','createdAt'=>$old]],'quote'=>['quoted_status'=>['uri'=>'https://mkultra.monster/users/fixture/notes/secret','visibility'=>'public','source'=>'bluesky']]];
+thread_check(!admin_direct_status_allowed($nestedLocal,1),'nested local note still needs its own row');
+$nestedFedi=$nestedLocal;$nestedFedi['quote']=['quoted_status'=>['uri'=>'https://remote.test/users/alice/statuses/99','visibility'=>'public','source'=>'bluesky']];
+thread_check(!admin_direct_status_allowed($nestedFedi,1),'nested fediverse quote still needs a stored row');
+thread_check($outboxBefore===(int)ap_db()->query('SELECT COUNT(*) FROM outbox_notes')->fetchColumn(),'opening bluesky quotes does not write the outbox');
 echo "bsky-thread-fragment-smoke PASS $checks actual helper/controller checks; declaration fixture only\n";
