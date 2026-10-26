@@ -886,7 +886,8 @@ if (isset($_GET['op']) && (string) $_GET['op'] === 'edit_draft') {
 
 // Low-volume passive Home learning. The client reports only a post key,
 // author/feed key, and a dwell bucket; server-side cooldowns deduplicate tabs
-// and reloads before anything reaches ap_user_signals.
+// and reloads before anything reaches ap_user_signals. Rows stay on this
+// server: they are not ActivityPub activities and they are not Bluesky records.
 if (
     ($_SERVER['REQUEST_METHOD'] ?? '') === 'POST'
     && isset($_GET['ajax'])
@@ -900,17 +901,16 @@ if (
         echo json_encode(['ok' => false, 'error' => 'Session expired.']);
         exit;
     }
-    $platform = strtolower(trim((string) ($_POST['platform'] ?? '')));
-    $kind = strtolower(trim((string) ($_POST['kind'] ?? '')));
-    $targetKey = trim((string) ($_POST['target_key'] ?? ''));
-    $targetActor = trim((string) ($_POST['target_actor'] ?? ''));
-    $dwellSeconds = max(0, min(300, (int) ($_POST['dwell_seconds'] ?? 0)));
-    $validActor = ($platform === 'fedi' && str_starts_with($targetActor, 'https://'))
-        || ($platform === 'bsky' && (str_starts_with($targetActor, 'did:') || str_starts_with($targetActor, 'https://bsky.app/profile/')))
-        || ($platform === 'rss' && preg_match('/^rss:feed:[1-9][0-9]*$/', $targetActor));
-    if (!in_array($kind, ['impression', 'click', 'dwell'], true)
-        || $targetKey === '' || strlen($targetKey) > 2048 || strlen($targetActor) > 2048 || !$validActor
-    ) {
+    $event = function_exists('ap_signal_passive_normalize_event')
+        ? ap_signal_passive_normalize_event(
+            (string) ($_POST['platform'] ?? ''),
+            (string) ($_POST['kind'] ?? ''),
+            (string) ($_POST['target_key'] ?? ''),
+            (string) ($_POST['target_actor'] ?? ''),
+            (int) ($_POST['dwell_seconds'] ?? 0)
+        )
+        : null;
+    if ($event === null) {
         http_response_code(400);
         echo json_encode(['ok' => false, 'error' => 'Invalid Home signal.']);
         exit;
@@ -922,13 +922,44 @@ if (
     } elseif (session_status() === PHP_SESSION_ACTIVE) {
         session_write_close();
     }
-    $signalProfile = function_exists('ap_profile_get') ? ap_profile_get($vaakActorKey) : [];
-    $algorithmEnabled = !array_key_exists('algorithm_enabled', $signalProfile)
-        || !empty($signalProfile['algorithm_enabled']);
-    $recorded = $algorithmEnabled && function_exists('ap_signal_record_passive')
-        ? ap_signal_record_passive($vaakOwnerId, $platform, $kind, $targetKey, $targetActor, $dwellSeconds)
-        : false;
-    echo json_encode(['ok' => true, 'recorded' => $recorded], JSON_UNESCAPED_SLASHES);
+    $recorded = vaak_home_signal_store_events($vaakOwnerId, $vaakActorKey, [$event]);
+    echo json_encode(['ok' => true, 'recorded' => $recorded > 0], JSON_UNESCAPED_SLASHES);
+    exit;
+}
+
+// Batched visible-time from Home and the open post. One request carries a
+// handful of measurements. Guests and logged-out sessions store nothing.
+if (
+    ($_SERVER['REQUEST_METHOD'] ?? '') === 'POST'
+    && isset($_GET['ajax'])
+    && (string) $_GET['ajax'] === 'home_signal_batch'
+) {
+    header('Content-Type: application/json; charset=utf-8');
+    header('Cache-Control: no-store');
+    $csrfSignal = (string) ($_POST['csrf'] ?? $_SERVER['HTTP_X_VAAK_CSRF'] ?? '');
+    if (!ap_auth_csrf_ok($csrfSignal)) {
+        http_response_code(403);
+        echo json_encode(['ok' => false, 'error' => 'Session expired.']);
+        exit;
+    }
+    $events = function_exists('ap_signal_passive_normalize_batch')
+        ? ap_signal_passive_normalize_batch($_POST['events'] ?? '[]')
+        : [];
+    if ($events === [] && trim((string) ($_POST['events'] ?? '')) !== '' && trim((string) ($_POST['events'] ?? '')) !== '[]') {
+        $decoded = json_decode((string) ($_POST['events'] ?? ''), true);
+        if (!is_array($decoded)) {
+            http_response_code(400);
+            echo json_encode(['ok' => false, 'error' => 'Invalid Home signal.']);
+            exit;
+        }
+    }
+    if (function_exists('ap_auth_session_write_close')) {
+        ap_auth_session_write_close();
+    } elseif (session_status() === PHP_SESSION_ACTIVE) {
+        session_write_close();
+    }
+    $recorded = vaak_home_signal_store_events($vaakOwnerId, $vaakActorKey, $events);
+    echo json_encode(['ok' => true, 'recorded' => $recorded, 'accepted' => count($events)], JSON_UNESCAPED_SLASHES);
     exit;
 }
 
@@ -8887,6 +8918,39 @@ function admin_home_item_preference_actor(array $item): string
         }
     }
     return rtrim((string) ($row['actor_id'] ?? $row['attributedTo'] ?? ''), '/');
+}
+
+/**
+ * Store passive Home / single-post measurements for the logged-in account.
+ * Guests store nothing. The rows are local personalization signals only.
+ *
+ * @param list<array{platform:string,kind:string,target_key:string,target_actor:string,dwell_seconds:int}> $events
+ */
+function vaak_home_signal_store_events(int $ownerUserId, string $actorKey, array $events): int
+{
+    if ($ownerUserId < 1 || $events === [] || !empty($GLOBALS['vaak_guest_profile'])) {
+        return 0;
+    }
+    $signalProfile = function_exists('ap_profile_get') ? ap_profile_get($actorKey) : [];
+    $algorithmEnabled = !array_key_exists('algorithm_enabled', $signalProfile)
+        || !empty($signalProfile['algorithm_enabled']);
+    if (!$algorithmEnabled || !function_exists('ap_signal_record_passive')) {
+        return 0;
+    }
+    $recorded = 0;
+    foreach ($events as $event) {
+        if (ap_signal_record_passive(
+            $ownerUserId,
+            (string) ($event['platform'] ?? ''),
+            (string) ($event['kind'] ?? ''),
+            (string) ($event['target_key'] ?? ''),
+            (string) ($event['target_actor'] ?? ''),
+            (int) ($event['dwell_seconds'] ?? 0)
+        )) {
+            $recorded++;
+        }
+    }
+    return $recorded;
 }
 
 /**
@@ -19674,6 +19738,10 @@ function admin_render_masto_status_card(
         if ($bskyRankKey !== '' && $bskyRankActor !== '') {
             $rankAttrs = admin_home_rank_tracking_attrs('bsky', $bskyRankKey, $bskyRankActor);
         }
+    } elseif ($focused && !$isRss && !$isBsky && $uri !== '' && $actorRef !== '') {
+        // Single-post view only. Home cards already get rank attrs from the
+        // timeline renderers; adding them here would change those cards.
+        $rankAttrs = admin_home_rank_tracking_attrs('fedi', $uri, $actorRef);
     }
     $rssHost = '';
     if ($isRss && $uri !== '' && preg_match('#^https?://#i', $uri)) {
@@ -40476,72 +40544,126 @@ window.apAdminToast = function (msg, isErr) {
   });
 })();
 </script>
+<script>document.documentElement.dataset.ownerSignals=<?= ($vaakOwnerId > 0 && empty($GLOBALS['vaak_guest_profile'])) ? "'1'" : "''" ?>;</script>
 <script>
-// Weak, privacy-bounded Home feedback: sustained visibility, meaningful card
-// clicks, and bucketed dwell. Explicit actions remain much stronger signals.
+// Weak, privacy-bounded Home and single-post feedback for the logged-in
+// account. Visible time is batched and sent occasionally. Idle tabs and
+// glances under six seconds are not dwell. Nothing here is federated.
 (function bindHomePassiveSignals() {
-  if (!('IntersectionObserver' in window) || document.documentElement.dataset.homeSignalsBound === '1') return;
+  const probe = window.__VAAK_HOME_SIGNAL_PROBE === true;
+  if (!probe && (document.documentElement.dataset.ownerSignals !== '1' || !('IntersectionObserver' in window) || document.documentElement.dataset.homeSignalsBound === '1')) return;
   document.documentElement.dataset.homeSignalsBound = '1';
+  const MIN_DWELL_MS = 6000;
+  const MAX_DWELL_S = 300;
+  const IMPRESSION_MS = 1200;
+  const IDLE_MS = 180000;
+  const FLUSH_MS = 20000;
+  const FLUSH_AT = 8;
   const states = new WeakMap();
   const active = new Set();
   const onscreen = new Set();
+  const watched = new Set();
+  const queue = [];
+  const requests = [];
+  let flushTimer = 0;
+  let lastInput = performance.now();
+  let idleTimer = 0;
 
-  function isHomeCard(card) {
-    const items = card && card.closest && card.closest('#timeline-items');
-    return !!(items && items.dataset.view === 'home' && card.dataset.rankKey && card.dataset.rankActor);
+  function now() { return performance.now(); }
+  function isTracked(card) {
+    if (!card || !card.dataset || !card.dataset.rankKey || !card.dataset.rankActor) return false;
+    if (card.id === 'status-focus') return true;
+    const items = card.closest && card.closest('#timeline-items');
+    return !!(items && items.dataset.view === 'home');
   }
-  function send(kind, card, dwellSeconds) {
-    if (!isHomeCard(card) || !window.VAAK_CSRF) return;
-    const fd = new FormData();
-    fd.set('csrf', window.VAAK_CSRF);
-    fd.set('kind', kind);
-    fd.set('platform', card.dataset.rankPlatform || '');
-    fd.set('target_key', card.dataset.rankKey || '');
-    fd.set('target_actor', card.dataset.rankActor || '');
-    if (dwellSeconds) fd.set('dwell_seconds', String(Math.min(300, Math.max(0, dwellSeconds))));
-    const url = '/vaak/?view=home&ajax=home_signal';
-    if (navigator.sendBeacon && navigator.sendBeacon(url, fd)) return;
-    fetch(url, { method: 'POST', body: fd, credentials: 'same-origin', keepalive: true }).catch(() => {});
+  function enqueue(kind, card, dwellSeconds) {
+    if (!isTracked(card) || !window.VAAK_CSRF) return;
+    const seconds = dwellSeconds ? Math.min(MAX_DWELL_S, Math.max(0, Math.round(dwellSeconds))) : 0;
+    if (kind === 'dwell' && seconds < 6) return;
+    queue.push({
+      kind: kind,
+      platform: card.dataset.rankPlatform || '',
+      target_key: card.dataset.rankKey || '',
+      target_actor: card.dataset.rankActor || '',
+      dwell_seconds: kind === 'dwell' ? seconds : 0
+    });
+    if (queue.length >= FLUSH_AT) flush(false);
+    else if (!flushTimer) flushTimer = window.setTimeout(function () { flush(false); }, FLUSH_MS);
+  }
+  function flush(beacon) {
+    if (flushTimer) { clearTimeout(flushTimer); flushTimer = 0; }
+    if (!queue.length || !window.VAAK_CSRF) { queue.length = 0; return; }
+    const url = '/vaak/?view=home&ajax=home_signal_batch';
+    do {
+      const events = queue.splice(0, FLUSH_AT);
+      requests.push(events);
+      const fd = new FormData();
+      fd.set('csrf', window.VAAK_CSRF);
+      fd.set('events', JSON.stringify(events));
+      if (beacon && navigator.sendBeacon && navigator.sendBeacon(url, fd)) {
+        continue;
+      }
+      fetch(url, { method: 'POST', body: fd, credentials: 'same-origin', keepalive: true }).catch(function () {});
+      if (queue.length) flushTimer = window.setTimeout(function () { flush(false); }, FLUSH_MS);
+      return;
+    } while (queue.length);
   }
   function stateFor(card) {
     let state = states.get(card);
     if (!state) {
       state = { visible: false, started: 0, total: 0, impression: false, dwell: false, click: false, timer: 0 };
       states.set(card, state);
+      watched.add(card);
     }
     return state;
   }
+  function userIdle() { return now() - lastInput >= IDLE_MS; }
   function start(card) {
-    if (!isHomeCard(card) || document.hidden) return;
+    if (!isTracked(card) || document.hidden || userIdle()) return;
     const state = stateFor(card);
-    if (state.visible) return;
+    if (state.visible || state.dwell) return;
     state.visible = true;
-    state.started = performance.now();
+    state.started = now();
     active.add(card);
     if (!state.impression) {
       clearTimeout(state.timer);
-      state.timer = window.setTimeout(() => {
-        if (!state.visible || document.hidden || state.impression) return;
+      state.timer = window.setTimeout(function () {
+        if (!state.visible || document.hidden || state.impression || userIdle()) return;
         state.impression = true;
-        send('impression', card, 0);
-      }, 1200);
+        enqueue('impression', card, 0);
+      }, IMPRESSION_MS);
     }
   }
-  function stop(card, flushDwell) {
+  function pause(card) {
     const state = states.get(card);
     if (!state || !state.visible) return;
-    state.total += Math.max(0, performance.now() - state.started);
+    state.total = Math.min(MAX_DWELL_S * 1000, state.total + Math.max(0, now() - state.started));
     state.started = 0;
     state.visible = false;
     active.delete(card);
     clearTimeout(state.timer);
-    if (flushDwell && !state.dwell && state.total >= 6000) {
-      state.dwell = true;
-      send('dwell', card, Math.round(state.total / 1000));
-    }
   }
-  const observer = new IntersectionObserver((entries) => {
-    entries.forEach((entry) => {
+  function commitDwell(card) {
+    const state = states.get(card);
+    if (!state || state.dwell) return;
+    if (state.visible) {
+      state.total = Math.min(MAX_DWELL_S * 1000, state.total + Math.max(0, now() - state.started));
+      state.started = now();
+    }
+    if (state.total < MIN_DWELL_MS) return;
+    state.dwell = true;
+    state.visible = false;
+    state.started = 0;
+    active.delete(card);
+    clearTimeout(state.timer);
+    enqueue('dwell', card, Math.round(state.total / 1000));
+  }
+  function leave(card) {
+    commitDwell(card);
+    pause(card);
+  }
+  const observer = new IntersectionObserver(function (entries) {
+    entries.forEach(function (entry) {
       const enough = entry.isIntersecting
         && entry.intersectionRect.height >= Math.min(240, entry.boundingClientRect.height * 0.5);
       if (enough) {
@@ -40549,52 +40671,89 @@ window.apAdminToast = function (msg, isErr) {
         start(entry.target);
       } else {
         onscreen.delete(entry.target);
-        stop(entry.target, true);
+        leave(entry.target);
       }
     });
   }, { threshold: [0, 0.25, 0.5] });
   function bind(root) {
     const scope = root && root.querySelectorAll ? root : document;
-    if (scope.matches && scope.matches('article.tweet[data-rank-key]') && isHomeCard(scope)) observer.observe(scope);
-    scope.querySelectorAll('article.tweet[data-rank-key]').forEach((card) => {
-      if (isHomeCard(card) && !states.has(card)) {
+    const cards = [];
+    if (scope.matches && scope.matches('article.tweet[data-rank-key], article#status-focus')) cards.push(scope);
+    if (scope.querySelectorAll) {
+      scope.querySelectorAll('article.tweet[data-rank-key], article#status-focus').forEach(function (card) { cards.push(card); });
+    }
+    cards.forEach(function (card) {
+      if (isTracked(card) && !states.has(card)) {
         stateFor(card);
         observer.observe(card);
       }
     });
   }
   bind(document);
-  const mutations = new MutationObserver((records) => {
-    records.forEach((record) => {
-      record.addedNodes.forEach((node) => { if (node.nodeType === 1) bind(node); });
-      record.removedNodes.forEach((node) => {
+  const mutations = new MutationObserver(function (records) {
+    records.forEach(function (record) {
+      record.addedNodes.forEach(function (node) { if (node.nodeType === 1) bind(node); });
+      record.removedNodes.forEach(function (node) {
         if (node.nodeType !== 1) return;
-        if (states.has(node)) { onscreen.delete(node); stop(node, true); }
-        if (node.querySelectorAll) node.querySelectorAll('article.tweet[data-rank-key]').forEach((card) => {
-          onscreen.delete(card); stop(card, true);
+        if (states.has(node)) { onscreen.delete(node); leave(node); }
+        if (node.querySelectorAll) node.querySelectorAll('article.tweet[data-rank-key], article#status-focus').forEach(function (card) {
+          onscreen.delete(card); leave(card);
         });
       });
     });
   });
   if (document.body) mutations.observe(document.body, { childList: true, subtree: true });
-  document.addEventListener('visibilitychange', () => {
-    if (document.hidden) Array.from(active).forEach((card) => stop(card, false));
+  function noteInput() { lastInput = now(); if (!document.hidden) Array.from(onscreen).forEach(start); }
+  ['mousemove', 'keydown', 'pointerdown', 'touchstart'].forEach(function (name) {
+    window.addEventListener(name, noteInput, { passive: true, capture: true });
+  });
+  // Scroll only marks that someone is here. It does not send a request.
+  window.addEventListener('scroll', noteInput, { passive: true, capture: true });
+  function freezeIdle() {
+    if (!userIdle()) return;
+    Array.from(active).forEach(pause);
+  }
+  idleTimer = window.setInterval(freezeIdle, 15000);
+  document.addEventListener('visibilitychange', function () {
+    if (document.hidden) Array.from(active).forEach(function (card) { commitDwell(card); pause(card); });
     else Array.from(onscreen).forEach(start);
   });
-  window.addEventListener('pagehide', () => {
-    Array.from(active).forEach((card) => stop(card, true));
+  window.addEventListener('pagehide', function () {
+    Array.from(watched).forEach(commitDwell);
+    flush(true);
   });
-  document.addEventListener('click', (event) => {
-    const card = event.target && event.target.closest && event.target.closest('article.tweet[data-rank-key]');
-    if (!card || !isHomeCard(card) || event.target.closest('.tweet-actions, form, .post-action-menu')) return;
+  document.addEventListener('click', function (event) {
+    noteInput();
+    const card = event.target && event.target.closest && event.target.closest('article.tweet[data-rank-key], article#status-focus');
+    if (!card || !isTracked(card) || event.target.closest('.tweet-actions, form, .post-action-menu')) return;
     const meaningful = event.target.closest('a[href], .tweet-content-more, .media-thumb, video, audio');
     if (!meaningful) return;
     const state = stateFor(card);
     if (!state.click) {
       state.click = true;
-      send('click', card, 0);
+      enqueue('click', card, 0);
     }
   }, true);
+  if (probe) {
+    window.__VAAK_HOME_SIGNAL_PROBE = {
+      isTracked: isTracked,
+      enqueue: enqueue,
+      flush: flush,
+      start: start,
+      leave: leave,
+      pause: pause,
+      commitDwell: commitDwell,
+      noteInput: noteInput,
+      freezeIdle: freezeIdle,
+      queue: queue,
+      requests: requests,
+      states: states,
+      MIN_DWELL_MS: MIN_DWELL_MS,
+      MAX_DWELL_S: MAX_DWELL_S,
+      IDLE_MS: IDLE_MS,
+      setIdleFor: function (ms) { lastInput = now() - ms; freezeIdle(); }
+    };
+  }
 })();
 </script>
 <script>

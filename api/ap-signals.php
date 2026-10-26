@@ -120,3 +120,81 @@ function ap_signal_record_passive(
         return false;
     }
 }
+
+/**
+ * One passive measurement the browser is allowed to send.
+ * Post text, scroll position, and the page URL are not accepted.
+ *
+ * @return array{platform:string,kind:string,target_key:string,target_actor:string,dwell_seconds:int}|null
+ */
+function ap_signal_passive_normalize_event(
+    string $platform,
+    string $kind,
+    string $targetKey,
+    string $targetActor,
+    int $dwellSeconds
+): ?array {
+    $platform = strtolower(trim($platform));
+    $kind = strtolower(trim($kind));
+    $targetKey = trim($targetKey);
+    $targetActor = trim($targetActor);
+    $dwellSeconds = max(0, min(300, $dwellSeconds));
+    $validActor = ($platform === 'fedi' && str_starts_with($targetActor, 'https://'))
+        || ($platform === 'bsky' && (str_starts_with($targetActor, 'did:') || str_starts_with($targetActor, 'https://bsky.app/profile/')))
+        || ($platform === 'rss' && preg_match('/^rss:feed:[1-9][0-9]*$/', $targetActor) === 1);
+    if (!in_array($kind, ['impression', 'click', 'dwell'], true)
+        || $targetKey === ''
+        || strlen($targetKey) > 2048
+        || strlen($targetActor) > 2048
+        || !$validActor
+    ) {
+        return null;
+    }
+    return [
+        'platform' => $platform,
+        'kind' => $kind,
+        'target_key' => $targetKey,
+        'target_actor' => $targetActor,
+        'dwell_seconds' => $kind === 'dwell' ? $dwellSeconds : 0,
+    ];
+}
+
+/**
+ * Cap a batch of passive measurements. Invalid rows are dropped.
+ * The cap is the whole request: the client flushes at this size so a fast
+ * scroll cannot turn into a large write.
+ *
+ * @param mixed $raw
+ * @return list<array{platform:string,kind:string,target_key:string,target_actor:string,dwell_seconds:int}>
+ */
+function ap_signal_passive_normalize_batch(mixed $raw, int $limit = 8): array
+{
+    $limit = max(1, min(8, $limit));
+    if (is_string($raw)) {
+        $decoded = json_decode($raw, true);
+        $raw = is_array($decoded) ? $decoded : [];
+    }
+    if (!is_array($raw)) {
+        return [];
+    }
+    $out = [];
+    foreach ($raw as $event) {
+        if (count($out) >= $limit) {
+            break;
+        }
+        if (!is_array($event)) {
+            continue;
+        }
+        $norm = ap_signal_passive_normalize_event(
+            (string) ($event['platform'] ?? ''),
+            (string) ($event['kind'] ?? ''),
+            (string) ($event['target_key'] ?? ''),
+            (string) ($event['target_actor'] ?? ''),
+            (int) ($event['dwell_seconds'] ?? 0)
+        );
+        if ($norm !== null) {
+            $out[] = $norm;
+        }
+    }
+    return $out;
+}
