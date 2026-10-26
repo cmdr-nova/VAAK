@@ -227,8 +227,14 @@ pub(crate) fn cw_gate(spoiler: &str, sensitive: bool, inner: &str, auto_unblur: 
 fn media_kind(url: &str, mime: &str, kind: &str) -> bool {
     let path = reqwest::Url::parse(url).ok().map(|u| u.path().to_owned()).unwrap_or_default();
     let extension = path.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
-    if kind == "video" { mime.starts_with("video/") || matches!(mime, "application/x-mpegurl" | "application/vnd.apple.mpegurl") || matches!(extension.as_str(), "mp4" | "webm" | "mov" | "m4v" | "m3u8") }
+    // audio/webm is a voice note. The file extension would otherwise look like video.
+    if kind == "video" { !mime.starts_with("audio/") && (mime.starts_with("video/") || matches!(mime, "application/x-mpegurl" | "application/vnd.apple.mpegurl") || matches!(extension.as_str(), "mp4" | "webm" | "mov" | "m4v" | "m3u8")) }
     else { mime.starts_with("audio/") || matches!(extension.as_str(), "mp3" | "m4a" | "aac" | "ogg" | "oga" | "wav" | "flac" | "webm") }
+}
+fn media_alt(att: &Value) -> String {
+    let raw = ["description", "name", "alt"].into_iter().find_map(|key| att.get(key).and_then(Value::as_str)).unwrap_or("");
+    let stripped = static_regex!(r"(?s)<!--.*?-->|<[^>]*>").replace_all(raw, "");
+    php_trim(&stripped).chars().take(1500).collect()
 }
 fn image_poster(url: &str) -> bool {
     if !url.starts_with("https://") || media_kind(url, "", "video") || media_kind(url, "", "audio") { return false; }
@@ -252,6 +258,8 @@ fn media_row_mode(media: &[Value], lazy: bool, silent:bool) -> String {
         let mime = string(att, "mediaType").to_ascii_lowercase();
         let kind = string(att, "type").to_ascii_lowercase();
         let mime = if mime.is_empty() && kind == "audio" { "audio/*".into() } else { mime };
+        let alt = media_alt(att);
+        let label = if alt.is_empty() { String::new() } else { format!(" aria-label=\"{}\"", esc(&alt)) };
         if media_kind(url, &mime, "video") {
             let mut poster = if image_poster(preview) { preview.to_owned() } else { String::new() };
             if poster.is_empty() {
@@ -260,11 +268,12 @@ fn media_row_mode(media: &[Value], lazy: bool, silent:bool) -> String {
             }
             let hls = url.split(['?', '#']).next().unwrap_or("").to_ascii_lowercase().ends_with(".m3u8") || matches!(mime.as_str(), "application/x-mpegurl" | "application/vnd.apple.mpegurl");
             let source = if hls { format!(" data-hls-src=\"{}\"{}", esc(url), if lazy { " preload=\"none\"" } else { "" }) } else if lazy { format!(" data-src=\"{}\" preload=\"none\"", esc(url)) } else { format!(" src=\"{}\"", esc(&first_frame_src(url, &poster))) };
-            cells.push(format!("<video class=\"media-video\" data-media-warm-url=\"{}\"{source} controls loop playsinline{}{}{} referrerpolicy=\"no-referrer\"></video>", esc(if poster.is_empty() { url } else { &poster }), if lazy { "" } else { " preload=\"metadata\"" }, if silent { " muted" } else { "" }, if poster.is_empty() { String::new() } else { format!(" poster=\"{}\"", esc(&poster)) }));
+            cells.push(format!("<video class=\"media-video\" data-media-warm-url=\"{}\"{source} controls loop playsinline{}{}{}{label} referrerpolicy=\"no-referrer\"></video>", esc(if poster.is_empty() { url } else { &poster }), if lazy { "" } else { " preload=\"metadata\"" }, if silent { " muted" } else { "" }, if poster.is_empty() { String::new() } else { format!(" poster=\"{}\"", esc(&poster)) }));
         } else if media_kind(url, &mime, "audio") {
-            cells.push(format!("<div class=\"media-audio-card\" role=\"group\" aria-label=\"Audio post\"><img class=\"media-audio-art\" src=\"/api/assets/audio-post-default.jpg\" alt=\"\" loading=\"lazy\" decoding=\"async\"><audio class=\"media-audio\" src=\"{}\" controls preload=\"metadata\"></audio></div>", esc(url)));
+            let audio_label = if alt.is_empty() { "Audio post" } else { alt.as_str() };
+            cells.push(format!("<div class=\"media-audio-card\" role=\"group\" aria-label=\"{}\"><img class=\"media-audio-art\" src=\"/api/assets/audio-post-default.jpg\" alt=\"\" loading=\"lazy\" decoding=\"async\"><audio class=\"media-audio\" src=\"{}\" controls preload=\"metadata\"{label}></audio></div>", esc(audio_label), esc(url)));
         } else {
-            cells.push(format!("<button type=\"button\" class=\"media-lightbox-trigger\" data-full=\"{}\" title=\"View image\"><img src=\"{}\" data-media-warm-url=\"{}\" alt=\"\" loading=\"lazy\" referrerpolicy=\"no-referrer\" decoding=\"async\"></button>", esc(url), esc(if lazy && image_poster(preview) { preview } else { url }), esc(if preview.is_empty() { url } else { preview })));
+            cells.push(format!("<button type=\"button\" class=\"media-lightbox-trigger\" data-full=\"{}\" title=\"View image\"><img src=\"{}\" data-media-warm-url=\"{}\" alt=\"{}\" loading=\"lazy\" referrerpolicy=\"no-referrer\" decoding=\"async\"></button>", esc(url), esc(if lazy && image_poster(preview) { preview } else { url }), esc(if preview.is_empty() { url } else { preview }), esc(&alt)));
         }
         if cells.len() == 4 { break; }
     }

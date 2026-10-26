@@ -10746,32 +10746,16 @@ function ap_masto_status_from_dm(array $row): array
     $raw = (string) ($row['content'] ?? '');
     $objectId = (string) ($row['object_id'] ?? '');
     $media = [];
-    if (!empty($row['media_urls'])) {
-        $decoded = json_decode((string) $row['media_urls'], true);
-        if (is_array($decoded)) {
-            $i = 0;
-            foreach ($decoded as $u) {
-                $clean = is_string($u) ? ap_profile_sanitize_https_url($u) : null;
-                if ($clean === null) {
-                    continue;
-                }
-                $i++;
-                $media[] = [
-                    'id' => ap_masto_dm_status_id($dmId, isset($row['created_at']) ? (string) $row['created_at'] : null) . $i,
-                    'type' => 'image',
-                    'url' => $clean,
-                    'preview_url' => $clean,
-                    'remote_url' => $clean,
-                    'preview_remote_url' => null,
-                    'text_url' => null,
-                    'meta' => null,
-                    'description' => null,
-                    'blurhash' => null,
-                ];
-                if ($i >= 4) {
-                    break;
-                }
-            }
+    $warn = function_exists('ap_dm_warning_from_row')
+        ? ap_dm_warning_from_row($row)
+        : ['spoiler_text' => '', 'sensitive' => false];
+    if (function_exists('ap_dm_masto_media_list')) {
+        $i = 0;
+        $baseId = ap_masto_dm_status_id($dmId, isset($row['created_at']) ? (string) $row['created_at'] : null);
+        foreach (ap_dm_masto_media_list($row) as $att) {
+            $i++;
+            $att['id'] = $baseId . $i;
+            $media[] = $att;
         }
     }
     $extraActors = [];
@@ -10845,8 +10829,8 @@ function ap_masto_status_from_dm(array $row): array
         'created_at' => ap_masto_format_time(isset($row['created_at']) ? (string) $row['created_at'] : null),
         'in_reply_to_id' => null,
         'in_reply_to_account_id' => null,
-        'sensitive' => false,
-        'spoiler_text' => '',
+        'sensitive' => !empty($warn['sensitive']),
+        'spoiler_text' => (string) ($warn['spoiler_text'] ?? ''),
         'visibility' => 'direct',
         'language' => 'en',
         'uri' => $objectId !== '' ? $objectId : ($ownerActor . '/notes/dm-' . $dmId),

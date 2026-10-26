@@ -4875,10 +4875,22 @@ $vaakAdminOnlyActions = [
             define('AP_INBOX_LIB_ONLY', true);
         }
         require_once __DIR__ . '/ap-inbox.php';
-        if ($to === '' || $content === '') {
-            $error = 'Recipient and message text are required.';
+        $uploaded = ap_admin_collect_media_uploads();
+        $spoiler = trim((string) ($_POST['spoiler_text'] ?? ''));
+        $sensitive = !empty($_POST['sensitive']) || $spoiler !== '';
+        if (!empty($uploaded['error'])) {
+            $error = (string) $uploaded['error'];
+        } elseif ($to === '' || ($content === '' && ($uploaded['ids'] ?? []) === [])) {
+            $error = 'Recipient and a message or attachment are required.';
         } else {
-            $res = ap_dm_send($content, $to, $inReplyTo !== '' ? $inReplyTo : null);
+            $res = ap_dm_send(
+                $content,
+                $to,
+                $inReplyTo !== '' ? $inReplyTo : null,
+                $uploaded['ids'] ?? [],
+                $spoiler,
+                $sensitive
+            );
             if (!empty($res['ok'])) {
                 $notice = 'DM sent to ' . ($res['peer'] ?? $to)
                     . ' · delivered=' . (int) ($res['delivered'] ?? 0);
@@ -14251,6 +14263,9 @@ function admin_report_href(string $targetActor, string $objectId = '', string $f
 function admin_media_is_video(string $url, ?string $mediaType = null): bool
 {
     $mt = strtolower(trim((string) $mediaType));
+    if (str_starts_with($mt, 'audio/')) {
+        return false;
+    }
     if (str_starts_with($mt, 'video/')
         || $mt === 'application/x-mpegurl'
         || $mt === 'application/vnd.apple.mpegurl') {
@@ -15362,7 +15377,7 @@ function admin_quote_media_html(array $items): string
  * Normalize Mastodon media_attachments / AS2 attachments into admin_media_row_html items.
  *
  * @param mixed $attachments
- * @return list<array{url:string,mediaType:?string,preview_url?:string}>
+ * @return list<array{url:string,mediaType:?string,preview_url?:string,description?:string,name?:string,alt?:string}>
  */
 function admin_quote_media_items_from_status_like(mixed $attachments): array
 {
@@ -15409,11 +15424,17 @@ function admin_quote_media_items_from_status_like(mixed $attachments): array
         } elseif (is_string($att['thumbnail'] ?? null) && str_starts_with((string) $att['thumbnail'], 'https://')) {
             $preview = (string) $att['thumbnail'];
         }
-        $items[] = [
+        $item = [
             'url' => $url,
             'mediaType' => $mt,
             'preview_url' => $preview,
         ];
+        foreach (['description', 'name', 'alt'] as $altKey) {
+            if (array_key_exists($altKey, $att) && is_string($att[$altKey])) {
+                $item[$altKey] = $att[$altKey];
+            }
+        }
+        $items[] = $item;
         if (count($items) >= 4) {
             break;
         }
@@ -15442,6 +15463,14 @@ function admin_media_row_html(array $items, string $hint = ''): string
                 $mt = 'audio/*';
             }
             $preview = (string) ($item['preview_url'] ?? $item['poster'] ?? $item['thumbnail'] ?? '');
+        }
+        $alt = '';
+        if (is_array($item)) {
+            $altRaw = $item['description'] ?? ($item['name'] ?? ($item['alt'] ?? ''));
+            if (is_string($altRaw)) {
+                $alt = trim(strip_tags($altRaw));
+                $alt = function_exists('mb_substr') ? mb_substr($alt, 0, 1500) : substr($alt, 0, 1500);
+            }
         }
         if ($url === '' || !str_starts_with($url, 'https://')) {
             continue;
@@ -15492,14 +15521,17 @@ function admin_media_row_html(array $items, string $hint = ''): string
             // mobile Safari/Chrome otherwise start the soundtrack on navigate.
             $muteAttr = !empty($GLOBALS['vaak_pin_media_silent']) ? ' muted' : '';
             $preload = $deferMedia ? '' : ' preload="metadata"';
+            $labelAttr = $alt !== '' ? ' aria-label="' . h($alt) . '"' : '';
             $cells[] = '<video class="media-video" data-media-warm-url="' . h($warmUrl) . '"' . $sourceAttr . ' controls loop playsinline' . $preload
                 . $muteAttr
                 . $posterAttr
+                . $labelAttr
                 . ' referrerpolicy="no-referrer"></video>';
         } elseif (admin_media_is_audio($url, $mt)) {
-            $cells[] = '<div class="media-audio-card" role="group" aria-label="Audio post">'
+            $audioLabel = $alt !== '' ? $alt : 'Audio post';
+            $cells[] = '<div class="media-audio-card" role="group" aria-label="' . h($audioLabel) . '">'
                 . '<img class="media-audio-art" src="/api/assets/audio-post-default.jpg" alt="" loading="lazy" decoding="async">'
-                . '<audio class="media-audio" src="' . h($url) . '" controls preload="metadata"></audio>'
+                . '<audio class="media-audio" src="' . h($url) . '" controls preload="metadata"' . ($alt !== '' ? ' aria-label="' . h($alt) . '"' : '') . '></audio>'
                 . '</div>';
         } else {
             $hasImage = true;
@@ -15508,7 +15540,7 @@ function admin_media_row_html(array $items, string $hint = ''): string
                 $imgSrc = $preview;
             }
             $cells[] = '<button type="button" class="media-lightbox-trigger" data-full="' . h($url) . '" title="View image">'
-                . '<img src="' . h($imgSrc) . '" data-media-warm-url="' . h($preview !== '' ? $preview : $url) . '" alt="" loading="lazy" referrerpolicy="no-referrer" decoding="async">'
+                . '<img src="' . h($imgSrc) . '" data-media-warm-url="' . h($preview !== '' ? $preview : $url) . '" alt="' . h($alt) . '" loading="lazy" referrerpolicy="no-referrer" decoding="async">'
                 . '</button>';
         }
         if (count($cells) >= 4) {
@@ -16545,6 +16577,90 @@ function admin_dm_html(?string $raw, ?array $dmRow = null): string
     return $out;
 }
 
+/**
+ * Playable DM media uses the timeline media row. Other files are download links.
+ *
+ * @param array<string,mixed> $row
+ */
+function admin_dm_media_html(array $row): string
+{
+    if (!function_exists('ap_dm_media_items') || !function_exists('ap_dm_media_kind')) {
+        return '';
+    }
+    $playable = [];
+    $files = [];
+    foreach (ap_dm_media_items($row) as $item) {
+        $kind = ap_dm_media_kind($item);
+        if ($kind === 'file') {
+            $files[] = $item;
+            continue;
+        }
+        $mt = $item['mediaType'] ?? null;
+        $mt = is_string($mt) ? strtolower(trim($mt)) : '';
+        if ($kind === 'audio') {
+            if ($mt === '' || !str_starts_with($mt, 'audio/')) {
+                $mt = 'audio/mpeg';
+            }
+        } elseif ($kind === 'gifv' || $kind === 'video') {
+            if ($mt === '' || (!str_starts_with($mt, 'video/') && !str_contains($mt, 'mpegurl'))) {
+                $mt = 'video/mp4';
+            }
+        }
+        $playable[] = [
+            'url' => (string) $item['url'],
+            'mediaType' => $mt !== '' ? $mt : null,
+            'preview_url' => (string) ($item['preview_url'] ?? ''),
+            'description' => (string) ($item['description'] ?? ''),
+        ];
+    }
+    $html = $playable !== [] ? admin_media_row_html($playable) : '';
+    if ($files !== []) {
+        $html .= '<ul class="dm-file-list">';
+        foreach ($files as $item) {
+            $label = function_exists('ap_dm_file_label') ? ap_dm_file_label($item) : 'Download file';
+            $html .= '<li><a class="dm-file-link" href="' . h((string) $item['url']) . '" target="_blank" rel="noopener noreferrer nofollow">'
+                . h($label) . '</a></li>';
+        }
+        $html .= '</ul>';
+    }
+    return $html;
+}
+
+/**
+ * DM bubble plus media. A content warning wraps both. Reply context stays outside.
+ *
+ * @param array<string,mixed> $row
+ */
+function admin_dm_thread_message_html(array $row, bool $isOut): string
+{
+    $msgHtml = admin_dm_html(isset($row['content']) ? (string) $row['content'] : null, $row);
+    $bubble = '<div class="dm-bubble' . ($isOut ? ' dm-out' : ' dm-in') . '">'
+        . ($msgHtml !== '' ? $msgHtml : '<span class="meta">(no text in this message)</span>')
+        . '</div>';
+    $inner = $bubble . admin_dm_media_html($row);
+    $warn = function_exists('ap_dm_warning_from_row')
+        ? ap_dm_warning_from_row($row)
+        : ['spoiler_text' => '', 'sensitive' => false];
+    $spoiler = trim((string) ($warn['spoiler_text'] ?? ''));
+    if (!empty($warn['sensitive']) || $spoiler !== '') {
+        return admin_cw_gate_html($spoiler, true, $inner);
+    }
+    return $inner;
+}
+
+/** Shared attachment controls for a new DM and a reply. */
+function admin_dm_composer_fields_html(): string
+{
+    return '<input name="spoiler_text" maxlength="500" placeholder="Content warning (optional)" style="margin-top:.5rem">'
+        . '<label class="composer-check" style="margin-top:.45rem">'
+        . '<input type="checkbox" name="sensitive" value="1">'
+        . '<span>Mark as sensitive</span></label>'
+        . '<label class="meta" style="display:block;margin:.55rem 0 .35rem">'
+        . '<input type="file" name="media[]" class="dm-media-input" accept="image/*,video/mp4,video/webm,video/quicktime,audio/*" multiple style="max-width:100%">'
+        . '</label>'
+        . '<div class="dm-media-alts"></div>';
+}
+
 /** Compact conversation rail used by the full-page DM workspace. */
 function admin_dm_conversation_list_html(array $conversations, string $activePeer = ''): string
 {
@@ -16567,7 +16683,9 @@ function admin_dm_conversation_list_html(array $conversations, string $activePee
             : strip_tags((string) ($last['content'] ?? ''));
         $preview = trim(preg_replace('/\s+/u', ' ', $preview) ?? $preview);
         if ($preview === '') {
-            $preview = 'Media or link';
+            $preview = (function_exists('ap_dm_media_items') && ap_dm_media_items($last) !== [])
+                ? 'Attachment'
+                : 'Media or link';
         }
         $preview = function_exists('mb_strimwidth')
             ? mb_strimwidth($preview, 0, 96, '…', 'UTF-8')
@@ -19517,13 +19635,20 @@ function admin_render_masto_status_card(
         }
         $atype = strtolower((string) ($att['type'] ?? ''));
         $attMime = strtolower((string) ($att['mediaType'] ?? ''));
-        $media[] = [
+        $item = [
             'url' => $u,
             'mediaType' => in_array($atype, ['video', 'gifv'], true)
                 ? ($attMime !== '' ? $attMime : 'video/mp4')
                 : ($atype === 'audio' ? ($attMime !== '' ? $attMime : 'audio/mpeg') : null),
             'preview_url' => str_starts_with($preview, 'https://') ? $preview : null,
         ];
+        // Alt text rides with the attachment. The shared media row escapes it.
+        foreach (['description', 'name', 'alt'] as $altKey) {
+            if (array_key_exists($altKey, $att) && is_string($att[$altKey])) {
+                $item[$altKey] = $att[$altKey];
+            }
+        }
+        $media[] = $item;
     }
     $following = !$isRss && !$isBsky && $actorRef !== '' && admin_is_following($followingIds, $actorRef);
     $sid = (string) ($st['id'] ?? '');
@@ -27668,6 +27793,18 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       word-break: break-all;
     }
     .dm-bubble a:hover { filter: brightness(1.15); }
+    .dm-file-list { list-style: none; margin: .45rem 0 0; padding: 0; }
+    .dm-file-link {
+      display: inline-block;
+      margin: .2rem 0;
+      padding: .35rem .65rem;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      word-break: break-word;
+    }
+    .dm-media-alts { margin: .2rem 0 .4rem; }
+    .dm-media-alt-row { margin: .35rem 0; }
+    .dm-media-alt-row input { width: 100%; margin-top: .2rem; }
     .dm-bubble .dm-actions {
       margin: .65rem 0 0;
       padding-top: .55rem;
@@ -31218,11 +31355,12 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
           <?php if ($dmUnread > 0): ?>
             <div class="meta" style="margin-bottom:.75rem">You have <?= $dmUnread > 99 ? '99+' : (string) (int) $dmUnread ?> unread <?= $dmUnread === 1 ? 'message' : 'messages' ?>.</div>
           <?php endif; ?>
-          <form class="composer" method="post" action="?view=dms" style="margin-bottom:1rem">
+          <form class="composer" method="post" action="?view=dms" enctype="multipart/form-data" style="margin-bottom:1rem">
             <input type="hidden" name="action" value="dm_send">
             <div class="meta" style="margin-bottom:.5rem">New direct message</div>
             <input name="to" type="text" required placeholder="@user@instance or https://…/users/…">
-            <textarea name="content" maxlength="2000" required placeholder="Private message…" style="margin-top:.5rem"></textarea>
+            <textarea name="content" maxlength="2000" placeholder="Private message or attachment…" style="margin-top:.5rem"></textarea>
+            <?= admin_dm_composer_fields_html() ?>
             <div class="composer-actions">
               <span class="meta"></span>
               <button class="btn btn-primary" type="submit">Send DM</button>
@@ -31267,7 +31405,6 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
           <?php foreach ($thread as $dmIndex => $m): ?>
             <?php
               $isOut = ($m['direction'] ?? '') === 'out';
-              $msgHtml = admin_dm_html($m['content'] ?? null, $m);
               $dmReplyContext = $dmReplyContexts[$dmIndex] ?? '';
             ?>
             <article class="tweet"<?= $dmIndex === count($thread) - 1 ? ' id="dm-message-last"' : '' ?>>
@@ -31281,17 +31418,11 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
                 </div>
               </div>
               <?= $dmReplyContext ?>
-              <div class="dm-bubble<?= $isOut ? ' dm-out' : ' dm-in' ?>"><?= $msgHtml !== '' ? $msgHtml : '<span class="meta">(no text in this message)</span>' ?></div>
-              <?php
-                $dMedia = mention_media_urls($m['media_urls'] ?? null);
-                if ($dMedia) {
-                    echo admin_media_row_html($dMedia);
-                }
-              ?>
+              <?= admin_dm_thread_message_html($m, $isOut) ?>
             </article>
           <?php endforeach; ?>
           </div>
-          <?php if (!$dmPeerBlocked): ?><form class="composer" method="post" action="?view=dms&amp;peer=<?= urlencode($dmPeer) ?>" style="margin-top:1rem">
+          <?php if (!$dmPeerBlocked): ?><form class="composer" method="post" action="?view=dms&amp;peer=<?= urlencode($dmPeer) ?>" enctype="multipart/form-data" style="margin-top:1rem">
             <input type="hidden" name="action" value="dm_reply">
             <input type="hidden" name="to" value="<?= h($dmPeer) ?>">
             <input type="hidden" name="peer" value="<?= h($dmPeer) ?>">
@@ -31307,7 +31438,8 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
             <?php if ($lastIn): ?>
               <input type="hidden" name="in_reply_to" value="<?= h((string) $lastIn['object_id']) ?>">
             <?php endif; ?>
-            <textarea name="content" maxlength="2000" required placeholder="Reply privately…"></textarea>
+            <textarea name="content" maxlength="2000" placeholder="Reply privately, with text or an attachment…"></textarea>
+            <?= admin_dm_composer_fields_html() ?>
             <div class="composer-actions">
               <span class="meta">Stays direct — not public</span>
               <button class="btn btn-primary" type="submit">Reply</button>
@@ -31368,6 +31500,66 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
             </section>
           </div>
         <?php endif; ?>
+        <script>
+        (function () {
+          document.querySelectorAll('form.composer .dm-media-input').forEach(function (input) {
+            const form = input.form;
+            if (!form || form.dataset.dmMediaBound === '1' || typeof DataTransfer !== 'function') return;
+            form.dataset.dmMediaBound = '1';
+            const slot = form.querySelector('.dm-media-alts');
+            const dt = new DataTransfer();
+            let syncing = false;
+            function render() {
+              if (!slot) return;
+              slot.replaceChildren();
+              Array.from(dt.files).forEach(function (file, i) {
+                const row = document.createElement('div');
+                row.className = 'dm-media-alt-row';
+                const name = document.createElement('div');
+                name.className = 'meta';
+                name.textContent = file.name || 'Attachment';
+                const alt = document.createElement('input');
+                alt.type = 'text';
+                alt.name = 'media_alt[' + i + ']';
+                alt.maxLength = 1500;
+                alt.placeholder = 'Describe this attachment (optional)';
+                alt.autocomplete = 'off';
+                const remove = document.createElement('button');
+                remove.type = 'button';
+                remove.className = 'btn btn-ghost';
+                remove.textContent = 'Remove';
+                remove.addEventListener('click', function () {
+                  const next = new DataTransfer();
+                  Array.from(dt.files).forEach(function (kept, j) {
+                    if (j !== i) next.items.add(kept);
+                  });
+                  dt.items.clear();
+                  Array.from(next.files).forEach(function (kept) { dt.items.add(kept); });
+                  syncing = true;
+                  input.files = dt.files;
+                  syncing = false;
+                  render();
+                });
+                row.appendChild(name);
+                row.appendChild(alt);
+                row.appendChild(remove);
+                slot.appendChild(row);
+              });
+            }
+            input.addEventListener('change', function () {
+              if (syncing) return;
+              Array.from(input.files || []).forEach(function (file) {
+                if (dt.files.length >= 4) return;
+                dt.items.add(file);
+              });
+              syncing = true;
+              input.files = dt.files;
+              syncing = false;
+              render();
+            });
+          });
+        })();
+        </script>
 
       <?php elseif ($view === 'report'): ?>
         <?php
@@ -45016,9 +45208,10 @@ $showComposeFab = empty($GLOBALS['vaak_guest_profile'])
   const img = document.getElementById('img-lightbox-img');
   const closeBtn = document.getElementById('img-lightbox-close');
   if (!box || !img) return;
-  function openLb(src) {
+  function openLb(src, alt) {
     if (!src) return;
     img.src = src;
+    img.alt = typeof alt === 'string' ? alt : '';
     box.classList.add('open');
     box.setAttribute('aria-hidden', 'false');
   }
@@ -45026,12 +45219,17 @@ $showComposeFab = empty($GLOBALS['vaak_guest_profile'])
     box.classList.remove('open');
     box.setAttribute('aria-hidden', 'true');
     img.removeAttribute('src');
+    img.alt = '';
   }
   document.addEventListener('click', (e) => {
     const t = e.target instanceof Element ? e.target.closest('.media-lightbox-trigger') : null;
     if (!t) return;
     e.preventDefault();
-    openLb(t.getAttribute('data-full') || (t.querySelector('img') && t.querySelector('img').src) || '');
+    const inner = t.querySelector('img');
+    openLb(
+      t.getAttribute('data-full') || (inner && inner.src) || '',
+      inner ? (inner.getAttribute('alt') || '') : ''
+    );
   });
   closeBtn && closeBtn.addEventListener('click', closeLb);
   // Backdrop or the enlarged image itself closes the lightbox.
