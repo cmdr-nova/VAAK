@@ -341,4 +341,60 @@ preview_check($plain === 'one', 'plain helper drops the quote tail');
 $long = admin_reply_preview_plain(str_repeat('a', 200), 180);
 preview_check(str_ends_with($long, '…') && mb_strlen($long) === 180, 'plain helper trims with an ellipsis');
 
+$quoteHtml = admin_reply_preview_quote_context_html($remote, $remotePreview);
+preview_check(str_contains($quoteHtml, '>Quoting<') && str_contains($quoteHtml, 'compose-reply-preview'), 'quote summary renders in the composer');
+preview_check(str_contains($quoteHtml, 'Ada Lovelace') && str_contains($quoteHtml, '@ada@remote.example'), 'quote summary has the name and handle');
+preview_check(str_contains($quoteHtml, 'Hello there') && str_contains($quoteHtml, '>Media<'), 'quote summary has the snippet and a media hint');
+preview_check(!str_contains($quoteHtml, '<b>there</b>') && !str_contains($quoteHtml, '<p>'), 'quote summary does not keep stored tags');
+
+$quoteMissing = admin_reply_preview_quote_context_html($remote, null);
+preview_check(str_contains($quoteMissing, '>Quoting<') && str_contains($quoteMissing, $remote), 'missing quote summary keeps the url');
+preview_check(!str_contains($quoteMissing, 'compose-reply-preview'), 'missing quote summary does not invent a card');
+
+$quoteXssUrl = 'https://remote.example/users/ada/statuses/9?q=<script>alert(1)</script>';
+$quoteXss = admin_reply_preview_quote_context_html($quoteXssUrl, null);
+preview_check(str_contains($quoteXss, '&lt;script&gt;') && !str_contains($quoteXss, '<script>'), 'quote url is escaped');
+
+foreach (['javascript:alert(1)', 'data:text/html,hi', 'vbscript:msgbox(1)'] as $badAvatar) {
+    $scheme = strstr($badAvatar, ':', true);
+    $evilQuote = admin_reply_preview_quote_context_html($remote, [
+        'name' => '<script>alert(1)</script>',
+        'handle' => '@ada',
+        'avatar' => $badAvatar,
+        'snippet' => '<b>nope</b>',
+        'media' => true,
+        'cw' => false,
+        'quote' => false,
+    ]);
+    preview_check(!str_contains($evilQuote, '<script>') && !str_contains($evilQuote, '<b>'), $scheme . ' quote text is not markup');
+    preview_check(str_contains($evilQuote, 'alert(1)') && str_contains($evilQuote, 'nope'), $scheme . ' quote text is plain');
+    preview_check(str_contains($evilQuote, 'https://mkultra.monster/img/avatar/default.webp'), $scheme . ' quote avatar uses the https default');
+    preview_check(!str_contains($evilQuote, $badAvatar), $scheme . ' quote preview drops the unsafe avatar');
+    preview_check(str_contains($evilQuote, '>Media<'), $scheme . ' quote preview keeps the media hint');
+}
+preview_check(admin_reply_preview_https_url('https://cdn.example/a.webp') === 'https://cdn.example/a.webp', 'https avatar with a host is kept');
+preview_check(admin_reply_preview_https_url('http://cdn.example/a.webp') === '', 'http avatar is dropped');
+preview_check(admin_reply_preview_https_url('https://') === '', 'https avatar without a host is dropped');
+
+preview_check(admin_reply_preview_lookup($direct) === null, 'direct still hidden for a quote lookup');
+$directQuote = admin_reply_preview_quote_context_html($direct, admin_reply_preview_lookup($direct));
+preview_check(!str_contains($directQuote, 'secret dm'), 'direct quote preview does not leak the body');
+preview_check(str_contains($directQuote, $direct), 'hidden direct quote keeps only the url');
+
+preview_check(admin_reply_preview_lookup($private) === null, 'followers-only still hidden for a quote lookup');
+$privateQuote = admin_reply_preview_quote_context_html($private, admin_reply_preview_lookup($private));
+preview_check(!str_contains($privateQuote, 'followers only body'), 'followers-only quote preview does not leak the body');
+
+$ownQuote = admin_reply_preview_quote_context_html($own, admin_reply_preview_lookup($own));
+preview_check(str_contains($ownQuote, 'Nova') && str_contains($ownQuote, '@cmdr_nova'), 'quoting your own post shows the author');
+preview_check(str_contains($ownQuote, 'continuing the thread') && str_contains($ownQuote, '>Media<'), 'quoting your own post shows the snippet and media');
+
+$bskyQuote = admin_reply_preview_quote_context_html($bskyHttps, $bskyPreview);
+preview_check(str_contains($bskyQuote, 'Ada Sky') && str_contains($bskyQuote, '@ada.bsky.social'), 'mirrored bluesky quote shows the author');
+preview_check(str_contains($bskyQuote, 'backfilled bluesky text') && str_contains($bskyQuote, '>Media<'), 'mirrored bluesky quote shows the snippet and media');
+
+$peerQuote = admin_reply_preview_quote_context_html($peer, admin_reply_preview_lookup($peer));
+preview_check(str_contains($peerQuote, 'Shana Flux') && str_contains($peerQuote, 'hello from shana'), 'followed local peer can be quoted');
+preview_check(str_contains($peerQuote, 'Content warning'), 'followed local peer keeps the content warning');
+
 echo "reply preview smoke: {$checks} checks\n";

@@ -12726,6 +12726,13 @@ if ($prefillReplyTo !== '' && $prefillQuoteObject === '' && $prefillEditNote ===
     && function_exists('admin_reply_preview_lookup')) {
     $prefillReplyPreview = admin_reply_preview_lookup($prefillReplyTo);
 }
+// Same one local lookup when the page opened on a quote. A click still reads
+// the card and does not reach this. Hidden posts keep the quoted URL.
+$prefillQuotePreview = null;
+if ($prefillQuoteObject !== '' && $prefillEditNote === ''
+    && function_exists('admin_reply_preview_lookup')) {
+    $prefillQuotePreview = admin_reply_preview_lookup($prefillQuoteObject);
+}
 $composerReturnView = $view;
 $draftsCountNav = function_exists('ap_drafts_count') ? ap_drafts_count() : 0;
 $phyrianPendingNav = 0;
@@ -12817,7 +12824,8 @@ function admin_render_compose_panel(bool $inline = false): void
     global $prefillEditNote, $prefillDraftId, $prefillReplyTo, $prefillQuoteObject,
         $prefillEditSpoiler, $prefillEditContent, $prefillEditSensitive, $prefillVisibility,
         $prefillDraftMediaIds, $prefillActor, $vaakHandle, $vaakUsername, $composerReturnView,
-        $prefillReplyPrivacyAuthor, $prefillReplyPrivacyParticipants, $prefillReplyPreview;
+        $prefillReplyPrivacyAuthor, $prefillReplyPrivacyParticipants, $prefillReplyPreview,
+        $prefillQuotePreview;
     $prefillEditNote = (string) ($prefillEditNote ?? '');
     $prefillDraftId = (int) ($prefillDraftId ?? 0);
     $prefillReplyTo = (string) ($prefillReplyTo ?? '');
@@ -12843,6 +12851,7 @@ function admin_render_compose_panel(bool $inline = false): void
     $prefillReplyPrivacyAuthor = strtolower((string) ($prefillReplyPrivacyAuthor ?? ''));
     $prefillReplyPrivacyParticipants = (int) ($prefillReplyPrivacyParticipants ?? 0);
     $prefillReplyPreview = is_array($prefillReplyPreview ?? null) ? $prefillReplyPreview : null;
+    $prefillQuotePreview = is_array($prefillQuotePreview ?? null) ? $prefillQuotePreview : null;
     ?>
   <div class="compose-modal__panel<?= $inline ? ' compose-inline-panel compose-tools-ready' : '' ?>"
        role="<?= $inline ? 'region' : 'dialog' ?>"<?= $inline ? '' : ' aria-modal="true"' ?>
@@ -12887,7 +12896,7 @@ function admin_render_compose_panel(bool $inline = false): void
       <?php if ($prefillQuoteObject !== '' && !$composeIsEdit): ?>
         <input type="hidden" name="quote_object" value="<?= h($prefillQuoteObject) ?>">
         <div class="meta compose-as-line" style="margin-bottom:.5rem">As <b style="color:var(--primary)"><?= h($vaakHandle !== '' ? $vaakHandle : $composeAsLabel) ?></b></div>
-        <div class="quote-block" style="margin-bottom:.75rem"><span class="qt-label">Quoting</span><br><span class="mono"><?= h($prefillQuoteObject) ?></span></div>
+        <?= admin_reply_preview_quote_context_html($prefillQuoteObject, $prefillQuotePreview) ?>
       <?php else: ?>
         <div class="meta compose-as-line" style="margin-bottom:.5rem">As <b style="color:var(--primary)"><?= h($composeAsLabel) ?></b><?php if ($composeIsDraft): ?> · <span style="color:var(--muted)">draft #<?= (int) $prefillDraftId ?></span><?php endif; ?></div>
         <?php if ($composeIsSelfReply || $prefillReplyTo !== ''): ?>
@@ -46468,12 +46477,13 @@ $showComposeFab = empty($GLOBALS['vaak_guest_profile'])
   /* vaak-reply-preview:start */
   function vaakReplyPreviewAvatar(src) {
     const s = String(src || '').trim();
-    // Allow only an https URL. Rejecting javascript: and leaving data: or
-    // vbscript: in an img src is not enough.
+    // Allow only an https URL that names a host. Rejecting javascript: and
+    // leaving data: or vbscript: in an img src is not enough, and a scheme
+    // with no host is not an image address.
     if (!s || /[\s<>"'\\]/.test(s)) return '';
     let parsed;
     try { parsed = new URL(s); } catch (e) { return ''; }
-    if (parsed.protocol !== 'https:') return '';
+    if (parsed.protocol !== 'https:' || !parsed.host) return '';
     return parsed.href;
   }
   function vaakReplyPreviewSnippet(text) {
@@ -46525,8 +46535,9 @@ $showComposeFab = empty($GLOBALS['vaak_guest_profile'])
     return '';
   }
   // Author, avatar, handle, and a short snippet from the card that owns this
-  // Reply link. Boosts use the boosted post's header. Quote text stays out of
-  // the snippet. Headerless notification embeds borrow the parent notif header.
+  // Reply or Quote link. Boosts use the boosted post's header. Nested quote
+  // text stays out of the snippet. Headerless notification embeds borrow the
+  // parent notif header.
   function vaakReplyPreviewFromCard(anchor) {
     if (!anchor || !anchor.closest) return null;
     const content = anchor.closest('article.tweet');
@@ -46649,7 +46660,7 @@ $showComposeFab = empty($GLOBALS['vaak_guest_profile'])
       }
       row.appendChild(main);
       qb.appendChild(row);
-    } else if (label === 'Replying to your post') {
+    } else if (label === 'Replying to your post' || label === 'Quoting') {
       const br = document.createElement('br');
       qb.appendChild(br);
       const mono = document.createElement('span');
@@ -46770,15 +46781,8 @@ $showComposeFab = empty($GLOBALS['vaak_guest_profile'])
       qHidden.name = 'quote_object';
       qHidden.value = quoteObject;
       form.insertBefore(qHidden, form.firstChild);
-      const qb = document.createElement('div');
-      qb.className = 'quote-block';
-      qb.style.marginBottom = '.75rem';
-      qb.innerHTML = '<span class="qt-label">Quoting</span><br><span class="mono"></span>';
-      const mono = qb.querySelector('.mono');
-      if (mono) mono.textContent = quoteObject;
-      const asMeta = form.querySelector('.meta[style*="margin-bottom"]');
-      if (asMeta && asMeta.parentNode) asMeta.parentNode.insertBefore(qb, asMeta.nextSibling);
-      else form.insertBefore(qb, form.firstChild);
+      // Same card summary as a reply. A missing card keeps the quoted URL.
+      vaakPaintComposeReplyContext(form, 'Quoting', quoteObject, opts.preview || null);
       if (title) title.textContent = 'Quote';
       if (submitBtn) submitBtn.textContent = 'Quote';
       if (ta) ta.placeholder = 'Add commentary (optional)…';
@@ -46881,20 +46885,30 @@ $showComposeFab = empty($GLOBALS['vaak_guest_profile'])
   // the same post is on this page, fill the summary from the card.
   function vaakUpgradeServerReplyPreview() {
     if (!form || (form.querySelector && form.querySelector('.compose-reply-preview'))) return;
+    const quoteField = form.querySelector ? form.querySelector('input[name="quote_object"]') : null;
+    const quoteUri = quoteField && quoteField.value ? String(quoteField.value).trim() : '';
+    if (quoteUri) {
+      vaakFillComposePreviewFromPage(quoteUri, 'a[href*="quote_object="]', 'quote_object', 'Quoting');
+      return;
+    }
     const replyToEl = document.getElementById('compose-in-reply-to');
     const uri = replyToEl && replyToEl.value ? String(replyToEl.value).trim() : '';
+    if (!uri) return;
+    vaakFillComposePreviewFromPage(uri, 'a[href*="reply_to="]', 'reply_to', isOwnNoteUrl(uri) ? 'Replying to your post' : 'Replying to');
+  }
+  function vaakFillComposePreviewFromPage(uri, selector, param, label) {
     if (!uri || !document.querySelectorAll) return;
     const want = uri.replace(/\/+$/, '');
-    const links = document.querySelectorAll('a[href*="reply_to="]');
+    const links = document.querySelectorAll(selector);
     for (let i = 0; i < links.length; i++) {
       const link = links[i];
       let parsed;
       try { parsed = new URL(link.getAttribute('href') || '', window.location.href); } catch (e) { continue; }
-      const target = String(parsed.searchParams.get('reply_to') || '').trim().replace(/\/+$/, '');
+      const target = String(parsed.searchParams.get(param) || '').trim().replace(/\/+$/, '');
       if (target !== want) continue;
       const preview = vaakReplyPreviewFromCard(link);
       if (!preview) continue;
-      vaakPaintComposeReplyContext(form, isOwnNoteUrl(uri) ? 'Replying to your post' : 'Replying to', uri, preview);
+      vaakPaintComposeReplyContext(form, label, uri, preview);
       break;
     }
   }
@@ -46931,7 +46945,7 @@ $showComposeFab = empty($GLOBALS['vaak_guest_profile'])
       mention: mention,
       cw: cw,
       sensitive: sensitive,
-      preview: replyTo && sourceEl ? vaakReplyPreviewFromCard(sourceEl) : null,
+      preview: sourceEl && (replyTo || quoteObject) ? vaakReplyPreviewFromCard(sourceEl) : null,
       returnView: (sp.get('view') === 'compose' ? null : sp.get('view')) || null,
     });
     // Don't restore a leftover local draft over a fresh reply/quote target.

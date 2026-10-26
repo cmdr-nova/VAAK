@@ -1,6 +1,6 @@
 <?php
 /**
- * Local-only summary for the composer's "Replying to" area.
+ * Local-only summary for the composer's "Replying to" and "Quoting" areas.
  *
  * The click path reads the card already on the page. This lookup is the
  * no-JS / full-navigation path: indexed rows VAAK already stored. It never
@@ -185,6 +185,24 @@ function admin_reply_preview_context_html(string $label, string $replyUrl, ?arra
             $fallback = 'the original post';
         }
         $html .= ' <strong>' . admin_reply_preview_h($fallback) . '</strong>';
+    }
+    return $html . '</div>';
+}
+
+/**
+ * Quote composer chrome. Same card as a reply. Without a local summary the
+ * composer keeps the quoted URL, which is what it showed before.
+ *
+ * @param array<string,mixed>|null $preview
+ */
+function admin_reply_preview_quote_context_html(string $quoteUrl, ?array $preview): string
+{
+    $html = '<div class="quote-block compose-reply-context" style="margin-bottom:.75rem">'
+        . '<span class="qt-label">Quoting</span>';
+    if (is_array($preview) && admin_reply_preview_usable($preview)) {
+        $html .= admin_reply_preview_card_html($preview);
+    } else {
+        $html .= '<br><span class="mono">' . admin_reply_preview_h($quoteUrl) . '</span>';
     }
     return $html . '</div>';
 }
