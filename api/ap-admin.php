@@ -13304,13 +13304,24 @@ function admin_direct_status_allowed(array $status, int $owner, int $depth = 0):
         $post = is_array($raw['post'] ?? null) ? $raw['post'] : $raw;
         $at = is_array($post) ? (string) ($post['uri'] ?? '') : '';
         if ($at === '' && str_starts_with($uri, 'at://')) $at = $uri;
-        if ($at !== '') {
-            $st = ap_db()->prepare('SELECT 1 FROM bsky_posts WHERE bsky_uri = ? LIMIT 1');
-            $st->execute([$at]);
-            if (!$st->fetchColumn()) return false;
-        } elseif (preg_match('#^https://mkultra\.monster/users/[^/]+/notes/#', $uri)) {
+        $localNote = (bool) preg_match('#^https://mkultra\.monster/users/[^/]+/notes/#', $uri);
+        // Quote and repost embeds are text already on the post being opened.
+        // They are not a second stored post, and a bsky.app preview of one is
+        // not an ActivityPub object. The opened post itself still needs its row.
+        $bskyEmbed = $depth > 0 && !$localNote && (
+            $at !== ''
+            || $uri === 'https://bsky.app'
+            || str_starts_with($uri, 'https://bsky.app/')
+        );
+        if ($localNote) {
             $st = ap_db()->prepare("SELECT note_id FROM masto_statuses WHERE rtrim(note_id, '/') = ? LIMIT 1");
             $st->execute([$uri]);
+            if (!$st->fetchColumn()) return false;
+        } elseif ($bskyEmbed) {
+            // No local row is required. Audience and block checks still run.
+        } elseif ($at !== '') {
+            $st = ap_db()->prepare('SELECT 1 FROM bsky_posts WHERE bsky_uri = ? LIMIT 1');
+            $st->execute([$at]);
             if (!$st->fetchColumn()) return false;
         } elseif ($uri !== '') {
             $st = ap_db()->prepare("SELECT type, action_taken FROM events WHERE object_id IN (?, ?)
@@ -13359,7 +13370,7 @@ function admin_direct_render_context_allowed(array $status, int $owner, array $h
     try {
         if (!admin_direct_status_allowed($status, $owner)) return false;
         foreach ($hydrated as $child) {
-            if (is_array($child) && !admin_direct_status_allowed($child, $owner)) return false;
+            if (is_array($child) && !admin_direct_status_allowed($child, $owner, 1)) return false;
         }
         foreach ($previews as $preview) {
             if (!is_array($preview)) continue;
@@ -13383,7 +13394,7 @@ function admin_direct_render_context_allowed(array $status, int $owner, array $h
                     || !is_array(ap_rss_item_by_id((int) ($evidence['id'] ?? 0), $owner))) return false;
             }
             if (is_array($source)) {
-                if (!admin_direct_status_allowed($source, $owner)) return false;
+                if (!admin_direct_status_allowed($source, $owner, 1)) return false;
             } elseif (trim((string) ($preview['text'] ?? '')) !== '' || !empty($preview['media'])) {
                 return false;
             }
@@ -22395,8 +22406,10 @@ function admin_bsky_thread_fragment(string $object, string $part, string $from, 
 function admin_bsky_thread_focus_item(string $at, int $owner, bool $repairFocus): ?array
 {
     $cached=ap_bsky_post_item_by_uri($at);
-    if(is_array($cached) && (($cached['post']['uri']??'')!==$at
-        || !is_array($cached['post']??null) || !admin_bsky_thread_post_valid($cached['post'])))return null;
+    // A row that does not describe this post is a miss, not a reason to skip
+    // the one AppView read. Do not paint it.
+    if(!is_array($cached) || !is_array($cached['post']??null) || ($cached['post']['uri']??'')!==$at
+        || !admin_bsky_thread_post_valid($cached['post']))$cached=null;
     $forceRepair=$GLOBALS['vaak_bsky_force_media_repair']??null;
     try {
         if($repairFocus)$GLOBALS['vaak_bsky_force_media_repair']=true;
@@ -22417,8 +22430,11 @@ function admin_bsky_thread_focus_item(string $at, int $owner, bool $repairFocus)
         return ($thin||$stale)?$cached:null;
     }
     $posts=$got['json']['posts']??null;
+    // Empty or mismatched AppView body: keep a valid cached copy (not indexed
+    // yet, or a bad response). Never write that body, and never tombstone here.
+    // No usable cache means the post is gone.
     if(!is_array($posts)||count($posts)!==1||!is_array($posts[0]??null)
-        || ($posts[0]['uri']??'')!==$at || !admin_bsky_thread_post_valid($posts[0]))return null;
+        || ($posts[0]['uri']??'')!==$at || !admin_bsky_thread_post_valid($posts[0]))return $cached;
     $live=$posts[0];
     if($stale){
         // Keep the cached paint; take AppView's current labels.
