@@ -52,6 +52,7 @@ php_tests=(
   api/bin/bsky-own-repost-profile-smoke.php
   api/bin/bsky-follow-carry-smoke.php
   api/bin/remote-poll-smoke.php
+  api/bin/reply-preview-smoke.php
   api/bin/remote-emoji-smoke.php
   api/bin/csp-smoke.php
   api/bin/bsky-jetstream-media-smoke.php
@@ -160,6 +161,7 @@ node_tests=(
   api/bin/timeline-new-posts-poll-regression.js
   api/bin/notif-badge-poll-regression.js
   api/bin/reply-no-reload-regression.js
+  api/bin/reply-preview-regression.js
   api/bin/home-notifications-view-switch-regression.js
   api/bin/profile-end-label-regression.js
   api/bin/soft-nav-address-regression.js

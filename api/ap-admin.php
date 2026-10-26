@@ -66,6 +66,7 @@ require_once __DIR__ . '/ap-notices.php'; // Local-only operator notices
 require_once __DIR__ . '/ap-discuss.php'; // Local-only discussion forums
 require_once __DIR__ . '/ap-webpush.php'; // Browser + Ice Cubes Web Push
 require_once __DIR__ . '/ap-bsky.php'; // Phase A Bluesky tab (opt-in, feature-flagged)
+require_once __DIR__ . '/ap-reply-preview.php'; // Composer "Replying to" summary (local rows only)
 require_once __DIR__ . '/ap-action-queue.php'; // Durable reversible timeline actions
 require_once __DIR__ . '/ap-rss.php'; // You → RSS → Home mix
 require_once __DIR__ . '/ap-phyrian.php'; // Phyrian Strains web game (Phase 1)
@@ -12616,6 +12617,7 @@ $autoOpenComposer = $composerForceOpen
 // Preserve reply-participant context for the server-rendered composer too.
 // Modal replies receive this metadata from applyReplyQuoteChrome(), while a
 // direct/inline compose navigation needs it present in the initial markup.
+$prefillReplyPreview = null;
 $prefillReplyPrivacyAuthor = '';
 $prefillReplyPrivacyParticipants = 0;
 if ($prefillReplyTo !== '' && $prefillQuoteObject === '' && $prefillEditNote === '' && $prefillMention !== '') {
@@ -12640,6 +12642,13 @@ if ($prefillReplyTo !== '' && $prefillQuoteObject === '' && $prefillEditNote ===
     $privacyHandles = array_values($privacyHandles);
     $prefillReplyPrivacyAuthor = strtolower((string) ($privacyHandles[0] ?? ''));
     $prefillReplyPrivacyParticipants = count($privacyHandles);
+}
+// Full-page compose (no-JS, drafts, a direct reply URL). The click path reads
+// the card already on the page and does not hit this lookup. Indexed local
+// rows only — never a remote or appview fetch. Hidden posts stay on the old label.
+if ($prefillReplyTo !== '' && $prefillQuoteObject === '' && $prefillEditNote === ''
+    && function_exists('admin_reply_preview_lookup')) {
+    $prefillReplyPreview = admin_reply_preview_lookup($prefillReplyTo);
 }
 $composerReturnView = $view;
 $draftsCountNav = function_exists('ap_drafts_count') ? ap_drafts_count() : 0;
@@ -12732,7 +12741,7 @@ function admin_render_compose_panel(bool $inline = false): void
     global $prefillEditNote, $prefillDraftId, $prefillReplyTo, $prefillQuoteObject,
         $prefillEditSpoiler, $prefillEditContent, $prefillEditSensitive, $prefillVisibility,
         $prefillDraftMediaIds, $prefillActor, $vaakHandle, $vaakUsername, $composerReturnView,
-        $prefillReplyPrivacyAuthor, $prefillReplyPrivacyParticipants;
+        $prefillReplyPrivacyAuthor, $prefillReplyPrivacyParticipants, $prefillReplyPreview;
     $prefillEditNote = (string) ($prefillEditNote ?? '');
     $prefillDraftId = (int) ($prefillDraftId ?? 0);
     $prefillReplyTo = (string) ($prefillReplyTo ?? '');
@@ -12757,6 +12766,7 @@ function admin_render_compose_panel(bool $inline = false): void
     $composerReturnView = (string) ($composerReturnView ?? 'home');
     $prefillReplyPrivacyAuthor = strtolower((string) ($prefillReplyPrivacyAuthor ?? ''));
     $prefillReplyPrivacyParticipants = (int) ($prefillReplyPrivacyParticipants ?? 0);
+    $prefillReplyPreview = is_array($prefillReplyPreview ?? null) ? $prefillReplyPreview : null;
     ?>
   <div class="compose-modal__panel<?= $inline ? ' compose-inline-panel compose-tools-ready' : '' ?>"
        role="<?= $inline ? 'region' : 'dialog' ?>"<?= $inline ? '' : ' aria-modal="true"' ?>
@@ -12804,30 +12814,8 @@ function admin_render_compose_panel(bool $inline = false): void
         <div class="quote-block" style="margin-bottom:.75rem"><span class="qt-label">Quoting</span><br><span class="mono"><?= h($prefillQuoteObject) ?></span></div>
       <?php else: ?>
         <div class="meta compose-as-line" style="margin-bottom:.5rem">As <b style="color:var(--primary)"><?= h($composeAsLabel) ?></b><?php if ($composeIsDraft): ?> · <span style="color:var(--muted)">draft #<?= (int) $prefillDraftId ?></span><?php endif; ?></div>
-        <?php if ($composeIsSelfReply): ?>
-          <div class="quote-block" style="margin-bottom:.75rem"><span class="qt-label">Replying to your post</span><br><span class="mono"><?= h($prefillReplyTo) ?></span></div>
-        <?php elseif ($prefillReplyTo !== ''): ?>
-          <?php
-            // Keep reply context visible for remote/Fediverse replies too. The
-            // hidden in_reply_to field is easy to miss, especially in the
-            // inline composer, and previously made a reply look like a new
-            // standalone post. Prefer a human handle over a raw URL/DID.
-            $composeReplyLabel = '';
-            if (preg_match('#^https://bsky\\.app/profile/([^/]+)/post/#i', $prefillReplyTo, $cm)) {
-                $composeReplyLabel = '@' . rawurldecode((string) $cm[1]);
-            } elseif (preg_match('#/users/([^/]+)/#i', $prefillReplyTo, $cm)) {
-                $composeReplyLabel = '@' . rawurldecode((string) $cm[1]);
-            } elseif (function_exists('actor_handle')) {
-                $composeReplyLabel = trim((string) actor_handle($prefillReplyTo));
-            }
-            if ($composeReplyLabel === '') {
-                $composeReplyLabel = 'the original post';
-            }
-          ?>
-          <div class="quote-block compose-reply-context" style="margin-bottom:.75rem">
-            <span class="qt-label">Replying to</span>
-            <strong><?= h($composeReplyLabel) ?></strong>
-          </div>
+        <?php if ($composeIsSelfReply || $prefillReplyTo !== ''): ?>
+          <?= admin_reply_preview_context_html($composeIsSelfReply ? 'Replying to your post' : 'Replying to', $prefillReplyTo, $prefillReplyPreview, $composeIsSelfReply) ?>
         <?php endif; ?>
       <?php endif; ?>
       <input name="spoiler_text" maxlength="500" placeholder="Content warning (optional)" style="margin-bottom:.5rem;flex:0 0 auto" value="<?= h($prefillEditSpoiler) ?>">
@@ -29518,6 +29506,30 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     .tweet-bsky .quote-block { white-space: normal; }
     .tweet-bsky-home .quote-block { margin-top: .45rem; }
     .quote-block .qt-label { color: var(--primary); font-size: .75rem; letter-spacing: .04em; }
+    .compose-reply-context:has(.compose-reply-preview) .qt-label { display: block; margin-bottom: .35rem; }
+    .compose-reply-preview {
+      display: flex; gap: .65rem; align-items: flex-start;
+      margin-top: .15rem; white-space: normal; min-width: 0;
+    }
+    .compose-reply-preview .tweet-av {
+      width: 32px; height: 32px; flex: 0 0 32px;
+    }
+    .compose-reply-preview__main { min-width: 0; flex: 1 1 auto; }
+    .compose-reply-preview__who {
+      display: flex; flex-wrap: wrap; gap: .15rem .4rem; align-items: baseline;
+      line-height: 1.3;
+    }
+    .compose-reply-preview__who .who { font-weight: 650; }
+    .compose-reply-preview__who .meta { color: var(--muted); }
+    .compose-reply-preview__text {
+      margin-top: .2rem; color: var(--text); line-height: 1.4;
+      overflow-wrap: anywhere; white-space: normal;
+      display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical;
+      overflow: hidden; max-height: 4.2em;
+    }
+    .compose-reply-preview__notes {
+      display: flex; flex-wrap: wrap; gap: .35rem; margin-top: .35rem;
+    }
     .notification-post {
       margin-top: .55rem;
       color: var(--text);
@@ -45653,6 +45665,209 @@ $showComposeFab = empty($GLOBALS['vaak_guest_profile'])
     if (qb) qb.remove();
   }
 
+  /* vaak-reply-preview:start */
+  function vaakReplyPreviewAvatar(src) {
+    const s = String(src || '').trim();
+    // Allow only an https URL. Rejecting javascript: and leaving data: or
+    // vbscript: in an img src is not enough.
+    if (!s || /[\s<>"'\\]/.test(s)) return '';
+    let parsed;
+    try { parsed = new URL(s); } catch (e) { return ''; }
+    if (parsed.protocol !== 'https:') return '';
+    return parsed.href;
+  }
+  function vaakReplyPreviewSnippet(text) {
+    let t = String(text || '').replace(/\s+/g, ' ').trim();
+    if (/^\((?:quote|media|poll|attachment|boost|no text preview|quoted post unavailable|quoted post)\)$/i.test(t)) return '';
+    if (t.length > 180) t = t.slice(0, 179).replace(/\s+$/, '') + '…';
+    return t;
+  }
+  function vaakReplyPreviewText(node) {
+    return String((node && node.textContent) || '').replace(/\s+/g, ' ').trim();
+  }
+  function vaakReplyPreviewOwned(root, node) {
+    if (!node || !root || !node.closest) return false;
+    if (node.closest('article.tweet') !== root) return false;
+    const quote = node.closest('.quote-block');
+    if (quote && quote.closest('article.tweet') === root) return false;
+    return true;
+  }
+  function vaakReplyPreviewHeader(article) {
+    if (!article || !article.querySelectorAll) return null;
+    const headers = article.querySelectorAll('.tweet-hd');
+    for (let i = 0; i < headers.length; i++) {
+      if (vaakReplyPreviewOwned(article, headers[i])) return headers[i];
+    }
+    return null;
+  }
+  function vaakReplyPreviewHandle(hd) {
+    const metas = hd.querySelectorAll ? hd.querySelectorAll('.meta') : [];
+    for (let i = 0; i < metas.length; i++) {
+      const found = vaakReplyPreviewText(metas[i]).match(/@\S+/);
+      if (found) return found[0];
+    }
+    return '';
+  }
+  function vaakReplyPreviewUsable(preview) {
+    if (!preview) return false;
+    return !!(preview.name || preview.handle || preview.snippet || preview.media || preview.cw || preview.quote);
+  }
+  function vaakReplyPreviewTargetLabel(url) {
+    const raw = String(url || '').trim();
+    const bsky = raw.match(/^https:\/\/bsky\.app\/profile\/([^/]+)\/post\//i);
+    if (bsky) {
+      try { return '@' + decodeURIComponent(bsky[1]); } catch (e) { return '@' + bsky[1]; }
+    }
+    const users = raw.match(/\/users\/([^/]+)\//i);
+    if (users) {
+      try { return '@' + decodeURIComponent(users[1]); } catch (e) { return '@' + users[1]; }
+    }
+    return '';
+  }
+  // Author, avatar, handle, and a short snippet from the card that owns this
+  // Reply link. Boosts use the boosted post's header. Quote text stays out of
+  // the snippet. Headerless notification embeds borrow the parent notif header.
+  function vaakReplyPreviewFromCard(anchor) {
+    if (!anchor || !anchor.closest) return null;
+    const content = anchor.closest('article.tweet');
+    if (!content) return null;
+    let headerRoot = content;
+    if (!vaakReplyPreviewHeader(headerRoot) && content.closest('.notif-status-embed')) {
+      let parent = content.parentElement;
+      while (parent) {
+        const up = parent.closest ? parent.closest('article.tweet') : null;
+        if (!up) break;
+        if (vaakReplyPreviewHeader(up)) { headerRoot = up; break; }
+        parent = up.parentElement;
+      }
+    }
+    const hd = vaakReplyPreviewHeader(headerRoot);
+    if (!hd) return null;
+    const who = hd.querySelector ? hd.querySelector('.who') : null;
+    const name = vaakReplyPreviewText(who);
+    const handle = vaakReplyPreviewHandle(hd);
+    const img = hd.querySelector ? (hd.querySelector('img.tweet-av') || hd.querySelector('img')) : null;
+    const avatar = vaakReplyPreviewAvatar(img && (img.getAttribute ? (img.getAttribute('src') || '') : ''));
+    let snippet = '';
+    const bodies = content.querySelectorAll ? content.querySelectorAll('.body, .notification-post') : [];
+    for (let i = 0; i < bodies.length; i++) {
+      if (!vaakReplyPreviewOwned(content, bodies[i])) continue;
+      snippet = vaakReplyPreviewSnippet(vaakReplyPreviewText(bodies[i]));
+      if (snippet) break;
+    }
+    const cwNodes = content.querySelectorAll ? content.querySelectorAll('details.cw-gate') : [];
+    let cw = false;
+    for (let i = 0; i < cwNodes.length; i++) {
+      if (vaakReplyPreviewOwned(content, cwNodes[i])) { cw = true; break; }
+    }
+    if (!snippet && cw) {
+      const cwText = content.querySelectorAll ? content.querySelectorAll('.cw-text') : [];
+      for (let i = 0; i < cwText.length; i++) {
+        if (!vaakReplyPreviewOwned(content, cwText[i])) continue;
+        snippet = vaakReplyPreviewSnippet(vaakReplyPreviewText(cwText[i]));
+        if (snippet) break;
+      }
+    }
+    const mediaNodes = content.querySelectorAll ? content.querySelectorAll('.media-row, video, audio') : [];
+    let media = false;
+    for (let i = 0; i < mediaNodes.length; i++) {
+      if (vaakReplyPreviewOwned(content, mediaNodes[i])) { media = true; break; }
+    }
+    const quotes = content.querySelectorAll ? content.querySelectorAll('.quote-block') : [];
+    let quote = false;
+    for (let i = 0; i < quotes.length; i++) {
+      if (quotes[i].closest && quotes[i].closest('article.tweet') === content) { quote = true; break; }
+    }
+    const preview = { name: name, handle: handle, avatar: avatar, snippet: snippet, media: media, cw: cw, quote: quote };
+    return vaakReplyPreviewUsable(preview) ? preview : null;
+  }
+  function vaakPaintComposeReplyContext(form, label, replyUrl, preview) {
+    if (!form || !document.createElement) return;
+    const old = form.querySelector ? form.querySelector('.quote-block') : null;
+    if (old && old.remove) old.remove();
+    const qb = document.createElement('div');
+    qb.className = 'quote-block compose-reply-context';
+    if (qb.style) qb.style.marginBottom = '.75rem';
+    const lab = document.createElement('span');
+    lab.className = 'qt-label';
+    lab.textContent = label || 'Replying to';
+    qb.appendChild(lab);
+    if (vaakReplyPreviewUsable(preview)) {
+      const row = document.createElement('div');
+      row.className = 'compose-reply-preview';
+      const img = document.createElement('img');
+      img.className = 'tweet-av';
+      img.setAttribute('src', vaakReplyPreviewAvatar(preview.avatar) || 'https://mkultra.monster/img/avatar/default.webp');
+      img.setAttribute('alt', '');
+      img.setAttribute('width', '32');
+      img.setAttribute('height', '32');
+      img.setAttribute('referrerpolicy', 'no-referrer');
+      row.appendChild(img);
+      const main = document.createElement('div');
+      main.className = 'compose-reply-preview__main';
+      const name = String(preview.name || '').replace(/\s+/g, ' ').trim();
+      let handle = String(preview.handle || '').replace(/\s+/g, ' ').trim();
+      if (handle && handle.charAt(0) !== '@') handle = '@' + handle;
+      if (name || handle) {
+        const who = document.createElement('div');
+        who.className = 'compose-reply-preview__who';
+        if (name) {
+          const nameEl = document.createElement('span');
+          nameEl.className = 'who';
+          nameEl.textContent = name;
+          who.appendChild(nameEl);
+        }
+        if (handle && handle.replace(/^@+/, '').toLowerCase() !== name.toLowerCase()) {
+          const handleEl = document.createElement('span');
+          handleEl.className = 'meta';
+          handleEl.textContent = handle;
+          who.appendChild(handleEl);
+        }
+        main.appendChild(who);
+      }
+      const snippet = String(preview.snippet || '').trim();
+      if (snippet) {
+        const text = document.createElement('div');
+        text.className = 'compose-reply-preview__text';
+        text.textContent = snippet;
+        main.appendChild(text);
+      }
+      const notes = [];
+      if (preview.cw) notes.push('Content warning');
+      if (preview.media) notes.push('Media');
+      if (preview.quote) notes.push('Quote');
+      if (notes.length) {
+        const noteRow = document.createElement('div');
+        noteRow.className = 'compose-reply-preview__notes';
+        notes.forEach((note) => {
+          const tag = document.createElement('span');
+          tag.className = 'tag';
+          tag.textContent = note;
+          noteRow.appendChild(tag);
+        });
+        main.appendChild(noteRow);
+      }
+      row.appendChild(main);
+      qb.appendChild(row);
+    } else if (label === 'Replying to your post') {
+      const br = document.createElement('br');
+      qb.appendChild(br);
+      const mono = document.createElement('span');
+      mono.className = 'mono';
+      mono.textContent = replyUrl || '';
+      qb.appendChild(mono);
+    } else {
+      const strong = document.createElement('strong');
+      strong.textContent = ' ' + (vaakReplyPreviewTargetLabel(replyUrl) || 'the original post');
+      qb.appendChild(strong);
+    }
+    const asMeta = form.querySelector ? (form.querySelector('.compose-as-line') || form.querySelector('.meta')) : null;
+    if (asMeta && asMeta.parentNode) asMeta.parentNode.insertBefore(qb, asMeta.nextSibling);
+    else if (form.insertBefore) form.insertBefore(qb, form.firstChild || null);
+    else if (form.appendChild) form.appendChild(qb);
+  }
+  /* vaak-reply-preview:end */
+
   function isOwnNoteUrl(url) {
     const m = String(url || '').trim().match(/^https:\/\/mkultra\.monster\/users\/([^/]+)\/notes\//i);
     const self = String(window.VAAK_ACTOR_KEY || '').trim().replace(/^@+/, '').toLowerCase();
@@ -45789,15 +46004,6 @@ $showComposeFab = empty($GLOBALS['vaak_guest_profile'])
       }
       if (isSelf) {
         if (ta) ta.value = '';
-        const qb = document.createElement('div');
-        qb.className = 'quote-block';
-        qb.style.marginBottom = '.75rem';
-        qb.innerHTML = '<span class="qt-label">Replying to your post</span><br><span class="mono"></span>';
-        const mono = qb.querySelector('.mono');
-        if (mono) mono.textContent = replyUrl;
-        const asMeta = form.querySelector('.meta[style*="margin-bottom"]');
-        if (asMeta && asMeta.parentNode) asMeta.parentNode.insertBefore(qb, asMeta.nextSibling);
-        else form.insertBefore(qb, form.firstChild);
       } else if (ta) {
         // Prefill @author (+ other mentions) with a trailing space.
         if (mentionSeed) {
@@ -45824,6 +46030,14 @@ $showComposeFab = empty($GLOBALS['vaak_guest_profile'])
       if (title) title.textContent = isSelf ? 'Continue thread' : 'Reply';
       if (submitBtn) submitBtn.textContent = 'Reply';
       if (ta) ta.placeholder = isSelf ? 'Add to the thread…' : 'Write your reply…';
+      // Summary from the card already on the page. A missing card keeps the
+      // handle (or your post's URL) that the composer used before.
+      vaakPaintComposeReplyContext(
+        form,
+        isSelf ? 'Replying to your post' : 'Replying to',
+        replyUrl,
+        opts.preview || null
+      );
     }
     vaakUpdateComposeCharCount();
     bindReplyPrivacyGuard();
@@ -45863,12 +46077,40 @@ $showComposeFab = empty($GLOBALS['vaak_guest_profile'])
     if (blocked && select.value === 'private') select.value = 'public';
   }
 
+  // Server-rendered compose already ran the local lookup. If that missed but
+  // the same post is on this page, fill the summary from the card.
+  function vaakUpgradeServerReplyPreview() {
+    if (!form || (form.querySelector && form.querySelector('.compose-reply-preview'))) return;
+    const replyToEl = document.getElementById('compose-in-reply-to');
+    const uri = replyToEl && replyToEl.value ? String(replyToEl.value).trim() : '';
+    if (!uri || !document.querySelectorAll) return;
+    const want = uri.replace(/\/+$/, '');
+    const links = document.querySelectorAll('a[href*="reply_to="]');
+    for (let i = 0; i < links.length; i++) {
+      const link = links[i];
+      let parsed;
+      try { parsed = new URL(link.getAttribute('href') || '', window.location.href); } catch (e) { continue; }
+      const target = String(parsed.searchParams.get('reply_to') || '').trim().replace(/\/+$/, '');
+      if (target !== want) continue;
+      const preview = vaakReplyPreviewFromCard(link);
+      if (!preview) continue;
+      vaakPaintComposeReplyContext(form, isOwnNoteUrl(uri) ? 'Replying to your post' : 'Replying to', uri, preview);
+      break;
+    }
+  }
+
   // The inline composer is rendered server-side and may never pass through
   // applyReplyQuoteChrome(), so bind its privacy guard on the initial page.
-  document.addEventListener('DOMContentLoaded', bindReplyPrivacyGuard);
-  if (document.readyState !== 'loading') bindReplyPrivacyGuard();
+  document.addEventListener('DOMContentLoaded', function () {
+    bindReplyPrivacyGuard();
+    vaakUpgradeServerReplyPreview();
+  });
+  if (document.readyState !== 'loading') {
+    bindReplyPrivacyGuard();
+    vaakUpgradeServerReplyPreview();
+  }
 
-  function openComposeFromTimelineLink(url) {
+  function openComposeFromTimelineLink(url, sourceEl) {
     let parsed;
     try { parsed = new URL(url, window.location.href); } catch (e) { return false; }
     const sp = parsed.searchParams;
@@ -45889,6 +46131,7 @@ $showComposeFab = empty($GLOBALS['vaak_guest_profile'])
       mention: mention,
       cw: cw,
       sensitive: sensitive,
+      preview: replyTo && sourceEl ? vaakReplyPreviewFromCard(sourceEl) : null,
       returnView: (sp.get('view') === 'compose' ? null : sp.get('view')) || null,
     });
     // Don't restore a leftover local draft over a fresh reply/quote target.
@@ -45907,7 +46150,7 @@ $showComposeFab = empty($GLOBALS['vaak_guest_profile'])
     if (!href || href.charAt(0) === '#') return;
     if (!/[?&]compose=/.test(href) && !/[?&]view=compose(?:&|$)/.test(href)) return;
     if (!/[?&](?:reply_to|quote_object)=/.test(href)) return;
-    if (openComposeFromTimelineLink(href)) {
+    if (openComposeFromTimelineLink(href, a)) {
       ev.preventDefault();
       ev.stopPropagation();
     }
