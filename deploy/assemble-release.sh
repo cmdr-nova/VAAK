@@ -115,6 +115,7 @@ self_test() {
   [[ -f "${tmp}/out/api/migrations/20261014_phyrian_clans_postgres.sql" ]]
   [[ -f "${tmp}/out/api/migrations/20261019_phyrian_grid_lineage_postgres.sql" ]]
   [[ -f "${tmp}/out/api/migrations/20261021_bsky_follow_carry_postgres.sql" ]]
+  [[ -f "${tmp}/out/api/migrations/20261026_ml_shadow_scorecard_postgres.sql" ]]
   [[ ! -e "${tmp}/out/docs" ]]
   echo "assemble_self_test_ok"
 }

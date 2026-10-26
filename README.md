@@ -65,7 +65,7 @@ The app I actually use is the link above. If you want to see how a copy is wired
 
 PostgreSQL is the database (`AP_DB_DSN` as a `pgsql:` DSN). SQLite is available when `AP_ALLOW_SQLITE=1` is set, for local work. Redis is a cache and a queue. If Redis is down, the app still serves. It just has more to do on the way.
 
-A small explainable ranker can train beside the live Home ordering and compare the two. People see the production heuristic. The comparison lives in [`rust/vaak-worker/src/ml_ranker.rs`](rust/vaak-worker/src/ml_ranker.rs).
+A small explainable ranker can train beside the live Home ordering and compare the two. People see the production heuristic. The nightly job holds out the newest positive interactions, scores that shadow model against the live signal formula, and keeps the older top-20 overlap number. Likes, bookmarks, dwell, and the hashtags on liked or bookmarked posts are the signals. The comparison lives in [`rust/vaak-worker/src/ml_ranker.rs`](rust/vaak-worker/src/ml_ranker.rs).
 
 ## Status
 

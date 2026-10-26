@@ -711,7 +711,18 @@ fn render_core_mode(status:&Value,facts:&CardFacts,direct:Option<&crate::direct_
     let rss_id = integer(st, "vaak_rss_item_id");
     let rss_attrs = if is_rss { format!(" data-rss-item=\"{rss_id}\"") } else { String::new() };
     let (bsky_attrs, bsky_rank) = if is_bsky { super::bsky::normalized_attr_parts(st) } else { (String::new(), String::new()) };
-    let rank_attrs = if is_rss { format!(" data-rank-platform=\"rss\" data-rank-key=\"rss:item:{rss_id}\" data-rank-actor=\"rss:feed:{}\"", integer(st, "vaak_rss_feed_id")) } else { bsky_rank };
+    // Focused fedi posts (single-post view) carry the same local rank key the
+    // Home cards use, so owner dwell can see them. Home cards are unchanged.
+    let focused=direct.is_some_and(|options|options.focused());
+    let rank_attrs = if is_rss {
+        format!(" data-rank-platform=\"rss\" data-rank-key=\"rss:item:{rss_id}\" data-rank-actor=\"rss:feed:{}\"", integer(st, "vaak_rss_feed_id"))
+    } else if !bsky_rank.is_empty() {
+        bsky_rank
+    } else if focused && !uri.is_empty() && !actor.is_empty() {
+        format!(" data-rank-platform=\"fedi\" data-rank-key=\"{}\" data-rank-actor=\"{}\"", esc(uri), esc(actor))
+    } else {
+        String::new()
+    };
     let card_is_boost = !boost.is_empty() || boost_hydrate;
     let displayed_id = scalar_string(st, "id");
     let timeline_key = if !card_is_boost && is_rss && rss_id > 0 {
@@ -725,7 +736,6 @@ fn render_core_mode(status:&Value,facts:&CardFacts,direct:Option<&crate::direct_
     let sort_ts = crate::timeline::status_created_ts(&serde_json::json!({ "created_at": sort_raw }));
     let announce = if card_is_boost && announce_id > 0 { announce_id.to_string() } else { String::new() };
     let identity_attrs = poll_identity_attrs(card_is_boost, &timeline_key, if card_is_boost { outer_id.as_str() } else { displayed_id.as_str() }, if card_is_boost { "" } else { uri }, &announce, sort_ts);
-    let focused=direct.is_some_and(|options|options.focused());
     let hide_header=direct.is_some_and(|options|options.hide_header());
     let mut html = format!("<article class=\"tweet{}{}{}{}\"{}{rss_attrs}{bsky_attrs}{identity_attrs}{hydrate_attrs}{rank_attrs}>{boost}",if focused {" tweet-focus"}else{""}, if boost.is_empty()&&!boost_hydrate { "" } else { " tweet-boost" },if is_bsky {" tweet-bsky"}else{""},if hide_header {" tweet-embed-nohd"}else{""},if focused {" id=\"status-focus\""}else{""});
     if !hide_header {

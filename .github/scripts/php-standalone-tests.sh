@@ -67,6 +67,7 @@ php_tests=(
   api/bin/dm-media-smoke.php
   api/bin/follow-fallback-smoke.php
   api/bin/home-bsky-index-smoke.php
+  api/bin/home-signal-batch-smoke.php
   api/bin/inbox-signature-smoke.php
   api/bin/inbox-ownership-smoke.php
   api/bin/inbox-flood-smoke.php
@@ -165,6 +166,7 @@ node_tests=(
   api/bin/reply-no-reload-regression.js
   api/bin/reply-preview-regression.js
   api/bin/home-notifications-view-switch-regression.js
+  api/bin/home-signal-dwell-regression.js
   api/bin/profile-end-label-regression.js
   api/bin/soft-nav-address-regression.js
 )

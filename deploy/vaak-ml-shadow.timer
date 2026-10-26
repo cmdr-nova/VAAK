@@ -1,0 +1,11 @@
+[Unit]
+Description=Train the VAAK shadow ranker and write its scorecard
+
+[Timer]
+# 11:50 PM US Eastern, after the evening and before midnight maintenance.
+OnCalendar=*-*-* 23:50:00 America/New_York
+Persistent=true
+Unit=vaak-ml-shadow.service
+
+[Install]
+WantedBy=timers.target

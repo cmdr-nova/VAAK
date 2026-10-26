@@ -14,6 +14,8 @@ Native Search rendering is enabled after separate user authorization and verifie
 | `actor-warm --loop` | **LIVE** | Drains `vaak:queue:bsky_actor_warm` (Redis DB1); `getProfiles` → `bsky_actor_profiles` + flat DID Redis |
 | `ap-actor-warm --loop` | **LIVE** | Drains `vaak:queue:ap_actor_warm` (Redis DB1); spawns PHP signed AS2 fetch → `remote_actors` + flat AP Redis |
 | `timeline-fanout --loop` | **LIVE** | Drains `vaak:queue:timeline_fanout` (Redis DB1); ranked prepend + Home hydrate invalidate (0.6.73); PHP enqueue with in-process fallback |
+| `ml-train` | shadow | Nightly owner ranker. Holds out recent positives, writes `ap_ml_shadow_scorecard`, logs overlap@20. Does not change Home order. Timer: `deploy/vaak-ml-shadow.timer` (23:50 America/New_York). |
+| `ml-compare` | shadow | Reprint the scorecard without saving a model. Requires a trained Redis model. |
 | `notif-badge` / `ranked-newer` / … | shadow | Parity / soak helpers |
 | `serve` | shadow HTTP | Localhost `/shadow/*` + Mastodon-shaped `/api/v1/timelines/home` (hydrate Redis), `/api/v1/notifications` (Redis-read) |
 

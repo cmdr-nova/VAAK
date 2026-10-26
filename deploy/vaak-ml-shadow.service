@@ -1,0 +1,28 @@
+# Nightly shadow ranker. Trains the owner model, writes the holdout
+# scorecard, and logs overlap@20. Does not change Home order.
+#
+#   cp deploy/vaak-ml-shadow.{service,timer} /etc/systemd/system/
+#   systemctl daemon-reload
+#   systemctl enable --now vaak-ml-shadow.timer
+#
+# Read the latest run:
+#   journalctl -u vaak-ml-shadow.service -n 40 --no-pager
+#   psql -d novalandia -c "SELECT run_on, summary_json FROM ap_ml_shadow_scorecard WHERE owner_user_id = 1 ORDER BY run_on DESC LIMIT 14;"
+
+[Unit]
+Description=VAAK shadow ranker nightly scorecard
+After=postgresql.service redis-server.service
+Wants=postgresql.service redis-server.service
+ConditionPathExists=/usr/local/bin/vaak-worker
+
+[Service]
+Type=oneshot
+User=www-data
+Group=www-data
+Nice=19
+IOSchedulingClass=idle
+Environment=VAAK_ENV_FILE=/etc/mkultra/vaak.env
+Environment=VAAK_SHADOW_OWNER_ID=1
+ExecStart=/usr/local/bin/vaak-worker ml-train --owner-id 0
+NoNewPrivileges=true
+PrivateTmp=true
