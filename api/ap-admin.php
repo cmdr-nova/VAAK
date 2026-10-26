@@ -16573,46 +16573,404 @@ function admin_dm_conversation_list_html(array $conversations, string $activePee
     return $html !== '' ? $html : admin_mascot_empty('No direct messages yet.');
 }
 
-/** Render cached context for a DM that references another post. */
-function admin_dm_reply_context_html(string $replyTo, string $returnView = 'dms'): string
+/**
+ * Reply-context HTML for one DM thread, keyed like $thread.
+ * The block and its status link are only on the first message
+ * that references a given non-DM post the viewer can already see: public,
+ * unlisted, or followers-only. A reply to a DM, a repeat of the same post, a
+ * direct/local post, or anything we cannot prove is visible stays blank.
+ *
+ * @param list<array<string,mixed>> $thread chronological rows (id ASC)
+ * @return array<int|string,string>
+ */
+function admin_dm_reply_contexts_html(array $thread, string $returnView = 'dms'): array
 {
-    $replyTo = rtrim(trim($replyTo), '/');
-    if ($replyTo === '' || !str_starts_with($replyTo, 'https://')) {
-        return '';
+    $out = [];
+    $replies = [];
+    $threadObjects = [];
+    foreach ($thread as $i => $message) {
+        $out[$i] = '';
+        if (!is_array($message)) {
+            continue;
+        }
+        $objectId = rtrim(trim((string) ($message['object_id'] ?? '')), '/');
+        if ($objectId !== '') {
+            $threadObjects[$objectId] = true;
+        }
+        $replyTo = rtrim(trim((string) ($message['in_reply_to'] ?? '')), '/');
+        if ($replyTo !== '' && str_starts_with($replyTo, 'https://')) {
+            $replies[$i] = $replyTo;
+        }
     }
-    $summary = '';
-    $author = '';
+    if ($replies === []) {
+        return $out;
+    }
+    $candidates = [];
+    foreach ($replies as $replyTo) {
+        if (!isset($threadObjects[$replyTo])) {
+            $candidates[$replyTo] = true;
+        }
+    }
     try {
-        $row = function_exists('ap_event_by_object_id') ? ap_event_by_object_id($replyTo) : null;
-        if (is_array($row)) {
-            $summary = trim((string) ($row['summary'] ?? ''));
-            $author = trim((string) ($row['actor_id'] ?? ''));
-        }
-        if ($summary === '' && function_exists('ap_masto_status_by_note_id')) {
-            $row = ap_masto_status_by_note_id($replyTo);
-            if (is_array($row)) {
-                $summary = trim((string) ($row['content_text'] ?? ''));
-                $author = trim((string) ($row['actor_id'] ?? $row['account_id'] ?? ''));
-            }
-        }
-        if ($summary === '') {
-            $st = ap_db()->prepare(
-                'SELECT content FROM outbox_notes WHERE id = ? OR id = ? LIMIT 1'
-            );
-            $st->execute([$replyTo, $replyTo . '/']);
-            $outbox = $st->fetch();
-            if (is_array($outbox)) {
-                $summary = trim(strip_tags((string) ($outbox['content'] ?? '')));
-            }
-        }
+        $visible = $candidates === [] ? [] : admin_dm_visible_reply_targets(array_keys($candidates));
     } catch (Throwable $e) {
-        // A missing/private remote parent should not prevent the DM rendering.
+        // An unreadable parent must not turn a private reply into a status link.
+        return $out;
     }
+    $returnView = preg_replace('/[^a-z_]/', '', $returnView) ?: 'dms';
+    $shown = [];
+    foreach ($replies as $i => $replyTo) {
+        if (isset($threadObjects[$replyTo]) || isset($shown[$replyTo]) || !isset($visible[$replyTo])) {
+            continue;
+        }
+        $shown[$replyTo] = true;
+        $fact = $visible[$replyTo];
+        $out[$i] = admin_dm_reply_context_block_html(
+            $replyTo,
+            (string) ($fact['author'] ?? ''),
+            (string) ($fact['summary'] ?? ''),
+            $returnView
+        );
+    }
+    return $out;
+}
+
+/**
+ * Posts in $urls that are safe to name from a DM.
+ * One lookup for the whole thread: DM rows win, then local outbox audience,
+ * then the firehose Create/Update, then a cached status. No remote fetch.
+ *
+ * @param list<string> $urls
+ * @return array<string,array{author:string,summary:string}>
+ */
+function admin_dm_visible_reply_targets(array $urls): array
+{
+    $urls = array_values(array_unique(array_filter(array_map(
+        static fn ($url): string => rtrim(trim((string) $url), '/'),
+        $urls
+    ), static fn (string $url): bool => str_starts_with($url, 'https://'))));
+    if ($urls === [] || !function_exists('ap_db')) {
+        return [];
+    }
+    $variants = [];
+    foreach ($urls as $url) {
+        $variants[$url] = true;
+        $variants[$url . '/'] = true;
+    }
+    $variantList = array_keys($variants);
+    $marks = implode(',', array_fill(0, count($variantList), '?'));
+    $db = ap_db();
+    $dm = $db->prepare("SELECT object_id FROM direct_messages WHERE object_id IN ($marks)");
+    $dm->execute($variantList);
+    $dmIds = [];
+    foreach ($dm->fetchAll() as $row) {
+        if (is_array($row)) {
+            $dmIds[rtrim((string) ($row['object_id'] ?? ''), '/')] = true;
+        }
+    }
+    $urls = array_values(array_filter($urls, static fn (string $url): bool => !isset($dmIds[$url])));
+    if ($urls === []) {
+        return [];
+    }
+    $variants = [];
+    foreach ($urls as $url) {
+        $variants[$url] = true;
+        $variants[$url . '/'] = true;
+    }
+    $variantList = array_keys($variants);
+    $marks = implode(',', array_fill(0, count($variantList), '?'));
+    $keyOf = static fn (string $url): string => rtrim(trim($url), '/');
+
+    $events = [];
+    $event = $db->prepare(
+        "SELECT object_id, type, actor_id, summary, visibility, action_taken
+         FROM events
+         WHERE object_id IN ($marks) AND type IN ('Create','Update','Delete','Tombstone')
+         ORDER BY id ASC"
+    );
+    $event->execute($variantList);
+    foreach ($event->fetchAll() as $row) {
+        if (!is_array($row)) {
+            continue;
+        }
+        $key = $keyOf((string) ($row['object_id'] ?? ''));
+        if ($key === '') {
+            continue;
+        }
+        if (!isset($events[$key])) {
+            $events[$key] = ['deleted' => false, 'author' => '', 'summary' => '', 'visibility' => ''];
+        }
+        $type = (string) ($row['type'] ?? '');
+        if ($type === 'Delete' || $type === 'Tombstone' || (string) ($row['action_taken'] ?? '') === 'deleted') {
+            $events[$key]['deleted'] = true;
+        }
+        if ($type === 'Create' || $type === 'Update') {
+            $author = rtrim(trim((string) ($row['actor_id'] ?? '')), '/');
+            $summary = trim((string) ($row['summary'] ?? ''));
+            $visibility = strtolower(trim((string) ($row['visibility'] ?? '')));
+            if ($author !== '') {
+                $events[$key]['author'] = $author;
+            }
+            if ($summary !== '') {
+                $events[$key]['summary'] = $summary;
+            }
+            if ($visibility !== '') {
+                $events[$key]['visibility'] = $visibility;
+            }
+        }
+    }
+
+    $outbox = [];
+    $note = $db->prepare("SELECT id, content, visibility, to_json, cc_json FROM outbox_notes WHERE id IN ($marks)");
+    $note->execute($variantList);
+    foreach ($note->fetchAll() as $row) {
+        if (!is_array($row)) {
+            continue;
+        }
+        $key = $keyOf((string) ($row['id'] ?? ''));
+        if ($key !== '') {
+            $outbox[$key] = $row;
+        }
+    }
+
+    $masto = [];
+    $status = $db->prepare("SELECT note_id, content_text, visibility FROM masto_statuses WHERE note_id IN ($marks)");
+    $status->execute($variantList);
+    foreach ($status->fetchAll() as $row) {
+        if (!is_array($row)) {
+            continue;
+        }
+        $key = $keyOf((string) ($row['note_id'] ?? ''));
+        if ($key !== '') {
+            $masto[$key] = $row;
+        }
+    }
+
+    $viewer = function_exists('vaak_actor_id') ? rtrim(vaak_actor_id(), '/') : '';
+    $pending = [];
+    foreach ($urls as $url) {
+        if (!empty($events[$url]['deleted'])) {
+            continue;
+        }
+        $author = (string) ($events[$url]['author'] ?? '');
+        $summary = (string) ($events[$url]['summary'] ?? '');
+        $visibility = (string) ($events[$url]['visibility'] ?? '');
+        $recipients = [];
+        $mastoVisibility = isset($masto[$url]) ? strtolower(trim((string) ($masto[$url]['visibility'] ?? ''))) : '';
+        if (isset($outbox[$url])) {
+            $outboxVisibility = strtolower(trim((string) ($outbox[$url]['visibility'] ?? '')));
+            if ($outboxVisibility !== '') {
+                $visibility = $outboxVisibility;
+            }
+            if ($author === '' && str_contains($url, '/notes/')) {
+                $author = rtrim(explode('/notes/', $url, 2)[0], '/');
+            }
+            foreach (['to_json', 'cc_json'] as $field) {
+                $decoded = json_decode((string) ($outbox[$url][$field] ?? ''), true);
+                if (!is_array($decoded)) {
+                    continue;
+                }
+                foreach ($decoded as $recipient) {
+                    if (is_string($recipient) && $recipient !== '') {
+                        $recipients[] = rtrim($recipient, '/');
+                    }
+                }
+            }
+        } elseif ($visibility === '' && $mastoVisibility !== '') {
+            $visibility = $mastoVisibility;
+        }
+        if ($summary === '' && isset($masto[$url])) {
+            $summary = trim((string) ($masto[$url]['content_text'] ?? ''));
+        }
+        if ($summary === '' && isset($outbox[$url])) {
+            $summary = trim(strip_tags((string) ($outbox[$url]['content'] ?? '')));
+        }
+        // A direct audience on any cached copy is a private post, not a status page.
+        if ($visibility === 'direct' || $mastoVisibility === 'direct') {
+            continue;
+        }
+        if (in_array($visibility, ['silent', 'silent_public'], true)) {
+            $visibility = 'unlisted';
+        } elseif (in_array($visibility, ['followers', 'followers_only'], true)) {
+            $visibility = 'private';
+        }
+        if ($visibility === 'public' || $visibility === 'unlisted') {
+            $pending[$url] = ['author' => $author, 'summary' => $summary, 'show' => true];
+            continue;
+        }
+        if ($visibility !== 'private') {
+            continue;
+        }
+        $pending[$url] = [
+            'author' => $author,
+            'summary' => $summary,
+            'show' => false,
+            'recipients' => $recipients,
+        ];
+    }
+    if ($pending !== []) {
+        admin_dm_grant_followers_only_targets($pending, $viewer);
+    }
+    $visible = [];
+    foreach ($pending as $url => $fact) {
+        if (empty($fact['show'])) {
+            continue;
+        }
+        $visible[$url] = [
+            'author' => (string) ($fact['author'] ?? ''),
+            'summary' => (string) ($fact['summary'] ?? ''),
+        ];
+    }
+    return $visible;
+}
+
+/**
+ * Followers-only targets the signed-in viewer already has an audience for.
+ * Public and unlisted targets are decided before this runs.
+ *
+ * @param array<string,array<string,mixed>> $pending
+ */
+function admin_dm_grant_followers_only_targets(array &$pending, string $viewer): void
+{
+    $viewer = rtrim($viewer, '/');
+    $needFollow = [];
+    $needMention = [];
+    foreach ($pending as $url => $fact) {
+        if (!empty($fact['show'])) {
+            continue;
+        }
+        $author = rtrim((string) ($fact['author'] ?? ''), '/');
+        $recipients = is_array($fact['recipients'] ?? null) ? $fact['recipients'] : [];
+        if ($viewer !== '' && ($author === $viewer || in_array($viewer, $recipients, true))) {
+            $pending[$url]['show'] = true;
+            continue;
+        }
+        if ($viewer !== '' && $author !== '') {
+            $needFollow[$url] = $author;
+        }
+        $needMention[$url] = true;
+    }
+    if ($needFollow === [] && $needMention === []) {
+        return;
+    }
+    $db = ap_db();
+    $followedAuthors = [];
+    $withSlash = static function (array $ids): array {
+        $out = [];
+        foreach ($ids as $id) {
+            $id = rtrim((string) $id, '/');
+            if ($id === '') {
+                continue;
+            }
+            $out[$id] = true;
+            $out[$id . '/'] = true;
+        }
+        return array_keys($out);
+    };
+    if ($viewer !== '' && $needFollow !== []) {
+        try {
+            $authors = array_values(array_unique(array_values($needFollow)));
+            $localAuthors = [];
+            $remoteAuthors = [];
+            foreach ($authors as $author) {
+                if (str_starts_with($author, 'https://mkultra.monster/users/')) {
+                    $localAuthors[] = $author;
+                } else {
+                    $remoteAuthors[] = $author;
+                }
+            }
+            if ($localAuthors !== []) {
+                $localKeys = $withSlash($localAuthors);
+                $localMarks = implode(',', array_fill(0, count($localKeys), '?'));
+                $st = $db->prepare("SELECT owner_actor_id FROM followers WHERE actor_id IN (?, ?) AND owner_actor_id IN ($localMarks)");
+                $st->execute(array_merge([$viewer, $viewer . '/'], $localKeys));
+                foreach ($st->fetchAll() as $row) {
+                    if (is_array($row)) {
+                        $followedAuthors[rtrim((string) ($row['owner_actor_id'] ?? ''), '/')] = true;
+                    }
+                }
+            }
+            if ($remoteAuthors !== []) {
+                $remoteKeys = $withSlash($remoteAuthors);
+                $remoteMarks = implode(',', array_fill(0, count($remoteKeys), '?'));
+                $st = $db->prepare("SELECT actor_id FROM following WHERE owner_actor_id IN (?, ?) AND actor_id IN ($remoteMarks)");
+                $st->execute(array_merge([$viewer, $viewer . '/'], $remoteKeys));
+                foreach ($st->fetchAll() as $row) {
+                    if (is_array($row)) {
+                        $followedAuthors[rtrim((string) ($row['actor_id'] ?? ''), '/')] = true;
+                    }
+                }
+            }
+        } catch (Throwable $e) {
+            // A missing follow table must not invent an audience.
+            $followedAuthors = [];
+        }
+    }
+    $mentioned = [];
+    $ownerId = function_exists('admin_owner_user_id') ? admin_owner_user_id() : 0;
+    if ($ownerId > 0 && $needMention !== []) {
+        $mentionUrls = [];
+        foreach (array_keys($needMention) as $url) {
+            if (!empty($pending[$url]['show'])) {
+                continue;
+            }
+            if (isset($needFollow[$url], $followedAuthors[$needFollow[$url]])) {
+                continue;
+            }
+            $mentionUrls[] = $url;
+            $mentionUrls[] = $url . '/';
+        }
+        if ($mentionUrls !== []) {
+            try {
+                $mentionMarks = implode(',', array_fill(0, count($mentionUrls), '?'));
+                $st = $db->prepare(
+                    "SELECT object_id FROM mentions
+                     WHERE owner_user_id = ? AND deleted_at IS NULL
+                       AND activity_type IN ('Create','Update','Quote','QuotePost')
+                       AND object_id IN ($mentionMarks)"
+                );
+                $st->execute(array_merge([$ownerId], $mentionUrls));
+                foreach ($st->fetchAll() as $row) {
+                    if (is_array($row)) {
+                        $mentioned[rtrim((string) ($row['object_id'] ?? ''), '/')] = true;
+                    }
+                }
+            } catch (Throwable $e) {
+                $mentioned = [];
+            }
+        }
+    }
+    foreach ($needFollow as $url => $author) {
+        if (isset($followedAuthors[$author]) || isset($mentioned[$url])) {
+            $pending[$url]['show'] = true;
+        }
+    }
+    foreach (array_keys($needMention) as $url) {
+        if (isset($mentioned[$url])) {
+            $pending[$url]['show'] = true;
+        }
+    }
+}
+
+/** The small "In reply to" block. Caller has already decided this post may be named. */
+function admin_dm_reply_context_block_html(string $replyTo, string $author, string $summary, string $returnView): string
+{
     $summary = trim(html_entity_decode(strip_tags($summary), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
     if ($summary !== '') {
         $summary = mb_substr($summary, 0, 320);
     }
-    $label = $author !== '' ? actor_handle($author) : (parse_url($replyTo, PHP_URL_HOST) ?: 'referenced post');
+    $label = parse_url($replyTo, PHP_URL_HOST) ?: 'referenced post';
+    $author = rtrim(trim($author), '/');
+    if ($author !== '' && function_exists('actor_handle')) {
+        try {
+            $handle = trim(actor_handle($author, null, false));
+            if ($handle !== '') {
+                $label = $handle;
+            }
+        } catch (Throwable $e) {
+            // Cache-only label. A profile miss must not drop the reference.
+        }
+    }
     $html = '<div class="quote-block dm-reply-context">'
         . '<div class="meta">In reply to ' . h($label) . '</div>';
     if ($summary !== '') {
@@ -30889,11 +31247,12 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
           <?php if (!$thread): ?>
             <div class="empty">Empty thread — no stored messages for this peer.</div>
           <?php endif; ?>
+          <?php $dmReplyContexts = $thread ? admin_dm_reply_contexts_html($thread, 'dms') : []; ?>
           <?php foreach ($thread as $dmIndex => $m): ?>
             <?php
               $isOut = ($m['direction'] ?? '') === 'out';
               $msgHtml = admin_dm_html($m['content'] ?? null, $m);
-              $dmReplyContext = admin_dm_reply_context_html((string) ($m['in_reply_to'] ?? ''), 'dms');
+              $dmReplyContext = $dmReplyContexts[$dmIndex] ?? '';
             ?>
             <article class="tweet"<?= $dmIndex === count($thread) - 1 ? ' id="dm-message-last"' : '' ?>>
               <div class="tweet-hd">

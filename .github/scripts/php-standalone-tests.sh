@@ -63,6 +63,7 @@ php_tests=(
   api/bin/net-guard-pin-smoke.php
   api/bin/masto-status-audience-smoke.php
   api/bin/dm-ask-parity-smoke.php
+  api/bin/dm-reply-context-smoke.php
   api/bin/follow-fallback-smoke.php
   api/bin/home-bsky-index-smoke.php
   api/bin/inbox-signature-smoke.php
