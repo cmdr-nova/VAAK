@@ -15377,7 +15377,7 @@ function admin_quote_media_html(array $items): string
  * Normalize Mastodon media_attachments / AS2 attachments into admin_media_row_html items.
  *
  * @param mixed $attachments
- * @return list<array{url:string,mediaType:?string,preview_url?:string}>
+ * @return list<array{url:string,mediaType:?string,preview_url?:string,description?:string,name?:string,alt?:string}>
  */
 function admin_quote_media_items_from_status_like(mixed $attachments): array
 {
@@ -15424,11 +15424,17 @@ function admin_quote_media_items_from_status_like(mixed $attachments): array
         } elseif (is_string($att['thumbnail'] ?? null) && str_starts_with((string) $att['thumbnail'], 'https://')) {
             $preview = (string) $att['thumbnail'];
         }
-        $items[] = [
+        $item = [
             'url' => $url,
             'mediaType' => $mt,
             'preview_url' => $preview,
         ];
+        foreach (['description', 'name', 'alt'] as $altKey) {
+            if (array_key_exists($altKey, $att) && is_string($att[$altKey])) {
+                $item[$altKey] = $att[$altKey];
+            }
+        }
+        $items[] = $item;
         if (count($items) >= 4) {
             break;
         }
@@ -19629,13 +19635,20 @@ function admin_render_masto_status_card(
         }
         $atype = strtolower((string) ($att['type'] ?? ''));
         $attMime = strtolower((string) ($att['mediaType'] ?? ''));
-        $media[] = [
+        $item = [
             'url' => $u,
             'mediaType' => in_array($atype, ['video', 'gifv'], true)
                 ? ($attMime !== '' ? $attMime : 'video/mp4')
                 : ($atype === 'audio' ? ($attMime !== '' ? $attMime : 'audio/mpeg') : null),
             'preview_url' => str_starts_with($preview, 'https://') ? $preview : null,
         ];
+        // Alt text rides with the attachment. The shared media row escapes it.
+        foreach (['description', 'name', 'alt'] as $altKey) {
+            if (array_key_exists($altKey, $att) && is_string($att[$altKey])) {
+                $item[$altKey] = $att[$altKey];
+            }
+        }
+        $media[] = $item;
     }
     $following = !$isRss && !$isBsky && $actorRef !== '' && admin_is_following($followingIds, $actorRef);
     $sid = (string) ($st['id'] ?? '');
