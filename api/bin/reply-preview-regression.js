@@ -127,6 +127,7 @@ const ctx = vm.createContext({
   decodeURIComponent,
   String,
   RegExp,
+  URL,
 });
 vm.runInContext(js, ctx);
 const fromCard = ctx.vaakReplyPreviewFromCard;
@@ -253,15 +254,17 @@ const searched = fromCard(searchLink);
 check(searched && searched.name === 'Shana Flux' && searched.handle === '@shana_flux', 'search and profile cards');
 
 check(fromCard(el('a', 'icon-btn')) === null, 'a reply link outside a card falls back');
-const badAvatar = article('tweet');
-const badHd = header('Ada', '@ada@remote.example', 'javascript:alert(1)');
-badAvatar.appendChild(badHd);
-badAvatar.appendChild(el('div', 'body feed-body', 'ok'));
-const badActions = el('div', 'tweet-actions');
-const badLink = replyLink('?view=home&compose=1&reply_to=' + encodeURIComponent(remoteUrl));
-badActions.appendChild(badLink);
-badAvatar.appendChild(badActions);
-check(fromCard(badLink).avatar === '', 'javascript avatar urls are dropped');
+['javascript:alert(1)', 'data:text/html,hi', 'vbscript:msgbox(1)'].forEach((bad) => {
+  const scheme = bad.slice(0, bad.indexOf(':'));
+  const badAvatar = article('tweet');
+  badAvatar.appendChild(header('Ada', '@ada@remote.example', bad));
+  badAvatar.appendChild(el('div', 'body feed-body', 'ok'));
+  const badActions = el('div', 'tweet-actions');
+  const badLink = replyLink('?view=home&compose=1&reply_to=' + encodeURIComponent(remoteUrl));
+  badActions.appendChild(badLink);
+  badAvatar.appendChild(badActions);
+  check(fromCard(badLink).avatar === '', scheme + ' avatar urls are dropped');
+});
 
 const form = el('form', 'composer');
 form.id = 'compose-form';
@@ -273,10 +276,23 @@ check(!!painted, 'paint builds a preview');
 check(textOf(form.querySelector('.who')) === 'Ada Lovelace', 'painted name is text');
 check(textOf(form.querySelector('.compose-reply-preview__text')) === remote.snippet, 'painted snippet');
 check(form.querySelector('img').getAttribute('src') === 'https://cdn.example/ada.webp', 'painted avatar');
-const xssPreview = { name: '<script>alert(1)</script>', handle: '@ada', avatar: 'javascript:alert(1)', snippet: '<b>nope</b>', media: true, cw: true, quote: false };
-paint(form, 'Replying to', remoteUrl, xssPreview);
+['javascript:alert(1)', 'data:text/html,hi', 'vbscript:msgbox(1)'].forEach((bad) => {
+  const scheme = bad.slice(0, bad.indexOf(':'));
+  paint(form, 'Replying to', remoteUrl, {
+    name: '<script>alert(1)</script>',
+    handle: '@ada',
+    avatar: bad,
+    snippet: '<b>nope</b>',
+    media: true,
+    cw: true,
+    quote: false,
+  });
+  const src = form.querySelector('img').getAttribute('src');
+  let parsed;
+  try { parsed = new URL(src); } catch (e) { parsed = null; }
+  check(parsed && parsed.protocol === 'https:' && parsed.href === 'https://mkultra.monster/img/avatar/default.webp', scheme + ' avatar falls back to the https default');
+});
 check(textOf(form.querySelector('.who')) === '<script>alert(1)</script>', 'painted name stays text');
-check(!form.querySelector('img').getAttribute('src').startsWith('javascript:'), 'painted avatar is https');
 check(textOf(form.querySelector('.tag')) === 'Content warning', 'painted cw note');
 
 paint(form, 'Replying to', remoteUrl, null);

@@ -17,14 +17,20 @@ function admin_reply_preview_h(string $s): string
     return htmlspecialchars($s, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
 }
 
-/** https URL safe to put in an img src. Anything else becomes ''. */
+/**
+ * https URL safe to put in an img src. javascript:, data:, vbscript:, and
+ * anything else become ''. The scheme is an allowlist, not a denylist.
+ */
 function admin_reply_preview_https_url(string $url): string
 {
     $url = trim($url);
-    if ($url === '' || !preg_match('#^https://#i', $url)) {
+    if ($url === '' || preg_match('/[\s<>"\'\\\\]/', $url)) {
         return '';
     }
-    if (preg_match('/[\s<>"\'\\\\]/', $url)) {
+    $parts = parse_url($url);
+    $scheme = strtolower((string) (is_array($parts) ? ($parts['scheme'] ?? '') : ''));
+    $host = (string) (is_array($parts) ? ($parts['host'] ?? '') : '');
+    if ($scheme !== 'https' || $host === '') {
         return '';
     }
     return $url;

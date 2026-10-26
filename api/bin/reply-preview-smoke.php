@@ -269,17 +269,32 @@ preview_check(($xssPreview['snippet'] ?? '') === 'plain & safe', 'markup and ent
 $html = admin_reply_preview_card_html($xssPreview);
 preview_check(!str_contains($html, '<img src=x'), 'preview html does not echo the payload tag');
 preview_check(str_contains($html, 'plain &amp; safe'), 'preview html escapes the snippet');
-$evil = admin_reply_preview_card_html([
-    'name' => '<script>alert(1)</script>',
-    'handle' => '@ada',
-    'avatar' => 'javascript:alert(1)',
-    'snippet' => '<b>nope</b>',
-    'media' => true,
-    'cw' => true,
-    'quote' => false,
-]);
-preview_check(!str_contains($evil, '<script>') && !str_contains($evil, 'javascript:'), 'card builder drops script and javascript urls');
-preview_check(str_contains($evil, 'Content warning') && str_contains($evil, '>Media<'), 'card builder notes cw and media');
+foreach (['javascript:alert(1)', 'data:text/html,hi', 'vbscript:msgbox(1)'] as $badAvatar) {
+    $scheme = strstr($badAvatar, ':', true);
+    $evil = admin_reply_preview_card_html([
+        'name' => '<script>alert(1)</script>',
+        'handle' => '@ada',
+        'avatar' => $badAvatar,
+        'snippet' => '<b>nope</b>',
+        'media' => true,
+        'cw' => true,
+        'quote' => false,
+    ]);
+    $src = '';
+    if (preg_match('/<img\b[^>]*\bsrc="([^"]*)"/', $evil, $srcMatch) === 1) {
+        $src = (string) $srcMatch[1];
+    }
+    $srcParts = parse_url($src);
+    preview_check(
+        is_array($srcParts)
+        && strtolower((string) ($srcParts['scheme'] ?? '')) === 'https'
+        && ($srcParts['host'] ?? '') !== ''
+        && $src === 'https://mkultra.monster/img/avatar/default.webp',
+        $scheme . ' avatar uses the https default'
+    );
+    preview_check(!str_contains($evil, '<script>'), $scheme . ' card does not emit a script tag');
+    preview_check(str_contains($evil, 'Content warning') && str_contains($evil, '>Media<'), $scheme . ' card keeps the cw and media notes');
+}
 
 $GLOBALS['blocked'] = ['https://remote.example/users/ada'];
 preview_check(admin_reply_preview_lookup($remote) === null, 'blocked actor hidden');

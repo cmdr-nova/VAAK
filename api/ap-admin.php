@@ -45668,8 +45668,13 @@ $showComposeFab = empty($GLOBALS['vaak_guest_profile'])
   /* vaak-reply-preview:start */
   function vaakReplyPreviewAvatar(src) {
     const s = String(src || '').trim();
-    if (!/^https:\/\//i.test(s) || /[\s<>"']/.test(s)) return '';
-    return s;
+    // Allow only an https URL. Rejecting javascript: and leaving data: or
+    // vbscript: in an img src is not enough.
+    if (!s || /[\s<>"'\\]/.test(s)) return '';
+    let parsed;
+    try { parsed = new URL(s); } catch (e) { return ''; }
+    if (parsed.protocol !== 'https:') return '';
+    return parsed.href;
   }
   function vaakReplyPreviewSnippet(text) {
     let t = String(text || '').replace(/\s+/g, ' ').trim();
