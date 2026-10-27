@@ -321,6 +321,9 @@ async fn hydrate_local_quote_targets(db: &Client, statuses: &mut [Value]) -> Res
     targets.sort();
     targets.dedup();
     if targets.is_empty() {
+        for st in statuses.iter_mut() {
+            crate::quote_media::rehome_flattened_quote_media(st);
+        }
         return Ok(());
     }
     let bsky_targets: Vec<String> = targets
@@ -378,6 +381,7 @@ async fn hydrate_local_quote_targets(db: &Client, statuses: &mut [Value]) -> Res
             st["quote"]["quoted_status"] = quoted.clone();
             st["vaak_quote_preview"] = quoted.clone();
         }
+        crate::quote_media::rehome_flattened_quote_media(st);
     }
     crate::home_hydrate_ranked::refresh_local_accounts(db, statuses).await?;
     Ok(())

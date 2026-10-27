@@ -2075,7 +2075,12 @@ pub(crate) async fn hydrate_local_quote_targets(db: &Client, statuses: &mut [Val
     }
     targets.sort();
     targets.dedup();
-    if targets.is_empty() { return Ok(()); }
+    if targets.is_empty() {
+        for st in statuses.iter_mut() {
+            crate::quote_media::rehome_flattened_quote_media(st);
+        }
+        return Ok(());
+    }
     let bsky_targets: Vec<String> = targets
         .iter()
         .filter(|target| !target.starts_with(LOCAL_ACTOR_PREFIX))
@@ -2178,6 +2183,11 @@ pub(crate) async fn hydrate_local_quote_targets(db: &Client, statuses: &mut [Val
             st["quote"]["quoted_status"] = quoted.clone();
             st["vaak_quote_preview"] = quoted.clone();
         }
+        // After a cache hit replaces the stub. A loaded attachment list wins;
+        // a summary that never resolved takes the flattened files inside.
+        // Do this before the alias stamp: a null quoted_status must still be
+        // null here, or the stamp becomes an alias stub and blocks the claim.
+        crate::quote_media::rehome_flattened_quote_media(st);
         if fed_targets.contains(&target) {
             // Also bind unresolved previews to denial checks on the requested
             // aliases: absent recovery must not expose flattened private media.
@@ -3088,12 +3098,16 @@ async fn fetch_creates_by_object(
 }
 
 pub(crate) fn quote_object_candidates(target: &str) -> Vec<String> {
-    let target = target.trim_end_matches('/');
-    let mut candidates = vec![target.to_owned()];
-    // The same literal web/object alias used by PHP's object lookup. Do not
-    // guess numeric actors, cross-host identities or unrelated URL variants.
-    if let Some(capture) = regex::Regex::new(r"^(https://[^/?#]+)/@([A-Za-z0-9_.-]+)/([A-Za-z0-9_-]+)$").unwrap().captures(target) {
-        candidates.push(format!("{}/users/{}/statuses/{}", &capture[1], &capture[2], &capture[3]));
+    let target = target.trim().trim_end_matches('/');
+    if target.is_empty() {
+        return Vec::new();
+    }
+    // Same web/object aliases as PHP ap_object_url_lookup_candidates
+    // (@user/id, /statuses/, /posts/, /notes/, and the reverse). Exact
+    // equality only — no LIKE, so underscores stay literal.
+    let mut candidates = crate::profile_quote_warm::lookup_candidates(target);
+    if !candidates.iter().any(|cand| cand == target) {
+        candidates.insert(0, target.to_owned());
     }
     candidates
 }
@@ -5556,6 +5570,21 @@ mod tests {
                 && !facets.contains(" OR "),
             "{facets}"
         );
+    }
+
+    #[test]
+    fn quote_object_candidates_cover_web_and_object_aliases() {
+        let web = "https://mastodon.social/@EveryPkmnCard/123";
+        let candidates = quote_object_candidates(web);
+        assert!(candidates.iter().any(|url| url == "https://mastodon.social/users/EveryPkmnCard/statuses/123"), "{candidates:?}");
+        assert!(candidates.iter().any(|url| url == "https://mastodon.social/users/EveryPkmnCard/posts/123"), "{candidates:?}");
+        assert!(candidates.iter().any(|url| url == "https://mastodon.social/users/EveryPkmnCard/notes/123"), "{candidates:?}");
+        let object = "https://mastodon.social/users/EveryPkmnCard/statuses/123";
+        let back = quote_object_candidates(object);
+        assert!(back.iter().any(|url| url == web), "{back:?}");
+        assert!(back.iter().any(|url| url.ends_with("/posts/123")), "{back:?}");
+        assert!(back.iter().any(|url| url.ends_with("/notes/123")), "{back:?}");
+        assert!(!back.iter().any(|url| url.contains("LIKE")), "{back:?}");
     }
 
     #[test]
