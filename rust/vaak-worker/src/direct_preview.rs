@@ -202,7 +202,8 @@ pub(crate) fn preview_plain(st:&Value,answer:Option<&str>)->String{
  let quoted_plain=quoted.map(|q|crate::library::body::scrub_as2(&crate::library::body::html_to_plain(s(q,"content"))));
  let mut plain=crate::library::body::strip_raw_quotes(&crate::library::body::scrub_as2(&crate::library::body::html_to_plain(s(st,"content"))),quoted_plain.as_deref());
  if let Some(answer)=answer.filter(|answer|!crate::library::card::php_trim(answer).is_empty()){plain=crate::library::card::php_trim(answer).into();}
- if regex::Regex::new(r"(?i)^\((?:attachment|media|poll|quote|boost)\)$").unwrap().is_match(crate::library::card::php_trim(&plain)){plain.clear();}
+ static PLACEHOLDER:std::sync::OnceLock<regex::Regex>=std::sync::OnceLock::new();
+ if PLACEHOLDER.get_or_init(||regex::Regex::new(r"(?i)^\((?:attachment|media|poll|quote|boost)\)$").unwrap()).is_match(crate::library::card::php_trim(&plain)){plain.clear();}
  plain
 }
 
@@ -290,6 +291,15 @@ async fn resolve_prepared(db:&Client,dns:&dyn PreviewDns,st:&Value,original_cont
 #[cfg(test)]
 mod tests {
  use super::*;
+ #[test]
+ fn preview_plain_placeholder_rule_is_unchanged(){
+  let fresh=regex::Regex::new(r"(?i)^\((?:attachment|media|poll|quote|boost)\)$").unwrap();
+  for content in ["(media)","(MEDIA)","<p>(quote)</p>"," (boost) ","(attachment)","(poll)","(media) and words","words (media)","(video)",""]{
+   let plain=preview_plain(&json!({"content":content}),None);let raw=crate::library::body::strip_raw_quotes(&crate::library::body::scrub_as2(&crate::library::body::html_to_plain(content)),None);
+   let expected=if fresh.is_match(crate::library::card::php_trim(&raw)){String::new()}else{raw};assert_eq!(plain,expected,"{content}");
+  }
+  assert_eq!(preview_plain(&json!({"content":"(media)"}),None),"");assert_eq!(preview_plain(&json!({"content":"(media)"}),Some("answer")),"answer");
+ }
  #[tokio::test]
  #[ignore="opt-in disposable PostgreSQL actual PHP cache-only preview differential"]
  async fn actual_profile_cache_only_preview_replay(){

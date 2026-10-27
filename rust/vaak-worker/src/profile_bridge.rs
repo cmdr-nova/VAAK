@@ -166,7 +166,7 @@ async fn render_request_inner(cfg:&crate::config::Config,secret:Option<&str>,hea
  let started=std::time::Instant::now();
  let request=match decode(&bytes){Ok(request)=>request,Err(_)=>{log_fallback("page","",0,"unknown","",0,"request",started);return(StatusCode::BAD_REQUEST,axum::Json(fallback_body("request"))).into_response()}};
  let(owner,viewer)=viewer_log(&request.viewer);
- let result:Result<Vec<u8>>=async{let db=timed(Stage::Connect,crate::db::connect(&cfg.database_url)).await?;ensure_budget()?;paint(cfg,&db,&request,deps,warm).await}.await;
+ let result:Result<Vec<u8>>=async{let db=timed(Stage::Connect,crate::db::profile_reused(&cfg.database_url)).await?;ensure_budget()?;paint(cfg,&db,&request,deps,warm).await}.await;
  match result{Ok(bytes)=>{log_complete("page",&request.actor,owner,viewer,&request.tab,request.offset,started);(StatusCode::OK,[(axum::http::header::CONTENT_TYPE,"application/json")],bytes).into_response()},Err(error)=>{let reason=fallback_reason(&error);log_fallback("page",&request.actor,owner,viewer,&request.tab,request.offset,reason,started);(StatusCode::UNPROCESSABLE_ENTITY,axum::Json(fallback_body(reason))).into_response()}}
 }
 #[cfg(test)]

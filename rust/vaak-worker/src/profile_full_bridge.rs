@@ -70,7 +70,7 @@ pub(crate) async fn render_full(cfg:&crate::config::Config,headers:HeaderMap,byt
   let started=std::time::Instant::now();
   let request=match decode_full(&bytes){Ok(request)=>request,Err(_)=>{super::log_fallback("full","",0,"unknown","",0,"request",started);return(StatusCode::BAD_REQUEST,axum::Json(json!({"fallback":true,"reason":"request"}))).into_response()}};
   let(owner,viewer)=match &request.viewer{Viewer::Guest{}=>(0,"guest"),Viewer::Authenticated{owner_id,..}=>(*owner_id,"authenticated")};
-  let result:Result<Vec<u8>>=async{let db=super::timed(super::Stage::Connect,crate::db::connect(&cfg.database_url)).await?;super::ensure_budget()?;paint_full(cfg,&db,&request,&crate::direct_preview::PreviewDependencies::production()).await}.await;
+  let result:Result<Vec<u8>>=async{let db=super::timed(super::Stage::Connect,crate::db::profile_reused(&cfg.database_url)).await?;super::ensure_budget()?;paint_full(cfg,&db,&request,&crate::direct_preview::PreviewDependencies::production()).await}.await;
   match result{Ok(bytes)=>{super::log_complete("full",&request.actor,owner,viewer,&request.tab,request.page,started);(StatusCode::OK,[(axum::http::header::CONTENT_TYPE,"application/json")],bytes).into_response()},Err(error)=>{let reason=super::fallback_reason(&error);super::log_fallback("full",&request.actor,owner,viewer,&request.tab,request.page,reason,started);(StatusCode::UNPROCESSABLE_ENTITY,axum::Json(json!({"fallback":true,"reason":reason}))).into_response()}}
  }).await;
  no_store(response).await

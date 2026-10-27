@@ -26,7 +26,9 @@ pub(crate) trait QuoteWarmTransport:Sync{
 pub(crate) struct QuoteWarmEffects{pub helper_requested:bool,pub unavailable:Option<String>,pub bsky_requested:bool,pub dispatched:bool,pub lock_stamped:bool}
 fn normalized(raw:&str)->&str{crate::library::card::php_trim(raw).trim_end_matches('/')}
 fn hash(raw:&str)->String{hex::encode(Sha256::digest(raw.as_bytes()))}
-fn captures(pattern:&str,input:&str)->Option<Vec<String>>{regex::Regex::new(pattern).unwrap().captures(input).map(|c|c.iter().skip(1).map(|m|m.map(|v|v.as_str().to_owned()).unwrap_or_default()).collect())}
+/// Literal patterns compile once per process. Regex is a cheap Arc clone.
+fn compiled(pattern:&'static str)->regex::Regex{static CACHE:std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<&'static str,regex::Regex>>>=std::sync::OnceLock::new();CACHE.get_or_init(Default::default).lock().expect("quote warm patterns").entry(pattern).or_insert_with(||regex::Regex::new(pattern).unwrap()).clone()}
+fn captures(pattern:&'static str,input:&str)->Option<Vec<String>>{compiled(pattern).captures(input).map(|c|c.iter().skip(1).map(|m|m.map(|v|v.as_str().to_owned()).unwrap_or_default()).collect())}
 fn percent(raw:&str)->String{raw.bytes().map(|b|if b.is_ascii_alphanumeric()||b"-_.~".contains(&b){(b as char).to_string()}else{format!("%{b:02X}")}).collect()}
 /// Exact PHP ap_object_url_lookup_candidates, including AP path variants.
 pub(crate) fn lookup_candidates(raw:&str)->Vec<String>{
@@ -106,7 +108,7 @@ impl QuoteWarmContext{
   effects.dispatched=self.transport.quote_process(url,grant).await?;grant.require_current().await?;drop(lock);Ok(effects)
  }
 }
-pub(crate) fn php_int(raw:&str)->i64{let raw=crate::library::card::php_trim(raw);let Some(found)=regex::Regex::new(r"^[+-]?(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][+-]?[0-9]+)?").unwrap().find(raw)else{return 0};let number=found.as_str();number.parse::<i64>().unwrap_or_else(|_|number.parse::<f64>().unwrap_or(0.0) as i64)}
+pub(crate) fn php_int(raw:&str)->i64{let raw=crate::library::card::php_trim(raw);let Some(found)=compiled(r"^[+-]?(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][+-]?[0-9]+)?").find(raw)else{return 0};let number=found.as_str();number.parse::<i64>().unwrap_or_else(|_|number.parse::<f64>().unwrap_or(0.0) as i64)}
 /// Explicit private worker/queue boundary. No owner defaults or credentials
 /// are taken from Config: handle resolution is the PHP helper's owner-zero
 /// public resolver, and the queue receives the already admitted caller owner.
@@ -154,6 +156,15 @@ impl QuoteWarmTransport for ProcessQuoteTransport{
 }
 #[cfg(test)]mod tests{
  use super::*;
+ #[test]fn cached_patterns_match_fresh_compiles(){
+  let patterns:[&'static str;15]=[r"^(https://[^/]+)/@([^/]+)/([A-Za-z0-9_-]+)$",r"^(https://[^/]+)/(?:ap/)?users/([^/]+)/(statuses|posts|notes)/([A-Za-z0-9_-]+)$",r"(?i)^(https://[^\s]+/statuses/[^/]+)/QuotePost/?$",r"/profile/[^/]+/post/[A-Za-z0-9_-]+",r"(?:^|\.)(youtu\.be|youtube\.com|wikipedia\.org|bloomberg\.com|twitter\.com|x\.com|tiktok\.com|instagram\.com|facebook\.com|reddit\.com|twitch\.tv)$",r"(?i)\.(?:jpe?g|png|gif|webp|mp4|webm|mp3|pdf|svg)(?:$|\?)",r"(?i)/(?:statuses|posts|notes|objects|notice|activity|videos/watch|w)/[A-Za-z0-9_-]+",r"/@[^/]+/[0-9A-Za-z_-]+$",r"/post/[0-9]+",r"^at://[^/]+/app\.bsky\.feed\.post/[A-Za-z0-9]+",r"(?i)(?:^|/)(?:convert/ap/)?at://(did:[^/\s]+)/app\.bsky\.feed\.post/([A-Za-z0-9]+)(?:[/?#]|$)",r"(?i)at%3A%2F%2F(did%3A[^/\s]+)/app\.bsky\.feed\.post/([A-Za-z0-9]+)",r"(?i)^https://bsky\.brid\.gy/r/(https://bsky\.app/.+)$",r"(?i)^https://bsky\.app/profile/([^/]+)/post/([^/?#]+)",r"^[+-]?(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][+-]?[0-9]+)?"];
+  let inputs=["https://remote.example/@luna/112233","https://remote.example/users/luna/statuses/112233","https://remote.example/ap/users/a%20b/notes/x-1","https://remote.example/users/luna/statuses/9/QuotePost/","/profile/luna.example/post/abc","www.youtube.com","/media/a.JPG?x=1","/notes/abc_1","/post/42","at://did:plc:abc/app.bsky.feed.post/xyz","https://bsky.brid.gy/convert/ap/at://did:plc:abc/app.bsky.feed.post/xyz","https://bsky.brid.gy/r/https://bsky.app/profile/luna.example/post/abc","https://bsky.app/profile/did:plc:abc/post/xyz?x","+12.5e3 tail","not a match",""];
+  for pattern in patterns{let fresh=regex::Regex::new(pattern).unwrap();for input in inputs{
+   let expected=fresh.captures(input).map(|c|c.iter().skip(1).map(|m|m.map(|v|v.as_str().to_owned()).unwrap_or_default()).collect::<Vec<_>>());
+   assert_eq!(captures(pattern,input),expected,"{pattern} {input}");assert_eq!(captures(pattern,input),expected,"cached {pattern} {input}");
+  }}
+  for(raw,expected)in [("123",123),(" 42 ",42),("1.9",1),("-3e2",-300),("x1",0),("",0)]{assert_eq!(php_int(raw),expected,"{raw}");assert_eq!(php_int(raw),expected,"cached {raw}");}
+ }
  struct Allowed;impl CurrentQuoteGrant for Allowed{fn require_current(&self)->GrantFuture<'_>{Box::pin(async{Ok(())})}}
  struct Recorded{scenario:serde_json::Value,effects:std::sync::Mutex<Vec<serde_json::Value>>}
  impl QuoteWarmTransport for Recorded{
