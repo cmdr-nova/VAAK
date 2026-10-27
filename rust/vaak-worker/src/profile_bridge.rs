@@ -109,6 +109,8 @@ pub(crate) fn fallback_reason(err:&anyhow::Error)->&'static str{
  else if text.contains("quote state"){"quote_state"}
  else if text.contains("XRPC"){"bluesky_xrpc"}
  else if text.contains("PHP fallback:"){"unported"}
+ else if text.contains("lost source positions"){"card_order"}
+ else if text.contains("raw profile view is not")||text.contains("raw authenticated profile requires")||text.contains("raw guest must use")||text.contains("raw current note DOM"){"raw_paint_guard"}
  else{"unclassified"}
 }
 /// VAAK_PROFILE_COMPLETE_LOG_ERRORS=1 also logs the error chain of an
@@ -235,6 +237,8 @@ mod tests{
   let nested=anyhow::anyhow!("PHP fallback: raw page item kind unported").context("raw batch admission for note abc");
   assert_eq!(fallback_reason(&nested),"unported");assert_eq!(unported_site(&nested).as_deref(),Some("PHP fallback: raw page item kind unported"));
   assert_eq!(unported_site(&anyhow::anyhow!("no marker here")),None);
+  assert_eq!(fallback_reason(&anyhow::anyhow!("ordered profile publication lost source positions")),"card_order");
+  for guard in["raw profile view is not a canonical profile caller","raw authenticated profile requires current owner and CSRF","raw guest must use isolated read-only facts","raw current note DOM binding absent"]{assert_eq!(fallback_reason(&anyhow::anyhow!(guard)),"raw_paint_guard","{guard}");}
   // Existing specific codes still win over the broader families.
   assert_eq!(fallback_reason(&anyhow::anyhow!("PHP fallback: cached remote reply changed")),"remote_reply");
  }
