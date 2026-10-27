@@ -109,15 +109,26 @@ pub(crate) fn fallback_reason(err:&anyhow::Error)->&'static str{
  else if text.contains("quote state"){"quote_state"}
  else if text.contains("XRPC"){"bluesky_xrpc"}
  else if text.contains("PHP fallback:"){"unported"}
+ else if text.contains("lost source positions"){"card_order"}
+ else if text.contains("raw profile view is not")||text.contains("raw authenticated profile requires")||text.contains("raw guest must use")||text.contains("raw current note DOM"){"raw_paint_guard"}
  else{"unclassified"}
 }
 /// VAAK_PROFILE_COMPLETE_LOG_ERRORS=1 also logs the error chain of an
 /// unclassified fallback, cut to 600 bytes. Off by default: the text can carry
 /// SQL or post text. Only for a diagnosis run.
 fn log_error_detail(reason:&str,err:&anyhow::Error){
+ if reason=="unported"{if let Some(site)=unported_site(err){tracing::warn!(target:"vaak.profile.complete",step=stage_times().step,site,"complete profile unported item");}return}
  if reason!="unclassified"||std::env::var("VAAK_PROFILE_COMPLETE_LOG_ERRORS").ok().as_deref()!=Some("1"){return}
  let mut detail=format!("{err:#}");if detail.len()>600{let mut end=600;while !detail.is_char_boundary(end){end-=1;}detail.truncate(end);}
  tracing::warn!(target:"vaak.profile.complete",step=stage_times().step,detail,"complete profile fallback detail");
+}
+/// The "PHP fallback:" message that named an unported item. These messages
+/// are written in the code (at most a table or kind name is filled in), so
+/// they are logged without the opt-in. Outer context is left out.
+fn unported_site(err:&anyhow::Error)->Option<String>{
+ let mut site=err.chain().map(ToString::to_string).find(|m|m.starts_with("PHP fallback:"))?;
+ if site.len()>200{let mut end=200;while !site.is_char_boundary(end){end-=1;}site.truncate(end);}
+ Some(site)
 }
 pub(crate) fn fallback_reason_logged(err:&anyhow::Error)->&'static str{let reason=fallback_reason(err);log_error_detail(reason,err);reason}
 fn fallback_body(reason:&str)->serde_json::Value{json!({"fallback":true,"reason":reason})}
@@ -223,6 +234,11 @@ mod tests{
   assert_eq!(fallback_reason(&anyhow::anyhow!("full profile quote state missing")),"quote_state");
   assert_eq!(fallback_reason(&anyhow::anyhow!("public XRPC reply exceeds native bounded body; whole request fallback required")),"bluesky_xrpc");
   assert_eq!(fallback_reason(&anyhow::anyhow!("PHP fallback: cold remote link preview warm capability absent")),"unported");
+  let nested=anyhow::anyhow!("PHP fallback: raw page item kind unported").context("raw batch admission for note abc");
+  assert_eq!(fallback_reason(&nested),"unported");assert_eq!(unported_site(&nested).as_deref(),Some("PHP fallback: raw page item kind unported"));
+  assert_eq!(unported_site(&anyhow::anyhow!("no marker here")),None);
+  assert_eq!(fallback_reason(&anyhow::anyhow!("ordered profile publication lost source positions")),"card_order");
+  for guard in["raw profile view is not a canonical profile caller","raw authenticated profile requires current owner and CSRF","raw guest must use isolated read-only facts","raw current note DOM binding absent"]{assert_eq!(fallback_reason(&anyhow::anyhow!(guard)),"raw_paint_guard","{guard}");}
   // Existing specific codes still win over the broader families.
   assert_eq!(fallback_reason(&anyhow::anyhow!("PHP fallback: cached remote reply changed")),"remote_reply");
  }
