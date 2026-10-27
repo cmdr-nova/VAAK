@@ -70,6 +70,7 @@ function ap_emoji_html(string $text, ?string $actorId = null, bool $allowFetch =
 
 $root = dirname(__DIR__);
 require_once $root . '/ap-profile-html.php';
+require_once $root . '/ap-listenbrainz.php';
 reference_load($root . '/ap-admin.php', [
     'h', 'short_host', 'actor_handle', 'admin_emoji_html', 'admin_profile_hover_attr', 'admin_avatar_img',
     'admin_reply_mention_normalize', 'admin_reply_mention_handle', 'admin_report_href', 'block_quick_actions',
@@ -136,7 +137,7 @@ function chrome_vars(array $case): array
         'rpRel' => !empty($case['following']) ? (!empty($case['follows_you']) ? 'mutual' : 'following') : (!empty($case['follows_you']) ? 'follows_you' : 'none'),
         'rpMuted' => !empty($case['muted']), 'rpBlockedPersonal' => !empty($case['blocked_personal']), 'rpBlockedServer' => !empty($case['blocked_server']),
         'rpPostSub' => !empty($case['subscribed']), 'rpPhyrianBridge' => $case['bridge'], 'rpSlLink' => $case['sl'], 'rpWowLink' => $case['wow'],
-        'rpProfileFields' => $case['fields'], 'rpProfileBadges' => $case['badges'],
+        'rpProfileFields' => $case['fields'], 'rpProfileBadges' => $case['badges'], 'rpNowPlaying' => $case['now_playing'],
         'rpHasCombinedStats' => true, 'rpBskyStatsHandle' => $case['stats_bsky'] ? 'ada.example' : null,
         'rpPostsStat' => (int) $case['posts_stat'], 'rpFollowingStat' => (int) $case['following_stat'], 'rpFollowersStat' => (int) $case['followers_stat'],
         'rpTabItems' => $items, 'rpOutboxTotal' => (int) $case['outbox_total'], 'rpOutboxRepliesTotal' => (int) $case['replies_total'],
@@ -163,7 +164,7 @@ function chrome_case(string $id, array $over = []): array
         'item_boosts' => 0, 'item_media' => 0, 'item_asks' => 0, 'outbox_total' => 3, 'replies_total' => 2,
         'hide_replies' => false, 'boost_total' => 1, 'hide_boosts' => false, 'bsky_posts' => 0, 'ask_count' => 0,
         'ask_rows' => 0, 'pin_rows' => 0, 'pin_count' => 0, 'featured_rows' => 0, 'featured_count' => 0,
-        'blog_rows' => 0, 'blog_count' => 0, 'blog_open' => false,
+        'blog_rows' => 0, 'blog_count' => 0, 'blog_open' => false, 'now_playing' => null,
     ];
 }
 
@@ -201,6 +202,8 @@ $cases = [
     chrome_case('asks_empty', ['tab' => 'asks', 'ask_count' => 0, 'from' => 'search']),
     chrome_case('asks_filled', ['tab' => 'asks', 'ask_count' => 2, 'ask_rows' => 2, 'item_asks' => 2]),
     chrome_case('pins_filled', ['tab' => 'pinned', 'pin_rows' => 2, 'pin_count' => 2]),
+    chrome_case('now_playing', ['badges' => ['cat'], 'now_playing' => ['label' => 'Now playing', 'track' => 'Tom & "Jerry\'s" <tag>', 'artist' => 'Björk', 'release' => 'Post', 'cover' => 'https://coverartarchive.org/release/0a1b2c3d-0000-4000-8000-000000000000/front-250', 'url' => 'https://listenbrainz.org/user/nova/']]),
+    chrome_case('last_played_no_badges', ['now_playing' => ['label' => 'Last played', 'track' => 'Roygbiv', 'artist' => '', 'release' => '', 'cover' => '', 'url' => 'https://listenbrainz.org/user/Nova%20Bee/']]),
     chrome_case('wow_text', ['wow' => ['character_name' => 'No Portrait', 'realm' => '', 'armory_url' => 'https://worldofwarcraft.blizzard.com/en-us/character/area-52/nop', 'portrait_url' => ''], 'sl' => ['sl_username' => 'Bad Id', 'sl_agent_id' => 'not-a-uuid']]),
 ];
 
@@ -244,6 +247,9 @@ if (!str_contains($byId['requested']['chrome'], 'Cancel this follow request?') |
 }
 if (!str_contains($byId['badges_fields']['chrome'], 'custom-emoji') || !str_contains($byId['badges_fields']['chrome'], '◈ Resonant') || !str_contains($byId['badges_fields']['chrome'], 'Cat person')) {
     throw new RuntimeException('emoji, resonant badge, or catalog badge drifted');
+}
+if (!str_contains($byId['now_playing']['chrome'], '<div class="profile-now-playing" data-state="playing">') || !str_contains($byId['last_played_no_badges']['chrome'], '>Last played<') || str_contains($byId['peer']['chrome'], 'profile-now-playing')) {
+    throw new RuntimeException('ListenBrainz now playing block drifted');
 }
 $slIcon = dirname(__DIR__, 2) . '/vaak/second-life.svg';
 if (!is_file($slIcon)) {

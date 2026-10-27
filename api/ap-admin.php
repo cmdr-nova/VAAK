@@ -2403,6 +2403,17 @@ $vaakAdminOnlyActions = [
         if (!empty($reward['ok'])) $notice = 'Supporter badge awarded. Thank you for supporting VAAK.';
         else $error = (string) ($reward['error'] ?? 'Could not redeem reward.');
         $view = 'profile';
+    } elseif ($action === 'save_listenbrainz') {
+        require_once __DIR__ . '/ap-listenbrainz.php';
+        $lbSaved = ap_listenbrainz_save_username(admin_owner_user_id(), (string) ($_POST['listenbrainz_username'] ?? ''));
+        if (!empty($lbSaved['ok'])) {
+            $notice = ($lbSaved['username'] ?? '') === ''
+                ? 'ListenBrainz now playing is off.'
+                : 'ListenBrainz username saved. Your profile picks up what you play within a couple of minutes.';
+        } else {
+            $error = (string) ($lbSaved['error'] ?? 'Could not save your ListenBrainz username.');
+        }
+        $view = 'profile';
     } elseif ($action === 'save_profile') {
         $fieldNames = $_POST['field_name'] ?? [];
         $fieldValues = $_POST['field_value'] ?? [];
@@ -29173,7 +29184,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       border: 1px solid var(--border);
     }
     /* Settings > Profile Supporter code: input and Redeem button share one row. */
-    .supporter-reward-form label { display: block; font-weight: 600; }
+    .supporter-reward-form label, .listenbrainz-form label { display: block; font-weight: 600; }
     .supporter-reward-row {
       display: flex; gap: .5rem; align-items: center; margin: .5rem 0 .45rem;
     }
@@ -29342,6 +29353,24 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     .featured-name { font-weight:650; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
     .featured-acct { font-size:.85rem; color:var(--muted); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
     .profile-world-links img { display:block; }
+    /* ListenBrainz now playing (api/ap-listenbrainz.php, Rust listenbrainz.rs). */
+    .profile-now-playing { margin-top:.65rem; }
+    .profile-now-playing a {
+      display:inline-flex; align-items:center; gap:.6rem; max-width:100%;
+      padding:.4rem .7rem .4rem .4rem; border:1px solid var(--border); border-radius:12px;
+      color:inherit; text-decoration:none;
+    }
+    .profile-now-playing a:hover { border-color:var(--primary); }
+    .profile-now-playing-cover {
+      flex:0 0 44px; width:44px; height:44px; border-radius:8px; object-fit:cover;
+      display:flex; align-items:center; justify-content:center; font-size:1.25rem;
+      background:var(--primary-dim); color:var(--primary);
+    }
+    .profile-now-playing-text { display:flex; flex-direction:column; min-width:0; line-height:1.25; }
+    .profile-now-playing-label { font-size:.72rem; text-transform:uppercase; letter-spacing:.04em; color:var(--muted); }
+    .profile-now-playing[data-state="playing"] .profile-now-playing-label { color:var(--primary); }
+    .profile-now-playing-track { font-weight:650; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .profile-now-playing-by { font-size:.85rem; color:var(--muted); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
     /* Focused status threads use the same flat card treatment as timelines. */
     #status-thread-ancestors > article.tweet,
     #status-thread-descendants > article.tweet,
@@ -33445,6 +33474,22 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
           <div class="meta">Paid Clearance supporters can redeem their code using the same account email. This awards a local Supporter badge.</div>
         </form>
         <?php endif; ?>
+        <?php
+          require_once __DIR__ . '/ap-listenbrainz.php';
+          $lbLink = ap_listenbrainz_link_for_user((int) $vaakOwnerId);
+          $lbName = is_array($lbLink) ? (string) ($lbLink['lb_username'] ?? '') : '';
+          $lbError = is_array($lbLink) ? trim((string) ($lbLink['last_error'] ?? '')) : '';
+        ?>
+        <form method="post" action="?view=profile" class="composer listenbrainz-form">
+          <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
+          <input type="hidden" name="action" value="save_listenbrainz">
+          <label for="listenbrainz-username">ListenBrainz username</label>
+          <div class="supporter-reward-row">
+            <input id="listenbrainz-username" name="listenbrainz_username" autocomplete="off" maxlength="120" value="<?= h($lbName) ?>" placeholder="your ListenBrainz name">
+            <button class="btn btn-primary" type="submit">Save</button>
+          </div>
+          <div class="meta">Shows what you're listening to (or your last played track) on your profile. Leave it empty to turn it off. Updates about once a minute.<?php if ($lbName !== '' && $lbError !== ''): ?> Last check: <?= h($lbError) ?>.<?php endif; ?></div>
+        </form>
         <?php if (($settingsNativeProfile = ap_settings_native_body('settings_profile', !empty($vaakIsAdmin))) !== null): ?><?= $settingsNativeProfile ?><?php else: ?>
         <form class="composer profile-form" method="post" action="?view=profile" enctype="multipart/form-data">
           <input type="hidden" name="action" value="save_profile">
@@ -36133,6 +36178,7 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
           $rpProfileFields = [];
           $rpSlLink = null;
           $rpWowLink = null;
+          $rpNowPlaying = null;
           $rpPinnedStatuses = [];
           $rpPinnedCount = 0;
           $rpFeaturedCards = [];
@@ -36316,6 +36362,9 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
                   $rpWowLink = function_exists('ap_wow_link_for_actor_key')
                       ? ap_wow_link_for_actor_key((string) $rpLocalKey)
                       : null;
+                  // Stored ListenBrainz snapshot only (one join); never fetches.
+                  require_once __DIR__ . '/ap-listenbrainz.php';
+                  $rpNowPlaying = ap_listenbrainz_display(ap_listenbrainz_link_for_actor_key((string) $rpLocalKey), time());
                   $rpPhyrianBridge = function_exists('ap_phyrian_bridge_link_for_actor_key')
                       ? ap_phyrian_bridge_link_for_actor_key((string) $rpLocalKey)
                       : null;
@@ -37094,6 +37143,7 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
                     ] : null,
                     'fields' => array_values(is_array($rpProfileFields) ? $rpProfileFields : []),
                     'badges' => array_values(is_array($rpProfileBadges) ? $rpProfileBadges : []),
+                    'now_playing' => is_array($rpNowPlaying ?? null) ? $rpNowPlaying : null,
                     'stats_bsky' => !empty($rpBskyStatsHandle),
                     'posts_stat' => (int) $rpPostsStat,
                     'following_stat' => (int) $rpFollowingStat,
@@ -37517,7 +37567,7 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
                   <span class="tag" title="<?= h((string) ($badge['label'] ?? $badgeKey)) ?>"><?= h((string) ($badge['emoji'] ?? '')) ?> <?= h((string) ($badge['label'] ?? $badgeKey)) ?></span>
                 <?php endforeach; ?>
               </div>
-            <?php endif; ?>
+            <?php endif; ?><?= ($rpIsLocal && function_exists('ap_listenbrainz_profile_html')) ? ap_listenbrainz_profile_html($rpNowPlaying ?? null) : '' ?>
             <?php if ($rpHasCombinedStats): ?>
               <?php
                 // Off unless VAAK_PHYRIAN_PROFILE_CARD=1. Checked before the helper

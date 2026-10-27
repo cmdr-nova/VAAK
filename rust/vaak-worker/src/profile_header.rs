@@ -29,7 +29,7 @@ pub(crate) struct HeaderFacts{
  requested_tab:String,effective_tab:String,from:String,blog_slug:String,tab_href:String,
  following:bool,follows_you:bool,requested:bool,locked:bool,post_subscription:bool,
  moderation:ModerationContext,counts:HeaderCounts,name:String,bio:String,avatar:Option<String>,banner:Option<String>,fallback_avatar:String,
- emoji:HashMap<String,String>,fields:Vec<Value>,badges:Vec<String>,sl:Option<Value>,wow:Option<Value>,bridge:Option<Value>,bsky_handle:String,
+ emoji:HashMap<String,String>,fields:Vec<Value>,badges:Vec<String>,now_playing:String,sl:Option<Value>,wow:Option<Value>,bridge:Option<Value>,bsky_handle:String,
  pin_rows:Vec<Value>,featured_rows:Vec<Value>,blog_rows:Vec<Value>,blog_post:Option<Value>,blog_offset:i64,
  dependencies:Value,
 }
@@ -204,8 +204,11 @@ async fn resolve_local(db:&Client,key:&str,actor:&str,owner:i64,owner_actor:Stri
  // Read-only presentation lookups run concurrently; results (and the first
  // error) are taken in the original order, combined's queue write stays after.
  let link_sql=[("ap_sl_links","l",""),("ap_wow_links","l",""),("phyrian_bridge_links","l"," AND l.status='verified' AND l.unlinked_at IS NULL")].map(|(table,alias,extra)|(table,format!("SELECT to_jsonb({alias}) FROM {table} {alias} INNER JOIN ap_users u ON u.id=l.owner_user_id WHERE u.actor_key=$1 AND u.disabled_at IS NULL{extra} LIMIT 1")));
- let(badges,emoji_rows,sl,wow,bridge,fallback_avatar)=tokio::join!(authorized_badges(db,key,&profile["profile_badges"]),db.query("SELECT shortcode,url FROM remote_custom_emojis WHERE host='mkultra.monster'",&[]),async{optional_rows(db,link_sql[0].0,&link_sql[0].1,&[&key]).await},async{optional_rows(db,link_sql[1].0,&link_sql[1].1,&[&key]).await},async{optional_rows(db,link_sql[2].0,&link_sql[2].1,&[&key]).await},facts::avatar(db,&Value::Null,actor));
- let badges=badges?;
+ // The ListenBrainz snapshot rides in the same pipelined batch: one indexed
+ // join, stored by the cron worker. Volatile presentation, so it is not a
+ // header dependency (like the counts).
+ let(badges,emoji_rows,sl,wow,bridge,fallback_avatar,listen)=tokio::join!(authorized_badges(db,key,&profile["profile_badges"]),db.query("SELECT shortcode,url FROM remote_custom_emojis WHERE host='mkultra.monster'",&[]),async{optional_rows(db,link_sql[0].0,&link_sql[0].1,&[&key]).await},async{optional_rows(db,link_sql[1].0,&link_sql[1].1,&[&key]).await},async{optional_rows(db,link_sql[2].0,&link_sql[2].1,&[&key]).await},facts::avatar(db,&Value::Null,actor),async{optional_rows(db,"ap_listenbrainz_links",crate::listenbrainz::ROW_FOR_ACTOR_KEY_SQL,&[&key]).await});
+ let badges=badges?;let now_playing=crate::listenbrainz::profile_html(listen?.first().and_then(|row|crate::listenbrainz::display(row,chrono::Utc::now().timestamp())).as_ref());
  let mut emoji=HashMap::new();for row in emoji_rows?{let k:String=row.get(0);let u:String=row.get(1);if !k.is_empty()&&u.starts_with("https://"){emoji.insert(k,u);}}
  let mut links=Vec::new();for rows in[sl,wow,bridge]{links.push(rows?.into_iter().next());}
  let tab_href=format!("/vaak/users/{}{}tab=",q(key),if from.is_empty(){"?".into()}else{format!("?from={}&",form_query(&from))});
@@ -213,7 +216,7 @@ async fn resolve_local(db:&Client,key:&str,actor:&str,owner:i64,owner_actor:Stri
  let locked=card::boolean(&profile,"manually_approves");let bio=crate::library::body::html_to_plain(s(&profile,"summary"));
  let fallback_avatar=fallback_avatar?;
  anyhow::ensure!(dependencies==header_dependencies(db,key,actor,owner,&owner_actor,target_id,false).await?,"header dependencies changed during enrichment");
- Ok(HeaderFacts{dependencies,actor:actor.into(),key:key.into(),profile,current_profile,owner,owner_actor,csrf:csrf.into(),guest,is_own,requested_tab,effective_tab,from,blog_slug,tab_href,following,follows_you,requested,locked,post_subscription,moderation,counts,name,bio,avatar,banner,fallback_avatar,emoji,fields,badges,sl:links[0].take(),wow:links[1].take(),bridge:links[2].take(),bsky_handle:combined.handle,pin_rows,featured_rows,blog_rows,blog_post,blog_offset})
+ Ok(HeaderFacts{dependencies,actor:actor.into(),key:key.into(),profile,current_profile,owner,owner_actor,csrf:csrf.into(),guest,is_own,requested_tab,effective_tab,from,blog_slug,tab_href,following,follows_you,requested,locked,post_subscription,moderation,counts,name,bio,avatar,banner,fallback_avatar,emoji,fields,badges,now_playing,sl:links[0].take(),wow:links[1].take(),bridge:links[2].take(),bsky_handle:combined.handle,pin_rows,featured_rows,blog_rows,blog_post,blog_offset})
 }
 pub(crate) struct BlockedHeaderFacts{actions:HeaderFacts,personal:bool,server:bool}
 impl BlockedHeaderFacts{pub(crate) async fn require_actions_current(&self,db:&Client)->Result<()>{self.actions.require_secondary_current(db).await}}
@@ -235,7 +238,7 @@ async fn resolve_blocked_local(db:&Client,key:&str,actor:&str,owner:i64,owner_ac
  // Cache-only identity; denied roots never enter profile/emoji/count/preview or warming helpers.
  let avatar=facts::avatar(db,&Value::Null,actor).await?;
  anyhow::ensure!(dependencies==header_dependencies(db,key,actor,owner,&owner_actor,card::integer(&target,"id"),true).await?,"blocked action dependencies changed during presentation");
- let actions=HeaderFacts{dependencies,actor:actor.into(),key:key.into(),profile:Value::Null,current_profile:Value::Null,owner,owner_actor,csrf:csrf.into(),guest,is_own,requested_tab:String::new(),effective_tab:String::new(),from,blog_slug:String::new(),tab_href:String::new(),following:false,follows_you:false,requested:false,locked:false,post_subscription:false,moderation,counts:HeaderCounts::default(),name:String::new(),bio:String::new(),avatar:None,banner:None,fallback_avatar:avatar,emoji:HashMap::new(),fields:vec![],badges:vec![],sl:None,wow:None,bridge:None,bsky_handle:String::new(),pin_rows:vec![],featured_rows:vec![],blog_rows:vec![],blog_post:None,blog_offset:0};
+ let actions=HeaderFacts{dependencies,actor:actor.into(),key:key.into(),profile:Value::Null,current_profile:Value::Null,owner,owner_actor,csrf:csrf.into(),guest,is_own,requested_tab:String::new(),effective_tab:String::new(),from,blog_slug:String::new(),tab_href:String::new(),following:false,follows_you:false,requested:false,locked:false,post_subscription:false,moderation,counts:HeaderCounts::default(),name:String::new(),bio:String::new(),avatar:None,banner:None,fallback_avatar:avatar,emoji:HashMap::new(),fields:vec![],badges:vec![],now_playing:String::new(),sl:None,wow:None,bridge:None,bsky_handle:String::new(),pin_rows:vec![],featured_rows:vec![],blog_rows:vec![],blog_post:None,blog_offset:0};
  Ok(BlockedHeaderFacts{actions,personal,server})
 }
 pub(crate) fn render_blocked(token:&crate::profile_context::AdmittedBlockedProfileHeader)->Result<String>{render_blocked_core(token.facts())}
@@ -358,6 +361,7 @@ fn render_core(f:&HeaderFacts)->Result<String>{
  if f.guest{out.push_str(&guest_follow(f));}
  out.push_str(&if f.bio.is_empty(){"<div class=\"meta\" style=\"margin-top:.75rem\">No bio set.</div>".into()}else{format!("<div class=\"body\" style=\"margin-top:.75rem;white-space:pre-wrap\">{}</div>",h(&f.bio))});out.push_str(&world_html(f));out.push_str(&fields_html(&f.fields));
  if !f.badges.is_empty(){out.push_str("<div class=\"profile-badges\" aria-label=\"Profile badges\" style=\"display:flex;flex-wrap:wrap;gap:.35rem;margin-top:.65rem\">");for key in &f.badges{if let Some((_,label,emoji))=BADGES.iter().find(|b|b.0==key){out.push_str(&format!("<span class=\"tag\" title=\"{}\">{} {}</span>",h(label),h(emoji),h(label)));}}out.push_str("</div>");}
+ out.push_str(&f.now_playing);
  let c=&f.counts;let title=if f.bsky_handle.is_empty(){""}else{" title=\"Includes ActivityPub and connected Bluesky counts\""};out.push_str(&format!("<div class=\"remote-profile-stats\" aria-label=\"Profile stats\"><div><span class=\"n\">{}</span><span class=\"l\">Posts</span></div>",c.posts));
  for(label,n,key)in[("Following",c.following,"following"),("Followers",c.followers,"followers")]{out.push_str(&format!("<a href=\"{}\"{}{title}><span class=\"n\">{n}</span><span class=\"l\">{label}</span></a>",if f.is_own{format!("?view={key}")}else{format!("/users/{}/{key}",q(&f.key))},if f.is_own{""}else{" target=\"_blank\" rel=\"noopener noreferrer\""}));}out.push_str("</div><div class=\"tweet-actions remote-profile-actions\" style=\"flex-wrap:wrap;align-items:center;gap:.45rem\">");
  if !f.guest&&!f.is_own{
@@ -398,7 +402,7 @@ mod tests{
    following:false,follows_you:false,requested:false,locked:false,post_subscription:false,
    moderation:ModerationContext{is_self:false,is_local:false,is_local_admin:false,is_wafrn:false,is_admin:false,personal_block_id:None,muted:false,deprioritized:false,global_kind:String::new(),global_id:0},
    counts:HeaderCounts::default(),name:String::new(),bio:String::new(),avatar:None,banner:None,fallback_avatar:String::new(),
-   emoji:HashMap::new(),fields:vec![],badges:vec![],sl:None,wow:None,bridge:None,bsky_handle:String::new(),
+   emoji:HashMap::new(),fields:vec![],badges:vec![],now_playing:String::new(),sl:None,wow:None,bridge:None,bsky_handle:String::new(),
    pin_rows:vec![],featured_rows:vec![],blog_rows:vec![],blog_post:None,blog_offset:0,dependencies:Value::Null,
   }
  }
