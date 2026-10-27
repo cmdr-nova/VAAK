@@ -9763,6 +9763,7 @@ function ap_bsky_follow_sync_worker(int $ownerUserId): array
     // Incoming followers — AppView graph (same idea as Wafrn getFollowers pages).
     // Prefer the session token; fall back to the public AppView.
     $followers = [];
+    $followersPartial = false;
     $cursor = null;
     $tok = function_exists('ap_bsky_access_token') ? ap_bsky_access_token($ownerUserId, false) : ['ok' => false];
     $bearer = (!empty($tok['ok']) && is_string($tok['access'] ?? null)) ? (string) $tok['access'] : '';
@@ -9782,6 +9783,7 @@ function ap_bsky_follow_sync_worker(int $ownerUserId): array
             // Following half still succeeded — keep going with empty followers
             // rather than failing the whole sync (private/rate-limit edges).
             error_log('[ap-bsky] follower sync partial fail owner=' . $ownerUserId . ' err=' . (string) ($res['error'] ?? 'fail'));
+            $followersPartial = true;
             break;
         }
         foreach ((array) ($res['json']['followers'] ?? []) as $row) {
@@ -9822,16 +9824,27 @@ function ap_bsky_follow_sync_worker(int $ownerUserId): array
         foreach ($followers as $did => $_uri) {
             ap_bsky_graph_sync_upsert($ownerUserId, 'follower', $did, null, 'pull');
         }
-        foreach ($existingFollowerDids as $did) {
-            if (!array_key_exists($did, $followers)) {
-                ap_bsky_graph_sync_delete($ownerUserId, 'follower', $did);
+        // A partial follower list (AppView error mid-paging) must not prune
+        // cached followers, or the profile count dips until the next sync.
+        if (!$followersPartial) {
+            foreach ($existingFollowerDids as $did) {
+                if (!array_key_exists($did, $followers)) {
+                    ap_bsky_graph_sync_delete($ownerUserId, 'follower', $did);
+                }
             }
         }
+        $edgeFollowers = $followersPartial
+            ? count(array_unique(array_merge($existingFollowerDids, array_map('strval', array_keys($followers)))))
+            : count($followers);
 
         // AppView getProfile totals (can be higher than enumerable getFollowers
         // pages — Bluesky hides some accounts from the list but still counts them).
-        $profileFollowers = count($followers);
+        $profileFollowers = $edgeFollowers;
         $profileFollowing = count($follows);
+        $prevMeta = $followersPartial ? ap_bsky_graph_sync_profile_counts($ownerUserId) : null;
+        if (is_array($prevMeta) && !empty($prevMeta['ok'])) {
+            $profileFollowers = max($profileFollowers, (int) ($prevMeta['followers'] ?? 0));
+        }
         $handleForProfile = is_array($session) ? ltrim((string) ($session['handle'] ?? ''), '@') : '';
         $actorRef = $handleForProfile !== '' ? $handleForProfile : $repo;
         $prof = ap_bsky_xrpc(AP_BSKY_PUBLIC_API, 'app.bsky.actor.getProfile', 'GET', ['actor' => $actorRef], null, null, 12);
@@ -9850,7 +9863,7 @@ function ap_bsky_follow_sync_worker(int $ownerUserId): array
             'graph_sync_v1',
             json_encode([
                 'following' => count($follows),
-                'followers' => count($followers),
+                'followers' => $edgeFollowers,
                 'profile_following' => $profileFollowing,
                 'profile_followers' => $profileFollowers,
                 'synced_at' => gmdate('c'),
@@ -9909,7 +9922,8 @@ function ap_bsky_follow_sync_worker(int $ownerUserId): array
             'ok' => true,
             'count' => count($follows),
             'following' => count($follows),
-            'followers' => count($followers),
+            'followers' => $edgeFollowers,
+            'followers_partial' => $followersPartial,
             'profile_following' => $profileFollowing,
             'profile_followers' => $profileFollowers,
         ];
