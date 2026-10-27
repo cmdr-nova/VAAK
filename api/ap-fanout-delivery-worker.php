@@ -61,6 +61,9 @@ try {
         $claim->execute([$now, $now, (int) $row['id']]);
         if ($claim->rowCount() !== 1) continue;
         $stats['claimed']++;
+        // A row that is not attempted must not inherit the previous row's
+        // delivery error: that text decides dead versus live for its host.
+        $GLOBALS['ap_delivery_last_error'] = '';
         $activity = json_decode((string) $row['activity_json'], true);
         $host = function_exists('ap_fanout_host_normalize')
             ? ap_fanout_host_normalize((string) $row['inbox_url'])

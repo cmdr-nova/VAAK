@@ -261,6 +261,11 @@ $check(!preg_match('/\b(ALTER|DROP|TRUNCATE|INSERT\s+INTO|DELETE\s+FROM|UPDATE\s
 
 $worker = (string) file_get_contents(dirname(__DIR__) . '/ap-fanout-delivery-worker.php');
 $check(str_contains($worker, 'ap_fanout_worker_outcome') && str_contains($worker, 'ap_fanout_host_note_terminal') && str_contains($worker, 'ap_fanout_host_requeue_probe'), 'the worker uses the suspension helpers');
+$claimAt = strpos($worker, "\$stats['claimed']++;");
+$resetAt = strpos($worker, "\$GLOBALS['ap_delivery_last_error'] = '';");
+$readAt = strpos($worker, "\$GLOBALS['ap_delivery_last_error'] ?? ''");
+$check($claimAt !== false && $resetAt !== false && $readAt !== false && $claimAt < $resetAt && $resetAt < $readAt, 'each claimed row starts without the previous row\'s delivery error');
+$check(!ap_fanout_counts_as_dead_failure('Remote host circuit is open'), 'a skipped circuit-open row is neutral, not live and not dead');
 $inbox = (string) file_get_contents(dirname(__DIR__) . '/ap-inbox.php');
 $check(str_contains($inbox, 'ap_fanout_host_note_inbound') && str_contains($inbox, 'ap_fanout_host_admit') && str_contains($inbox, 'ap_fanout_deliver_or_hold'), 'queuing and inbound recovery call the helpers');
 $rust = (string) file_get_contents(dirname(__DIR__, 2) . '/rust/vaak-worker/src/fanout_host.rs');
