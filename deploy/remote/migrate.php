@@ -271,6 +271,21 @@ function vaak_migrate_notification_index_specs(): array
             'create' => 'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_mentions_owner_live_id ON mentions (owner_user_id, id DESC) WHERE deleted_at IS NULL',
             'drop' => 'DROP INDEX CONCURRENTLY IF EXISTS idx_mentions_owner_live_id',
         ],
+        'idx_followers_actor_key' => [
+            'table' => 'followers',
+            'create' => "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_followers_actor_key ON followers (rtrim(actor_id, '/'))",
+            'drop' => 'DROP INDEX CONCURRENTLY IF EXISTS idx_followers_actor_key',
+        ],
+        'idx_following_owner_actor_key' => [
+            'table' => 'following',
+            'create' => "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_following_owner_actor_key ON following (rtrim(owner_actor_id, '/')) WHERE actor_id NOT LIKE 'https://mkultra.monster/users/%'",
+            'drop' => 'DROP INDEX CONCURRENTLY IF EXISTS idx_following_owner_actor_key',
+        ],
+        'idx_mentions_owner_object_live' => [
+            'table' => 'mentions',
+            'create' => 'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_mentions_owner_object_live ON mentions (owner_user_id, object_id) WHERE deleted_at IS NULL',
+            'drop' => 'DROP INDEX CONCURRENTLY IF EXISTS idx_mentions_owner_object_live',
+        ],
     ];
 }
 

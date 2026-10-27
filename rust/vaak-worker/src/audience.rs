@@ -168,24 +168,64 @@ async fn audience_records(db: &Client, owner: i64, statuses: &[Value]) -> Result
     let mut ids = HashSet::new();
     for st in statuses.iter() { collect(st, &mut ids, 0); }
     let ids: Vec<String> = ids.into_iter().collect();
+    let slashed: Vec<String> = ids.iter().map(|id| format!("{id}/")).collect();
+    let variants: Vec<String> = ids.iter().flat_map(|id| [id.clone(), format!("{id}/")]).collect();
+    let mut quote_aliases = HashSet::new();
+    for status in statuses { collect_requested_quote_aliases(status, &mut quote_aliases, 0); }
+    let quote_aliases: Vec<String> = quote_aliases.into_iter().collect();
+    // The rtrim equality is the idx_events_object_key_id seek. The original
+    // equality list stays as a filter so a multi-slash row, which trims to the
+    // same key, is still excluded. Quote-source probes seek the same index.
+    let events = async {
+        db.query(
+            "SELECT DISTINCT ON (rtrim(object_id, '/')) rtrim(object_id, '/'),
+                    COALESCE(visibility, 'public'), rtrim(COALESCE(actor_id, ''), '/')
+             FROM events e WHERE (e.type IN ('Create','Update') OR (e.type IN ('Quote','QuotePost') AND NOT EXISTS (
+                  SELECT 1 FROM events note_source
+                  WHERE rtrim(note_source.object_id, '/') = rtrim(e.object_id, '/')
+                    AND note_source.object_id IN (rtrim(e.object_id, '/'), rtrim(e.object_id, '/') || '/')
+                    AND note_source.type IN ('Create','Update'))))
+               AND action_taken = ANY(ARRAY['log','local_observe','local_fav_update'])
+               AND rtrim(object_id, '/') = ANY($1)
+               AND (object_id = ANY($1) OR object_id = ANY($2))
+             ORDER BY rtrim(object_id, '/'), id DESC",
+            &[&ids, &slashed],
+        ).await
+    };
+    let outbox = async {
+        db.query(
+            "SELECT id, COALESCE(visibility, 'public'), COALESCE(to_json, '[]'), COALESCE(cc_json, '[]')
+             FROM outbox_notes WHERE id = ANY($1)", &[&variants],
+        ).await
+    };
+    let aliases = async {
+        if quote_aliases.is_empty() {
+            Ok(Vec::new())
+        } else {
+            db.query(
+                "SELECT DISTINCT rtrim(e.object_id,'/') FROM events e WHERE rtrim(e.object_id,'/') = ANY($1)
+                 AND (e.type IN ('Delete','Tombstone') OR (e.type IN ('Create','Update') AND e.action_taken = 'deleted')
+                   OR (e.type = 'Announce' AND COALESCE(e.action_taken,'') <> 'deleted' AND COALESCE(e.visibility,'public') <> 'public'
+                     AND NOT EXISTS (SELECT 1 FROM events original WHERE rtrim(original.object_id,'/') = rtrim(e.object_id,'/') AND original.type IN ('Create','Update'))))",
+                &[&quote_aliases],
+            ).await
+        }
+    };
+    let viewer_row = async {
+        if owner > 0 {
+            db.query_opt("SELECT actor_id FROM ap_users WHERE id = $1::bigint AND disabled_at IS NULL", &[&owner]).await
+        } else {
+            Ok(None)
+        }
+    };
+    let (event_rows, outbox_rows, alias_rows, viewer_row) = tokio::try_join!(events, outbox, aliases, viewer_row)?;
     let mut records = HashMap::new();
-    // Restrict the lookup to this bounded page, including quote/boost targets.
-    for row in db.query(
-        "SELECT DISTINCT ON (rtrim(object_id, '/')) rtrim(object_id, '/'),
-                COALESCE(visibility, 'public'), rtrim(COALESCE(actor_id, ''), '/')
-         FROM events e WHERE (e.type IN ('Create','Update') OR (e.type IN ('Quote','QuotePost') AND NOT EXISTS (SELECT 1 FROM events note_source WHERE note_source.object_id IN (rtrim(e.object_id, '/'), rtrim(e.object_id, '/') || '/') AND note_source.type IN ('Create','Update'))))
-           AND action_taken = ANY(ARRAY['log','local_observe','local_fav_update'])
-           AND (object_id = ANY($1) OR object_id = ANY($2))
-         ORDER BY rtrim(object_id, '/'), id DESC",
-        &[&ids, &ids.iter().map(|id| format!("{id}/")).collect::<Vec<_>>()],
-    ).await? {
+    for row in event_rows {
         records.insert(row.get::<_, String>(0), Audience { visibility: row.get(1), author: row.get(2), ..Default::default() });
     }
-    let variants: Vec<String> = ids.iter().flat_map(|id| [id.clone(), format!("{id}/")]).collect();
-    for row in db.query(
-        "SELECT id, COALESCE(visibility, 'public'), COALESCE(to_json, '[]'), COALESCE(cc_json, '[]')
-         FROM outbox_notes WHERE id = ANY($1)", &[&variants],
-    ).await? {
+    // Outbox overwrites an events row for the same trimmed id. Row order inside
+    // one query is unchanged, so two slash forms of one note still last-write-win.
+    for row in outbox_rows {
         let id = key(&row.get::<_, String>(0));
         let mut recipients = HashSet::new();
         for col in [2, 3] {
@@ -196,39 +236,36 @@ async fn audience_records(db: &Client, owner: i64, statuses: &[Value]) -> Result
         let author = id.split("/notes/").next().unwrap_or("").to_string();
         records.insert(id, Audience { visibility: row.get(1), author, recipients, denied:false });
     }
-    let mut quote_aliases = HashSet::new();
-    for status in statuses { collect_requested_quote_aliases(status, &mut quote_aliases, 0); }
-    let quote_aliases: Vec<String> = quote_aliases.into_iter().collect();
-    if !quote_aliases.is_empty() {
-        for row in db.query(
-            "SELECT DISTINCT rtrim(e.object_id,'/') FROM events e WHERE rtrim(e.object_id,'/') = ANY($1)
-             AND (e.type IN ('Delete','Tombstone') OR (e.type IN ('Create','Update') AND e.action_taken = 'deleted')
-               OR (e.type = 'Announce' AND COALESCE(e.action_taken,'') <> 'deleted' AND COALESCE(e.visibility,'public') <> 'public'
-                 AND NOT EXISTS (SELECT 1 FROM events original WHERE rtrim(original.object_id,'/') = rtrim(e.object_id,'/') AND original.type IN ('Create','Update'))))", &[&quote_aliases]
-        ).await? {
-            records.insert(row.get(0), Audience { denied:true, ..Default::default() });
-        }
+    for row in alias_rows {
+        records.insert(row.get(0), Audience { denied:true, ..Default::default() });
     }
     let mut viewer = String::new();
     let mut following = HashSet::new();
-    if owner > 0 {
-        if let Some(row) = db.query_opt("SELECT actor_id FROM ap_users WHERE id = $1::bigint AND disabled_at IS NULL", &[&owner]).await? {
-            viewer = key(&row.get::<_, String>(0));
-        }
-        if !viewer.is_empty() {
-            // An owner-scoped delivered mention is proof of an explicit recipient.
-            for row in db.query("SELECT object_id FROM mentions WHERE owner_user_id = $1::bigint AND deleted_at IS NULL AND activity_type IN ('Create','Update','Quote','QuotePost') AND object_id = ANY($2)", &[&owner, &variants]).await? {
-                let id = key(&row.get::<_, String>(0));
-                if let Some(a) = records.get_mut(&id) { a.recipients.insert(viewer.clone()); }
-            }
-            // Accepted local followers are authoritative. Following a private
-            // local account while its request is pending grants no audience.
-            for row in db.query(
+    if let Some(row) = viewer_row {
+        viewer = key(&row.get::<_, String>(0));
+    }
+    if owner > 0 && !viewer.is_empty() {
+        let mentions = async {
+            db.query(
+                "SELECT object_id FROM mentions WHERE owner_user_id = $1::bigint AND deleted_at IS NULL AND activity_type IN ('Create','Update','Quote','QuotePost') AND object_id = ANY($2)",
+                &[&owner, &variants],
+            ).await
+        };
+        // Accepted local followers are authoritative. Following a private
+        // local account while its request is pending grants no audience.
+        let follows = async {
+            db.query(
                 "SELECT rtrim(owner_actor_id, '/') FROM followers WHERE rtrim(actor_id, '/') = $1
                  UNION SELECT rtrim(actor_id, '/') FROM following WHERE rtrim(owner_actor_id, '/') = $1
                    AND actor_id NOT LIKE 'https://mkultra.monster/users/%'", &[&viewer],
-            ).await? { following.insert(row.get::<_, String>(0)); }
+            ).await
+        };
+        let (mention_rows, follow_rows) = tokio::try_join!(mentions, follows)?;
+        for row in mention_rows {
+            let id = key(&row.get::<_, String>(0));
+            if let Some(a) = records.get_mut(&id) { a.recipients.insert(viewer.clone()); }
         }
+        for row in follow_rows { following.insert(row.get::<_, String>(0)); }
     }
     Ok((records, viewer, following))
 }
@@ -468,8 +505,6 @@ mod tests {
 /// Recheck cached notification cards against current viewer rules.
 pub async fn filter_notifications(db: &Client, owner: i64, items: &mut Vec<Value>) -> Result<()> {
     crate::home_hydrate_ranked::refresh_local_accounts(db, items).await?;
-    let mut hidden = crate::hidden::load_hidden_sets(db, owner).await?;
-    crate::hidden::expand_bsky_identities(db, &mut hidden).await;
     let mut statuses = Vec::new();
     for (idx, item) in items.iter().enumerate() {
         if let Some(st) = item.get("status").filter(|s| s.is_object()) {
@@ -478,7 +513,18 @@ pub async fn filter_notifications(db: &Client, owner: i64, items: &mut Vec<Value
             statuses.push(st);
         }
     }
-    filter_statuses(db, owner, Surface::Home, &mut statuses).await?;
+    // Hidden sets and audience grants are independent. Both finish before a
+    // row is kept, and neither decision is reused after a later await.
+    let hidden_fut = async {
+        let mut hidden = crate::hidden::load_hidden_sets(db, owner).await?;
+        crate::hidden::expand_bsky_identities(db, &mut hidden).await;
+        Ok(hidden)
+    };
+    let admit_fut = async {
+        filter_statuses(db, owner, Surface::Home, &mut statuses).await?;
+        Ok::<_, anyhow::Error>(())
+    };
+    let (hidden, ()) = tokio::try_join!(hidden_fut, admit_fut)?;
     let mut allowed = HashMap::new();
     for mut st in statuses {
         let idx = st["_vaak_policy_index"].as_u64().unwrap() as usize;

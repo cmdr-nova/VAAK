@@ -45,6 +45,23 @@ pub async fn json_get(
     }
 }
 
+/// MGET with the same miss rule as `json_get`: a missing key and a value that
+/// does not parse as JSON are both `None`.
+pub async fn json_mget(
+    conn: &mut redis::aio::MultiplexedConnection,
+    keys: &[String],
+) -> Result<Vec<Option<serde_json::Value>>> {
+    if keys.is_empty() {
+        return Ok(Vec::new());
+    }
+    let raws: Vec<Option<String>> = redis::cmd("MGET")
+        .arg(keys)
+        .query_async(conn)
+        .await
+        .context("redis MGET")?;
+    Ok(raws.into_iter().map(|raw| raw.and_then(|s| serde_json::from_str(&s).ok())).collect())
+}
+
 /// PHP `ap_redis_delete_pattern`: SCAN in batches of 100 and DEL each batch.
 pub async fn delete_pattern(conn: &mut redis::aio::MultiplexedConnection, pattern: &str) -> Result<usize> {
     let mut cursor: u64 = 0;

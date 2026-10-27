@@ -433,13 +433,37 @@ pub async fn load_hidden_sets(db: &Client, owner_user_id: i64) -> Result<HiddenS
     let mut sets = HiddenSets::default();
     let mut blocked_actors = Vec::new();
 
-    let mute_rows = db
-        .query(
+    let mute_rows = async {
+        db.query(
             "SELECT actor_id FROM ap_mutes WHERE owner_user_id = $1::bigint",
             &[&owner_user_id],
         )
         .await
-        .context("select ap_mutes")?;
+        .context("select ap_mutes")
+    };
+    let user_block_rows = async {
+        db.query(
+            "SELECT scope, value FROM ap_user_blocks WHERE owner_user_id = $1::bigint",
+            &[&owner_user_id],
+        )
+        .await
+        .context("select ap_user_blocks")
+    };
+    let inst_rows = async {
+        db.query("SELECT scope, value, COALESCE(to_jsonb(ap_blocks)->>'kind', 'block') FROM ap_blocks", &[])
+            .await
+            .context("select ap_blocks")
+    };
+    let word_rows = async {
+        if owner_user_id > 0 {
+            db.query("SELECT phrase FROM ap_muted_words WHERE owner_user_id = $1::bigint", &[&owner_user_id])
+                .await
+                .context("load muted words")
+        } else {
+            Ok(Vec::new())
+        }
+    };
+    let (mute_rows, user_block_rows, inst_rows, word_rows) = tokio::try_join!(mute_rows, user_block_rows, inst_rows, word_rows)?;
     for row in mute_rows {
         let a: String = row.try_get::<_, Option<String>>(0)?.unwrap_or_default();
         let a = norm_actor(&a);
@@ -448,13 +472,6 @@ pub async fn load_hidden_sets(db: &Client, owner_user_id: i64) -> Result<HiddenS
         }
     }
 
-    let user_block_rows = db
-        .query(
-            "SELECT scope, value FROM ap_user_blocks WHERE owner_user_id = $1::bigint",
-            &[&owner_user_id],
-        )
-        .await
-        .context("select ap_user_blocks")?;
     for row in user_block_rows {
         let scope: String = row.try_get::<_, Option<String>>(0)?.unwrap_or_default();
         let value: String = row.try_get::<_, Option<String>>(1)?.unwrap_or_default();
@@ -476,10 +493,6 @@ pub async fn load_hidden_sets(db: &Client, owner_user_id: i64) -> Result<HiddenS
         }
     }
 
-    let inst_rows = db
-        .query("SELECT scope, value, COALESCE(to_jsonb(ap_blocks)->>'kind', 'block') FROM ap_blocks", &[])
-        .await
-        .context("select ap_blocks")?;
     for row in inst_rows {
         let scope: String = row.try_get::<_, Option<String>>(0)?.unwrap_or_default();
         let value: String = row.try_get::<_, Option<String>>(1)?.unwrap_or_default();
@@ -504,7 +517,7 @@ pub async fn load_hidden_sets(db: &Client, owner_user_id: i64) -> Result<HiddenS
     }
 
     if owner_user_id > 0 {
-        for row in db.query("SELECT phrase FROM ap_muted_words WHERE owner_user_id = $1::bigint", &[&owner_user_id]).await.context("load muted words")? {
+        for row in word_rows {
             let phrase: String = row.get(0);
             let phrase = normalize_muted_text(&phrase);
             if !phrase.is_empty() { sets.muted_phrases.push(phrase); }
@@ -562,26 +575,34 @@ pub async fn expand_bsky_identities(db: &Client, sets: &mut HiddenSets) {
     if dids.is_empty() && handles.is_empty() { return; }
     let lookup = async {
         let mut pairs = Vec::new();
-        for row in db.query(
-            "SELECT d, (SELECT lower(author_handle) FROM bsky_posts WHERE author_did = d AND author_handle IS NOT NULL AND author_handle <> '' LIMIT 1)
-             FROM unnest($1::text[]) AS d
-             UNION ALL
-             SELECT (SELECT author_did FROM bsky_posts WHERE lower(author_handle) = h AND author_did LIKE 'did:%' LIMIT 1), h
-             FROM unnest($2::text[]) AS h",
-            &[&dids, &handles],
-        ).await.context("bsky moderation identities")? {
+        let handle_urls: Vec<String> = handles.iter().map(|h| format!("https://bsky.app/profile/{h}")).collect();
+        let (post_rows, profile_rows) = tokio::try_join!(
+            async {
+                db.query(
+                    "SELECT d, (SELECT lower(author_handle) FROM bsky_posts WHERE author_did = d AND author_handle IS NOT NULL AND author_handle <> '' LIMIT 1)
+                     FROM unnest($1::text[]) AS d
+                     UNION ALL
+                     SELECT (SELECT author_did FROM bsky_posts WHERE lower(author_handle) = h AND author_did LIKE 'did:%' LIMIT 1), h
+                     FROM unnest($2::text[]) AS h",
+                    &[&dids, &handles],
+                ).await.context("bsky moderation identities")
+            },
+            async {
+                db.query(
+                    "SELECT did, profile_json FROM bsky_actor_profiles
+                     WHERE did = ANY($1) OR lower(actor_ref) = ANY($2) OR lower(actor_ref) = ANY($3)",
+                    &[&dids, &handles, &handle_urls],
+                ).await.context("bsky moderation profiles")
+            },
+        )?;
+        for row in post_rows {
             let did: Option<String> = row.get(0);
             let handle: Option<String> = row.get(1);
             if let (Some(did), Some(handle)) = (did, handle) {
                 if did.starts_with("did:") && !handle.is_empty() { pairs.push((did, handle)); }
             }
         }
-        let handle_urls: Vec<String> = handles.iter().map(|h| format!("https://bsky.app/profile/{h}")).collect();
-        for row in db.query(
-            "SELECT did, profile_json FROM bsky_actor_profiles
-             WHERE did = ANY($1) OR lower(actor_ref) = ANY($2) OR lower(actor_ref) = ANY($3)",
-            &[&dids, &handles, &handle_urls],
-        ).await.context("bsky moderation profiles")? {
+        for row in profile_rows {
             let profile: Value = serde_json::from_str(&row.get::<_, String>(1)).unwrap_or(Value::Null);
             let did = row.get::<_, Option<String>>(0).filter(|d| d.starts_with("did:"))
                 .or_else(|| profile.get("did").and_then(Value::as_str).map(str::to_owned));
@@ -744,29 +765,49 @@ pub async fn load_viewer_moderation(db: &Client, owner_user_id: i64) -> Result<V
     if owner_user_id < 1 {
         return Ok(out);
     }
-    let mute_rows = db
-        .query(
-            "SELECT actor_id FROM ap_mutes WHERE owner_user_id = $1::bigint",
-            &[&owner_user_id],
-        )
-        .await
-        .context("select ap_mutes for moderation menu")?;
-    for row in mute_rows {
+    let (mute_rows, block_rows, depri_rows, session_row, unblur_row) = tokio::join!(
+        async {
+            db.query(
+                "SELECT actor_id FROM ap_mutes WHERE owner_user_id = $1::bigint",
+                &[&owner_user_id],
+            ).await
+        },
+        async {
+            db.query(
+                "SELECT id::bigint, value FROM ap_user_blocks
+                 WHERE owner_user_id = $1::bigint AND scope = 'actor'",
+                &[&owner_user_id],
+            ).await
+        },
+        async {
+            db.query(
+                "SELECT actor_id FROM ap_deprioritized_actors WHERE owner_user_id = $1::bigint",
+                &[&owner_user_id],
+            ).await
+        },
+        async {
+            db.query_opt(
+                "SELECT COALESCE(handle, ''), COALESCE(did, '')
+                 FROM bsky_sessions WHERE owner_user_id = $1::bigint LIMIT 1",
+                &[&owner_user_id],
+            ).await
+        },
+        async {
+            db.query_opt(
+                "SELECT COALESCE(p.auto_unblur_sensitive::bigint, 0) FROM ap_users u
+                 JOIN actor_profile p ON p.actor_key = u.actor_key WHERE u.id = $1::bigint AND u.disabled_at IS NULL",
+                &[&owner_user_id],
+            ).await
+        },
+    );
+    for row in mute_rows.context("select ap_mutes for moderation menu")? {
         let a: String = row.try_get::<_, Option<String>>(0)?.unwrap_or_default();
         let a = norm_actor(&a);
         if !a.is_empty() {
             out.muted_actors.insert(a);
         }
     }
-    let block_rows = db
-        .query(
-            "SELECT id::bigint, value FROM ap_user_blocks
-             WHERE owner_user_id = $1::bigint AND scope = 'actor'",
-            &[&owner_user_id],
-        )
-        .await
-        .context("select ap_user_blocks for moderation menu")?;
-    for row in block_rows {
+    for row in block_rows.context("select ap_user_blocks for moderation menu")? {
         let id: i64 = row.try_get(0)?;
         let value: String = row.try_get::<_, Option<String>>(1)?.unwrap_or_default();
         let a = norm_actor(&value);
@@ -774,42 +815,23 @@ pub async fn load_viewer_moderation(db: &Client, owner_user_id: i64) -> Result<V
             out.blocked_actors.insert(a, id);
         }
     }
-    if let Ok(rows) = db
-        .query(
-            "SELECT actor_id FROM ap_deprioritized_actors WHERE owner_user_id = $1::bigint",
-            &[&owner_user_id],
-        )
-        .await
-    {
+    if let Ok(rows) = depri_rows {
         for row in rows {
             let a: String = row.try_get::<_, Option<String>>(0)?.unwrap_or_default();
             insert_actor_aliases(&mut out.deprioritized_actors, &a);
         }
     }
-    if let Ok(row) = db
-        .query_opt(
-            "SELECT COALESCE(handle, ''), COALESCE(did, '')
-             FROM bsky_sessions WHERE owner_user_id = $1::bigint LIMIT 1",
-            &[&owner_user_id],
-        )
-        .await
-    {
-        if let Some(row) = row {
-            let handle: String = row.try_get(0).unwrap_or_default();
-            let did: String = row.try_get(1).unwrap_or_default();
-            for key in [handle, did] {
-                let key = key.trim().trim_start_matches('@').to_ascii_lowercase();
-                if !key.is_empty() {
-                    out.own_bsky_keys.insert(key);
-                }
+    if let Ok(Some(row)) = session_row {
+        let handle: String = row.try_get(0).unwrap_or_default();
+        let did: String = row.try_get(1).unwrap_or_default();
+        for key in [handle, did] {
+            let key = key.trim().trim_start_matches('@').to_ascii_lowercase();
+            if !key.is_empty() {
+                out.own_bsky_keys.insert(key);
             }
         }
     }
-    if let Some(row) = db.query_opt(
-        "SELECT COALESCE(p.auto_unblur_sensitive::bigint, 0) FROM ap_users u
-         JOIN actor_profile p ON p.actor_key = u.actor_key WHERE u.id = $1::bigint AND u.disabled_at IS NULL",
-        &[&owner_user_id],
-    ).await? {
+    if let Some(row) = unblur_row? {
         out.auto_unblur_sensitive = row.get::<_, i64>(0) != 0;
     }
     Ok(out)

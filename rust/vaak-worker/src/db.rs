@@ -66,3 +66,50 @@ pub async fn reused(database_url: &str) -> Result<Reused> {
     };
     Ok(Reused { url: database_url.to_owned(), client: Some(client) })
 }
+
+/// Idle connections for the notifications HTML fill. Separate from the Search
+/// pool so a mentions page cannot take the two connections Search keeps warm.
+const NOTIF_IDLE_MAX: usize = 2;
+static NOTIF_IDLE: std::sync::Mutex<Vec<(String, Client)>> = std::sync::Mutex::new(Vec::new());
+
+pub struct NotifConn {
+    url: String,
+    client: Option<Client>,
+}
+
+impl std::ops::Deref for NotifConn {
+    type Target = Client;
+    fn deref(&self) -> &Client {
+        self.client.as_ref().expect("notification client present until drop")
+    }
+}
+
+impl Drop for NotifConn {
+    fn drop(&mut self) {
+        let Some(client) = self.client.take() else { return };
+        if client.is_closed() {
+            return;
+        }
+        if let Ok(mut idle) = NOTIF_IDLE.lock() {
+            if idle.len() < NOTIF_IDLE_MAX {
+                idle.push((std::mem::take(&mut self.url), client));
+            }
+        }
+    }
+}
+
+/// Take an idle notifications connection for this database, or open a new one.
+/// The fill runs plain queries only, so a returned connection carries no
+/// session state into the next page.
+pub async fn notif_reused(database_url: &str) -> Result<NotifConn> {
+    let idle = NOTIF_IDLE.lock().ok().and_then(|mut idle| {
+        idle.retain(|(_, client)| !client.is_closed());
+        let at = idle.iter().rposition(|(url, _)| url == database_url)?;
+        Some(idle.swap_remove(at).1)
+    });
+    let client = match idle {
+        Some(client) => client,
+        None => connect(database_url).await?,
+    };
+    Ok(NotifConn { url: database_url.to_owned(), client: Some(client) })
+}
