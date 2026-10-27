@@ -1071,6 +1071,273 @@ function ap_masto_oauth_revoke(): void
     exit;
 }
 
+/**
+ * Query integer that never casts an array. Out-of-range numbers clamp.
+ * Non-numeric values, including limit[]=1, keep $default.
+ */
+function ap_masto_bounded_int(mixed $raw, int $default, int $min, int $max): int
+{
+    if (is_int($raw)) {
+        $n = $raw;
+    } elseif (is_string($raw) && preg_match('/^-?\d+$/', trim($raw)) === 1) {
+        $n = (int) trim($raw);
+    } else {
+        return $default;
+    }
+    if ($n < $min) {
+        return $min;
+    }
+    if ($n > $max) {
+        return $max;
+    }
+    return $n;
+}
+
+/** @return list<string> */
+function ap_masto_filter_contexts(): array
+{
+    return ['home', 'notifications', 'public', 'thread', 'account'];
+}
+
+function ap_masto_is_filters_path(string $path): bool
+{
+    return (bool) preg_match('#^/api/v[12]/filters(?:/\d+(?:/(?:keywords|statuses)(?:/\d+)?)?)?$#', $path);
+}
+
+function ap_masto_is_lists_path(string $path): bool
+{
+    return $path === '/api/v1/lists'
+        || (bool) preg_match('#^/api/v1/lists/\d+$#', $path)
+        || (bool) preg_match('#^/api/v1/lists/\d+/accounts$#', $path)
+        || (bool) preg_match('#^/api/v1/accounts/\d+/lists$#', $path)
+        || (bool) preg_match('#^/api/v1/timelines/list/\d+$#', $path);
+}
+
+/**
+ * Account refresh reads the lists collection and the filter collection.
+ * Both must be real routes: a 404 on either is the Pachli "lists and filters may be incomplete" dialog.
+ */
+function ap_masto_account_refresh_route(string $method, string $path): ?string
+{
+    if ($method === 'GET' && $path === '/api/v1/lists') {
+        return 'lists';
+    }
+    if ($method === 'GET' && ($path === '/api/v1/filters' || $path === '/api/v2/filters')) {
+        return 'filters';
+    }
+    return null;
+}
+
+function ap_masto_filter_phrase_from_input(array $in): string
+{
+    $phrase = trim((string) ($in['phrase'] ?? ''));
+    if ($phrase === '') {
+        $phrase = trim((string) ($in['title'] ?? ''));
+    }
+    if ($phrase === '') {
+        $phrase = trim((string) ($in['keyword'] ?? ''));
+    }
+    if ($phrase === '') {
+        $attrs = $in['keywords_attributes'] ?? $in['keyword_attributes'] ?? null;
+        if (is_array($attrs)) {
+            foreach ($attrs as $attr) {
+                if (is_array($attr)) {
+                    $candidate = trim((string) ($attr['keyword'] ?? $attr['phrase'] ?? ''));
+                } else {
+                    $candidate = trim((string) $attr);
+                }
+                if ($candidate !== '') {
+                    $phrase = $candidate;
+                    break;
+                }
+            }
+        }
+    }
+    return $phrase;
+}
+
+/**
+ * @param array<string,mixed> $row
+ * @return array<string,mixed>
+ */
+function ap_masto_filter_keyword(array $row): array
+{
+    return [
+        'id' => (string) (int) ($row['id'] ?? 0),
+        'keyword' => (string) ($row['phrase'] ?? ''),
+        'whole_word' => false,
+    ];
+}
+
+/**
+ * @param array<string,mixed> $row
+ * @return array<string,mixed>
+ */
+function ap_masto_filter_v1(array $row): array
+{
+    return [
+        'id' => (string) (int) ($row['id'] ?? 0),
+        'phrase' => (string) ($row['phrase'] ?? ''),
+        'context' => ap_masto_filter_contexts(),
+        'expires_at' => null,
+        'irreversible' => true,
+        'whole_word' => false,
+    ];
+}
+
+/**
+ * @param array<string,mixed> $row
+ * @return array<string,mixed>
+ */
+function ap_masto_filter_v2(array $row): array
+{
+    return [
+        'id' => (string) (int) ($row['id'] ?? 0),
+        'title' => (string) ($row['phrase'] ?? ''),
+        'context' => ap_masto_filter_contexts(),
+        'expires_at' => null,
+        'filter_action' => 'hide',
+        'keywords' => [ap_masto_filter_keyword($row)],
+        'statuses' => [],
+    ];
+}
+
+/**
+ * @return array<string,mixed>|null
+ */
+function ap_masto_filter_owned_row(int $id, int $ownerUserId): ?array
+{
+    if ($id < 1 || $ownerUserId < 1) {
+        return null;
+    }
+    foreach (ap_muted_words_list($ownerUserId) as $row) {
+        if ((int) ($row['id'] ?? 0) === $id) {
+            return $row;
+        }
+    }
+    return null;
+}
+
+function ap_masto_filters_dispatch(string $method, string $path): void
+{
+    if (!preg_match('#^/api/v(1|2)/filters(?:/(\d+)(?:/(keywords|statuses)(?:/(\d+))?)?)?$#', $path, $m)) {
+        ap_masto_json(['error' => 'Record not found'], 404);
+    }
+    $version = $m[1];
+    $id = isset($m[2]) && $m[2] !== '' ? (int) $m[2] : 0;
+    $sub = $m[3] ?? '';
+    $subId = isset($m[4]) && $m[4] !== '' ? (int) $m[4] : 0;
+    $read = $method === 'GET' || $method === 'HEAD';
+    $token = ap_masto_require_token($read ? 'read:filters' : 'write:filters');
+    unset($token);
+    $owner = (int) ($GLOBALS['vaak_owner_id'] ?? 0);
+    $present = static function (array $row) use ($version): array {
+        return $version === '1' ? ap_masto_filter_v1($row) : ap_masto_filter_v2($row);
+    };
+    if ($id === 0) {
+        if ($method === 'GET' || $method === 'HEAD') {
+            $out = [];
+            foreach (ap_muted_words_list($owner) as $row) {
+                $out[] = $present($row);
+            }
+            ap_masto_json($out);
+        }
+        if ($method === 'POST') {
+            $phrase = ap_masto_filter_phrase_from_input(ap_masto_input());
+            $res = ap_muted_word_add($phrase, '', $owner);
+            if (empty($res['ok'])) {
+                ap_masto_json(['error' => $res['error'] ?? 'Could not save filter'], 422);
+            }
+            $row = ap_masto_filter_owned_row((int) ($res['id'] ?? 0), $owner);
+            if ($row === null) {
+                foreach (ap_muted_words_list($owner) as $candidate) {
+                    if (mb_strtolower((string) ($candidate['phrase'] ?? ''), 'UTF-8') === mb_strtolower($phrase, 'UTF-8')) {
+                        $row = $candidate;
+                        break;
+                    }
+                }
+            }
+            if ($row === null) {
+                ap_masto_json(['error' => 'Could not save filter'], 422);
+            }
+            ap_masto_json($present($row));
+        }
+        ap_masto_json(['error' => 'Record not found'], 404);
+    }
+    $row = ap_masto_filter_owned_row($id, $owner);
+    if ($row === null) {
+        ap_masto_json(['error' => 'Record not found'], 404);
+    }
+    if ($sub === 'statuses') {
+        if ($method === 'GET') {
+            ap_masto_json([]);
+        }
+        ap_masto_json(['error' => 'Status filters are not available'], 422);
+    }
+    if ($sub === 'keywords') {
+        if ($version !== '2') {
+            ap_masto_json(['error' => 'Record not found'], 404);
+        }
+        if ($method === 'POST' && $subId === 0) {
+            $in = ap_masto_input();
+            $keyword = trim((string) ($in['keyword'] ?? ''));
+            if ($keyword === '') {
+                ap_masto_json(['error' => 'keyword is required'], 422);
+            }
+            $res = ap_muted_word_update($id, $keyword, $owner);
+            if (empty($res['ok'])) {
+                $code = (($res['error'] ?? '') === 'Phrase not found.') ? 404 : 422;
+                ap_masto_json(['error' => $res['error'] ?? 'Could not save keyword'], $code);
+            }
+            $updated = ap_masto_filter_owned_row($id, $owner) ?? $row;
+            $updated['phrase'] = (string) ($res['phrase'] ?? $keyword);
+            ap_masto_json(ap_masto_filter_keyword($updated));
+        }
+        if ($method === 'DELETE' && $subId > 0) {
+            if ($subId !== $id) {
+                ap_masto_json(['error' => 'Record not found'], 404);
+            }
+            $res = ap_muted_word_remove($id, $owner);
+            if (empty($res['ok'])) {
+                ap_masto_json(['error' => 'Record not found'], 404);
+            }
+            http_response_code(200);
+            header('Content-Type: application/json');
+            echo '{}';
+            exit;
+        }
+        ap_masto_json(['error' => 'Record not found'], 404);
+    }
+    if ($method === 'GET' || $method === 'HEAD') {
+        ap_masto_json($present($row));
+    }
+    if ($method === 'PUT' || $method === 'PATCH') {
+        $phrase = ap_masto_filter_phrase_from_input(ap_masto_input());
+        if ($phrase === '') {
+            $phrase = (string) ($row['phrase'] ?? '');
+        }
+        $res = ap_muted_word_update($id, $phrase, $owner);
+        if (empty($res['ok'])) {
+            $code = (($res['error'] ?? '') === 'Phrase not found.') ? 404 : 422;
+            ap_masto_json(['error' => $res['error'] ?? 'Could not update filter'], $code);
+        }
+        $updated = ap_masto_filter_owned_row($id, $owner) ?? $row;
+        $updated['phrase'] = (string) ($res['phrase'] ?? $phrase);
+        ap_masto_json($present($updated));
+    }
+    if ($method === 'DELETE') {
+        $res = ap_muted_word_remove($id, $owner);
+        if (empty($res['ok'])) {
+            ap_masto_json(['error' => 'Record not found'], 404);
+        }
+        http_response_code(200);
+        header('Content-Type: application/json');
+        echo '{}';
+        exit;
+    }
+    ap_masto_json(['error' => 'Record not found'], 404);
+}
+
 function ap_masto_trends_viewer_user_id(): int
 {
     $auth = $_SERVER['HTTP_AUTHORIZATION'] ?? $_SERVER['REDIRECT_HTTP_AUTHORIZATION'] ?? '';
@@ -1090,14 +1357,19 @@ function ap_masto_api(string $method, string $path): void
     if ($method === 'GET' && in_array($path, [
         '/api/v1/custom_emojis',
         '/api/v1/announcements',
-        '/api/v1/filters',
     ], true)) {
         ap_masto_json([]);
         return;
     }
 
+    // Pachli account refresh. A missing collection is "Not found: GET /api/v2/filters".
+    if (ap_masto_account_refresh_route($method, $path) === 'filters' || ap_masto_is_filters_path($path)) {
+        ap_masto_filters_dispatch($method, $path);
+        return;
+    }
+
     // ----- Lists (private follow subsets; Library → Lists) -----
-    if ($path === '/api/v1/lists' && $method === 'GET') {
+    if (ap_masto_account_refresh_route($method, $path) === 'lists') {
         ap_masto_require_token('read:lists');
         $out = [];
         foreach (ap_lists_all() as $row) {
@@ -1292,14 +1564,28 @@ function ap_masto_api(string $method, string $path): void
         return;
     }
 
-    // Trending statuses (Ice Cubes Explore → Posts)
+    // Trending statuses (Ice Cubes Explore → Posts). Never 500: bad rows and
+    // bad limit/offset become an empty list.
     if ($method === 'GET' && $path === '/api/v1/trends/statuses') {
-        $limit = isset($_GET['limit']) ? (int) $_GET['limit'] : 10;
-        $limit = max(1, min(20, $limit));
-        $owner = ap_masto_trends_viewer_user_id();
-        ap_trends_replay_json('statuses', $owner, $limit);
-        $items = ap_masto_trends_statuses($owner > 0 ? 20 : $limit);
-        ap_trends_emit_json('statuses', $owner, $limit, ap_masto_trends_filter_for_owner($items, $owner, $limit));
+        try {
+            $limit = ap_masto_bounded_int($_GET['limit'] ?? null, 10, 1, 20);
+            $offset = ap_masto_bounded_int($_GET['offset'] ?? null, 0, 0, 40);
+            $owner = ap_masto_trends_viewer_user_id();
+            if ($offset === 0) {
+                ap_trends_replay_json('statuses', $owner, $limit);
+            }
+            $fetch = $owner > 0 ? 20 : $limit;
+            $items = ap_masto_trends_statuses($fetch);
+            $window = $offset > 0 ? 20 : $limit;
+            $filtered = ap_masto_trends_filter_for_owner(is_array($items) ? $items : [], $owner, $window);
+            if ($offset > 0) {
+                $filtered = array_values(array_slice($filtered, $offset, $limit));
+            }
+            ap_trends_emit_json('statuses', $owner, $limit, $filtered);
+        } catch (Throwable $e) {
+            error_log('[ap-mastodon] trends/statuses: ' . $e->getMessage());
+            ap_masto_json([]);
+        }
         return;
     }
 

@@ -95,7 +95,8 @@ fn status_id(created: &str, db_id: i64, kind: i64) -> String {
 }
 
 fn account_json(actor: &str, username: &str, display: &str, host: &str, avatar: Option<&str>) -> Value {
-    let av = avatar.filter(|v| v.starts_with("https://")).unwrap_or("https://mkultra.monster/img/avatar/default.webp");
+    let owned = avatar.and_then(|v| crate::actor_warm::account_media_url(v, actor));
+    let av = owned.as_deref().unwrap_or("https://mkultra.monster/img/avatar/default.webp");
     let acct = if host.is_empty() { username.to_string() } else { format!("{username}@{host}") };
     json!({"id": actor, "username": username, "acct": acct, "display_name": if display.is_empty() { username } else { display },
         "locked": false, "bot": false, "discoverable": false, "group": false,

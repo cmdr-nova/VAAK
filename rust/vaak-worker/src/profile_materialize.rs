@@ -608,8 +608,8 @@ impl Projector<'_>{
             if next_avatar.as_ref().is_some_and(|u|!u.is_empty()&&u!="0"){avatar=next_avatar;}
             if next_header.as_ref().is_some_and(|u|!u.is_empty()&&u!="0"){header=next_header;}else if avatar.as_ref().is_some_and(|u|!u.is_empty()&&u!="https://mkultra.monster/img/avatar/default.webp"){header=avatar.clone();}
         }
-        let avatar=crate::profile_enrichment::sanitize_profile_url(avatar.as_deref().unwrap_or(""))?.unwrap_or_else(||"https://mkultra.monster/img/avatar/default.webp".into());
-        let header=crate::profile_enrichment::sanitize_profile_url(header.as_deref().unwrap_or(""))?.unwrap_or_else(||avatar.clone());
+        let avatar=crate::actor_warm::account_media_url(avatar.as_deref().unwrap_or(""), actor).unwrap_or_else(||"https://mkultra.monster/img/avatar/default.webp".into());
+        let header=crate::actor_warm::account_media_url(header.as_deref().unwrap_or(""), actor).unwrap_or_else(||avatar.clone());
 
         let id=self.remote_account_id(actor).await?;
         self.effect(ProjectionEffect::RememberAccount{account_id:id.clone(),actor:canonical.clone()});

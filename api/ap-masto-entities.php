@@ -6144,7 +6144,7 @@ function ap_masto_https_media_url(mixed $value, ?string $fallback = null, int $d
         && !isset($parts['pass'])
         && preg_match('/\s/', $value) !== 1
         && filter_var($value, FILTER_VALIDATE_URL) !== false;
-    if (!$ok) {
+    if (!$ok || (function_exists('ap_account_media_is_broken_local') && ap_account_media_is_broken_local($value))) {
         return $next($fallback, $depth);
     }
     return $value;
@@ -11102,7 +11102,8 @@ function ap_masto_search_sanitize_accounts(array $accounts): array
         }
         foreach (['avatar', 'header', 'avatar_static', 'header_static'] as $k) {
             $u = (string) ($a[$k] ?? '');
-            if ($u === '' || !str_starts_with($u, 'https://')) {
+            $broken = function_exists('ap_account_media_is_broken_local') && ap_account_media_is_broken_local($u);
+            if ($u === '' || !str_starts_with($u, 'https://') || $broken) {
                 $a[$k] = 'https://mkultra.monster/img/avatar/default.jpg';
             }
         }
@@ -12238,7 +12239,8 @@ function ap_trends_emit_json(string $kind, int $ownerUserId, int $limit, mixed $
 {
     $json = json_encode($data, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE);
     if (!is_string($json)) {
-        ap_masto_json(['error' => 'JSON encode failed'], 500);
+        error_log('[ap-trends] json encode failed for ' . $kind);
+        ap_masto_json([]);
     }
     $saved = ap_trends_http_put($kind, $ownerUserId, 'json-' . $limit, $json, 0, false);
     ap_trends_send_reuse_headers($saved['etag'], $ownerUserId < 1);
@@ -12553,13 +12555,22 @@ function ap_masto_trends_filter_for_owner(array $items, int $ownerUserId, int $l
         return is_array($item) && ap_masto_trend_status_listable($item);
     }));
     if ($ownerUserId < 1) return array_slice($items, 0, $limit);
-    $user = ap_auth_user_by_id($ownerUserId);
-    if (!is_array($user) || (int) ($user['id'] ?? 0) !== $ownerUserId || !empty($user['disabled_at'])) return [];
-    $downrankRefs = ap_masto_trend_downrank_ref_set($ownerUserId);
+    try {
+        $user = ap_auth_user_by_id($ownerUserId);
+        if (!is_array($user) || (int) ($user['id'] ?? 0) !== $ownerUserId || !empty($user['disabled_at'])) return [];
+        $downrankRefs = ap_masto_trend_downrank_ref_set($ownerUserId);
+    } catch (Throwable $e) {
+        return [];
+    }
     $out = [];
     foreach ($items as $item) {
-        if (!is_array($item) || ap_masto_trend_tree_hidden($item, $ownerUserId, 0, $downrankRefs)) continue;
-        $out[] = ap_masto_trend_status_owner_metadata($item,$ownerUserId);
+        if (!is_array($item)) continue;
+        try {
+            if (ap_masto_trend_tree_hidden($item, $ownerUserId, 0, $downrankRefs)) continue;
+            $out[] = ap_masto_trend_status_owner_metadata($item, $ownerUserId);
+        } catch (Throwable $e) {
+            continue;
+        }
         if (count($out) >= $limit) break;
     }
     return $out;
@@ -13000,6 +13011,23 @@ function ap_masto_trend_status_world_metadata(array $item): array
     return $item;
 }
 
+function ap_masto_trend_ensure_bsky_viewer(): bool
+{
+    if (function_exists('ap_bsky_viewer_for_owner')) {
+        return true;
+    }
+    $lib = __DIR__ . '/ap-bsky.php';
+    if (!is_file($lib)) {
+        return false;
+    }
+    try {
+        require_once $lib;
+    } catch (Throwable $e) {
+        return false;
+    }
+    return function_exists('ap_bsky_viewer_for_owner');
+}
+
 function ap_masto_trend_status_owner_metadata(array $item,int $ownerUserId,int $depth=0): array
 {
     if($depth>16||$ownerUserId<1)return ap_masto_trend_status_world_metadata($item);
@@ -13019,13 +13047,25 @@ function ap_masto_trend_status_owner_metadata(array $item,int $ownerUserId,int $
             }catch(Throwable $e){/* Same unavailable-poll fallback as ordinary PHP cards. */}
         }
         if(is_array($item['bsky_post']??null)&&str_starts_with($uri,'at://')) {
-            $q=ap_db()->prepare('SELECT raw_json FROM bsky_posts WHERE bsky_uri=?');$q->execute([$uri]);$raw=json_decode((string)$q->fetchColumn(),true);$post=is_array($raw['post']??null)?$raw['post']:$raw;
-            $viewer=is_array($post['viewer']??null)?array_intersect_key($post['viewer'],array_flip(['like','repost'])):[];
-            $item['bsky_post']['viewer']=ap_bsky_viewer_for_owner($viewer,$ownerUserId,$uri);
+            try {
+                // Cache hits skip the rebuild that used to load ap-bsky.php, so this
+                // call fataled for signed-in clients whenever a Bluesky post was trending.
+                if (!ap_masto_trend_ensure_bsky_viewer()) {
+                    unset($item['bsky_post']['viewer']);
+                } else {
+                    $q=ap_db()->prepare('SELECT raw_json FROM bsky_posts WHERE bsky_uri=?');$q->execute([$uri]);$raw=json_decode((string)$q->fetchColumn(),true);$post=is_array($raw['post']??null)?$raw['post']:$raw;
+                    $viewer=is_array($post['viewer']??null)?array_intersect_key($post['viewer'],array_flip(['like','repost'])):[];
+                    $item['bsky_post']['viewer']=ap_bsky_viewer_for_owner($viewer,$ownerUserId,$uri);
+                }
+            } catch (Throwable $e) {
+                unset($item['bsky_post']['viewer']);
+            }
         }
     }
     foreach(['quote','reblog','quoted_status','status','vaak_quote_preview'] as $key)if(is_array($item[$key]??null))$item[$key]=ap_masto_trend_status_owner_metadata($item[$key],$ownerUserId,$depth+1);
     return $item;
+    } catch (Throwable $e) {
+        return ap_masto_trend_status_world_metadata($item);
     } finally {if($memoHad)$GLOBALS['ap_masto_flag_memo']=$memoPrior;else unset($GLOBALS['ap_masto_flag_memo']);}
 }
 
@@ -14118,6 +14158,23 @@ function ap_masto_bsky_trend_status(array $post): ?array
  * @return list<array<string,mixed>> Mastodon Status entities
  */
 
+/** URI set for trend de-dupe. A missing uri must not become an empty array key. */
+function ap_masto_trend_status_seen_uris(array $rows): array
+{
+    $seen = [];
+    foreach ($rows as $row) {
+        if (!is_array($row)) {
+            continue;
+        }
+        $uri = $row['uri'] ?? null;
+        if (!is_string($uri) || $uri === '') {
+            continue;
+        }
+        $seen[$uri] = true;
+    }
+    return $seen;
+}
+
 function ap_masto_trends_statuses(int $limit = 10): array
 {
     $limit = max(1, min(20, $limit));
@@ -14229,14 +14286,18 @@ function ap_masto_trends_statuses(int $limit = 10): array
     $fediCap = 14;
     foreach (array_chunk(array_keys($scored),32) as $oids) {
         if (count($out) >= $fediCap) break;
+        try {
         $entries=[];foreach($oids as $oid)$entries[]=['source'=>'event','row'=>['object_id'=>$oid]];
-        foreach(ap_masto_trend_status_candidate_batch($entries,array_fill_keys(array_column($out,'uri'),true)) as $status) {
+        foreach(ap_masto_trend_status_candidate_batch($entries,ap_masto_trend_status_seen_uris($out)) as $status) {
             if(count($out)>=$fediCap)break;
             $oid=rtrim((string)($status['uri']??''),'/');$a=$agg[$oid]??null;if(!is_array($a))continue;
             $status['reblogs_count']=max((int)($status['reblogs_count']??0),(int)$a['announces']);
             $status['favourites_count']=max((int)($status['favourites_count']??0),(int)$a['likes']);
             $status['replies_count']=max((int)($status['replies_count']??0),(int)$a['replies']);
             $takeStatus($status,$status['_vaak_trend_source']['row']);
+        }
+        } catch (Throwable $e) {
+            continue;
         }
     }
 
@@ -14255,7 +14316,7 @@ function ap_masto_trends_statuses(int $limit = 10): array
             foreach(array_chunk($st->fetchAll()?:[],32) as $batch) {
                 if(count($out)>=max($limit,10))break;
                 $entries=[];foreach($batch as $row)$entries[]=['source'=>'event','row'=>$row];
-                foreach(ap_masto_trend_status_candidate_batch($entries,array_fill_keys(array_column($out,'uri'),true)) as $status) {
+                foreach(ap_masto_trend_status_candidate_batch($entries,ap_masto_trend_status_seen_uris($out)) as $status) {
                     if(count($out)>=max($limit,10))break;
                     $takeStatus($status,$status['_vaak_trend_source']['row']);
                 }
@@ -14283,7 +14344,7 @@ function ap_masto_trends_statuses(int $limit = 10): array
         foreach(array_chunk($st->fetchAll()?:[],32) as $batch) {
             if($bskyAdded>=$bskyCap||count($out)>=20)break;
             $entries=[];foreach($batch as $row)$entries[]=['source'=>'bsky','row'=>$row];
-            foreach(ap_masto_trend_status_candidate_batch($entries,array_fill_keys(array_column($out,'uri'),true)) as $status) {
+            foreach(ap_masto_trend_status_candidate_batch($entries,ap_masto_trend_status_seen_uris($out)) as $status) {
                 if($bskyAdded>=$bskyCap||count($out)>=20)break;
                 if($takeStatus($status,$status['_vaak_trend_source']['row'],'bsky'))$bskyAdded++;
             }
@@ -14459,8 +14520,13 @@ function ap_masto_suggestion_account(string $actorId): ?array
             ? AP_REMOTE_AVATAR_FALLBACK
             : 'https://mkultra.monster/img/avatar/default.jpg';
         if ($avatar !== '' && (string) ($account['avatar'] ?? '') === $fallback) {
-            $account['avatar'] = $avatar;
-            $account['avatar_static'] = $avatar;
+            $safe = function_exists('ap_masto_https_media_url')
+                ? ap_masto_https_media_url($avatar, $fallback)
+                : (str_starts_with($avatar, 'https://') ? $avatar : $fallback);
+            if (is_string($safe) && $safe !== '') {
+                $account['avatar'] = $safe;
+                $account['avatar_static'] = $safe;
+            }
         }
     }
 
