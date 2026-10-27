@@ -97,7 +97,8 @@ fn status_id(created: &str, db_id: i64, kind: i64) -> String {
 fn account_json(actor: &str, username: &str, display: &str, host: &str, avatar: Option<&str>) -> Value {
     let owned = avatar.and_then(|v| crate::actor_warm::account_media_url(v, actor));
     let av = owned.as_deref().unwrap_or("https://mkultra.monster/img/avatar/default.webp");
-    let acct = if host.is_empty() { username.to_string() } else { format!("{username}@{host}") };
+    let acct = crate::home_hydrate_ranked::local_api_acct(username, host, actor)
+        .unwrap_or_else(|| if host.is_empty() { username.to_string() } else { format!("{username}@{host}") });
     json!({"id": actor, "username": username, "acct": acct, "display_name": if display.is_empty() { username } else { display },
         "locked": false, "bot": false, "discoverable": false, "group": false,
         "created_at": "2018-01-01T00:00:00.000Z", "note": "", "url": actor, "uri": actor,

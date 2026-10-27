@@ -406,6 +406,185 @@ async fn write_list_envelope(
     redis_util::json_set(redis, key, &payload, 600).await
 }
 
+/// A valid local owner with nothing to list, versus a miss that PHP must hydrate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QuietListDecision {
+    Empty,
+    Miss,
+}
+
+fn quiet_list_decision(valid_local_owner: bool, has_sources: bool) -> QuietListDecision {
+    if valid_local_owner && !has_sources {
+        QuietListDecision::Empty
+    } else {
+        QuietListDecision::Miss
+    }
+}
+
+/// Live `ap_users` row only. No `actor_profile` and no projection table: a
+/// quiet account often has neither, and that must not become a 404.
+const QUIET_OWNER_SQL: &str = "\
+SELECT
+  (
+    EXISTS (SELECT 1 FROM mentions m WHERE m.owner_user_id = u.id AND m.deleted_at IS NULL)
+    OR EXISTS (
+      SELECT 1 FROM events e
+      WHERE e.type = 'Follow'
+        AND e.action_taken IN ('local_accept_followback', 'bsky_follow')
+        AND (
+          e.target_actor = rtrim(u.actor_id, '/')
+          OR e.target_actor = rtrim(u.actor_id, '/') || '/'
+        )
+    )
+  ) AS has_sources,
+  rtrim(u.actor_id, '/') AS actor_id
+FROM ap_users u
+WHERE u.id = $1::bigint AND u.disabled_at IS NULL
+LIMIT 1";
+
+/// Same 40-row expired window PHP scans. Not `actor_profile` and not the
+/// projection table. A missing polls table means this install has no polls.
+const QUIET_POLL_SQL: &str = "\
+SELECT note_id, COALESCE(voters_json, '[]'), expires_at
+FROM masto_polls
+WHERE expires_at <= $1
+ORDER BY expires_at DESC
+LIMIT 40";
+
+fn poll_time_reached(expires_at: &str) -> bool {
+    let expires_at = expires_at.trim();
+    if expires_at.is_empty() {
+        return true;
+    }
+    let parsed = chrono::DateTime::parse_from_rfc3339(expires_at)
+        .ok()
+        .or_else(|| chrono::DateTime::parse_from_str(expires_at, "%Y-%m-%dT%H:%M:%S%.f%z").ok())
+        .or_else(|| chrono::DateTime::parse_from_str(expires_at, "%Y-%m-%d %H:%M:%S%z").ok());
+    match parsed {
+        Some(dt) => dt.timestamp() <= Utc::now().timestamp(),
+        None => true,
+    }
+}
+
+fn voters_include(voters_json: &str, actor: &str) -> bool {
+    let actor = actor.trim().trim_end_matches('/');
+    if actor.is_empty() {
+        return false;
+    }
+    let Ok(value) = serde_json::from_str::<Value>(voters_json) else {
+        return voters_json.contains(actor);
+    };
+    value
+        .as_array()
+        .map(|rows| {
+            rows.iter().any(|voter| {
+                voter
+                    .as_str()
+                    .is_some_and(|raw| raw.trim().trim_end_matches('/') == actor)
+            })
+        })
+        .unwrap_or_else(|| voters_json.contains(actor))
+}
+
+fn poll_row_is_source(note_id: &str, voters_json: &str, expires_at: &str, actor: &str) -> bool {
+    if !poll_time_reached(expires_at) {
+        return false;
+    }
+    let actor = actor.trim().trim_end_matches('/');
+    if actor.is_empty() {
+        return false;
+    }
+    let note = note_id.trim().trim_end_matches('/');
+    note.starts_with(&format!("{actor}/notes/")) || voters_include(voters_json, actor)
+}
+
+fn undefined_table(err: &tokio_postgres::Error) -> bool {
+    err.code() == Some(&tokio_postgres::error::SqlState::UNDEFINED_TABLE)
+}
+
+async fn owner_has_poll_source(db: &Client, actor: &str) -> Result<bool> {
+    let bound = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let rows = match db.query(QUIET_POLL_SQL, &[&bound]).await {
+        Ok(rows) => rows,
+        Err(e) if undefined_table(&e) => return Ok(false),
+        Err(e) => return Err(e).context("quiet poll scan"),
+    };
+    Ok(rows.into_iter().any(|row| {
+        let note: String = row.try_get(0).unwrap_or_default();
+        let voters: String = row.try_get(1).unwrap_or_else(|_| "[]".into());
+        let expires: String = row.try_get(2).unwrap_or_default();
+        poll_row_is_source(&note, &voters, &expires, actor)
+    }))
+}
+
+/// `Miss` when the owner is unknown, disabled, has mentions/follows/polls, or
+/// the database cannot answer. `Empty` only for a live local owner with none
+/// of those sources. Lookup does not require settings or projection rows.
+async fn quiet_owner_decision(db: &Client, owner_user_id: i64) -> Result<QuietListDecision> {
+    let row = db
+        .query_opt(QUIET_OWNER_SQL, &[&owner_user_id])
+        .await
+        .context("quiet owner")?;
+    let Some(row) = row else {
+        return Ok(QuietListDecision::Miss);
+    };
+    let has_sources: bool = row.get(0);
+    if has_sources {
+        return Ok(quiet_list_decision(true, true));
+    }
+    let actor: String = row.try_get(1).unwrap_or_default();
+    let actor = actor.trim().trim_end_matches('/').to_string();
+    if !actor.starts_with("https://") {
+        return Ok(QuietListDecision::Miss);
+    }
+    match owner_has_poll_source(db, &actor).await {
+        Ok(true) => Ok(quiet_list_decision(true, true)),
+        Ok(false) => Ok(quiet_list_decision(true, false)),
+        Err(e) => {
+            tracing::warn!(owner = owner_user_id, error = %e, "notif quiet poll check failed");
+            Ok(QuietListDecision::Miss)
+        }
+    }
+}
+
+async fn publish_quiet_empty(
+    cfg: &Config,
+    mut report: NotificationsShadowReport,
+) -> Result<NotificationsShadowReport> {
+    if report.cache_hit {
+        return Ok(report);
+    }
+    let decision = match crate::db::connect(&cfg.database_url).await {
+        Ok(db) => match quiet_owner_decision(&db, report.owner_user_id).await {
+            Ok(decision) => decision,
+            Err(e) => {
+                tracing::warn!(owner = report.owner_user_id, error = %e, "notif quiet owner check failed");
+                QuietListDecision::Miss
+            }
+        },
+        Err(e) => {
+            tracing::warn!(owner = report.owner_user_id, error = %e, "notif quiet owner db connect failed");
+            QuietListDecision::Miss
+        }
+    };
+    if decision != QuietListDecision::Empty {
+        return Ok(report);
+    }
+    if let Ok(mut redis) = redis_util::connect(&cfg.redis_url).await {
+        if let Err(e) = write_list_envelope(&mut redis, &report.redis_key, Vec::new()).await {
+            tracing::warn!(owner = report.owner_user_id, error = %e, "quiet notification envelope was not cached");
+        }
+    }
+    report.cache_hit = true;
+    report.cache_ts = Some(Utc::now().timestamp());
+    report.cache_age_secs = Some(0);
+    report.source = "vaak-worker-projection".into();
+    report.count = 0;
+    report.items.clear();
+    report.note = "Valid local owner with no notification sources; empty list.";
+    Ok(report)
+}
+
 /// Warm one owner: projection→Redis; fill thin projection via PHP bridge when needed.
 pub async fn warm_owner(cfg: &Config, owner_user_id: i64, limit: i64) -> Result<String> {
     let limit = limit.clamp(1, 80);
@@ -466,7 +645,18 @@ pub async fn warm_owner(cfg: &Config, owner_user_id: i64, limit: i64) -> Result<
         }
     }
 
-    if proj_count < min_rows || heal {
+    let confirmed_quiet = match quiet_owner_decision(&db, owner_user_id).await {
+        Ok(QuietListDecision::Empty) => true,
+        Ok(QuietListDecision::Miss) => false,
+        Err(e) => {
+            tracing::warn!(owner = owner_user_id, error = %e, "notif quiet owner check failed");
+            false
+        }
+    };
+
+    if confirmed_quiet {
+        lines.push(format!("owner={owner_user_id} fill=skip_quiet"));
+    } else if proj_count < min_rows || heal {
         match maybe_fill_projection(&mut redis, owner_user_id, limit.max(40), heal).await {
             Ok(Some(line)) => {
                 if line.contains("fill=ok") {
@@ -552,6 +742,19 @@ pub async fn warm_owner(cfg: &Config, owner_user_id: i64, limit: i64) -> Result<
                 ));
             }
             None => {
+                if confirmed_quiet {
+                    if job.label == "all40" {
+                        all40_items = Some(Vec::new());
+                    }
+                    write_list_envelope(&mut redis, &key, Vec::new()).await?;
+                    native_ok += 1;
+                    lines.push(format!(
+                        "owner={owner_user_id} job={} quiet_empty ms={}",
+                        job.label,
+                        t0.elapsed().as_millis()
+                    ));
+                    continue;
+                }
                 // Quiet account: prior warm already confirmed empty. Re-stamp as
                 // projection instead of leaving Mentions cold every refresh.
                 if let Some(prior) = redis_util::json_get(&mut redis, &key).await? {
@@ -981,10 +1184,12 @@ pub(crate) fn page_after_filter(
 
 /// Exact warm key, then one filtered slice of a raw warm head.
 ///
-/// `since_id` / `min_id` pulls stay a miss so pull-to-refresh still reads PHP.
-/// A short scroll tail stays a miss so a client does not treat the warm cap as
-/// the end of the notifications list. Audience SQL runs on the exact key, or
-/// on the single head `plan_warm_heads` selects — not on every probed head.
+/// `since_id` / `min_id` pulls stay a miss when the owner has notification
+/// sources, so pull-to-refresh still reads PHP. A valid local owner with no
+/// sources answers an empty list. A short scroll tail stays a miss so a client
+/// does not treat the warm cap as the end of the notifications list. Audience
+/// SQL runs on the exact key, or on the single head `plan_warm_heads` selects
+/// — not on every probed head. The quiet-owner lookup runs only on a miss.
 pub async fn notifications_shadow_resolved(
     cfg: &Config,
     owner_user_id: i64,
@@ -1000,9 +1205,10 @@ pub async fn notifications_shadow_resolved(
         truncate_page(&mut report, limit);
         return Ok(report);
     }
-    // Newer-than cursor is not a slice of the head.
+    // Newer-than cursor is not a slice of the head. A quiet owner still
+    // answers [] here; an owner who has sources stays a miss so PHP hydrates.
     if cursor_digits(since_id).is_some() {
-        return Ok(report);
+        return publish_quiet_empty(cfg, report).await;
     }
     let want = expand_types(types);
     let mut redis = redis_util::connect(&cfg.redis_url).await?;
@@ -1024,14 +1230,14 @@ pub async fn notifications_shadow_resolved(
         heads.push((env, alt));
     }
     let Some(plan) = plan_warm_heads(&planned, limit, max_id) else {
-        return Ok(report);
+        return publish_quiet_empty(cfg, report).await;
     };
     let (env, head_limit) = &heads[plan.index];
     let mut items = planned[plan.index].items.clone();
     let db = crate::db::connect(&cfg.database_url).await?;
     crate::audience::filter_notifications(&db, owner_user_id, &mut items).await?;
     let Some(page) = page_after_filter(&items, &plan, limit) else {
-        return Ok(report);
+        return publish_quiet_empty(cfg, report).await;
     };
     let now = chrono::Utc::now().timestamp();
     let mut sliced = hit_report(owner_user_id, *head_limit, want, env, now, page);
@@ -1134,6 +1340,69 @@ mod stale_projection_head_tests {
         assert!(!projection_lacks_head("999999999", &proj));
         // Empty projection is the thin-fill path, not a heal.
         assert!(!projection_lacks_head("1792000100600000007", &[]));
+    }
+}
+
+#[cfg(test)]
+mod quiet_owner_tests {
+    use super::{
+        poll_row_is_source, quiet_list_decision, QuietListDecision, QUIET_OWNER_SQL, QUIET_POLL_SQL,
+    };
+
+    #[test]
+    fn valid_local_owner_without_sources_is_an_empty_list() {
+        assert_eq!(quiet_list_decision(true, false), QuietListDecision::Empty);
+    }
+
+    #[test]
+    fn sources_or_unknown_owner_stay_a_miss() {
+        assert_eq!(quiet_list_decision(true, true), QuietListDecision::Miss);
+        assert_eq!(quiet_list_decision(false, false), QuietListDecision::Miss);
+        assert_eq!(quiet_list_decision(false, true), QuietListDecision::Miss);
+    }
+
+    #[test]
+    fn quiet_lookup_does_not_require_profile_or_projection_rows() {
+        for sql in [QUIET_OWNER_SQL, QUIET_POLL_SQL] {
+            let folded = sql.to_ascii_lowercase();
+            assert!(!folded.contains("actor_profile"), "{sql}");
+            assert!(!folded.contains("ap_notification_projection"), "{sql}");
+            assert!(!folded.contains("ap_user_settings"), "{sql}");
+        }
+        assert!(QUIET_OWNER_SQL.contains("disabled_at IS NULL"));
+        assert!(QUIET_OWNER_SQL.contains("FROM ap_users"));
+        assert!(QUIET_OWNER_SQL.contains("FROM mentions"));
+        assert!(QUIET_OWNER_SQL.contains("local_accept_followback"));
+        assert!(QUIET_OWNER_SQL.contains("bsky_follow"));
+    }
+
+    #[test]
+    fn slice_e_test_shape_has_no_poll_source() {
+        let actor = "https://mkultra.monster/users/slice_e_test";
+        assert!(!poll_row_is_source(
+            "https://mkultra.monster/users/cmdr_nova/notes/other",
+            "[]",
+            "2020-01-01T00:00:00Z",
+            actor
+        ));
+        assert!(!poll_row_is_source(
+            "https://mkultra.monster/users/slice_e_test/notes/later",
+            "[]",
+            "2099-01-01T00:00:00Z",
+            actor
+        ));
+        assert!(poll_row_is_source(
+            "https://mkultra.monster/users/slice_e_test/notes/done",
+            "[]",
+            "2020-01-01T00:00:00Z",
+            actor
+        ));
+        assert!(poll_row_is_source(
+            "https://remote.test/users/alice/notes/1",
+            "[\"https://mkultra.monster/users/slice_e_test\"]",
+            "2020-01-01T00:00:00Z",
+            actor
+        ));
     }
 }
 

@@ -637,6 +637,7 @@ impl Projector<'_>{
         }else if let Some(threads)=threads_web{web=threads;}
         else if !username.is_empty()&&username!="user"&&!crate::profile_identity::placeholder(username){web=format!("https://{host}/@{}",entities::encode(username))}
         }
+        if let Some(bare)=crate::home_hydrate_ranked::local_api_acct(username,host,&canonical){acct=bare;}
         let account=json!({"id":id,"username":username,"acct":acct,"display_name":label["display_name"],"locked":false,"bot":false,"discoverable":true,"group":false,"created_at":"2020-01-01T00:00:00.000Z","note":"","url":web,"uri":canonical,"avatar":avatar,"avatar_static":avatar,"header":header,"header_static":header,"followers_count":0,"following_count":0,"statuses_count":0,"last_status_at":null,"emojis":[],"fields":[]});
         self.account_memo.insert(actor.into(),account.clone());Ok(account)
     }
