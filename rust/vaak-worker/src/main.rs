@@ -47,6 +47,7 @@ mod profile_remote;
 mod profile_bsky_chrome;
 mod profile_quote_state;
 mod profile_warm;
+mod post_media_cache;
 mod profile_quote_warm;
 mod profile_preview_fetch;
 mod profile_preview_transport;
