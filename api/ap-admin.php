@@ -12769,6 +12769,32 @@ function h(mixed $s): string
     return htmlspecialchars($str, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
 }
 
+/**
+ * Local @handle for the sidebar "signed in as" line and account-switcher labels.
+ * Display only. A full acct (name@domain or @name@domain) keeps the local part.
+ * Acct, actor ids, profile URLs, mentions, and API output are unchanged.
+ */
+function admin_sidebar_local_handle(string $username, string $fallback = '', bool $withAt = true): string
+{
+    foreach ([$username, $fallback] as $candidate) {
+        $raw = trim($candidate);
+        if ($raw === '' || $raw === '__guest__') {
+            continue;
+        }
+        $raw = ltrim($raw, '@');
+        $at = strpos($raw, '@');
+        if ($at !== false) {
+            $raw = substr($raw, 0, $at);
+        }
+        $raw = trim($raw);
+        if ($raw === '' || $raw === '__guest__') {
+            continue;
+        }
+        return ($withAt ? '@' : '') . $raw;
+    }
+    return '';
+}
+
 function admin_mascot_empty(string $message, string $variant = 'neutral'): string
 {
     $variant = in_array($variant, ['neutral', 'welcome', 'error'], true) ? $variant : 'neutral';
@@ -30590,7 +30616,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       <a class="brand-avatar-link" href="<?= h($brandProfileHref) ?>" aria-label="View profile">
         <?= admin_avatar_img($vaakActorId, 'brand-avatar', false) ?>
       </a>
-      <div class="meta brand-signed-in" style="margin:.35rem 0 0;font-size:.72rem;line-height:1.3">signed in as <?= h($vaakHandle) ?></div>
+      <div class="meta brand-signed-in" style="margin:.35rem 0 0;font-size:.72rem;line-height:1.3">signed in as <?= h(admin_sidebar_local_handle((string) $vaakUsername, (string) ($vaakActorKey ?? ''))) ?></div>
       <a class="btn btn-ghost brand-profile-link" href="<?= h($brandProfileHref) ?>">View profile</a>
       <?php
         $switchAccountRows = function_exists('ap_auth_users_by_ids')
@@ -30615,7 +30641,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                       : trim((string) ($switchProfile['icon_url'] ?? $switchRow['icon_url'] ?? ''));
                 ?>
                 <?php if ($switchIcon !== ''): ?><img src="<?= h($switchIcon) ?>" alt="" width="24" height="24" loading="lazy" decoding="async"><?php endif; ?>
-                <span><?= h('@' . (string) ($switchRow['username'] ?? $switchRowKey)) ?><?= $switchRowId === $vaakOwnerId ? ' · current' : '' ?></span>
+                <span><?= h(admin_sidebar_local_handle((string) ($switchRow['username'] ?? ''), (string) $switchRowKey)) ?><?= $switchRowId === $vaakOwnerId ? ' · current' : '' ?></span>
               </button>
             </form>
           <?php endforeach; ?>
@@ -33085,8 +33111,8 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
                   ?>
                   <?php if ($sessionIcon !== ''): ?><img src="<?= h($sessionIcon) ?>" alt="" width="42" height="42" loading="lazy" decoding="async"><?php endif; ?>
                   <div class="switch-account-meta">
-                    <strong><?= h((string) ($sessionAccount['username'] ?? $sessionAccountKey)) ?></strong>
-                    <div class="meta">@<?= h($sessionAccountKey) ?><?= $sessionAccountId === $vaakOwnerId ? ' · current' : '' ?></div>
+                    <strong><?= h(admin_sidebar_local_handle((string) ($sessionAccount['username'] ?? ''), $sessionAccountKey, false)) ?></strong>
+                    <div class="meta"><?= h(admin_sidebar_local_handle((string) ($sessionAccount['username'] ?? ''), $sessionAccountKey)) ?><?= $sessionAccountId === $vaakOwnerId ? ' · current' : '' ?></div>
                   </div>
                   <div class="switch-account-actions">
                     <?php if ($sessionAccountId !== $vaakOwnerId): ?>

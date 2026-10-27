@@ -132,6 +132,7 @@ php_tests=(
   api/bin/search-quote-preview-boundary-smoke.php
   api/bin/settings-behavior-smoke.php
   api/bin/settings-parity-smoke.php
+  api/bin/sidebar-signed-in-label-smoke.php
   api/bin/shadow-http-token-smoke.php
   api/bin/trends-response-cache-smoke.php
   api/bin/trending-open-ref-smoke.php
