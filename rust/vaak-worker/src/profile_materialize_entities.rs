@@ -27,7 +27,7 @@ pub(super) fn plain_pack(raw:&str)->Result<Value>{
  if text.contains('@'){bail!("PHP fallback: canonical mention SQL resolver remains unfinished")}
  render_pack(&text,&[])
 }
-fn render_pack(text:&str,mentions:&[Value])->Result<Value>{
+pub(super) fn render_pack(text:&str,mentions:&[Value])->Result<Value>{
  let mut escaped=crate::library::actions::esc(text);let mut mention_hold=vec![];
  let mut sorted=mentions.to_vec();sorted.sort_by_key(|m|std::cmp::Reverse(s(m,"acct").len()));
  for m in &sorted{let acct=s(m,"acct");if let Some((user,host))=acct.split_once('@'){let user=if user.is_empty(){s(m,"username")}else{user};let link=format!("<span class=\"h-card\"><a href=\"{}\" class=\"u-url mention\">@<span>{}</span>@<span>{}</span></a></span>",crate::library::actions::esc(s(m,"url")),crate::library::actions::esc(user),crate::library::actions::esc(host));escaped=escaped.replace(&format!("@{}",crate::library::actions::esc(acct)),&link)}}

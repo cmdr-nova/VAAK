@@ -12,7 +12,6 @@ use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 use tokio_postgres::Client;
 
 use crate::hidden;
@@ -344,6 +343,33 @@ pub fn public_origin() -> String {
         .unwrap_or_else(|| "https://vaak.monster".to_string())
 }
 
+/// Origin for the Mastodon Link header. `X-Forwarded-Host` wins over `Host`.
+/// Only mkultra.monster and vaak.monster (with or without `www`) are accepted,
+/// so a client-supplied host cannot point the pager at somewhere else.
+pub fn notification_request_origin(forwarded_host: Option<&str>, host: Option<&str>) -> String {
+    for candidate in [forwarded_host, host] {
+        let Some(raw) = candidate
+            .and_then(|value| value.split(',').next())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        let sanitized: String = raw
+            .chars()
+            .filter(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | ':' | '-'))
+            .collect();
+        let hostname = sanitized.split(':').next().unwrap_or("");
+        if matches!(
+            hostname.to_ascii_lowercase().as_str(),
+            "mkultra.monster" | "www.mkultra.monster" | "vaak.monster" | "www.vaak.monster"
+        ) {
+            return format!("https://{sanitized}");
+        }
+    }
+    public_origin()
+}
+
 pub fn format_notif_time(raw: Option<&str>) -> String {
     let secs = raw
         .and_then(notif::parse_epoch_secs)
@@ -370,17 +396,6 @@ pub fn remote_account_id(seed: &str) -> String {
     (300_000_000 + (n % 699_999_999)).to_string()
 }
 
-fn group_key(type_name: &str, actor: &str, group_ref: &str) -> String {
-    let actor = {
-        let trimmed = actor.trim().trim_end_matches('/');
-        if trimmed.is_empty() { "-" } else { trimmed }
-    };
-    let mut hasher = Sha256::new();
-    hasher.update(format!("{actor}|{group_ref}").as_bytes());
-    let hexed = hex::encode(hasher.finalize());
-    format!("{type_name}-{}", &hexed[..24])
-}
-
 #[derive(Clone, Debug)]
 #[allow(dead_code)]
 struct Cand {
@@ -398,6 +413,10 @@ struct Cand {
     is_bsky: bool,
     owner_actor: String,
     status_local_id: i64,
+    in_reply_to: String,
+    media_urls: String,
+    spoiler: String,
+    sensitive: bool,
 }
 
 struct SourceCursor {
@@ -621,30 +640,46 @@ fn is_bluesky(activity_id: &str, actor_id: &str, object_id: &str) -> bool {
 }
 
 async fn load_mention_batch(db: &Client, owner: i64, before: Option<i64>) -> Result<Vec<tokio_postgres::Row>> {
-    if let Some(before) = before {
-        db.query(
-            "SELECT id::bigint, created_at, activity_id, activity_type, type,
+    const WIDE_BOUND: &str = "SELECT id::bigint, created_at, activity_id, activity_type, type,
+                    object_id, owner_actor_id, actor_id, content, in_reply_to,
+                    COALESCE(media_urls::text, ''), COALESCE(spoiler_text, ''),
+                    COALESCE(sensitive, false)
+             FROM mentions
+             WHERE owner_user_id = $1::bigint AND deleted_at IS NULL AND id < $2::bigint
+             ORDER BY id DESC LIMIT 80";
+    const THIN_BOUND: &str = "SELECT id::bigint, created_at, activity_id, activity_type, type,
                     object_id, owner_actor_id, actor_id, content, in_reply_to
              FROM mentions
              WHERE owner_user_id = $1::bigint AND deleted_at IS NULL AND id < $2::bigint
-             ORDER BY id DESC
-             LIMIT 80",
-            &[&owner, &before],
-        )
-        .await
-        .context("mention page")
-    } else {
-        db.query(
-            "SELECT id::bigint, created_at, activity_id, activity_type, type,
+             ORDER BY id DESC LIMIT 80";
+    const WIDE_OPEN: &str = "SELECT id::bigint, created_at, activity_id, activity_type, type,
+                    object_id, owner_actor_id, actor_id, content, in_reply_to,
+                    COALESCE(media_urls::text, ''), COALESCE(spoiler_text, ''),
+                    COALESCE(sensitive, false)
+             FROM mentions
+             WHERE owner_user_id = $1::bigint AND deleted_at IS NULL
+             ORDER BY id DESC LIMIT 80";
+    const THIN_OPEN: &str = "SELECT id::bigint, created_at, activity_id, activity_type, type,
                     object_id, owner_actor_id, actor_id, content, in_reply_to
              FROM mentions
              WHERE owner_user_id = $1::bigint AND deleted_at IS NULL
-             ORDER BY id DESC
-             LIMIT 80",
-            &[&owner],
-        )
-        .await
-        .context("mention page")
+             ORDER BY id DESC LIMIT 80";
+    if let Some(before) = before {
+        match db.query(WIDE_BOUND, &[&owner, &before]).await {
+            Ok(rows) => Ok(rows),
+            Err(err) => {
+                tracing::warn!(error = %err, "notification mention extras unavailable");
+                db.query(THIN_BOUND, &[&owner, &before]).await.context("mention page")
+            }
+        }
+    } else {
+        match db.query(WIDE_OPEN, &[&owner]).await {
+            Ok(rows) => Ok(rows),
+            Err(err) => {
+                tracing::warn!(error = %err, "notification mention extras unavailable");
+                db.query(THIN_OPEN, &[&owner]).await.context("mention page")
+            }
+        }
     }
 }
 
@@ -707,255 +742,6 @@ async fn load_follow_batch(db: &Client, actor: &str, before: Option<i64>) -> Res
     } else {
         db.query(&sql, &[&actor, &slash]).await.context("follow page")
     }
-}
-
-fn note_account_seed(actor_id: &str, username: &str, host: &str) -> String {
-    let username = username.trim().trim_start_matches('@');
-    let host = host.trim().trim_end_matches('/');
-    if !username.is_empty() && !host.is_empty() {
-        format!("acct:{}@{}", username.to_lowercase(), host.to_lowercase())
-    } else {
-        actor_id.trim().trim_end_matches('/').to_string()
-    }
-}
-
-fn bluesky_host(host: &str) -> bool {
-    let host = host.to_ascii_lowercase();
-    host == "bsky.app" || host.contains("bridgy")
-}
-
-fn account_json(id: &str, username: &str, acct: &str, display: &str, url: &str) -> Value {
-    let username = if username.is_empty() { "user" } else { username };
-    let acct = if acct.is_empty() { username } else { acct };
-    let display = if display.is_empty() { username } else { display };
-    let avatar = "https://mkultra.monster/img/avatar/default.webp";
-    let header = "https://mkultra.monster/img/header/default.webp";
-    json!({
-        "id": id,
-        "username": username,
-        "acct": acct,
-        "display_name": display,
-        "locked": false,
-        "bot": false,
-        "discoverable": false,
-        "created_at": "1970-01-01T00:00:00.000Z",
-        "note": "",
-        "url": url,
-        "avatar": avatar,
-        "avatar_static": avatar,
-        "header": header,
-        "header_static": header,
-        "followers_count": 0,
-        "following_count": 0,
-        "statuses_count": 0,
-        "last_status_at": null,
-        "emojis": [],
-        "fields": []
-    })
-}
-
-fn status_json(id: &str, created: &str, content: &str, account: &Value, uri: &str) -> Value {
-    let content = if content.contains('<') {
-        content.to_string()
-    } else if content.is_empty() {
-        String::new()
-    } else {
-        format!("<p>{}</p>", content.replace('<', ""))
-    };
-    json!({
-        "id": id,
-        "created_at": created,
-        "edited_at": null,
-        "in_reply_to_id": null,
-        "in_reply_to_account_id": null,
-        "sensitive": false,
-        "spoiler_text": "",
-        "visibility": "public",
-        "language": null,
-        "uri": uri,
-        "url": uri,
-        "replies_count": 0,
-        "reblogs_count": 0,
-        "favourites_count": 0,
-        "quotes_count": 0,
-        "favourited": false,
-        "reblogged": false,
-        "bookmarked": false,
-        "pinned": false,
-        "content": content,
-        "reblog": null,
-        "media_attachments": [],
-        "mentions": [],
-        "tags": [],
-        "emojis": [],
-        "card": null,
-        "poll": null,
-        "account": account
-    })
-}
-
-struct BuiltMaps {
-    local: HashMap<String, (String, String, String)>,
-    remote: HashMap<String, (String, String, String)>,
-    status: HashMap<String, (i64, String, String, String)>,
-}
-
-async fn load_maps(db: &Client, actors: &[String], notes: &[String]) -> BuiltMaps {
-    let mut local = HashMap::new();
-    let mut remote = HashMap::new();
-    let mut status = HashMap::new();
-    let actors: Vec<String> = actors.iter().map(|a| a.trim().trim_end_matches('/').to_string()).filter(|a| !a.is_empty()).collect();
-    if !actors.is_empty() {
-        if let Ok(rows) = db
-            .query(
-                "SELECT id::bigint, rtrim(actor_id, '/'), COALESCE(actor_key, ''), COALESCE(username, '')
-                 FROM ap_users WHERE rtrim(actor_id, '/') = ANY($1)",
-                &[&actors],
-            )
-            .await
-        {
-            for row in rows {
-                let id: i64 = row.get(0);
-                let actor: String = row.get(1);
-                let key: String = row.get(2);
-                let username: String = row.get(3);
-                local.insert(actor, (id.to_string(), key, username));
-            }
-        }
-        if let Ok(rows) = db
-            .query(
-                "SELECT rtrim(actor_id, '/'), COALESCE(username, ''), COALESCE(host, ''), COALESCE(display_name, '')
-                 FROM remote_actors WHERE rtrim(actor_id, '/') = ANY($1)",
-                &[&actors],
-            )
-            .await
-        {
-            for row in rows {
-                let actor: String = row.get(0);
-                remote.insert(actor, (row.get(1), row.get(2), row.get(3)));
-            }
-        }
-    }
-    let notes: Vec<String> = notes.iter().map(|n| n.trim().trim_end_matches('/').to_string()).filter(|n| n.starts_with("https://")).collect();
-    if !notes.is_empty() {
-        if let Ok(rows) = db
-            .query(
-                "SELECT local_id::bigint, rtrim(note_id, '/'), COALESCE(published, ''), COALESCE(content_text, '')
-                 FROM masto_statuses WHERE rtrim(note_id, '/') = ANY($1)",
-                &[&notes],
-            )
-            .await
-        {
-            for row in rows {
-                let local_id: i64 = row.get(0);
-                let note: String = row.get(1);
-                status.insert(note, (local_id, row.get(2), row.get(3), String::new()));
-            }
-        }
-    }
-    BuiltMaps { local, remote, status }
-}
-
-fn path_username(actor: &str) -> String {
-    let actor = actor.trim().trim_end_matches('/');
-    actor.rsplit('/').next().unwrap_or("").trim().to_string()
-}
-
-fn account_for(actor: &str, maps: &BuiltMaps, owner: &OwnerRow) -> Value {
-    let actor = actor.trim().trim_end_matches('/');
-    if actor.is_empty() {
-        let username = if !owner.username.is_empty() { owner.username.as_str() } else { owner.actor_key.as_str() };
-        return account_json("0", username, username, username, &owner.actor_id);
-    }
-    if let Some((id, key, username)) = maps.local.get(actor) {
-        let name = if !username.is_empty() { username.as_str() } else { key.as_str() };
-        return account_json(id, name, name, name, actor);
-    }
-    if actor.starts_with("https://mkultra.monster/users/") {
-        let name = path_username(actor);
-        if name == owner.actor_key || name == owner.username {
-            let username = if !owner.username.is_empty() { owner.username.as_str() } else { name.as_str() };
-            return account_json(&owner_id_fallback(owner), username, username, username, actor);
-        }
-    }
-    if let Some((username, host, display)) = maps.remote.get(actor) {
-        let acct = if bluesky_host(host) {
-            username.trim().trim_start_matches('@').to_string()
-        } else if !username.is_empty() && !host.is_empty() {
-            format!("{}@{}", username.trim().trim_start_matches('@'), host)
-        } else {
-            path_username(actor)
-        };
-        let seed = note_account_seed(actor, username, host);
-        let id = remote_account_id(&seed);
-        return account_json(&id, username, &acct, display, actor);
-    }
-    let username = path_username(actor);
-    let host = actor.split('/').nth(2).unwrap_or("");
-    let acct = if bluesky_host(host) { username.clone() } else if host.is_empty() { username.clone() } else { format!("{username}@{host}") };
-    let seed = if username.is_empty() { actor.to_string() } else { note_account_seed(actor, &username, host) };
-    account_json(&remote_account_id(&seed), &username, &acct, &username, actor)
-}
-
-fn owner_id_fallback(owner: &OwnerRow) -> String {
-    owner.user_id.to_string()
-}
-
-fn build_entity(cand: &Cand, maps: &BuiltMaps, owner: &OwnerRow, owner_account: &Value) -> Option<Value> {
-    if cand.hidden {
-        return None;
-    }
-    let created = format_notif_time(Some(&cand.created));
-    if cand.kind == "follow" {
-        let account = account_for(&cand.actor_id, maps, owner);
-        return Some(json!({
-            "id": cand.id,
-            "type": "follow",
-            "group_key": format!("ungrouped-{}", cand.id),
-            "created_at": created,
-            "account": account,
-            "status": null
-        }));
-    }
-    if cand.kind == "poll" {
-        return Some(json!({
-            "id": cand.id,
-            "type": "poll",
-            "group_key": format!("ungrouped-{}", cand.id),
-            "created_at": created,
-            "account": owner_account.clone(),
-            "status": null
-        }));
-    }
-    let target = notif::mention_target_object_id(&cand.object_id);
-    let account = account_for(&cand.actor_id, maps, owner);
-    let local_status = maps.status.get(target.trim_end_matches('/'));
-    let needs_our_post = matches!(cand.type_name.as_str(), "favourite" | "reblog");
-    let (status_id, status_body, status_uri, status_account) = if let Some((local_id, published, content, _)) = local_status {
-        let sid = notif::snowflake_id(Some(published), *local_id, 0);
-        (sid, content.clone(), target.clone(), owner_account.clone())
-    } else if needs_our_post && !cand.is_bsky {
-        return None;
-    } else {
-        let sid = notif::snowflake_id(Some(&cand.created), cand.db_id, 2);
-        let body = if cand.content.is_empty() && cand.is_bsky {
-            "Bluesky post".to_string()
-        } else {
-            cand.content.clone()
-        };
-        let uri = if !target.is_empty() { target.clone() } else { cand.object_id.clone() };
-        (sid, body, uri, account.clone())
-    };
-    let status = status_json(&status_id, &created, &status_body, &status_account, &status_uri);
-    let group_ref = status_id.clone();
-    Some(json!({
-        "id": cand.id,
-        "type": cand.type_name,
-        "group_key": group_key(&cand.type_name, &cand.actor_id, &group_ref),
-        "created_at": created,
-        "account": account,
-        "status": status
-    }))
 }
 
 /// Keyset page for one owner. Unknown owners do not scan notifications.
@@ -1105,6 +891,9 @@ pub async fn load_notification_page(
                     let actor_id: String = row.try_get::<_, Option<String>>(7)?.unwrap_or_default();
                     let content: String = row.try_get::<_, Option<String>>(8)?.unwrap_or_default();
                     let in_reply_to: String = row.try_get::<_, Option<String>>(9)?.unwrap_or_default();
+                    let media_urls = if row.len() > 10 { row.try_get::<_, Option<String>>(10)?.unwrap_or_default() } else { String::new() };
+                    let row_spoiler = if row.len() > 11 { row.try_get::<_, Option<String>>(11)?.unwrap_or_default() } else { String::new() };
+                    let row_sensitive = if row.len() > 12 { row.try_get::<_, Option<bool>>(12)?.unwrap_or(false) } else { false };
                     let our = {
                         let trimmed = owner_actor.trim().trim_end_matches('/');
                         if trimmed.is_empty() { owner.actor_id.as_str() } else { trimmed }
@@ -1122,7 +911,12 @@ pub async fn load_notification_page(
                     ).unwrap_or("").to_string();
                     if type_name.is_empty() && activity_type.eq_ignore_ascii_case("update") {
                         let target = notif::mention_target_object_id(&object_id);
-                        if hidden::is_favourited(db, owner_user_id, &target).await.unwrap_or(false) {
+                        let obj = obj_type.to_ascii_lowercase();
+                        let our_note = target.starts_with(&format!("{our}/notes/"))
+                            || target.starts_with(&format!("{our}/statuses/"));
+                        let note_like = matches!(obj.as_str(), "note" | "article" | "page" | "question" | "");
+                        let video = target.contains("/videos/") || target.contains("/w/");
+                        if !our_note && note_like && !video && hidden::is_favourited(db, owner_user_id, &target).await.unwrap_or(false) {
                             type_name = "update".into();
                         }
                     }
@@ -1158,6 +952,10 @@ pub async fn load_notification_page(
                         is_bsky: bsky,
                         owner_actor: our.to_string(),
                         status_local_id: 0,
+                        in_reply_to,
+                        media_urls,
+                        spoiler: row_spoiler,
+                        sensitive: row_sensitive,
                     });
                 }
                 if oldest != i64::MAX {
@@ -1220,6 +1018,10 @@ pub async fn load_notification_page(
                         is_bsky: action == "bsky_follow",
                         owner_actor: owner.actor_id.clone(),
                         status_local_id: 0,
+                        in_reply_to: String::new(),
+                        media_urls: String::new(),
+                        spoiler: String::new(),
+                        sensitive: false,
                     });
                 }
                 if oldest != i64::MAX {
@@ -1254,6 +1056,7 @@ pub async fn load_notification_page(
                     let expires: String = row.try_get::<_, Option<String>>(1)?.unwrap_or_default();
                     let note_id: String = row.try_get::<_, Option<String>>(2)?.unwrap_or_default();
                     let voters: String = row.try_get::<_, Option<String>>(3)?.unwrap_or_default();
+                    let status_local_id: i64 = row.try_get(4).unwrap_or(0);
                     let me = owner.actor_id.as_str();
                     let ours = !me.is_empty() && note_id.trim_end_matches('/').starts_with(&format!("{me}/notes/"));
                     let voted = voters.split('"').any(|part| part.trim_end_matches('/') == me);
@@ -1276,7 +1079,11 @@ pub async fn load_notification_page(
                         activity_id: String::new(),
                         is_bsky: false,
                         owner_actor: owner.actor_id.clone(),
-                        status_local_id: local_id,
+                        status_local_id,
+                        in_reply_to: String::new(),
+                        media_urls: String::new(),
+                        spoiler: String::new(),
+                        sensitive: false,
                     });
                 }
                 sources[2].before = Some(last_local);
@@ -1313,20 +1120,33 @@ pub async fn load_notification_page(
             chosen.push(cand);
         }
     }
-    let actors: Vec<String> = chosen.iter().map(|cand| cand.actor_id.clone()).collect();
-    let notes: Vec<String> = chosen.iter().map(|cand| notif::mention_target_object_id(&cand.object_id)).collect();
-    let maps = load_maps(db, &actors, &notes).await;
-    let owner_name = if !owner.username.is_empty() { owner.username.as_str() } else { owner.actor_key.as_str() };
-    let owner_account = account_for(&owner.actor_id, &maps, &owner);
-    let _ = owner_name;
-    let mut items = Vec::new();
-    for cand in chosen {
-        if items.len() == limit_usize + 1 {
-            break;
-        }
-        if let Some(entity) = build_entity(cand, &maps, &owner, &owner_account) {
-            items.push(entity);
-        }
+    let inputs: Vec<crate::notif_entity::NotifInput> = chosen.iter().map(|cand| crate::notif_entity::NotifInput {
+        id: cand.id.clone(),
+        kind: cand.kind,
+        db_id: cand.db_id,
+        created: cand.created.clone(),
+        actor_id: cand.actor_id.clone(),
+        type_name: cand.type_name.clone(),
+        object_id: cand.object_id.clone(),
+        content: cand.content.clone(),
+        activity_id: cand.activity_id.clone(),
+        is_bsky: cand.is_bsky,
+        owner_actor: cand.owner_actor.clone(),
+        status_local_id: cand.status_local_id,
+        in_reply_to: cand.in_reply_to.clone(),
+        media_urls: cand.media_urls.clone(),
+        spoiler: cand.spoiler.clone(),
+        sensitive: cand.sensitive,
+    }).collect();
+    let owner_view = crate::notif_entity::OwnerView {
+        user_id: owner.user_id,
+        actor_id: owner.actor_id.clone(),
+        actor_key: owner.actor_key.clone(),
+        username: owner.username.clone(),
+    };
+    let mut items = crate::notif_entity::entities_for_page(db, &owner_view, &inputs, &hidden_sets.muted_phrases).await?;
+    if items.len() > limit_usize + 1 {
+        items.truncate(limit_usize + 1);
     }
     let filled_extra = items.len() > limit_usize;
     if filled_extra {
@@ -1375,7 +1195,7 @@ async fn status_texts(db: &Client, uris: &[String]) -> Result<HashMap<String, (S
 async fn load_poll_batch(db: &Client, now: &str, before: Option<i64>) -> Result<Vec<tokio_postgres::Row>> {
     if let Some(before) = before {
         db.query(
-            "SELECT local_id::bigint, expires_at, note_id, voters_json
+            "SELECT local_id::bigint, expires_at, note_id, voters_json, COALESCE(status_local_id, 0)::bigint
              FROM masto_polls
              WHERE expires_at <= $1 AND local_id < $2::bigint
              ORDER BY local_id DESC
@@ -1386,7 +1206,7 @@ async fn load_poll_batch(db: &Client, now: &str, before: Option<i64>) -> Result<
         .context("poll page")
     } else {
         db.query(
-            "SELECT local_id::bigint, expires_at, note_id, voters_json
+            "SELECT local_id::bigint, expires_at, note_id, voters_json, COALESCE(status_local_id, 0)::bigint
              FROM masto_polls
              WHERE expires_at <= $1
              ORDER BY local_id DESC
