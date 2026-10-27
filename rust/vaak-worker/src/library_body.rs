@@ -682,7 +682,7 @@ mod tests {
             let mut resolver=FixtureResolver(reference["fixture"].clone());
             let body=discover_mentions(text,actor,case["self_key"].as_str().unwrap(),actor,&mut resolver).await.unwrap();
             assert_eq!(body.source(),text);
-            assert_eq!(linked_discovered(&body,case["view"].as_str().unwrap()).unwrap(),case["html"].as_str().unwrap(),"actual PHP raw discovery {} {:?}",case["name"],body.mentions());
+            assert_eq!(linked_discovered(&body,case["view"].as_str().unwrap()).unwrap(),case["html"].as_str().unwrap(),"actual PHP raw discovery {}",case["name"]);
         }
     }
 }
