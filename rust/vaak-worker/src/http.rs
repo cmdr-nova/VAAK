@@ -36,6 +36,8 @@ pub struct OwnerQuery {
     pub since_id: Option<String>,
     /// Ice Cubes pull-to-refresh uses min_id (same exclusive lower bound as since_id).
     pub min_id: Option<String>,
+    /// Comma-separated Mastodon exclude_types. Empty means no exclusion.
+    pub exclude_types: Option<String>,
     /// Mentions nested-card HTML fragment (`/shadow/notif-embed`).
     pub uri: Option<String>,
     pub status_id: Option<String>,
@@ -1229,15 +1231,18 @@ async fn shadow_notifications(
 }
 
 /// Mastodon-shaped body: a bare notification array (Ice Cubes decodes this).
-/// No Link header here. PHP owns the public URL and pagination host.
-/// `min_id` is the same newer-than cursor as `since_id` and is not sliced.
+/// Link uses the public origin (VAAK_PUBLIC_ORIGIN, default https://vaak.monster).
+/// PHP rewrites that origin to the request host when it proxies this result.
+/// `min_id` is the same newer-than cursor as `since_id`.
 async fn shadow_notifications_masto(
     State(state): State<AppState>,
     Query(q): Query<OwnerQuery>,
 ) -> impl IntoResponse {
     let owner = q.owner_id.filter(|v| *v > 0).unwrap_or(state.cfg.default_owner_id);
-    let limit = q.limit.unwrap_or(30);
+    let requested_limit = q.limit.unwrap_or(30);
+    let limit = requested_limit;
     let types = parse_types(q.types.as_deref());
+    let exclude = parse_types(q.exclude_types.as_deref());
     let since = q
         .since_id
         .as_deref()
@@ -1248,18 +1253,58 @@ async fn shadow_notifications_masto(
         owner,
         limit,
         &types,
+        &exclude,
         q.max_id.as_deref(),
         since,
     )
     .await
     {
-        Ok(report) if report.cache_hit => {
+        Ok(report) if report.cache_hit || report.answered || report.source == "db" => {
             let mut headers = axum::http::HeaderMap::new();
             if let Ok(v) = axum::http::HeaderValue::from_str(&report.source) {
                 headers.insert(axum::http::HeaderName::from_static("x-vaak-notif-source"), v);
             }
+            headers.insert(
+                axum::http::HeaderName::from_static("x-vaak-notif-has-more"),
+                axum::http::HeaderValue::from_static(if report.has_more { "1" } else { "0" }),
+            );
+            headers.insert(
+                axum::http::HeaderName::from_static("x-vaak-notif-exclude-applied"),
+                axum::http::HeaderValue::from_static("1"),
+            );
+            let first = report
+                .items
+                .first()
+                .and_then(|item| item.get("id"))
+                .and_then(|v| v.as_str());
+            let next = if report.next_cursor.is_empty() {
+                None
+            } else {
+                Some(report.next_cursor.as_str())
+            };
+            let link = crate::notif_page::notification_link(
+                &crate::notif_page::public_origin(),
+                first,
+                report.has_more,
+                next,
+                requested_limit,
+                &types,
+                &exclude,
+            );
+            if !link.is_empty() {
+                if let Ok(v) = axum::http::HeaderValue::from_str(&link) {
+                    headers.insert(axum::http::header::LINK, v);
+                }
+            }
             (StatusCode::OK, headers, Json(report.items)).into_response()
         }
+        Ok(report) if report.source == "unknown-owner" => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "unknown owner",
+            })),
+        )
+            .into_response(),
         Ok(report) => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({

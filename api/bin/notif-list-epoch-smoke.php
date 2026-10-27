@@ -64,8 +64,13 @@ $end = strpos($src, "\nfunction ", $start + 10);
 $body = substr($src, $start, $end === false ? null : $end - $start);
 $epochAt = strpos($body, '$listEpoch = ');
 $firstRead = strpos($body, 'ap_redis_json_get(');
-$firstQuery = strpos($body, 'ap_db()->prepare(');
-epoch_check($epochAt !== false && $epochAt < $firstRead && $epochAt < $firstQuery, 'epoch is read before any cache or source read');
+$firstQuery = strpos($body, 'ap_masto_notifications_db_page(');
+epoch_check(
+    $epochAt !== false && $firstRead !== false && $firstQuery !== false
+        && $epochAt < $firstRead && $epochAt < $firstQuery,
+    'epoch is read before any cache or source read'
+);
+epoch_check(strpos($body, 'ap_db()->prepare(') === false, 'fetch does not prepare its own page query');
 epoch_check(preg_match('/if \(\$writeBack\) \{\s*ap_notification_projection_write\(/', $body) === 1, 'projection write is epoch-guarded');
 epoch_check(str_contains($body, "if (\$writeBack && function_exists('ap_redis_json_set'))"), 'Redis page write is epoch-guarded');
 epoch_check(str_contains($body, "if (function_exists('ap_redis_json_set') && \$listEpochCurrent())"), 'projection-hit Redis write is epoch-guarded');

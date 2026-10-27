@@ -684,7 +684,7 @@ pub async fn warm_owner(cfg: &Config, owner_user_id: i64, limit: i64) -> Result<
 
     for job in &jobs {
         let want = expand_types(&job.types);
-        let key = notifications_list_redis_key(owner_user_id, job.limit, None, None, &want);
+        let key = notifications_list_redis_key(owner_user_id, job.limit, None, None, &want, &[]);
 
         if epoch.is_some() && list_epoch(&mut redis, owner_user_id).await != epoch {
             lines.push(format!(
@@ -833,6 +833,13 @@ pub struct NotificationsShadowReport {
     pub items: Vec<Value>,
     pub mode: &'static str,
     pub note: &'static str,
+    /// True when this response is safe to return as the Mastodon list.
+    /// A warm miss stays false so PHP can still hydrate the newest page.
+    pub answered: bool,
+    pub has_more: bool,
+    /// The envelope stored an explicit has_more flag (including false).
+    pub has_more_known: bool,
+    pub next_cursor: String,
 }
 
 fn default_want_types() -> Vec<String> {
@@ -871,8 +878,13 @@ pub fn notifications_list_redis_key(
     max_id: Option<&str>,
     since_id: Option<&str>,
     types: &[String],
+    exclude: &[String],
 ) -> String {
-    let want = expand_types(types);
+    let mut want = expand_types(types);
+    if !exclude.is_empty() {
+        let drop: std::collections::HashSet<&str> = exclude.iter().map(|s| s.as_str()).collect();
+        want.retain(|kind| !drop.contains(kind.as_str()));
+    }
     let max_json = max_id
         .map(|s| serde_json::to_string(s).unwrap_or_else(|_| "null".into()))
         .unwrap_or_else(|| "null".into());
@@ -880,9 +892,10 @@ pub fn notifications_list_redis_key(
         .map(|s| serde_json::to_string(s).unwrap_or_else(|_| "null".into()))
         .unwrap_or_else(|| "null".into());
     let types_json = serde_json::to_string(&want).unwrap_or_else(|_| "[]".into());
-    // exclude is always [] for Mentions warm / shadow reads today.
+    // Empty exclude stays `[]` so the hash matches PHP's historical key.
+    let exclude_json = serde_json::to_string(exclude).unwrap_or_else(|_| "[]".into());
     let encoded = format!(
-        "{{\"limit\":{limit},\"max\":{max_json},\"since\":{since_json},\"types\":{types_json},\"exclude\":[]}}"
+        "{{\"limit\":{limit},\"max\":{max_json},\"since\":{since_json},\"types\":{types_json},\"exclude\":{exclude_json}}}"
     );
     let mut hasher = Sha256::new();
     hasher.update(encoded.as_bytes());
@@ -898,6 +911,8 @@ struct NotificationEnvelope {
     cache_ts: Option<i64>,
     source: String,
     items: Vec<Value>,
+    has_more: Option<bool>,
+    next_cursor: String,
 }
 
 /// Raw Redis envelope. No audience SQL — callers filter after they know this
@@ -907,10 +922,11 @@ async fn read_notification_envelope(
     owner_user_id: i64,
     limit: i64,
     types: &[String],
+    exclude: &[String],
     max_id: Option<&str>,
     since_id: Option<&str>,
 ) -> Result<NotificationEnvelope> {
-    let redis_key = notifications_list_redis_key(owner_user_id, limit, max_id, since_id, types);
+    let redis_key = notifications_list_redis_key(owner_user_id, limit, max_id, since_id, types, exclude);
     let cached = redis_util::json_get(redis, &redis_key).await?;
     if let Some(payload) = cached {
         let items = payload
@@ -923,12 +939,19 @@ async fn read_notification_envelope(
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
+        let next_cursor = payload
+            .get("next_cursor")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         return Ok(NotificationEnvelope {
             redis_key,
             cache_hit: true,
             cache_ts: payload.get("ts").and_then(|v| v.as_i64()),
             source,
             items,
+            has_more: payload.get("has_more").and_then(|v| v.as_bool()),
+            next_cursor,
         });
     }
     Ok(NotificationEnvelope {
@@ -937,6 +960,8 @@ async fn read_notification_envelope(
         cache_ts: None,
         source: "miss".into(),
         items: vec![],
+        has_more: None,
+        next_cursor: String::new(),
     })
 }
 
@@ -962,9 +987,27 @@ fn hit_report(
             env.source.clone()
         },
         count: items.len(),
-        items,
+        items: items.clone(),
         mode: "shadow",
         note: "Axum reads warm Redis list only; PHP remains live /api/v1/notifications until cutover.",
+        answered: true,
+        has_more: match env.has_more {
+            Some(flag) => flag,
+            None => (items.len() as i64) >= limit.clamp(1, 80),
+        },
+        has_more_known: env.has_more.is_some(),
+        next_cursor: if !env.next_cursor.is_empty() {
+            env.next_cursor.clone()
+        } else if env.has_more.unwrap_or(items.len() as i64 >= limit.clamp(1, 80)) {
+            items
+                .last()
+                .and_then(|item| item.get("id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string()
+        } else {
+            String::new()
+        },
     }
 }
 
@@ -987,6 +1030,10 @@ fn miss_report(
         items: vec![],
         mode: "shadow",
         note: "Cache miss — run notif-list warm or open Mentions in PHP; shadow does not hydrate.",
+        answered: false,
+        has_more: false,
+        has_more_known: false,
+        next_cursor: String::new(),
     }
 }
 
@@ -1006,6 +1053,7 @@ pub async fn notifications_shadow(
         owner_user_id,
         limit,
         &want,
+        &[],
         max_id,
         since_id,
     )
@@ -1182,44 +1230,171 @@ pub(crate) fn page_after_filter(
     Some(page)
 }
 
-/// Exact warm key, then one filtered slice of a raw warm head.
+fn cache_page_authoritative(report: &NotificationsShadowReport, limit: i64) -> bool {
+    if !report.cache_hit {
+        return false;
+    }
+    if report.count == 0 || report.has_more_known {
+        return true;
+    }
+    (report.count as i64) >= limit.clamp(1, 80)
+}
+
+async fn owner_is_disabled(db: &Client, owner_user_id: i64) -> Result<Option<bool>> {
+    let row = db
+        .query_opt(
+            "SELECT (disabled_at IS NOT NULL) FROM ap_users WHERE id = $1::bigint",
+            &[&owner_user_id],
+        )
+        .await
+        .context("select notification owner existence")?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    Ok(Some(row.get(0)))
+}
+
+async fn answer_from_database(
+    cfg: &Config,
+    owner_user_id: i64,
+    limit: i64,
+    types: &[String],
+    exclude: &[String],
+    max_id: Option<&str>,
+    since_id: Option<&str>,
+) -> Result<NotificationsShadowReport> {
+    let want = expand_types(types);
+    let db = crate::db::connect(&cfg.database_url).await?;
+    match crate::notif_page::load_notification_page(
+        &db, owner_user_id, limit, types, exclude, max_id, since_id,
+    )
+    .await?
+    {
+        crate::notif_page::PageOutcome::UnknownOwner => Ok(NotificationsShadowReport {
+            owner_user_id,
+            limit,
+            types: want,
+            redis_key: notifications_list_redis_key(owner_user_id, limit, max_id, since_id, types, exclude),
+            cache_hit: false,
+            cache_ts: None,
+            cache_age_secs: None,
+            source: "unknown-owner".into(),
+            count: 0,
+            items: vec![],
+            mode: "shadow",
+            note: "No local ap_users row for this owner.",
+            answered: false,
+            has_more: false,
+            has_more_known: true,
+            next_cursor: String::new(),
+        }),
+        crate::notif_page::PageOutcome::Page { items, has_more, next_cursor } => {
+            let now = chrono::Utc::now().timestamp();
+            let key = notifications_list_redis_key(owner_user_id, limit, max_id, since_id, types, exclude);
+            if let Ok(mut redis) = redis_util::connect(&cfg.redis_url).await {
+                let envelope = json!({
+                    "ts": now,
+                    "items": items,
+                    "source": "vaak-worker-db",
+                    "has_more": has_more,
+                    "next_cursor": next_cursor,
+                });
+                if let Err(err) = redis_util::json_set(&mut redis, &key, &envelope, 600).await {
+                    tracing::warn!(error = %err, "notification db page cache write skipped");
+                }
+            }
+            Ok(NotificationsShadowReport {
+                owner_user_id,
+                limit,
+                types: want,
+                redis_key: key,
+                cache_hit: false,
+                cache_ts: Some(now),
+                cache_age_secs: Some(0),
+                source: "db".into(),
+                count: items.len(),
+                items,
+                mode: "shadow",
+                note: "Database keyset page. Deleted, muted, blocked, and undone rows stay hidden.",
+                answered: true,
+                has_more,
+                has_more_known: true,
+                next_cursor,
+            })
+        }
+    }
+}
+
+/// Exact warm key, then one filtered slice of a raw warm head, then a database
+/// keyset for cursors the warm head does not cover.
 ///
-/// `since_id` / `min_id` pulls stay a miss when the owner has notification
-/// sources, so pull-to-refresh still reads PHP. A valid local owner with no
-/// sources answers an empty list. A short scroll tail stays a miss so a client
-/// does not treat the warm cap as the end of the notifications list. Audience
-/// SQL runs on the exact key, or on the single head `plan_warm_heads` selects
-/// — not on every probed head. The quiet-owner lookup runs only on a miss.
+/// `max_id`, `since_id`, and `min_id` are database pages when the owner exists,
+/// including a disabled owner. A quiet enabled owner with no sources answers
+/// an empty newest page. An enabled owner who has sources and no warm envelope
+/// stays a miss so PHP can hydrate that first page. A short warm tail is not
+/// the end of the list. Audience SQL runs on the exact key, or on the single
+/// head `plan_warm_heads` selects — not on every probed head. The quiet-owner
+/// lookup runs only on a newest-page miss.
 pub async fn notifications_shadow_resolved(
     cfg: &Config,
     owner_user_id: i64,
     limit: i64,
     types: &[String],
+    exclude: &[String],
     max_id: Option<&str>,
     since_id: Option<&str>,
 ) -> Result<NotificationsShadowReport> {
     let limit = limit.clamp(1, 80);
+    let cursor = cursor_digits(max_id).is_some() || cursor_digits(since_id).is_some();
+    if !exclude.is_empty() || cursor {
+        if exclude.is_empty() {
+            if let Ok(mut redis) = redis_util::connect(&cfg.redis_url).await {
+                if let Ok(env) = read_notification_envelope(
+                    &mut redis,
+                    owner_user_id,
+                    limit,
+                    &expand_types(types),
+                    exclude,
+                    max_id,
+                    since_id,
+                )
+                .await
+                {
+                    if env.cache_hit {
+                        let now = chrono::Utc::now().timestamp();
+                        let mut items = env.items.clone();
+                        if let Ok(db) = crate::db::connect(&cfg.database_url).await {
+                            let _ = crate::audience::filter_notifications(&db, owner_user_id, &mut items).await;
+                        }
+                        let mut cached = hit_report(owner_user_id, limit, expand_types(types), &env, now, items);
+                        truncate_page(&mut cached, limit);
+                        if cache_page_authoritative(&cached, limit) {
+                            return Ok(cached);
+                        }
+                    }
+                }
+            }
+        }
+        return answer_from_database(cfg, owner_user_id, limit, types, exclude, max_id, since_id).await;
+    }
     let mut report =
         notifications_shadow(cfg, owner_user_id, limit, types, max_id, since_id).await?;
-    if report.cache_hit {
+    if cache_page_authoritative(&report, limit) {
         truncate_page(&mut report, limit);
         return Ok(report);
-    }
-    // Newer-than cursor is not a slice of the head. A quiet owner still
-    // answers [] here; an owner who has sources stays a miss so PHP hydrates.
-    if cursor_digits(since_id).is_some() {
-        return publish_quiet_empty(cfg, report).await;
     }
     let want = expand_types(types);
     let mut redis = redis_util::connect(&cfg.redis_url).await?;
     let mut heads: Vec<(NotificationEnvelope, i64)> = Vec::new();
     let mut planned = Vec::new();
     for alt in warm_head_limits(limit) {
-        if cursor_digits(max_id).is_none() && alt == limit {
+        if alt == limit {
             continue;
         }
-        let env =
-            read_notification_envelope(&mut redis, owner_user_id, alt, &want, None, None).await?;
+        let env = read_notification_envelope(
+            &mut redis, owner_user_id, alt, &want, &[], None, None,
+        )
+        .await?;
         if !env.cache_hit {
             continue;
         }
@@ -1229,20 +1404,42 @@ pub async fn notifications_shadow_resolved(
         });
         heads.push((env, alt));
     }
-    let Some(plan) = plan_warm_heads(&planned, limit, max_id) else {
-        return publish_quiet_empty(cfg, report).await;
-    };
-    let (env, head_limit) = &heads[plan.index];
-    let mut items = planned[plan.index].items.clone();
-    let db = crate::db::connect(&cfg.database_url).await?;
-    crate::audience::filter_notifications(&db, owner_user_id, &mut items).await?;
-    let Some(page) = page_after_filter(&items, &plan, limit) else {
-        return publish_quiet_empty(cfg, report).await;
-    };
-    let now = chrono::Utc::now().timestamp();
-    let mut sliced = hit_report(owner_user_id, *head_limit, want, env, now, page);
-    sliced.source = tag_source(&sliced.source, plan.suffix);
-    Ok(sliced)
+    if let Some(plan) = plan_warm_heads(&planned, limit, max_id) {
+        let (env, head_limit) = &heads[plan.index];
+        let mut items = planned[plan.index].items.clone();
+        let db = crate::db::connect(&cfg.database_url).await?;
+        crate::audience::filter_notifications(&db, owner_user_id, &mut items).await?;
+        if let Some(page) = page_after_filter(&items, &plan, limit) {
+            let now = chrono::Utc::now().timestamp();
+            let mut sliced = hit_report(owner_user_id, *head_limit, want.clone(), env, now, page);
+            sliced.source = tag_source(&sliced.source, plan.suffix);
+            if cache_page_authoritative(&sliced, limit) {
+                return Ok(sliced);
+            }
+        }
+    }
+    match crate::db::connect(&cfg.database_url).await {
+        Ok(db) => match owner_is_disabled(&db, owner_user_id).await {
+            Ok(None) => {
+                report.source = "unknown-owner".into();
+                report.note = "No local ap_users row for this owner.";
+                report.answered = false;
+                Ok(report)
+            }
+            Ok(Some(true)) => {
+                answer_from_database(cfg, owner_user_id, limit, types, exclude, max_id, since_id).await
+            }
+            Ok(Some(false)) => publish_quiet_empty(cfg, report).await,
+            Err(err) => {
+                tracing::warn!(error = %err, "notification owner lookup skipped");
+                Ok(report)
+            }
+        },
+        Err(err) => {
+            tracing::warn!(error = %err, "notification owner lookup skipped");
+            Ok(report)
+        }
+    }
 }
 
 pub async fn run_loop(cfg: &Config, owner_user_id: i64, interval_secs: u64, limit: i64) -> Result<()> {
@@ -1588,5 +1785,23 @@ mod warm_page_plan_tests {
         assert!(plan_warm_heads(&heads, 12, Some("10")).is_none());
         assert!(new_filtered_page(&heads, 12, Some("10"), &HashSet::new()).is_none());
         assert!(old_filtered_page(&heads, 12, Some("10"), &HashSet::new()).is_none());
+    }
+
+    #[test]
+    fn warm_miss_is_not_the_end_of_an_older_page() {
+        let heads = vec![head(40, &(100..=139).rev().collect::<Vec<_>>())];
+        assert!(plan_warm_heads(&heads, 40, Some("80")).is_none());
+        let older: Vec<crate::notif_page::PageRow> = (1..=120)
+            .rev()
+            .map(|id| crate::notif_page::PageRow {
+                id: id.to_string(),
+                sort: id,
+                hidden: false,
+            })
+            .collect();
+        let page = crate::notif_page::decide_page(&older, 40, Some("80"), None, None);
+        assert_eq!(page.ids.len(), 40);
+        assert_eq!(page.ids[0], "79");
+        assert!(page.has_more);
     }
 }
