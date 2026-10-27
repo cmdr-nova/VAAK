@@ -1884,6 +1884,33 @@ fn split_quote_summary(summary: &str) -> (String, Option<Value>) {
     (commentary, Some(preview))
 }
 
+/// Local note behind a fresh compose event. PHP Home already paints these
+/// from `outbox_notes` (admin_render_feed_item): the compose event row stores
+/// no media, CW flag or quote metadata, so the event card is a bare copy of
+/// what Local shows. Followers get that event id from `home_followers`
+/// fan-out, which is why a local post first lands on Home without its image.
+fn local_note_for_event(ev: &EventRow) -> Option<String> {
+    if !matches!(ev.event_type.as_str(), "Create" | "Quote" | "QuotePost" | "Announce") {
+        return None;
+    }
+    local_note_object(&ev.object_id)
+}
+
+/// `https://mkultra.monster/users/{name}/notes/{id}`, slash-trimmed.
+fn local_note_object(object_id: &str) -> Option<String> {
+    let oid = object_id.trim().trim_end_matches('/');
+    let rest = oid.strip_prefix(LOCAL_ACTOR_PREFIX)?;
+    let (user, note) = rest.split_once("/notes/")?;
+    if user.is_empty()
+        || !user.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        || note.is_empty()
+        || note.contains('/')
+    {
+        return None;
+    }
+    Some(oid.to_string())
+}
+
 fn local_username_from_url(url: &str) -> Option<String> {
     let url = url.trim_end_matches('/');
     let rest = url.strip_prefix("https://mkultra.monster/users/")?;
@@ -3879,6 +3906,24 @@ fn materialize_announce(
     })
 }
 
+/// Boost of a local note: the newest Create event for it may be the bare
+/// compose row (no media / CW / quote), so paint the inner post from
+/// `outbox_notes` exactly like Local does.
+fn swap_local_boost_inner(
+    st: &mut Value,
+    announce: &EventRow,
+    outbox: &HashMap<String, OutboxRow>,
+    owner_username: &str,
+    profiles: &HashMap<String, LocalProfile>,
+) {
+    let Some(row) = local_note_object(&announce.object_id).and_then(|oid| outbox.get(&oid)) else {
+        return;
+    };
+    let mut inner = materialize_outbox(row, owner_username, profiles);
+    inner["reblog"] = Value::Null;
+    st["reblog"] = inner;
+}
+
 fn finish_boost_wrapper(
     rb: &BoostRow,
     mut inner: Value,
@@ -4759,7 +4804,11 @@ pub async fn warm_view(
     actor_ids.dedup();
     let actors_map = fetch_actors_map(&db, &actor_ids).await?;
     let actors_map = resolve_missing_actor_labels(&db, &actor_ids, actors_map).await;
-    let mut outbox_map = fetch_outbox_map(&db, &outbox_ids).await?;
+    let mut outbox_fetch = outbox_ids.clone();
+    outbox_fetch.extend(events_map.values().filter_map(local_note_for_event));
+    outbox_fetch.sort();
+    outbox_fetch.dedup();
+    let mut outbox_map = fetch_outbox_map(&db, &outbox_fetch).await?;
     let mut ask_ids: Vec<String> = events_map.values().map(|e| e.object_id.clone()).collect();
     ask_ids.extend(outbox_map.keys().cloned());
     let ask_map = fetch_ask_context_map(&db, &ask_ids).await?;
@@ -4800,6 +4849,7 @@ pub async fn warm_view(
     let mut statuses = Vec::new();
     let mut kinds: HashMap<String, usize> = HashMap::new();
     let mut seen_external: HashSet<String> = HashSet::new();
+    let mut seen_local_notes: HashSet<String> = HashSet::new();
     for e in &head {
         let st = match (view, e.kind.as_str()) {
             ("home", "rss") => {
@@ -4842,13 +4892,21 @@ pub async fn warm_view(
                         let create = creates_map.get(ev.object_id.trim_end_matches('/'));
                         let summary_empty = strip_tags_simple(&ev.summary).trim().is_empty();
                         let media_empty = ev.media_urls.is_empty() || ev.media_urls == "[]";
-                        if create.is_none() && summary_empty && media_empty {
+                        let local_inner = local_note_for_event(ev).is_some_and(|oid| outbox_map.contains_key(&oid));
+                        if create.is_none() && summary_empty && media_empty && !local_inner {
                             // Do not expose a hollow boost while its original
                             // Create is still waiting on ingestion/hydration.
                             return None;
                         }
-                        Some(materialize_announce(ev, actor, create, &actors_map))
+                        let mut st = materialize_announce(ev, actor, create, &actors_map);
+                        swap_local_boost_inner(&mut st, ev, &outbox_map, &owner_username, &local_profiles);
+                        Some(st)
                     } else {
+                        // Before the stub check: a media-only compose event
+                        // has an empty summary and no media of its own.
+                        if let Some(row) = local_note_for_event(ev).and_then(|oid| outbox_map.get(&oid)) {
+                            return Some(materialize_outbox(row, &owner_username, &local_profiles));
+                        }
                         // Skip empty private-ish stubs with no body/media/CW.
                         let plain = strip_tags_simple(&ev.summary);
                         let media_empty = ev.media_urls.is_empty() || ev.media_urls == "[]";
@@ -4874,6 +4932,13 @@ pub async fn warm_view(
             _ => None,
         };
         if let Some(mut st) = st {
+            // A local note can reach the head as its own outbox row and as a
+            // follower's compose event. Both now paint the outbox card.
+            if st.get("uri").and_then(Value::as_str).is_some_and(|uri| {
+                uri.starts_with(LOCAL_ACTOR_PREFIX) && !seen_local_notes.insert(uri.trim_end_matches('/').to_string())
+            }) {
+                continue;
+            }
             if e.source == "recommendation" { st["vaak_home_source"] = json!("recommendation"); }
             // Ranked caches can briefly contain an item from before a mute or
             // instance block changed. Filter again at hydration so stale
@@ -5389,6 +5454,9 @@ pub(crate) async fn statuses_for_older_hits(
     }
     let actors_map = fetch_actors_map(db, &actor_ids).await.unwrap_or_default();
     let creates_map = fetch_creates_by_object(db, &create_objects).await.unwrap_or_default();
+    outbox_ids.extend(events_map.values().filter_map(local_note_for_event));
+    outbox_ids.sort();
+    outbox_ids.dedup();
     let outbox_map = fetch_outbox_map(db, &outbox_ids).await.unwrap_or_default();
     let boosts_map = fetch_boosts_map(db, &boost_ids, owner_user_id).await.unwrap_or_default();
     let bsky_map = fetch_bsky_map(db, &bsky_uris).await.unwrap_or_default();
@@ -5428,7 +5496,11 @@ pub(crate) async fn statuses_for_older_hits(
                     let actor = actors_map.get(ev.actor_id.trim_end_matches('/'));
                     if ev.event_type.eq_ignore_ascii_case("announce") {
                         let create = creates_map.get(ev.object_id.trim_end_matches('/'));
-                        Some(materialize_announce(ev, actor, create, &actors_map))
+                        let mut st = materialize_announce(ev, actor, create, &actors_map);
+                        swap_local_boost_inner(&mut st, ev, &outbox_map, &owner_username, &local_profiles);
+                        Some(st)
+                    } else if let Some(row) = local_note_for_event(ev).and_then(|oid| outbox_map.get(&oid)) {
+                        Some(materialize_outbox(row, &owner_username, &local_profiles))
                     } else {
                         Some(materialize_event_create(ev, actor))
                     }
@@ -6484,5 +6556,78 @@ mod local_api_acct_tests {
             assert_eq!(case["url"], case["url_before"], "{case}");
             assert_eq!(case["uri"], case["uri_before"], "{case}");
         }
+    }
+}
+
+#[cfg(test)]
+mod local_note_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn compose_event(event_type: &str, object_id: &str) -> EventRow {
+        EventRow {
+            id: 9001,
+            event_type: event_type.into(),
+            actor_id: "https://mkultra.monster/users/shana_flux".into(),
+            object_id: object_id.into(),
+            summary: "<p>meme</p>".into(),
+            media_urls: "[]".into(),
+            created_at: "2026-10-27T17:00:00Z".into(),
+            sensitive: false,
+            spoiler_text: String::new(),
+            host: "mkultra.monster".into(),
+            target_actor: String::new(),
+            in_reply_to: String::new(),
+            ask_actor: String::new(),
+            ask_question: String::new(),
+            ask_answer: String::new(),
+        }
+    }
+
+    fn shana_outbox_row(id: &str) -> OutboxRow {
+        OutboxRow {
+            id: id.into(),
+            published: "2026-10-27T17:00:00Z".into(),
+            content: "<p>meme</p>".into(),
+            in_reply_to: String::new(),
+            media_urls: r#"["https://media.example/meme.webp"]"#.into(),
+            sensitive: true,
+            spoiler_text: "lol".into(),
+            ask_actor: String::new(),
+            ask_question: String::new(),
+            ask_answer: String::new(),
+            quote_object: String::new(),
+        }
+    }
+
+    #[test]
+    fn local_compose_event_resolves_to_outbox_note() {
+        let note = "https://mkultra.monster/users/shana_flux/notes/abc123";
+        assert_eq!(local_note_for_event(&compose_event("Create", &format!("{note}/"))).as_deref(), Some(note));
+        assert_eq!(local_note_for_event(&compose_event("Announce", note)).as_deref(), Some(note));
+        assert!(local_note_for_event(&compose_event("Like", note)).is_none());
+        assert!(local_note_for_event(&compose_event("Create", "https://remote.example/users/a/notes/1")).is_none());
+        assert!(local_note_for_event(&compose_event("Create", "https://mkultra.monster/users/a/notes/1/replies")).is_none());
+        assert!(local_note_for_event(&compose_event("Create", "https://mkultra.monster/users/a/notes/")).is_none());
+    }
+
+    #[test]
+    fn local_boost_inner_uses_outbox_media_and_cw() {
+        let note = "https://mkultra.monster/users/shana_flux/notes/abc123";
+        let mut outbox = HashMap::new();
+        outbox.insert(note.to_string(), shana_outbox_row(note));
+        let mut announce = compose_event("Announce", note);
+        announce.actor_id = "https://mkultra.monster/users/cmdr_nova".into();
+        // Newest Create for the note is the bare compose row.
+        let bare = compose_event("Create", note);
+        let mut st = materialize_announce(&announce, None, Some(&bare), &HashMap::new());
+        assert_eq!(st["reblog"]["media_attachments"].as_array().map(Vec::len), Some(0));
+        swap_local_boost_inner(&mut st, &announce, &outbox, "cmdr_nova", &HashMap::new());
+        let inner = &st["reblog"];
+        assert_eq!(inner["media_attachments"][0]["url"], "https://media.example/meme.webp");
+        assert_eq!(inner["sensitive"], true);
+        assert_eq!(inner["spoiler_text"], "lol");
+        assert_eq!(inner["uri"], note);
+        assert!(inner["reblog"].is_null());
     }
 }
