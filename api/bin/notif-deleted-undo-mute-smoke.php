@@ -112,6 +112,11 @@ reference_load($api . '/ap-masto-entities.php', [
     'ap_masto_strip_announce_fragment',
     'ap_masto_mention_target_object_id',
 ]);
+reference_load($api . '/ap-mastodon.php', [
+    'ap_masto_filter_contexts',
+    'ap_masto_filter_keyword',
+    'ap_masto_filter_v2',
+]);
 
 $note = 'https://mkultra.monster/users/ada/notes/post1';
 $check(ap_notification_target_object_id($note . '#like-0123456789ab') === $note, 'like suffix');
@@ -173,7 +178,37 @@ $items = [
 $ids = array_column(ap_notifications_apply_viewer_filters($items, 7), 'id');
 $check($ids === ['2', '3', '4'], 'missing local target dropped, remote and follow kept: ' . json_encode($ids));
 
-$GLOBALS['smoke_phrases'] = ['spoiler phrase', 'cats & dogs'];
+$mutedWordRows = [
+    ['id' => 1, 'phrase' => 'spoiler phrase'],
+    ['id' => 2, 'phrase' => 'cats & dogs'],
+];
+$appPhrases = [];
+foreach ($mutedWordRows as $row) {
+    $filter = ap_masto_filter_v2($row);
+    $check(($filter['title'] ?? '') === $row['phrase'], 'v2 title is the muted phrase');
+    $check(in_array('notifications', $filter['context'] ?? [], true), 'v2 filter includes the notifications context');
+    $check(($filter['filter_action'] ?? '') === 'hide', 'v2 filter hides, matching a dropped notification');
+    $check(array_key_exists('expires_at', $filter) && $filter['expires_at'] === null, 'v2 filter does not expire');
+    $keywords = $filter['keywords'] ?? null;
+    $check(is_array($keywords) && $keywords !== [], 'v2 filter carries the muted phrase');
+    foreach ($keywords as $keyword) {
+        $check(($keyword['whole_word'] ?? true) === false, 'v2 keyword is a substring, matching notification mute');
+        $check(($keyword['keyword'] ?? '') === $row['phrase'], 'v2 keyword is the muted phrase');
+        // Null expires_at is "does not expire". ?? would replace that null and drop the phrase.
+        if (
+            ($filter['filter_action'] ?? '') === 'hide'
+            && array_key_exists('expires_at', $filter)
+            && $filter['expires_at'] === null
+            && in_array('notifications', $filter['context'] ?? [], true)
+            && ($keyword['whole_word'] ?? true) === false
+            && ($keyword['keyword'] ?? '') !== ''
+        ) {
+            $appPhrases[] = mb_strtolower((string) $keyword['keyword'], 'UTF-8');
+        }
+    }
+}
+$check($appPhrases === ['spoiler phrase', 'cats & dogs'], 'notifications-context keywords are the muted phrases: ' . json_encode($appPhrases));
+$GLOBALS['smoke_phrases'] = $appPhrases;
 $muted = [
     ['id' => 'a', 'type' => 'mention', 'status' => ['content' => '<p>SPOILER <em>phrase</em></p>']],
     ['id' => 'b', 'type' => 'mention', 'status' => ['content' => 'fine', 'spoiler_text' => 'Cats &amp; dogs']],
@@ -210,7 +245,14 @@ $check(str_contains($dbSrc, "ap_notification_dismiss_local_interaction(\$actor, 
 $entities = (string) file_get_contents($api . '/ap-masto-entities.php');
 $check(substr_count($entities, '$presentNotifications(') >= 5, 'list, cache, grouped source, and marker reads share the filter');
 $mastodon = (string) file_get_contents($api . '/ap-mastodon.php');
-$check(!str_contains($mastodon, '/api/v2/filters'), 'no Mastodon v2 filters context to diverge from notifications');
-$check(str_contains($mastodon, "'/api/v1/filters'"), 'v1 filters stub remains');
+$check(str_contains($mastodon, 'ap_masto_filter_v2'), 'apps receive v2 filters built from muted words');
+$check(str_contains($mastodon, "path === '/api/v2/filters'"), 'GET /api/v2/filters is the collection apps refresh');
+$check(str_contains($mastodon, 'ap_muted_words_list'), 'that collection is the owner muted-word list');
+$rust = (string) file_get_contents(dirname($api) . '/rust/vaak-worker/src/notif/mod.rs');
+$check(str_contains($rust, 'fn deleted_local_target_and_muted_words_match_php'), 'rust shares the notification mute cases');
+foreach ($appPhrases as $phrase) {
+    $check(str_contains($rust, '"' . $phrase . '"'), 'rust applies the same muted phrase: ' . $phrase);
+}
+$check(str_contains($rust, 'texts_match_muted_phrases'), 'rust matches those phrases the same way notifications do');
 
 echo "notif-deleted-undo-mute-smoke: ok\n";
