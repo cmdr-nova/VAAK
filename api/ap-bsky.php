@@ -3391,6 +3391,188 @@ function ap_bsky_jetstream_observer_ids(string $did, ?PDO $db = null): array
     return array_keys($owners);
 }
 
+/**
+ * Session owners of this DID. Observers who follow the account are not owners
+ * and must not receive this account's posts, likes, or follows as their own.
+ *
+ * @return list<int>
+ */
+function ap_bsky_jetstream_own_session_owners(string $did, ?PDO $db = null): array
+{
+    $did = trim($did);
+    if (!str_starts_with($did, 'did:')) {
+        return [];
+    }
+    $db ??= ap_db();
+    try {
+        $st = $db->prepare('SELECT owner_user_id FROM bsky_sessions WHERE did = ?');
+        $st->execute([$did]);
+        $owners = [];
+        foreach ($st->fetchAll(PDO::FETCH_COLUMN) ?: [] as $owner) {
+            $owner = (int) $owner;
+            if ($owner > 0) {
+                $owners[$owner] = true;
+            }
+        }
+        return array_keys($owners);
+    } catch (Throwable $e) {
+        return [];
+    }
+}
+
+/** vaakOrigin on a local note, or an empty string when the note is not imported. */
+function ap_bsky_imported_note_origin(string $noteId): string
+{
+    $noteId = rtrim(trim($noteId), '/');
+    if ($noteId === '' || !str_starts_with($noteId, 'https://')) {
+        return '';
+    }
+    try {
+        $st = ap_db()->prepare('SELECT raw_create_json FROM outbox_notes WHERE id = ? OR id = ? LIMIT 1');
+        $st->execute([$noteId, $noteId . '/']);
+        $raw = $st->fetchColumn();
+        if (!is_string($raw) || $raw === '') {
+            return '';
+        }
+        $doc = json_decode($raw, true);
+        return is_array($doc) ? (string) ($doc['object']['vaakOrigin'] ?? '') : '';
+    } catch (Throwable $e) {
+        return '';
+    }
+}
+
+/**
+ * Remove a Bluesky-origin local note without an ActivityPub Delete.
+ * VAAK-origin mirrors are left for the federating delete path.
+ *
+ * @return array{ok:bool,skipped?:bool,retracted?:bool}
+ */
+function ap_bsky_retract_imported_note(int $ownerUserId, string $noteId): array
+{
+    $noteId = rtrim(trim($noteId), '/');
+    if ($ownerUserId < 1 || $noteId === '' || ap_bsky_imported_note_origin($noteId) !== 'bluesky') {
+        return ['ok' => true, 'skipped' => true];
+    }
+    $removed = false;
+    $statements = [
+        'DELETE FROM outbox_notes WHERE id = ? OR id = ?',
+        'DELETE FROM masto_statuses WHERE note_id = ? OR note_id = ?',
+        'DELETE FROM bsky_crossposts WHERE note_id = ? OR note_id = ?',
+        'DELETE FROM bsky_post_links WHERE fediverse_id = ? OR fediverse_id = ? OR ap_object_id = ? OR ap_object_id = ?',
+    ];
+    foreach ($statements as $sql) {
+        try {
+            $st = ap_db()->prepare($sql);
+            if (substr_count($sql, '?') === 4) {
+                $st->execute([$noteId, $noteId . '/', $noteId, $noteId . '/']);
+            } else {
+                $st->execute([$noteId, $noteId . '/']);
+            }
+            if ($st->rowCount() > 0) {
+                $removed = true;
+            }
+        } catch (Throwable $e) {
+            // A deployment may not have every optional map table.
+        }
+    }
+    return ['ok' => true, 'retracted' => $removed];
+}
+
+/**
+ * Copy one of our own AppView commits into VAAK without ActivityPub delivery.
+ * Posts, replies, quotes, and media use the existing local import. Reposts,
+ * likes, follows, and unlikes enqueue the account sync workers. A profile
+ * edit refreshes the Bluesky actor cache only. Blocks, mutes, and text edits
+ * of an already imported post are not applied here.
+ *
+ * @param array<string,mixed> $commit
+ * @return array{ok:bool,actions:list<string>}
+ */
+function ap_bsky_jetstream_backfill_own(string $did, string $collection, string $action, string $uri, array $commit): array
+{
+    $actions = [];
+    try {
+        $owners = ap_bsky_jetstream_own_session_owners($did);
+        if ($owners === []) {
+            return ['ok' => true, 'actions' => []];
+        }
+        $record = is_array($commit['record'] ?? null) ? $commit['record'] : [];
+        if ($collection === 'app.bsky.feed.post' && $action === 'create') {
+            $post = [
+                'uri' => $uri,
+                'cid' => (string) ($commit['cid'] ?? ''),
+                'author' => ['did' => $did],
+                'record' => $record,
+            ];
+            $embed = is_array($record['embed'] ?? null) ? $record['embed'] : null;
+            if ($embed !== null && function_exists('ap_bsky_record_embed_view')) {
+                $view = ap_bsky_record_embed_view($embed, $did);
+                if (is_array($view)) {
+                    $post['embed'] = $view;
+                }
+            }
+            foreach ($owners as $owner) {
+                if (!function_exists('ap_bsky_import_own_post_as_local')) {
+                    continue;
+                }
+                ap_bsky_import_own_post_as_local((int) $owner, $post);
+                $actions[] = 'import_post';
+            }
+        } elseif ($collection === 'app.bsky.feed.post' && $action === 'delete') {
+            foreach ($owners as $owner) {
+                $note = function_exists('ap_bsky_local_note_id_for_at_uri')
+                    ? ap_bsky_local_note_id_for_at_uri($uri, (int) $owner, false)
+                    : null;
+                if (!is_string($note) || $note === '') {
+                    continue;
+                }
+                ap_bsky_retract_imported_note((int) $owner, $note);
+                $actions[] = 'retract_post';
+            }
+        } elseif ($collection === 'app.bsky.feed.repost' && ($action === 'create' || $action === 'delete')) {
+            $subject = is_array($record['subject'] ?? null) ? trim((string) ($record['subject']['uri'] ?? '')) : '';
+            foreach ($owners as $owner) {
+                if ($subject !== '' && function_exists('ap_bsky_own_repost_profile_sync')) {
+                    ap_bsky_own_repost_profile_sync((int) $owner, $subject, $action === 'create');
+                    $actions[] = $action === 'create' ? 'repost_sync' : 'repost_undo';
+                }
+                if (function_exists('ap_bsky_background_sync_enqueue')) {
+                    ap_bsky_background_sync_enqueue((int) $owner, 'reposts', true);
+                    $actions[] = 'repost_refresh';
+                }
+            }
+        } elseif ($collection === 'app.bsky.feed.like' && ($action === 'create' || $action === 'delete')) {
+            foreach ($owners as $owner) {
+                if (!function_exists('ap_bsky_background_sync_enqueue')) {
+                    continue;
+                }
+                ap_bsky_background_sync_enqueue((int) $owner, 'favourites', true);
+                $actions[] = $action === 'delete' ? 'unlike_refresh' : 'like_refresh';
+            }
+        } elseif ($collection === 'app.bsky.graph.follow' && ($action === 'create' || $action === 'delete')) {
+            foreach ($owners as $owner) {
+                if (!function_exists('ap_bsky_follow_sync_enqueue')) {
+                    continue;
+                }
+                ap_bsky_follow_sync_enqueue((int) $owner, null, true);
+                $actions[] = $action === 'delete' ? 'unfollow_refresh' : 'follow_refresh';
+            }
+        } elseif ($collection === 'app.bsky.actor.profile' && ($action === 'create' || $action === 'update')) {
+            foreach ($owners as $owner) {
+                if (!function_exists('ap_bsky_actor_refresh_enqueue')) {
+                    continue;
+                }
+                ap_bsky_actor_refresh_enqueue((int) $owner, $did, true);
+                $actions[] = 'profile_refresh';
+            }
+        }
+    } catch (Throwable $e) {
+        error_log('[ap-bsky] jetstream own backfill failed');
+        return ['ok' => false, 'actions' => $actions];
+    }
+    return ['ok' => true, 'actions' => $actions];
+}
+
 /** Ingest one filtered Jetstream commit into the shared canonical cache. */
 function ap_bsky_jetstream_ingest_event(array $event): array
 {
@@ -3404,6 +3586,9 @@ function ap_bsky_jetstream_ingest_event(array $event): array
     }
     $uri = 'at://' . $did . '/' . $collection . '/' . $rkey;
     $owners = ap_bsky_jetstream_observer_ids($did);
+    // Own AppView commits land in VAAK here. The import and sync workers do
+    // not enqueue ActivityPub delivery.
+    ap_bsky_jetstream_backfill_own($did, $collection, $action, $uri, $commit);
     if ($collection === 'app.bsky.feed.post' && $action === 'create') {
         $record = is_array($commit['record'] ?? null) ? $commit['record'] : [];
         $post = [
@@ -13197,6 +13382,13 @@ function ap_bsky_reconcile_deleted_crossposts(int $ownerUserId, int $limit = 15)
             if ($localId < 1) {
                 // Orphan map — just clear Bluesky cache/maps.
                 ap_bsky_delete_crosspost_for_note($ownerUserId, $noteId);
+                continue;
+            }
+            // AppView imports share bsky_crossposts with VAAK mirrors. Only the
+            // mirror may federate Delete; a Bluesky-origin note is removed locally.
+            if (ap_bsky_imported_note_origin($noteId) === 'bluesky') {
+                ap_bsky_retract_imported_note($ownerUserId, $noteId);
+                $out['deleted']++;
                 continue;
             }
             if (!function_exists('ap_delete_local_status')) {
