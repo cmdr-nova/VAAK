@@ -266,6 +266,7 @@ pub async fn tl_html_fill(
             }
         }
         stamp_ask_identities(&db, &mut slice, &mut extra_parents).await;
+        crate::post_media_cache::swap_cached_post_media(&db, &mut slice, Some(&mut extra_parents)).await;
     }
 
     let units = plan_feed_paint_units(&slice, &extra_parents);
@@ -371,6 +372,7 @@ async fn tl_html_older(
     let _ = crate::wafrn_crosspost::filter_statuses(&db, &mut statuses).await;
     let _ = crate::wafrn_crosspost::filter_bridgy_twins(&db, &mut statuses).await;
     let _ = crate::wafrn_crosspost::stamp_text_asks(&db, &mut statuses).await;
+    crate::post_media_cache::swap_cached_post_media(&db, &mut statuses, None).await;
     let viewer_actor = owner_actor;
     let units = plan_feed_paint_units(&statuses, &std::collections::HashMap::new());
     let paint = |st: &serde_json::Value, from: &str, viewer: &str| {
@@ -441,6 +443,7 @@ pub async fn home_html_since(
         attach_visible_polls(&db, &mut slice, &mut extra_parents, &viewer_actor).await;
         let _ = crate::home_hydrate_ranked::attach_bsky_link_facets(&db, &mut slice).await;
         stamp_ask_identities(&db, &mut slice, &mut extra_parents).await;
+        crate::post_media_cache::swap_cached_post_media(&db, &mut slice, Some(&mut extra_parents)).await;
     }
     let units = plan_feed_paint_units(&slice, &extra_parents);
     let paint = |st: &serde_json::Value, from: &str, viewer: &str| {
@@ -505,6 +508,7 @@ pub async fn tl_html_since(
         attach_visible_polls(&db, &mut slice, &mut extra_parents, &viewer_actor).await;
         let _ = crate::home_hydrate_ranked::attach_bsky_link_facets(&db, &mut slice).await;
         stamp_ask_identities(&db, &mut slice, &mut extra_parents).await;
+        crate::post_media_cache::swap_cached_post_media(&db, &mut slice, Some(&mut extra_parents)).await;
     }
     let units = plan_feed_paint_units(&slice, &extra_parents);
     let paint = |st: &serde_json::Value, from: &str, viewer: &str| {
