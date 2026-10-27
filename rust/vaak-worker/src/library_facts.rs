@@ -84,6 +84,52 @@ fn reply_seeds(status: &Value, owner_actor: &str, owner_key: &str) -> Vec<String
     out
 }
 
+fn reply_seed_actor(status: &Value, seed: &str) -> String {
+    let bare = seed.trim_start_matches('@').to_lowercase();
+    let account = &status["account"];
+    let actor = super::card::account_actor_ref(account).trim_end_matches('/').to_owned();
+    let acct = s(account, "acct").trim_start_matches('@').to_lowercase();
+    if !actor.is_empty() && (acct == bare || acct.split('@').next().unwrap_or("") == bare) { return actor; }
+    for mention in status.get("mentions").and_then(Value::as_array).into_iter().flatten() {
+        let url = mention.get("url").or_else(|| mention.get("uri")).and_then(Value::as_str).unwrap_or("").trim_end_matches('/').to_owned();
+        let acct = if let Some(text) = mention.as_str() { text.trim_start_matches('@').to_lowercase() } else { s(mention, "acct").trim_start_matches('@').to_lowercase() };
+        if !url.is_empty() && (acct == bare || acct.split('@').next().unwrap_or("") == bare) { return url; }
+    }
+    String::new()
+}
+
+/// Drop handles the viewer has blocked, and local accounts known to have blocked the viewer.
+pub(crate) fn visible_reply_seeds(status: &Value, owner_actor: &str, owner_key: &str, blocks: &[Value], inbound_local_keys: &[String]) -> Vec<String> {
+    reply_seeds(status, owner_actor, owner_key).into_iter().filter(|seed| {
+        let bare = seed.trim_start_matches('@').to_lowercase();
+        let host = bare.rsplit_once('@').map(|(_, host)| host.to_owned()).unwrap_or_default();
+        let local_key = if host.is_empty() && !bare.contains('.') { bare.clone() } else if ["mkultra.monster","www.mkultra.monster","vaak.monster","www.vaak.monster"].iter().any(|h| host == *h) { bare.split('@').next().unwrap_or("").to_owned() } else { String::new() };
+        if !local_key.is_empty() && inbound_local_keys.iter().any(|key| key.eq_ignore_ascii_case(&local_key)) { return false; }
+        let actor = reply_seed_actor(status, seed);
+        for row in blocks {
+            match s(row, "scope") {
+                "domain" => {
+                    let value = s(row, "value").to_lowercase();
+                    if !value.is_empty() && !host.is_empty() && (host == value || host.ends_with(&format!(".{value}"))) { return false; }
+                }
+                "actor" => {
+                    let value = s(row, "value").trim_end_matches('/').to_lowercase();
+                    if !value.is_empty() && !actor.is_empty() && actor.trim_end_matches('/').eq_ignore_ascii_case(&value) { return false; }
+                }
+                _ => {}
+            }
+        }
+        true
+    }).collect()
+}
+
+pub(crate) async fn reply_inbound_block_keys(db: &Client, owner_actor: &str) -> Result<Vec<String>> {
+    let owner = owner_actor.trim_end_matches('/').to_owned();
+    if owner.is_empty() { return Ok(Vec::new()); }
+    let rows = db.query("SELECT u.actor_key FROM ap_users u JOIN ap_user_blocks b ON b.owner_user_id::bigint = u.id::bigint WHERE b.scope='actor' AND (rtrim(b.value,'/')=$1 OR b.value=$1)", &[&owner]).await?;
+    Ok(rows.into_iter().map(|row| row.get::<_, String>(0).trim().to_lowercase()).filter(|key| !key.is_empty()).collect())
+}
+
 /// Remote Questions have no masto_polls row; inbox keeps them in remote_polls
 /// (created with the first one). poll_html reads the masto_polls shape, so
 /// the row gains `local_id` (the offset remote poll id PHP's poll_vote takes),
@@ -347,7 +393,9 @@ pub(crate) async fn resolve(db: &Client, owner_id: i64, owner_actor: &str, statu
     let sid=super::card::scalar_string(st,"id");
     let sid=super::card::php_trim(&sid);
     let current_action_counts=if let Some(own)=own.as_ref(){Some(own.counts.clone())}else if uri.contains("/notes/"){Some(local_counts(db,uri,if !sid.is_empty()&&sid.bytes().all(|byte|byte.is_ascii_digit()){sid}else{""}).await?)}else{None};
-    Ok(CardFacts { current_action_counts, bsky:super::bsky::resolve_with_bookmark_state(db,owner_id,st,session.bsky_enabled(),session.bsky_bookmark_state(st)).await?, owner_id,owner_actor:owner_actor.into(),return_view:session.return_view().into(),auto_unblur_sensitive:auto_unblur,resolved_avatar:avatar_with_context(db,st,actor,session.warm_context()).await?,csrf:session.csrf().into(),favourited:flag(st,"favourited"),bookmarked:flag(st,"bookmarked"),boosted:flag(st,"reblogged"),moderation,poll_row,ask_row,now:chrono::Utc::now(),lazy_media:session.lazy_media(),own,reply_mentions:reply_seeds(st,owner_actor,&key),rss_row:None,rss_quote_row,rss_quoted,emoji_by_actor:emoji_maps(db,status).await? })
+    let inbound_blocks = reply_inbound_block_keys(db, owner_actor).await?;
+    let reply_mentions = visible_reply_seeds(st, owner_actor, &key, &rows, &inbound_blocks);
+    Ok(CardFacts { current_action_counts, bsky:super::bsky::resolve_with_bookmark_state(db,owner_id,st,session.bsky_enabled(),session.bsky_bookmark_state(st)).await?, owner_id,owner_actor:owner_actor.into(),return_view:session.return_view().into(),auto_unblur_sensitive:auto_unblur,resolved_avatar:avatar_with_context(db,st,actor,session.warm_context()).await?,csrf:session.csrf().into(),favourited:flag(st,"favourited"),bookmarked:flag(st,"bookmarked"),boosted:flag(st,"reblogged"),moderation,poll_row,ask_row,now:chrono::Utc::now(),lazy_media:session.lazy_media(),own,reply_mentions,rss_row:None,rss_quote_row,rss_quoted,emoji_by_actor:emoji_maps(db,status).await? })
 }
 
 #[cfg(test)] mod tests {
@@ -470,5 +518,8 @@ pub(crate) async fn resolve(db: &Client, owner_id: i64, owner_actor: &str, statu
         assert_eq!(reply_seeds(&st,"https://mkultra.monster/users/nova","nova"), vec!["a@remote.test","B@remote.test"]);
         let st=serde_json::json!({"account":{"uri":"https://mkultra.monster/users/shana_flux","acct":"shana_flux"},"mentions":[{"acct":"nova@vaak.monster"}]});
         assert!(!reply_seeds(&st,"https://mkultra.monster/users/nova","nova").iter().any(|h|h.to_lowercase().contains("nova@")), "vaak.monster self alias is dropped");
+        let st=serde_json::json!({"account":{"uri":"https://remote.test/users/a","acct":"a@remote.test"},"mentions":[{"acct":"B@remote.test","url":"https://remote.test/users/b"},{"acct":"ada","url":"https://mkultra.monster/users/ada"}]});
+        let blocked=vec![serde_json::json!({"scope":"actor","value":"https://remote.test/users/a"})];
+        assert_eq!(visible_reply_seeds(&st,"https://mkultra.monster/users/nova","nova",&blocked,&["ada".into()]), vec!["B@remote.test"]);
     }
 }

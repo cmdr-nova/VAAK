@@ -45,6 +45,7 @@ php_tests=(
   api/bin/guest-status-link-smoke.php
   api/bin/vaak-status-permalink-smoke.php
   api/bin/bsky-thread-no-federation-smoke.php
+  api/bin/bsky-thread-local-notify-smoke.php
   api/bin/cpu-index-smoke.php
   api/bin/deploy-canary-smoke.php
   api/bin/downrank-search-trends-smoke.php

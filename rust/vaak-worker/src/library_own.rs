@@ -39,7 +39,7 @@ fn render_core(note:&str,actor:&str,facts:&CardFacts,own:&OwnFacts,from:&str,vis
     if view=="status"{action_url.push_str(&format!("&object={}",query(note)));if !from.is_empty(){action_url.push_str(&format!("&from={}",query(from)));}}
     let numeric=!own.status_id.is_empty() && own.status_id.bytes().all(|byte|byte.is_ascii_digit());
     let can_share=!matches!(visibility.unwrap_or(own.visibility.as_str()),"private"|"direct"|"followers");
-    let cw=super::actions::reply_suffix(&[],&own.spoiler,own.sensitive);
+    let cw=super::actions::reply_suffix(&facts.reply_mentions,&own.spoiler,own.sensitive);
     let mut html=format!("<div class=\"tweet-actions\"><a class=\"icon-btn\" href=\"?view={}&amp;compose=1&amp;reply_to={}{}\" title=\"Reply\" aria-label=\"Reply\"><i class=\"ph ph-arrow-bend-up-left\" aria-hidden=\"true\"></i></a>",esc(view),query(note),cw);
     let form = |action: &str, target_actor: bool| -> String {
         let mut output=format!("<form method=\"post\" action=\"{}\" style=\"display:inline\">",esc(&action_url));

@@ -310,6 +310,7 @@ check(source.includes('Followers-only replies are available only on your own pos
 check(source.includes('function isOwnNoteUrl(url)'), 'own-note detection is unchanged');
 check(source.includes('preview: sourceEl && (replyTo || quoteObject) ? vaakReplyPreviewFromCard(sourceEl) : null'), 'reply and quote clicks pass the card into the composer');
 check(source.includes("title.textContent = isSelf ? 'Continue thread' : 'Reply'"), 'self replies still continue the thread');
+check(source.includes('if (!isSelf && mentionParts.length >= 2)'), 'continuing your own post still prefills other participants without locking followers-only');
 check(source.includes('vaakUpgradeServerReplyPreview'), 'a full navigation can still read a card on the page');
 check(source.includes("vaakPaintComposeReplyContext(form, 'Quoting', quoteObject, opts.preview || null)"), 'quote clicks paint the same summary');
 check(source.includes('a[href*="quote_object="]'), 'a full navigation can still read a quote card on the page');
