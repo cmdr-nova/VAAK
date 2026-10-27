@@ -1,0 +1,7 @@
+SHELL=/bin/sh
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# ListenBrainz "now playing" for profiles. Only users who entered a
+# ListenBrainz username are polled, each at most once a minute. Page views
+# never fetch. flock keeps runs from overlapping.
+* * * * * www-data /usr/bin/flock -n /tmp/vaak-ap-listenbrainz.lock /usr/bin/nice -n 10 /usr/bin/env AP_DB_DSN=pgsql:dbname=novalandia /usr/bin/php /srv/mkultra/html/api/ap-listenbrainz-worker.php --limit=20 >> /var/log/mkultra/ap-listenbrainz.log 2>&1

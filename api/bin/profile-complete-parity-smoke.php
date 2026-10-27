@@ -269,6 +269,16 @@ try {
         parity_check($result['code'] === 200 && ($result['json']['ok'] ?? false) === true, parity_http_detail('pinned profile', $result));
         return (string) ($result['json']['html'] ?? '');
     };
+    // ListenBrainz now playing: the Rust header prints the same block PHP does.
+    require_once dirname(__DIR__) . '/ap-listenbrainz.php';
+    $lbNow = time();
+    $pdo->prepare(
+        'INSERT INTO ap_listenbrainz_links (owner_user_id, lb_username, playing_track, playing_artist, playing_release, playing_cover, fetched_at, next_fetch_at, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+    )->execute([$ownerId, 'Parity Listener', 'Song & "Dance"', 'Artist', 'Album', 'https://coverartarchive.org/release/0a1b2c3d-0000-4000-8000-000000000000/front-250', $lbNow, $lbNow + 3600, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z']);
+    $lbRow = $pdo->query('SELECT * FROM ap_listenbrainz_links WHERE owner_user_id = ' . (int) $ownerId)->fetch();
+    $lbHtml = ap_listenbrainz_profile_html(ap_listenbrainz_display(is_array($lbRow) ? $lbRow : null, $lbNow));
+    parity_check(str_contains($lbHtml, '>Now playing<'), 'PHP paints the stored now playing row');
     $guestPins = $full($guest);
     $ownerPins = $full($owner);
     $fanPins = $full($fan);
@@ -277,6 +287,7 @@ try {
         parity_check(str_contains($html, 'PIN-PUBLIC') && str_contains($html, 'Public'), 'unauthorized pinned view keeps the public pin and its audience label');
         parity_check(!str_contains($html, 'PIN-FOLLOWERS') && !str_contains($html, 'PIN-DIRECT') && !str_contains($html, 'Followers-only') && !str_contains($html, '>Direct<'), 'unauthorized pinned view drops followers-only and direct pins');
     }
+    parity_check(str_contains($guestPins, $lbHtml) && str_contains($ownerPins, $lbHtml), 'Rust header prints the same ListenBrainz block as PHP');
     parity_check(str_contains($ownerPins, 'PIN-PUBLIC') && str_contains($ownerPins, 'PIN-FOLLOWERS') && str_contains($ownerPins, 'PIN-DIRECT'), 'owner sees every selected pin');
     parity_check(str_contains($ownerPins, 'Followers-only') && str_contains($ownerPins, '>Direct<') && str_contains($ownerPins, 'Public'), 'owner pin cards keep audience labels');
     parity_check(str_contains($fanPins, 'PIN-PUBLIC') && str_contains($fanPins, 'PIN-FOLLOWERS') && str_contains($fanPins, 'Followers-only'), 'follower sees the followers-only pin and its label');
@@ -291,6 +302,7 @@ try {
     parity_check((int) $fanout->fetchColumn() === 0, 'fixture notes are not in the fan-out queue');
 } finally {
     $pdo->prepare('DELETE FROM masto_pins WHERE owner_user_id = ?')->execute([$ownerId]);
+    $pdo->prepare('DELETE FROM ap_listenbrainz_links WHERE owner_user_id = ?')->execute([$ownerId]);
     $pdo->prepare('DELETE FROM masto_reblogs WHERE owner_user_id = ?')->execute([$ownerId]);
     $pdo->prepare('DELETE FROM masto_statuses WHERE note_id LIKE ?')->execute([$actor . '/%']);
     $pdo->prepare('DELETE FROM outbox_notes WHERE id LIKE ?')->execute([$actor . '/%']);

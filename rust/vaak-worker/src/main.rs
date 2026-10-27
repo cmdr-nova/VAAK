@@ -73,6 +73,7 @@ mod relationships;
 mod settings;
 mod shadow_auth;
 mod library;
+mod listenbrainz;
 mod ml_ranker;
 mod integrations;
 mod private_surfaces;

@@ -84,6 +84,8 @@ struct Facts {
     wow_portrait: String,
     fields: Vec<Field>,
     badges: Vec<String>,
+    /// Stored ListenBrainz block (listenbrainz::profile_html); '' when off.
+    now_playing: String,
     stats_bsky: bool,
     posts_stat: i64,
     following_stat: i64,
@@ -753,6 +755,8 @@ fn header(f: &Facts) -> String {
         w.line(14, "</div>");
         w.indent(12);
     }
+    // PHP prints this right after the badges endif, on the same line.
+    w.text(&f.now_playing);
     w.indent(12);
     w.indent(14);
     let title = if f.stats_bsky { " title=\"Includes ActivityPub and connected Bluesky counts\"" } else { "" };
@@ -906,6 +910,7 @@ fn load(input: &Value) -> Result<Facts, String> {
         wow_url: wow.and_then(|row| row.get("armory_url")).and_then(Value::as_str).unwrap_or("").to_owned(),
         wow_portrait: wow.and_then(|row| row.get("portrait_url")).and_then(Value::as_str).unwrap_or("").trim().to_owned(),
         fields, badges, stats_bsky: flag(input, "stats_bsky"),
+        now_playing: crate::listenbrainz::profile_html(input.get("now_playing").filter(|v| v.is_object())),
         posts_stat: num(input, "posts_stat"), following_stat: num(input, "following_stat"), followers_stat: num(input, "followers_stat"),
         item_posts: num(input, "item_posts"), item_replies: num(input, "item_replies"), item_boosts: num(input, "item_boosts"),
         item_media: num(input, "item_media"), item_asks: num(input, "item_asks"),

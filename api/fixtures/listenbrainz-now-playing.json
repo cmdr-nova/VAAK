@@ -1,0 +1,260 @@
+{
+    "cases": [
+        {
+            "id": "playing_with_cover",
+            "row": {
+                "playing_track": "Windowlicker",
+                "playing_artist": "Aphex Twin",
+                "playing_release": "Windowlicker",
+                "playing_cover": "https://coverartarchive.org/release/0a1b2c3d-0000-4000-8000-000000000000/123456789-250.jpg",
+                "last_track": "Older",
+                "owner_user_id": 1,
+                "lb_username": "nova",
+                "last_artist": "",
+                "last_release": "",
+                "last_cover": "",
+                "last_listened_at": 0,
+                "fetched_at": 1799999970,
+                "next_fetch_at": 0,
+                "failures": 0,
+                "last_error": ""
+            },
+            "now": 1800000000,
+            "display": {
+                "label": "Now playing",
+                "track": "Windowlicker",
+                "artist": "Aphex Twin",
+                "release": "Windowlicker",
+                "cover": "https://coverartarchive.org/release/0a1b2c3d-0000-4000-8000-000000000000/123456789-250.jpg",
+                "url": "https://listenbrainz.org/user/nova/"
+            },
+            "html": "<div class=\"profile-now-playing\" data-state=\"playing\"><a href=\"https://listenbrainz.org/user/nova/\" target=\"_blank\" rel=\"noopener noreferrer\" title=\"Now playing on ListenBrainz\"><img class=\"profile-now-playing-cover\" src=\"https://coverartarchive.org/release/0a1b2c3d-0000-4000-8000-000000000000/123456789-250.jpg\" alt=\"\" width=\"44\" height=\"44\" loading=\"lazy\" decoding=\"async\" referrerpolicy=\"no-referrer\" onerror=\"this.remove()\"><span class=\"profile-now-playing-text\"><span class=\"profile-now-playing-label\">Now playing</span><span class=\"profile-now-playing-track\">Windowlicker</span><span class=\"profile-now-playing-by\">Aphex Twin</span></span></a></div>"
+        },
+        {
+            "id": "playing_stale_falls_back",
+            "row": {
+                "playing_track": "Stale",
+                "fetched_at": 1799999399,
+                "last_track": "Roygbiv",
+                "last_artist": "Boards of Canada",
+                "last_release": "Music Has the Right to Children",
+                "owner_user_id": 1,
+                "lb_username": "nova",
+                "playing_artist": "",
+                "playing_release": "",
+                "playing_cover": "",
+                "last_cover": "",
+                "last_listened_at": 0,
+                "next_fetch_at": 0,
+                "failures": 0,
+                "last_error": ""
+            },
+            "now": 1800000000,
+            "display": {
+                "label": "Last played",
+                "track": "Roygbiv",
+                "artist": "Boards of Canada",
+                "release": "Music Has the Right to Children",
+                "cover": "",
+                "url": "https://listenbrainz.org/user/nova/"
+            },
+            "html": "<div class=\"profile-now-playing\" data-state=\"last\"><a href=\"https://listenbrainz.org/user/nova/\" target=\"_blank\" rel=\"noopener noreferrer\" title=\"Last played on ListenBrainz\"><span class=\"profile-now-playing-cover\" aria-hidden=\"true\">♪</span><span class=\"profile-now-playing-text\"><span class=\"profile-now-playing-label\">Last played</span><span class=\"profile-now-playing-track\">Roygbiv</span><span class=\"profile-now-playing-by\">Boards of Canada · Music Has the Right to Children</span></span></a></div>"
+        },
+        {
+            "id": "playing_edge_fresh",
+            "row": {
+                "playing_track": "Edge",
+                "fetched_at": 1799999400,
+                "owner_user_id": 1,
+                "lb_username": "nova",
+                "playing_artist": "",
+                "playing_release": "",
+                "playing_cover": "",
+                "last_track": "",
+                "last_artist": "",
+                "last_release": "",
+                "last_cover": "",
+                "last_listened_at": 0,
+                "next_fetch_at": 0,
+                "failures": 0,
+                "last_error": ""
+            },
+            "now": 1800000000,
+            "display": {
+                "label": "Now playing",
+                "track": "Edge",
+                "artist": "",
+                "release": "",
+                "cover": "",
+                "url": "https://listenbrainz.org/user/nova/"
+            },
+            "html": "<div class=\"profile-now-playing\" data-state=\"playing\"><a href=\"https://listenbrainz.org/user/nova/\" target=\"_blank\" rel=\"noopener noreferrer\" title=\"Now playing on ListenBrainz\"><span class=\"profile-now-playing-cover\" aria-hidden=\"true\">♪</span><span class=\"profile-now-playing-text\"><span class=\"profile-now-playing-label\">Now playing</span><span class=\"profile-now-playing-track\">Edge</span></span></a></div>"
+        },
+        {
+            "id": "last_only_no_artist",
+            "row": {
+                "last_track": "Untitled",
+                "last_release": "Selected Ambient Works",
+                "owner_user_id": 1,
+                "lb_username": "nova",
+                "playing_track": "",
+                "playing_artist": "",
+                "playing_release": "",
+                "playing_cover": "",
+                "last_artist": "",
+                "last_cover": "",
+                "last_listened_at": 0,
+                "fetched_at": 1799999970,
+                "next_fetch_at": 0,
+                "failures": 0,
+                "last_error": ""
+            },
+            "now": 1800000000,
+            "display": {
+                "label": "Last played",
+                "track": "Untitled",
+                "artist": "",
+                "release": "Selected Ambient Works",
+                "cover": "",
+                "url": "https://listenbrainz.org/user/nova/"
+            },
+            "html": "<div class=\"profile-now-playing\" data-state=\"last\"><a href=\"https://listenbrainz.org/user/nova/\" target=\"_blank\" rel=\"noopener noreferrer\" title=\"Last played on ListenBrainz\"><span class=\"profile-now-playing-cover\" aria-hidden=\"true\">♪</span><span class=\"profile-now-playing-text\"><span class=\"profile-now-playing-label\">Last played</span><span class=\"profile-now-playing-track\">Untitled</span><span class=\"profile-now-playing-by\">Selected Ambient Works</span></span></a></div>"
+        },
+        {
+            "id": "escaping",
+            "row": {
+                "lb_username": "Nova Bee",
+                "playing_track": "<b>\"Tom\" & 'Jerry'</b>",
+                "playing_artist": "A&B",
+                "playing_release": "R<1>",
+                "playing_cover": "javascript:alert(1)",
+                "owner_user_id": 1,
+                "last_track": "",
+                "last_artist": "",
+                "last_release": "",
+                "last_cover": "",
+                "last_listened_at": 0,
+                "fetched_at": 1799999970,
+                "next_fetch_at": 0,
+                "failures": 0,
+                "last_error": ""
+            },
+            "now": 1800000000,
+            "display": {
+                "label": "Now playing",
+                "track": "<b>\"Tom\" & 'Jerry'</b>",
+                "artist": "A&B",
+                "release": "R<1>",
+                "cover": "",
+                "url": "https://listenbrainz.org/user/Nova%20Bee/"
+            },
+            "html": "<div class=\"profile-now-playing\" data-state=\"playing\"><a href=\"https://listenbrainz.org/user/Nova%20Bee/\" target=\"_blank\" rel=\"noopener noreferrer\" title=\"Now playing on ListenBrainz\"><span class=\"profile-now-playing-cover\" aria-hidden=\"true\">♪</span><span class=\"profile-now-playing-text\"><span class=\"profile-now-playing-label\">Now playing</span><span class=\"profile-now-playing-track\">&lt;b&gt;&quot;Tom&quot; &amp; &#039;Jerry&#039;&lt;/b&gt;</span><span class=\"profile-now-playing-by\">A&amp;B · R&lt;1&gt;</span></span></a></div>"
+        },
+        {
+            "id": "unicode",
+            "row": {
+                "lb_username": "Ålesund_ü",
+                "playing_track": "ニュース",
+                "playing_artist": "Björk",
+                "playing_cover": "https://coverartarchive.org/release/0a1b2c3d-0000-4000-8000-000000000000/front-250",
+                "owner_user_id": 1,
+                "playing_release": "",
+                "last_track": "",
+                "last_artist": "",
+                "last_release": "",
+                "last_cover": "",
+                "last_listened_at": 0,
+                "fetched_at": 1799999970,
+                "next_fetch_at": 0,
+                "failures": 0,
+                "last_error": ""
+            },
+            "now": 1800000000,
+            "display": {
+                "label": "Now playing",
+                "track": "ニュース",
+                "artist": "Björk",
+                "release": "",
+                "cover": "https://coverartarchive.org/release/0a1b2c3d-0000-4000-8000-000000000000/front-250",
+                "url": "https://listenbrainz.org/user/%C3%85lesund_%C3%BC/"
+            },
+            "html": "<div class=\"profile-now-playing\" data-state=\"playing\"><a href=\"https://listenbrainz.org/user/%C3%85lesund_%C3%BC/\" target=\"_blank\" rel=\"noopener noreferrer\" title=\"Now playing on ListenBrainz\"><img class=\"profile-now-playing-cover\" src=\"https://coverartarchive.org/release/0a1b2c3d-0000-4000-8000-000000000000/front-250\" alt=\"\" width=\"44\" height=\"44\" loading=\"lazy\" decoding=\"async\" referrerpolicy=\"no-referrer\" onerror=\"this.remove()\"><span class=\"profile-now-playing-text\"><span class=\"profile-now-playing-label\">Now playing</span><span class=\"profile-now-playing-track\">ニュース</span><span class=\"profile-now-playing-by\">Björk</span></span></a></div>"
+        },
+        {
+            "id": "nothing_stored",
+            "row": {
+                "owner_user_id": 1,
+                "lb_username": "nova",
+                "playing_track": "",
+                "playing_artist": "",
+                "playing_release": "",
+                "playing_cover": "",
+                "last_track": "",
+                "last_artist": "",
+                "last_release": "",
+                "last_cover": "",
+                "last_listened_at": 0,
+                "fetched_at": 1799999970,
+                "next_fetch_at": 0,
+                "failures": 0,
+                "last_error": ""
+            },
+            "now": 1800000000,
+            "display": null,
+            "html": ""
+        },
+        {
+            "id": "no_username",
+            "row": {
+                "lb_username": "  ",
+                "playing_track": "X",
+                "owner_user_id": 1,
+                "playing_artist": "",
+                "playing_release": "",
+                "playing_cover": "",
+                "last_track": "",
+                "last_artist": "",
+                "last_release": "",
+                "last_cover": "",
+                "last_listened_at": 0,
+                "fetched_at": 1799999970,
+                "next_fetch_at": 0,
+                "failures": 0,
+                "last_error": ""
+            },
+            "now": 1800000000,
+            "display": null,
+            "html": ""
+        },
+        {
+            "id": "whitespace_track",
+            "row": {
+                "playing_track": "   ",
+                "last_track": " Kept ",
+                "owner_user_id": 1,
+                "lb_username": "nova",
+                "playing_artist": "",
+                "playing_release": "",
+                "playing_cover": "",
+                "last_artist": "",
+                "last_release": "",
+                "last_cover": "",
+                "last_listened_at": 0,
+                "fetched_at": 1799999970,
+                "next_fetch_at": 0,
+                "failures": 0,
+                "last_error": ""
+            },
+            "now": 1800000000,
+            "display": {
+                "label": "Last played",
+                "track": "Kept",
+                "artist": "",
+                "release": "",
+                "cover": "",
+                "url": "https://listenbrainz.org/user/nova/"
+            },
+            "html": "<div class=\"profile-now-playing\" data-state=\"last\"><a href=\"https://listenbrainz.org/user/nova/\" target=\"_blank\" rel=\"noopener noreferrer\" title=\"Last played on ListenBrainz\"><span class=\"profile-now-playing-cover\" aria-hidden=\"true\">♪</span><span class=\"profile-now-playing-text\"><span class=\"profile-now-playing-label\">Last played</span><span class=\"profile-now-playing-track\">Kept</span></span></a></div>"
+        }
+    ]
+}
