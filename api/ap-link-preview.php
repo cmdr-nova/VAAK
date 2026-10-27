@@ -472,6 +472,45 @@ function ap_link_preview_fetch_youtube(string $url): ?array
     return $fallback;
 }
 
+/** Canonical open.spotify.com item URL, or null for anything else. */
+function ap_link_preview_spotify_url(string $url): ?string
+{
+    $url = ap_link_preview_normalize_url($url);
+    if (!preg_match('~^https://open\.spotify\.com/(?:intl-[a-z]{2}(?:-[a-z]{2})?/)?(album|track|playlist|artist|episode|show)/([A-Za-z0-9]{10,40})(?:[/?#]|$)~i', $url, $m)) {
+        return null;
+    }
+    return 'https://open.spotify.com/' . strtolower($m[1]) . '/' . $m[2];
+}
+
+/**
+ * Spotify pages are client-rendered (no og:image), so use their oEmbed for
+ * the title and cover art. Null when oEmbed fails; callers fall back to OG.
+ */
+function ap_link_preview_fetch_spotify(string $url): ?array
+{
+    $canonical = ap_link_preview_spotify_url($url);
+    if ($canonical === null) {
+        return null;
+    }
+    $json = ap_link_preview_http_get('https://open.spotify.com/oembed?url=' . rawurlencode($canonical), 4, 65536);
+    $data = is_string($json) ? json_decode($json, true) : null;
+    $title = is_array($data) && isset($data['title']) ? trim((string) $data['title']) : '';
+    if ($title === '') {
+        return null;
+    }
+    $image = isset($data['thumbnail_url']) ? (string) $data['thumbnail_url'] : '';
+    return [
+        'url' => $canonical,
+        'title' => $title,
+        'description' => null,
+        'image' => str_starts_with($image, 'https://') ? $image : null,
+        'provider_name' => 'Spotify',
+        'provider_url' => 'https://open.spotify.com/',
+        'type' => 'link',
+        'status' => 'ok',
+    ];
+}
+
 /**
  * Parse basic OG / twitter meta tags from HTML.
  *
@@ -565,6 +604,9 @@ function ap_link_preview_for_url(string $url, bool $allowFetch = true): ?array
     if (ap_link_preview_youtube_id($url) !== null) {
         $card = ap_link_preview_fetch_youtube($url);
     }
+    if ($card === null && ap_link_preview_spotify_url($url) !== null) {
+        $card = ap_link_preview_fetch_spotify($url);
+    }
     if ($card === null) {
         $card = ap_link_preview_fetch_og($url);
     }
@@ -583,6 +625,11 @@ function ap_link_preview_for_url(string $url, bool $allowFetch = true): ?array
         return null;
     }
     ap_link_preview_cache_put($card, 7 * 86400);
+    // Cards keyed by their canonical URL (og:url, Spotify, YouTube) would
+    // never be found again under the requested URL, refetching every view.
+    if (ap_link_preview_normalize_url((string) ($card['url'] ?? '')) !== $url) {
+        ap_link_preview_cache_put(array_merge($card, ['url' => $url]), 7 * 86400);
+    }
     return $card;
 }
 
