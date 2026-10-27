@@ -111,11 +111,8 @@ fn format_published(raw: &str) -> String {
 }
 
 fn empty_account(actor_url: &str, username: &str, display: &str, avatar: &str) -> Value {
-    let av = if avatar.starts_with("https://") {
-        avatar
-    } else {
-        DEFAULT_AVATAR
-    };
+    let owned = crate::actor_warm::account_media_url(avatar, actor_url);
+    let av = owned.as_deref().unwrap_or(DEFAULT_AVATAR);
     json!({
         "id": actor_url,
         "username": username,

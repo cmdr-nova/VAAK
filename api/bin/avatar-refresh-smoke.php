@@ -75,6 +75,10 @@ function vaak_eval_functions(string $path, array $names): void
 $root = dirname(__DIR__);
 vaak_eval_functions($root . '/ap-db.php', [
     'ap_profile_sanitize_https_url',
+    'ap_vaak_own_media_host',
+    'ap_masto_system_media_path',
+    'ap_account_media_is_broken_local',
+    'ap_account_media_resolve',
     'ap_remote_actor_username_is_placeholder',
     'ap_remote_actor_as2_media_url',
     'ap_remote_actor_needs_refresh',

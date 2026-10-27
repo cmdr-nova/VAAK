@@ -4497,6 +4497,105 @@ function ap_profile_sanitize_https_url(mixed $url): ?string
     return $url;
 }
 
+/** Hosts that serve this VAAK instance. Remote Mastodon media must not be rewritten onto them. */
+function ap_vaak_own_media_host(string $host): bool
+{
+    $host = strtolower(rtrim($host, '.'));
+    return in_array($host, ['mkultra.monster', 'www.mkultra.monster', 'vaak.monster', 'www.vaak.monster'], true);
+}
+
+/** Mastodon Paperclip paths. VAAK does not store these files. */
+function ap_masto_system_media_path(string $path): bool
+{
+    $path = '/' . ltrim(strtok($path, '?#') ?: '', '/');
+    return (bool) preg_match('#^/system/(?:accounts/(?:avatars|headers)|media_attachments)(?:/|$)#', $path);
+}
+
+/**
+ * True when an https URL points at a Mastodon system file on VAAK's own host.
+ * Clients request that URL and get a 404 because the bytes live on the remote server.
+ */
+function ap_account_media_is_broken_local(string $url): bool
+{
+    $parts = parse_url(trim($url));
+    if (!is_array($parts) || ($parts['scheme'] ?? '') !== 'https') {
+        return false;
+    }
+    $host = strtolower((string) ($parts['host'] ?? ''));
+    $path = (string) ($parts['path'] ?? '');
+    return $host !== '' && ap_vaak_own_media_host($host) && ap_masto_system_media_path($path);
+}
+
+/**
+ * Absolute https account image, or null when it cannot be shown.
+ * Root-relative paths are resolved against the remote actor host, never this instance.
+ */
+function ap_account_media_resolve(mixed $url, ?string $actorUrl = null): ?string
+{
+    if (!is_string($url)) {
+        return null;
+    }
+    $url = trim($url);
+    if ($url === '') {
+        return null;
+    }
+    if (str_starts_with($url, '/') && !str_starts_with($url, '//')) {
+        $actorHost = is_string($actorUrl) ? parse_url($actorUrl, PHP_URL_HOST) : null;
+        $actorScheme = is_string($actorUrl) ? parse_url($actorUrl, PHP_URL_SCHEME) : null;
+        if (!is_string($actorHost) || $actorHost === '' || $actorScheme !== 'https' || ap_vaak_own_media_host($actorHost)) {
+            return null;
+        }
+        $url = 'https://' . $actorHost . $url;
+    }
+    $sanitized = ap_profile_sanitize_https_url($url);
+    if ($sanitized === null || ap_account_media_is_broken_local($sanitized)) {
+        return null;
+    }
+    return $sanitized;
+}
+
+/**
+ * What a maintenance pass should do with a stored avatar or header URL.
+ *
+ * @return array{action:'keep'|'clear'|'replace',replacement:?string}
+ */
+function ap_account_media_repair_decision(?string $url, ?string $actorId, ?string $profileJson, string $kind): array
+{
+    $url = is_string($url) ? trim($url) : '';
+    if ($url === '' || !ap_account_media_is_broken_local($url)) {
+        return ['action' => 'keep', 'replacement' => null];
+    }
+    if (is_string($profileJson) && $profileJson !== '' && in_array($kind, ['icon', 'image'], true)) {
+        $doc = json_decode($profileJson, true);
+        $field = $kind === 'image' ? 'image' : 'icon';
+        if (is_array($doc)) {
+            $replacement = ap_remote_actor_as2_media_url($doc[$field] ?? null, $actorId);
+            if (is_string($replacement) && $replacement !== '' && !ap_account_media_is_broken_local($replacement)) {
+                return ['action' => 'replace', 'replacement' => $replacement];
+            }
+        }
+    }
+    return ['action' => 'clear', 'replacement' => null];
+}
+
+/**
+ * Cached account media whose public URL 404s on this host.
+ * A usable remote source URL replaces it; otherwise the cache row should go.
+ *
+ * @return array{action:'keep'|'delete'|'replace',replacement:?string}
+ */
+function ap_account_media_cache_repair_decision(?string $publicUrl, ?string $sourceUrl): array
+{
+    if (!ap_account_media_is_broken_local((string) $publicUrl)) {
+        return ['action' => 'keep', 'replacement' => null];
+    }
+    $source = ap_account_media_resolve($sourceUrl);
+    if (is_string($source) && !ap_account_media_is_broken_local($source)) {
+        return ['action' => 'replace', 'replacement' => $source];
+    }
+    return ['action' => 'delete', 'replacement' => null];
+}
+
 /**
  * Infer AS2 / HTTP mediaType from a profile image URL path extension.
  */
@@ -13153,6 +13252,48 @@ function ap_muted_word_remove(int $id, int $ownerUserId): array
     }
 }
 
+/**
+ * @return array{ok:bool,error?:string,id?:int,phrase?:string}
+ */
+function ap_muted_word_update(int $id, string $phrase, int $ownerUserId): array
+{
+    if ($id < 1 || $ownerUserId < 1) {
+        return ['ok' => false, 'error' => 'Missing phrase id.'];
+    }
+    $phrase = trim(preg_replace('/\s+/u', ' ', $phrase) ?? $phrase);
+    if ($phrase === '' || mb_strlen($phrase, 'UTF-8') < 2) {
+        return ['ok' => false, 'error' => 'Phrase must be at least 2 characters.'];
+    }
+    if (mb_strlen($phrase, 'UTF-8') > 200) {
+        return ['ok' => false, 'error' => 'Phrase too long (max 200 characters).'];
+    }
+    $norm = mb_strtolower($phrase, 'UTF-8');
+    $found = false;
+    foreach (ap_muted_words_list($ownerUserId) as $row) {
+        $rowId = (int) ($row['id'] ?? 0);
+        $same = mb_strtolower((string) ($row['phrase'] ?? ''), 'UTF-8') === $norm;
+        if ($rowId === $id) {
+            $found = true;
+            continue;
+        }
+        if ($same) {
+            return ['ok' => false, 'error' => 'That phrase is already muted.'];
+        }
+    }
+    if (!$found) {
+        return ['ok' => false, 'error' => 'Phrase not found.'];
+    }
+    try {
+        $st = ap_db()->prepare('UPDATE ap_muted_words SET phrase = ? WHERE id = ? AND owner_user_id = ?');
+        $st->execute([$phrase, $id, $ownerUserId]);
+        ap_muted_words_cache_clear($ownerUserId);
+        return ['ok' => true, 'id' => $id, 'phrase' => $phrase];
+    } catch (Throwable $e) {
+        error_log('[ap-db] muted_word_update: ' . $e->getMessage());
+        return ['ok' => false, 'error' => 'Could not update muted phrase.'];
+    }
+}
+
 /* ----------------- Compose drafts (VAAK composer) ----------------- */
 
 /**
@@ -17361,10 +17502,10 @@ function ap_remote_actor_upsert(string $actorId, array $fields): void
     $icon = $fields['icon_source_url'] ?? ($existing['icon_source_url'] ?? null);
     $image = $fields['image_source_url'] ?? ($existing['image_source_url'] ?? null);
     if (is_string($icon)) {
-        $icon = ap_profile_sanitize_https_url($icon);
+        $icon = ap_account_media_resolve($icon, $actorId);
     }
     if (is_string($image)) {
-        $image = ap_profile_sanitize_https_url($image);
+        $image = ap_account_media_resolve($image, $actorId);
     }
     $incomingSummary = array_key_exists('summary', $fields) ? $fields['summary'] : null;
     if (is_string($incomingSummary)) {
@@ -17434,11 +17575,11 @@ function ap_remote_actor_upsert(string $actorId, array $fields): void
  * https icon/header URL from an ActivityPub Image, Link, or a list of either.
  * Works without ap-r2.php loaded (actor warm only includes the inbox library).
  */
-function ap_remote_actor_as2_media_url(mixed $node): ?string
+function ap_remote_actor_as2_media_url(mixed $node, ?string $baseActorUrl = null): ?string
 {
     if (is_array($node) && array_is_list($node)) {
         foreach ($node as $item) {
-            $found = ap_remote_actor_as2_media_url($item);
+            $found = ap_remote_actor_as2_media_url($item, $baseActorUrl);
             if (is_string($found) && $found !== '') {
                 return $found;
             }
@@ -17446,21 +17587,21 @@ function ap_remote_actor_as2_media_url(mixed $node): ?string
         return null;
     }
     if (is_string($node)) {
-        return ap_profile_sanitize_https_url($node);
+        return ap_account_media_resolve($node, $baseActorUrl);
     }
     if (!is_array($node)) {
         return null;
     }
     if (isset($node['url'])) {
         if (is_string($node['url']) || is_array($node['url'])) {
-            $found = ap_remote_actor_as2_media_url($node['url']);
+            $found = ap_remote_actor_as2_media_url($node['url'], $baseActorUrl);
             if (is_string($found) && $found !== '') {
                 return $found;
             }
         }
     }
     if (isset($node['href']) && is_string($node['href'])) {
-        return ap_profile_sanitize_https_url($node['href']);
+        return ap_account_media_resolve($node['href'], $baseActorUrl);
     }
     return null;
 }
@@ -17620,8 +17761,8 @@ function ap_remote_actor_ensure(string $actorId, bool $allowFetch = true): ?arra
                 if (!empty($doc['name']) && is_string($doc['name'])) {
                     $dname = trim($doc['name']);
                 }
-                $icon = ap_remote_actor_as2_media_url($doc['icon'] ?? null);
-                $image = ap_remote_actor_as2_media_url($doc['image'] ?? null);
+                $icon = ap_remote_actor_as2_media_url($doc['icon'] ?? null, $actorId);
+                $image = ap_remote_actor_as2_media_url($doc['image'] ?? null, $actorId);
                 if (is_string($icon) && $icon !== '') {
                     ap_remote_actor_icon_miss_clear($actorId);
                 } else {

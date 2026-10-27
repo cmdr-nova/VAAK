@@ -649,6 +649,68 @@ pub(crate) fn https_public_url(raw: &str) -> Option<String> {
     Some(url.to_string())
 }
 
+fn https_host(url: &str) -> Option<String> {
+    let rest = url.trim().strip_prefix("https://")?;
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.is_empty() || authority.contains('@') {
+        return None;
+    }
+    let host = if let Some(stripped) = authority.strip_prefix('[') {
+        stripped.split(']').next()?.to_ascii_lowercase()
+    } else {
+        authority.split(':').next().unwrap_or("").to_ascii_lowercase()
+    };
+    if host.is_empty() { None } else { Some(host) }
+}
+
+pub(crate) fn own_media_host(host: &str) -> bool {
+    matches!(
+        host,
+        "mkultra.monster" | "www.mkultra.monster" | "vaak.monster" | "www.vaak.monster"
+    )
+}
+
+pub(crate) fn system_media_path(path: &str) -> bool {
+    let path = path.split(['?', '#']).next().unwrap_or(path);
+    path.starts_with("/system/accounts/avatars/")
+        || path == "/system/accounts/avatars"
+        || path.starts_with("/system/accounts/headers/")
+        || path == "/system/accounts/headers"
+        || path.starts_with("/system/media_attachments/")
+        || path == "/system/media_attachments"
+}
+
+/// Mastodon Paperclip URL served from this instance. The file is not here.
+pub(crate) fn broken_local_system_media(url: &str) -> bool {
+    let rest = url.trim().strip_prefix("https://").unwrap_or("");
+    if rest.is_empty() {
+        return false;
+    }
+    let (authority, path) = match rest.split_once('/') {
+        Some((authority, path)) => (authority, format!("/{path}")),
+        None => (rest, "/".to_string()),
+    };
+    let host = https_host(&format!("https://{authority}")).unwrap_or_default();
+    own_media_host(&host) && system_media_path(&path)
+}
+
+/// Account avatar/header URL. Relative paths resolve against the remote actor, not this host.
+pub(crate) fn account_media_url(raw: &str, actor: &str) -> Option<String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    if raw.starts_with('/') && !raw.starts_with("//") {
+        let host = https_host(actor)?;
+        if own_media_host(&host) {
+            return None;
+        }
+        return account_media_url(&format!("https://{host}{raw}"), "");
+    }
+    let url = https_public_url(raw)?;
+    if broken_local_system_media(&url) { None } else { Some(url) }
+}
+
 fn cid_ok(raw: &str) -> bool {
     let raw = raw.trim();
     (20..=128).contains(&raw.len()) && raw.bytes().all(|b| b.is_ascii_alphanumeric())
@@ -705,25 +767,32 @@ pub(crate) fn bsky_avatar_url(avatar: Option<&Value>, did: &str) -> Option<Strin
 
 /// ActivityPub icon/image: string, Link href, url object, or a list of those.
 pub(crate) fn activitypub_image_url(node: Option<&Value>) -> Option<String> {
+    activitypub_image_url_for(node, "")
+}
+
+/// Same shapes as [`activitypub_image_url`], resolving root-relative URLs against `actor`.
+pub(crate) fn activitypub_image_url_for(node: Option<&Value>, actor: &str) -> Option<String> {
     let node = node?;
     if let Some(items) = node.as_array() {
         for item in items {
-            if let Some(url) = activitypub_image_url(Some(item)) {
+            if let Some(url) = activitypub_image_url_for(Some(item), actor) {
                 return Some(url);
             }
         }
         return None;
     }
     if let Some(raw) = node.as_str() {
-        return https_public_url(raw);
+        return account_media_url(raw, actor);
     }
     let obj = node.as_object()?;
     if let Some(url) = obj.get("url") {
-        if let Some(found) = activitypub_image_url(Some(url)) {
+        if let Some(found) = activitypub_image_url_for(Some(url), actor) {
             return Some(found);
         }
     }
-    obj.get("href").and_then(|v| v.as_str()).and_then(https_public_url)
+    obj.get("href")
+        .and_then(|v| v.as_str())
+        .and_then(|raw| account_media_url(raw, actor))
 }
 
 #[cfg(test)]
@@ -787,5 +856,36 @@ mod avatar_url_tests {
         );
         assert_eq!(activitypub_image_url(Some(&json!("http://cdn.example/a.png"))), None);
         assert_eq!(activitypub_image_url(Some(&json!("https://127.0.0.1/a.png"))), None);
+        let paperclip = "https://mkultra.monster/system/accounts/avatars/111/939/142/189/797/780/original/3b513d04526c9dac.png";
+        assert_eq!(account_media_url(paperclip, "https://mastodon.social/users/a"), None);
+        assert_eq!(
+            account_media_url(
+                "https://mastodon.social/system/accounts/avatars/111/939/142/189/797/780/original/3b513d04526c9dac.png",
+                "https://mastodon.social/users/a"
+            ).as_deref(),
+            Some("https://mastodon.social/system/accounts/avatars/111/939/142/189/797/780/original/3b513d04526c9dac.png")
+        );
+        assert_eq!(
+            account_media_url(
+                "/system/accounts/avatars/111/939/142/189/797/780/original/3b513d04526c9dac.png",
+                "https://mastodon.social/users/a"
+            ).as_deref(),
+            Some("https://mastodon.social/system/accounts/avatars/111/939/142/189/797/780/original/3b513d04526c9dac.png")
+        );
+        assert_eq!(
+            account_media_url("/system/accounts/avatars/1/original/a.png", "https://mkultra.monster/users/a"),
+            None
+        );
+        assert_eq!(
+            account_media_url("https://mkultra.monster/img/avatar/default.webp", "").as_deref(),
+            Some("https://mkultra.monster/img/avatar/default.webp")
+        );
+        assert_eq!(
+            activitypub_image_url_for(
+                Some(&json!("/system/accounts/avatars/1/original/a.png")),
+                "https://remote.example/users/a"
+            ).as_deref(),
+            Some("https://remote.example/system/accounts/avatars/1/original/a.png")
+        );
     }
 }

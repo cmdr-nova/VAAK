@@ -904,11 +904,11 @@ function ap_r2_delete_object(string $key, bool $allowLocalMedia = false): array
 /**
  * Extract https media URL from ActivityPub icon/image field.
  */
-function ap_as2_media_url(mixed $node): ?string
+function ap_as2_media_url(mixed $node, ?string $baseActorUrl = null): ?string
 {
     if (is_array($node) && array_is_list($node)) {
         foreach ($node as $item) {
-            $found = ap_as2_media_url($item);
+            $found = ap_as2_media_url($item, $baseActorUrl);
             if (is_string($found) && $found !== '') {
                 return $found;
             }
@@ -916,29 +916,31 @@ function ap_as2_media_url(mixed $node): ?string
         return null;
     }
     if (is_string($node)) {
-        return ap_profile_sanitize_https_url($node);
+        return function_exists('ap_account_media_resolve')
+            ? ap_account_media_resolve($node, $baseActorUrl)
+            : ap_profile_sanitize_https_url($node);
     }
     if (!is_array($node)) {
         return null;
     }
     if (isset($node['url'])) {
         if (is_string($node['url'])) {
-            return ap_profile_sanitize_https_url($node['url']);
+            return ap_as2_media_url($node['url'], $baseActorUrl);
         }
         if (is_array($node['url'])) {
             // list of Link objects or single
             if (isset($node['url']['href'])) {
-                return ap_profile_sanitize_https_url($node['url']['href']);
+                return ap_as2_media_url($node['url']['href'], $baseActorUrl);
             }
             foreach ($node['url'] as $u) {
                 if (is_string($u)) {
-                    $s = ap_profile_sanitize_https_url($u);
+                    $s = ap_as2_media_url($u, $baseActorUrl);
                     if ($s) {
                         return $s;
                     }
                 }
-                if (is_array($u) && isset($u['href'])) {
-                    $s = ap_profile_sanitize_https_url($u['href']);
+                if (is_array($u) && isset($u['href']) && is_string($u['href'])) {
+                    $s = ap_as2_media_url($u['href'], $baseActorUrl);
                     if ($s) {
                         return $s;
                     }
@@ -947,7 +949,7 @@ function ap_as2_media_url(mixed $node): ?string
         }
     }
     if (isset($node['href']) && is_string($node['href'])) {
-        return ap_profile_sanitize_https_url($node['href']);
+        return ap_as2_media_url($node['href'], $baseActorUrl);
     }
     return null;
 }
@@ -1311,8 +1313,8 @@ function ap_remote_media_ensure(string $actorId, string $kind = 'avatar', bool $
     }
     $host = parse_url($actorId, PHP_URL_HOST);
     $host = is_string($host) ? strtolower($host) : null;
-    $iconSrc = ap_as2_media_url($doc['icon'] ?? null);
-    $imageSrc = ap_as2_media_url($doc['image'] ?? null);
+    $iconSrc = ap_as2_media_url($doc['icon'] ?? null, $actorId);
+    $imageSrc = ap_as2_media_url($doc['image'] ?? null, $actorId);
     ap_remote_actor_upsert($actorId, [
         'username' => $username,
         'display_name' => $display,
@@ -1666,15 +1668,21 @@ function ap_remote_media_account_urls(string $actorId): array
         if ($avatar === null) {
             $cachedA = ap_remote_media_get($lid, 'avatar');
             if ($cachedA) {
-                $avatar = (string) $cachedA['public_url'];
-                $warmId = $lid;
+                $candidate = ap_account_media_resolve((string) ($cachedA['public_url'] ?? ''));
+                if (is_string($candidate) && $candidate !== '') {
+                    $avatar = $candidate;
+                    $warmId = $lid;
+                }
             }
         }
         if ($header === null) {
             $cachedH = ap_remote_media_get($lid, 'header');
             if ($cachedH) {
-                $header = (string) $cachedH['public_url'];
-                $warmId = $lid;
+                $candidate = ap_account_media_resolve((string) ($cachedH['public_url'] ?? ''));
+                if (is_string($candidate) && $candidate !== '') {
+                    $header = $candidate;
+                    $warmId = $lid;
+                }
             }
         }
         if ($avatar !== null && $header !== null) {
@@ -1690,11 +1698,11 @@ function ap_remote_media_account_urls(string $actorId): array
                 continue;
             }
             if ($avatar === null && !empty($meta['icon_source_url'])) {
-                $avatar = ap_profile_sanitize_https_url($meta['icon_source_url']);
+                $avatar = ap_account_media_resolve($meta['icon_source_url'], $lid);
                 $warmId = $lid;
             }
             if ($header === null && !empty($meta['image_source_url'])) {
-                $header = ap_profile_sanitize_https_url($meta['image_source_url']);
+                $header = ap_account_media_resolve($meta['image_source_url'], $lid);
                 $warmId = $lid;
             }
             if ($avatar !== null && ($header !== null || !empty($meta['icon_source_url']))) {
@@ -1707,9 +1715,10 @@ function ap_remote_media_account_urls(string $actorId): array
         ap_remote_media_warm_async($warmId);
     }
 
-    // Re-sanitize R2/public URLs too (defense in depth for timeline JSON)
-    $avatar = ap_profile_sanitize_https_url($avatar) ?: $fallback;
-    $header = ap_profile_sanitize_https_url($header) ?: $avatar;
+    // Re-sanitize R2/public URLs too (defense in depth for timeline JSON).
+    // A Mastodon /system/accounts path on this host is not a file we can serve.
+    $avatar = ap_account_media_resolve(is_string($avatar) ? $avatar : null) ?: $fallback;
+    $header = ap_account_media_resolve(is_string($header) ? $header : null) ?: $avatar;
     return ['avatar' => $avatar, 'header' => $header];
 }
 

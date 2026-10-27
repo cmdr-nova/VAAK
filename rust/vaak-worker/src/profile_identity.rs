@@ -59,7 +59,9 @@ pub(crate) fn sanitized_profile_url(raw:&str)->Option<String>{
  });
  if !icon.starts_with("https://")||icon.len()>800||host.is_empty()||authority.contains('@')||icon.bytes().any(|b|b<32||b==127)||matches!(host.as_str(),"localhost"|"127.0.0.1"|"::1"|"[::1]")||private||port_bad{None}else{Some(icon.into())}
 }
-pub(crate) fn local_avatar(raw:&str)->String{sanitized_profile_url(raw).unwrap_or_else(||"https://mkultra.monster/img/avatar/local-default.webp".into())}
+pub(crate) fn local_avatar(raw:&str)->String{
+ match sanitized_profile_url(raw){Some(icon) if !crate::actor_warm::broken_local_system_media(&icon)=>icon,_=>"https://mkultra.monster/img/avatar/local-default.webp".into()}
+}
 
 /// Label, flat cache key, and whether a placeholder username would warm.
 /// Same helpers the profile identity unit test compares to PHP.
@@ -97,7 +99,7 @@ pub(crate) async fn ask_identity(db:&Client,context:&WarmContext,mut ask:Value)-
   let label=label(&actor,row.as_ref());
   let mut icon=if matches!(actor.as_str(),"https://waffles.baeddel.social/fediverse/blog/admin"|"https://app.wafrn.net/fediverse/blog/admin"){"https://mkultra.monster/img/avatar/wafrn-approvals.webp".into()}else{row.as_ref().map(|r|field(r,"icon_source_url")).unwrap_or_default()};
   if icon.is_empty(){if let Some(row)=db.query_opt("SELECT public_url FROM remote_media_cache WHERE actor_id=$1 AND kind='avatar' LIMIT 1",&[&actor]).await?{icon=row.get::<_,Option<String>>(0).unwrap_or_default();}}
-  (card::php_trim(&field(&label,"display_name")).into(),field(&label,"handle"),if icon.starts_with("https://"){icon}else{fallback.into()})
+  (card::php_trim(&field(&label,"display_name")).into(),field(&label,"handle"),crate::actor_warm::account_media_url(&icon,&actor).unwrap_or_else(||fallback.into()))
  };
  ask["asker_display"]=json!(display);ask["asker_handle"]=json!(handle);ask["asker_avatar"]=json!(avatar);
  ask["_body_answer"]=ask.get("answer").or_else(||ask.get("ask_answer")).cloned().unwrap_or(Value::Null);ask["answer"]=json!("");Ok(ask)

@@ -463,11 +463,8 @@ fn rss_acct(feed_title: &str) -> String {
 }
 
 fn empty_account(id: &str, username: &str, acct: &str, display: &str, url: &str, avatar: &str) -> Value {
-    let av = if avatar.starts_with("https://") {
-        avatar
-    } else {
-        DEFAULT_AVATAR
-    };
+    let owned = crate::actor_warm::account_media_url(avatar, url);
+    let av = owned.as_deref().unwrap_or(DEFAULT_AVATAR);
     json!({
         "id": id,
         "username": username,
@@ -1901,11 +1898,8 @@ fn local_account_from_profile(
         // Mirrors ap_profile_display_name: vanity ✓ then automated 🤖.
         if p.vanity_verified { d.push_str(" ✓"); }
         if p.automated { d.push_str(" 🤖"); }
-        let a = if p.icon_url.starts_with("https://") {
-            p.icon_url.clone()
-        } else {
-            LOCAL_DEFAULT_AVATAR.to_string()
-        };
+        let a = crate::actor_warm::account_media_url(&p.icon_url, actor_url)
+            .unwrap_or_else(|| LOCAL_DEFAULT_AVATAR.to_string());
         (d, a)
     } else {
         (username.to_string(), LOCAL_DEFAULT_AVATAR.to_string())
@@ -3167,12 +3161,17 @@ async fn fetch_actors_map(db: &Client, actor_ids: &[String]) -> Result<HashMap<S
                     }
                 }
             }
-            if !icon.starts_with("https://") {
-                if let Some(found) = crate::actor_warm::activitypub_image_url(profile.get("icon")) {
-                    icon = found;
-                }
+            if let Some(found) = crate::actor_warm::account_media_url(&icon, &key) {
+                icon = found;
+            } else if let Some(found) = crate::actor_warm::activitypub_image_url_for(profile.get("icon"), &key) {
+                icon = found;
+            } else {
+                icon.clear();
             }
             emojis = actor_emojis(&profile);
+        }
+        if crate::actor_warm::account_media_url(&icon, &key).is_none() {
+            icon.clear();
         }
         map.insert(
             key,
@@ -3188,15 +3187,17 @@ async fn fetch_actors_map(db: &Client, actor_ids: &[String]) -> Result<HashMap<S
     }
     let missing: Vec<String> = map
         .iter()
-        .filter(|(_, row)| !row.icon.starts_with("https://"))
+        .filter(|(_, row)| crate::actor_warm::account_media_url(&row.icon, "").is_none())
         .map(|(id, _)| id.clone())
         .collect();
     if !missing.is_empty() {
         if let Ok(cached) = fetch_remote_avatar_cache(db, &missing).await {
             for (id, url) in cached {
                 if let Some(row) = map.get_mut(&id) {
-                    if !row.icon.starts_with("https://") && url.starts_with("https://") {
-                        row.icon = url;
+                    if crate::actor_warm::account_media_url(&row.icon, &id).is_none() {
+                        if let Some(fixed) = crate::actor_warm::account_media_url(&url, &id) {
+                            row.icon = fixed;
+                        }
                     }
                 }
             }
@@ -3395,13 +3396,12 @@ fn asker_identity(
         .unwrap_or_else(|| username.clone());
     let avatar = if let Some(url) = peer_avatar_override(actor) {
         url.to_string()
-    } else if let Some(icon) = row.map(|r| r.icon.as_str()).filter(|u| u.starts_with("https://")) {
-        icon.to_string()
+    } else if let Some(icon) = row.map(|r| r.icon.as_str()).and_then(|u| crate::actor_warm::account_media_url(u, actor)) {
+        icon
     } else {
         media
             .get(actor)
-            .cloned()
-            .filter(|url| url.starts_with("https://"))
+            .and_then(|url| crate::actor_warm::account_media_url(url, actor))
             .unwrap_or_else(|| DEFAULT_AVATAR.to_string())
     };
     (display, asker_remote_handle(&username, &host), avatar)
