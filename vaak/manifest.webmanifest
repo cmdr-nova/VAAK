@@ -1,0 +1,16 @@
+{
+  "name": "VAAK",
+  "short_name": "VAAK",
+  "id": "/vaak/",
+  "start_url": "/vaak/",
+  "scope": "/vaak/",
+  "display": "standalone",
+  "background_color": "#0a0a0a",
+  "theme_color": "#0a0a0a",
+  "icons": [
+    { "src": "/vaak/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "/vaak/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "/vaak/apple-touch-icon.png", "sizes": "180x180", "type": "image/png" },
+    { "src": "/vaak/favicon.svg", "sizes": "any", "type": "image/svg+xml" }
+  ]
+}
