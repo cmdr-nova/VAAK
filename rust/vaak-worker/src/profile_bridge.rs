@@ -40,22 +40,26 @@ pub(crate) fn prewarm_complete_profile(){
 pub(crate) async fn with_production_budget<T>(fut:impl std::future::Future<Output=T>)->T{
  PROFILE_DEADLINE.scope(std::time::Instant::now()+complete_budget(),PROFILE_STAGES.scope(std::cell::Cell::new(StageTimes::default()),fut)).await
 }
+/// True inside a production complete-profile request (fixtures run outside).
+pub(crate) fn in_production_request()->bool{PROFILE_DEADLINE.try_with(|_|()).is_ok()}
 /// True once the production deadline has passed. Unset (fixtures) is never late.
 pub(crate) fn past_deadline()->bool{PROFILE_DEADLINE.try_with(|deadline|std::time::Instant::now()>=*deadline).unwrap_or(false)}
 /// Wall time per stage of one complete-profile request, in microseconds. It is
 /// carried as a task-local beside PROFILE_DEADLINE and only read for the log
 /// line. Counts and timings only: no SQL, URL or post text is recorded.
 /// Stages nest: materialize..proof sit inside cards; warm and dns sit inside
-/// whichever stage awaited them.
+/// whichever stage awaited them. The header_* sub-stages split header time and
+/// also accrue when recheck/publish rerun the header dependency checks.
 #[derive(Default,Clone,Copy,Debug,PartialEq)]
-pub(crate) struct StageTimes{connect_us:u64,session_us:u64,header_us:u64,source_us:u64,cards_us:u64,materialize_us:u64,effects_us:u64,presentation_us:u64,admission_us:u64,warm_us:u64,dns_us:u64,paint_us:u64,proof_us:u64,recheck_us:u64,render_us:u64,serialize_us:u64,publish_us:u64,cards:u64,warm_calls:u64,dns_lookups:u64,ledger_checks:u64}
+pub(crate) struct StageTimes{connect_us:u64,session_us:u64,header_us:u64,source_us:u64,cards_us:u64,materialize_us:u64,effects_us:u64,presentation_us:u64,admission_us:u64,warm_us:u64,dns_us:u64,paint_us:u64,proof_us:u64,recheck_us:u64,render_us:u64,serialize_us:u64,publish_us:u64,header_deps_us:u64,header_probe_us:u64,header_redis_us:u64,header_counts_us:u64,header_bsky_us:u64,header_recheck_us:u64,cards:u64,warm_calls:u64,dns_lookups:u64,ledger_checks:u64,header_deps_runs:u64,header_probes:u64,header_redis_ops:u64,header_rechecks:u64}
 #[derive(Clone,Copy,Debug)]
-pub(crate) enum Stage{Connect,Session,Header,Source,Cards,Materialize,Effects,Presentation,Admission,Warm,Dns,Paint,Proof,Recheck,Render,Serialize,Publish}
+pub(crate) enum Stage{Connect,Session,Header,Source,Cards,Materialize,Effects,Presentation,Admission,Warm,Dns,Paint,Proof,Recheck,Render,Serialize,Publish,HeaderDeps,HeaderProbe,HeaderRedis,HeaderCounts,HeaderBsky,HeaderRecheck}
 #[derive(Clone,Copy,Debug)]
 pub(crate) enum StageCount{Card,LedgerCheck}
 tokio::task_local! { static PROFILE_STAGES: std::cell::Cell<StageTimes>; }
 impl StageTimes{
- fn add(&mut self,stage:Stage,us:u64){let slot=match stage{Stage::Connect=>&mut self.connect_us,Stage::Session=>&mut self.session_us,Stage::Header=>&mut self.header_us,Stage::Source=>&mut self.source_us,Stage::Cards=>&mut self.cards_us,Stage::Materialize=>&mut self.materialize_us,Stage::Effects=>&mut self.effects_us,Stage::Presentation=>&mut self.presentation_us,Stage::Admission=>&mut self.admission_us,Stage::Warm=>{self.warm_calls+=1;&mut self.warm_us},Stage::Dns=>{self.dns_lookups+=1;&mut self.dns_us},Stage::Paint=>&mut self.paint_us,Stage::Proof=>&mut self.proof_us,Stage::Recheck=>&mut self.recheck_us,Stage::Render=>&mut self.render_us,Stage::Serialize=>&mut self.serialize_us,Stage::Publish=>&mut self.publish_us};*slot=slot.saturating_add(us);}
+ fn add(&mut self,stage:Stage,us:u64){let slot=match stage{Stage::Connect=>&mut self.connect_us,Stage::Session=>&mut self.session_us,Stage::Header=>&mut self.header_us,Stage::Source=>&mut self.source_us,Stage::Cards=>&mut self.cards_us,Stage::Materialize=>&mut self.materialize_us,Stage::Effects=>&mut self.effects_us,Stage::Presentation=>&mut self.presentation_us,Stage::Admission=>&mut self.admission_us,Stage::Warm=>{self.warm_calls+=1;&mut self.warm_us},Stage::Dns=>{self.dns_lookups+=1;&mut self.dns_us},Stage::Paint=>&mut self.paint_us,Stage::Proof=>&mut self.proof_us,Stage::Recheck=>&mut self.recheck_us,Stage::Render=>&mut self.render_us,Stage::Serialize=>&mut self.serialize_us,Stage::Publish=>&mut self.publish_us,Stage::HeaderDeps=>{self.header_deps_runs+=1;&mut self.header_deps_us},Stage::HeaderProbe=>{self.header_probes+=1;&mut self.header_probe_us},Stage::HeaderRedis=>{self.header_redis_ops+=1;&mut self.header_redis_us},Stage::HeaderCounts=>&mut self.header_counts_us,Stage::HeaderBsky=>&mut self.header_bsky_us,Stage::HeaderRecheck=>{self.header_rechecks+=1;&mut self.header_recheck_us}};*slot=slot.saturating_add(us);}
+ #[cfg(test)] pub(crate) fn header_breakdown(&self)->serde_json::Value{json!({"header_ms":self.header_us as f64/1000.0,"deps_ms":self.header_deps_us as f64/1000.0,"deps_runs":self.header_deps_runs,"probe_ms":self.header_probe_us as f64/1000.0,"probes":self.header_probes,"redis_ms":self.header_redis_us as f64/1000.0,"redis_ops":self.header_redis_ops,"counts_ms":self.header_counts_us as f64/1000.0,"bsky_ms":self.header_bsky_us as f64/1000.0,"recheck_ms":self.header_recheck_us as f64/1000.0,"rechecks":self.header_rechecks})}
  fn count(&mut self,counter:StageCount){match counter{StageCount::Card=>self.cards+=1,StageCount::LedgerCheck=>self.ledger_checks+=1}}
 }
 fn ms(us:u64)->u64{us/1_000}
@@ -64,7 +68,7 @@ pub(crate) fn record_stage(stage:Stage,started:std::time::Instant){let us=starte
 pub(crate) fn count_stage(counter:StageCount){let _=PROFILE_STAGES.try_with(|cell|{let mut times=cell.get();times.count(counter);cell.set(times)});}
 /// Time one awaited stage. It is recorded whether the future succeeds or fails.
 pub(crate) async fn timed<T>(stage:Stage,fut:impl std::future::Future<Output=T>)->T{let started=std::time::Instant::now();let out=fut.await;record_stage(stage,started);out}
-fn stage_times()->StageTimes{PROFILE_STAGES.try_with(std::cell::Cell::get).unwrap_or_default()}
+pub(crate) fn stage_times()->StageTimes{PROFILE_STAGES.try_with(std::cell::Cell::get).unwrap_or_default()}
 /// Stable reason code for the 422 body and the worker log. The error Display
 /// is not logged: it can carry SQL or post text. Codes after "request" name
 /// families that used to land in "unclassified": typed Postgres and JSON errors
@@ -98,11 +102,11 @@ pub(crate) fn fallback_reason(err:&anyhow::Error)->&'static str{
 fn fallback_body(reason:&str)->serde_json::Value{json!({"fallback":true,"reason":reason})}
 pub(crate) fn log_fallback(route:&str,profile_target:&str,owner:i64,viewer:&str,tab:&str,offset:i64,reason:&str,started:std::time::Instant){
  let t=stage_times();
- tracing::warn!(target:"vaak.profile.complete",profile_target,owner,viewer,tab,offset,route,reason,elapsed_ms=started.elapsed().as_millis() as u64,over_budget=past_deadline(),connect_ms=ms(t.connect_us),session_ms=ms(t.session_us),header_ms=ms(t.header_us),source_ms=ms(t.source_us),cards_ms=ms(t.cards_us),materialize_ms=ms(t.materialize_us),effects_ms=ms(t.effects_us),presentation_ms=ms(t.presentation_us),admission_ms=ms(t.admission_us),warm_ms=ms(t.warm_us),dns_ms=ms(t.dns_us),paint_ms=ms(t.paint_us),proof_ms=ms(t.proof_us),recheck_ms=ms(t.recheck_us),render_ms=ms(t.render_us),serialize_ms=ms(t.serialize_us),publish_ms=ms(t.publish_us),cards=t.cards,warm_calls=t.warm_calls,dns_lookups=t.dns_lookups,ledger_checks=t.ledger_checks,"complete profile fallback");
+ tracing::warn!(target:"vaak.profile.complete",profile_target,owner,viewer,tab,offset,route,reason,elapsed_ms=started.elapsed().as_millis() as u64,over_budget=past_deadline(),connect_ms=ms(t.connect_us),session_ms=ms(t.session_us),header_ms=ms(t.header_us),source_ms=ms(t.source_us),cards_ms=ms(t.cards_us),materialize_ms=ms(t.materialize_us),effects_ms=ms(t.effects_us),presentation_ms=ms(t.presentation_us),admission_ms=ms(t.admission_us),warm_ms=ms(t.warm_us),dns_ms=ms(t.dns_us),paint_ms=ms(t.paint_us),proof_ms=ms(t.proof_us),recheck_ms=ms(t.recheck_us),render_ms=ms(t.render_us),serialize_ms=ms(t.serialize_us),publish_ms=ms(t.publish_us),header_deps_ms=ms(t.header_deps_us),header_probe_ms=ms(t.header_probe_us),header_redis_ms=ms(t.header_redis_us),header_counts_ms=ms(t.header_counts_us),header_bsky_ms=ms(t.header_bsky_us),header_recheck_ms=ms(t.header_recheck_us),cards=t.cards,warm_calls=t.warm_calls,dns_lookups=t.dns_lookups,ledger_checks=t.ledger_checks,header_deps_runs=t.header_deps_runs,header_probes=t.header_probes,header_redis_ops=t.header_redis_ops,header_rechecks=t.header_rechecks,"complete profile fallback");
 }
 pub(crate) fn log_complete(route:&str,profile_target:&str,owner:i64,viewer:&str,tab:&str,offset:i64,started:std::time::Instant){
  let t=stage_times();
- tracing::info!(target:"vaak.profile.complete",profile_target,owner,viewer,tab,offset,route,elapsed_ms=started.elapsed().as_millis() as u64,over_budget=past_deadline(),connect_ms=ms(t.connect_us),session_ms=ms(t.session_us),header_ms=ms(t.header_us),source_ms=ms(t.source_us),cards_ms=ms(t.cards_us),materialize_ms=ms(t.materialize_us),effects_ms=ms(t.effects_us),presentation_ms=ms(t.presentation_us),admission_ms=ms(t.admission_us),warm_ms=ms(t.warm_us),dns_ms=ms(t.dns_us),paint_ms=ms(t.paint_us),proof_ms=ms(t.proof_us),recheck_ms=ms(t.recheck_us),render_ms=ms(t.render_us),serialize_ms=ms(t.serialize_us),publish_ms=ms(t.publish_us),cards=t.cards,warm_calls=t.warm_calls,dns_lookups=t.dns_lookups,ledger_checks=t.ledger_checks,"complete profile rendered");
+ tracing::info!(target:"vaak.profile.complete",profile_target,owner,viewer,tab,offset,route,elapsed_ms=started.elapsed().as_millis() as u64,over_budget=past_deadline(),connect_ms=ms(t.connect_us),session_ms=ms(t.session_us),header_ms=ms(t.header_us),source_ms=ms(t.source_us),cards_ms=ms(t.cards_us),materialize_ms=ms(t.materialize_us),effects_ms=ms(t.effects_us),presentation_ms=ms(t.presentation_us),admission_ms=ms(t.admission_us),warm_ms=ms(t.warm_us),dns_ms=ms(t.dns_us),paint_ms=ms(t.paint_us),proof_ms=ms(t.proof_us),recheck_ms=ms(t.recheck_us),render_ms=ms(t.render_us),serialize_ms=ms(t.serialize_us),publish_ms=ms(t.publish_us),header_deps_ms=ms(t.header_deps_us),header_probe_ms=ms(t.header_probe_us),header_redis_ms=ms(t.header_redis_us),header_counts_ms=ms(t.header_counts_us),header_bsky_ms=ms(t.header_bsky_us),header_recheck_ms=ms(t.header_recheck_us),cards=t.cards,warm_calls=t.warm_calls,dns_lookups=t.dns_lookups,ledger_checks=t.ledger_checks,header_deps_runs=t.header_deps_runs,header_probes=t.header_probes,header_redis_ops=t.header_redis_ops,header_rechecks=t.header_rechecks,"complete profile rendered");
 }
 #[derive(Deserialize)]
 #[serde(tag="kind",rename_all="snake_case",deny_unknown_fields)]
@@ -215,12 +219,12 @@ mod tests{
   record_stage(Stage::Header,std::time::Instant::now());count_stage(StageCount::Card);assert_eq!(stage_times(),StageTimes::default());
   let times=with_production_budget(async{
    let started=std::time::Instant::now()-std::time::Duration::from_millis(5);record_stage(Stage::Header,started);record_stage(Stage::Header,started);
-   timed(Stage::Dns,async{}).await;timed(Stage::Warm,async{}).await;count_stage(StageCount::Card);count_stage(StageCount::Card);count_stage(StageCount::LedgerCheck);
+   timed(Stage::Dns,async{}).await;timed(Stage::Warm,async{}).await;for stage in[Stage::HeaderDeps,Stage::HeaderProbe,Stage::HeaderRedis,Stage::HeaderRecheck,Stage::HeaderCounts,Stage::HeaderBsky]{record_stage(stage,started);}count_stage(StageCount::Card);count_stage(StageCount::Card);count_stage(StageCount::LedgerCheck);
    let failed:Result<()>=timed(Stage::Publish,async{bail!("still timed")}).await;assert!(failed.is_err());
    stage_times()
   }).await;
   assert!(times.header_us>=10_000,"{times:?}");assert!(ms(times.header_us)>=10);
-  assert_eq!((times.cards,times.ledger_checks,times.dns_lookups,times.warm_calls),(2,1,1,1));
+  assert_eq!((times.cards,times.ledger_checks,times.dns_lookups,times.warm_calls),(2,1,1,1));assert_eq!((times.header_deps_runs,times.header_probes,times.header_redis_ops,times.header_rechecks),(1,1,1,1));assert!(times.header_counts_us>=5_000&&times.header_bsky_us>=5_000&&times.header_deps_us>=5_000);
   assert_eq!(times.connect_us,0);assert_eq!(stage_times(),StageTimes::default());
   assert_eq!(fallback_body("budget"),json!({"fallback":true,"reason":"budget"}));
  }
