@@ -29,6 +29,7 @@ mod status_emoji;
 mod quote_media;
 mod notif_list;
 mod notif_page;
+mod notif_entity;
 mod profile_html;
 mod profile_context;
 mod profile_remote_context;
