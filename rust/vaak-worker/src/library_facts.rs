@@ -233,7 +233,8 @@ async fn local_counts_mode(db:&Client,note:&str,sid:&str,include_bookmarks:bool)
     Ok(counts)
 }
 
-pub(crate) async fn emoji_maps(db:&Client,status:&Value)->Result<std::collections::HashMap<String,std::collections::HashMap<String,String>>> {
+pub(crate) async fn emoji_maps(db:&Client,status:&Value)->Result<std::collections::HashMap<String,std::collections::HashMap<String,String>>> {emoji_maps_with_context(db,status,None).await}
+pub(crate) async fn emoji_maps_with_context(db:&Client,status:&Value,warm:Option<&crate::profile_enrichment::WarmContext>)->Result<std::collections::HashMap<String,std::collections::HashMap<String,String>>> {
     fn collect(value:&Value,actors:&mut Vec<String>){
         match value {
             Value::Object(object)=>{if let Some(account)=object.get("account"){let actor=s(account,"uri");if !actor.is_empty()&&!actors.iter().any(|a|a==actor){actors.push(actor.into());}}for child in object.values().filter(|v|v.is_object()||v.is_array()){collect(child,actors);}},
@@ -241,7 +242,7 @@ pub(crate) async fn emoji_maps(db:&Client,status:&Value)->Result<std::collection
         }
     }
     let mut actors=Vec::new();collect(status,&mut actors);let mut maps=std::collections::HashMap::new();
-    for actor in actors {let rows=db.query("SELECT shortcode,url FROM remote_custom_emojis WHERE host=$1",&[&host(&actor)]).await?;let mut map=std::collections::HashMap::new();for row in rows {let code:String=row.get(0);let url:String=row.get(1);if !code.is_empty()&&url.starts_with("https://"){map.insert(code,url);}}maps.insert(actor,map);}
+    for actor in actors {let host_name=host(&actor);if let Some(cached)=warm.and_then(|context|context.cached_emoji_host(&host_name)){maps.insert(actor,cached);continue}let rows=db.query("SELECT shortcode,url FROM remote_custom_emojis WHERE host=$1",&[&host_name]).await?;let mut map=std::collections::HashMap::new();for row in rows {let code:String=row.get(0);let url:String=row.get(1);if !code.is_empty()&&url.starts_with("https://"){map.insert(code,url);}}if let Some(context)=warm{context.cache_emoji_host(&host_name,map.clone());}maps.insert(actor,map);}
     // Emoji carried on the status/account itself (Mastodon API shape) fill
     // gaps the host cache has not learned yet.
     fn carried(value:&Value,maps:&mut std::collections::HashMap<String,std::collections::HashMap<String,String>>){

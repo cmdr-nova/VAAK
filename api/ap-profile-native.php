@@ -21,6 +21,51 @@ function ap_profile_complete_native_enabled(): bool
     return getenv('VAAK_PROFILE_COMPLETE_NATIVE') === '1'
         && strlen((string) getenv('VAAK_PROFILE_COMPLETE_SECRET')) >= 32;
 }
+/** Loopback budget. A refusal must not hold the PHP page for multiple seconds. */
+function ap_profile_complete_timeout_ms(): int
+{
+    $raw = getenv('VAAK_PROFILE_COMPLETE_TIMEOUT_MS');
+    $ms = is_string($raw) && ctype_digit(trim($raw)) ? (int) trim($raw) : 400;
+    return max(100, min(2000, $ms));
+}
+function ap_profile_complete_fallback_ttl(): int
+{
+    $raw = getenv('VAAK_PROFILE_COMPLETE_FALLBACK_TTL');
+    $ttl = is_string($raw) && ctype_digit(trim($raw)) ? (int) trim($raw) : 30;
+    return max(5, min(120, $ttl));
+}
+function ap_profile_complete_fallback_key(string $actorKey, string $route, string $tab): string
+{
+    $route = preg_replace('/[^a-z]/', '', strtolower($route)) ?: 'page';
+    $tab = preg_replace('/[^a-z_]/', '', strtolower($tab)) ?: 'posts';
+    $actorKey = preg_replace('/[^a-z0-9_]/', '', strtolower($actorKey)) ?: 'actor';
+    return 'vaak:profile-complete-fallback:v1:' . $route . ':' . $actorKey . ':' . $tab;
+}
+function ap_profile_complete_fallback_cached(string $actorKey, string $route, string $tab): bool
+{
+    if (!function_exists('ap_redis_json_get')) return false;
+    $row = ap_redis_json_get(ap_profile_complete_fallback_key($actorKey, $route, $tab));
+    return is_array($row) && ($row['fallback'] ?? null) === true;
+}
+function ap_profile_complete_remember_fallback(string $actorKey, string $route, string $tab, string $reason): void
+{
+    if (!function_exists('ap_redis_json_set')) return;
+    $reason = strtolower($reason);
+    if (!preg_match('/^[a-z0-9_]{1,40}$/', $reason)) $reason = 'unclassified';
+    ap_redis_json_set(ap_profile_complete_fallback_key($actorKey, $route, $tab), ['fallback' => true, 'reason' => $reason], ap_profile_complete_fallback_ttl());
+}
+/** Cache a non-200 complete-profile response so the next page does not call Rust. */
+function ap_profile_complete_observe_transport(string $actorKey, string $route, string $tab, int $code, mixed $raw): void
+{
+    if ($code === 200) return;
+    $reason = $code === 0 ? 'timeout' : 'transport';
+    if ($code === 422 && is_string($raw)) {
+        $decoded = json_decode($raw, true);
+        $candidate = is_array($decoded) && is_string($decoded['reason'] ?? null) ? $decoded['reason'] : '';
+        $reason = preg_match('/^[a-z0-9_]{1,40}$/', $candidate) ? $candidate : 'unclassified';
+    }
+    ap_profile_complete_remember_fallback($actorKey, $route, $tab, $reason);
+}
 /** Validate every field before publishing any HTML or either preview global. */
 function ap_profile_complete_reply(mixed $reply, array $binding, int $statusInitial, int $quoteInitial): ?array
 {
@@ -60,6 +105,7 @@ function ap_profile_complete_fetch(string $actor, string $tab, int $limit, int $
         $csrf=ap_auth_csrf_token(); if (!is_string($csrf)||$csrf==='') return null;
     }
     $binding = ['actor_key'=>strtolower($match[1]), 'actor'=>$actor, 'tab'=>$tab, 'mode'=>$mode, 'offset'=>$mode==='first_paint'?0:max(0,$offset), 'limit'=>$mode==='first_paint'?12:max(10,min(50,$limit))];
+    if (ap_profile_complete_fallback_cached($binding['actor_key'], 'page', $tab)) return null;
     $status = ap_native_preview_effective_budget(); $rawQuote = $GLOBALS['admin_quote_link_preview_budget'] ?? null; $quote = is_int($rawQuote) ? $rawQuote : 2;
     if ($status < 0 || $status > 100) return null;
     $request = ['protocol_version'=>1, 'viewer'=>$guest?['kind'=>'guest']:['kind'=>'authenticated','owner_id'=>$owner,'csrf'=>$csrf]] + $binding + ['lazy_media'=>!empty($GLOBALS['admin_bookmark_lazy_media']),'status_preview_budget'=>$status,'quote_preview_budget'=>$quote];
@@ -73,9 +119,9 @@ function ap_profile_complete_fetch(string $actor, string $tab, int $limit, int $
     $base=getenv('VAAK_SHADOW_HTTP');$base=is_string($base)&&trim($base)!==''?rtrim(trim($base),'/'):'http://127.0.0.1:8787';
     $host=parse_url($base,PHP_URL_HOST);if (!is_string($host)||!in_array(strtolower($host),['127.0.0.1','localhost','::1','[::1]'],true)||!function_exists('curl_init')) return null;
     $ch=curl_init($base.'/internal/profile/page');if($ch===false)return null;
-    curl_setopt_array($ch,[CURLOPT_POST=>true,CURLOPT_POSTFIELDS=>$body,CURLOPT_RETURNTRANSFER=>true,CURLOPT_CONNECTTIMEOUT_MS=>120,CURLOPT_TIMEOUT_MS=>8000,CURLOPT_HTTPHEADER=>['Content-Type: application/json','X-VAAK-Profile-Token: '.getenv('VAAK_PROFILE_COMPLETE_SECRET')]]);
+    curl_setopt_array($ch,[CURLOPT_POST=>true,CURLOPT_POSTFIELDS=>$body,CURLOPT_RETURNTRANSFER=>true,CURLOPT_CONNECTTIMEOUT_MS=>120,CURLOPT_TIMEOUT_MS=>ap_profile_complete_timeout_ms(),CURLOPT_HTTPHEADER=>['Content-Type: application/json','X-VAAK-Profile-Token: '.getenv('VAAK_PROFILE_COMPLETE_SECRET')]]);
     $raw=curl_exec($ch);$code=(int)curl_getinfo($ch,CURLINFO_RESPONSE_CODE);curl_close($ch);
-    if($code!==200||!is_string($raw)||strlen($raw)>8*1024*1024)return null;
+    if($code!==200||!is_string($raw)||strlen($raw)>8*1024*1024){ap_profile_complete_observe_transport($binding['actor_key'],'page',$tab,$code,$raw);return null;}
     try{$reply=json_decode($raw,true,512,JSON_THROW_ON_ERROR);}catch(Throwable){return null;}
     return ap_profile_complete_reply($reply,$binding,$status,$quote);
 }
@@ -134,6 +180,7 @@ function ap_profile_full_fetch(string $actor, string $tab, string $from, string 
         $csrf = ap_auth_csrf_token(); if (!is_string($csrf) || $csrf === '') return null;
     }
     $binding = ['actor_key'=>strtolower($match[1]), 'actor'=>$actor, 'tab'=>$tab, 'from'=>$from, 'post'=>$post, 'shell'=>$shell];
+    if (ap_profile_complete_fallback_cached($binding['actor_key'], 'full', $tab)) return null;
     $status = ap_native_preview_effective_budget(); $rawQuote = $GLOBALS['admin_quote_link_preview_budget'] ?? null; $quote = is_int($rawQuote) ? $rawQuote : 2;
     if ($status < 0 || $status > 100) return null;
     $request = ['protocol_version'=>1, 'viewer'=>$guest ? ['kind'=>'guest'] : ['kind'=>'authenticated','owner_id'=>$owner,'csrf'=>$csrf]] + $binding + ['lazy_media'=>!empty($GLOBALS['admin_bookmark_lazy_media']), 'status_preview_budget'=>$status, 'quote_preview_budget'=>$quote];
@@ -147,9 +194,9 @@ function ap_profile_full_fetch(string $actor, string $tab, string $from, string 
     $host = parse_url($base, PHP_URL_HOST);
     if (!is_string($host) || !in_array(strtolower($host), ['127.0.0.1','localhost','::1','[::1]'], true) || !function_exists('curl_init')) return null;
     $ch = curl_init($base . '/internal/profile/full'); if ($ch === false) return null;
-    curl_setopt_array($ch, [CURLOPT_POST=>true, CURLOPT_POSTFIELDS=>$body, CURLOPT_RETURNTRANSFER=>true, CURLOPT_CONNECTTIMEOUT_MS=>120, CURLOPT_TIMEOUT_MS=>8000, CURLOPT_HTTPHEADER=>['Content-Type: application/json', 'X-VAAK-Profile-Token: '.getenv('VAAK_PROFILE_COMPLETE_SECRET')]]);
+    curl_setopt_array($ch, [CURLOPT_POST=>true, CURLOPT_POSTFIELDS=>$body, CURLOPT_RETURNTRANSFER=>true, CURLOPT_CONNECTTIMEOUT_MS=>120, CURLOPT_TIMEOUT_MS=>ap_profile_complete_timeout_ms(), CURLOPT_HTTPHEADER=>['Content-Type: application/json', 'X-VAAK-Profile-Token: '.getenv('VAAK_PROFILE_COMPLETE_SECRET')]]);
     $raw = curl_exec($ch); $code = (int)curl_getinfo($ch, CURLINFO_RESPONSE_CODE); curl_close($ch);
-    if ($code !== 200 || !is_string($raw) || strlen($raw) > 8 * 1024 * 1024) return null;
+    if ($code !== 200 || !is_string($raw) || strlen($raw) > 8 * 1024 * 1024) { ap_profile_complete_observe_transport($binding['actor_key'], 'full', $tab, $code, $raw); return null; }
     try { $reply = json_decode($raw, true, 512, JSON_THROW_ON_ERROR); } catch (Throwable) { return null; }
     return ap_profile_full_reply($reply, $binding, $status, $quote);
 }

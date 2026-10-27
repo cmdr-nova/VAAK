@@ -29,6 +29,7 @@ async fn paint_full(cfg:&crate::config::Config,db:&tokio_postgres::Client,reques
  paint_full_with_warm(db,request,deps,warm,None).await
 }
 async fn paint_full_with_warm(db:&tokio_postgres::Client,request:&FullRequest,deps:&crate::direct_preview::PreviewDependencies<'_>,warm:std::sync::Arc<crate::profile_enrichment::WarmContext>,clock:Option<chrono::DateTime<chrono::Utc>>)->Result<Vec<u8>>{
+ super::ensure_budget()?;
  let guest;let authenticated;
  let viewer=match &request.viewer{
   Viewer::Guest{}=>{guest=crate::profile_context::GuestProfileSession::from_php_guest_profile(request.actor_key.clone(),request.actor.clone(),request.lazy_media,request.status_preview_budget)?.with_quote_preview_budget(request.quote_preview_budget).with_warm_context(warm);crate::profile_materialize::ProfileViewer::Guest(&guest)},
@@ -61,12 +62,14 @@ async fn paint_full_with_warm(db:&tokio_postgres::Client,request:&FullRequest,de
  prepared.require_current(db).await?;Ok(bytes)
 }
 pub(crate) async fn render_full(cfg:&crate::config::Config,headers:HeaderMap,bytes:Bytes)->Response{
- let response=async{
+ let response=super::with_production_budget(async{
   let Some(secret)=secret()else{return StatusCode::NOT_FOUND.into_response()};if !authorized(&headers,&secret){return StatusCode::UNAUTHORIZED.into_response()}
-  let request=match decode_full(&bytes){Ok(request)=>request,Err(_)=>return(StatusCode::BAD_REQUEST,axum::Json(json!({"fallback":true}))).into_response()};
-  let result:Result<Vec<u8>>=async{let db=crate::db::connect(&cfg.database_url).await?;paint_full(cfg,&db,&request,&crate::direct_preview::PreviewDependencies::production()).await}.await;
-  match result{Ok(bytes)=>(StatusCode::OK,[(axum::http::header::CONTENT_TYPE,"application/json")],bytes).into_response(),Err(_)=>(StatusCode::UNPROCESSABLE_ENTITY,axum::Json(json!({"fallback":true}))).into_response()}
- }.await;
+  let started=std::time::Instant::now();
+  let request=match decode_full(&bytes){Ok(request)=>request,Err(_)=>{super::log_fallback("full","",0,"unknown","",0,"request",started);return(StatusCode::BAD_REQUEST,axum::Json(json!({"fallback":true,"reason":"request"}))).into_response()}};
+  let(owner,viewer)=match &request.viewer{Viewer::Guest{}=>(0,"guest"),Viewer::Authenticated{owner_id,..}=>(*owner_id,"authenticated")};
+  let result:Result<Vec<u8>>=async{let db=crate::db::connect(&cfg.database_url).await?;super::ensure_budget()?;paint_full(cfg,&db,&request,&crate::direct_preview::PreviewDependencies::production()).await}.await;
+  match result{Ok(bytes)=>(StatusCode::OK,[(axum::http::header::CONTENT_TYPE,"application/json")],bytes).into_response(),Err(error)=>{let reason=super::fallback_reason(&error);super::log_fallback("full",&request.actor,owner,viewer,&request.tab,request.page,reason,started);(StatusCode::UNPROCESSABLE_ENTITY,axum::Json(json!({"fallback":true,"reason":reason}))).into_response()}}
+ }).await;
  no_store(response).await
 }
 

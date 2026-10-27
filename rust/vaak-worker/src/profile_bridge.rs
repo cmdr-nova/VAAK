@@ -9,6 +9,44 @@ use axum::{body::Bytes,http::{HeaderMap,StatusCode},response::{IntoResponse,Resp
 use serde::{Deserialize,Serialize};
 use serde_json::json;
 const MAX_BYTES:usize=64*1024;const MAX_REPLY:usize=8*1024*1024;
+tokio::task_local! { static PROFILE_DEADLINE: std::time::Instant; }
+/// Production complete-profile requests carry a hard budget. Fixture and unit
+/// callers leave the task-local unset, so existing tests stay unlimited.
+pub(crate) fn ensure_budget()->Result<()>{
+ match PROFILE_DEADLINE.try_with(|deadline| std::time::Instant::now()<*deadline) {
+  Ok(true)|Err(_)=>Ok(()),
+  Ok(false)=>bail!("profile_fallback_code=budget"),
+ }
+}
+fn complete_budget()->std::time::Duration{
+ let ms=std::env::var("VAAK_PROFILE_COMPLETE_BUDGET_MS").ok().and_then(|raw|raw.trim().parse::<u64>().ok()).unwrap_or(250).clamp(50,5_000);
+ std::time::Duration::from_millis(ms)
+}
+pub(crate) async fn with_production_budget<T>(fut:impl std::future::Future<Output=T>)->T{
+ PROFILE_DEADLINE.scope(std::time::Instant::now()+complete_budget(),fut).await
+}
+/// Stable reason code for the 422 body and the worker log. The error Display
+/// is not logged: it can carry SQL or post text.
+pub(crate) fn fallback_reason(err:&anyhow::Error)->&'static str{
+ let text=format!("{err:#}");
+ if text.contains("profile_fallback_code=budget"){"budget"}
+ else if text.contains("associative quote tag"){"quote_tag_order"}
+ else if text.contains("raw Bluesky quote"){"bluesky_quote"}
+ else if text.contains("remote lookup candidate"){"remote_quote"}
+ else if text.contains("unavailable raw quote"){"unavailable_quote"}
+ else if text.contains("summary/tag quote")||text.contains("embedded raw quote"){"quote_dialect"}
+ else if text.contains("event QT"){"event_quote"}
+ else if text.contains("remote account web URL")||text.contains("bridged account web URL"){"bridged_account"}
+ else if text.contains("cold remote avatar"){"cold_avatar"}
+ else if text.contains("cached remote reply"){"remote_reply"}
+ else if text.contains("raw profile target unavailable")||text.contains("raw profile author unavailable"){"author_missing"}
+ else if text.contains("profile request")||text.contains("profile selector")||text.contains("profile first paint")||text.contains("profile append")||text.contains("invalid authenticated")||text.contains("full profile request"){"request"}
+ else{"unclassified"}
+}
+fn fallback_body(reason:&str)->serde_json::Value{json!({"fallback":true,"reason":reason})}
+pub(crate) fn log_fallback(route:&str,profile_target:&str,owner:i64,viewer:&str,tab:&str,offset:i64,reason:&str,started:std::time::Instant){
+ tracing::warn!(target:"vaak.profile.complete",profile_target,owner,viewer,tab,offset,route,reason,elapsed_ms=started.elapsed().as_millis() as u64,"complete profile fallback");
+}
 #[derive(Deserialize)]
 #[serde(tag="kind",rename_all="snake_case",deny_unknown_fields)]
 enum Viewer{Authenticated{owner_id:i64,csrf:String,#[serde(default)] bsky:Option<crate::profile_bsky::PhpProfileBsky>},Guest{}}
@@ -42,6 +80,7 @@ fn decode(bytes:&[u8])->Result<Request>{
  Ok(request)
 }
 async fn paint(cfg:&crate::config::Config,db:&tokio_postgres::Client,request:&Request,deps:&crate::direct_preview::PreviewDependencies<'_>,warm_override:Option<std::sync::Arc<crate::profile_enrichment::WarmContext>>)->Result<Vec<u8>>{
+ ensure_budget()?;
  let warm=warm_override.unwrap_or_else(||std::sync::Arc::new(crate::profile_enrichment::WarmContext::new(cfg.clone(),std::sync::Arc::new(crate::profile_warm::ProcessWarmTransport::configured())).with_preview_context(std::sync::Arc::new(crate::profile_preview_fetch::PreviewFetchContext::new(std::sync::Arc::new(crate::profile_preview_transport::ProcessPreviewTransport::configured(cfg.clone()))))).with_quote_context(std::sync::Arc::new(crate::profile_quote_warm::QuoteWarmContext::new(std::sync::Arc::new(crate::profile_quote_warm::ProcessQuoteTransport::configured(cfg.clone()))).with_bsky_budget_deadline(request.bsky_budget_deadline)))));
  let guest;let authenticated;
  let viewer=match &request.viewer{
@@ -57,22 +96,36 @@ async fn paint(cfg:&crate::config::Config,db:&tokio_postgres::Client,request:&Re
  prepared.require_current(db).await?;Ok(bytes)
 }
 pub(crate) async fn render(cfg:&crate::config::Config,headers:HeaderMap,bytes:Bytes)->Response{
- render_request(cfg,secret().as_deref(),headers,bytes,&crate::direct_preview::PreviewDependencies::production(),None).await
+ with_production_budget(render_request(cfg,secret().as_deref(),headers,bytes,&crate::direct_preview::PreviewDependencies::production(),None)).await
 }
 async fn render_request(cfg:&crate::config::Config,secret:Option<&str>,headers:HeaderMap,bytes:Bytes,deps:&crate::direct_preview::PreviewDependencies<'_>,warm:Option<std::sync::Arc<crate::profile_enrichment::WarmContext>>)->Response{
  let mut response=render_request_inner(cfg,secret,headers,bytes,deps,warm).await;response.headers_mut().insert(axum::http::header::CACHE_CONTROL,axum::http::HeaderValue::from_static("no-store"));response
 }
+fn viewer_log(viewer:&Viewer)->(i64,&'static str){match viewer{Viewer::Guest{}=>(0,"guest"),Viewer::Authenticated{owner_id,..}=>(*owner_id,"authenticated")}}
 async fn render_request_inner(cfg:&crate::config::Config,secret:Option<&str>,headers:HeaderMap,bytes:Bytes,deps:&crate::direct_preview::PreviewDependencies<'_>,warm:Option<std::sync::Arc<crate::profile_enrichment::WarmContext>>)->Response{
  let Some(secret)=secret else{return StatusCode::NOT_FOUND.into_response()};if !authorized(&headers,secret){return StatusCode::UNAUTHORIZED.into_response()}
- let request=match decode(&bytes){Ok(request)=>request,Err(_)=>return(StatusCode::BAD_REQUEST,axum::Json(json!({"fallback":true}))).into_response()};
- let result:Result<Vec<u8>>=async{let db=crate::db::connect(&cfg.database_url).await?;paint(cfg,&db,&request,deps,warm).await}.await;
- match result{Ok(bytes)=>(StatusCode::OK,[(axum::http::header::CONTENT_TYPE,"application/json")],bytes).into_response(),Err(_)=>{tracing::debug!("complete profile whole PHP fallback");(StatusCode::UNPROCESSABLE_ENTITY,axum::Json(json!({"fallback":true}))).into_response()}}
+ let started=std::time::Instant::now();
+ let request=match decode(&bytes){Ok(request)=>request,Err(_)=>{log_fallback("page","",0,"unknown","",0,"request",started);return(StatusCode::BAD_REQUEST,axum::Json(fallback_body("request"))).into_response()}};
+ let(owner,viewer)=viewer_log(&request.viewer);
+ let result:Result<Vec<u8>>=async{let db=crate::db::connect(&cfg.database_url).await?;ensure_budget()?;paint(cfg,&db,&request,deps,warm).await}.await;
+ match result{Ok(bytes)=>(StatusCode::OK,[(axum::http::header::CONTENT_TYPE,"application/json")],bytes).into_response(),Err(error)=>{let reason=fallback_reason(&error);log_fallback("page",&request.actor,owner,viewer,&request.tab,request.offset,reason,started);(StatusCode::UNPROCESSABLE_ENTITY,axum::Json(fallback_body(reason))).into_response()}}
 }
 #[cfg(test)]
 pub(crate) async fn fixture_request(cfg:&crate::config::Config,secret:&str,headers:HeaderMap,bytes:Bytes,deps:&crate::direct_preview::PreviewDependencies<'_>,warm:std::sync::Arc<crate::profile_enrichment::WarmContext>)->Response{render_request(cfg,Some(secret),headers,bytes,deps,Some(warm)).await}
 #[cfg(test)]
 mod tests{
  use super::*;
+ #[test]fn fallback_reason_codes_hide_source_text(){
+  let budget=anyhow::anyhow!("profile_fallback_code=budget");assert_eq!(fallback_reason(&budget),"budget");
+  assert_eq!(fallback_reason(&anyhow::anyhow!("PHP fallback: associative quote tag order requires raw decoding")),"quote_tag_order");
+  assert_eq!(fallback_reason(&anyhow::anyhow!("PHP fallback: raw Bluesky quote normalization incomplete")),"bluesky_quote");
+  assert_eq!(fallback_reason(&anyhow::anyhow!("PHP fallback: raw quote remote lookup candidate/event parity incomplete")),"remote_quote");
+  assert_eq!(fallback_reason(&anyhow::anyhow!("PHP fallback: unavailable raw quote requires warming/stub assembly")),"unavailable_quote");
+  assert_eq!(fallback_reason(&anyhow::anyhow!("PHP fallback: cold remote avatar requires authoritative alias lookup")),"cold_avatar");
+  assert_eq!(fallback_reason(&anyhow::anyhow!("PHP fallback: raw profile author unavailable")),"author_missing");
+  assert_eq!(fallback_reason(&anyhow::anyhow!("database rejected a private note body")),"unclassified");
+  assert_eq!(fallback_body("budget"),json!({"fallback":true,"reason":"budget"}));
+ }
  #[test]fn strict_viewer_and_selector_envelope(){
   let valid=json!({"protocol_version":1,"viewer":{"kind":"guest"},"actor_key":"fixture","actor":"https://mkultra.monster/users/fixture","tab":"posts","mode":"append","offset":0,"limit":10,"lazy_media":false,"status_preview_budget":0,"quote_preview_budget":0});assert!(decode(&serde_json::to_vec(&valid).unwrap()).is_ok());
   for(field,value)in [("protocol_version",json!(2)),("limit",json!(9)),("offset",json!(-1)),("tab",json!("unexpected")),("statuses",json!([]))]{let mut invalid=valid.clone();invalid[field]=value;assert!(decode(&serde_json::to_vec(&invalid).unwrap()).is_err());}

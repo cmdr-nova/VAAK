@@ -251,6 +251,31 @@ mod tests{
    assert_eq!(render_quote(&q,&facts).unwrap(),string(case,"html"),"actual PHP raw quote {}",string(case,"case"));
   }
  }
+ /// Pure painter timing for a 50-card guest page. The old per-card regex compile
+ /// made this about 1.3s; the static patterns on this path stay under the
+ /// complete-profile budget with no database or network.
+ #[test]
+ fn fifty_raw_cards_paint_under_budget(){
+  let mut card=presentation_facts();card.owner_id=0;card.csrf.clear();
+  let quote=RawQuoteFacts{acct:"@luna.example".into(),text:"Quoted from Bluesky\nsecond line".into(),url:"https://bsky.app/profile/luna.example/post/abc".into(),media:vec![json!({"url":"https://cdn.bsky.app/img/a.jpg","mediaType":"image/jpeg","preview_url":"https://cdn.bsky.app/img/a-thumb.jpg"})],card:None,mentions:Vec::new(),spoiler:String::new(),sensitive:false,is_rss:false,article_url:String::new(),open_label:"Open original".into(),open_external:true};
+  let quote_html=render_quote(&quote,&card).unwrap();
+  let text_at=quote_html.find("white-space:pre-wrap").unwrap();
+  let media_at=quote_html.find("quote-media").unwrap();
+  assert!(text_at<media_at,"quoted media belongs inside the quote card below the quoted text");
+  let attachments=(1..=4).map(|n|json!({"type":"Image","mediaType":"image/jpeg","url":format!("https://cdn.test/{n}.jpg")})).collect::<Vec<_>>();
+  let raw=json!({"id":"https://mkultra.monster/users/luna_naloc/notes/mirrored","published":"2026-10-01T00:00:00Z","visibility":"public","content":"<p>Mirrored post with a quote</p>","in_reply_to":"https://mkultra.monster/users/luna_naloc/notes/parent","raw_create_json":serde_json::to_string(&json!({"object":{"vaakOrigin":"bluesky","blueskyUri":"at://did:plc:abc/app.bsky.feed.post/xyz","attachment":attachments,"oneOf":[{"name":"Yes"},{"name":"No"}]}})).unwrap()});
+  let profile=RawProfileFacts{card,actor_key:"luna_naloc".into(),actor:"https://mkultra.monster/users/luna_naloc".into(),display_name:"Luna".into(),note_dom_id:"0123456789abcdef0123456789abcdef".into(),masto_row:Some(json!({"edited_at":"2026-10-02T00:00:00Z","spoiler_text":"","sensitive":false,"visibility":"public","content_text":"Mirrored post with a quote"})),status_id:String::new(),own_note:false,guest:true,quote_html,link_card:None,media_preview_by_url:Default::default()};
+  let _warmup=render_core(&raw,&profile).unwrap();
+  let started=std::time::Instant::now();
+  let mut html=String::new();
+  for _ in 0..50{html=render_core(&raw,&profile).unwrap();}
+  let elapsed=started.elapsed();
+  assert!(html.contains("quote-media")&&html.contains("quote-block")&&html.contains("parent post")&&html.contains("edited")&&html.contains("Open on Bluesky")&&html.contains("cdn.test/4.jpg"),"{html}");
+  eprintln!("fifty raw cards: {}ms",elapsed.as_millis());
+  // Debug paint of this fixture is about 200ms alone. The suite runs it beside
+  // the other tests, so the guard stays under the old 1,339ms compile-every-call cost.
+  assert!(elapsed.as_millis()<500,"50 raw cards took {elapsed:?}; static regex paint regressed toward the old 1339ms cost");
+ }
  #[test]
  fn raw_poll_display_fallback_matches_actual_php_outbox_lookup(){
   let root=std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
