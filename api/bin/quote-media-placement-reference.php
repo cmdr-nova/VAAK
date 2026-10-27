@@ -10,7 +10,15 @@ else{
  $warmBootstrapPath='/tmp/vaak-quote-media-warm-bootstrap-'.getmypid().'.php';file_put_contents($warmBootstrapPath,$resolved);
  putenv('DIRECT_PRODUCTION_HELPERS=1');$setup=(string)file_get_contents(__DIR__.'/remote-direct-policy-independent.php');$setup=str_replace("__DIR__.'/remote-direct-production-helper-bootstrap.php'",var_export($warmBootstrapPath,true),$setup);$end=strpos($setup,'$captures=[];$checks=0;');if($end===false)throw new RuntimeException('production setup boundary');$resolved='';foreach(token_get_all(substr($setup,0,$end)) as $token)$resolved.=is_array($token)&&$token[0]===T_DIR?var_export(__DIR__,true):(is_array($token)?$token[1]:$token);eval(substr($resolved,5));
 }
-reference_load(dirname(__DIR__).'/ap-masto-entities.php',['ap_masto_outer_media_without_quote_duplicates']);
+reference_load(dirname(__DIR__).'/ap-masto-entities.php',[
+    'ap_masto_strip_announce_fragment',
+    'ap_masto_status_is_boost_wrapper',
+    'ap_masto_quoted_display_status',
+    'ap_masto_attachment_asset_urls',
+    'ap_masto_outer_media_without_quote_duplicates',
+    'ap_masto_quoted_media_is_authoritative',
+    'ap_masto_rehome_flattened_quote_media',
+]);
 $actualLookupSource=(string)file_get_contents(dirname(__DIR__).'/ap-masto-entities.php');
 $actualLookupSource=str_replace('function ap_masto_lookup_status_by_object_url(', 'function quote_reference_actual_lookup(', $actualLookupSource);
 $lookupPath='/tmp/vaak-quote-reference-actual-lookup-'.getmypid().'.php';file_put_contents($lookupPath,$actualLookupSource);
