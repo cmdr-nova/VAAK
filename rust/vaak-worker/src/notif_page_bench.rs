@@ -378,7 +378,9 @@ async fn notif_page_bench() {
 }
 
 fn assert_visible(html: &str, first_page: bool) {
-    for secret in [
+    // The marker text stays out of the panic message. A failed check reports
+    // only that private content leaked, never the content, a token, or an account id.
+    for private_text in [
         "FOLLOWERS-ONLY-SECRET",
         "DM-ONLY-SECRET",
         "MUTED-ACTOR-SECRET",
@@ -386,7 +388,7 @@ fn assert_visible(html: &str, first_page: bool) {
         "DOMAIN-BLOCK-SECRET",
         "LOAD-MORE-DM-SECRET",
     ] {
-        assert!(!html.contains(secret), "leaked {secret}");
+        assert!(!html.contains(private_text), "private notification content leaked");
     }
     if first_page {
         for marker in [
