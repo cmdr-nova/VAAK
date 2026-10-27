@@ -235,6 +235,20 @@ fn peer_actions(note:&str,actor:&str,vis:&str,label:&str,spoiler:&str,sensitive:
  html.push_str(&crate::library::actions::render_moderation(&ctx));html.push_str("</div>");Ok(html)
 }
 
+/// Compile this painter's static regexes once. Complete-profile requests call
+/// this before the budget clock starts, so the first page does not spend the
+/// deadline on `Regex::new`.
+pub(crate) fn prewarm_static_regexes(){
+ let _=bsky_open("https://bsky.app/profile/name.example/post/abc?x=1");
+ let _=bsky_open("at://did:plc:abc/app.bsky.feed.post/xyz");
+ let card=CardFacts{bsky:None,owner_id:0,owner_actor:String::new(),return_view:"remote_profile".into(),auto_unblur_sensitive:false,resolved_avatar:String::new(),csrf:String::new(),favourited:false,bookmarked:false,boosted:false,own:None,current_action_counts:None,rss_row:None,rss_quote_row:None,rss_quoted:false,emoji_by_actor:Default::default(),reply_mentions:Vec::new(),moderation:Default::default(),poll_row:None,ask_row:None,now:chrono::DateTime::from_timestamp(1_791_673_200,0).unwrap(),lazy_media:false};
+ let quote=RawQuoteFacts{acct:"@luna.example".into(),text:"Quoted line".into(),url:"at://did:plc:abc/app.bsky.feed.post/xyz".into(),media:vec![json!({"url":"https://cdn.example/original/clip.mp4","mediaType":"video/mp4","preview_url":"https://cdn.example/thumb.jpg"})],card:None,mentions:Vec::new(),spoiler:String::new(),sensitive:false,is_rss:false,article_url:String::new(),open_label:"Open original".into(),open_external:true};
+ let quote_html=render_quote(&quote,&card).unwrap_or_default();
+ let raw=json!({"id":"https://mkultra.monster/users/fixture/notes/prewarm","published":"2026-10-01T00:00:00Z","visibility":"public","content":"<p>prewarm</p>","in_reply_to":"https://mkultra.monster/users/fixture/notes/parent","raw_create_json":serde_json::to_string(&json!({"object":{"vaakOrigin":"bluesky","summary":"<p>cw</p>","blueskyUri":"https://bsky.app/profile/name.example/post/abc","attachment":[{"type":"Video","mediaType":"video/mp4","url":"https://cdn.example/original/clip.mp4"}],"oneOf":[{"name":"Yes"},{"name":"No"}]}})).unwrap_or_default()});
+ let profile=RawProfileFacts{card,actor_key:"fixture".into(),actor:"https://mkultra.monster/users/fixture".into(),display_name:"Fixture".into(),note_dom_id:"0123456789abcdef0123456789abcdef".into(),masto_row:Some(json!({"edited_at":"2026-10-02T00:00:00Z","spoiler_text":"","sensitive":false,"visibility":"public","content_text":"prewarm"})),status_id:String::new(),own_note:false,guest:true,quote_html,link_card:None,media_preview_by_url:Default::default()};
+ let _=render_core(&raw,&profile);
+}
+
 #[cfg(test)]
 mod tests{
  use super::*;
@@ -251,6 +265,33 @@ mod tests{
    assert_eq!(render_quote(&q,&facts).unwrap(),string(case,"html"),"actual PHP raw quote {}",string(case,"case"));
   }
  }
+ /// Pure painter timing for a 50-card guest page. The old per-card regex compile
+ /// made this about 1.3s. Production requests compile these OnceLocks before
+ /// the budget clock starts; this guard is the warmed paint only.
+ #[test]
+ fn fifty_raw_cards_paint_under_budget(){
+  let mut card=presentation_facts();card.owner_id=0;card.csrf.clear();
+  let quote=RawQuoteFacts{acct:"@luna.example".into(),text:"Quoted from Bluesky\nsecond line".into(),url:"https://bsky.app/profile/luna.example/post/abc".into(),media:vec![json!({"url":"https://cdn.bsky.app/img/a.jpg","mediaType":"image/jpeg","preview_url":"https://cdn.bsky.app/img/a-thumb.jpg"})],card:None,mentions:Vec::new(),spoiler:String::new(),sensitive:false,is_rss:false,article_url:String::new(),open_label:"Open original".into(),open_external:true};
+  let quote_html=render_quote(&quote,&card).unwrap();
+  let text_at=quote_html.find("white-space:pre-wrap").unwrap();
+  let media_at=quote_html.find("quote-media").unwrap();
+  assert!(text_at<media_at,"quoted media belongs inside the quote card below the quoted text");
+  let attachments=(1..=4).map(|n|json!({"type":"Image","mediaType":"image/jpeg","url":format!("https://cdn.test/{n}.jpg")})).collect::<Vec<_>>();
+  let raw=json!({"id":"https://mkultra.monster/users/luna_naloc/notes/mirrored","published":"2026-10-01T00:00:00Z","visibility":"public","content":"<p>Mirrored post with a quote</p>","in_reply_to":"https://mkultra.monster/users/luna_naloc/notes/parent","raw_create_json":serde_json::to_string(&json!({"object":{"vaakOrigin":"bluesky","blueskyUri":"at://did:plc:abc/app.bsky.feed.post/xyz","attachment":attachments,"oneOf":[{"name":"Yes"},{"name":"No"}]}})).unwrap()});
+  let profile=RawProfileFacts{card,actor_key:"luna_naloc".into(),actor:"https://mkultra.monster/users/luna_naloc".into(),display_name:"Luna".into(),note_dom_id:"0123456789abcdef0123456789abcdef".into(),masto_row:Some(json!({"edited_at":"2026-10-02T00:00:00Z","spoiler_text":"","sensitive":false,"visibility":"public","content_text":"Mirrored post with a quote"})),status_id:String::new(),own_note:false,guest:true,quote_html,link_card:None,media_preview_by_url:Default::default()};
+  let _warmup=render_core(&raw,&profile).unwrap();
+  let started=std::time::Instant::now();
+  let mut html=String::new();
+  for _ in 0..50{html=render_core(&raw,&profile).unwrap();}
+  let elapsed=started.elapsed();
+  assert!(html.contains("quote-media")&&html.contains("quote-block")&&html.contains("parent post")&&html.contains("edited")&&html.contains("Open on Bluesky")&&html.contains("cdn.test/4.jpg"),"{html}");
+  eprintln!("fifty raw cards: {}ms",elapsed.as_millis());
+  // Debug paint of this fixture is about 200ms alone. The suite runs it beside
+  // the other tests, so the guard stays under the old 1,339ms compile-every-call cost.
+  assert!(elapsed.as_millis()<500,"50 raw cards took {elapsed:?}; static regex paint regressed toward the old 1339ms cost");
+ }
+ #[test]
+ fn prewarm_static_regexes_paints(){prewarm_static_regexes();}
  #[test]
  fn raw_poll_display_fallback_matches_actual_php_outbox_lookup(){
   let root=std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");

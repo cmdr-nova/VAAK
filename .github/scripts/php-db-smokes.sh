@@ -139,11 +139,15 @@ run "$runner" api/bin/direct-partial-blocks-smoke.php
 
 # Complete-profile routes stay unregistered on the worker above. This process
 # gets a one-shot secret so the parity smoke can call them. The secret is not
-# printed.
+# printed. The production budget default is 1000ms. A debug CI worker spent
+# ~480ms before the old 250ms ceiling fired, so this process keeps the budget
+# and raises it. The worker reads the variable; the smoke process cannot.
 profile_port="${VAAK_CI_PROFILE_PORT:-18788}"
 profile_secret="$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')"
+profile_budget_ms="${VAAK_PROFILE_COMPLETE_BUDGET_MS:-5000}"
 VAAK_ENV_FILE=/nonexistent VAAK_PHYRIAN_BRIDGE_ENV_FILE=/nonexistent \
   VAAK_PROFILE_COMPLETE_NATIVE=1 VAAK_PROFILE_COMPLETE_SECRET="$profile_secret" \
+  VAAK_PROFILE_COMPLETE_BUDGET_MS="$profile_budget_ms" \
   VAAK_DATABASE_URL="postgresql://${PGUSER}@${PGHOST}:${PGPORT}/${db}" \
   VAAK_REDIS_URL="redis://${redis_hostport}/0" VAAK_REDIS_QUEUE_URL="redis://${redis_hostport}/1" \
   VAAK_JETSTREAM_STATE="${work}/worker/jetstream-profile" VAAK_NOTIF_CACHE_DIR="${work}/worker" \
@@ -161,6 +165,7 @@ for _ in $(seq 1 60); do
   sleep 1
 done
 VAAK_PROFILE_PARITY_RUST_URL="$profile_url" VAAK_PROFILE_COMPLETE_SECRET="$profile_secret" \
+  VAAK_PROFILE_COMPLETE_BUDGET_MS="$profile_budget_ms" \
   run "$runner" api/bin/profile-complete-parity-smoke.php
 
 echo "db smokes: 13 passed"

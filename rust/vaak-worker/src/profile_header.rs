@@ -232,10 +232,23 @@ fn guest_follow(f:&HeaderFacts)->String{
  out.push_str("</div></div><script>");
  out.push_str(&include_str!("profile_guest_follow.js").replace("__NATIVE_ACTOR_JSON__",&serde_json::to_string(&format!("https://mkultra.monster/users/{}",f.key)).unwrap()));out.push_str("</script>");out
 }
+fn field_comment_re()->&'static regex::Regex{static RE:std::sync::OnceLock<regex::Regex>=std::sync::OnceLock::new();RE.get_or_init(||regex::Regex::new(r"(?s)<!--.*?-->").unwrap())}
+fn field_tag_re()->&'static regex::Regex{static RE:std::sync::OnceLock<regex::Regex>=std::sync::OnceLock::new();RE.get_or_init(||regex::Regex::new(r"(?is)<[^>]*>").unwrap())}
+fn field_anchor_re()->&'static regex::Regex{static RE:std::sync::OnceLock<regex::Regex>=std::sync::OnceLock::new();RE.get_or_init(||regex::Regex::new(r"(?is)^<(\/?)a(?:\s([^>]*))?>$").unwrap())}
+fn field_href_quoted_re()->&'static regex::Regex{static RE:std::sync::OnceLock<regex::Regex>=std::sync::OnceLock::new();RE.get_or_init(||regex::Regex::new(r#"(?i)href\s*=\s*(?:"(https?://[^"']+)"|'(https?://[^"']+)')"#).unwrap())}
+fn field_href_bare_re()->&'static regex::Regex{static RE:std::sync::OnceLock<regex::Regex>=std::sync::OnceLock::new();RE.get_or_init(||regex::Regex::new(r"(?i)href\s*=\s*(https?://[^\s>]+)").unwrap())}
+fn field_empty_anchor_re()->&'static regex::Regex{static RE:std::sync::OnceLock<regex::Regex>=std::sync::OnceLock::new();RE.get_or_init(||regex::Regex::new(r"(?is)<a>(.*?)</a>").unwrap())}
+fn sl_agent_re()->&'static regex::Regex{static RE:std::sync::OnceLock<regex::Regex>=std::sync::OnceLock::new();RE.get_or_init(||regex::Regex::new(r"^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$").unwrap())}
+/// Compile header regexes before a complete-profile budget starts. Field HTML
+/// used to compile the same patterns once per tag.
+pub(crate) fn prewarm_static_regexes(){
+ let _=sl_agent_re().is_match("01234567-89ab-cdef-0123-456789abcdef");
+ let _=fields_html(&[json!({"name":"Site","value":"<!-- note --><a href=\"https://example.test/a\">link</a> <a href=https://example.test/b>bare</a>"})]);
+}
 pub(crate) fn fields_html(fields:&[Value])->String{
  let mut rows=String::new();for field in fields{
   let name=card::php_trim(s(field,"name"));let raw=s(field,"value");
-  if name.is_empty()||card::php_trim(&regex::Regex::new(r"(?s)<[^>]*>").unwrap().replace_all(raw,"")).is_empty(){continue;}
+  if name.is_empty()||card::php_trim(&field_tag_re().replace_all(raw,"")).is_empty(){continue;}
   let value=field_html(&crate::home_hydrate_ranked::html_entity_decode(raw));if value.is_empty(){continue;}
   let verified=if card::boolean(field,"verified_at"){s(field,"verified_at")}else{""};
   rows.push_str(&format!("<div class=\"remote-profile-field\"><span class=\"meta\" style=\"display:block;font-size:.75rem;margin:0 0 .15rem\">{}{} </span><div style=\"overflow:hidden;text-overflow:ellipsis;white-space:nowrap\">{value}</div></div>",h(name),if verified.is_empty(){String::new()}else{format!(" <span class=\"field-verified\" title=\"Verified via rel=me · {}\" aria-label=\"Verified\">✓</span>",h(verified))}));
@@ -248,22 +261,22 @@ fn field_html(input:&str)->String{
  // PHP strip_tags tracks attribute quotes; an unterminated quoted tag consumes the remaining input.
  let mut complete=input.len();let bytes=input.as_bytes();let mut pos=0;while pos<bytes.len(){if bytes[pos]!=b'<'{pos+=1;continue}let begin=pos;pos+=1;let mut quote=None;while pos<bytes.len(){let c=bytes[pos];if let Some(q)=quote{if c==q{quote=None}}else if c==b'\''||c==b'"'{quote=Some(c)}else if c==b'>'{break}pos+=1;}if pos==bytes.len(){complete=begin;break}pos+=1;}
  let input=&input[..complete];
- let comments=regex::Regex::new(r"(?s)<!--.*?-->").unwrap().replace_all(input,"");
- let tag=regex::Regex::new(r"(?is)<[^>]*>").unwrap();let mut out=tag.replace_all(&comments,|cap:&regex::Captures|{
-  let Some(a)=regex::Regex::new(r"(?is)^<(\/?)a(?:\s([^>]*))?>$").unwrap().captures(&cap[0])else{return String::new();};
+ let comments=field_comment_re().replace_all(input,"");
+ let mut out=field_tag_re().replace_all(&comments,|cap:&regex::Captures|{
+  let Some(a)=field_anchor_re().captures(&cap[0])else{return String::new();};
   if &a[1]=="/"{return "</a>".into();}let attrs=a.get(2).map(|v|v.as_str()).unwrap_or("");
-  let href=regex::Regex::new(r#"(?i)href\s*=\s*(?:"(https?://[^"']+)"|'(https?://[^"']+)')"#).unwrap().captures(attrs).map(|c|c.get(1).or_else(||c.get(2)).unwrap().as_str().to_owned())
-   .or_else(||regex::Regex::new(r"(?i)href\s*=\s*(https?://[^\s>]+)").unwrap().captures(attrs).map(|c|c[1].to_owned())).unwrap_or_default();
+  let href=field_href_quoted_re().captures(attrs).map(|c|c.get(1).or_else(||c.get(2)).unwrap().as_str().to_owned())
+   .or_else(||field_href_bare_re().captures(attrs).map(|c|c[1].to_owned())).unwrap_or_default();
   let href=crate::home_hydrate_ranked::html_entity_decode(card::php_trim(&href));
   if href.to_ascii_lowercase().starts_with("https://"){format!("<a href=\"{}\" rel=\"nofollow noopener noreferrer\">",h(&href))}else{"<a>".into()}
  }).into_owned();
- out=regex::Regex::new(r"(?is)<a>(.*?)</a>").unwrap().replace_all(&out,"$1").into_owned();
+ out=field_empty_anchor_re().replace_all(&out,"$1").into_owned();
  out.replace("rel=\"nofollow noopener noreferrer\">","rel=\"nofollow noopener noreferrer\" target=\"_blank\">")
 }
 fn world_html(f:&HeaderFacts)->String{
  let sl=f.sl.as_ref().filter(|v|card::boolean(v,"sl_username"));let wow=f.wow.as_ref().filter(|v|card::boolean(v,"armory_url"));if sl.is_none()&&wow.is_none(){return String::new();}
  let mut out=String::from("<div class=\"profile-world-links\" style=\"display:flex;gap:.5rem;align-items:center;margin:.65rem 0 0;flex-wrap:wrap\">");
- if let Some(sl)=sl{let name=s(sl,"sl_username");let agent=card::php_trim(s(sl,"sl_agent_id")).to_ascii_lowercase();let url=if regex::Regex::new(r"^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$").unwrap().is_match(&agent){format!("secondlife:///app/agent/{agent}/about")}else{"https://secondlife.com/".into()};out.push_str(&format!("<a href=\"{}\" rel=\"noopener noreferrer me\" title=\"Open {} in Second Life\" aria-label=\"Open {} in Second Life\"><img src=\"/vaak/second-life.svg\" alt=\"Second Life\" width=\"43\" height=\"34\" loading=\"lazy\"></a><span class=\"meta\">{}</span>",h(&url),h(name),h(name),h(name)));}
+ if let Some(sl)=sl{let name=s(sl,"sl_username");let agent=card::php_trim(s(sl,"sl_agent_id")).to_ascii_lowercase();let url=if sl_agent_re().is_match(&agent){format!("secondlife:///app/agent/{agent}/about")}else{"https://secondlife.com/".into()};out.push_str(&format!("<a href=\"{}\" rel=\"noopener noreferrer me\" title=\"Open {} in Second Life\" aria-label=\"Open {} in Second Life\"><img src=\"/vaak/second-life.svg\" alt=\"Second Life\" width=\"43\" height=\"34\" loading=\"lazy\"></a><span class=\"meta\">{}</span>",h(&url),h(name),h(name),h(name)));}
  if let Some(wow)=wow{let name=wow.get("character_name").and_then(Value::as_str).unwrap_or("World of Warcraft character");let realm=card::php_trim(s(wow,"realm"));let label=if realm.is_empty(){name.into()}else{format!("{name} · {realm}")};let portrait=card::php_trim(s(wow,"portrait_url"));let url=h(s(wow,"armory_url"));if portrait.is_empty(){out.push_str(&format!("<a class=\"btn btn-ghost\" href=\"{url}\" target=\"_blank\" rel=\"noopener noreferrer\">WoW Armory</a>"));}else{out.push_str(&format!("<a href=\"{url}\" target=\"_blank\" rel=\"noopener noreferrer\" title=\"Open {} Armory profile\" aria-label=\"Open {} Armory profile\"><img src=\"{}\" alt=\"World of Warcraft\" width=\"43\" height=\"34\" loading=\"lazy\" referrerpolicy=\"no-referrer\" style=\"object-fit:cover;border-radius:8px\"></a>",h(&label),h(&label),h(portrait)));}out.push_str(&format!("<span class=\"meta\">{}</span>",h(&label)));}
  out.push_str("</div>");out
 }

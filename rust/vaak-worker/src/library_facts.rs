@@ -233,7 +233,8 @@ async fn local_counts_mode(db:&Client,note:&str,sid:&str,include_bookmarks:bool)
     Ok(counts)
 }
 
-pub(crate) async fn emoji_maps(db:&Client,status:&Value)->Result<std::collections::HashMap<String,std::collections::HashMap<String,String>>> {
+pub(crate) async fn emoji_maps(db:&Client,status:&Value)->Result<std::collections::HashMap<String,std::collections::HashMap<String,String>>> {emoji_maps_with_context(db,status,None).await}
+pub(crate) async fn emoji_maps_with_context(db:&Client,status:&Value,warm:Option<&crate::profile_enrichment::WarmContext>)->Result<std::collections::HashMap<String,std::collections::HashMap<String,String>>> {
     fn collect(value:&Value,actors:&mut Vec<String>){
         match value {
             Value::Object(object)=>{if let Some(account)=object.get("account"){let actor=s(account,"uri");if !actor.is_empty()&&!actors.iter().any(|a|a==actor){actors.push(actor.into());}}for child in object.values().filter(|v|v.is_object()||v.is_array()){collect(child,actors);}},
@@ -241,7 +242,7 @@ pub(crate) async fn emoji_maps(db:&Client,status:&Value)->Result<std::collection
         }
     }
     let mut actors=Vec::new();collect(status,&mut actors);let mut maps=std::collections::HashMap::new();
-    for actor in actors {let rows=db.query("SELECT shortcode,url FROM remote_custom_emojis WHERE host=$1",&[&host(&actor)]).await?;let mut map=std::collections::HashMap::new();for row in rows {let code:String=row.get(0);let url:String=row.get(1);if !code.is_empty()&&url.starts_with("https://"){map.insert(code,url);}}maps.insert(actor,map);}
+    for actor in actors {let host_name=host(&actor);if let Some(cached)=warm.and_then(|context|context.cached_emoji_host(&host_name)){maps.insert(actor,cached);continue}let rows=db.query("SELECT shortcode,url FROM remote_custom_emojis WHERE host=$1",&[&host_name]).await?;let mut map=std::collections::HashMap::new();for row in rows {let code:String=row.get(0);let url:String=row.get(1);if !code.is_empty()&&url.starts_with("https://"){map.insert(code,url);}}if let Some(context)=warm{context.cache_emoji_host(&host_name,map.clone());}maps.insert(actor,map);}
     // Emoji carried on the status/account itself (Mastodon API shape) fill
     // gaps the host cache has not learned yet.
     fn carried(value:&Value,maps:&mut std::collections::HashMap<String,std::collections::HashMap<String,String>>){
@@ -254,6 +255,20 @@ pub(crate) async fn emoji_maps(db:&Client,status:&Value)->Result<std::collection
     Ok(maps)
 }
 
+fn local_profile_key_re()->&'static regex::Regex{
+ static RE:std::sync::OnceLock<regex::Regex>=std::sync::OnceLock::new();
+ RE.get_or_init(||regex::Regex::new(r"^https://mkultra\.monster/users/([A-Za-z0-9_]+)$").unwrap())
+}
+fn local_actor_re()->&'static regex::Regex{
+ static RE:std::sync::OnceLock<regex::Regex>=std::sync::OnceLock::new();
+ RE.get_or_init(||regex::Regex::new(r"^https://mkultra\.monster/users/[A-Za-z0-9_]+(?:/|$)").unwrap())
+}
+/// Compile the actor patterns used while resolving a profile card. The first
+/// complete-profile request calls this before its budget clock starts.
+pub(crate) fn prewarm_profile_regexes(){
+ let _=local_profile_key_re().is_match("https://mkultra.monster/users/fixture");
+ let _=local_actor_re().is_match("https://mkultra.monster/users/fixture/notes/1");
+}
 pub(crate) async fn avatar(db:&Client,status:&Value,actor:&str)->Result<String>{avatar_with_context(db,status,actor,None).await}
 pub(crate) async fn avatar_with_context(db:&Client,status:&Value,actor:&str,warm:Option<&crate::profile_enrichment::WarmContext>)->Result<String> {
     #[cfg(test)] let _timing=crate::search_context::selection::fixture_performance::span("avatar_facts",1);
@@ -268,7 +283,7 @@ async fn avatar_current(db:&Client,status:&Value,actor:&str,warm:Option<&crate::
         if direct.starts_with("https://")||direct.starts_with("http://"){return Ok(direct.into());}
     }
     if matches!(actor,"https://waffles.baeddel.social/fediverse/blog/admin"|"https://app.wafrn.net/fediverse/blog/admin"){return Ok("https://mkultra.monster/img/avatar/wafrn-approvals.webp".into());}
-    if let Some(capture)=regex::Regex::new(r"^https://mkultra\.monster/users/([A-Za-z0-9_]+)$").unwrap().captures(actor){
+    if let Some(capture)=local_profile_key_re().captures(actor){
         let key=capture[1].to_lowercase();let row=db.query_opt("SELECT icon_url FROM actor_profile WHERE lower(actor_key)=$1 LIMIT 1",&[&key]).await?;
         let icon=row.and_then(|row|row.get::<_,Option<String>>(0)).unwrap_or_default();
         return Ok(if reqwest::Url::parse(&icon).is_ok_and(|url|url.scheme()=="https"){icon}else{"https://mkultra.monster/img/avatar/local-default.webp".into()});
@@ -335,7 +350,7 @@ pub(crate) async fn resolve(db: &Client, owner_id: i64, owner_actor: &str, statu
     let st = status.get("reblog").filter(|v| v.is_object() && s(status,"content").is_empty()).unwrap_or(status);
     let actor_ref=super::card::account_actor_ref(&st["account"]);
     let actor=actor_ref.trim_end_matches('/'); let uri = s(st,"uri").trim_end_matches('/');
-    let local = regex::Regex::new(r"^https://mkultra\.monster/users/[A-Za-z0-9_]+(?:/|$)").unwrap().is_match(actor);
+    let local = local_actor_re().is_match(actor);
     let mut moderation = ModerationContext { is_self: actor == owner_actor.trim_end_matches('/'), is_local: local, is_admin:admin, ..Default::default() };
     if !moderation.is_self && host(actor)=="bsky.app" {
         if let Some(row)=db.query_opt("SELECT did,handle FROM bsky_sessions WHERE owner_user_id::bigint=$1 LIMIT 1",&[&owner_id]).await? {

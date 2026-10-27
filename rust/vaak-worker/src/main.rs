@@ -302,8 +302,20 @@ enum Command {
     },
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    // Pinned complete-profile projection is one large async function. Debug
+    // builds, which the database smoke uses, overflow tokio's default 2MB
+    // worker stack there. Eight megabytes covers that frame; the budget still
+    // bounds how long the request may run.
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(8 * 1024 * 1024)
+        .build()
+        .expect("vaak-worker runtime")
+        .block_on(worker_main())
+}
+
+async fn worker_main() -> Result<()> {
     let cli = Cli::parse();
     if let Command::ParityReplay { producer, input } = &cli.cmd {
         // Stay offline. Do not load worker config or open Postgres/Redis.

@@ -174,14 +174,17 @@ pub(crate) struct AuthenticatedProfileSession {
     source_actor:String,
     direct:crate::direct_context::DirectSession,
 }
+fn local_profile_key(actor:&str)->Option<String>{
+    static RE:std::sync::OnceLock<regex::Regex>=std::sync::OnceLock::new();
+    RE.get_or_init(||regex::Regex::new(r"^https://mkultra\.monster/users/([A-Za-z0-9_]+)$").unwrap()).captures(actor).map(|capture|capture[1].to_owned())
+}
 impl AuthenticatedProfileSession {
     pub(crate) fn from_php_session(owner:i64,csrf:String,actor_key:String,source_actor:String,lazy_media:bool,budget:i64)->Result<Self>{
         if actor_key.is_empty()||actor_key.len()>80||!actor_key.bytes().all(|b|b.is_ascii_lowercase()||b.is_ascii_digit()||b==b'_'){bail!("invalid canonical local profile key")}
         let canonical_actor=format!("https://mkultra.monster/users/{actor_key}");
         let source_actor=source_actor.trim().trim_end_matches('/').to_owned();
-        let actor_pattern=regex::Regex::new(r"^https://mkultra\.monster/users/([A-Za-z0-9_]+)$").unwrap();
-        let captured=actor_pattern.captures(&source_actor).context("invalid original local profile actor")?;
-        if captured[1].to_ascii_lowercase()!=actor_key{bail!("profile actor/key binding differs")}
+        let captured=local_profile_key(&source_actor).context("invalid original local profile actor")?;
+        if captured.to_ascii_lowercase()!=actor_key{bail!("profile actor/key binding differs")}
         let direct=crate::direct_context::DirectSession::from_php_session(owner,csrf,crate::direct_context::DirectRoute::RemoteProfile,"remote_profile".into(),false,true,false,lazy_media,source_actor.clone())?.with_status_preview_budget(budget)?;
         Ok(Self{owner,actor_key,canonical_actor,source_actor,direct})
     }
@@ -211,9 +214,8 @@ impl GuestProfileSession {
         if !(0..=100).contains(&status_preview_budget){bail!("invalid trusted guest preview budget")}
         if actor_key.is_empty()||actor_key.len()>80||!actor_key.bytes().all(|b|b.is_ascii_lowercase()||b.is_ascii_digit()||b==b'_'){bail!("invalid canonical guest profile key")}
         let source_actor=source_actor.trim().trim_end_matches('/').to_owned();
-        let pattern=regex::Regex::new(r"^https://mkultra\.monster/users/([A-Za-z0-9_]+)$").unwrap();
-        let captured=pattern.captures(&source_actor).context("invalid original guest profile actor")?;
-        if captured[1].to_ascii_lowercase()!=actor_key{bail!("guest profile actor/key binding differs")}
+        let captured=local_profile_key(&source_actor).context("invalid original guest profile actor")?;
+        if captured.to_ascii_lowercase()!=actor_key{bail!("guest profile actor/key binding differs")}
         Ok(Self{canonical_actor:format!("https://mkultra.monster/users/{actor_key}"),actor_key,source_actor,lazy_media,status_preview_budget,quote_preview_budget:None,warm_context:None})
     }
     pub(crate) fn with_warm_context(mut self,context:std::sync::Arc<crate::profile_enrichment::WarmContext>)->Self{self.warm_context=Some(context);self}
@@ -229,12 +231,15 @@ impl RawProfileProof {
  async fn require_current(&self,db:&Client,page:&ProfilePage)->Result<()>{
   require_projection_identity(db,self.owner,&self.owner_snapshot,&self.actor,page).await?;
   let current=db.query_opt("SELECT to_jsonb(p) FROM actor_profile p WHERE actor_key=$1",&[&self.key]).await?.map(|row|row.get::<_,Value>(0));if current.as_ref()!=Some(&self.target){bail!("raw profile target changed after later source preparation")}
-  for(status,key,profile,masto)in &self.dependencies{
-   let mut checked=vec![status.clone()];crate::audience::filter_profile_statuses(db,self.owner,crate::audience::Surface::Direct,&mut checked).await?;if checked.len()!=1{bail!("raw prepared prefix audience changed after later source preparation")}
-   let current_profile=db.query_opt("SELECT to_jsonb(p) FROM actor_profile p WHERE actor_key=$1",&[key]).await?.map(|row|row.get::<_,Value>(0));
-   let note=status["uri"].as_str().context("raw prefix lost source identity")?;let current_masto=db.query_opt("SELECT to_jsonb(s) FROM masto_statuses s WHERE note_id IN ($1,$2) LIMIT 1",&[&note,&format!("{}/",note.trim_end_matches('/'))]).await?.map(|row|row.get::<_,Value>(0));if current_profile.as_ref()!=Some(profile)||&current_masto!=masto{bail!("raw prepared prefix current presentation changed after later source preparation")}
+  if !self.dependencies.is_empty(){
+   let mut statuses=self.dependencies.iter().map(|dependency|dependency.0.clone()).collect::<Vec<_>>();crate::audience::filter_profile_statuses(db,self.owner,crate::audience::Surface::Direct,&mut statuses).await?;
+   if statuses.len()!=self.dependencies.len(){bail!("raw prepared prefix audience changed after later source preparation")}
+   let input=Value::Array(self.dependencies.iter().map(|(status,key,..)|serde_json::json!({"key":key,"note":status["uri"]})).collect());
+   let rows=db.query("SELECT p.value,s.value FROM jsonb_array_elements($1::jsonb) WITH ORDINALITY i(value,n) LEFT JOIN LATERAL (SELECT to_jsonb(p) AS value FROM actor_profile p WHERE actor_key=i.value->>'key') p ON true LEFT JOIN LATERAL (SELECT to_jsonb(s) AS value FROM masto_statuses s WHERE note_id IN (i.value->>'note',rtrim(i.value->>'note','/')||'/') LIMIT 1) s ON true ORDER BY i.n",&[&input]).await?;
+   if rows.len()!=self.dependencies.len(){bail!("raw prepared prefix source cardinality changed")}
+   for(row,(_,_,profile,masto))in rows.iter().zip(&self.dependencies){if row.get::<_,Option<Value>>(0).as_ref()!=Some(profile)||&row.get::<_,Option<Value>>(1)!=masto{bail!("raw prepared prefix current presentation changed after later source preparation")}}
   }
-  for(product,painted)in &self.quotes{product.require_current(db).await?;if *painted{require_current_profile_card(db,self.owner,product.status().context("raw quote prefix lost current child")?).await?;}}
+  for(product,painted)in &self.quotes{product.require_current(db).await?;if *painted{if let Some(status)=product.status(){require_current_profile_card(db,self.owner,status).await?;}}}
   Ok(())
  }
 }
@@ -252,7 +257,7 @@ async fn require_raw_profile_prefix(db:&Client,owner:i64,page:&ProfilePage,proof
   if rows.len()!=dependencies.len(){bail!("raw final prefix source cardinality changed")}
   for(row,(_,_,profile,masto))in rows.iter().zip(dependencies){if row.get::<_,Option<Value>>(0).as_ref()!=Some(profile)||row.get::<_,Option<Value>>(1)!=*masto{bail!("raw final prefix presentation changed")}}
  }
- let mut children=Vec::new();for proof in proofs{for(product,painted)in &proof.quotes{product.require_current(db).await?;if *painted{children.push(product.status().context("raw final prefix quote lost child")?);}}}
+ let mut children=Vec::new();for proof in proofs{for(product,painted)in &proof.quotes{product.require_current(db).await?;if *painted{if let Some(status)=product.status(){children.push(status);}}}}
  require_current_profile_cards(db,owner,&children).await
 }
 struct RawStageGrant{proof:RawProfileProof,page:ProfilePage}
@@ -268,47 +273,86 @@ impl GuestRawProfileCards {
 pub(crate) async fn admit_guest_raw(db:&Client,session:&GuestProfileSession,selection:crate::profile_source::SelectedProfilePage)->Result<GuestRawProfileCards>{
     admit_guest_raw_with_dns(db,session,selection,&crate::direct_preview::SystemDns).await
 }
+struct RawPageRow {index:usize,raw:Value,note:String,key:String,actor:String,profile:Value,masto:Option<Value>,digest:String,status:Value,plain:String,quote:Option<RawQuoteIntent>}
+/// One profile/status/audience/media/poll/ask/Bluesky read for the whole page.
+async fn load_guest_raw_page(db:&Client,selected_rows:Vec<(usize,Value)>)->Result<(Vec<RawPageRow>,std::collections::HashMap<String,String>,std::collections::HashMap<String,(String,String,String)>,crate::profile_guest_facts::GuestFactMemo)>{
+ let mut kept=Vec::new();let mut specs=Vec::new();
+ for (index,raw) in selected_rows{
+  let note=raw.get("id").and_then(Value::as_str).context("raw profile source is not an outbox note")?.trim_end_matches('/').to_owned();
+  let source_key=crate::direct_context::local_note_author(&note).context("PHP fallback: raw note author shape")?;
+  let key=source_key.to_ascii_lowercase();
+  specs.push(serde_json::json!({"note":note,"key":key}));
+  kept.push((index,raw));
+ }
+ let input=Value::Array(specs);
+ let looked=if kept.is_empty(){Vec::new()}else{db.query("SELECT i.value->>'note', i.value->>'key', p.value, s.value, md5(i.value->>'note') FROM jsonb_array_elements($1::jsonb) WITH ORDINALITY i(value,n) LEFT JOIN LATERAL (SELECT to_jsonb(p) AS value FROM actor_profile p WHERE actor_key=i.value->>'key') p ON true LEFT JOIN LATERAL (SELECT to_jsonb(s) AS value FROM masto_statuses s WHERE note_id IN (i.value->>'note', rtrim(i.value->>'note','/')||'/') LIMIT 1) s ON true ORDER BY i.n",&[&input]).await?};
+ if looked.len()!=kept.len(){bail!("raw page lookup cardinality changed")}
+ let mut statuses=Vec::new();let mut staged=Vec::new();
+ for ((index,raw),row) in kept.into_iter().zip(looked){
+  let note:String=row.get(0);let key:String=row.get(1);
+  let profile=row.get::<_,Option<Value>>(2).context("PHP fallback: raw profile author unavailable")?;
+  let masto:Option<Value>=row.get(3);let digest:String=row.get(4);
+  let actor=format!("https://mkultra.monster/users/{key}");
+  let status=serde_json::json!({"id":"","uri":note,"url":note,"visibility":raw.get("visibility").cloned().unwrap_or(serde_json::json!("public")),"content":raw.get("content").cloned().unwrap_or(serde_json::json!("")),"account":{"uri":actor,"url":actor,"acct":key},"media_attachments":[]});
+  statuses.push(status.clone());
+  staged.push((index,raw,note,key,actor,profile,masto,digest,status));
+ }
+ let mut allowed_statuses=statuses;crate::audience::filter_profile_statuses(db,0,crate::audience::Surface::Direct,&mut allowed_statuses).await?;
+ let allowed:std::collections::HashSet<String>=allowed_statuses.iter().filter_map(|status|status.get("uri").and_then(Value::as_str).map(str::to_owned)).collect();
+ let mut rows=Vec::new();let mut notes=Vec::new();let mut media_urls=Vec::new();let mut quote_keys=Vec::new();
+ for (index,raw,note,key,actor,profile,masto,digest,status) in staged{
+  if !allowed.contains(&note){continue}
+  let plain=crate::library::body::html_to_plain(raw.get("content").and_then(Value::as_str).unwrap_or(""));
+  let decoded:Value=serde_json::from_str(raw.get("raw_create_json").and_then(Value::as_str).unwrap_or("")).unwrap_or(Value::Null);
+  let object=decoded.get("object").cloned().unwrap_or(decoded);
+  let quote=raw_quote_intent(&object,&plain)?;
+  if let Some(intent)=quote.as_ref(){if let Some(rkey)=bsky_rkey(&intent.url){quote_keys.push(rkey);}}
+  if let Some(items)=object.get("attachment").and_then(Value::as_array){for item in items{if let Some(url)=item.get("url").and_then(Value::as_str).or_else(||item.get("url").and_then(|url|url.get("href")).and_then(Value::as_str)).filter(|url|url.starts_with("https://")){media_urls.push(url.to_owned());}}}
+  else if let Some(item)=object.get("attachment").filter(|item|item.is_object()){if let Some(url)=item.get("url").and_then(Value::as_str).or_else(||item.get("url").and_then(|url|url.get("href")).and_then(Value::as_str)).filter(|url|url.starts_with("https://")){media_urls.push(url.to_owned());}}
+  notes.push(note.clone());
+  rows.push(RawPageRow{index,raw,note,key,actor,profile,masto,digest,status,plain,quote});
+ }
+ let media=if media_urls.is_empty(){std::collections::HashMap::new()}else{db.query("SELECT public_url,preview_url FROM masto_media WHERE public_url=ANY($1) AND preview_url IS NOT NULL",&[&media_urls]).await?.into_iter().map(|row|(row.get::<_,String>(0),row.get::<_,String>(1))).collect()};
+ let mut polls=std::collections::HashMap::new();let mut asks=std::collections::HashMap::new();let mut mention_asks=std::collections::HashMap::new();
+ if !notes.is_empty(){
+  for row in db.query("SELECT DISTINCT ON (rtrim(note_id,'/')) rtrim(note_id,'/'), jsonb_build_object('note_id',note_id,'local_id',local_id,'multiple',multiple,'votes_count',votes_count,'voters_count',voters_count,'expires_at',expires_at,'options_json',options_json) FROM masto_polls WHERE rtrim(note_id,'/')=ANY($1::text[]) ORDER BY rtrim(note_id,'/'), local_id",&[&notes]).await?{polls.insert(row.get::<_,String>(0),row.get(1));}
+  for row in db.query("SELECT DISTINCT ON (rtrim(answer_note_id,'/')) rtrim(answer_note_id,'/'), jsonb_build_object('question',question,'asker_actor',asker_actor,'answer_note_id',answer_note_id) FROM ap_asks WHERE rtrim(answer_note_id,'/')=ANY($1::text[]) ORDER BY rtrim(answer_note_id,'/'), id DESC",&[&notes]).await?{asks.insert(row.get::<_,String>(0),row.get(1));}
+  for row in db.query("SELECT DISTINCT ON (rtrim(object_id,'/')) rtrim(object_id,'/'), COALESCE(ask_actor,''), COALESCE(ask_question,''), COALESCE(ask_answer,'') FROM mentions WHERE deleted_at IS NULL AND ask_question<>'' AND rtrim(object_id,'/')=ANY($1::text[]) ORDER BY rtrim(object_id,'/'), id DESC",&[&notes]).await?{mention_asks.insert(row.get::<_,String>(0),serde_json::json!({"asker_actor":row.get::<_,String>(1),"question":row.get::<_,String>(2),"answer":row.get::<_,String>(3)}));}
+ }
+ let mut bsky=std::collections::HashMap::new();
+ if !quote_keys.is_empty(){
+  let found=db.query("SELECT split_part(bsky_uri, '/app.bsky.feed.post/', 2), left(COALESCE(text,''),2000), COALESCE(author_handle,''), COALESCE(embed_json::text,'') FROM bsky_posts WHERE split_part(bsky_uri, '/app.bsky.feed.post/', 2)=ANY($1::text[])",&[&quote_keys]).await;
+  match found{Ok(found)=>{for row in found{bsky.insert(row.get::<_,String>(0),(row.get::<_,String>(1),row.get::<_,String>(2),row.get::<_,String>(3)));}},Err(error) if error.code()==Some(&tokio_postgres::error::SqlState::UNDEFINED_TABLE)||error.code()==Some(&tokio_postgres::error::SqlState::UNDEFINED_COLUMN)=>{},Err(error)=>return Err(error.into())}
+ }
+ Ok((rows,media,bsky,crate::profile_guest_facts::GuestFactMemo{polls,asks,mention_asks}))
+}
 pub(crate) async fn admit_guest_raw_with_dns(db:&Client,session:&GuestProfileSession,selection:crate::profile_source::SelectedProfilePage,dns:&dyn crate::direct_preview::PreviewDns)->Result<GuestRawProfileCards>{
     let (selected_rows,page)=selection.into_indexed_parts();page.require_current_ledger(db).await?;page.require_target(&session.actor_key,&session.source_actor)?;
     if root_content_blocked_for(db,0,&session.canonical_actor).await?{bail!("PHP fallback: raw guest profile root blocked")}
     let target=db.query_opt("SELECT to_jsonb(p) FROM actor_profile p WHERE actor_key=$1",&[&session.actor_key]).await?.map(|row|row.get::<_,Value>(0)).context("PHP fallback: raw profile target unavailable")?;
+    reject_unsupported_profile_quotes(&selected_rows.iter().map(|(_,row)|row.clone()).collect::<Vec<_>>())?;
+    crate::profile_bridge::ensure_budget()?;
+    let (rows,media,bsky,memo)=load_guest_raw_page(db,selected_rows).await?;
+    if let Some(warm)=session.warm_context(){for row in &rows{if warm.cached_avatar(&row.actor).is_none(){let icon=row.profile.get("icon_url").and_then(Value::as_str).unwrap_or("");let url=if reqwest::Url::parse(icon).ok().is_some_and(|url|url.scheme()=="https"){icon.to_owned()}else{"https://mkultra.monster/img/avatar/local-default.webp".into()};warm.cache_avatar(&row.actor,&url);}}}
     let mut cards=Vec::new();let mut dependencies=Vec::new();let mut quote_products:Vec<(crate::profile_materialize::ProjectedQuoteTarget,bool)>=Vec::new();let mut mapping_changes=Vec::new();
-    for (index,raw) in selected_rows{
-        let note=raw.get("id").and_then(Value::as_str).context("raw profile source is not an outbox note")?;
-        let source_key=crate::direct_context::local_note_author(note).context("PHP fallback: raw note author shape")?;
-        let actor=format!("https://mkultra.monster/users/{source_key}");let key=source_key.to_ascii_lowercase();
-        let profile=db.query_opt("SELECT to_jsonb(p) FROM actor_profile p WHERE actor_key=$1",&[&key]).await?.map(|row|row.get::<_,Value>(0)).context("PHP fallback: raw profile author unavailable")?;
-        let status=serde_json::json!({"id":"","uri":note,"url":note,"visibility":raw.get("visibility").cloned().unwrap_or(serde_json::json!("public")),"content":raw.get("content").cloned().unwrap_or(serde_json::json!("")),"account":{"uri":actor,"url":actor,"acct":key},"media_attachments":[]});
-        let mut checked=vec![status.clone()];crate::audience::filter_profile_statuses(db,0,crate::audience::Surface::Direct,&mut checked).await?;
-        if checked.is_empty(){continue}
-        let plain=crate::library::body::html_to_plain(raw.get("content").and_then(Value::as_str).unwrap_or(""));
-        let decoded:Value=serde_json::from_str(raw.get("raw_create_json").and_then(Value::as_str).unwrap_or("")).unwrap_or(Value::Null);
-        let object=decoded.get("object").unwrap_or(&decoded);
-        let quote_target=raw_scalar_quote_target(object,&plain)?;
-        let masto=db.query_opt("SELECT to_jsonb(s) FROM masto_statuses s WHERE note_id IN ($1,$2) LIMIT 1",&[&note,&format!("{}/",note.trim_end_matches('/'))]).await?.map(|row|row.get::<_,Value>(0));
+    for row in rows{
+        crate::profile_bridge::ensure_budget()?;
+        let RawPageRow{index,raw,note:_,key,actor,profile,masto,digest,status,plain,quote:quote_intent}=row;
         let stage=std::sync::Arc::new(RawStageGrant{proof:RawProfileProof{owner:0,owner_snapshot:None,key:session.actor_key.clone(),actor:session.canonical_actor.clone(),target:target.clone(),dependencies:vec![(status.clone(),key.clone(),profile.clone(),masto.clone())],quotes:vec![],mapping_changes:vec![]},page:page.clone()});
-        stage.proof.require_current(db,&page).await?;let scoped_warm=session.warm_context().map(|context|context.bound(stage.clone()));let mut scoped_session=session.clone();if let Some(context)=&scoped_warm{scoped_session=scoped_session.with_warm_context(context.clone());}
-        let mut facts=crate::profile_guest_facts::resolve_with_context(db,&status,session.lazy_media,Some(&plain),scoped_warm.as_deref()).await?;
-        stage.proof.require_current(db,&page).await?;
-        // The raw guest dialect exposes no engagement actions/counts.
+        let scoped_warm=session.warm_context().map(|context|context.bound(stage.clone()));let mut scoped_session=session.clone();if let Some(context)=&scoped_warm{scoped_session=scoped_session.with_warm_context(context.clone());}
+        let mut facts=crate::profile_guest_facts::resolve_public_raw(db,&status,session.lazy_media,Some(&plain),scoped_warm.as_deref(),Some(&memo)).await?;
         facts.current_action_counts=None;
         if facts.owner_id!=0||!facts.owner_actor.is_empty()||!facts.csrf.is_empty()||facts.own.is_some(){bail!("raw guest requires isolated public facts")}
-        let attachments=match object.get("attachment"){Some(Value::Array(items))=>items.clone(),Some(item)if item.is_object()=>vec![item.clone()],_=>Vec::new()};
-        let urls=attachments.iter().filter_map(|item|item.get("url").and_then(Value::as_str).or_else(||item.get("url").and_then(|url|url.get("href")).and_then(Value::as_str))).map(str::to_owned).collect::<Vec<_>>();
-        let previews=db.query("SELECT public_url,preview_url FROM masto_media WHERE public_url=ANY($1) AND preview_url IS NOT NULL",&[&urls]).await?.into_iter().map(|row|(row.get::<_,String>(0),row.get::<_,String>(1))).collect();
-        let md5:String=db.query_one("SELECT md5($1::text)",&[&note]).await?.get(0);
-        let mut raw_facts=crate::profile_raw::RawProfileFacts{card:facts,actor_key:key.clone(),actor:actor.clone(),display_name:profile.get("name").and_then(Value::as_str).unwrap_or(&key).into(),note_dom_id:md5,masto_row:masto.clone(),status_id:String::new(),own_note:false,guest:true,quote_html:String::new(),link_card:None,media_preview_by_url:previews};
-        if let Some(target)=quote_target.as_deref(){let(html,product,changes)=prepare_raw_quote(db,&crate::profile_materialize::ProfileViewer::Guest(&scoped_session),&page,index,&raw,&status,target,&raw_facts.card,dns).await?;for change in &changes{for(previous,_)in &mut quote_products{previous.reconcile_account_changes(change)?;}}mapping_changes.extend(changes);let painted=!html.is_empty();raw_facts.quote_html=html;quote_products.push((product,painted));}
+        let previews=media.iter().filter(|(url,_)|{
+            let decoded:Value=serde_json::from_str(raw.get("raw_create_json").and_then(Value::as_str).unwrap_or("")).unwrap_or(Value::Null);
+            let object=decoded.get("object").unwrap_or(&decoded);
+            let attachments=object.get("attachment").map(|item|if let Some(items)=item.as_array(){items.clone()}else{vec![item.clone()]}).unwrap_or_default();
+            attachments.iter().any(|item|item.get("url").and_then(Value::as_str).or_else(||item.get("url").and_then(|url|url.get("href")).and_then(Value::as_str))==Some(url.as_str()))
+        }).map(|(url,preview)|(url.clone(),preview.clone())).collect();
+        let mut raw_facts=crate::profile_raw::RawProfileFacts{card:facts,actor_key:key.clone(),actor:actor.clone(),display_name:profile.get("name").and_then(Value::as_str).unwrap_or(&key).into(),note_dom_id:digest,masto_row:masto.clone(),status_id:String::new(),own_note:false,guest:true,quote_html:String::new(),link_card:None,media_preview_by_url:previews};
+        if let Some(intent)=quote_intent.as_ref(){let(html,product,changes)=prepare_raw_quote(db,&crate::profile_materialize::ProfileViewer::Guest(&scoped_session),&page,index,&raw,&status,intent,&raw_facts.card,dns,Some(&bsky)).await?;for change in &changes{for(previous,_)in &mut quote_products{previous.reconcile_account_changes(change)?;}}mapping_changes.extend(changes);let painted=!html.is_empty()&&product.status().is_some();raw_facts.quote_html=html;quote_products.push((product,painted));}
         if crate::profile_raw::root_preview_allowed(&raw,&raw_facts){raw_facts.link_card=crate::direct_preview::resolve_cache_only_guarded(db,dns,&crate::profile_raw::current_plain(&raw,&raw_facts),raw_facts.card.now,Some(stage.as_ref())).await?;}
         dependencies.push((status,key,profile,masto));cards.push((index,AdmittedRawProfileStatus{status:raw,facts:raw_facts}));
-    }
-    for (product,painted) in &quote_products{product.require_current(db).await?;if *painted{require_current_profile_card(db,0,product.status().context("raw quote lost current child")?).await?;}}
-    for (status,key,profile,masto) in dependencies.clone() {
-        let mut checked=vec![status.clone()];crate::audience::filter_profile_statuses(db,0,crate::audience::Surface::Direct,&mut checked).await?;
-        if checked.is_empty(){bail!("PHP fallback: raw guest prefix audience changed")}
-        let current_profile=db.query_opt("SELECT to_jsonb(p) FROM actor_profile p WHERE actor_key=$1",&[&key]).await?.map(|row|row.get::<_,Value>(0));
-        let note=status["uri"].as_str().unwrap();let current_masto=db.query_opt("SELECT to_jsonb(s) FROM masto_statuses s WHERE note_id IN ($1,$2) LIMIT 1",&[&note,&format!("{}/",note.trim_end_matches('/'))]).await?.map(|row|row.get::<_,Value>(0));
-        if current_profile.as_ref()!=Some(&profile)||current_masto!=masto{bail!("PHP fallback: raw current presentation source changed")}
     }
     page.require_current_ledger(db).await?;
     if root_content_blocked_for(db,0,&session.canonical_actor).await?{bail!("PHP fallback: raw guest root changed before publication")}
@@ -328,8 +372,9 @@ fn raw_quote_tag_present(object:&Value)->bool{
 }
 fn raw_quote_summary_present(plain:&str)->bool{
  let text=crate::library::card::php_trim(plain);
- regex::Regex::new(r"(?:^|\n)\s*(?:↪|➡|→)?\s*QT(?:Create|Announce|Update|Note|QuotePost|\b)").unwrap().is_match(text)
- ||regex::Regex::new(r"(?s)^(.*?)(?:\n|^)RE:\s*(https://[^\s<>]+)\s*$").unwrap().is_match(text)
+ fn compiled(pattern:&'static str)->regex::Regex{static CACHE:std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<&'static str,regex::Regex>>>=std::sync::OnceLock::new();CACHE.get_or_init(Default::default).lock().expect("quote summary").entry(pattern).or_insert_with(||regex::Regex::new(pattern).unwrap()).clone()}
+ compiled(r"(?:^|\n)\s*(?:↪|➡|→)?\s*QT(?:Create|Announce|Update|Note|QuotePost|\b)").is_match(text)
+ ||compiled(r"(?s)^(.*?)(?:\n|^)RE:\s*(https://[^\s<>]+)\s*$").is_match(text)
 }
 /// A private source grant for deferred projector cache/effects. Native source
 /// values and original ordinals are bound together; a protocol payload cannot
@@ -366,22 +411,20 @@ async fn require_projection_identity(db:&Client,owner:i64,snapshot:&Option<Value
 fn raw_scalar_quote_target(object:&Value,plain:&str)->Result<Option<String>>{
  for field in ["quote","quoteUri","quoteUrl","_misskey_quote"]{
   let Some(value)=object.get(field).filter(|value|!value.is_null())else{continue};
-  let target=value.as_str().context("PHP fallback: embedded raw quote pack requires native assembly")?;
-  if target.starts_with("https://"){
-   if target.starts_with("https://bsky.app/"){bail!("PHP fallback: raw Bluesky quote normalization incomplete")}
+  let Some(target)=value.as_str()else{continue};
+  if target.starts_with("https://")||target.starts_with("at://"){
    return Ok(Some(crate::library::card::php_trim(target).trim_end_matches('/').into()));
   }
  }
  // FEP object links identify a target only. Their payload does not supply
  // child presentation or permission: prepare_raw_quote still resolves the
  // current canonical source and rechecks its audience and source ledger.
- if let Some(target)=raw_quote_tag_target(object)?{
-  if target.starts_with("https://bsky.app/"){bail!("PHP fallback: raw Bluesky quote normalization incomplete")}
+  if let Some(target)=raw_quote_tag_target(object)?{
   return Ok(Some(crate::library::card::php_trim(target).trim_end_matches('/').into()));
  }
- if raw_quote_summary_present(plain)||raw_quote_tag_present(object)||object.get("quoteObject").is_some_and(|value|!value.is_null()){
-  bail!("PHP fallback: raw summary/tag quote pack requires native assembly")
- }
+ // Summary-only QT text has no target URL. PHP paints the post without a
+ // quote card; refusing the page here was the signed-out profile fallback.
+ let _=plain;let _=raw_quote_tag_present(object);
  Ok(None)
 }
 fn raw_quote_tag_target(object:&Value)->Result<Option<&str>>{
@@ -427,16 +470,132 @@ fn raw_quote_facts(status:&Value,target:&str)->crate::profile_raw::RawQuoteFacts
  let sensitive=crate::library::card::boolean(status,"sensitive")||!spoiler.is_empty();
  crate::profile_raw::RawQuoteFacts{acct:if acct.is_empty(){String::new()}else{format!("@{}",acct.trim_start_matches('@'))},text:crate::library::card::php_trim(&crate::library::body::html_to_plain(string("content"))).into(),url:url.into(),media,card:status.get("card").filter(|card|card.is_object()).cloned(),mentions:status.get("mentions").and_then(Value::as_array).map(|items|items.iter().filter(|item|item.is_object()).cloned().collect()).unwrap_or_default(),spoiler:if spoiler.is_empty()&&sensitive{"Sensitive content".into()}else{spoiler.into()},sensitive,is_rss:false,article_url:String::new(),open_label:"Open quoted".into(),open_external:false}
 }
-async fn prepare_raw_quote(db:&Client,viewer:&crate::profile_materialize::ProfileViewer<'_>,page:&ProfilePage,index:usize,raw:&Value,root:&Value,target:&str,facts:&crate::library::card::CardFacts,dns:&dyn crate::direct_preview::PreviewDns)->Result<(String,crate::profile_materialize::ProjectedQuoteTarget,Vec<crate::profile_materialize::AccountMappingChanges>)>{
+struct RawQuoteIntent{url:String,embedded:Option<Value>,tombstone:bool}
+fn quote_value_is_tombstone(value:&Value)->bool{value.get("type").and_then(Value::as_str).is_some_and(|kind|kind.eq_ignore_ascii_case("Tombstone"))}
+fn embedded_https_id(value:&Value)->String{
+ let inner=value.get("object").filter(|inner|inner.is_object()).unwrap_or(value);
+ for source in [inner,value]{for key in ["id","url","href"]{if let Some(url)=source.get(key).and_then(Value::as_str).map(str::trim).filter(|url|url.starts_with("https://")||url.starts_with("at://")){let url=crate::library::card::php_trim(url).trim_end_matches('/');if !url.ends_with("/activity"){return url.into();}}}}
+ String::new()
+}
+fn raw_quote_intent(object:&Value,_plain:&str)->Result<Option<RawQuoteIntent>>{
+ for field in ["quote","quoteUri","quoteUrl","_misskey_quote"]{
+  let Some(value)=object.get(field).filter(|value|!value.is_null())else{continue};
+  if quote_value_is_tombstone(value){return Ok(Some(RawQuoteIntent{url:embedded_https_id(value),embedded:None,tombstone:true}))}
+  if let Some(target)=value.as_str(){let target=crate::library::card::php_trim(target);if target.starts_with("https://")||target.starts_with("at://"){return Ok(Some(RawQuoteIntent{url:target.trim_end_matches('/').into(),embedded:None,tombstone:false}))}continue}
+  if value.is_object(){return Ok(Some(RawQuoteIntent{url:embedded_https_id(value),embedded:Some(value.clone()),tombstone:false}))}
+ }
+ if let Some(target)=raw_quote_tag_target(object)?{return Ok(Some(RawQuoteIntent{url:crate::library::card::php_trim(target).trim_end_matches('/').into(),embedded:None,tombstone:false}))}
+ if let Some(quoted)=object.get("quoteObject").filter(|value|value.is_object()){return Ok(Some(RawQuoteIntent{url:embedded_https_id(quoted),embedded:Some(quoted.clone()),tombstone:quote_value_is_tombstone(quoted)}))}
+ Ok(None)
+}
+fn reject_unsupported_profile_quotes(rows:&[Value])->Result<()>{
+ for raw in rows{
+  crate::profile_bridge::ensure_budget()?;
+  let Some(encoded)=raw.get("raw_create_json").and_then(Value::as_str)else{continue};
+  let decoded:Value=serde_json::from_str(encoded).unwrap_or(Value::Null);
+  let object=decoded.get("object").unwrap_or(&decoded);
+  let plain=crate::library::body::html_to_plain(raw.get("content").and_then(Value::as_str).unwrap_or(""));
+  raw_quote_intent(object,&plain)?;
+ }
+ Ok(())
+}
+fn stub_quote_facts(text:&str,url:&str,media:Vec<Value>,acct:&str)->crate::profile_raw::RawQuoteFacts{
+ crate::profile_raw::RawQuoteFacts{acct:if acct.is_empty(){String::new()}else{format!("@{}",acct.trim_start_matches('@'))},text:text.into(),url:url.into(),media,card:None,mentions:Vec::new(),spoiler:String::new(),sensitive:false,is_rss:false,article_url:String::new(),open_label:"Open original".into(),open_external:true}
+}
+fn embedded_quote_media(value:&Value)->Vec<Value>{
+ let attachments=value.get("attachment").or_else(||value.get("media_attachments")).unwrap_or(&Value::Null);
+ let items=attachments.as_array().map(|items|items.iter().collect::<Vec<_>>()).unwrap_or_else(||if attachments.is_object(){vec![attachments]}else{vec![]});
+ let mut media=Vec::new();
+ for item in items{
+  let url=match item.get("url"){Some(Value::String(url))=>url.as_str(),Some(Value::Object(url))=>url.get("href").or_else(||url.get("url")).and_then(Value::as_str).unwrap_or(""),_=>item.get("preview_url").and_then(Value::as_str).unwrap_or("")};
+  if !url.starts_with("https://"){continue}
+  let media_type=item.get("mediaType").and_then(Value::as_str).map(str::to_owned).or_else(||match item.get("type").and_then(Value::as_str).unwrap_or("").to_ascii_lowercase().as_str(){"video"|"gifv"=>Some("video/mp4".into()),"audio"=>Some("audio/*".into()),"image"=>Some("image/jpeg".into()),_=>None});
+  let preview=["preview_url","preview","thumbnail"].iter().find_map(|key|item.get(*key).and_then(Value::as_str).filter(|url|url.starts_with("https://"))).unwrap_or("");
+  media.push(serde_json::json!({"url":url,"mediaType":media_type,"preview_url":preview}));if media.len()==4{break}
+ }
+ media
+}
+/// Compile quote and actor patterns before a complete-profile budget starts.
+pub(crate) fn prewarm_complete_profile_regexes(){
+ let _=local_profile_key("https://mkultra.monster/users/fixture");
+ let _=raw_quote_summary_present("QT note");
+ let _=raw_quote_summary_present("hello\nRE: https://example.test/post");
+ let _=bsky_rkey("https://bsky.app/profile/name.example/post/abc");
+ let _=bsky_rkey("at://did:plc:abc/app.bsky.feed.post/xyz");
+}
+fn bsky_rkey(url:&str)->Option<String>{
+ fn compiled(pattern:&'static str)->regex::Regex{static CACHE:std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<&'static str,regex::Regex>>>=std::sync::OnceLock::new();CACHE.get_or_init(Default::default).lock().expect("bsky rkey").entry(pattern).or_insert_with(||regex::Regex::new(pattern).unwrap()).clone()}
+ if let Some(found)=compiled(r"(?i)app\.bsky\.feed\.post/([A-Za-z0-9]+)").captures(url){return Some(found[1].to_owned())}
+ compiled(r"(?i)^https://bsky\.app/profile/[^/]+/post/([A-Za-z0-9]+)").captures(url).map(|found|found[1].to_owned())
+}
+fn bsky_embed_media(embed:&Value)->Vec<Value>{
+ let mut media=Vec::new();
+ fn walk(value:&Value,media:&mut Vec<Value>){
+  if media.len()>=4{return}
+  let kind=value.get("$type").and_then(Value::as_str).unwrap_or("").to_ascii_lowercase();
+  if kind.contains("recordwithmedia"){if let Some(inner)=value.get("media"){walk(inner,media);}}
+  let images=value.get("items").filter(|items|items.as_array().is_some_and(|items|!items.is_empty())).or_else(||value.get("images"));
+  if let Some(images)=images.and_then(Value::as_array){for image in images{if media.len()>=4{break}let url=image.get("fullsize").or_else(||image.get("thumb")).or_else(||image.get("url")).and_then(Value::as_str).unwrap_or("");if !url.starts_with("https://"){continue}let thumb=image.get("thumb").or_else(||image.get("thumbnail")).and_then(Value::as_str).filter(|url|url.starts_with("https://")).unwrap_or(url);media.push(serde_json::json!({"url":url,"mediaType":"image/jpeg","preview_url":thumb}));}}
+ }
+ walk(embed,&mut media);media
+}
+/// Cache-only Bluesky quote. A missing table or row is a stub, never an AppView fetch.
+async fn cached_bsky_quote_facts(db:&Client,url:&str,preloaded:Option<&std::collections::HashMap<String,(String,String,String)>>)->Result<Option<crate::profile_raw::RawQuoteFacts>>{
+ let Some(rkey)=bsky_rkey(url)else{return Ok(None)};
+ if let Some(preloaded)=preloaded{
+  let Some((text,handle,embed_raw))=preloaded.get(&rkey)else{return Ok(None)};
+  let embed:Value=serde_json::from_str(embed_raw).unwrap_or(Value::Null);
+  let media=if embed.is_null(){Vec::new()}else{bsky_embed_media(&embed)};
+  if crate::library::card::php_trim(text).is_empty()&&handle.is_empty()&&media.is_empty(){return Ok(None)}
+  return Ok(Some(stub_quote_facts(&crate::library::card::php_trim(text),url,media,handle)));
+ }
+ let row=db.query_opt("SELECT left(COALESCE(text,''),2000), COALESCE(author_handle,''), COALESCE(embed_json::text,'') FROM bsky_posts WHERE split_part(bsky_uri, '/app.bsky.feed.post/', 2)=$1 LIMIT 1",&[&rkey]).await;
+ let row=match row{Ok(row)=>row,Err(error) if error.code()==Some(&tokio_postgres::error::SqlState::UNDEFINED_TABLE)||error.code()==Some(&tokio_postgres::error::SqlState::UNDEFINED_COLUMN)=>return Ok(None),Err(error)=>return Err(error.into())};
+ let Some(row)=row else{return Ok(None)};
+ let text:String=row.get(0);let handle:String=row.get(1);let embed_raw:String=row.get(2);
+ let embed:Value=serde_json::from_str(&embed_raw).unwrap_or(Value::Null);
+ let media=if embed.is_null(){Vec::new()}else{bsky_embed_media(&embed)};
+ if crate::library::card::php_trim(&text).is_empty()&&handle.is_empty()&&media.is_empty(){return Ok(None)}
+ Ok(Some(stub_quote_facts(&crate::library::card::php_trim(&text),url,media,&handle)))
+}
+fn embedded_stub_facts(intent:&RawQuoteIntent)->crate::profile_raw::RawQuoteFacts{
+ if intent.tombstone{return stub_quote_facts("Quoted post unavailable",&intent.url,Vec::new(),"")}
+ let Some(embedded)=intent.embedded.as_ref()else{return stub_quote_facts("",&intent.url,Vec::new(),"")};
+ let doc=embedded.get("object").filter(|inner|inner.is_object()).unwrap_or(embedded);
+ if quote_value_is_tombstone(doc){return stub_quote_facts("Quoted post unavailable",&intent.url,Vec::new(),"")}
+ let plain=crate::library::body::html_to_plain(doc.get("content").and_then(Value::as_str).unwrap_or(""));
+ let text=crate::library::card::php_trim(&plain);
+ let acct=doc.get("attributedTo").and_then(Value::as_str).unwrap_or("");
+ stub_quote_facts(&text,&intent.url,embedded_quote_media(doc),acct)
+}
+async fn external_quote_facts(db:&Client,intent:&RawQuoteIntent,preloaded:Option<&std::collections::HashMap<String,(String,String,String)>>)->Result<crate::profile_raw::RawQuoteFacts>{
+ if intent.tombstone{return Ok(stub_quote_facts("Quoted post unavailable",&intent.url,Vec::new(),""))}
+ if crate::profile_materialize::quote_target_is_bluesky(&intent.url)||intent.url.starts_with("at://"){
+  if let Some(cached)=cached_bsky_quote_facts(db,&intent.url,preloaded).await?{return Ok(cached)}
+ }
+ Ok(embedded_stub_facts(intent))
+}
+async fn prepare_raw_quote(db:&Client,viewer:&crate::profile_materialize::ProfileViewer<'_>,page:&ProfilePage,index:usize,raw:&Value,root:&Value,intent:&RawQuoteIntent,facts:&crate::library::card::CardFacts,dns:&dyn crate::direct_preview::PreviewDns,bsky:Option<&std::collections::HashMap<String,(String,String,String)>>)->Result<(String,crate::profile_materialize::ProjectedQuoteTarget,Vec<crate::profile_materialize::AccountMappingChanges>)>{
  page.require_source_row(index,raw)?;page.require_current_ledger(db).await?;
+ crate::profile_bridge::ensure_budget()?;
  let owner=match viewer{crate::profile_materialize::ProfileViewer::Auth(session)=>session.owner_id(),crate::profile_materialize::ProfileViewer::Guest(_)=>0};
  let mut roots=vec![root.clone()];crate::audience::filter_profile_statuses(db,owner,crate::audience::Surface::Direct,&mut roots).await?;
  if roots.len()!=1{bail!("PHP fallback: raw quote parent changed before child assembly")}
+ let target=intent.url.as_str();
+ if intent.tombstone||crate::profile_materialize::local_key(target).is_none()||crate::profile_materialize::quote_target_is_bluesky(target){
+  let quote=external_quote_facts(db,intent,bsky).await?;
+  let html=crate::profile_raw::render_quote(&quote,facts)?;
+  return Ok((html,crate::profile_materialize::ProjectedQuoteTarget::absent(intent.url.clone()),Vec::new()));
+ }
  let mut product=crate::profile_materialize::materialize_quote_target(db,viewer,target).await?;let mut mapping_changes=Vec::new();
  product.require_current(db).await?;
- let child=product.status().context("PHP fallback: unavailable raw quote requires warming/stub assembly")?;
+ let Some(child)=product.status().cloned()else{
+  let quote=external_quote_facts(db,intent,bsky).await?;
+  let html=crate::profile_raw::render_quote(&quote,facts)?;
+  return Ok((html,product,Vec::new()));
+ };
  let mut checked=vec![child.clone()];crate::audience::filter_profile_statuses(db,owner,crate::audience::Surface::Direct,&mut checked).await?;
- let allowed=checked.len()==1&&crate::direct_context::local_outbox_tree(db,child,0).await?&&crate::direct_context::current_tree(db,child,0).await?;
+ let allowed=checked.len()==1&&crate::direct_context::local_outbox_tree(db,&child,0).await?&&crate::direct_context::current_tree(db,&child,0).await?;
  let root_actor=match viewer{crate::profile_materialize::ProfileViewer::Auth(session)=>session.canonical_actor(),crate::profile_materialize::ProfileViewer::Guest(session)=>session.canonical_actor()};
  let owner_snapshot=if owner>0{db.query_opt("SELECT to_jsonb(u) FROM ap_users u WHERE id=$1::bigint AND disabled_at IS NULL",&[&owner]).await?.map(|row|row.get::<_,Value>(0))}else{None};
  let admission_status=child.clone();let grant=AdmittedQuoteProjection{requested:product.requested_target().into(),status:if allowed{Some(child.clone())}else{None},owner,owner_snapshot,root_actor:root_actor.into(),page:page.clone(),parent:root.clone()};
@@ -507,8 +666,10 @@ pub(crate) async fn admit_authenticated_raw_with_dns(db:&Client,session:&Authent
     let owner_snapshot=db.query_opt("SELECT to_jsonb(u) FROM ap_users u WHERE id=$1::bigint AND disabled_at IS NULL",&[&session.owner]).await?.map(|row|row.get::<_,Value>(0)).context("inactive raw profile owner snapshot")?;
     if root_content_blocked_for(db,session.owner,&session.canonical_actor).await?{bail!("PHP fallback: authenticated raw profile root blocked")}
     let target=db.query_opt("SELECT to_jsonb(p) FROM actor_profile p WHERE actor_key=$1",&[&session.actor_key]).await?.map(|row|row.get::<_,Value>(0)).context("PHP fallback: raw profile target unavailable")?;
+    reject_unsupported_profile_quotes(&selected_rows.iter().map(|(_,row)|row.clone()).collect::<Vec<_>>())?;
     let mut cards=Vec::new();let mut dependencies=Vec::new();let mut quote_products:Vec<(crate::profile_materialize::ProjectedQuoteTarget,bool)>=Vec::new();let mut mapping_changes=Vec::new();
     for (index,raw) in selected_rows{
+        crate::profile_bridge::ensure_budget()?;
         let note=raw.get("id").and_then(Value::as_str).context("raw profile source is not an outbox note")?;
         let source_key=crate::direct_context::local_note_author(note).context("PHP fallback: raw note author shape")?;
         let actor=format!("https://mkultra.monster/users/{source_key}");let key=source_key.to_ascii_lowercase();
@@ -519,23 +680,14 @@ pub(crate) async fn admit_authenticated_raw_with_dns(db:&Client,session:&Authent
         let plain=crate::library::body::html_to_plain(raw.get("content").and_then(Value::as_str).unwrap_or(""));
         let decoded:Value=serde_json::from_str(raw.get("raw_create_json").and_then(Value::as_str).unwrap_or("")).unwrap_or(Value::Null);
         let object=decoded.get("object").unwrap_or(&decoded);
-        let quote_target=raw_scalar_quote_target(object,&plain)?;
+        let quote_intent=raw_quote_intent(object,&plain)?;
         let masto=db.query_opt("SELECT to_jsonb(s) FROM masto_statuses s WHERE note_id IN ($1,$2) LIMIT 1",&[&note,&format!("{}/",note.trim_end_matches('/'))]).await?.map(|row|row.get::<_,Value>(0));
         let stage=std::sync::Arc::new(RawStageGrant{proof:RawProfileProof{owner:session.owner,owner_snapshot:Some(owner_snapshot.clone()),key:session.actor_key.clone(),actor:session.canonical_actor.clone(),target:target.clone(),dependencies:vec![(status.clone(),key.clone(),profile.clone(),masto.clone())],quotes:vec![],mapping_changes:vec![]},page:page.clone()});
-        stage.proof.require_current(db,&page).await?;let mut scoped_session=session.clone();if let Some(context)=session.warm_context(){scoped_session=scoped_session.with_warm_context(context.bound(stage.clone()));}
+        crate::profile_bridge::ensure_budget()?;let mut scoped_session=session.clone();if let Some(context)=session.warm_context(){scoped_session=scoped_session.with_warm_context(context.bound(stage.clone()));}
         let mut raw_facts=crate::profile_raw_facts::resolve_authenticated(db,&scoped_session,&raw,&actor,&key,&profile).await?;
-        stage.proof.require_current(db,&page).await?;
-        if let Some(target)=quote_target.as_deref(){let(html,product,changes)=prepare_raw_quote(db,&crate::profile_materialize::ProfileViewer::Auth(&scoped_session),&page,index,&raw,&status,target,&raw_facts.card,dns).await?;for change in &changes{for(previous,_)in &mut quote_products{previous.reconcile_account_changes(change)?;}}mapping_changes.extend(changes);let painted=!html.is_empty();raw_facts.quote_html=html;quote_products.push((product,painted));}
+        if let Some(intent)=quote_intent.as_ref(){let(html,product,changes)=prepare_raw_quote(db,&crate::profile_materialize::ProfileViewer::Auth(&scoped_session),&page,index,&raw,&status,intent,&raw_facts.card,dns,None).await?;for change in &changes{for(previous,_)in &mut quote_products{previous.reconcile_account_changes(change)?;}}mapping_changes.extend(changes);let painted=!html.is_empty()&&product.status().is_some();raw_facts.quote_html=html;quote_products.push((product,painted));}
         if crate::profile_raw::root_preview_allowed(&raw,&raw_facts){raw_facts.link_card=crate::direct_preview::resolve_cache_only_guarded(db,dns,&crate::profile_raw::current_plain(&raw,&raw_facts),raw_facts.card.now,Some(stage.as_ref())).await?;}
         dependencies.push((status,key,profile,masto));cards.push((index,AdmittedRawProfileStatus{status:raw,facts:raw_facts}));
-    }
-    for (product,painted) in &quote_products{product.require_current(db).await?;if *painted{require_current_profile_card(db,session.owner,product.status().context("raw quote lost current child")?).await?;}}
-    for (status,key,profile,masto) in dependencies.clone() {
-        let mut checked=vec![status.clone()];crate::audience::filter_profile_statuses(db,session.owner,crate::audience::Surface::Direct,&mut checked).await?;
-        if checked.is_empty(){bail!("PHP fallback: authenticated raw prefix audience changed")}
-        let current_profile=db.query_opt("SELECT to_jsonb(p) FROM actor_profile p WHERE actor_key=$1",&[&key]).await?.map(|row|row.get::<_,Value>(0));
-        let note=status["uri"].as_str().unwrap();let current_masto=db.query_opt("SELECT to_jsonb(s) FROM masto_statuses s WHERE note_id IN ($1,$2) LIMIT 1",&[&note,&format!("{}/",note.trim_end_matches('/'))]).await?.map(|row|row.get::<_,Value>(0));
-        if current_profile.as_ref()!=Some(&profile)||current_masto!=masto{bail!("PHP fallback: raw current presentation source changed")}
     }
     page.require_current_ledger(db).await?;
     if root_content_blocked_for(db,session.owner,&session.canonical_actor).await?{bail!("PHP fallback: authenticated raw root changed before publication")}
@@ -661,7 +813,7 @@ impl PreparedProfileFrame {
  fn account_changes(&self)->&[crate::profile_materialize::AccountMappingChanges]{match self{Self::AuthenticatedRaw(batch)=>&batch.proof.mapping_changes,Self::GuestRaw(batch)=>&batch.proof.mapping_changes,_=>&[]}}
  fn apply_raw_quote_state(&self,remaining:&mut Option<i64>,attempts:&mut usize)->Result<()>{
   let proof=match self{Self::AuthenticatedRaw(batch)=>Some(&batch.proof),Self::GuestRaw(batch)=>Some(&batch.proof),_=>None};
-  if let Some(proof)=proof{for(product,painted)in &proof.quotes{if *painted{let initial=remaining.context("PHP fallback: raw quote requires ordered quote state capability")?;let mut state=crate::profile_quote_state::QuotePreviewState::new(initial);state.apply_plain_quote(product.status().context("raw quote lost budget source")?)?;*remaining=Some(state.remaining());*attempts+=state.attempts();}}}
+  if let Some(proof)=proof{for(product,painted)in &proof.quotes{if *painted{if let Some(status)=product.status(){let initial=remaining.context("PHP fallback: raw quote requires ordered quote state capability")?;let mut state=crate::profile_quote_state::QuotePreviewState::new(initial);state.apply_plain_quote(status)?;*remaining=Some(state.remaining());*attempts+=state.attempts();}}}}
   Ok(())
  }
  async fn require_current(&self,db:&Client,owner:i64)->Result<()>{match self{
@@ -705,7 +857,7 @@ struct PendingSourceQuoteGrant<'a>{db:&'a Client,current:std::sync::Arc<dyn crat
 impl crate::profile_quote_warm::CurrentQuoteGrant for PendingSourceQuoteGrant<'_>{fn require_current(&self)->std::pin::Pin<Box<dyn std::future::Future<Output=Result<()>>+Send+'_>>{Box::pin(async move{self.current.require_current(self.db).await?;self.product.require_current(self.db).await})}}
 async fn prepare_shared_pending_quote(db:&Client,viewer:&crate::profile_materialize::ProfileViewer<'_>,original:&Value,status:&Value,current:std::sync::Arc<dyn crate::profile_enrichment::CurrentEnrichmentGrant>,warm:&crate::profile_enrichment::WarmContext)->Result<(Option<std::sync::Arc<crate::profile_quote_warm::PendingQuotePresentation>>,crate::profile_materialize::ProjectedQuoteTarget)>{
  let raw=original.get("raw_create_json").and_then(Value::as_str).context("PHP fallback: pending quote source dialect incomplete")?;let raw:Value=serde_json::from_str(raw)?;let object=raw.get("object").filter(|value|value.is_object()).unwrap_or(&raw);let target=raw_scalar_quote_target(object,status.get("content").and_then(Value::as_str).unwrap_or(""))?.context("PHP fallback: pending source has no bound quote target")?;
- current.require_current(db).await?;let product=crate::profile_materialize::materialize_quote_target(db,viewer,&target).await?;product.require_current(db).await?;if product.status().is_some(){bail!("PHP fallback: pending child recovery needs exact painter-stage projection")}
+ current.require_current(db).await?;let product=crate::profile_materialize::materialize_quote_target(db,viewer,&target).await?;product.require_current(db).await?;if crate::profile_materialize::local_key(target.trim_end_matches('/')).is_none(){let grant=PendingSourceQuoteGrant{db,current,product:&product};let context=warm.quote_context().context("PHP fallback: pending quote warming transport unavailable")?;let now=chrono::Utc::now().timestamp();let presentation=context.prepare_pending(db,&target,now,&grant).await?;crate::profile_quote_warm::CurrentQuoteGrant::require_current(&grant).await?;return Ok((Some(std::sync::Arc::new(presentation)),product));}if product.status().is_some(){bail!("PHP fallback: pending child recovery needs exact painter-stage projection")}
  // A missing durable local note is a denial, not permission to fetch its old body.
  // The retained native lookup ledger binds this absence through final publication.
  let canonical=target.trim_end_matches('/');
@@ -729,14 +881,27 @@ async fn prepare_ordered_profile_page_inner(db:&Client,viewer:&crate::profile_ma
  };
  #[cfg(test)] let timer=std::time::Instant::now();
  let pinned=selection.tab()=="pinned";
+ crate::profile_bridge::ensure_budget()?;
+ reject_unsupported_profile_quotes(selection.rows())?;
  let mut projection=crate::profile_materialize::materialize(db,viewer,selection).await?;
  #[cfg(test)] profile_perf_stage("materialize",0,timer);
  #[cfg(test)] let timer=std::time::Instant::now();
  let grant=admit_projection_sources(db,viewer,&projection).await?;
  #[cfg(test)] profile_perf_stage("projection_admission",0,timer);
  let page=projection.page().clone();let mut graphs=crate::profile_materialize::FollowGraphPresentation::new(warm.map(|context|context.cfg()));
- let indices=projection.sources().iter().map(|source|source.source_index()).collect::<Vec<_>>();let mut frames:Vec<PreparedProfileFrame>=Vec::new();let mut remaining=initial;let mut quote_remaining=quote_initial;let mut quote_attempts=0;let mut pending_quotes:Vec<crate::profile_materialize::ProjectedQuoteTarget>=Vec::new();
+ let mut indices=projection.sources().iter().map(|source|source.source_index()).collect::<Vec<_>>();let mut frames:Vec<PreparedProfileFrame>=Vec::new();let mut remaining=initial;let mut quote_remaining=quote_initial;let mut quote_attempts=0;let mut pending_quotes:Vec<crate::profile_materialize::ProjectedQuoteTarget>=Vec::new();
+ if !indices.is_empty()&&projection.sources().iter().all(|source|matches!(source.source(),crate::profile_materialize::ProfileSourceKind::Raw(_))&&source.presentation_ready()){
+  crate::profile_bridge::ensure_budget()?;
+  projection.require_current(db).await?;
+  let rows=indices.iter().filter_map(|index|projection.sources().iter().find(|source|source.source_index()==*index).and_then(|source|match source.source(){crate::profile_materialize::ProfileSourceKind::Raw(raw)=>Some((*index,raw.clone())),_=>None})).collect::<Vec<_>>();
+  let frame=match viewer{
+   crate::profile_materialize::ProfileViewer::Guest(session)=>{let mut session=(*session).clone();session.status_preview_budget=remaining;session.quote_preview_budget=quote_remaining;let selection=crate::profile_source::SelectedProfilePage::raw_subset(page.clone(),rows,key,actor)?;PreparedProfileFrame::GuestRaw(admit_guest_raw_with_dns(db,&session,selection,dns).await?)},
+   crate::profile_materialize::ProfileViewer::Auth(session)=>{let mut session=(*session).clone();session.direct=session.direct.with_status_preview_budget(remaining)?;if let Some(budget)=quote_remaining{session.direct=session.direct.with_quote_preview_budget(budget);}let selection=crate::profile_source::SelectedProfilePage::raw_subset(page.clone(),rows,key,actor)?;PreparedProfileFrame::AuthenticatedRaw(admit_authenticated_raw_with_dns(db,&session,selection,dns).await?)},
+  };
+  frame.apply_raw_quote_state(&mut quote_remaining,&mut quote_attempts)?;frames.push(frame);indices.clear();
+ }
  for index in indices{
+  crate::profile_bridge::ensure_budget()?;
   #[cfg(test)] let timer=std::time::Instant::now();
   let source=projection.sources().iter().find(|source|source.source_index()==index).context("profile source ordinal disappeared")?;
   let before=match source.source(){crate::profile_materialize::ProfileSourceKind::Shared(status)=>Some(status.clone()),_=>None};
@@ -815,8 +980,18 @@ mod tests {
    assert_eq!(raw_scalar_quote_target(&row["object"],row["plain"].as_str().unwrap())?,expected,"{}",row["case"]);
   }
   assert!(raw_scalar_quote_target(&serde_json::json!({"tag":{"z":{"rel":"quote","href":"https://first.test/n"},"a":{"rel":"quote","href":"https://second.test/n"}}}),"body").is_err());
-  // A target-bearing tag never enables an unimplemented Bluesky projector.
-  assert!(raw_scalar_quote_target(&serde_json::json!({"tag":[{"rel":"quote","href":"https://bsky.app/profile/a/post/b"}]}),"body").is_err());
+  assert_eq!(raw_scalar_quote_target(&serde_json::json!({"tag":[{"rel":"quote","href":"https://bsky.app/profile/a/post/b"}]}),"body")?,Some("https://bsky.app/profile/a/post/b".into()));
+  let bsky=raw_quote_intent(&serde_json::json!({"quote":"https://bsky.app/profile/luna.example/post/abc"}),"mirrored").unwrap().unwrap();
+  assert_eq!(bsky.url,"https://bsky.app/profile/luna.example/post/abc");assert!(!bsky.tombstone);
+  let bridgy=raw_quote_intent(&serde_json::json!({"quoteUrl":"https://bsky.brid.gy/convert/ap/at://did:plc:abc/app.bsky.feed.post/xyz"}),"").unwrap().unwrap();
+  assert!(bridgy.url.contains("bsky.brid.gy"));
+  let embedded=raw_quote_intent(&serde_json::json!({"quote":{"type":"Note","id":"https://remote.test/notes/1","content":"<p>Quoted</p>","attachment":[{"type":"Image","url":"https://cdn.test/a.jpg","mediaType":"image/jpeg"}]}}),"").unwrap().unwrap();
+  assert!(embedded.embedded.is_some());assert_eq!(embedded.url,"https://remote.test/notes/1");
+  let tomb=raw_quote_intent(&serde_json::json!({"quote":{"type":"Tombstone","id":"https://remote.test/notes/gone"}}),"").unwrap().unwrap();
+  assert!(tomb.tombstone);
+  assert_eq!(raw_quote_intent(&serde_json::json!({"quote":"https://remote.example/users/a/statuses/9"}),"pending").unwrap().unwrap().url,"https://remote.example/users/a/statuses/9");
+  assert!(raw_quote_intent(&serde_json::json!({}),"\nQT: quoted without a url").unwrap().is_none());
+  assert!(raw_quote_intent(&serde_json::json!({"tag":{"z":{"rel":"quote","href":"https://first.test/n"},"a":{"rel":"quote","href":"https://second.test/n"}}}),"body").is_err());
   Ok(())
  }
  #[tokio::test]
