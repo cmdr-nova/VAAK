@@ -56,6 +56,7 @@ php_tests=(
   api/bin/reply-preview-smoke.php
   api/bin/remote-emoji-smoke.php
   api/bin/csp-smoke.php
+  api/bin/reddit-json-feed-smoke.php
   api/bin/bsky-jetstream-media-smoke.php
   api/bin/jetstream-worker-smoke.php
   api/bin/bsky-backfill-no-federation-smoke.php
