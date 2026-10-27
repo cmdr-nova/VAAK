@@ -429,7 +429,7 @@ async fn status_texts_for_notes(db: &Client, uris: &[String]) -> Result<std::col
 /// Thin port of PHP `ap_masto_mention_notif_type` — returns Some(kind) when the
 /// row should count toward the badge. `update` returns None so the caller can
 /// run the favourites lookup.
-fn mention_notif_type(
+pub(crate) fn mention_notif_type(
     activity_type: &str,
     obj_type: &str,
     object_id: &str,
@@ -528,7 +528,7 @@ fn mention_notif_type(
 /// PHP `ap_masto_snowflake_id`: seconds * 1e9 + (type%10)*1e8 + (dbId%1e8).
 /// Local actor whose connected Bluesky account is `actor_id`
 /// (`https://bsky.app/profile/{handle|did}`), keyed by lowercase handle/DID.
-fn bsky_twin_local_actor<'a>(
+pub(crate) fn bsky_twin_local_actor<'a>(
     actor_id: &str,
     twins: &'a std::collections::HashMap<String, String>,
 ) -> Option<&'a String> {
@@ -583,7 +583,7 @@ async fn load_owner_actor_id(db: &Client, owner_user_id: i64) -> Result<String> 
     Ok(actor.trim_end_matches('/').to_string())
 }
 
-fn parse_epoch_secs(s: &str) -> Option<i64> {
+pub(crate) fn parse_epoch_secs(s: &str) -> Option<i64> {
     if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
         return Some(dt.timestamp());
     }

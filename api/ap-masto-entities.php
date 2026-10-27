@@ -7245,7 +7245,8 @@ function ap_masto_notifications_axum_fetch(
     ?string $maxId = null,
     ?string $sinceId = null,
     array $types = [],
-    int $ownerUserId = 0
+    int $ownerUserId = 0,
+    array $exclude = []
 ): ?array {
     $enabled = getenv('VAAK_NOTIF_AXUM_PRIMARY');
     $enabled = ($enabled === false || $enabled === '')
@@ -7288,7 +7289,16 @@ function ap_masto_notifications_axum_fetch(
             $types
         ), static fn($t) => $t !== '')));
     }
+    if ($exclude !== []) {
+        $query['exclude_types'] = implode(',', array_values(array_filter(array_map(
+            static fn($t) => strtolower(trim((string) $t)),
+            $exclude
+        ), static fn($t) => $t !== '')));
+    }
     $url = $base . '/api/v1/notifications?' . http_build_query($query);
+    $responseHeaders = [];
+    $GLOBALS['ap_notif_axum_exclude_applied'] = false;
+    $GLOBALS['ap_notif_has_more_known'] = false;
     $body = null;
     $code = 0;
     $started = microtime(true);
@@ -7302,6 +7312,10 @@ function ap_masto_notifications_axum_fetch(
             CURLOPT_CONNECTTIMEOUT_MS => 120,
             CURLOPT_TIMEOUT_MS => 350,
             CURLOPT_HTTPHEADER => array_merge(['Accept: application/json', 'Connection: close'], ap_shadow_http_auth_headers()),
+            CURLOPT_HEADERFUNCTION => static function ($ch, string $line) use (&$responseHeaders): int {
+                $responseHeaders[] = $line;
+                return strlen($line);
+            },
         ]);
         $raw = curl_exec($ch);
         $code = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
@@ -7324,11 +7338,21 @@ function ap_masto_notifications_axum_fetch(
         }
         if (isset($http_response_header) && is_array($http_response_header)) {
             foreach ($http_response_header as $hline) {
+                $responseHeaders[] = (string) $hline;
                 if (preg_match('#^HTTP/\S+\s+(\d+)#', (string) $hline, $m)) {
                     $code = (int) $m[1];
-                    break;
                 }
             }
+        }
+    }
+    foreach ($responseHeaders as $hline) {
+        if (preg_match('/^Link:\s*(.+)$/i', trim((string) $hline), $m)) {
+            $GLOBALS['ap_notif_list_link'] = trim($m[1]);
+        } elseif (preg_match('/^X-VAAK-Notif-Has-More:\s*([01])/i', trim((string) $hline), $m)) {
+            $GLOBALS['ap_notif_has_more_known'] = true;
+            $GLOBALS['ap_notif_list_has_more'] = $m[1] === '1';
+        } elseif (preg_match('/^X-VAAK-Notif-Exclude-Applied:\s*1/i', trim((string) $hline))) {
+            $GLOBALS['ap_notif_axum_exclude_applied'] = true;
         }
     }
     $ms = (int) round((microtime(true) - $started) * 1000);
@@ -7890,6 +7914,205 @@ function ap_masto_notifications_drop_hidden(array $items, ?int $ownerUserId = nu
 }
 
 /**
+ * Digit compare for notification ids. Longer ids are newer. This matches
+ * integer order for the snowflakes this server actually issues.
+ */
+function ap_masto_notifications_id_cmp(string $a, string $b): int
+{
+    $a = preg_replace('/\D/', '', $a) ?? '';
+    $b = preg_replace('/\D/', '', $b) ?? '';
+    $la = strlen($a);
+    $lb = strlen($b);
+    if ($la !== $lb) {
+        return $la < $lb ? -1 : 1;
+    }
+    return $a <=> $b;
+}
+
+/**
+ * Exclusive mention id for a v2 type-5 cursor (`id < db_id`). A follow cursor
+ * is not a mention id. Other cursors return null and the caller seeks.
+ */
+function ap_masto_notifications_fast_mention_bound(int $maxId): ?int
+{
+    if ($maxId <= 0 || !function_exists('ap_masto_parse_notification_id')) {
+        return null;
+    }
+    $parsed = ap_masto_parse_notification_id($maxId);
+    if (!is_array($parsed)) {
+        return null;
+    }
+    if ((int) ($parsed['ver'] ?? 0) === 2 && ($parsed['kind'] ?? '') === 'mention') {
+        $dbId = (int) ($parsed['db_id'] ?? 0);
+        return $dbId > 0 ? $dbId : null;
+    }
+    return null;
+}
+
+/**
+ * @param list<array{id:string,sort:int,hidden:bool}> $rows
+ * @return array{ids:list<string>,has_more:bool,next_cursor:?string,need_more:bool,oldest_seen:?string}
+ */
+function ap_masto_notifications_page_decision(array $rows, int $limit, ?string $maxId, ?string $sinceId, ?int $unfinishedWatermark): array
+{
+    $limit = max(1, min(80, $limit));
+    $maxId = $maxId !== null ? (preg_replace('/\D/', '', $maxId) ?? '') : '';
+    $sinceId = $sinceId !== null ? (preg_replace('/\D/', '', $sinceId) ?? '') : '';
+    $kept = [];
+    foreach ($rows as $row) {
+        if (!is_array($row)) {
+            continue;
+        }
+        $id = preg_replace('/\D/', '', (string) ($row['id'] ?? '')) ?? '';
+        if ($id === '') {
+            continue;
+        }
+        if ($maxId !== '' && ap_masto_notifications_id_cmp($id, $maxId) >= 0) {
+            continue;
+        }
+        $kept[] = ['id' => $id, 'sort' => (int) ($row['sort'] ?? 0), 'hidden' => !empty($row['hidden'])];
+    }
+    usort($kept, static function (array $a, array $b): int {
+        if ($a['sort'] !== $b['sort']) {
+            return $b['sort'] <=> $a['sort'];
+        }
+        return ap_masto_notifications_id_cmp($b['id'], $a['id']);
+    });
+    $visible = [];
+    $oldest = null;
+    $stoppedSince = false;
+    $blocked = false;
+    foreach ($kept as $row) {
+        if ($sinceId !== '' && ap_masto_notifications_id_cmp($row['id'], $sinceId) <= 0) {
+            $stoppedSince = true;
+            break;
+        }
+        if ($unfinishedWatermark !== null && $row['sort'] <= $unfinishedWatermark) {
+            $blocked = true;
+            break;
+        }
+        $oldest = $row['id'];
+        if ($row['hidden']) {
+            continue;
+        }
+        $visible[] = $row['id'];
+        if (count($visible) === $limit + 1) {
+            break;
+        }
+    }
+    $hasExtra = count($visible) > $limit;
+    if ($hasExtra) {
+        $visible = array_slice($visible, 0, $limit);
+    }
+    return [
+        'ids' => array_values($visible),
+        'has_more' => $hasExtra,
+        'next_cursor' => $hasExtra ? (string) $visible[count($visible) - 1] : null,
+        'need_more' => !$hasExtra && count($visible) < $limit && $blocked && !$stoppedSince,
+        'oldest_seen' => $oldest,
+    ];
+}
+
+/**
+ * @param array{ids:list<string>,has_more:bool,next_cursor:?string,need_more:bool,oldest_seen:?string} $decision
+ * @return array{ids:list<string>,has_more:bool,next_cursor:?string,need_more:bool,oldest_seen:?string}
+ */
+function ap_masto_notifications_finalize_capped(array $decision, int $limit): array
+{
+    if (empty($decision['need_more'])) {
+        return $decision;
+    }
+    $decision['need_more'] = false;
+    $limit = max(1, min(80, $limit));
+    if (count($decision['ids']) >= $limit) {
+        $decision['next_cursor'] = (string) $decision['ids'][count($decision['ids']) - 1];
+    } else {
+        $decision['next_cursor'] = $decision['oldest_seen'] ?? ($decision['ids'][count($decision['ids']) - 1] ?? null);
+    }
+    $decision['has_more'] = is_string($decision['next_cursor']) && $decision['next_cursor'] !== '';
+    return $decision;
+}
+
+/**
+ * A cached page is complete when it is empty, explicitly finished, or full.
+ * A short legacy envelope (no has_more flag) is rebuilt so filtering cannot
+ * stop the list early.
+ *
+ * @param list<mixed> $items
+ */
+function ap_masto_notifications_cache_page_complete(array $items, int $limit, mixed $hasMore): bool
+{
+    $count = count($items);
+    if ($count === 0 || $hasMore === false) {
+        return true;
+    }
+    return $count >= max(1, min(80, $limit));
+}
+
+function ap_masto_notifications_query_encode(string $value): string
+{
+    return rawurlencode($value);
+}
+
+/**
+ * Mastodon Link header. next is max_id, prev is min_id. since_id is never written.
+ * types[] and exclude_types[] use empty brackets.
+ *
+ * @param list<string> $types
+ * @param list<string> $exclude
+ */
+function ap_masto_notifications_link(array $items, int $limit, bool $hasMore, ?string $nextCursor, array $types = [], array $exclude = [], ?string $base = null): string
+{
+    $base = $base ?? (function_exists('ap_masto_timeline_base_url')
+        ? ap_masto_timeline_base_url('/api/v1/notifications')
+        : 'https://vaak.monster/api/v1/notifications');
+    if ($limit === 0) {
+        $limit = 40;
+    }
+    $extra = '';
+    foreach ($types as $type) {
+        $type = (string) $type;
+        if ($type !== '') {
+            $extra .= '&types%5B%5D=' . rawurlencode($type);
+        }
+    }
+    foreach ($exclude as $type) {
+        $type = (string) $type;
+        if ($type !== '') {
+            $extra .= '&exclude_types%5B%5D=' . rawurlencode($type);
+        }
+    }
+    $parts = [];
+    if ($hasMore) {
+        $cursor = $nextCursor !== null && $nextCursor !== ''
+            ? $nextCursor
+            : (string) ($items === [] ? '' : ($items[count($items) - 1]['id'] ?? ''));
+        if ($cursor !== '') {
+            $parts[] = '<' . $base . '?limit=' . $limit . '&max_id=' . rawurlencode($cursor) . $extra . '>; rel="next"';
+        }
+    }
+    $first = (string) ($items[0]['id'] ?? '');
+    if ($first !== '') {
+        $parts[] = '<' . $base . '?limit=' . $limit . '&min_id=' . rawurlencode($first) . $extra . '>; rel="prev"';
+    }
+    return $parts ? implode(', ', $parts) : '';
+}
+
+/** Keep Rust's path and query, and put the Link on the host the client called. */
+function ap_masto_notifications_rewrite_link_host(string $link): string
+{
+    $link = trim($link);
+    if ($link === '') {
+        return '';
+    }
+    $base = function_exists('ap_masto_timeline_base_url')
+        ? ap_masto_timeline_base_url('/api/v1/notifications')
+        : 'https://vaak.monster/api/v1/notifications';
+    $origin = (string) preg_replace('#/api/v1/notifications$#', '', $base);
+    return (string) preg_replace('#https?://[^/<>\s]+(?=/api/v1/notifications)#', $origin, $link);
+}
+
+/**
  * ap_masto_notifications_fetch for API readers, with mute/block applied.
  *
  * @param list<string> $types
@@ -7906,6 +8129,529 @@ function ap_masto_notifications_fetch_visible(int $limit = 40, ?string $maxId = 
  * @param list<string> $exclude
  * @return list<array<string,mixed>>
  */
+/**
+ * Indexed exclusive upper id, or null when the page starts at the newest row.
+ * 0 means the seek proved there is nothing older than the cursor.
+ */
+function ap_masto_notifications_mention_exclusive_id(int $ownerUserId, int $maxId): ?int
+{
+    if ($maxId <= 0) {
+        return null;
+    }
+    $fast = ap_masto_notifications_fast_mention_bound($maxId);
+    if ($fast !== null) {
+        return $fast;
+    }
+    try {
+        $span = ap_db()->prepare(
+            'SELECT MIN(id) AS lo, MAX(id) AS hi FROM mentions WHERE owner_user_id = ? AND deleted_at IS NULL'
+        );
+        $span->execute([$ownerUserId]);
+        $bounds = $span->fetch();
+        $lo = (int) ($bounds['lo'] ?? 0);
+        $hi = (int) ($bounds['hi'] ?? 0);
+        if ($lo < 1 || $hi < 1) {
+            return 0;
+        }
+        $best = 0;
+        for ($step = 0; $step < 48 && $lo <= $hi; $step++) {
+            $mid = $lo + intdiv($hi - $lo, 2);
+            $probe = ap_db()->prepare(
+                'SELECT id, created_at FROM mentions
+                 WHERE owner_user_id = ? AND deleted_at IS NULL AND id <= ?
+                 ORDER BY id DESC LIMIT 1'
+            );
+            $probe->execute([$ownerUserId, $mid]);
+            $row = $probe->fetch();
+            if (!is_array($row)) {
+                $hi = $mid - 1;
+                continue;
+            }
+            $id = (int) ($row['id'] ?? 0);
+            $snow = (int) ap_masto_snowflake_id((string) ($row['created_at'] ?? ''), $id, 5);
+            if ($snow < $maxId) {
+                $best = $id;
+                $lo = $id + 1;
+            } else {
+                $hi = $id - 1;
+            }
+        }
+        return $best > 0 ? $best + 1 : 0;
+    } catch (Throwable $e) {
+        return null;
+    }
+}
+
+function ap_masto_notifications_follow_exclusive_id(string $ownerActorId, int $maxId): ?int
+{
+    if ($maxId <= 0 || $ownerActorId === '') {
+        return $ownerActorId === '' ? 0 : null;
+    }
+    $parsed = function_exists('ap_masto_parse_notification_id') ? ap_masto_parse_notification_id($maxId) : null;
+    if (is_array($parsed) && (int) ($parsed['ver'] ?? 0) === 2 && ($parsed['kind'] ?? '') === 'follow') {
+        $dbId = (int) ($parsed['db_id'] ?? 0);
+        return $dbId > 0 ? $dbId : 0;
+    }
+    try {
+        $span = ap_db()->prepare(
+            "SELECT MIN(id) AS lo, MAX(id) AS hi FROM events
+             WHERE type = 'Follow'
+               AND action_taken IN ('local_accept_followback', ?)
+               AND (target_actor = ? OR target_actor = ?)"
+        );
+        $bsky = defined('AP_BSKY_FOLLOW_ACTION') ? AP_BSKY_FOLLOW_ACTION : 'bsky_follow';
+        $span->execute([$bsky, $ownerActorId, $ownerActorId . '/']);
+        $bounds = $span->fetch();
+        $lo = (int) ($bounds['lo'] ?? 0);
+        $hi = (int) ($bounds['hi'] ?? 0);
+        if ($lo < 1 || $hi < 1) {
+            return 0;
+        }
+        $best = 0;
+        for ($step = 0; $step < 48 && $lo <= $hi; $step++) {
+            $mid = $lo + intdiv($hi - $lo, 2);
+            $probe = ap_db()->prepare(
+                "SELECT id, created_at FROM events
+                 WHERE type = 'Follow'
+                   AND action_taken IN ('local_accept_followback', ?)
+                   AND (target_actor = ? OR target_actor = ?)
+                   AND id <= ?
+                 ORDER BY id DESC LIMIT 1"
+            );
+            $probe->execute([$bsky, $ownerActorId, $ownerActorId . '/', $mid]);
+            $row = $probe->fetch();
+            if (!is_array($row)) {
+                $hi = $mid - 1;
+                continue;
+            }
+            $id = (int) ($row['id'] ?? 0);
+            $snow = (int) ap_masto_snowflake_id((string) ($row['created_at'] ?? ''), $id, 6);
+            if ($snow < $maxId) {
+                $best = $id;
+                $lo = $id + 1;
+            } else {
+                $hi = $id - 1;
+            }
+        }
+        return $best > 0 ? $best + 1 : 0;
+    } catch (Throwable $e) {
+        return null;
+    }
+}
+
+/**
+ * Block, mute, and missing-note hides are known from the raw row. Mark them
+ * before the limit is chosen so they do not shorten the page.
+ *
+ * @param list<array<string,mixed>> $pool
+ */
+function ap_masto_notifications_mark_cheap_hidden(int $ownerUserId, array &$pool, int $from): void
+{
+    $from = max(0, $from);
+    $targets = [];
+    for ($i = $from; $i < count($pool); $i++) {
+        if (($pool[$i]['kind'] ?? '') !== 'mention' || !is_array($pool[$i]['row'] ?? null)) {
+            continue;
+        }
+        $target = function_exists('ap_notification_target_object_id')
+            ? ap_notification_target_object_id((string) ($pool[$i]['row']['object_id'] ?? ''))
+            : (string) ($pool[$i]['row']['object_id'] ?? '');
+        $target = rtrim($target, '/');
+        if ($target !== '') {
+            $targets[$target] = true;
+        }
+    }
+    $missing = function_exists('ap_notification_missing_local_notes')
+        ? ap_notification_missing_local_notes(array_keys($targets))
+        : [];
+    $phrases = function_exists('ap_muted_words_phrases_cached')
+        ? ap_muted_words_phrases_cached($ownerUserId)
+        : [];
+    $texts = ($phrases !== [] && function_exists('ap_notification_status_texts_for_notes'))
+        ? ap_notification_status_texts_for_notes(array_keys($targets))
+        : [];
+    for ($i = $from; $i < count($pool); $i++) {
+        if (!empty($pool[$i]['hidden']) || !is_array($pool[$i]['row'] ?? null)) {
+            continue;
+        }
+        $row = $pool[$i]['row'];
+        $actor = rtrim((string) ($row['actor_id'] ?? ''), '/');
+        if ($actor !== '' && function_exists('ap_row_is_hidden') && ap_row_is_hidden($actor, null, $ownerUserId)) {
+            $pool[$i]['hidden'] = true;
+            continue;
+        }
+        if (($pool[$i]['kind'] ?? '') !== 'mention') {
+            continue;
+        }
+        $target = function_exists('ap_notification_target_object_id')
+            ? ap_notification_target_object_id((string) ($row['object_id'] ?? ''))
+            : '';
+        $target = rtrim($target, '/');
+        if ($target !== '' && !empty($missing[$target])) {
+            $pool[$i]['hidden'] = true;
+            continue;
+        }
+        if ($phrases !== [] && function_exists('ap_notification_mention_row_muted')
+            && ap_notification_mention_row_muted($ownerUserId, $row, $texts)) {
+            $pool[$i]['hidden'] = true;
+        }
+    }
+}
+
+/**
+ * Keyset notification page. Hidden rows do not consume the limit. A short page
+ * is returned only at the true end, or with a next cursor when the scan cap
+ * still has older rows.
+ *
+ * @param list<string> $want
+ * @return array{items:list<array<string,mixed>>,has_more:bool,next_cursor:string}
+ */
+function ap_masto_notifications_db_page(
+    int $ownerUserId,
+    string $ownerActorId,
+    int $limit,
+    ?string $maxId,
+    ?string $sinceId,
+    array $want
+): array {
+    $limit = max(1, min(80, $limit));
+    $mentionTypes = ['mention', 'favourite', 'reblog', 'quote', 'update', 'bite', 'status'];
+    $maxIdInt = ($maxId !== null && $maxId !== '') ? (int) $maxId : 0;
+    $sinceIdInt = ($sinceId !== null && $sinceId !== '') ? (int) $sinceId : 0;
+    $batch = 80;
+    $mentionBefore = $maxIdInt > 0 ? ap_masto_notifications_mention_exclusive_id($ownerUserId, $maxIdInt) : null;
+    $followBefore = $maxIdInt > 0 ? ap_masto_notifications_follow_exclusive_id($ownerActorId, $maxIdInt) : null;
+    $sources = [
+        'mention' => ['wanted' => (bool) array_intersect($want, $mentionTypes), 'done' => false, 'loaded' => false, 'before' => $mentionBefore, 'oldest' => null],
+        'follow' => ['wanted' => in_array('follow', $want, true) && $ownerActorId !== '', 'done' => false, 'loaded' => false, 'before' => $followBefore, 'oldest' => null],
+        'poll' => ['wanted' => in_array('poll', $want, true), 'done' => false, 'loaded' => false, 'before' => null, 'oldest' => null],
+    ];
+    foreach ($sources as $name => $source) {
+        if (!$source['wanted']) {
+            $sources[$name]['done'] = true;
+            $sources[$name]['loaded'] = true;
+        }
+        if ($source['before'] === 0) {
+            $sources[$name]['done'] = true;
+            $sources[$name]['loaded'] = true;
+        }
+    }
+    $pool = [];
+    $seenActivity = [];
+    $followerSet = null;
+    $poolMarked = 0;
+    $bskyFollowAction = defined('AP_BSKY_FOLLOW_ACTION') ? AP_BSKY_FOLLOW_ACTION : 'bsky_follow';
+    $decision = ['ids' => [], 'has_more' => false, 'next_cursor' => null, 'need_more' => true, 'oldest_seen' => null];
+    for ($round = 0; $round < 8; $round++) {
+        $progress = false;
+        if (!$sources['mention']['done']) {
+            if ($sources['mention']['before'] === null) {
+                $st = ap_db()->prepare(
+                    'SELECT * FROM mentions WHERE owner_user_id = ? AND deleted_at IS NULL ORDER BY id DESC LIMIT ' . $batch
+                );
+                $st->execute([$ownerUserId]);
+            } else {
+                $st = ap_db()->prepare(
+                    'SELECT * FROM mentions WHERE owner_user_id = ? AND deleted_at IS NULL AND id < ? ORDER BY id DESC LIMIT ' . $batch
+                );
+                $st->execute([$ownerUserId, (int) $sources['mention']['before']]);
+            }
+            $rows = $st->fetchAll() ?: [];
+            if (count($rows) < $batch) {
+                $sources['mention']['done'] = true;
+            }
+            if ($rows === []) {
+                $sources['mention']['done'] = true;
+            } else {
+                $progress = true;
+                $last = (int) ($rows[count($rows) - 1]['id'] ?? 0);
+                $sources['mention']['before'] = $last;
+                $oldest = null;
+                foreach ($rows as $row) {
+                    if (!is_array($row)) {
+                        continue;
+                    }
+                    $activityId = trim((string) ($row['activity_id'] ?? ''));
+                    if ($activityId !== '') {
+                        if (isset($seenActivity[$activityId])) {
+                            continue;
+                        }
+                        $seenActivity[$activityId] = true;
+                    }
+                    $type = ap_masto_mention_notif_type($row);
+                    $sort = strtotime((string) ($row['created_at'] ?? '')) ?: (int) ($row['id'] ?? 0);
+                    if ($oldest === null || $sort < $oldest) {
+                        $oldest = $sort;
+                    }
+                    $hidden = $type === null || !in_array($type, $want, true);
+                    $nid = ap_masto_notification_id_for_mention((int) $row['id'], (string) ($row['created_at'] ?? ''));
+                    $pool[] = [
+                        'id' => $nid,
+                        'sort' => $sort,
+                        'hidden' => $hidden,
+                        'kind' => 'mention',
+                        'row' => $row,
+                    ];
+                }
+                if ($oldest !== null) {
+                    $sources['mention']['oldest'] = $oldest;
+                }
+            }
+            $sources['mention']['loaded'] = true;
+        }
+        if (!$sources['follow']['done']) {
+            if ($followerSet === null) {
+                $followerSet = [];
+                try {
+                    foreach (ap_followers_list($ownerActorId) as $fr) {
+                        $aid = rtrim((string) ($fr['actor_id'] ?? ''), '/');
+                        if ($aid !== '') {
+                            $followerSet[$aid] = true;
+                        }
+                    }
+                } catch (Throwable $e) {
+                    $followerSet = [];
+                }
+            }
+            if ($sources['follow']['before'] === null) {
+                $st = ap_db()->prepare(
+                    "SELECT id, created_at, actor_id, target_actor, action_taken FROM events
+                     WHERE type = 'Follow'
+                       AND action_taken IN ('local_accept_followback', ?)
+                       AND (target_actor = ? OR target_actor = ?)
+                     ORDER BY id DESC LIMIT " . $batch
+                );
+                $st->execute([$bskyFollowAction, $ownerActorId, $ownerActorId . '/']);
+            } else {
+                $st = ap_db()->prepare(
+                    "SELECT id, created_at, actor_id, target_actor, action_taken FROM events
+                     WHERE type = 'Follow'
+                       AND action_taken IN ('local_accept_followback', ?)
+                       AND (target_actor = ? OR target_actor = ?)
+                       AND id < ?
+                     ORDER BY id DESC LIMIT " . $batch
+                );
+                $st->execute([$bskyFollowAction, $ownerActorId, $ownerActorId . '/', (int) $sources['follow']['before']]);
+            }
+            $rows = $st->fetchAll() ?: [];
+            if (count($rows) < $batch) {
+                $sources['follow']['done'] = true;
+            }
+            if ($rows === []) {
+                $sources['follow']['done'] = true;
+            } else {
+                $progress = true;
+                $sources['follow']['before'] = (int) ($rows[count($rows) - 1]['id'] ?? 0);
+                $oldest = null;
+                foreach ($rows as $row) {
+                    if (!is_array($row)) {
+                        continue;
+                    }
+                    $fa = rtrim((string) ($row['actor_id'] ?? ''), '/');
+                    $action = (string) ($row['action_taken'] ?? '');
+                    $sort = strtotime((string) ($row['created_at'] ?? '')) ?: (int) ($row['id'] ?? 0);
+                    if ($oldest === null || $sort < $oldest) {
+                        $oldest = $sort;
+                    }
+                    $hidden = false;
+                    if ($action === 'local_accept_followback' && $fa !== '' && $followerSet !== [] && empty($followerSet[$fa])) {
+                        $hidden = true;
+                    }
+                    if ($action === $bskyFollowAction && $fa !== '' && function_exists('ap_bsky_twin_local_actor_id')) {
+                        $twin = ap_bsky_twin_local_actor_id($fa);
+                        if ($twin !== '' && !empty($followerSet[$twin])) {
+                            $hidden = true;
+                        }
+                    }
+                    $pool[] = [
+                        'id' => ap_masto_notification_id_for_follow_event((int) $row['id'], (string) ($row['created_at'] ?? '')),
+                        'sort' => $sort,
+                        'hidden' => $hidden,
+                        'kind' => 'follow',
+                        'row' => $row,
+                    ];
+                }
+                if ($oldest !== null) {
+                    $sources['follow']['oldest'] = $oldest;
+                }
+            }
+            $sources['follow']['loaded'] = true;
+        }
+        if (!$sources['poll']['done']) {
+            try {
+                $now = (new DateTimeImmutable('now', new DateTimeZone('UTC')))->format('c');
+                if ($sources['poll']['before'] === null) {
+                    $st = ap_db()->prepare(
+                        'SELECT * FROM masto_polls WHERE expires_at <= ? ORDER BY local_id DESC LIMIT ' . $batch
+                    );
+                    $st->execute([$now]);
+                } else {
+                    $st = ap_db()->prepare(
+                        'SELECT * FROM masto_polls WHERE expires_at <= ? AND local_id < ? ORDER BY local_id DESC LIMIT ' . $batch
+                    );
+                    $st->execute([$now, (int) $sources['poll']['before']]);
+                }
+                $rows = $st->fetchAll() ?: [];
+                if (count($rows) < $batch) {
+                    $sources['poll']['done'] = true;
+                }
+                if ($rows === []) {
+                    $sources['poll']['done'] = true;
+                } else {
+                    $progress = true;
+                    $sources['poll']['before'] = (int) ($rows[count($rows) - 1]['local_id'] ?? 0);
+                    $me = rtrim($ownerActorId, '/');
+                    $oldest = null;
+                    foreach ($rows as $row) {
+                        if (!is_array($row)) {
+                            continue;
+                        }
+                        $noteId = rtrim((string) ($row['note_id'] ?? ''), '/');
+                        $ours = $me !== '' && str_starts_with($noteId, $me . '/notes/');
+                        $voted = false;
+                        $voters = json_decode((string) ($row['voters_json'] ?? '[]'), true);
+                        if (is_array($voters)) {
+                            foreach ($voters as $v) {
+                                if (rtrim((string) $v, '/') === $me) {
+                                    $voted = true;
+                                    break;
+                                }
+                            }
+                        }
+                        $sort = strtotime((string) ($row['expires_at'] ?? '')) ?: (int) ($row['local_id'] ?? 0);
+                        if ($oldest === null || $sort < $oldest) {
+                            $oldest = $sort;
+                        }
+                        if (!$ours && !$voted) {
+                            continue;
+                        }
+                        $pool[] = [
+                            'id' => ap_masto_notification_id_for_poll((int) $row['local_id'], (string) ($row['expires_at'] ?? '')),
+                            'sort' => $sort,
+                            'hidden' => false,
+                            'kind' => 'poll',
+                            'row' => $row,
+                        ];
+                    }
+                    if ($oldest !== null) {
+                        $sources['poll']['oldest'] = $oldest;
+                    }
+                }
+            } catch (Throwable $e) {
+                $sources['poll']['done'] = true;
+            }
+            $sources['poll']['loaded'] = true;
+        }
+        if (count($pool) > $poolMarked) {
+            ap_masto_notifications_mark_cheap_hidden($ownerUserId, $pool, $poolMarked);
+            $poolMarked = count($pool);
+        }
+        $mark = null;
+        foreach ($sources as $source) {
+            if (!$source['wanted'] || $source['done']) {
+                continue;
+            }
+            if (!$source['loaded']) {
+                $mark = PHP_INT_MAX;
+                break;
+            }
+            $oldest = $source['oldest'] ?? PHP_INT_MAX;
+            $mark = $mark === null ? $oldest : max($mark, $oldest);
+        }
+        $open = false;
+        foreach ($sources as $source) {
+            if (!empty($source['wanted']) && empty($source['done'])) {
+                $open = true;
+                break;
+            }
+        }
+        $slackLimit = min(80, $limit + 8);
+        $slack = ap_masto_notifications_page_decision($pool, $slackLimit, $maxId, $sinceId, $mark);
+        $decision = ap_masto_notifications_page_decision($pool, $limit, $maxId, $sinceId, $mark);
+        if (!$progress || count($slack['ids']) >= $slackLimit || (empty($slack['need_more']) && !$open)) {
+            break;
+        }
+    }
+    $stillOpen = false;
+    foreach ($sources as $source) {
+        if (!empty($source['wanted']) && empty($source['done'])) {
+            $stillOpen = true;
+            break;
+        }
+    }
+    if (!empty($decision['need_more']) || ($stillOpen && empty($decision['has_more']) && count($decision['ids']) < $limit)) {
+        $decision['need_more'] = true;
+        $decision = ap_masto_notifications_finalize_capped($decision, $limit);
+    }
+    $wideMark = $stillOpen ? ($mark ?? null) : null;
+    $wide = ap_masto_notifications_page_decision($pool, 80, $maxId, $sinceId, $wideMark);
+    $byId = [];
+    foreach ($pool as $item) {
+        $byId[(string) $item['id']] = $item;
+    }
+    $raw = [];
+    foreach ($wide['ids'] as $id) {
+        if (isset($byId[$id]) && empty($byId[$id]['hidden'])) {
+            $raw[] = $byId[$id];
+        }
+    }
+    if (function_exists('ap_masto_notifications_dedupe_twin_actions')) {
+        $raw = ap_masto_notifications_dedupe_twin_actions($raw);
+    }
+    $out = [];
+    foreach ($raw as $item) {
+        try {
+            $ent = ap_masto_notification_entity($item);
+        } catch (Throwable $e) {
+            continue;
+        }
+        if (!is_array($ent)) {
+            continue;
+        }
+        $entId = (int) ($ent['id'] ?? 0);
+        if ($maxIdInt > 0 && $entId >= $maxIdInt) {
+            continue;
+        }
+        if ($sinceIdInt > 0 && $entId <= $sinceIdInt) {
+            break;
+        }
+        $one = [$ent];
+        if (function_exists('ap_notifications_apply_viewer_filters')) {
+            $one = ap_notifications_apply_viewer_filters($one, $ownerUserId);
+        }
+        if (function_exists('ap_masto_notifications_drop_hidden')) {
+            $one = ap_masto_notifications_drop_hidden($one, $ownerUserId);
+        }
+        if ($one === [] || !is_array($one[0] ?? null)) {
+            continue;
+        }
+        $out[] = $one[0];
+        if (count($out) === $limit + 1) {
+            break;
+        }
+    }
+    $hasMore = false;
+    $next = '';
+    if (count($out) > $limit) {
+        $out = array_slice($out, 0, $limit);
+        $hasMore = true;
+        $next = (string) ($out[count($out) - 1]['id'] ?? '');
+    } elseif (count($out) === $limit && (!empty($wide['has_more']) || $stillOpen)) {
+        $hasMore = true;
+        $next = (string) ($out[count($out) - 1]['id'] ?? '');
+    } elseif (count($out) < $limit && ($stillOpen || !empty($wide['has_more']) || !empty($decision['has_more']))) {
+        $hasMore = true;
+        $next = (string) ($wide['oldest_seen'] ?? ($decision['oldest_seen'] ?? ''));
+    }
+    if ($hasMore && $next === '' && $out !== []) {
+        $next = (string) ($out[count($out) - 1]['id'] ?? '');
+    }
+    if ($next === '') {
+        $hasMore = false;
+    }
+    return ['items' => array_values($out), 'has_more' => $hasMore, 'next_cursor' => $next];
+}
+
 function ap_masto_notifications_fetch(int $limit = 40, ?string $maxId = null, ?string $sinceId = null, array $types = [], array $exclude = [], bool $bypassCache = false): array
 {
     $notifStartedAt = microtime(true);
@@ -7915,6 +8661,10 @@ function ap_masto_notifications_fetch(int $limit = 40, ?string $maxId = null, ?s
         }
     };
     $limit = max(1, min(80, $limit));
+    $GLOBALS['ap_notif_list_has_more'] = false;
+    $GLOBALS['ap_notif_list_next_cursor'] = '';
+    $GLOBALS['ap_notif_list_link'] = '';
+    $GLOBALS['ap_notif_has_more_known'] = false;
     // favourites, mentions, boosts, quote-boosts, bites, poll ended, favourited-status edits, follows, subscribed posts
     $want = ap_masto_notifications_want_types($types, $exclude);
     if (!$want) {
@@ -7922,8 +8672,6 @@ function ap_masto_notifications_fetch(int $limit = 40, ?string $maxId = null, ?s
         return [];
     }
 
-    $items = [];
-    $mentionTypes = ['mention', 'favourite', 'reblog', 'quote', 'update', 'bite', 'status'];
     $GLOBALS['ap_notif_list_cache_hit'] = false;
 
     $ownerUserId = function_exists('ap_db_masto_owner_user_id')
@@ -7968,6 +8716,8 @@ function ap_masto_notifications_fetch(int $limit = 40, ?string $maxId = null, ?s
                 'ts' => (int) ($cached['ts'] ?? 0),
                 'items' => $cached['items'],
                 'source' => (string) ($cached['source'] ?? ''),
+                'has_more' => array_key_exists('has_more', $cached) ? (bool) $cached['has_more'] : null,
+                'next_cursor' => (string) ($cached['next_cursor'] ?? ''),
             ];
         }
         if ($cached === [] || array_is_list($cached)) {
@@ -7980,16 +8730,30 @@ function ap_masto_notifications_fetch(int $limit = 40, ?string $maxId = null, ?s
         if (is_array($wrapped)) {
             $age = time() - (int) ($wrapped['ts'] ?? 0);
             $items = $wrapped['items'];
-            if ($age >= 0 && $age <= $notifFreshSec) {
+            $cachedHasMore = array_key_exists('has_more', $wrapped) ? $wrapped['has_more'] : null;
+            $cacheComplete = ap_masto_notifications_cache_page_complete(
+                is_array($items) ? $items : [],
+                $limit,
+                $cachedHasMore
+            );
+            if ($cacheComplete && $age >= 0 && $age <= $notifFreshSec) {
                 $GLOBALS['ap_notif_list_cache_hit'] = true;
                 $GLOBALS['ap_notif_list_source'] = 'redis';
+                $GLOBALS['ap_notif_list_has_more'] = $cachedHasMore === null
+                    ? count($items) >= $limit
+                    : (bool) $cachedHasMore;
+                $GLOBALS['ap_notif_list_next_cursor'] = (string) ($wrapped['next_cursor'] ?? '');
                 $recordNotifTiming('cache_fresh', $notifStartedAt);
                 $recordNotifTiming('total', $notifStartedAt);
                 return $presentNotifications($items);
             }
-            if ($age >= 0 && $age <= $notifStaleSec) {
+            if ($cacheComplete && $age >= 0 && $age <= $notifStaleSec) {
                 $GLOBALS['ap_notif_list_cache_hit'] = true;
                 $GLOBALS['ap_notif_list_source'] = 'redis';
+                $GLOBALS['ap_notif_list_has_more'] = $cachedHasMore === null
+                    ? count($items) >= $limit
+                    : (bool) $cachedHasMore;
+                $GLOBALS['ap_notif_list_next_cursor'] = (string) ($wrapped['next_cursor'] ?? '');
                 // Stale-while-revalidate: answer immediately. When list-warm is
                 // primary, skip request-path rebuild — the worker refreshes keys.
                 if (!$listRustPrimary) {
@@ -8006,15 +8770,22 @@ function ap_masto_notifications_fetch(int $limit = 40, ?string $maxId = null, ?s
                 return $presentNotifications($items);
             }
         }
-        // Exact page missed. Reuse the warm head before locking a database rebuild.
-        // exclude_types stays here: those envelopes are not exclude-filtered.
+        // Exact page missed. Reuse Rust before locking a database rebuild.
         // A short scroll page is rejected so Ice Cubes does not stop early.
-        if ($exclude === [] && function_exists('ap_masto_notifications_axum_fetch')) {
-            $axumItems = ap_masto_notifications_axum_fetch($limit, $maxId, $sinceId, $types);
-            if (is_array($axumItems) && $axumItems !== []
+        // exclude_types is trusted only when this Rust build says it applied them.
+        if (function_exists('ap_masto_notifications_axum_fetch')) {
+            $axumItems = ap_masto_notifications_axum_fetch($limit, $maxId, $sinceId, $types, 0, $exclude);
+            $excludeApplied = $exclude === [] || !empty($GLOBALS['ap_notif_axum_exclude_applied']);
+            if ($excludeApplied && is_array($axumItems) && $axumItems !== []
                 && ($maxId === null || $maxId === '' || count($axumItems) >= $limit)) {
                 $GLOBALS['ap_notif_list_cache_hit'] = true;
                 $GLOBALS['ap_notif_list_source'] = 'axum-notif-api';
+                $linkKnown = trim((string) ($GLOBALS['ap_notif_list_link'] ?? '')) !== '';
+                if (!$linkKnown && empty($GLOBALS['ap_notif_has_more_known']) && count($axumItems) >= $limit) {
+                    $GLOBALS['ap_notif_list_has_more'] = true;
+                    $last = $axumItems[count($axumItems) - 1];
+                    $GLOBALS['ap_notif_list_next_cursor'] = is_array($last) ? (string) ($last['id'] ?? '') : '';
+                }
                 $recordNotifTiming('axum', $notifStartedAt);
                 $recordNotifTiming('total', $notifStartedAt);
                 return $presentNotifications($axumItems);
@@ -8031,7 +8802,14 @@ function ap_masto_notifications_fetch(int $limit = 40, ?string $maxId = null, ?s
                 200
             );
             if (is_array($peer) && isset($peer['items']) && is_array($peer['items'])) {
-                return $presentNotifications($peer['items']);
+                $peerHasMore = array_key_exists('has_more', $peer) ? $peer['has_more'] : null;
+                if (ap_masto_notifications_cache_page_complete($peer['items'], $limit, $peerHasMore)) {
+                    $GLOBALS['ap_notif_list_has_more'] = $peerHasMore === null
+                        ? count($peer['items']) >= $limit
+                        : (bool) $peerHasMore;
+                    $GLOBALS['ap_notif_list_next_cursor'] = (string) ($peer['next_cursor'] ?? '');
+                    return $presentNotifications($peer['items']);
+                }
             }
         }
     }
@@ -8045,6 +8823,7 @@ function ap_masto_notifications_fetch(int $limit = 40, ?string $maxId = null, ?s
         $projected = ap_notification_projection_read($ownerUserId, $limit, $want, $exclude);
         if ($projected !== []) {
             $recordNotifTiming('projection_hit', $projectionStartedAt);
+            $GLOBALS['ap_notif_list_has_more'] = true;
             if (function_exists('ap_redis_json_set') && $listEpochCurrent()) {
                 ap_redis_json_set($redisKey, ['ts' => time(), 'items' => $projected, 'source' => 'php-projection'], 300);
             }
@@ -8054,291 +8833,11 @@ function ap_masto_notifications_fetch(int $limit = 40, ?string $maxId = null, ?s
     }
 
     $queryStartedAt = microtime(true);
-    if (array_intersect($want, $mentionTypes)) {
-        // The page only hydrates the first handful of notifications. Scan a
-        // bounded multiple of that page size instead of always walking 80
-        // rows, which made large mention tables slow even when the newest
-        // entries were valid.
-        $mentionScanLimit = max(20, min(80, $limit * 4));
-        $st = ap_db()->prepare(
-            'SELECT * FROM mentions WHERE owner_user_id = ? AND deleted_at IS NULL ORDER BY id DESC LIMIT ' . $mentionScanLimit
-        );
-        $st->execute([$ownerUserId]);
-        $seenActivityIds = [];
-        foreach ($st->fetchAll() as $row) {
-            $activityId = trim((string) ($row['activity_id'] ?? ''));
-            if ($activityId !== '') {
-                if (isset($seenActivityIds[$activityId])) {
-                    continue;
-                }
-                $seenActivityIds[$activityId] = true;
-            }
-            $t = ap_masto_mention_notif_type($row);
-            if ($t === null || !in_array($t, $want, true)) {
-                continue;
-            }
-            $nid = (int) $row['id'];
-            $items[] = [
-                'sort' => strtotime((string) ($row['created_at'] ?? '')) ?: $nid,
-                'kind' => 'mention',
-                'row' => $row,
-            ];
-        }
-        if ($items !== []
-            && function_exists('ap_notification_missing_local_notes')
-            && function_exists('ap_notification_is_local_note')
-            && function_exists('ap_notification_target_object_id')) {
-            $scanTargets = [];
-            foreach ($items as $item) {
-                $target = ap_notification_target_object_id((string) ($item['row']['object_id'] ?? ''));
-                if (ap_notification_is_local_note($target)) {
-                    $scanTargets[$target] = true;
-                }
-            }
-            if ($scanTargets !== []) {
-                $missingScan = ap_notification_missing_local_notes(array_keys($scanTargets));
-                if ($missingScan !== []) {
-                    $items = array_values(array_filter($items, static function (array $item) use ($missingScan): bool {
-                        $target = ap_notification_target_object_id((string) ($item['row']['object_id'] ?? ''));
-                        return $target === '' || empty($missingScan[$target]);
-                    }));
-                }
-            }
-        }
-    }
-
-    if (in_array('follow', $want, true)) {
-        // Follow events must target THIS session actor only (never NULL/empty — that leaked).
-        // Include Bluesky follows (action_taken=bsky_follow) — those are not in AP followers[].
-        $bskyFollowAction = defined('AP_BSKY_FOLLOW_ACTION') ? AP_BSKY_FOLLOW_ACTION : 'bsky_follow';
-        $st = ap_db()->prepare(
-            "SELECT id, created_at, actor_id, target_actor, action_taken FROM events
-             WHERE type = 'Follow'
-               AND action_taken IN ('local_accept_followback', ?)
-               AND (target_actor = ? OR target_actor = ?)
-             ORDER BY id DESC LIMIT 40"
-        );
-        $st->execute([$bskyFollowAction, $ownerActorId, $ownerActorId . '/']);
-        // Drop AP follow notifs once the actor has unfollowed (Undo Follow).
-        $followerSet = [];
-        try {
-            foreach (ap_followers_list($ownerActorId) as $fr) {
-                $aid = rtrim((string) ($fr['actor_id'] ?? ''), '/');
-                if ($aid !== '') {
-                    $followerSet[$aid] = true;
-                }
-            }
-        } catch (Throwable $e) {
-            $followerSet = [];
-        }
-        foreach ($st->fetchAll() as $row) {
-            $fa = rtrim((string) ($row['actor_id'] ?? ''), '/');
-            $action = (string) ($row['action_taken'] ?? '');
-            if ($action === 'local_accept_followback'
-                && $fa !== '' && $followerSet !== [] && empty($followerSet[$fa])) {
-                continue;
-            }
-            // A linked VAAK user's Bluesky twin following too is not news.
-            if ($action === $bskyFollowAction && $fa !== '' && function_exists('ap_bsky_twin_local_actor_id')) {
-                $twin = ap_bsky_twin_local_actor_id($fa);
-                if ($twin !== '' && !empty($followerSet[$twin])) {
-                    continue;
-                }
-            }
-            $nid = 1000000 + (int) $row['id'];
-            $items[] = [
-                'sort' => strtotime((string) ($row['created_at'] ?? '')) ?: $nid,
-                'kind' => 'follow',
-                'row' => $row,
-            ];
-        }
-    }
-
-    // Poll ended: polls THIS account authored, or polls they voted on — never other locals'.
-    if (in_array('poll', $want, true)) {
-        try {
-            $now = (new DateTimeImmutable('now', new DateTimeZone('UTC')))->format('c');
-            $st = ap_db()->prepare(
-                'SELECT * FROM masto_polls WHERE expires_at <= ? ORDER BY expires_at DESC LIMIT 40'
-            );
-            $st->execute([$now]);
-            $me = rtrim($ownerActorId !== '' ? $ownerActorId : ap_masto_session_actor_id(), '/');
-            foreach ($st->fetchAll() as $row) {
-                if (!is_array($row)) {
-                    continue;
-                }
-                $noteId = rtrim((string) ($row['note_id'] ?? ''), '/');
-                $ours = $me !== '' && str_starts_with($noteId, $me . '/notes/');
-                $voted = false;
-                $voters = json_decode((string) ($row['voters_json'] ?? '[]'), true);
-                if (is_array($voters)) {
-                    foreach ($voters as $v) {
-                        if (rtrim((string) $v, '/') === $me) {
-                            $voted = true;
-                            break;
-                        }
-                    }
-                }
-                if (!$ours && !$voted) {
-                    continue;
-                }
-                $nid = 2000000 + (int) $row['local_id'];
-                $items[] = [
-                    'sort' => strtotime((string) ($row['expires_at'] ?? '')) ?: $nid,
-                    'kind' => 'poll',
-                    'row' => $row,
-                ];
-            }
-        } catch (Throwable $e) {
-            // polls table may be absent on older installs
-        }
-    }
-
-    // Twin-identity dedupe: one like/boost from a linked Fedi+Bluesky user
-    // collapses to a single notification (prefer the local AP row).
-    $items = ap_masto_notifications_dedupe_twin_actions($items);
-
-    // Batch-load known remote actor rows before entity hydration. This keeps
-    // Ice Cubes notification requests from repeating one DB lookup per card;
-    // unknown actors still follow the existing async warm path in
-    // ap_masto_remote_account(). PostgreSQL remains authoritative.
-    $prefetchIds = [];
-    $bskyDids = [];
-    foreach ($items as $item) {
-        $row = is_array($item['row'] ?? null) ? $item['row'] : [];
-        $actorId = (string) ($row['actor_id'] ?? '');
-        if ($actorId !== '') {
-            $prefetchIds[$actorId] = true;
-        }
-        // Flat DID Redis (actor-warm) — extract from at:// activity ids.
-        $activityId = trim((string) ($row['activity_id'] ?? ''));
-        if (preg_match('#^at://(did:[^/]+)/#', $activityId, $m)) {
-            $bskyDids[$m[1]] = true;
-        }
-    }
-    $actorPrefetchStartedAt = microtime(true);
-    if ($prefetchIds !== [] && function_exists('ap_remote_actors_prefetch')) {
-        ap_remote_actors_prefetch(array_keys($prefetchIds));
-    }
-    if ($bskyDids !== []) {
-        if (!function_exists('ap_bsky_actors_prefetch')) {
-            $bskyLib = __DIR__ . '/ap-bsky.php';
-            if (is_file($bskyLib)) {
-                require_once $bskyLib;
-            }
-        }
-        if (function_exists('ap_bsky_actors_prefetch')) {
-            ap_bsky_actors_prefetch(array_keys($bskyDids));
-        }
-    }
-    // Favourite/reblog notifications often point at local notes. Prefetch
-    // those target rows in one bounded query so each card does not repeat a
-    // note_id lookup. This is request-local and never replaces privacy checks.
-    $statusPrefetchStartedAt = microtime(true);
-    $statusTargets = [];
-    foreach ($items as $item) {
-        $row = is_array($item['row'] ?? null) ? $item['row'] : [];
-        $kind = (string) ($item['kind'] ?? '');
-        if ($kind !== 'mention') {
-            continue;
-        }
-        $type = ap_masto_mention_notif_type($row);
-        if (!in_array($type, ['favourite', 'reblog', 'quote', 'update', 'bite', 'status', 'mention'], true)) {
-            continue;
-        }
-        $target = ap_masto_mention_target_object_id((string) ($row['object_id'] ?? ''));
-        if ($target !== '' && str_starts_with($target, 'https://')) {
-            $statusTargets[rtrim($target, '/')] = true;
-        }
-    }
-    $GLOBALS['ap_notification_status_rows'] = [];
-    $GLOBALS['ap_notification_media_rows'] = [];
-    $mediaPrefetchStartedAt = microtime(true);
-    if ($statusTargets !== []) {
-        try {
-            foreach (array_chunk(array_keys($statusTargets), 80) as $chunk) {
-                $lookup = [];
-                foreach ($chunk as $target) {
-                    $lookup[] = $target;
-                    $lookup[] = $target . '/';
-                }
-                $ph = implode(',', array_fill(0, count($lookup), '?'));
-                $st = ap_db()->prepare("SELECT * FROM masto_statuses WHERE note_id IN ($ph)");
-                $st->execute($lookup);
-                foreach ($st->fetchAll() ?: [] as $row) {
-                    if (!is_array($row)) {
-                        continue;
-                    }
-                    $noteId = rtrim((string) ($row['note_id'] ?? ''), '/');
-                    if ($noteId !== '') {
-                        $GLOBALS['ap_notification_status_rows'][$noteId] = $row;
-                        $GLOBALS['ap_notification_status_rows'][$noteId . '/'] = $row;
-                    }
-                }
-            }
-            $localIds = [];
-            foreach ($GLOBALS['ap_notification_status_rows'] as $prefetchedRow) {
-                if (is_array($prefetchedRow) && (int) ($prefetchedRow['local_id'] ?? 0) > 0) {
-                    $localIds[(int) $prefetchedRow['local_id']] = true;
-                }
-            }
-            if ($localIds !== []) {
-                $ids = array_keys($localIds);
-                foreach (array_chunk($ids, 80) as $idChunk) {
-                    $ph = implode(',', array_fill(0, count($idChunk), '?'));
-                    $mediaSt = ap_db()->prepare("SELECT * FROM masto_media WHERE status_local_id IN ($ph) ORDER BY status_local_id, local_id");
-                    $mediaSt->execute($idChunk);
-                    foreach ($mediaSt->fetchAll() ?: [] as $mediaRow) {
-                        $sid = (int) ($mediaRow['status_local_id'] ?? 0);
-                        if ($sid > 0) $GLOBALS['ap_notification_media_rows'][$sid][] = $mediaRow;
-                    }
-                }
-            }
-        } catch (Throwable $e) {
-            // Per-status fallback remains available if the batch query fails.
-        }
-    }
-    $recordNotifTiming('media_prefetch', $mediaPrefetchStartedAt);
+    $page = ap_masto_notifications_db_page($ownerUserId, $ownerActorId, $limit, $maxId, $sinceId, $want);
+    $out = $page['items'];
+    $GLOBALS['ap_notif_list_has_more'] = (bool) ($page['has_more'] ?? false);
+    $GLOBALS['ap_notif_list_next_cursor'] = (string) ($page['next_cursor'] ?? '');
     $recordNotifTiming('query', $queryStartedAt);
-    $recordNotifTiming('actor_prefetch', $actorPrefetchStartedAt);
-    $recordNotifTiming('status_prefetch', $statusPrefetchStartedAt);
-
-    usort($items, static function ($a, $b) {
-        return $b['sort'] <=> $a['sort'];
-    });
-
-    $out = [];
-    // Items are newest-first (sort desc). Ice Cubes polls with since_id near the tip;
-    // once we hit the watermark, older rows cannot be "newer" — stop instead of
-    // hydrating the whole backlog (was ~4–11s for /api/v2/notifications).
-    $sinceIdInt = ($sinceId !== null && $sinceId !== '') ? (int) $sinceId : 0;
-    $maxIdInt = ($maxId !== null && $maxId !== '') ? (int) $maxId : 0;
-    $hydrateStartedAt = microtime(true);
-    foreach ($items as $item) {
-        try {
-            $ent = ap_masto_notification_entity($item);
-        } catch (Throwable $e) {
-            error_log('[ap-masto] notification entity: ' . $e->getMessage());
-            continue;
-        }
-        if ($ent === null) {
-            continue;
-        }
-        $entId = (int) ($ent['id'] ?? 0);
-        // max_id: skip newer-or-equal, keep scanning older
-        if ($maxIdInt > 0 && $entId >= $maxIdInt) {
-            continue;
-        }
-        // since_id: only newer than watermark; then stop (newest-first)
-        if ($sinceIdInt > 0 && $entId <= $sinceIdInt) {
-            break;
-        }
-        $out[] = $ent;
-        if (count($out) >= $limit) {
-            break;
-        }
-    }
-    $recordNotifTiming('hydrate', $hydrateStartedAt);
     $out = $presentNotifications($out);
     // Warm the durable projection only on a cache rebuild.  Cache hits remain
     // read-only and the projection is never authoritative for privacy rules.
@@ -8354,7 +8853,13 @@ function ap_masto_notifications_fetch(int $limit = 40, ?string $maxId = null, ?s
         $source = $listWarmMode ? 'vaak-worker-live' : 'php';
         // Keep 5–10 minutes for stale-while-revalidate; freshness is gated by ts.
         $ttl = $listRustPrimary ? 600 : 300;
-        ap_redis_json_set($redisKey, ['ts' => time(), 'items' => $out, 'source' => $source], $ttl);
+        ap_redis_json_set($redisKey, [
+            'ts' => time(),
+            'items' => $out,
+            'source' => $source,
+            'has_more' => (bool) ($GLOBALS['ap_notif_list_has_more'] ?? false),
+            'next_cursor' => (string) ($GLOBALS['ap_notif_list_next_cursor'] ?? ''),
+        ], $ttl);
     }
     if ($holdNotifLock && $notifStampedeLock !== '' && function_exists('ap_redis_unlock')) {
         ap_redis_unlock($notifStampedeLock);

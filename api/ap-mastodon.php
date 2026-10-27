@@ -1899,7 +1899,29 @@ function ap_masto_api(string $method, string $path): void
             $sinceId = (string) $_GET['min_id'];
         }
         [$types, $exclude] = ap_masto_parse_notification_type_filters();
-        ap_masto_json(ap_masto_notifications_api_list(ap_masto_notifications_fetch_visible($limit, $maxId, $sinceId, $types, $exclude)));
+        $GLOBALS['ap_notif_list_link'] = '';
+        $GLOBALS['ap_notif_list_has_more'] = false;
+        $GLOBALS['ap_notif_list_next_cursor'] = '';
+        $list = ap_masto_notifications_api_list(ap_masto_notifications_fetch_visible($limit, $maxId, $sinceId, $types, $exclude));
+        $rustLink = trim((string) ($GLOBALS['ap_notif_list_link'] ?? ''));
+        if ($rustLink !== '' && function_exists('ap_masto_notifications_rewrite_link_host')) {
+            $link = ap_masto_notifications_rewrite_link_host($rustLink);
+        } elseif (function_exists('ap_masto_notifications_link')) {
+            $link = ap_masto_notifications_link(
+                $list,
+                $limit,
+                (bool) ($GLOBALS['ap_notif_list_has_more'] ?? false),
+                (string) ($GLOBALS['ap_notif_list_next_cursor'] ?? ''),
+                $types,
+                $exclude
+            );
+        } else {
+            $link = '';
+        }
+        if ($link !== '') {
+            header('Link: ' . $link);
+        }
+        ap_masto_json($list);
         return;
     }
 
