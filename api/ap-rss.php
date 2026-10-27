@@ -1774,7 +1774,8 @@ function ap_rss_favicon_for_url(string $pageUrl): string
  * same ids the Atom feed used) carry over untouched.
  *
  * Optional app-only OAuth: set AP_REDDIT_CLIENT_ID and AP_REDDIT_CLIENT_SECRET
- * (a "script" or "web app" at reddit.com/prefs/apps) and listings come from
+ * in the environment or /etc/mkultra/vaak.env (a "script" or "web app" at
+ * reddit.com/prefs/apps) and listings come from
  * oauth.reddit.com, which Reddit rate-limits far less than anonymous .json.
  */
 
@@ -1851,11 +1852,39 @@ function ap_rss_reddit_json_url(string $feedUrl, bool $oauth = false): ?string
         . ($l['path'] === '' ? '/' : $l['path']) . '.json?' . http_build_query($query);
 }
 
-/** App-only OAuth bearer token, cached on disk until shortly before expiry. '' when not configured or on failure. */
-function ap_rss_reddit_oauth_token(): string
+/**
+ * Reddit app credentials: process env first, then /etc/mkultra/vaak.env, so
+ * the cron poller and the FPM pool both see them without per-entry env lines.
+ *
+ * @return array{0:string,1:string} [client id, client secret]
+ */
+function ap_rss_reddit_credentials(?string $envFile = null): array
 {
     $id = trim((string) (getenv('AP_REDDIT_CLIENT_ID') ?: ''));
     $secret = trim((string) (getenv('AP_REDDIT_CLIENT_SECRET') ?: ''));
+    $envFile ??= '/etc/mkultra/vaak.env';
+    if (($id === '' || $secret === '') && is_readable($envFile)) {
+        foreach (file($envFile, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) ?: [] as $line) {
+            $line = trim($line);
+            if ($line === '' || str_starts_with($line, '#') || !str_contains($line, '=')) {
+                continue;
+            }
+            [$k, $v] = array_map('trim', explode('=', $line, 2));
+            $v = trim($v, " \t\"'");
+            if ($k === 'AP_REDDIT_CLIENT_ID' && $id === '') {
+                $id = $v;
+            } elseif ($k === 'AP_REDDIT_CLIENT_SECRET' && $secret === '') {
+                $secret = $v;
+            }
+        }
+    }
+    return [$id, $secret];
+}
+
+/** App-only OAuth bearer token, cached on disk until shortly before expiry. '' when not configured or on failure. */
+function ap_rss_reddit_oauth_token(): string
+{
+    [$id, $secret] = ap_rss_reddit_credentials();
     if ($id === '' || $secret === '') {
         return '';
     }

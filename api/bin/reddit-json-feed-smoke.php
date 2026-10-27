@@ -92,4 +92,16 @@ reddit_check(ap_rss_parse_reddit_json('{"error":403}', 'https://www.reddit.com/r
 $empty = ap_rss_parse_reddit_json('{"kind":"Listing","data":{"children":[]}}', 'https://www.reddit.com/r/pics/.rss');
 reddit_check(is_array($empty) && $empty['items'] === [], 'empty listing is valid');
 
+// Credentials: process env wins, vaak.env fills the gaps, quotes stripped.
+$envFile = tempnam(sys_get_temp_dir(), 'vaak-reddit-env-');
+file_put_contents($envFile, "# comment\nAP_REDDIT_CLIENT_ID=\"fileid\"\nAP_REDDIT_CLIENT_SECRET='filesecret'\nOTHER=x\n");
+putenv('AP_REDDIT_CLIENT_ID');
+putenv('AP_REDDIT_CLIENT_SECRET');
+reddit_check(ap_rss_reddit_credentials($envFile) === ['fileid', 'filesecret'], 'vaak.env credentials');
+putenv('AP_REDDIT_CLIENT_ID=envid');
+reddit_check(ap_rss_reddit_credentials($envFile) === ['envid', 'filesecret'], 'process env wins');
+putenv('AP_REDDIT_CLIENT_ID');
+reddit_check(ap_rss_reddit_credentials($envFile . '.missing') === ['', ''], 'unconfigured');
+unlink($envFile);
+
 echo "reddit json feed smoke: {$checks} checks passed\n";
