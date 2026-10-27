@@ -300,6 +300,9 @@ $check(str_contains($admin, 'admin_dm_reply_contexts_html($thread, \'dms\')'), '
 $check(str_contains($functionSource($api . '/ap-admin.php', 'admin_dm_reply_context_block_html'), 'Open referenced ' . 'post'), 'referenced-post link is unchanged');
 $check(str_contains($admin, 'enctype="multipart/form-data"'), 'DM composers upload through the existing media pipeline');
 $check(substr_count($admin, 'class="dm-media-input"') >= 1, 'both composers share the media field');
+$check(str_contains($admin, 'class="dm-media-live"'), 'DM composers announce pasted attachments');
+$check(str_contains($admin, 'clipboardImageFiles'), 'DM paste uses the shared clipboard helper');
+$check(!str_contains($admin, 'paste_media') && !str_contains($admin, 'upload_paste'), 'paste does not add an upload action');
 
 if ($failures !== []) {
     fwrite(STDERR, 'dm-media-smoke: ' . count($failures) . " of {$checks} failed\n  " . implode("\n  ", $failures) . "\n");
