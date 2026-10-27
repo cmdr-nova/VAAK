@@ -27275,6 +27275,12 @@ function admin_notifications_page(int $limit, ?string $maxId, array $types = [])
     if ($fromAxum) {
         $GLOBALS['ap_notif_list_cache_hit'] = true;
         $GLOBALS['ap_notif_list_source'] = 'axum-shadow';
+        if (function_exists('ap_notifications_apply_viewer_filters')) {
+            $filterOwner = function_exists('ap_db_masto_owner_user_id')
+                ? (int) ap_db_masto_owner_user_id()
+                : 0;
+            $primary = ap_notifications_apply_viewer_filters($primary, $filterOwner);
+        }
     }
 
     $primaryKeys = [];

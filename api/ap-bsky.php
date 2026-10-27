@@ -3475,6 +3475,14 @@ function ap_bsky_retract_imported_note(int $ownerUserId, string $noteId): array
             // A deployment may not have every optional map table.
         }
     }
+    // Bluesky-origin removal does not federate. Notifications that point at
+    // the local note still have to disappear with it.
+    if (function_exists('ap_mention_soft_delete')) {
+        ap_mention_soft_delete($noteId);
+    }
+    if (function_exists('ap_events_mark_object_deleted')) {
+        ap_events_mark_object_deleted($noteId);
+    }
     return ['ok' => true, 'retracted' => $removed];
 }
 
@@ -3612,6 +3620,12 @@ function ap_bsky_jetstream_ingest_event(array $event): array
             ap_bsky_post_preview_warm_enqueue($uri, (int) ($owners[0] ?? 0));
         }
         return ['ok' => true, 'type' => 'post', 'owners' => count($owners)];
+    }
+    if ($action === 'delete' && $collection === 'app.bsky.feed.like' && function_exists('ap_mention_soft_delete_at_uri')) {
+        ap_mention_soft_delete_at_uri($uri);
+    }
+    if ($action === 'delete' && $collection === 'app.bsky.graph.follow' && function_exists('ap_notification_dismiss_follow_object')) {
+        ap_notification_dismiss_follow_object($uri);
     }
     if ($action === 'delete' && ($collection === 'app.bsky.feed.post' || $collection === 'app.bsky.feed.repost')) {
         ap_bsky_tombstone_uri($uri);
@@ -6374,6 +6388,9 @@ function ap_bsky_tombstone_uri(string $uri, ?int $ownerUserId = null): bool
         } catch (Throwable $e2) {
             // ignore
         }
+    }
+    if (function_exists('ap_mention_soft_delete_at_uri')) {
+        ap_mention_soft_delete_at_uri($uri);
     }
     if ($removed) {
         $owners = [];

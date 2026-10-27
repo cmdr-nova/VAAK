@@ -56,6 +56,32 @@ pub async fn compute_unread(db: &Client, owner_user_id: i64, scan: i64) -> Resul
         )
         .await
         .context("select mentions")?;
+    let mut mention_targets = Vec::new();
+    for row in &mention_rows {
+        let object_id: String = row.try_get::<_, Option<String>>(5)?.unwrap_or_default();
+        let target = mention_target_object_id(&object_id);
+        if !target.is_empty() {
+            mention_targets.push(target);
+        }
+    }
+    let missing_local = match missing_local_note_uris(db, &mention_targets).await {
+        Ok(set) => set,
+        Err(err) => {
+            tracing::warn!(error = %err, "notification missing-note check skipped");
+            std::collections::HashSet::new()
+        }
+    };
+    let status_texts = if hidden.muted_phrases.is_empty() {
+        std::collections::HashMap::new()
+    } else {
+        match status_texts_for_notes(db, &mention_targets).await {
+            Ok(map) => map,
+            Err(err) => {
+                tracing::warn!(error = %err, "notification muted-text check skipped");
+                std::collections::HashMap::new()
+            }
+        }
+    };
     let mut seen_activity = std::collections::HashSet::new();
     for row in mention_rows {
         let activity_id: String = row
@@ -142,6 +168,20 @@ pub async fn compute_unread(db: &Client, owner_user_id: i64, scan: i64) -> Resul
             }
         };
         let _ = kind;
+
+        let target = mention_target_object_id(&object_id);
+        if is_local_vaak_note(&target) && missing_local.contains(&target) {
+            mention_skipped += 1;
+            continue;
+        }
+        if !hidden.muted_phrases.is_empty() {
+            let (body, spoiler) = status_texts.get(&target).map(|pair| (pair.0.as_str(), pair.1.as_str())).unwrap_or(("", ""));
+            if hidden::texts_match_muted_phrases(&hidden.muted_phrases, &[content.as_str(), body, spoiler]) {
+                hidden_skipped += 1;
+                mention_skipped += 1;
+                continue;
+            }
+        }
 
         // Snowflake type 5 = mention/fav/boost/quote/update row in mentions table.
         ids.push(snowflake_id(created.as_deref(), id, 5));
@@ -263,6 +303,127 @@ pub async fn compute_unread(db: &Client, owner_user_id: i64, scan: i64) -> Resul
         source: "vaak-worker-shadow".into(),
         scanned_ids,
     })
+}
+
+/// Same rule as PHP `ap_notification_is_local_note` / `ap_bsky_is_local_note_id`.
+pub(crate) fn is_local_vaak_note(uri: &str) -> bool {
+    let uri = uri.trim().trim_end_matches('/');
+    uri.starts_with("https://mkultra.monster/users/") && uri.contains("/notes/")
+}
+
+/// Same suffix strip as PHP `ap_notification_target_object_id`.
+pub(crate) fn mention_target_object_id(object_id: &str) -> String {
+    let object_id = object_id.trim().trim_end_matches('/');
+    static KIND: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let kind = KIND.get_or_init(|| {
+        regex::Regex::new(r"(?i)^(https://.+?)#(like|reblog|update|quote|bite|webmention)-[a-z0-9]+$").unwrap()
+    });
+    if let Some(caps) = kind.captures(object_id) {
+        return caps[1].trim_end_matches('/').to_string();
+    }
+    static ANNOUNCE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let announce = ANNOUNCE.get_or_init(|| regex::Regex::new(r"#announce-\d+$").unwrap());
+    announce.replace(object_id, "").trim_end_matches('/').to_string()
+}
+
+pub(crate) fn collect_local_note_uris(value: &serde_json::Value, out: &mut Vec<String>, depth: usize, envelope: bool) {
+    if depth > 16 || !value.is_object() {
+        return;
+    }
+    for field in ["uri", "url", "id"] {
+        if let Some(uri) = value.get(field).and_then(|item| item.as_str()) {
+            let uri = uri.trim().trim_end_matches('/');
+            if is_local_vaak_note(uri) {
+                out.push(uri.to_string());
+            }
+        }
+    }
+    if envelope {
+        if let Some(status) = value.get("status").filter(|item| item.is_object()) {
+            collect_local_note_uris(status, out, depth, false);
+        }
+    }
+    if let Some(reblog) = value.get("reblog").filter(|item| item.is_object()) {
+        collect_local_note_uris(reblog, out, depth + 1, false);
+    }
+    for field in ["quote", "vaak_quote_preview"] {
+        if let Some(quote) = value.get(field).filter(|item| item.is_object()) {
+            let nested = quote.get("quoted_status").or_else(|| quote.get("status")).filter(|item| item.is_object()).unwrap_or(quote);
+            collect_local_note_uris(nested, out, depth + 1, false);
+        }
+    }
+}
+
+pub(crate) fn item_targets_missing_local(item: &serde_json::Value, missing: &std::collections::HashSet<String>) -> bool {
+    if missing.is_empty() {
+        return false;
+    }
+    let mut uris = Vec::new();
+    collect_local_note_uris(item, &mut uris, 0, true);
+    uris.iter().any(|uri| missing.contains(uri))
+}
+
+pub(crate) async fn missing_local_notes_in_items(db: &Client, items: &[serde_json::Value]) -> std::collections::HashSet<String> {
+    let mut uris = Vec::new();
+    for item in items {
+        collect_local_note_uris(item, &mut uris, 0, true);
+    }
+    if uris.is_empty() {
+        return std::collections::HashSet::new();
+    }
+    match missing_local_note_uris(db, &uris).await {
+        Ok(set) => set,
+        Err(err) => {
+            tracing::warn!(error = %err, "notification missing-note check skipped");
+            std::collections::HashSet::new()
+        }
+    }
+}
+
+pub(crate) async fn missing_local_note_uris(db: &Client, uris: &[String]) -> Result<std::collections::HashSet<String>> {
+    let mut local: Vec<String> = uris.iter().map(|uri| uri.trim().trim_end_matches('/').to_string()).filter(|uri| is_local_vaak_note(uri)).collect();
+    local.sort();
+    local.dedup();
+    let mut present = std::collections::HashSet::new();
+    if local.is_empty() {
+        return Ok(present);
+    }
+    for batch in local.chunks(200) {
+        let selected = batch.to_vec();
+        for row in db.query(
+            "SELECT rtrim(note_id, '/') FROM masto_statuses WHERE rtrim(note_id, '/') = ANY($1)",
+            &[&selected],
+        ).await.context("notification local notes in masto_statuses")? {
+            present.insert(row.get::<_, String>(0));
+        }
+        for row in db.query(
+            "SELECT rtrim(id, '/') FROM outbox_notes WHERE rtrim(id, '/') = ANY($1)",
+            &[&selected],
+        ).await.context("notification local notes in outbox")? {
+            present.insert(row.get::<_, String>(0));
+        }
+    }
+    Ok(local.into_iter().filter(|uri| !present.contains(uri)).collect())
+}
+
+async fn status_texts_for_notes(db: &Client, uris: &[String]) -> Result<std::collections::HashMap<String, (String, String)>> {
+    let mut keys: Vec<String> = uris.iter().map(|uri| uri.trim().trim_end_matches('/').to_string()).filter(|uri| uri.starts_with("https://")).collect();
+    keys.sort();
+    keys.dedup();
+    let mut out = std::collections::HashMap::new();
+    if keys.is_empty() {
+        return Ok(out);
+    }
+    for batch in keys.chunks(200) {
+        let selected = batch.to_vec();
+        for row in db.query(
+            "SELECT rtrim(note_id, '/'), COALESCE(content_text, ''), COALESCE(spoiler_text, '') FROM masto_statuses WHERE rtrim(note_id, '/') = ANY($1)",
+            &[&selected],
+        ).await.context("notification muted status text")? {
+            out.insert(row.get(0), (row.get(1), row.get(2)));
+        }
+    }
+    Ok(out)
 }
 
 /// Thin port of PHP `ap_masto_mention_notif_type` — returns Some(kind) when the
@@ -687,5 +848,37 @@ mod tests {
         assert!(!snowflake_is_unread("999999999999999999", "1000000000000000000"));
         assert!(snowflake_is_unread("42", "0"));
         assert!(!snowflake_is_unread("0", "0"));
+    }
+
+    /// Cases shared with api/bin/notif-deleted-undo-mute-smoke.php.
+    #[test]
+    fn deleted_local_target_and_muted_words_match_php() {
+        use serde_json::json;
+        let note = "https://mkultra.monster/users/ada/notes/post1";
+        assert_eq!(super::mention_target_object_id(&format!("{note}#like-0123456789ab")), note);
+        assert_eq!(super::mention_target_object_id(&format!("{note}#reblog-abcdef012345")), note);
+        assert_eq!(super::mention_target_object_id(&format!("{note}#quote-deadbeef0000")), note);
+        assert_eq!(super::mention_target_object_id(&format!("{note}/#announce-4")), note);
+        assert!(super::is_local_vaak_note(note));
+        assert!(!super::is_local_vaak_note("https://remote.test/users/ada/notes/post1"));
+        assert!(!super::is_local_vaak_note("https://bsky.app/profile/ada/post/abc"));
+        let missing = std::collections::HashSet::from([note.to_string()]);
+        let gone = json!({"id":"1","type":"favourite","status":{"uri":note,"content":"hello"}});
+        let remote = json!({"id":"2","type":"mention","status":{"uri":"https://remote.test/users/ada/notes/post1","content":"hello"}});
+        let live = json!({"id":"3","type":"mention","status":{"uri":"https://mkultra.monster/users/ada/notes/live","content":"hello"}});
+        assert!(super::item_targets_missing_local(&gone, &missing));
+        assert!(!super::item_targets_missing_local(&remote, &missing));
+        assert!(!super::item_targets_missing_local(&live, &missing));
+        assert!(!super::item_targets_missing_local(&gone, &std::collections::HashSet::new()));
+        let phrases = vec!["spoiler phrase".to_string(), "cats & dogs".to_string()];
+        assert!(crate::hidden::texts_match_muted_phrases(&phrases, &["<p>SPOILER <em>phrase</em></p>", ""]));
+        assert!(crate::hidden::texts_match_muted_phrases(&phrases, &["fine", "Cats &amp; dogs"]));
+        assert!(!crate::hidden::texts_match_muted_phrases(&phrases, &["A clean post", ""]));
+        assert!(!crate::hidden::texts_match_muted_phrases(&[], &["spoiler phrase"]));
+        let nested = json!({"status":{"content":"clean","quote":{"quoted_status":{"content":"spoiler phrase"}}}});
+        let mut hidden = crate::hidden::HiddenSets { muted_phrases: phrases.clone(), ..Default::default() };
+        assert!(crate::hidden::status_hidden(nested.get("status").unwrap(), &hidden));
+        hidden.muted_phrases.clear();
+        assert!(!crate::hidden::status_hidden(nested.get("status").unwrap(), &hidden));
     }
 }

@@ -7933,6 +7933,11 @@ function ap_masto_notifications_fetch(int $limit = 40, ?string $maxId = null, ?s
         ? ap_db_owner_actor_id_for_user_id($ownerUserId)
         : (string) ($GLOBALS['vaak_actor_id'] ?? 'https://mkultra.monster/users/cmdr_nova');
     $ownerActorId = rtrim($ownerActorId, '/');
+    $presentNotifications = static function (array $rows) use ($ownerUserId): array {
+        return function_exists('ap_notifications_apply_viewer_filters')
+            ? ap_notifications_apply_viewer_filters($rows, (int) $ownerUserId)
+            : $rows;
+    };
     $redisKey = ap_masto_notifications_list_redis_key($ownerUserId, $limit, $maxId, $sinceId, $want, $exclude);
     // Read before any source query. A hydrate takes seconds; if a follow or
     // mention invalidated the caches meanwhile, this page is already older
@@ -7980,7 +7985,7 @@ function ap_masto_notifications_fetch(int $limit = 40, ?string $maxId = null, ?s
                 $GLOBALS['ap_notif_list_source'] = 'redis';
                 $recordNotifTiming('cache_fresh', $notifStartedAt);
                 $recordNotifTiming('total', $notifStartedAt);
-                return $items;
+                return $presentNotifications($items);
             }
             if ($age >= 0 && $age <= $notifStaleSec) {
                 $GLOBALS['ap_notif_list_cache_hit'] = true;
@@ -7998,7 +8003,7 @@ function ap_masto_notifications_fetch(int $limit = 40, ?string $maxId = null, ?s
                 }
                 $recordNotifTiming('cache_stale', $notifStartedAt);
                 $recordNotifTiming('total', $notifStartedAt);
-                return $items;
+                return $presentNotifications($items);
             }
         }
         // Exact page missed. Reuse the warm head before locking a database rebuild.
@@ -8012,7 +8017,7 @@ function ap_masto_notifications_fetch(int $limit = 40, ?string $maxId = null, ?s
                 $GLOBALS['ap_notif_list_source'] = 'axum-notif-api';
                 $recordNotifTiming('axum', $notifStartedAt);
                 $recordNotifTiming('total', $notifStartedAt);
-                return $axumItems;
+                return $presentNotifications($axumItems);
             }
         }
         // Coalesce cold notification list rebuilds after idle.
@@ -8026,7 +8031,7 @@ function ap_masto_notifications_fetch(int $limit = 40, ?string $maxId = null, ?s
                 200
             );
             if (is_array($peer) && isset($peer['items']) && is_array($peer['items'])) {
-                return $peer['items'];
+                return $presentNotifications($peer['items']);
             }
         }
     }
@@ -8044,7 +8049,7 @@ function ap_masto_notifications_fetch(int $limit = 40, ?string $maxId = null, ?s
                 ap_redis_json_set($redisKey, ['ts' => time(), 'items' => $projected, 'source' => 'php-projection'], 300);
             }
             $recordNotifTiming('total', $notifStartedAt);
-            return $projected;
+            return $presentNotifications($projected);
         }
     }
 
@@ -8078,6 +8083,27 @@ function ap_masto_notifications_fetch(int $limit = 40, ?string $maxId = null, ?s
                 'kind' => 'mention',
                 'row' => $row,
             ];
+        }
+        if ($items !== []
+            && function_exists('ap_notification_missing_local_notes')
+            && function_exists('ap_notification_is_local_note')
+            && function_exists('ap_notification_target_object_id')) {
+            $scanTargets = [];
+            foreach ($items as $item) {
+                $target = ap_notification_target_object_id((string) ($item['row']['object_id'] ?? ''));
+                if (ap_notification_is_local_note($target)) {
+                    $scanTargets[$target] = true;
+                }
+            }
+            if ($scanTargets !== []) {
+                $missingScan = ap_notification_missing_local_notes(array_keys($scanTargets));
+                if ($missingScan !== []) {
+                    $items = array_values(array_filter($items, static function (array $item) use ($missingScan): bool {
+                        $target = ap_notification_target_object_id((string) ($item['row']['object_id'] ?? ''));
+                        return $target === '' || empty($missingScan[$target]);
+                    }));
+                }
+            }
         }
     }
 
@@ -8313,6 +8339,7 @@ function ap_masto_notifications_fetch(int $limit = 40, ?string $maxId = null, ?s
         }
     }
     $recordNotifTiming('hydrate', $hydrateStartedAt);
+    $out = $presentNotifications($out);
     // Warm the durable projection only on a cache rebuild.  Cache hits remain
     // read-only and the projection is never authoritative for privacy rules.
     // Skip both writes when an invalidation landed during the hydrate: this
@@ -8619,8 +8646,30 @@ function ap_masto_notifications_unread_state(int $scan = 80, bool $bypassCache =
              ORDER BY id DESC LIMIT 250'
         );
         $st->execute([$ownerUserId]);
+        $mentionRows = $st->fetchAll() ?: [];
+        $mentionTargets = [];
+        foreach ($mentionRows as $row) {
+            if (!is_array($row)) {
+                continue;
+            }
+            $target = function_exists('ap_notification_target_object_id')
+                ? ap_notification_target_object_id((string) ($row['object_id'] ?? ''))
+                : '';
+            if ($target !== '') {
+                $mentionTargets[$target] = true;
+            }
+        }
+        $missingLocal = function_exists('ap_notification_missing_local_notes')
+            ? ap_notification_missing_local_notes(array_keys($mentionTargets))
+            : [];
+        $statusTexts = [];
+        if (function_exists('ap_muted_words_phrases_cached')
+            && ap_muted_words_phrases_cached($ownerUserId) !== []
+            && function_exists('ap_notification_status_texts_for_notes')) {
+            $statusTexts = ap_notification_status_texts_for_notes(array_keys($mentionTargets));
+        }
         $seenActivityIds = [];
-        foreach ($st->fetchAll() ?: [] as $row) {
+        foreach ($mentionRows as $row) {
             if (!is_array($row)) {
                 continue;
             }
@@ -8637,6 +8686,16 @@ function ap_masto_notifications_unread_state(int $scan = 80, bool $bypassCache =
             $notifActor = rtrim((string) ($row['actor_id'] ?? ''), '/');
             if ($notifActor !== '' && function_exists('ap_row_is_hidden')
                 && ap_row_is_hidden($notifActor, null, $ownerUserId)) {
+                continue;
+            }
+            $mentionTarget = function_exists('ap_notification_target_object_id')
+                ? ap_notification_target_object_id((string) ($row['object_id'] ?? ''))
+                : '';
+            if ($mentionTarget !== '' && !empty($missingLocal[$mentionTarget])) {
+                continue;
+            }
+            if (function_exists('ap_notification_mention_row_muted')
+                && ap_notification_mention_row_muted($ownerUserId, $row, $statusTexts)) {
                 continue;
             }
             $ids[] = ap_masto_notification_id_for_mention(
@@ -8818,6 +8877,9 @@ function ap_masto_notifications_mark_read(?string $lastId = null): string
         if (function_exists('ap_masto_notifications_axum_fetch')) {
             try {
                 $axumHead = ap_masto_notifications_axum_fetch(1);
+                if (is_array($axumHead) && function_exists('ap_notifications_apply_viewer_filters')) {
+                    $axumHead = ap_notifications_apply_viewer_filters($axumHead);
+                }
                 if (is_array($axumHead) && isset($axumHead[0]) && is_array($axumHead[0])) {
                     $axTip = (string) ($axumHead[0]['id'] ?? '');
                     if ($axTip !== '') {
@@ -8937,7 +8999,12 @@ function ap_masto_notification_by_id(string $id): ?array
     if (!is_array($row)) {
         return null;
     }
-    return ap_masto_notification_entity(['kind' => 'mention', 'row' => $row]);
+    $ent = ap_masto_notification_entity(['kind' => 'mention', 'row' => $row]);
+    if (!is_array($ent) || !function_exists('ap_notifications_apply_viewer_filters')) {
+        return is_array($ent) ? $ent : null;
+    }
+    $visible = ap_notifications_apply_viewer_filters([$ent], (int) $ownerUserId);
+    return $visible[0] ?? null;
 }
 
 function ap_masto_markers_get(?int $ownerUserId = null): object

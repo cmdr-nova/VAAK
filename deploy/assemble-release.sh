@@ -26,23 +26,37 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-BIN_ALLOW=(
-  bsky-jetstream-media-backfill.php
-  bsky-notif-subject-backfill.php
-  bsky-own-repost-profile-backfill.php
-  bsky-shadow-repost-cleanup.php
-  deploy-canary.php
-  home-timeline-warm.php
-  notif-projection-fill.php
-  phyrian-decay.php
-  phyrian-sync.php
-  quote-notify-dedupe-cleanup.php
-  ranked-warm.php
-  remote-emoji-backfill.php
-)
+# Operational CLIs ship. Smoke, capture, and harness scripts stay in git only.
+# A hand-maintained allowlist dropped new api/bin scripts (PR #196) while
+# ap-inbox.php still deployed.
+bin_ships() {
+  local base="$1"
+  case "$base" in
+    *smoke*|*test*|*reference*|*capture*|*review*|*parity*|*independent*|*fixture*|*regression*)
+      return 1 ;;
+  esac
+  case "$base" in
+    *-backfill.php|*-cleanup.php|*-warm.php|deploy-canary.php|notif-projection-fill.php|phyrian-decay.php|phyrian-sync.php|ranked-warm.php)
+      return 0 ;;
+  esac
+  return 1
+}
+
+build_bin_allow() {
+  BIN_ALLOW=()
+  local path base
+  for path in "${ROOT}/api/bin/"*.php; do
+    base="$(basename "$path")"
+    if bin_ships "$base"; then
+      BIN_ALLOW+=("$base")
+    fi
+  done
+  [[ ${#BIN_ALLOW[@]} -gt 0 ]] || { echo "no production api/bin scripts selected" >&2; return 1; }
+}
 
 assemble() {
   local binary="$1" revision="$2" output="$3"
+  build_bin_allow
   [[ -f "$binary" ]] || { echo "missing binary: $binary" >&2; return 1; }
   [[ "$revision" =~ ^[0-9a-f]{40}$ ]] || { echo "revision must be a 40-character sha" >&2; return 1; }
   [[ -n "$output" && "$output" != "/" ]] || { echo "output directory required" >&2; return 1; }
@@ -103,10 +117,14 @@ self_test() {
   [[ -f "${tmp}/out/api/ap-version.php" ]]
   [[ -f "${tmp}/out/api/bin/notif-projection-fill.php" ]]
   [[ -f "${tmp}/out/api/bin/bsky-notif-subject-backfill.php" ]]
+  [[ -f "${tmp}/out/api/bin/bsky-thread-local-notify-backfill.php" ]]
+  [[ -f "${tmp}/out/api/bin/notif-deleted-target-cleanup.php" ]]
   [[ -f "${tmp}/out/api/bin/deploy-canary.php" ]]
   [[ ! -e "${tmp}/out/api/bin/deploy-canary-smoke.php" ]]
   [[ ! -e "${tmp}/out/api/bin/bsky-notif-subject-backfill-smoke.php" ]]
+  [[ ! -e "${tmp}/out/api/bin/bsky-thread-local-notify-smoke.php" ]]
   [[ ! -e "${tmp}/out/api/bin/library-client-smoke.php" ]]
+  [[ ! -e "${tmp}/out/api/bin/admin-native-http-consumer.php" ]]
   [[ ! -e "${tmp}/out/api/fixtures" ]]
   [[ -f "${tmp}/out/api/deploy/ap-bsky-jetstream.py" ]]
   [[ -f "${tmp}/out/vaak/index.php" ]]

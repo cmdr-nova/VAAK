@@ -6193,6 +6193,9 @@ function ap_follower_remove(string $actorId, ?string $ownerActorId = null): void
         'DELETE FROM followers WHERE owner_actor_id = ? AND (actor_id = ? OR actor_id = ?)'
     )->execute([$owner, $actorId, $actorId . '/']);
     ap_follow_lists_reset_memo($owner);
+    if (function_exists('ap_notification_dismiss_follow')) {
+        ap_notification_dismiss_follow($actorId, $owner);
+    }
 }
 
 /** Store an inbound Follow until the local account approves or rejects it. */
@@ -6628,6 +6631,676 @@ function ap_mentions_list(int $limit = 120, ?int $ownerUserId = null): array
  *
  * @return int number of rows soft-deleted
  */
+/**
+ * Local VAAK note URL. Same rule as ap_bsky_is_local_note_id: remote posts and
+ * bsky.app URLs are never treated as missing just because they are not stored here.
+ */
+function ap_notification_is_local_note(string $uri): bool
+{
+    $uri = rtrim(trim($uri), '/');
+    return $uri !== ''
+        && str_starts_with($uri, 'https://mkultra.monster/users/')
+        && str_contains($uri, '/notes/');
+}
+
+/**
+ * Status URL a mention row points at. Strips #like/#reblog/#quote/… and #announce-N.
+ * Keep in step with ap_masto_mention_target_object_id.
+ */
+function ap_notification_target_object_id(string $objectId): string
+{
+    $objectId = rtrim(trim($objectId), '/');
+    if (preg_match('/^(https:\/\/.+?)#(like|reblog|update|quote|bite|webmention)-[a-z0-9]+$/i', $objectId, $m)) {
+        return rtrim($m[1], '/');
+    }
+    $stripped = preg_replace('/#announce-\d+$/', '', $objectId);
+    if (is_string($stripped) && $stripped !== $objectId) {
+        return rtrim($stripped, '/');
+    }
+    return $objectId;
+}
+
+/**
+ * @param list<int|string> $owners
+ */
+function ap_notification_unread_invalidate_owners(array $owners): void
+{
+    if (!function_exists('ap_masto_notifications_unread_invalidate')) {
+        return;
+    }
+    $seen = [];
+    foreach ($owners as $owner) {
+        $owner = (int) $owner;
+        if ($owner < 1 || isset($seen[$owner])) {
+            continue;
+        }
+        $seen[$owner] = true;
+        ap_masto_notifications_unread_invalidate($owner);
+    }
+}
+
+/**
+ * @param list<mixed> $params
+ * @return list<int|string>
+ */
+function ap_mention_active_owner_ids(string $sql, array $params): array
+{
+    try {
+        $st = ap_db()->prepare($sql);
+        $st->execute($params);
+        return $st->fetchAll(PDO::FETCH_COLUMN) ?: [];
+    } catch (Throwable $e) {
+        return [];
+    }
+}
+
+/**
+ * Local note URLs in $uris that are in neither masto_statuses nor outbox_notes.
+ * One bounded lookup. A failed read hides nothing.
+ *
+ * @param list<string> $uris
+ * @return array<string,true>
+ */
+function ap_notification_missing_local_notes(array $uris): array
+{
+    $local = [];
+    foreach ($uris as $uri) {
+        $uri = rtrim(trim((string) $uri), '/');
+        if (ap_notification_is_local_note($uri)) {
+            $local[$uri] = true;
+        }
+    }
+    if ($local === []) {
+        return [];
+    }
+    $present = [];
+    try {
+        $db = ap_db();
+        foreach (array_chunk(array_keys($local), 80) as $chunk) {
+            $keys = [];
+            foreach ($chunk as $uri) {
+                $keys[] = $uri;
+                $keys[] = $uri . '/';
+            }
+            $ph = implode(',', array_fill(0, count($keys), '?'));
+            $st = $db->prepare("SELECT note_id FROM masto_statuses WHERE note_id IN ($ph)");
+            $st->execute($keys);
+            foreach ($st->fetchAll(PDO::FETCH_COLUMN) ?: [] as $id) {
+                $present[rtrim((string) $id, '/')] = true;
+            }
+            $st = $db->prepare("SELECT id FROM outbox_notes WHERE id IN ($ph)");
+            $st->execute($keys);
+            foreach ($st->fetchAll(PDO::FETCH_COLUMN) ?: [] as $id) {
+                $present[rtrim((string) $id, '/')] = true;
+            }
+        }
+    } catch (Throwable $e) {
+        return [];
+    }
+    $missing = [];
+    foreach (array_keys($local) as $uri) {
+        if (empty($present[$uri])) {
+            $missing[$uri] = true;
+        }
+    }
+    return $missing;
+}
+
+/**
+ * Remote (or any https) targets that have a Delete or Tombstone event.
+ * action_taken=deleted is also used for an undone boost, so it is not a deleted post.
+ *
+ * @param list<string> $uris
+ * @return array<string,true>
+ */
+function ap_notification_event_deleted_objects(array $uris): array
+{
+    $want = [];
+    foreach ($uris as $uri) {
+        $uri = rtrim(trim((string) $uri), '/');
+        if ($uri !== '' && str_starts_with($uri, 'https://')) {
+            $want[$uri] = true;
+        }
+    }
+    if ($want === []) {
+        return [];
+    }
+    $found = [];
+    try {
+        $db = ap_db();
+        foreach (array_chunk(array_keys($want), 80) as $chunk) {
+            $keys = [];
+            foreach ($chunk as $uri) {
+                $keys[] = $uri;
+                $keys[] = $uri . '/';
+            }
+            $ph = implode(',', array_fill(0, count($keys), '?'));
+            $st = $db->prepare(
+                "SELECT object_id FROM events
+                 WHERE object_id IN ($ph)
+                   AND type IN ('Delete', 'Tombstone')"
+            );
+            $st->execute($keys);
+            foreach ($st->fetchAll(PDO::FETCH_COLUMN) ?: [] as $id) {
+                $found[rtrim((string) $id, '/')] = true;
+            }
+        }
+    } catch (Throwable $e) {
+        return [];
+    }
+    $out = [];
+    foreach (array_keys($want) as $uri) {
+        if (!empty($found[$uri])) {
+            $out[$uri] = true;
+        }
+    }
+    return $out;
+}
+
+/**
+ * Bodies already stored for these note URLs. No network. Callers skip this
+ * when the viewer has no muted phrases.
+ *
+ * @param list<string> $uris
+ * @return array<string,array{content:string,spoiler:string}>
+ */
+function ap_notification_status_texts_for_notes(array $uris): array
+{
+    $keys = [];
+    foreach ($uris as $uri) {
+        $uri = rtrim(trim((string) $uri), '/');
+        if ($uri !== '' && str_starts_with($uri, 'https://')) {
+            $keys[$uri] = true;
+        }
+    }
+    if ($keys === []) {
+        return [];
+    }
+    $out = [];
+    try {
+        $db = ap_db();
+        foreach (array_chunk(array_keys($keys), 80) as $chunk) {
+            $lookup = [];
+            foreach ($chunk as $uri) {
+                $lookup[] = $uri;
+                $lookup[] = $uri . '/';
+            }
+            $ph = implode(',', array_fill(0, count($lookup), '?'));
+            $st = $db->prepare(
+                "SELECT note_id, content_text, spoiler_text FROM masto_statuses WHERE note_id IN ($ph)"
+            );
+            $st->execute($lookup);
+            foreach ($st->fetchAll(PDO::FETCH_ASSOC) ?: [] as $row) {
+                if (!is_array($row)) {
+                    continue;
+                }
+                $id = rtrim((string) ($row['note_id'] ?? ''), '/');
+                if ($id === '') {
+                    continue;
+                }
+                $out[$id] = [
+                    'content' => (string) ($row['content_text'] ?? ''),
+                    'spoiler' => (string) ($row['spoiler_text'] ?? ''),
+                ];
+            }
+        }
+    } catch (Throwable $e) {
+        return [];
+    }
+    return $out;
+}
+
+/**
+ * Word mute for one status node. Same rules Rust status_hidden uses for
+ * notifications: case-insensitive substring after HTML-entity and tag
+ * normalization of content + spoiler_text, then reblog / quote /
+ * vaak_quote_preview. ap_muted_words has no expiry and no whole-word flag;
+ * a phrase applies until it is removed. An empty phrase list returns
+ * immediately and does not read the database.
+ *
+ * @param mixed $node
+ */
+function ap_notification_tree_muted(int $ownerUserId, mixed $node, int $depth = 0): bool
+{
+    if ($ownerUserId < 1
+        || !function_exists('ap_muted_words_phrases_cached')
+        || ap_muted_words_phrases_cached($ownerUserId) === []) {
+        return false;
+    }
+    if ($depth > 16) {
+        return true;
+    }
+    if (!is_array($node)) {
+        return false;
+    }
+    $content = isset($node['content']) && is_string($node['content']) ? $node['content'] : '';
+    $spoiler = isset($node['spoiler_text']) && is_string($node['spoiler_text']) ? $node['spoiler_text'] : '';
+    if (($content !== '' || $spoiler !== '') && ap_muted_words_match($ownerUserId, $content, $spoiler) !== null) {
+        return true;
+    }
+    if (isset($node['reblog']) && is_array($node['reblog'])
+        && ap_notification_tree_muted($ownerUserId, $node['reblog'], $depth + 1)) {
+        return true;
+    }
+    foreach (['quote', 'vaak_quote_preview'] as $field) {
+        if (!isset($node[$field]) || !is_array($node[$field])) {
+            continue;
+        }
+        $nested = $node[$field];
+        if (isset($nested['quoted_status']) && is_array($nested['quoted_status'])) {
+            $nested = $nested['quoted_status'];
+        } elseif (isset($nested['status']) && is_array($nested['status'])) {
+            $nested = $nested['status'];
+        }
+        if (ap_notification_tree_muted($ownerUserId, $nested, $depth + 1)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/**
+ * @param array<string,mixed> $item hydrated Mastodon notification
+ */
+function ap_notification_item_muted(int $ownerUserId, array $item): bool
+{
+    if (ap_notification_tree_muted($ownerUserId, $item, 0)) {
+        return true;
+    }
+    $status = $item['status'] ?? null;
+    return is_array($status) && ap_notification_tree_muted($ownerUserId, $status, 0);
+}
+
+/**
+ * @param array<string,true> $uris
+ * @param mixed $node
+ */
+function ap_notification_collect_item_uris(mixed $node, array &$uris, int $depth = 0, bool $envelope = true): void
+{
+    if ($depth > 16 || !is_array($node)) {
+        return;
+    }
+    foreach (['uri', 'url', 'id'] as $field) {
+        if (!isset($node[$field]) || !is_string($node[$field])) {
+            continue;
+        }
+        $uri = rtrim(trim($node[$field]), '/');
+        if (ap_notification_is_local_note($uri)) {
+            $uris[$uri] = true;
+        }
+    }
+    if ($envelope && isset($node['status']) && is_array($node['status'])) {
+        ap_notification_collect_item_uris($node['status'], $uris, $depth, false);
+    }
+    if (isset($node['reblog']) && is_array($node['reblog'])) {
+        ap_notification_collect_item_uris($node['reblog'], $uris, $depth + 1, false);
+    }
+    foreach (['quote', 'vaak_quote_preview'] as $field) {
+        if (!isset($node[$field]) || !is_array($node[$field])) {
+            continue;
+        }
+        $nested = $node[$field];
+        if (isset($nested['quoted_status']) && is_array($nested['quoted_status'])) {
+            $nested = $nested['quoted_status'];
+        } elseif (isset($nested['status']) && is_array($nested['status'])) {
+            $nested = $nested['status'];
+        }
+        ap_notification_collect_item_uris($nested, $uris, $depth + 1, false);
+    }
+}
+
+/**
+ * @param array<string,mixed> $item
+ * @param array<string,true> $missing
+ */
+function ap_notification_item_targets_missing(array $item, array $missing): bool
+{
+    if ($missing === []) {
+        return false;
+    }
+    $uris = [];
+    ap_notification_collect_item_uris($item, $uris);
+    foreach (array_keys($uris) as $uri) {
+        if (!empty($missing[$uri])) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/**
+ * Drop hydrated notifications whose local target post is gone, and those whose
+ * status text matches a muted phrase. No phrase list and no local note URL
+ * means the list is returned unchanged.
+ *
+ * @param list<mixed> $items
+ * @return list<mixed>
+ */
+function ap_notifications_apply_viewer_filters(array $items, int $ownerUserId = 0): array
+{
+    if ($items === []) {
+        return [];
+    }
+    if ($ownerUserId < 1 && function_exists('ap_db_masto_owner_user_id')) {
+        $ownerUserId = (int) ap_db_masto_owner_user_id();
+    }
+    $uris = [];
+    foreach ($items as $item) {
+        if (is_array($item)) {
+            ap_notification_collect_item_uris($item, $uris);
+        }
+    }
+    $missing = $uris === [] ? [] : ap_notification_missing_local_notes(array_keys($uris));
+    $filterWords = $ownerUserId > 0
+        && function_exists('ap_muted_words_phrases_cached')
+        && ap_muted_words_phrases_cached($ownerUserId) !== [];
+    if ($missing === [] && !$filterWords) {
+        return $items;
+    }
+    $out = [];
+    foreach ($items as $item) {
+        if (!is_array($item)) {
+            continue;
+        }
+        if (ap_notification_item_targets_missing($item, $missing)) {
+            continue;
+        }
+        if ($filterWords && ap_notification_item_muted($ownerUserId, $item)) {
+            continue;
+        }
+        $out[] = $item;
+    }
+    return $out;
+}
+
+/**
+ * @param array<string,mixed> $row mention row
+ * @param array<string,array{content:string,spoiler:string}> $textsByNote
+ */
+function ap_notification_mention_row_muted(int $ownerUserId, array $row, array $textsByNote): bool
+{
+    if ($ownerUserId < 1
+        || !function_exists('ap_muted_words_phrases_cached')
+        || ap_muted_words_phrases_cached($ownerUserId) === []) {
+        return false;
+    }
+    $parts = [(string) ($row['content'] ?? '')];
+    $target = ap_notification_target_object_id((string) ($row['object_id'] ?? ''));
+    if ($target !== '' && isset($textsByNote[$target])) {
+        $parts[] = $textsByNote[$target]['content'];
+        $parts[] = $textsByNote[$target]['spoiler'];
+    }
+    return ap_muted_words_match($ownerUserId, ...$parts) !== null;
+}
+
+/**
+ * Hide the follow notification stored for this actor/target pair.
+ * Renderers only keep action_taken local_accept_followback and bsky_follow,
+ * including when the follower set is empty, so the row has to change.
+ */
+function ap_notification_dismiss_follow(string $actorId, string $ownerActorId): int
+{
+    $actorId = rtrim(trim($actorId), '/');
+    $ownerActorId = rtrim(trim($ownerActorId), '/');
+    if ($actorId === '' || $ownerActorId === '') {
+        return 0;
+    }
+    try {
+        $st = ap_db()->prepare(
+            "UPDATE events SET action_taken = 'undone'
+             WHERE type = 'Follow'
+               AND action_taken IN ('local_accept_followback', 'bsky_follow')
+               AND rtrim(actor_id, '/') = ?
+               AND rtrim(target_actor, '/') = ?"
+        );
+        $st->execute([$actorId, $ownerActorId]);
+        $n = (int) $st->rowCount();
+        if ($n > 0) {
+            $ownerUserId = function_exists('ap_db_owner_user_id_for_actor')
+                ? (int) ap_db_owner_user_id_for_actor($ownerActorId)
+                : 0;
+            if ($ownerUserId > 0 && function_exists('ap_notification_projection_invalidate_owner')) {
+                ap_notification_projection_invalidate_owner($ownerUserId);
+            } elseif (function_exists('ap_notification_projection_invalidate_all')) {
+                ap_notification_projection_invalidate_all();
+            }
+            if ($ownerUserId > 0) {
+                ap_notification_unread_invalidate_owners([$ownerUserId]);
+            }
+        }
+        return $n;
+    } catch (Throwable $e) {
+        error_log('[ap-db] dismiss follow failed');
+        return 0;
+    }
+}
+
+/** Hide a Bluesky follow notification keyed by its at:// follow URI. */
+function ap_notification_dismiss_follow_object(string $objectId): int
+{
+    $objectId = trim($objectId);
+    if ($objectId === '') {
+        return 0;
+    }
+    $alt = rtrim($objectId, '/');
+    try {
+        $sel = ap_db()->prepare(
+            "SELECT DISTINCT target_actor FROM events
+             WHERE type = 'Follow' AND action_taken = 'bsky_follow'
+               AND (object_id = ? OR object_id = ?)"
+        );
+        $sel->execute([$objectId, $alt]);
+        $targets = $sel->fetchAll(PDO::FETCH_COLUMN) ?: [];
+        $st = ap_db()->prepare(
+            "UPDATE events SET action_taken = 'undone'
+             WHERE type = 'Follow' AND action_taken = 'bsky_follow'
+               AND (object_id = ? OR object_id = ?)"
+        );
+        $st->execute([$objectId, $alt]);
+        $n = (int) $st->rowCount();
+        if ($n > 0) {
+            $owners = [];
+            foreach ($targets as $target) {
+                if (function_exists('ap_db_owner_user_id_for_actor')) {
+                    $owners[] = (int) ap_db_owner_user_id_for_actor((string) $target);
+                }
+            }
+            foreach ($owners as $owner) {
+                if ($owner > 0 && function_exists('ap_notification_projection_invalidate_owner')) {
+                    ap_notification_projection_invalidate_owner($owner);
+                }
+            }
+            ap_notification_unread_invalidate_owners($owners);
+            if ($owners === [] && function_exists('ap_notification_projection_invalidate_all')) {
+                ap_notification_projection_invalidate_all();
+            }
+        }
+        return $n;
+    } catch (Throwable $e) {
+        error_log('[ap-db] dismiss follow object failed');
+        return 0;
+    }
+}
+
+/**
+ * Drop the notification a local like or boost created, including a Bluesky twin echo.
+ * Write path only. Does not federate.
+ */
+function ap_notification_dismiss_local_interaction(
+    string $actorId,
+    string $objectId,
+    string $kind,
+    ?string $activityId = null
+): int {
+    $actorId = rtrim(trim($actorId), '/');
+    $objectId = rtrim(trim($objectId), '/');
+    $kind = strtolower($kind);
+    $touched = 0;
+    try {
+        if (($activityId !== null && $activityId !== '') || ($actorId !== '' && $objectId !== '')) {
+            $touched += ap_mention_soft_delete_interaction($actorId, $objectId, $kind, $activityId);
+        }
+        if ($objectId !== '' && $actorId !== '' && ap_notification_is_local_note($objectId)
+            && function_exists('ap_mention_soft_delete_linked_bsky_twin_echo')
+            && preg_match('#^(https://mkultra\.monster/users/[A-Za-z0-9_]+)/notes/#', $objectId, $m)) {
+            $recipient = function_exists('ap_db_owner_user_id_for_actor')
+                ? (int) ap_db_owner_user_id_for_actor($m[1])
+                : 0;
+            if ($recipient > 0) {
+                $twinKind = $kind === 'reblog' ? 'reblog' : 'like';
+                $touched += ap_mention_soft_delete_linked_bsky_twin_echo($recipient, $objectId, $twinKind, $actorId);
+            }
+        }
+    } catch (Throwable $e) {
+        error_log('[ap-db] dismiss local interaction failed');
+    }
+    return $touched;
+}
+
+/**
+ * Hide notifications that point at a deleted Bluesky record.
+ * Posts match the bsky.app URL and #like/#reblog suffixes. Likes and reposts
+ * match activity_id. Follows match the at:// object id. Does not federate.
+ */
+function ap_mention_soft_delete_at_uri(string $atUri): int
+{
+    $atUri = trim($atUri);
+    if (!preg_match('#^at://(did:[A-Za-z0-9:%._-]+)/(app\.bsky\.[A-Za-z0-9.]+)/([A-Za-z0-9._~:-]+)$#', $atUri, $m)) {
+        return 0;
+    }
+    $did = $m[1];
+    $collection = $m[2];
+    $rkey = $m[3];
+    if ($collection === 'app.bsky.graph.follow') {
+        return ap_notification_dismiss_follow_object($atUri);
+    }
+    if (!in_array($collection, ['app.bsky.feed.post', 'app.bsky.feed.like', 'app.bsky.feed.repost'], true)) {
+        return 0;
+    }
+    try {
+        $db = ap_db();
+        $now = ap_db_now();
+        $escape = $db->getAttribute(PDO::ATTR_DRIVER_NAME) === 'pgsql' ? "ESCAPE E'\\\\'" : "ESCAPE '\\'";
+        if ($collection === 'app.bsky.feed.like' || $collection === 'app.bsky.feed.repost') {
+            $owners = ap_mention_active_owner_ids(
+                'SELECT DISTINCT owner_user_id FROM mentions WHERE deleted_at IS NULL AND activity_id = ?',
+                [$atUri]
+            );
+            $st = $db->prepare('UPDATE mentions SET deleted_at = ? WHERE deleted_at IS NULL AND activity_id = ?');
+            $st->execute([$now, $atUri]);
+            $n = (int) $st->rowCount();
+            if ($n > 0) {
+                ap_notification_projection_invalidate_all();
+                ap_notification_unread_invalidate_owners($owners);
+            }
+            return $n;
+        }
+        $plain = 'https://bsky.app/profile/' . $did . '/post/' . $rkey;
+        $encoded = 'https://bsky.app/profile/' . rawurlencode($did) . '/post/' . rawurlencode($rkey);
+        $suffix = addcslashes('/post/' . $rkey, '\\%_');
+        $where = 'deleted_at IS NULL AND (
+            activity_id = ?
+            OR object_id = ? OR object_id = ? OR object_id = ? OR object_id = ?
+            OR object_id LIKE ? ' . $escape . '
+            OR object_id LIKE ? ' . $escape . '
+            OR object_id LIKE ? ' . $escape . '
+            OR object_id LIKE ? ' . $escape . '
+        )';
+        $params = [
+            $atUri,
+            $plain,
+            $plain . '/',
+            $encoded,
+            $encoded . '/',
+            addcslashes($plain, '\\%_') . '#%',
+            addcslashes($encoded, '\\%_') . '#%',
+            'https://bsky.app/profile/%' . $suffix,
+            'https://bsky.app/profile/%' . $suffix . '#%',
+        ];
+        $owners = ap_mention_active_owner_ids(
+            'SELECT DISTINCT owner_user_id FROM mentions WHERE ' . $where,
+            $params
+        );
+        $st = $db->prepare('UPDATE mentions SET deleted_at = ? WHERE ' . $where);
+        $st->execute(array_merge([$now], $params));
+        $n = (int) $st->rowCount();
+        if ($n > 0) {
+            if (function_exists('ap_search_fts_delete_object')) {
+                ap_search_fts_delete_object($plain);
+            }
+            ap_notification_projection_invalidate_all();
+            ap_notification_unread_invalidate_owners($owners);
+        }
+        return $n;
+    } catch (Throwable $e) {
+        error_log('[ap-db] soft-delete at uri failed');
+        return 0;
+    }
+}
+
+/**
+ * Active mentions whose target post is a missing local note, or any https
+ * target with a Delete/Tombstone event. Paged. Does not print account ids.
+ *
+ * @return list<array{id:int,reason:string}>
+ */
+function ap_notification_stale_mention_ids(): array
+{
+    $out = [];
+    $last = 0;
+    try {
+        $db = ap_db();
+        while (true) {
+            $st = $db->prepare(
+                'SELECT id, object_id FROM mentions
+                 WHERE deleted_at IS NULL AND id > ? AND object_id LIKE ?
+                 ORDER BY id LIMIT 400'
+            );
+            $st->execute([$last, 'https://%']);
+            $rows = $st->fetchAll(PDO::FETCH_ASSOC) ?: [];
+            if ($rows === []) {
+                break;
+            }
+            $local = [];
+            $remote = [];
+            foreach ($rows as $row) {
+                if (!is_array($row)) {
+                    continue;
+                }
+                $last = (int) ($row['id'] ?? $last);
+                $target = ap_notification_target_object_id((string) ($row['object_id'] ?? ''));
+                if (ap_notification_is_local_note($target)) {
+                    $local[$target][] = (int) $row['id'];
+                } elseif (str_starts_with($target, 'https://')) {
+                    $remote[$target][] = (int) $row['id'];
+                }
+            }
+            if ($local !== []) {
+                $missing = ap_notification_missing_local_notes(array_keys($local));
+                foreach ($missing as $uri => $_) {
+                    foreach ($local[$uri] ?? [] as $id) {
+                        $out[] = ['id' => $id, 'reason' => 'local_missing'];
+                    }
+                }
+            }
+            if ($remote !== []) {
+                $deleted = ap_notification_event_deleted_objects(array_keys($remote));
+                foreach ($deleted as $uri => $_) {
+                    foreach ($remote[$uri] ?? [] as $id) {
+                        $out[] = ['id' => $id, 'reason' => 'remote_delete'];
+                    }
+                }
+            }
+            if (count($rows) < 400) {
+                break;
+            }
+        }
+    } catch (Throwable $e) {
+        error_log('[ap-db] stale mention scan failed');
+    }
+    return $out;
+}
+
 function ap_mention_soft_delete(string $objectId): int
 {
     $objectId = rtrim($objectId, '/');
@@ -6638,19 +7311,23 @@ function ap_mention_soft_delete(string $objectId): int
     // The id comes from remote Deletes. Escape LIKE wildcards so it can only
     // match its own #suffix rows.
     $escape = ap_db()->getAttribute(PDO::ATTR_DRIVER_NAME) === 'pgsql' ? "ESCAPE E'\\\\'" : "ESCAPE '\\'";
-    $st = ap_db()->prepare(
-        'UPDATE mentions SET deleted_at = ?
-         WHERE deleted_at IS NULL AND (
+    $where = 'deleted_at IS NULL AND (
            object_id = ? OR object_id = ? OR object_id LIKE ? ' . $escape . '
-         )'
+         )';
+    $params = [$objectId, $objectId . '/', addcslashes($objectId, '\\%_') . '#%'];
+    $owners = ap_mention_active_owner_ids(
+        'SELECT DISTINCT owner_user_id FROM mentions WHERE ' . $where,
+        $params
     );
-    $st->execute([$now, $objectId, $objectId . '/', addcslashes($objectId, '\\%_') . '#%']);
+    $st = ap_db()->prepare('UPDATE mentions SET deleted_at = ? WHERE ' . $where);
+    $st->execute(array_merge([$now], $params));
     $n = (int) $st->rowCount();
     if ($n > 0 && function_exists('ap_search_fts_delete_object')) {
         ap_search_fts_delete_object($objectId);
     }
     if ($n > 0) {
         ap_notification_projection_invalidate_all();
+        ap_notification_unread_invalidate_owners($owners);
     }
     return $n;
 }
@@ -6685,8 +7362,13 @@ function ap_mention_soft_delete_interaction(string $actorId, string $targetObjec
     $now = ap_db_now();
     $touched = 0;
     $db = ap_db();
+    $owners = [];
 
     if ($activityId !== null && $activityId !== '') {
+        $owners = array_merge($owners, ap_mention_active_owner_ids(
+            'SELECT DISTINCT owner_user_id FROM mentions WHERE deleted_at IS NULL AND activity_id = ?',
+            [$activityId]
+        ));
         $st = $db->prepare(
             'UPDATE mentions SET deleted_at = ?
              WHERE deleted_at IS NULL AND activity_id = ?'
@@ -6698,6 +7380,13 @@ function ap_mention_soft_delete_interaction(string $actorId, string $targetObjec
     if ($actorId !== '' && $targetObjectId !== '' && in_array($kind, ['like', 'reblog', 'quote', 'update'], true)) {
         $stableId = ap_mention_interaction_object_id($targetObjectId, $actorId, $kind);
         $likePattern = $targetObjectId . '#' . $kind . '-%';
+        $owners = array_merge($owners, ap_mention_active_owner_ids(
+            'SELECT DISTINCT owner_user_id FROM mentions WHERE deleted_at IS NULL AND (
+               object_id = ?
+               OR ((actor_id = ? OR actor_id = ?) AND object_id LIKE ?)
+             )',
+            [$stableId, $actorId, $actorId . '/', $likePattern]
+        ));
         // Stable key + any legacy activity-id-keyed rows for same actor/target/kind
         $st = $db->prepare(
             'UPDATE mentions SET deleted_at = ?
@@ -6712,6 +7401,7 @@ function ap_mention_soft_delete_interaction(string $actorId, string $targetObjec
 
     if ($touched > 0) {
         ap_notification_projection_invalidate_all();
+        ap_notification_unread_invalidate_owners($owners);
     }
 
     return $touched;
@@ -15047,6 +15737,13 @@ function ap_masto_favourite_remove(string $statusId, ?int $ownerUserId = null, ?
         if (function_exists('ap_redis_library_html_invalidate')) {
             ap_redis_library_html_invalidate($ownerUserId, 'favourites_bsky');
         }
+        $actor = rtrim((string) ($row['owner_actor_id'] ?? ''), '/');
+        if ($actor === '' && function_exists('ap_db_owner_actor_id_for_user_id')) {
+            $actor = ap_db_owner_actor_id_for_user_id((int) $ownerUserId);
+        }
+        $target = rtrim((string) ($row['object_id'] ?? $objectId), '/');
+        $activity = trim((string) ($row['like_activity_id'] ?? ''));
+        ap_notification_dismiss_local_interaction($actor, $target, 'like', $activity !== '' ? $activity : null);
     }
     return $row;
 }
@@ -15360,6 +16057,13 @@ function ap_masto_reblog_remove(string $statusId, ?int $ownerUserId = null): ?ar
     if ($row) {
         ap_db()->prepare('DELETE FROM masto_reblogs WHERE owner_user_id = ? AND status_id = ?')
             ->execute([$ownerUserId, $statusId]);
+        $actor = rtrim((string) ($row['owner_actor_id'] ?? ''), '/');
+        if ($actor === '' && function_exists('ap_db_owner_actor_id_for_user_id')) {
+            $actor = ap_db_owner_actor_id_for_user_id((int) $ownerUserId);
+        }
+        $target = rtrim((string) ($row['object_id'] ?? ''), '/');
+        $activity = trim((string) ($row['announce_activity_id'] ?? ''));
+        ap_notification_dismiss_local_interaction($actor, $target, 'reblog', $activity !== '' ? $activity : null);
     }
     return $row;
 }
@@ -15371,11 +16075,30 @@ function ap_masto_reblog_remove_by_object_id(string $objectId, ?int $ownerUserId
     if ($objectId === '') return 0;
     $ownerUserId = $ownerUserId ?? ap_db_default_owner_user_id();
     try {
+        $sel = ap_db()->prepare(
+            'SELECT owner_actor_id, object_id, announce_activity_id FROM masto_reblogs
+             WHERE owner_user_id = ? AND (object_id = ? OR object_id = ?)'
+        );
+        $sel->execute([$ownerUserId, $objectId, $objectId . '/']);
+        $rows = $sel->fetchAll(PDO::FETCH_ASSOC) ?: [];
         $st = ap_db()->prepare(
             'DELETE FROM masto_reblogs WHERE owner_user_id = ? AND (object_id = ? OR object_id = ?)'
         );
         $st->execute([$ownerUserId, $objectId, $objectId . '/']);
-        return $st->rowCount();
+        $n = (int) $st->rowCount();
+        foreach ($rows as $row) {
+            if (!is_array($row)) {
+                continue;
+            }
+            $actor = rtrim((string) ($row['owner_actor_id'] ?? ''), '/');
+            if ($actor === '' && function_exists('ap_db_owner_actor_id_for_user_id')) {
+                $actor = ap_db_owner_actor_id_for_user_id((int) $ownerUserId);
+            }
+            $target = rtrim((string) ($row['object_id'] ?? $objectId), '/');
+            $activity = trim((string) ($row['announce_activity_id'] ?? ''));
+            ap_notification_dismiss_local_interaction($actor, $target, 'reblog', $activity !== '' ? $activity : null);
+        }
+        return $n;
     } catch (Throwable $e) {
         return 0;
     }
