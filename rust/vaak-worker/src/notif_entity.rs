@@ -1893,6 +1893,17 @@ fn api_status(status: &Value, depth: usize) -> Option<Value> {
     if depth > 3 || !status.is_object() {
         return None;
     }
+    // PHP's ap_masto_api_status rehomes flattened quote files before shaping
+    // the top status. Nested quotes are shaped as they already stand.
+    if depth == 0 {
+        let mut rehomed = status.clone();
+        crate::quote_media::rehome_flattened_quote_media(&mut rehomed);
+        return api_status_body(&rehomed, depth);
+    }
+    api_status_body(status, depth)
+}
+
+fn api_status_body(status: &Value, depth: usize) -> Option<Value> {
     let id = json_string(status, "id");
     let account = status.get("account").and_then(|item| api_account(item, 0))?;
     if id.is_empty() {

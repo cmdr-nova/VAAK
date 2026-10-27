@@ -39,6 +39,12 @@ reference_load($api . '/ap-db.php', [
 ]);
 reference_load($api . '/ap-masto-entities.php', [
     'ap_masto_strip_announce_fragment',
+    'ap_masto_status_is_boost_wrapper',
+    'ap_masto_quoted_display_status',
+    'ap_masto_attachment_asset_urls',
+    'ap_masto_outer_media_without_quote_duplicates',
+    'ap_masto_quoted_media_is_authoritative',
+    'ap_masto_rehome_flattened_quote_media',
     'ap_masto_snowflake_id',
     'ap_masto_format_time',
     'ap_masto_mention_target_object_id',
@@ -291,6 +297,8 @@ $cardStatusId = $snow($replyAt, 55, 2);
 $bskyQuoteNotifId = $snow($quoteAt, 11, 5);
 $bskyQuoteStatusId = $snow($quoteAt, 11, 2);
 $bskyRepostNotifId = $snow($likeAt, 12, 5);
+$flatNotifId = $snow($quoteAt, 8, 5);
+$flatStatusId = $snow($quoteAt, 8, 2);
 
 $mentionMedia = [[
     'id' => '20018531',
@@ -315,6 +323,31 @@ $quotedMedia = [[
     'meta' => null,
     'description' => null,
     'blurhash' => null,
+]];
+$flatMedia = [[
+    'id' => '20000081',
+    'type' => 'image',
+    'url' => 'https://pics.example/parent.jpg',
+    'preview_url' => 'https://pics.example/parent.jpg',
+    'remote_url' => 'https://pics.example/parent.jpg',
+    'preview_remote_url' => null,
+    'text_url' => null,
+    'meta' => null,
+    'description' => null,
+    'blurhash' => null,
+    'mediaType' => null,
+], [
+    'id' => '20000082',
+    'type' => 'image',
+    'url' => 'https://pics.example/quoted.jpg',
+    'preview_url' => 'https://pics.example/quoted.jpg',
+    'remote_url' => 'https://pics.example/quoted.jpg',
+    'preview_remote_url' => null,
+    'text_url' => null,
+    'meta' => null,
+    'description' => null,
+    'blurhash' => null,
+    'mediaType' => null,
 ]];
 $card = [
     'url' => 'https://example.com/article',
@@ -523,6 +556,38 @@ $push('quote', $item([
             'media_attachments' => $quotedMedia,
         ]),
     ]]
+))], [
+    'remotes' => [['actor_id' => $quoter, 'username' => 'quoter', 'host' => 'example.social', 'display_name' => '']],
+    'media' => ['50' => $quotedMedia],
+]);
+
+$push('quote_flattened', $item([
+    'id' => $flatNotifId,
+    'db_id' => 8,
+    'created' => $quoteAt,
+    'actor_id' => $quoter,
+    'type_name' => 'quote',
+    'object_id' => 'https://example.social/users/quoter/statuses/2',
+    'content' => "commentary\n\n↪ QT {$quotedNote}",
+    'media_urls' => '["https://pics.example/parent.jpg","https://pics.example/quoted.jpg"]',
+]), [
+    ['local_id' => 50, 'note_id' => $quotedNote, 'published' => $quotedAt, 'content_text' => 'quoted words', 'visibility' => 'public'],
+], [$notif($flatNotifId, 'quote', $quoter, $quoteAt, $quoterAcct, $mentionStatus(
+    $flatStatusId,
+    $quoteAt,
+    'https://example.social/users/quoter/statuses/2',
+    $quoterAcct,
+    'commentary',
+    [
+        'media_attachments' => $flatMedia,
+        'quote' => [
+            'state' => 'accepted',
+            'quoted_status_id' => $quotedStatusId,
+            'quoted_status' => $localStatus($quotedStatusId, $quotedAt, $quotedNote, $novaAcct, 'quoted words', [
+                'media_attachments' => $quotedMedia,
+            ]),
+        ],
+    ]
 ))], [
     'remotes' => [['actor_id' => $quoter, 'username' => 'quoter', 'host' => 'example.social', 'display_name' => '']],
     'media' => ['50' => $quotedMedia],
@@ -739,6 +804,25 @@ $roundIn = [[
 $roundOut = ap_masto_notifications_api_list($roundIn);
 if (count($roundOut) !== 1 || ($roundOut[0]['type'] ?? '') !== 'favourite') {
     $fail('api list did not rewrite bite');
+}
+
+foreach ($cases as $case) {
+    if (($case['name'] ?? '') !== 'quote_flattened') {
+        continue;
+    }
+    $status = $case['api'][0]['status'] ?? null;
+    $outer = is_array($status['media_attachments'] ?? null) ? $status['media_attachments'] : [];
+    $inner = $status['quote']['quoted_status']['media_attachments'] ?? null;
+    $outerUrls = [];
+    foreach ($outer as $attachment) {
+        if (is_array($attachment) && is_string($attachment['url'] ?? null)) {
+            $outerUrls[] = $attachment['url'];
+        }
+    }
+    $innerUrl = is_array($inner) && isset($inner[0]['url']) ? (string) $inner[0]['url'] : '';
+    if ($innerUrl !== 'https://pics.example/quoted.jpg' || in_array('https://pics.example/quoted.jpg', $outerUrls, true) || !in_array('https://pics.example/parent.jpg', $outerUrls, true)) {
+        $fail('quoted media must stay inside the quote');
+    }
 }
 
 $doc = [
