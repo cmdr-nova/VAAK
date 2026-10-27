@@ -222,13 +222,16 @@ mod tests {
             assert!(!row.suspended);
         }
         assert_eq!(row.last_live, Some(old));
-        row = after_terminal(row, "No HTTP response from inbox", old, 7, 20);
+        let week = 7 * 86_400;
+        row = after_terminal(row, "No HTTP response from inbox", now - week, 7, 20);
         assert_eq!(row.consecutive, 1);
-        assert_eq!(row.streak_started, Some(old));
+        assert_eq!(row.streak_started, Some(now - week));
+        assert_eq!(row.last_live, Some(old));
         for _ in 0..19 {
-            row = after_terminal(row, "Connection refused", old, 7, 20);
+            row = after_terminal(row, "Connection refused", now, 7, 20);
         }
         assert!(row.suspended);
+        assert_eq!(row.last_live, Some(old));
         row = after_success(row.last_live, now);
         assert!(!row.suspended);
         assert_eq!(row.consecutive, 0);
