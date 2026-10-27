@@ -56,6 +56,7 @@ php_tests=(
   api/bin/reply-preview-smoke.php
   api/bin/remote-emoji-smoke.php
   api/bin/csp-smoke.php
+  api/bin/reddit-json-feed-smoke.php
   api/bin/bsky-jetstream-media-smoke.php
   api/bin/jetstream-worker-smoke.php
   api/bin/bsky-backfill-no-federation-smoke.php
@@ -100,6 +101,7 @@ php_tests=(
   api/bin/notif-grouped-schema-smoke.php
   api/bin/notif-hidden-filter-smoke.php
   api/bin/notif-deleted-undo-mute-smoke.php
+  api/bin/masto-local-acct-smoke.php
   api/bin/notif-list-epoch-smoke.php
   api/bin/notif-page-speed-smoke.php
   api/bin/notif-reply-content-smoke.php

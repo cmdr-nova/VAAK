@@ -32,11 +32,11 @@ done
 bin_ships() {
   local base="$1"
   case "$base" in
-    *smoke*|*test*|*reference*|*capture*|*review*|*parity*|*independent*|*fixture*|*regression*)
+    *smoke*|*test*|*reference*|*capture*|*review*|*parity*|*independent*|*fixture*|*regression*|*harness*)
       return 1 ;;
   esac
   case "$base" in
-    *-backfill.php|*-cleanup.php|*-warm.php|deploy-canary.php|notif-projection-fill.php|phyrian-decay.php|phyrian-sync.php|ranked-warm.php)
+    *-backfill.php|*-cleanup.php|*-warm.php|repair-*.php|deploy-canary.php|notif-projection-fill.php|phyrian-decay.php|phyrian-sync.php|ranked-warm.php)
       return 0 ;;
   esac
   return 1
@@ -120,6 +120,7 @@ self_test() {
   [[ -f "${tmp}/out/api/bin/bsky-thread-local-notify-backfill.php" ]]
   [[ -f "${tmp}/out/api/bin/notif-deleted-target-cleanup.php" ]]
   [[ -f "${tmp}/out/api/bin/deploy-canary.php" ]]
+  [[ -f "${tmp}/out/api/bin/repair-remote-avatar-urls.php" ]]
   [[ ! -e "${tmp}/out/api/bin/deploy-canary-smoke.php" ]]
   [[ ! -e "${tmp}/out/api/bin/bsky-notif-subject-backfill-smoke.php" ]]
   [[ ! -e "${tmp}/out/api/bin/bsky-thread-local-notify-smoke.php" ]]
