@@ -2,9 +2,9 @@
 
 Production deploys run from GitHub Actions. The workflow is [`.github/workflows/deploy-production.yml`](../.github/workflows/deploy-production.yml). It is manual (`workflow_dispatch` on `main`). It deploys a commit that is already on `main` and has a green CI check, or a version-only release commit whose parent has that check. The activate job waits on the GitHub Environment named `production` and runs on a self-hosted runner on the production host. GitHub-hosted runners cannot SSH to the server, so this workflow does not use SSH.
 
-Nothing in this workflow publishes the Jekyll blog. `NovaLandia/update_site.sh` stays the blog publisher. It `rsync -avz --delete`s the site root with `--exclude '/api/'` and `--exclude '/vaak/'` (trailing slash, so those rules match directories only; a second rsync uses `api/` and `vaak/`). This deploy never writes the site root, `clearance/`, `/img/profile`, or `update_site.sh`.
+Nothing in this workflow publishes the Jekyll blog. `NovaLandia/update_site.sh` stays the blog publisher. It `rsync -avz --delete`s the site root. That script is not in this repository. It must never delete `api/` or `vaak/`. The exclude has to be `--exclude '/api'` and `--exclude '/vaak'` on every rsync that uses `--delete`, with no trailing slash: `--exclude '/api/'` matches a directory only, so a symlink at that path is not excluded and `--delete` can remove it. Do not pass `--delete-excluded`. This deploy never writes the site root, `clearance/`, `/img/profile`, or `update_site.sh`.
 
-`/srv/mkultra/html/api` and `/srv/mkultra/html/vaak` stay **real directories**. rsync without `-L` treats a symlink as a non-directory, so if those paths were symlinks the blog publish would delete them. This deploy does not depend on a change to `update_site.sh`. The safest companion change, in the owner's NovaLandia copy of that script, is to drop the trailing slash (`--exclude '/api'` and `--exclude '/vaak'`, and the same for the second rsync). Do that when convenient. Do not treat it as a requirement for this deploy.
+`/srv/mkultra/html/api` and `/srv/mkultra/html/vaak` stay **real directories**. Activation rsyncs into those directories only, refuses any other destination, and checks that both directories still exist afterwards. rsync of `release/api/` into `html/api/` deletes files inside the directory. It does not remove the directory.
 
 The counter in this checkout is **alpha 0.8.46** (`api/ap-version.php`, dated 2026-10-13). That release commit is on `main` and was not activated. **0.8.35** is an older note at `docs/RELEASE-0.8.35.md`, not the constant the app reads.
 
@@ -204,7 +204,7 @@ Run that SQL as a superuser. The env file also sets `AP_DB_PASSWORD`. Keep that 
 
 1. Takes a non-blocking lock at `/srv/mkultra/vaak-releases/.deploy.lock`.
 2. Refuses to continue unless `html/api` and `html/vaak` are real directories, `/usr/local/bin/vaak-worker` is a symlink to `/srv/mkultra/vaak-releases/bin/vaak-worker`, and the release root is outside `/srv/mkultra/html`.
-3. Extracts the tarball under `releases/<git sha>/`. The tarball is the CI artifact: filtered `api/`, `vaak/`, `bin/vaak-worker`, and `migrate.php`. Replay tools under `api/bin/` are omitted except the production CLIs `deploy-canary.php`, `home-timeline-warm.php`, `notif-projection-fill.php`, `phyrian-decay.php`, `phyrian-sync.php`, and `ranked-warm.php`. `api/fixtures/` and `docs/` are omitted.
+3. Extracts the tarball under `releases/<git sha>/`. The tarball is the CI artifact: filtered `api/`, `vaak/`, `bin/vaak-worker`, and `migrate.php`. `api/bin/` ships operational CLIs only: `*-backfill.php`, `*-cleanup.php`, `*-warm.php`, plus `deploy-canary.php`, `notif-projection-fill.php`, `phyrian-decay.php`, `phyrian-sync.php`, and `ranked-warm.php`. Names containing smoke, test, reference, capture, review, parity, independent, fixture, or regression stay out. `api/fixtures/` and `docs/` are omitted.
 4. Runs `php -l` on the new PHP, then `migrate.php` against that tree, before copying it into the live directories.
 5. `rsync -a --checksum --delete-delay --delay-updates` copies `api/` and `vaak/` into the real directories. `--checksum` replaces a file whose bytes changed even when the size and mtime match. The four canonical files above are excluded, so a deploy and a rollback both leave them as they are on disk. The worker binary is installed with `mv` onto `/srv/mkultra/vaak-releases/bin/vaak-worker`.
 6. Restarts the required units, then requires `http://127.0.0.1:8787/healthz` to contain `"ok":true`, every required unit to be active, and the live `VAAK_VERSION` to match the release `VERSION` file.
@@ -281,7 +281,7 @@ These stay in the tree. They are not how production is deployed anymore:
 
 These are not deploys of the VAAK app and this workflow does not replace them:
 
-- `NovaLandia/update_site.sh` (Jekyll blog; keeps excluding `api/`, `vaak/`, and `clearance/`)
+- `NovaLandia/update_site.sh` (Jekyll blog; not in this repo; must never delete `api/` or `vaak/`)
 - `deploy_clearance.sh` (Clearance, separate tree)
 - `deploy/vaak-postgres-backup.sh`, `deploy/vaak-disc3-backup.sh`, `deploy/vaak-backup-restore-drill.sh` ([restore drill](vaak-integrity-policy.md#restore-drill)), and their timers
 - `deploy/vaak-integrity-check.sh`
@@ -298,7 +298,7 @@ PHP reads the path from the request URI, so a front server that already sends un
 rewrite @vaak_local_status /vaak/index.php?vaak_status_key={re.vaakstatus.1}&vaak_status_id={re.vaakstatus.2}&{http.request.uri.query}
 ```
 
-There is no nginx config in this repository. This deploy does not change `NovaLandia/update_site.sh`. That script still excludes `api/` and `vaak/`.
+There is no nginx config in this repository. `NovaLandia/update_site.sh` is not in this repository. On the blog host it must exclude `api` and `vaak` without a trailing slash, and it must never delete those directories.
 
 ## Local checks
 

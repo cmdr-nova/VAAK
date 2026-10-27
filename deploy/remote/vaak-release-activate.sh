@@ -291,10 +291,19 @@ sync_into() {
   local src="$1" dest="$2"
   shift 2
   require_real_dir "$dest"
+  # rsync --delete only removes files inside these two directories. It must
+  # never be pointed at the site root, a symlink, or any other path. The
+  # directories themselves stay after the transfer.
+  if [[ "$dest" != "$HTML_API" && "$dest" != "$HTML_VAAK" ]]; then
+    die "refusing to rsync --delete into ${dest}; only the configured api and vaak directories are allowed"
+  fi
   [[ -d "$src" && ! -L "$src" ]] || die "release source ${src} is not a real directory"
   # --checksum so a same-size edit is not skipped when mtimes match.
   # --delay-updates renames each new file into place at the end of the transfer.
   rsync -a --checksum --delete-delay --delay-updates "$@" "${src}/" "${dest}/"
+  if [[ ! -d "$dest" || -L "$dest" ]]; then
+    die "rsync removed ${dest}; api and vaak directories must remain"
+  fi
 }
 
 preserve_excludes() {

@@ -2347,13 +2347,21 @@ function ap_route_verified_activity(array $activity, int $bytes): string
         }
     }
 
-    // Remote Delete: soft-delete mentions/DMs AND hide matching firehose Creates.
+    // Remote Delete or Tombstone: soft-delete mentions/DMs AND hide matching firehose Creates.
     // Mastodon Deletes are often bare IDs (no Mention tags / inReplyTo), so
     // ap_activity_touches_local() is false — without this, ghosts stay on Home/Federated.
-    if ($type === 'Delete') {
+    // A bare Tombstone activity, or any activity whose object is a Tombstone, is the same removal.
+    $deleteObjectType = is_array($activity['object'] ?? null) ? (string) ($activity['object']['type'] ?? '') : '';
+    if ($type === 'Delete' || strcasecmp($type, 'Tombstone') === 0 || strcasecmp($deleteObjectType, 'Tombstone') === 0) {
         $deleteIds = [];
         if (is_string($objectId) && $objectId !== '') {
             $deleteIds[] = $objectId;
+        }
+        if (strcasecmp($type, 'Tombstone') === 0) {
+            $selfId = ap_as_id($activity);
+            if (is_string($selfId) && $selfId !== '') {
+                $deleteIds[] = $selfId;
+            }
         }
         // Tombstone / nested object id
         $obj = $activity['object'] ?? null;
@@ -8898,6 +8906,12 @@ function ap_delete_local_status(int $localId): array
     ap_db()->prepare('UPDATE masto_media SET status_local_id = NULL WHERE status_local_id = ?')->execute([$localId]);
     if (function_exists('ap_notification_projection_invalidate_status')) {
         ap_notification_projection_invalidate_status($noteId);
+    }
+    // Mentions, replies, likes, boosts, and quotes stay active unless the
+    // mention row itself is soft-deleted. invalidate_status keys projection
+    // by numeric status id, not the note URI.
+    if (function_exists('ap_mention_soft_delete')) {
+        ap_mention_soft_delete($noteId);
     }
     try {
         ap_db()->prepare('DELETE FROM site_syndications WHERE note_id = ?')->execute([$noteId]);

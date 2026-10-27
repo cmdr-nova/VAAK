@@ -330,6 +330,19 @@ fn normalize_muted_text(text: &str) -> String {
     plain.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
 }
 
+/// Case-insensitive substring match after the same normalization as status_hidden.
+/// An empty phrase list matches nothing. There is no whole-word or expiry flag.
+pub fn texts_match_muted_phrases(phrases: &[String], texts: &[&str]) -> bool {
+    if phrases.iter().all(|phrase| phrase.is_empty()) {
+        return false;
+    }
+    let text = texts.iter().copied().map(normalize_muted_text).filter(|part| !part.is_empty()).collect::<Vec<_>>().join(" ");
+    if text.is_empty() {
+        return false;
+    }
+    phrases.iter().any(|phrase| !phrase.is_empty() && text.contains(phrase.as_str()))
+}
+
 fn host_of(actor: &str) -> Option<String> {
     let url = reqwest::Url::parse(actor).ok()?;
     if !matches!(url.scheme(), "http" | "https") { return None; }

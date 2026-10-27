@@ -525,6 +525,7 @@ pub async fn filter_notifications(db: &Client, owner: i64, items: &mut Vec<Value
         Ok::<_, anyhow::Error>(())
     };
     let (hidden, ()) = tokio::try_join!(hidden_fut, admit_fut)?;
+    let missing_local = crate::notif::missing_local_notes_in_items(db, items).await;
     let mut allowed = HashMap::new();
     for mut st in statuses {
         let idx = st["_vaak_policy_index"].as_u64().unwrap() as usize;
@@ -535,6 +536,7 @@ pub async fn filter_notifications(db: &Client, owner: i64, items: &mut Vec<Value
     items.retain_mut(|item| {
         let original_idx = idx;
         idx += 1;
+        if crate::notif::item_targets_missing_local(item, &missing_local) { return false; }
         if crate::hidden::status_hidden(item, &hidden) { return false; }
         if item.get("status").is_some_and(Value::is_object) {
             let Some(st) = allowed.remove(&original_idx) else { return false; };
