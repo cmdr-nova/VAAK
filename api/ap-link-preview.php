@@ -786,14 +786,73 @@ function ap_link_preview_warm_async(string $url): void
     @exec($cmd);
 }
 
-// Direct HTTP hits disabled (SSRF surface). Link previews stay internal via require.
+/**
+ * Whether $url is linked from one of cmdr_nova's recent public notes. The
+ * public HTTP handler only previews those, so visitors cannot make the
+ * server fetch arbitrary URLs.
+ */
+function ap_link_preview_url_in_site_notes(string $url, int $scan = 100): bool
+{
+    $want = ap_link_preview_canonicalize_url(ap_link_preview_normalize_url($url));
+    if ($want === '') {
+        return false;
+    }
+    $st = ap_db()->prepare(
+        "SELECT content FROM outbox_notes
+         WHERE id LIKE ? AND COALESCE(visibility, 'public') = 'public'
+         ORDER BY published DESC LIMIT " . max(1, min(500, $scan))
+    );
+    $st->execute(['https://mkultra.monster/users/cmdr_nova/notes/%']);
+    foreach ($st->fetchAll() as $row) {
+        if (in_array($want, ap_link_preview_extract_all_urls((string) ($row['content'] ?? ''), false), true)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Direct HTTP hits: GET ?url= for the homepage's latest-note card
+// (assets/js/ap-site-latest.js). Cache-first and limited to links in
+// cmdr_nova's own public notes; misses warm in the background.
 if (PHP_SAPI !== 'cli'
     && isset($_SERVER['SCRIPT_FILENAME'])
     && realpath((string) $_SERVER['SCRIPT_FILENAME']) === realpath(__FILE__)
 ) {
-    http_response_code(403);
-    header('Content-Type: text/plain; charset=utf-8');
-    header('Cache-Control: no-store');
-    echo 'Forbidden';
+    header('Content-Type: application/json; charset=utf-8');
+    header('X-Content-Type-Options: nosniff');
+    $miss = static function (int $code, string $cache): void {
+        http_response_code($code);
+        header('Cache-Control: ' . $cache);
+        echo '{}';
+        exit;
+    };
+    if (($_SERVER['REQUEST_METHOD'] ?? 'GET') !== 'GET') {
+        $miss(405, 'no-store');
+    }
+    $url = trim((string) ($_GET['url'] ?? ''));
+    if ($url === '' || strlen($url) > 2000 || !str_starts_with(strtolower($url), 'https://')) {
+        $miss(400, 'no-store');
+    }
+    try {
+        if (!ap_link_preview_url_in_site_notes($url)) {
+            $miss(404, 'public, max-age=300');
+        }
+        $card = ap_masto_preview_card(ap_link_preview_for_url($url, false));
+        if ($card === null || !str_starts_with((string) $card['url'], 'https://')) {
+            ap_link_preview_warm_async(ap_link_preview_normalize_url($url));
+            $miss(404, 'no-store');
+        }
+        header('Cache-Control: public, max-age=600');
+        echo json_encode([
+            'url' => $card['url'],
+            'title' => $card['title'],
+            'description' => $card['description'],
+            'provider_name' => $card['provider_name'],
+            'image' => $card['image'],
+        ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+    } catch (Throwable $e) {
+        error_log('[ap-link-preview] public: ' . $e->getMessage());
+        $miss(500, 'no-store');
+    }
     exit;
 }
