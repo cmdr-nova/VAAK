@@ -7027,7 +7027,8 @@ function ap_quote_target_is_bluesky(string $quoteObjectId): bool
 
 /**
  * True when a reply belongs to a thread that started on Bluesky, so it must
- * stay Bluesky-side: no ActivityPub Create, no AP Mention tags, no inbox hits.
+ * stay Bluesky-side: no ActivityPub delivery, no remote Mention tags, no inbox hits.
+ * Mentions of local VAAK users are kept and notified in-process.
  *
  * - bsky.app / at:// parents are Bluesky-native unless they map to a VAAK note
  *   (a VAAK→Bluesky mirror), in which case that note decides.
@@ -7319,6 +7320,227 @@ function ap_quote_response_handle(array $activity, string $responseType): ?strin
 }
 
 /**
+ * Local actor id embedded in a VAAK note URL, or '' when the URL is not one.
+ */
+function ap_publish_local_actor_from_note(string $url): string
+{
+    $url = rtrim(trim($url), '/');
+    if (preg_match('#^(https://mkultra\.monster/users/[A-Za-z0-9_]+)/notes/#', $url, $m)) {
+        return $m[1];
+    }
+    return '';
+}
+
+/**
+ * Local accounts who should see a reply: the parent author, plus anyone this
+ * Note already mentions on this instance. Not the rest of the thread.
+ *
+ * @param list<array<string,mixed>> $mentionTags
+ * @return list<string>
+ */
+function ap_publish_local_reply_recipient_actors(string $actor, string $inReplyTo, array $mentionTags): array
+{
+    $actor = rtrim($actor, '/');
+    $recipients = [];
+    $parent = ap_publish_local_actor_from_note($inReplyTo);
+    if ($parent === '' && $inReplyTo !== ''
+        && (str_starts_with($inReplyTo, 'at://') || str_starts_with($inReplyTo, 'https://bsky.app/'))
+        && function_exists('ap_bsky_local_note_id_for_at_uri')) {
+        try {
+            $mapped = ap_bsky_local_note_id_for_at_uri($inReplyTo, 0, false);
+        } catch (Throwable $e) {
+            $mapped = null;
+        }
+        if (is_string($mapped)) {
+            $parent = ap_publish_local_actor_from_note($mapped);
+        }
+    }
+    if ($parent !== '') {
+        $recipients[$parent] = true;
+    }
+    foreach ($mentionTags as $tag) {
+        if (!is_array($tag)) {
+            continue;
+        }
+        $href = rtrim((string) ($tag['href'] ?? ''), '/');
+        if (preg_match('#^https://mkultra\.monster/users/[A-Za-z0-9_]+$#', $href)) {
+            $recipients[$href] = true;
+        }
+    }
+    unset($recipients[$actor]);
+    return array_keys($recipients);
+}
+
+/**
+ * Write mentions rows for a local reply without ActivityPub delivery.
+ * ap_mention_store drops the owner's notification projection, which is what
+ * the Rust notification list refills from. Idempotent with any later inbox copy.
+ *
+ * @param list<array<string,mixed>> $mentionTags
+ */
+function ap_publish_notify_local_reply_participants(array $create, string $actor, string $inReplyTo, array $mentionTags): void
+{
+    if (!function_exists('ap_mention_store') || !function_exists('ap_local_user_by_actor_id')) {
+        return;
+    }
+    $targets = ap_publish_local_reply_recipient_actors($actor, $inReplyTo, $mentionTags);
+    if ($targets === []) {
+        return;
+    }
+    $author = rtrim($actor, '/');
+    $authorUser = ap_local_user_by_actor_id($author);
+    $authorId = is_array($authorUser) ? (int) ($authorUser['id'] ?? 0) : 0;
+    $object = is_array($create['object'] ?? null) ? $create['object'] : [];
+    $noteId = rtrim((string) ($object['id'] ?? ''), '/');
+    if ($noteId === '') {
+        return;
+    }
+    $content = isset($object['content']) && is_string($object['content']) ? $object['content'] : null;
+    $spoiler = isset($object['summary']) && is_string($object['summary']) ? $object['summary'] : '';
+    $sensitive = !empty($object['sensitive']) || $spoiler !== '';
+    foreach ($targets as $recipient) {
+        try {
+            $user = ap_local_user_by_actor_id($recipient);
+            if (!is_array($user) || (int) ($user['id'] ?? 0) < 1) {
+                continue;
+            }
+            $uid = (int) $user['id'];
+            if ($authorId > 0 && function_exists('ap_user_is_blocked')) {
+                if (ap_user_is_blocked($recipient, null, $authorId) || ap_user_is_blocked($author, null, $uid)) {
+                    continue;
+                }
+            }
+            ap_mention_store([
+                'activity_id' => (string) ($create['id'] ?? ''),
+                'object_id' => $noteId,
+                'actor_id' => $author,
+                'type' => (string) ($object['type'] ?? 'Note'),
+                'activity_type' => 'Create',
+                'content' => $content,
+                'in_reply_to' => $inReplyTo !== '' ? $inReplyTo : null,
+                'spoiler_text' => $spoiler,
+                'sensitive' => $sensitive,
+                'owner_user_id' => $uid,
+                'owner_actor_id' => $recipient,
+            ]);
+            if (function_exists('ap_webpush_notify_event')) {
+                try {
+                    ap_webpush_notify_event('mention', $author, null, is_string($content) ? $content : null, $uid);
+                } catch (Throwable $e) {
+                    error_log('[ap-inbox] local reply webpush skipped: ' . $e->getMessage());
+                }
+            }
+        } catch (Throwable $e) {
+            error_log('[ap-inbox] local reply notification skipped: ' . $e->getMessage());
+        }
+    }
+}
+
+/**
+ * Replies since $since whose Bluesky-side parent never produced a local
+ * mentions row. Dry-run listing for api/bin/bsky-thread-local-notify-backfill.php.
+ *
+ * @return array{since:string,scanned:int,missing:list<array{note_id:string,actor:string,in_reply_to:string,recipients:list<string>}>,applied:int}
+ */
+function ap_bsky_thread_local_notify_backfill(bool $apply = false, string $since = '2026-10-18T00:00:00Z', int $limit = 500): array
+{
+    $since = trim($since) !== '' ? trim($since) : '2026-10-18T00:00:00Z';
+    $limit = max(1, min(2000, $limit));
+    $missing = [];
+    $scanned = 0;
+    $applied = 0;
+    try {
+        $st = ap_db()->prepare(
+            'SELECT id, in_reply_to, raw_create_json, published FROM outbox_notes
+             WHERE in_reply_to IS NOT NULL AND in_reply_to != \'\'
+               AND published >= ?
+             ORDER BY published ASC
+             LIMIT ?'
+        );
+        $st->execute([$since, $limit]);
+        $rows = $st->fetchAll() ?: [];
+    } catch (Throwable $e) {
+        return ['since' => $since, 'scanned' => 0, 'missing' => [], 'applied' => 0];
+    }
+    foreach ($rows as $row) {
+        if (!is_array($row)) {
+            continue;
+        }
+        $scanned++;
+        $noteId = rtrim((string) ($row['id'] ?? ''), '/');
+        $inReplyTo = trim((string) ($row['in_reply_to'] ?? ''));
+        if ($noteId === '' || $inReplyTo === '' || !ap_reply_parent_is_bluesky_side($inReplyTo)) {
+            continue;
+        }
+        $create = json_decode((string) ($row['raw_create_json'] ?? ''), true);
+        if (!is_array($create)) {
+            $create = [];
+        }
+        $object = is_array($create['object'] ?? null) ? $create['object'] : [];
+        $actor = rtrim((string) ($create['actor'] ?? ''), '/');
+        if ($actor === '' && preg_match('#^(https://mkultra\.monster/users/[A-Za-z0-9_]+)/notes/#', $noteId, $am)) {
+            $actor = $am[1];
+        }
+        $tags = [];
+        foreach ((array) ($object['tag'] ?? []) as $tag) {
+            if (is_array($tag) && strcasecmp((string) ($tag['type'] ?? ''), 'Mention') === 0) {
+                $tags[] = $tag;
+            }
+        }
+        $content = (string) ($object['content'] ?? '');
+        if ($content !== '' && preg_match_all('#https://mkultra\.monster/users/([A-Za-z0-9_]+)(?!/notes/)#', $content, $found)) {
+            foreach ($found[1] as $key) {
+                $href = 'https://mkultra.monster/users/' . $key;
+                $tags[] = ['type' => 'Mention', 'href' => $href, 'name' => '@' . $key];
+            }
+        }
+        $recipients = ap_publish_local_reply_recipient_actors($actor, $inReplyTo, $tags);
+        $need = [];
+        foreach ($recipients as $recipient) {
+            $user = function_exists('ap_local_user_by_actor_id') ? ap_local_user_by_actor_id($recipient) : null;
+            $uid = is_array($user) ? (int) ($user['id'] ?? 0) : 0;
+            if ($uid < 1) {
+                continue;
+            }
+            try {
+                $have = ap_db()->prepare(
+                    'SELECT 1 FROM mentions WHERE owner_user_id = ? AND (object_id = ? OR object_id = ?) AND deleted_at IS NULL LIMIT 1'
+                );
+                $have->execute([$uid, $noteId, $noteId . '/']);
+                if ($have->fetchColumn()) {
+                    continue;
+                }
+            } catch (Throwable $e) {
+                continue;
+            }
+            $need[] = $recipient;
+        }
+        if ($need === []) {
+            continue;
+        }
+        $missing[] = [
+            'note_id' => $noteId,
+            'actor' => $actor,
+            'in_reply_to' => $inReplyTo,
+            'recipients' => $need,
+        ];
+        if ($apply && $create !== []) {
+            $only = [];
+            foreach ($tags as $tag) {
+                $href = rtrim((string) ($tag['href'] ?? ''), '/');
+                if (in_array($href, $need, true) || ap_publish_local_actor_from_note($inReplyTo) === $href) {
+                    $only[] = $tag;
+                }
+            }
+            // Parent author is resolved from inReplyTo, not from tags.
+            ap_publish_notify_local_reply_participants($create, $actor, $inReplyTo, $only);
+            $applied++;
+        }
+    }
+    return ['since' => $since, 'scanned' => $scanned, 'missing' => $missing, 'applied' => $applied];
+}
+
+/**
  * Publish a Note as @cmdr_nova (admin compose + queue + Mastodon API).
  * Visibility: public | unlisted (silent public) | private (followers-only) | local.
  *
@@ -7473,8 +7695,9 @@ function ap_publish_status_text(
 
     // Replies inside a thread that started on Bluesky stay Bluesky-side. The
     // note is still stored locally and mirrored to Bluesky, but is never sent
-    // to ActivityPub inboxes and carries no AP Mention tags (a Bluesky handle
-    // like @kevinr.example.com must never notify a same-named fediverse actor).
+    // to ActivityPub inboxes. Only mentions of local VAAK users are kept; a
+    // Bluesky handle like @kevinr.example.com must never notify a same-named
+    // fediverse actor, and nothing from the thread is queued for federation.
     $bskySide = $inReplyTo !== '' && $visibility !== 'local'
         && ap_reply_parent_is_bluesky_side($inReplyTo);
 
@@ -7529,12 +7752,17 @@ function ap_publish_status_text(
     $as2MentionSeen = [];
     if ($content !== '' && function_exists('ap_masto_content_with_mentions')) {
         $mentionPack = ap_masto_content_with_mentions($content, $extraMentionActors);
-        foreach (($bskySide ? [] : ($mentionPack['mentions'] ?? [])) as $m) {
+        foreach (($mentionPack['mentions'] ?? []) as $m) {
             $mUrl = rtrim((string) ($m['url'] ?? ''), '/');
             if ($mUrl === '' || !str_starts_with($mUrl, 'https://')) {
                 continue;
             }
             if (rtrim($mUrl, '/') === rtrim($actor, '/')) {
+                continue;
+            }
+            // Bluesky-thread replies keep @mentions of local users. Bluesky
+            // handles and remote ActivityPub actors stay off the Note.
+            if ($bskySide && !preg_match('#^https://mkultra\.monster/users/[A-Za-z0-9_]+$#', $mUrl)) {
                 continue;
             }
             if (isset($as2MentionSeen[$mUrl])) {
@@ -7810,9 +8038,20 @@ function ap_publish_status_text(
         error_log('[ap-inbox] local timeline fanout deferred after durable save');
     }
 
+    // Local parent author and local @mentions get mentions rows here, including
+    // Bluesky-thread replies that never enter an ActivityPub queue. Remote
+    // delivery for ordinary replies is unchanged below.
+    try {
+        ap_publish_notify_local_reply_participants($create, $actor, $inReplyTo, $as2MentionTags);
+    } catch (Throwable $e) {
+        error_log('[ap-inbox] local reply notifications deferred: ' . $e->getMessage());
+    }
+
     // The canonical post and its timeline row are committed above. Persist
     // federation/mirroring work before returning so remote slowness cannot
     // hold the compose request open, and a restart cannot discard delivery.
+    // Bluesky-thread replies are not queued: both delivery queues stay empty
+    // and the synchronous path below mirrors to Bluesky without fan-out.
     try {
         require_once __DIR__ . '/ap-publish-delivery.php';
         $deliveryOwnerId = function_exists('ap_db_owner_user_id_for_actor')
@@ -7830,7 +8069,7 @@ function ap_publish_status_text(
             'skip_bsky' => $pollNorm !== null,
             'skip_fedi' => $bskySide,
         ];
-        if (ap_publish_delivery_enqueue($deliveryOwnerId, $noteId, $deliveryPayload)) {
+        if (!$bskySide && ap_publish_delivery_enqueue($deliveryOwnerId, $noteId, $deliveryPayload)) {
             // Best effort immediate wake; the scheduled worker is the durable
             // recovery path if process spawning is unavailable or interrupted.
             ap_publish_delivery_wake_async();
@@ -7862,14 +8101,17 @@ function ap_publish_status_text(
 
     $priorityExtra = [];
     // Priority-deliver to reply author + mentioned actors (not DMs — still public/unlisted/private Create).
+    // Bluesky-thread replies skip this lookup entirely: no inbox fetch, no fan-out.
     $priorityActors = [];
-    if (is_string($replyActor) && $replyActor !== '') {
+    if (!$bskySide && is_string($replyActor) && $replyActor !== '') {
         $priorityActors[] = $replyActor;
     }
-    foreach ($as2MentionTags as $mt) {
-        $href = rtrim((string) ($mt['href'] ?? ''), '/');
-        if ($href !== '') {
-            $priorityActors[] = $href;
+    if (!$bskySide) {
+        foreach ($as2MentionTags as $mt) {
+            $href = rtrim((string) ($mt['href'] ?? ''), '/');
+            if ($href !== '') {
+                $priorityActors[] = $href;
+            }
         }
     }
     $seenPri = [];

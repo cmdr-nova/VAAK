@@ -179,7 +179,12 @@ pub(crate) fn reply_mention_handle(actor: &str, hint: &str, owner_actor: &str) -
         if actor.starts_with("https://mkultra.monster/users/") { hint.strip_suffix("@mkultra.monster").unwrap_or(hint).to_owned() }
         else { hint.to_owned() }
     } else {
-        if actor.is_empty() || actor == owner_actor.trim_end_matches('/') || actor.starts_with("https://mkultra.monster/users/") { return String::new(); }
+        if actor.is_empty() || actor.trim_end_matches('/') == owner_actor.trim_end_matches('/') { return String::new(); }
+        if let Some(rest) = actor.strip_prefix("https://mkultra.monster/users/") {
+            let name = rest.trim_matches('/');
+            if !name.is_empty() && !name.contains('/') && name.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'_') { return name.to_owned(); }
+            return String::new();
+        }
         let Ok(url) = reqwest::Url::parse(actor) else { return actor.to_owned(); };
         let host = url.host_str().unwrap_or("");
         let name = url.path().trim_end_matches('/').rsplit('/').next().unwrap_or("");

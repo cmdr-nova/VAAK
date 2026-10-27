@@ -12596,7 +12596,12 @@ if ($prefillReplyTo !== '' && $prefillEditNote === '' && $prefillDraftId <= 0) {
         $prefillEditSensitive = true;
     }
 }
-// Remote replies: seed the textarea with @author (+ other mentions) so you can keep typing.
+// Replies seed the textarea with @author (+ other mentions) so you can keep typing.
+// Continuing your own post still prefills the other people that post mentioned.
+$replyIsSelf = $prefillReplyTo !== ''
+    && function_exists('vaak_is_own_url')
+    && vaak_is_own_url($prefillReplyTo)
+    && str_contains($prefillReplyTo, '/notes/');
 if (
     $prefillReplyTo !== ''
     && $prefillQuoteObject === ''
@@ -12604,47 +12609,45 @@ if (
     && $prefillDraftId <= 0
     && $prefillEditContent === ''
 ) {
-    $replyIsSelf = vaak_is_own_url($prefillReplyTo) && str_contains($prefillReplyTo, '/notes/');
-    if (!$replyIsSelf) {
-        $seedHandles = [];
-        if ($prefillMention !== '') {
-            foreach (preg_split('/\s*,\s*/', $prefillMention) ?: [] as $part) {
-                $part = trim((string) $part);
-                if ($part === '') {
-                    continue;
-                }
-                $h = function_exists('admin_reply_mention_handle')
-                    ? admin_reply_mention_handle(null, $part)
-                    : ('@' . ltrim($part, '@'));
-                if ($h !== '' && !(function_exists('admin_reply_mention_is_self') && admin_reply_mention_is_self($h))) {
-                    $seedHandles[] = $h;
-                }
+    $seedHandles = [];
+    if ($prefillMention !== '') {
+        foreach (preg_split('/\s*,\s*/', $prefillMention) ?: [] as $part) {
+            $part = trim((string) $part);
+            if ($part === '') {
+                continue;
             }
-        } elseif ($prefillActor !== '' && function_exists('admin_reply_mention_handle')) {
-            $h = admin_reply_mention_handle($prefillActor);
-            if ($h !== '') {
+            $h = function_exists('admin_reply_mention_handle')
+                ? admin_reply_mention_handle(null, $part)
+                : ('@' . ltrim($part, '@'));
+            if ($h !== '' && !(function_exists('admin_reply_mention_is_self') && admin_reply_mention_is_self($h))
+                && !(function_exists('admin_reply_mention_is_blocked') && admin_reply_mention_is_blocked($h))) {
                 $seedHandles[] = $h;
             }
         }
-        // Dedupe while preserving order (collapse @handle vs @handle@bsky.app).
-        $seenSeed = [];
-        $uniq = [];
-        foreach ($seedHandles as $h) {
-            $h = function_exists('admin_reply_mention_normalize')
-                ? admin_reply_mention_normalize($h)
-                : $h;
-            $k = function_exists('admin_reply_mention_dedupe_key')
-                ? admin_reply_mention_dedupe_key($h)
-                : strtolower(ltrim($h, '@'));
-            if ($k === '' || isset($seenSeed[$k])) {
-                continue;
-            }
-            $seenSeed[$k] = true;
-            $uniq[] = $h;
+    } elseif (!$replyIsSelf && $prefillActor !== '' && function_exists('admin_reply_mention_handle')) {
+        $h = admin_reply_mention_handle($prefillActor);
+        if ($h !== '' && !(function_exists('admin_reply_mention_is_blocked') && admin_reply_mention_is_blocked($h, $prefillActor))) {
+            $seedHandles[] = $h;
         }
-        if ($uniq !== []) {
-            $prefillEditContent = implode(' ', $uniq) . ' ';
+    }
+    // Dedupe while preserving order (collapse @handle vs @handle@bsky.app).
+    $seenSeed = [];
+    $uniq = [];
+    foreach ($seedHandles as $h) {
+        $h = function_exists('admin_reply_mention_normalize')
+            ? admin_reply_mention_normalize($h)
+            : $h;
+        $k = function_exists('admin_reply_mention_dedupe_key')
+            ? admin_reply_mention_dedupe_key($h)
+            : strtolower(ltrim($h, '@'));
+        if ($k === '' || isset($seenSeed[$k])) {
+            continue;
         }
+        $seenSeed[$k] = true;
+        $uniq[] = $h;
+    }
+    if ($uniq !== []) {
+        $prefillEditContent = implode(' ', $uniq) . ' ';
     }
 }
 // Standalone Mention actions use the same handle seed as replies, but do not
@@ -12696,7 +12699,7 @@ $autoOpenComposer = $composerForceOpen
 $prefillReplyPreview = null;
 $prefillReplyPrivacyAuthor = '';
 $prefillReplyPrivacyParticipants = 0;
-if ($prefillReplyTo !== '' && $prefillQuoteObject === '' && $prefillEditNote === '' && $prefillMention !== '') {
+if (!$replyIsSelf && $prefillReplyTo !== '' && $prefillQuoteObject === '' && $prefillEditNote === '' && $prefillMention !== '') {
     $privacyHandles = [];
     foreach (preg_split('/\s*,\s*/', $prefillMention) ?: [] as $part) {
         $part = trim((string) $part);
@@ -14735,8 +14738,17 @@ function admin_own_post_action_bar(string $noteId, string $returnView, array $op
     };
     $csrf = function_exists('ap_auth_csrf_token') ? ap_auth_csrf_token() : '';
 
+    $mentionExtras = is_array($opts['mentions'] ?? null) ? $opts['mentions'] : [];
+    if ($mentionExtras === [] && function_exists('admin_reply_plain_mention_handles')) {
+        $mentionExtras = admin_reply_plain_mention_handles((string) ($opts['plain'] ?? ''));
+    }
+    $mentionSeed = function_exists('admin_reply_mention_seed')
+        ? admin_reply_mention_seed($actor !== '' ? $actor : null, null, $mentionExtras)
+        : [];
+    $mentionQuery = function_exists('admin_reply_mention_query') ? admin_reply_mention_query($mentionSeed) : '';
     $html = '<a class="icon-btn" href="?view=' . h($returnView) . '&amp;compose=1&amp;reply_to='
         . rawurlencode($noteId)
+        . $mentionQuery
         . (function_exists('admin_reply_cw_query') ? admin_reply_cw_query($spoiler, $sensitive) : '')
         . '" title="Reply" aria-label="Reply"><i class="ph ph-arrow-bend-up-left" aria-hidden="true"></i></a>';
     if ($canBoostQuote && $statusId !== '' && preg_match('/^\d+$/', $statusId)) {
@@ -18244,6 +18256,7 @@ function admin_render_event_tweet(array $e, array $followingIds, string $returnV
                     'spoiler' => $cwSpoiler,
                     'sensitive' => $cwSensitive,
                     'plain' => $summaryRaw ?? '',
+                    'mentions' => is_array($eventMentions ?? null) ? $eventMentions : [],
                     'boosted' => !empty($boosted),
                     'actor' => $aid,
                 ]) ?>
@@ -19246,6 +19259,135 @@ function admin_reply_mention_is_self(string $handle): bool
 }
 
 /**
+ * Local accounts that have blocked the signed-in user. One lookup per request.
+ *
+ * @return array<string,true>
+ */
+function admin_reply_local_blocker_keys(): array
+{
+    static $loaded = false;
+    static $keys = [];
+    if ($loaded) {
+        return $keys;
+    }
+    $loaded = true;
+    $me = function_exists('vaak_actor_id') ? rtrim((string) vaak_actor_id(), '/') : '';
+    if ($me === '' || !function_exists('ap_db')) {
+        return $keys;
+    }
+    try {
+        $st = ap_db()->prepare(
+            'SELECT u.actor_key FROM ap_user_blocks b
+             INNER JOIN ap_users u ON u.id = b.owner_user_id
+             WHERE b.scope = ? AND (b.value = ? OR b.value = ?)'
+        );
+        $st->execute(['actor', $me, $me . '/']);
+        foreach ($st->fetchAll() ?: [] as $row) {
+            $key = strtolower(trim((string) ($row['actor_key'] ?? '')));
+            if ($key !== '') {
+                $keys[$key] = true;
+            }
+        }
+    } catch (Throwable $e) {
+        $keys = [];
+    }
+    return $keys;
+}
+
+/** True when the viewer blocked this account, or a local account blocked the viewer. */
+function admin_reply_mention_is_blocked(string $handle, string $actorUrl = ''): bool
+{
+    $owner = (int) ($GLOBALS['vaak_owner_id'] ?? 0);
+    if ($owner < 1 && function_exists('ap_db_masto_owner_user_id')) {
+        try {
+            $owner = (int) ap_db_masto_owner_user_id();
+        } catch (Throwable $e) {
+            $owner = 0;
+        }
+    }
+    if ($owner < 1 || !function_exists('ap_user_is_blocked')) {
+        return false;
+    }
+    try {
+        $actorUrl = rtrim($actorUrl, '/');
+        if ($actorUrl !== '' && ap_user_is_blocked($actorUrl, null, $owner)) {
+            return true;
+        }
+        $bare = strtolower(ltrim(trim($handle), '@'));
+        $host = '';
+        if (str_contains($bare, '@')) {
+            $host = substr($bare, (int) strrpos($bare, '@') + 1);
+        }
+        if ($host !== '' && ap_user_is_blocked($actorUrl !== '' ? $actorUrl : null, $host, $owner)) {
+            return true;
+        }
+        $localKey = '';
+        if (preg_match('#^https://mkultra\.monster/users/([A-Za-z0-9_]+)$#i', $actorUrl, $m)) {
+            $localKey = strtolower($m[1]);
+        } elseif (preg_match('/^([a-z0-9_]+)@(?:www\.)?(?:mkultra|vaak)\.monster$/', $bare, $m)) {
+            $localKey = $m[1];
+        } elseif ($bare !== '' && !str_contains($bare, '@') && !str_contains($bare, '.') && preg_match('/^[a-z0-9_]+$/', $bare)) {
+            $localKey = $bare;
+        }
+        if ($localKey !== '' && isset(admin_reply_local_blocker_keys()[$localKey])) {
+            return true;
+        }
+    } catch (Throwable $e) {
+        return false;
+    }
+    return false;
+}
+
+/**
+ * @handles written in a post, including dotted Bluesky handles.
+ *
+ * @return list<string>
+ */
+function admin_reply_plain_mention_handles(string $plain): array
+{
+    $plain = trim($plain);
+    if ($plain === '' || !preg_match_all(
+        '/(?<![\w@])@([A-Za-z0-9_](?:[A-Za-z0-9_.-]*[A-Za-z0-9_])?(?:@[A-Za-z0-9.-]+\.[A-Za-z]{2,})?)/',
+        $plain,
+        $m
+    )) {
+        return [];
+    }
+    $out = [];
+    foreach ($m[1] as $handle) {
+        $handle = trim((string) $handle);
+        if ($handle !== '') {
+            $out[] = $handle;
+        }
+    }
+    return $out;
+}
+
+/**
+ * Mention tags already stored on a Note.
+ *
+ * @param array<string,mixed>|null $obj
+ * @return list<array{url:string,acct:string}>
+ */
+function admin_reply_mention_tags_from_object(?array $obj): array
+{
+    if (!is_array($obj)) {
+        return [];
+    }
+    $out = [];
+    foreach ((array) ($obj['tag'] ?? []) as $tag) {
+        if (!is_array($tag) || strcasecmp((string) ($tag['type'] ?? ''), 'Mention') !== 0) {
+            continue;
+        }
+        $out[] = [
+            'url' => (string) ($tag['href'] ?? ''),
+            'acct' => ltrim((string) ($tag['name'] ?? ''), '@'),
+        ];
+    }
+    return $out;
+}
+
+/**
  * Build the reply composer seed: author first, then other mentions (no duplicates, no self).
  *
  * @param list<array{acct?:string,username?:string,url?:string,uri?:string}|string> $extraMentions
@@ -19263,6 +19405,9 @@ function admin_reply_mention_seed(?string $authorActorId, ?string $authorAcct = 
         if (admin_reply_mention_is_self($handle)) {
             return;
         }
+        if (admin_reply_mention_is_blocked($handle)) {
+            return;
+        }
         $key = admin_reply_mention_dedupe_key($handle);
         if ($key === '' || isset($seen[$key])) {
             return;
@@ -19272,7 +19417,7 @@ function admin_reply_mention_seed(?string $authorActorId, ?string $authorAcct = 
     };
 
     $authorHandle = admin_reply_mention_handle($authorActorId, $authorAcct);
-    if ($authorHandle !== '') {
+    if ($authorHandle !== '' && !admin_reply_mention_is_blocked($authorHandle, (string) $authorActorId)) {
         $push($authorHandle);
     }
 
@@ -19294,6 +19439,9 @@ function admin_reply_mention_seed(?string $authorActorId, ?string $authorAcct = 
         }
         // Skip structured mentions that point at us by URL.
         if ($url !== '' && function_exists('vaak_is_own_url') && vaak_is_own_url($url)) {
+            continue;
+        }
+        if (admin_reply_mention_is_blocked($acct !== '' ? $acct : $url, $url)) {
             continue;
         }
         $h = admin_reply_mention_handle($url !== '' ? $url : null, $acct !== '' ? $acct : null);
@@ -20569,6 +20717,7 @@ function admin_render_masto_status_card(
                     'spoiler' => $editSpoiler,
                     'sensitive' => $editSensitive,
                     'plain' => $editPlain,
+                    'mentions' => $stMentions,
                     'visibility' => $ownVis,
                     'boosted' => !empty($boosted),
                     'actor' => $actorRef,
@@ -21991,6 +22140,7 @@ function admin_render_outbox_card(array $n, string $returnView): void
                     'spoiler' => $editSpoiler,
                     'sensitive' => $editSensitive,
                     'plain' => $editPlain,
+                    'mentions' => admin_reply_mention_tags_from_object(is_array($obj ?? null) ? $obj : null),
                     'visibility' => $ownVisRaw ?? 'public',
                     'boosted' => $ownBoosted,
                     'actor' => $actor,
@@ -22018,7 +22168,14 @@ function admin_render_outbox_card(array $n, string $returnView): void
                       $peerActionBase .= '&actor=' . rawurlencode($actor);
                   }
                 ?>
-                <a class="icon-btn" href="?view=<?= h($returnView) ?>&amp;compose=1&amp;reply_to=<?= urlencode($noteId) ?><?= $actor !== '' ? '&amp;to=' . urlencode($actor) : '' ?><?= admin_reply_cw_query($ownSpoiler, $ownSensitive) ?>" title="Reply" aria-label="Reply"><i class="ph ph-arrow-bend-up-left" aria-hidden="true"></i></a>
+                <?php
+                  $peerMentionExtras = admin_reply_mention_tags_from_object(is_array($obj ?? null) ? $obj : null);
+                  if ($peerMentionExtras === []) {
+                      $peerMentionExtras = admin_reply_plain_mention_handles($bodyPlain !== '(quote)' ? $bodyPlain : '');
+                  }
+                  $peerMentionSeed = admin_reply_mention_seed($actor !== '' ? $actor : null, null, $peerMentionExtras);
+                ?>
+                <a class="icon-btn" href="?view=<?= h($returnView) ?>&amp;compose=1&amp;reply_to=<?= urlencode($noteId) ?><?= $actor !== '' ? '&amp;to=' . urlencode($actor) : '' ?><?= admin_reply_mention_query($peerMentionSeed) ?><?= admin_reply_cw_query($ownSpoiler, $ownSensitive) ?>" title="Reply" aria-label="Reply"><i class="ph ph-arrow-bend-up-left" aria-hidden="true"></i></a>
                 <?php if ($peerCanBoostQuote): ?>
                   <a class="icon-btn" href="?view=<?= h($returnView) ?>&amp;compose=1&amp;quote_object=<?= urlencode($noteId) ?><?= $peerSid !== '' ? '&amp;quote_status_id=' . urlencode($peerSid) : '' ?>" title="Quote" aria-label="Quote"><i class="ph ph-quotes" aria-hidden="true"></i></a>
                 <?php endif; ?>
@@ -47160,10 +47317,10 @@ $showComposeFab = empty($GLOBALS['vaak_guest_profile'])
         }
         delete toActor.dataset.inlineHidden;
       }
-      if (isSelf) {
-        if (ta) ta.value = '';
-      } else if (ta) {
-        // Prefill @author (+ other mentions) with a trailing space.
+      if (ta) {
+        // Prefill @author (+ other mentions) with a trailing space, including
+        // when the post is your own. You stay out of the seed; everyone else
+        // that post mentioned stays, and you can delete them before sending.
         if (mentionSeed) {
           ta.value = mentionSeed + ' ';
           ta.dataset.autoMention = mentionSeed;
@@ -47174,10 +47331,10 @@ $showComposeFab = empty($GLOBALS['vaak_guest_profile'])
         } else {
           ta.value = '';
         }
-        // The first seeded handle is the parent author. When a reply has
-        // multiple participants, keep privacy controls unavailable if that
-        // author handle is removed from the authored text.
-        if (mentionParts.length >= 2) {
+        // The first seeded handle is the parent author only when this is not
+        // your own post. Continuing your own thread must keep followers-only
+        // available, so that guard stays off here.
+        if (!isSelf && mentionParts.length >= 2) {
           ta.dataset.requiredReplyMention = mentionParts[0];
           ta.dataset.replyParticipantCount = String(mentionParts.length);
         } else {

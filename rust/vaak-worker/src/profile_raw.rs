@@ -219,7 +219,7 @@ fn peer_actions(note:&str,actor:&str,vis:&str,label:&str,spoiler:&str,sensitive:
  let mut html=String::from("<div class=\"tweet-actions\">");
  if f.guest{html.push_str(&crate::library::actions::read_only_overflow(note,view,note));html.push_str("</div>");return Ok(html);}
  let sid=&f.status_id;let numeric=!sid.is_empty()&&sid.bytes().all(|b|b.is_ascii_digit());let share=!matches!(vis.to_ascii_lowercase().as_str(),"private"|"direct"|"followers");
- html.push_str(&format!("<a class=\"icon-btn\" href=\"?view={}&amp;compose=1&amp;reply_to={}{}{}\" title=\"Reply\" aria-label=\"Reply\"><i class=\"ph ph-arrow-bend-up-left\" aria-hidden=\"true\"></i></a>",esc(view),form_query(note),if actor.is_empty(){String::new()}else{format!("&amp;to={}",form_query(actor))},crate::library::actions::reply_suffix(&[],spoiler,sensitive)));
+ html.push_str(&format!("<a class=\"icon-btn\" href=\"?view={}&amp;compose=1&amp;reply_to={}{}{}\" title=\"Reply\" aria-label=\"Reply\"><i class=\"ph ph-arrow-bend-up-left\" aria-hidden=\"true\"></i></a>",esc(view),form_query(note),if actor.is_empty(){String::new()}else{format!("&amp;to={}",form_query(actor))},crate::library::actions::reply_suffix(&facts.reply_mentions,spoiler,sensitive)));
  if share{html.push_str(&format!("<a class=\"icon-btn\" href=\"?view={}&amp;compose=1&amp;quote_object={}{}\" title=\"Quote\" aria-label=\"Quote\"><i class=\"ph ph-quotes\" aria-hidden=\"true\"></i></a>",esc(view),form_query(note),if sid.is_empty(){String::new()}else{format!("&amp;quote_status_id={}",form_query(sid))}));}
  let base=format!("?view={}{}",query(view),if view=="remote_profile"&&!actor.is_empty(){format!("&actor={}",query(actor))}else{String::new()});
  if numeric{for (action,on,name,icon,target,picker,enabled) in [
@@ -231,7 +231,7 @@ fn peer_actions(note:&str,actor:&str,vis:&str,label:&str,spoiler:&str,sensitive:
   html.push_str(&hidden("status_id",sid));html.push_str(&hidden("object_id",note));if target{html.push_str(&hidden("target_actor",actor));}
   html.push_str(&format!("<button class=\"icon-btn{}\" type=\"submit\" title=\"{name}\" aria-label=\"{name}\"{}><i class=\"ph{} ph-{icon}\" aria-hidden=\"true\"></i></button></form>",if on{" on"}else{""},if picker{format!(" data-bm-picker=\"{}\"",if on{"1"}else{"0"})}else{String::new()},if on&&icon!="repeat"{"-fill"}else{""}));
  }}
- let ctx=FediActionContext{owner_id:facts.owner_id,status_id:sid.clone(),object_id:note.into(),actor_id:actor.into(),remote_url:note.into(),return_view:view.clone(),reply_mentions:vec![],spoiler:spoiler.into(),sensitive,favourited:facts.favourited,bookmarked:facts.bookmarked,boosted:facts.boosted,counts:Default::default(),csrf:facts.csrf.clone(),moderation:facts.moderation.clone()};
+ let ctx=FediActionContext{owner_id:facts.owner_id,status_id:sid.clone(),object_id:note.into(),actor_id:actor.into(),remote_url:note.into(),return_view:view.clone(),reply_mentions:facts.reply_mentions.clone(),spoiler:spoiler.into(),sensitive,favourited:facts.favourited,bookmarked:facts.bookmarked,boosted:facts.boosted,counts:Default::default(),csrf:facts.csrf.clone(),moderation:facts.moderation.clone()};
  html.push_str(&crate::library::actions::render_moderation(&ctx));html.push_str("</div>");Ok(html)
 }
 

@@ -40,6 +40,23 @@ async fn saved(db:&Client,owner:i64,table:&str,sid:&str,note:&str)->Result<bool>
  Ok(db.query_one(&format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE owner_user_id::bigint=$1 AND (status_id=$2 OR object_id=ANY($3)))"),&[&owner,&sid,&keys]).await?.get(0))
 }
 fn aliases(a:&str,b:&str)->bool{let aliases=crate::hidden::actor_aliases(a);crate::hidden::actor_aliases(b).iter().any(|b|aliases.contains(b))}
+fn raw_reply_mentions(actor:&str,plain:&str,obj:&Value,owner_actor:&str,owner_key:&str,blocks:&[Value],inbound:&[String])->Vec<String>{
+ let mut mentions=Vec::new();
+ if let Some(tags)=obj.get("tag").and_then(Value::as_array){
+  for tag in tags{
+   if !text(tag,"type").eq_ignore_ascii_case("mention"){continue;}
+   let href=tag.get("href").and_then(Value::as_str).unwrap_or("");
+   let name=text(tag,"name").trim_start_matches('@');
+   if !href.is_empty()||!name.is_empty(){mentions.push(json!({"acct":name,"url":href}));}
+  }
+ }
+ if let Ok(re)=regex::Regex::new(r"(?i)(?:^|[^A-Za-z0-9_@])@([A-Za-z0-9_](?:[A-Za-z0-9_.-]*[A-Za-z0-9_])?(?:@[A-Za-z0-9.-]+\.[A-Za-z]{2,})?)"){
+  for cap in re.captures_iter(plain){if let Some(handle)=cap.get(1){mentions.push(Value::String(handle.as_str().to_owned()));}}
+ }
+ let acct=actor.trim_end_matches('/').rsplit('/').next().unwrap_or("");
+ let status=json!({"account":{"uri":actor,"acct":acct},"mentions":mentions});
+ facts::visible_reply_seeds(&status,owner_actor,owner_key,blocks,inbound)
+}
 pub(crate) async fn resolve_authenticated(db:&Client,session:&AuthenticatedProfileSession,raw:&Value,actor:&str,key:&str,profile:&Value)->Result<RawProfileFacts>{
  let owner=session.owner_id();if owner<1||session.csrf().is_empty(){bail!("raw facts require an authenticated profile session")}
  let identity=db.query_opt("SELECT actor_id,actor_key,COALESCE(is_admin,0)::bigint FROM ap_users WHERE id::bigint=$1 AND disabled_at IS NULL",&[&owner]).await?.context("inactive raw facts owner")?;
@@ -91,7 +108,9 @@ pub(crate) async fn resolve_authenticated(db:&Client,session:&AuthenticatedProfi
  let mut media_preview_by_url=HashMap::new();let atts=obj.get("attachment");let atts=match atts{Some(Value::Array(v))=>v.clone(),Some(v)if v.get("type").is_some_and(|v|!v.is_null())=>vec![v.clone()],_=>vec![]};
  for att in atts{let url=att.get("url").and_then(Value::as_str).or_else(||att.get("url").and_then(|v|v.get("href")).and_then(Value::as_str)).unwrap_or("");if url.starts_with("https://"){if let Some(row)=db.query_opt("SELECT preview_url FROM masto_media WHERE public_url=$1 AND preview_url IS NOT NULL LIMIT 1",&[&url]).await?{let preview:String=row.get(0);media_preview_by_url.insert(url.into(),preview);}}}
  let note_dom_id:String=db.query_one("SELECT md5($1)",&[&note]).await?.get(0);
- Ok(RawProfileFacts{card:CardFacts{bsky:None,owner_id:owner,owner_actor,return_view:session.return_view().into(),auto_unblur_sensitive:auto,resolved_avatar:facts::avatar_with_context(db,&Value::Null,actor,session.warm_context()).await?,csrf:session.csrf().into(),favourited,bookmarked,boosted,own,current_action_counts:None,rss_row:None,rss_quote_row:None,rss_quoted:false,emoji_by_actor,reply_mentions:vec![],moderation,poll_row,ask_row,now,lazy_media:session.lazy_media()},actor_key:key.into(),actor:actor.into(),display_name:card::php_trim(text(profile,"name")).into(),note_dom_id,masto_row,status_id,own_note,guest:false,quote_html:String::new(),link_card:None,media_preview_by_url})
+ let inbound=facts::reply_inbound_block_keys(db,&owner_actor).await?;
+ let reply_mentions=raw_reply_mentions(actor,&plain,obj,&owner_actor,&owner_key,&blocks,&inbound);
+ Ok(RawProfileFacts{card:CardFacts{bsky:None,owner_id:owner,owner_actor,return_view:session.return_view().into(),auto_unblur_sensitive:auto,resolved_avatar:facts::avatar_with_context(db,&Value::Null,actor,session.warm_context()).await?,csrf:session.csrf().into(),favourited,bookmarked,boosted,own,current_action_counts:None,rss_row:None,rss_quote_row:None,rss_quoted:false,emoji_by_actor,reply_mentions,moderation,poll_row,ask_row,now,lazy_media:session.lazy_media()},actor_key:key.into(),actor:actor.into(),display_name:card::php_trim(text(profile,"name")).into(),note_dom_id,masto_row,status_id,own_note,guest:false,quote_html:String::new(),link_card:None,media_preview_by_url})
 }
 
 #[cfg(test)]
