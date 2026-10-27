@@ -43,6 +43,7 @@ $check(
         '20261019_phyrian_grid_lineage_postgres.sql',
         '20261021_bsky_follow_carry_postgres.sql',
         '20261026_ml_shadow_scorecard_postgres.sql',
+        '20261027_fanout_host_health_postgres.sql',
     ],
     'deploy runner picks up the clans migration and the quote-target table'
 );

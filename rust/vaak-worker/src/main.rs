@@ -88,6 +88,7 @@ mod search_bridge;
 mod search_collect;
 mod search_components;
 mod cleanup;
+mod fanout_host;
 mod follow_fallback;
 mod inbox_origin;
 mod parity_replay;

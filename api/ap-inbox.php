@@ -43,6 +43,7 @@ const LOCAL_FOLLOW_BACK_MAX_PER_HOUR = 30;
 
 require_once __DIR__ . '/ap-db.php';
 require_once __DIR__ . '/ap-asks.php';
+require_once __DIR__ . '/ap-fanout-host.php';
 
 /** Outbound HTTP User-Agent for federation fingerprints (software name: vaak). */
 function ap_http_user_agent(?string $actorId = null): string
@@ -247,6 +248,9 @@ if (is_array($json)) {
     }
     if (is_string($keyHost) && $keyHost !== '' && function_exists('ap_inbox_host_seen_note')) {
         ap_inbox_host_seen_note(strtolower($keyHost), $type);
+    }
+    if (is_string($keyHost) && $keyHost !== '' && function_exists('ap_fanout_host_note_inbound')) {
+        ap_fanout_host_note_inbound(strtolower($keyHost));
     }
     $action = ap_route_verified_activity($json, strlen($raw));
 }
@@ -6692,6 +6696,16 @@ function ap_deliver_fanout_background(array $activity, array $inboxUrls, string 
         $now = gmdate('c');
         $queued = 0;
         foreach ($inboxUrls as $inbox) {
+            $decision = function_exists('ap_fanout_host_admit')
+                ? ap_fanout_host_admit($inbox, $activity, $keyId, $privPath)
+                : 'send';
+            if ($decision === 'skip') {
+                continue;
+            }
+            if ($decision === 'probe') {
+                $queued++;
+                continue;
+            }
             $st->execute([$activityKey, $inbox, $json, $keyId, $privPath, $priority, $now, $now, $now]);
             $queued += $st->rowCount();
         }
@@ -6780,7 +6794,7 @@ function ap_deliver_public_activity(array $activity, array $priorityExtra = [], 
             continue;
         }
         // 5s: Bridgy often ACKs immediately even when its media pipeline is busy.
-        if (ap_deliver_signed_json($inbox, $activity, $ident['key_id'], $ident['priv'], 5.0)) {
+        if (ap_fanout_deliver_or_hold($inbox, $activity, $ident['key_id'], $ident['priv'], 5.0)) {
             $delivered++;
             $bridgyOk = true;
             break;
@@ -6817,7 +6831,7 @@ function ap_deliver_public_activity(array $activity, array $priorityExtra = [], 
     $sync = array_slice($otherPriority, 0, $syncBudget);
     $bgFollowers = array_slice($otherPriority, $syncBudget);
     foreach ($sync as $inbox) {
-        if (ap_deliver_signed_json($inbox, $activity, $ident['key_id'], $ident['priv'], 2.5)) {
+        if (ap_fanout_deliver_or_hold($inbox, $activity, $ident['key_id'], $ident['priv'], 2.5)) {
             $delivered++;
         }
     }
@@ -6873,7 +6887,7 @@ function ap_deliver_public_activity(array $activity, array $priorityExtra = [], 
             $queued = count($deferred);
         } else {
             foreach (array_slice($deferred, 0, 5) as $inbox) {
-                if (ap_deliver_signed_json($inbox, $activity, $ident['key_id'], $ident['priv'], 2.5)) {
+                if (ap_fanout_deliver_or_hold($inbox, $activity, $ident['key_id'], $ident['priv'], 2.5)) {
                     $delivered++;
                 }
             }
@@ -6932,7 +6946,7 @@ function ap_deliver_followers_activity(array $activity, array $priorityExtra = [
     $sync = array_slice($targets, 0, $syncBudget);
     $deferred = array_slice($targets, $syncBudget);
     foreach ($sync as $inbox) {
-        if (ap_deliver_signed_json($inbox, $activity, $ident['key_id'], $ident['priv'], 2.5)) {
+        if (ap_fanout_deliver_or_hold($inbox, $activity, $ident['key_id'], $ident['priv'], 2.5)) {
             $delivered++;
         }
     }
@@ -6942,7 +6956,7 @@ function ap_deliver_followers_activity(array $activity, array $priorityExtra = [
             $queued = count($deferred);
         } else {
             foreach (array_slice($deferred, 0, 8) as $inbox) {
-                if (ap_deliver_signed_json($inbox, $activity, $ident['key_id'], $ident['priv'], 2.5)) {
+                if (ap_fanout_deliver_or_hold($inbox, $activity, $ident['key_id'], $ident['priv'], 2.5)) {
                     $delivered++;
                 }
             }
