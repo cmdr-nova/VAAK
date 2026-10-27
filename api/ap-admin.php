@@ -47119,6 +47119,7 @@ $showComposeFab = empty($GLOBALS['vaak_guest_profile'])
   }
 
   function clearQuoteChrome() {
+    if (!form) return;
     const quoteField = form.querySelector('input[name="quote_object"]');
     if (quoteField) quoteField.remove();
     const qb = form.querySelector('.quote-block');
@@ -48440,14 +48441,19 @@ $showComposeFab = empty($GLOBALS['vaak_guest_profile'])
       mediaHint.textContent = '';
     }
     if (visibilityWrap) visibilityWrap.style.display = '';
+    // Quote mode lives in the hidden quote_object field and the quote card.
+    // Drop both before the poll sync below, which reads that field.
+    clearQuoteChrome();
     const replyTo = document.getElementById('compose-in-reply-to');
     const toActor = document.getElementById('compose-to-actor');
     const ta = document.getElementById('compose-content');
     if (ta) {
       // The composer panel is reused between replies and new posts. Do not
-      // carry reply-participant privacy state into the next composition.
+      // carry reply-participant privacy state or quote/reply/edit wording
+      // into the next composition.
       delete ta.dataset.requiredReplyMention;
       delete ta.dataset.replyParticipantCount;
+      ta.placeholder = "What's happening?";
     }
     if (replyTo) {
       replyTo.style.display = '';
