@@ -190,6 +190,9 @@ fn remote_account(actor: &str, actors: &HashMap<String, Value>) -> Value {
     } else if !host.is_empty() && !username.is_empty() && username != "user" && !crate::profile_identity::placeholder(username) {
         web = format!("https://{host}/@{}", query(username));
     }
+    if let Some(bare) = crate::home_hydrate_ranked::local_api_acct(username, host, &actor) {
+        acct = bare;
+    }
     json!({
         "id": remote_account_id(&actor, row),
         "username": username,

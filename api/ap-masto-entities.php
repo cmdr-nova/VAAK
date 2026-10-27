@@ -157,6 +157,42 @@ function ap_masto_is_local_actor_url(string $actorId): bool
 }
 
 /**
+ * Mastodon API acct for a local account: the bare username.
+ * Remote accounts stay user@domain. Null leaves the caller's acct alone
+ * (placeholders, Bluesky handles, and web @user@host rendering).
+ */
+function ap_masto_local_api_acct(string $username, string $host, string $actorId): ?string
+{
+    $username = ltrim(trim($username), '@');
+    if (str_contains($username, '@')) {
+        $username = explode('@', $username, 2)[0];
+    }
+    $username = trim($username);
+    $host = strtolower(trim($host));
+    $actorId = rtrim(trim($actorId), '/');
+    $localHost = in_array($host, ['mkultra.monster', 'www.mkultra.monster', 'vaak.monster', 'www.vaak.monster'], true);
+    $localUrl = (bool) preg_match(
+        '#^https://(?:www\.)?(?:mkultra|vaak)\.monster/users/[A-Za-z0-9_]+(?:/|$)#',
+        $actorId
+    );
+    if (!$localHost && !$localUrl) {
+        return null;
+    }
+    // Path snowflakes and "user" stay off the acct field. Do not invent a
+    // handle from the actor URL.
+    if ($username === '' || $username === 'user') {
+        return null;
+    }
+    if (str_starts_with(strtolower($username), 'did:') || preg_match('/^did%3a/i', $username) === 1) {
+        return null;
+    }
+    if (preg_match('/^\d{6,}$/', $username) === 1) {
+        return null;
+    }
+    return $username;
+}
+
+/**
  * If $url is a local note, return its actor IRI; else null.
  * e.g. .../users/test_account/notes/abc → .../users/test_account
  */
@@ -4630,6 +4666,12 @@ function ap_masto_remote_account(string $actorId, bool $allowFetch = false): arr
     if (function_exists('ap_masto_https_media_url')) {
         $avatar = ap_masto_https_media_url($avatar, $fallback) ?? $fallback;
         $header = ap_masto_https_media_url($header, $avatar) ?? $avatar;
+    }
+    // Mastodon: local acct is the bare username. url and uri stay as built.
+    // Mention linkify re-stamps written @user@host after this returns.
+    $localApiAcct = ap_masto_local_api_acct($username, is_string($host) ? $host : '', $canonicalActor);
+    if (is_string($localApiAcct) && $localApiAcct !== '') {
+        $acct = $localApiAcct;
     }
     $account = [
         'id' => $id,

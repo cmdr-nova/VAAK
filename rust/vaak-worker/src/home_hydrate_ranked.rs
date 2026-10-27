@@ -339,6 +339,43 @@ fn host_from_url(url: &str) -> String {
     host.to_ascii_lowercase()
 }
 
+/// Mastodon API `acct` for a local account is the bare username. Remote stays
+/// `user@domain`. `None` means the caller keeps its existing acct (Bluesky,
+/// placeholders, and web `@user@host` handles). Mirrors PHP
+/// `ap_masto_local_api_acct`. Does not read the actor path as a handle.
+pub(crate) fn local_api_acct(username: &str, host: &str, actor_id: &str) -> Option<String> {
+    let username = username.trim().trim_start_matches('@');
+    let username = username.split('@').next().unwrap_or("").trim();
+    let host = host.trim().to_ascii_lowercase();
+    let local_host = matches!(
+        host.as_str(),
+        "mkultra.monster" | "www.mkultra.monster" | "vaak.monster" | "www.vaak.monster"
+    );
+    if !local_host && !local_actor_url(actor_id) {
+        return None;
+    }
+    if username.is_empty() || username_is_placeholder(username) {
+        return None;
+    }
+    Some(username.to_string())
+}
+
+fn local_actor_url(actor: &str) -> bool {
+    let actor = actor.trim().trim_end_matches('/');
+    let Some(rest) = [
+        "https://mkultra.monster/users/",
+        "https://www.mkultra.monster/users/",
+        "https://vaak.monster/users/",
+        "https://www.vaak.monster/users/",
+    ]
+    .iter()
+    .find_map(|prefix| actor.strip_prefix(*prefix)) else {
+        return false;
+    };
+    let key = rest.split('/').next().unwrap_or("");
+    !key.is_empty() && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
 /// Mastodon `/ap/users/{snowflake}`, DID leftovers, and empty cache rows are
 /// not handles. PHP `ap_remote_actor_username_is_placeholder` uses the same rule.
 fn username_is_placeholder(username: &str) -> bool {
@@ -396,7 +433,9 @@ fn label_account_fields(
     } else {
         username.clone()
     };
-    let acct = if placeholder && !host.is_empty() {
+    let acct = if let Some(bare) = local_api_acct(&username, &host, actor_id) {
+        bare
+    } else if placeholder && !host.is_empty() {
         host.clone()
     } else if host.is_empty() {
         username.clone()
@@ -6375,5 +6414,46 @@ mod timeline_contract {
         let html = crate::notif_embed::paint_lean_feed_card_opts(&st, "local", "");
         assert!(html.contains("poll-block") && html.contains("Coffee"), "{html}");
         assert!(html.contains("social.example/media/a.jpg"), "{html}");
+    }
+}
+
+#[cfg(test)]
+mod local_api_acct_tests {
+    use super::local_api_acct;
+
+    #[test]
+    fn local_api_acct_matches_php() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let output = std::process::Command::new(root.join("api/bin/php-policy-test"))
+            .arg(root.join("api/bin/masto-local-acct-smoke.php"))
+            .output()
+            .expect("php local acct smoke");
+        assert!(
+            output.status.success(),
+            "stdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let reference: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("php acct json");
+        let cases = reference["cases"].as_array().expect("cases");
+        assert!(cases.len() >= 8, "parity cases");
+        for case in cases {
+            let username = case["username"].as_str().unwrap();
+            let host = case["host"].as_str().unwrap();
+            let actor = case["actor"].as_str().unwrap();
+            let expect = case["acct"].as_str().map(str::to_string);
+            assert_eq!(
+                local_api_acct(username, host, actor),
+                expect,
+                "{case}"
+            );
+            assert_eq!(case["url"], case["url_before"], "{case}");
+            assert_eq!(case["uri"], case["uri_before"], "{case}");
+        }
     }
 }
