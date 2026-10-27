@@ -3132,7 +3132,22 @@ function ap_enrich_activity_for_feed(array $activity, string $type, ?string $obj
             $summary = $combined;
         }
         if (is_array($quotedDoc) && !ap_quote_is_tombstone($quotedDoc)) {
-            $media = array_values(array_unique(array_merge($media, ap_extract_media_urls($quotedDoc))));
+            // The quoted post's files belong on the quoted object, not the
+            // quoting event. Cache them there when we already have the doc.
+            // Only if that cache cannot be written do we keep the old flatten,
+            // so a public image is not dropped on the floor.
+            $cachedQuoteMedia = false;
+            try {
+                $cachedQuoteMedia = ap_quote_cache_target_from_doc(
+                    is_string($quotedUrl) ? $quotedUrl : null,
+                    $quotedDoc
+                );
+            } catch (Throwable $e) {
+                $cachedQuoteMedia = false;
+            }
+            if (!$cachedQuoteMedia) {
+                $media = array_values(array_unique(array_merge($media, ap_extract_media_urls($quotedDoc))));
+            }
         }
     } elseif ($isQuoteActivity && ($summary === null || $summary === '') && $objectId) {
         // Last resort label so the feed isn't a blank "(no text preview)"
@@ -4535,7 +4550,128 @@ function ap_format_quote_feed_summary(?string $commentary, ?array $quotedDoc, ?s
     if (!$parts) {
         return null;
     }
-    return implode("\n\n", $parts);
+    $combined = implode("\n\n", $parts);
+    // Keep the quote target address on the summary. Render looks it up from
+    // this line; the QT excerpt itself is often text with no URL.
+    if (is_string($quotedUrl) && str_starts_with($quotedUrl, 'https://')
+        && !str_contains($combined, $quotedUrl)) {
+        $combined = 'RE: ' . rtrim($quotedUrl, '/') . "\n\n" . $combined;
+    }
+    return $combined;
+}
+
+/**
+ * Remember a quoted Note's attachments on that Note's cached event.
+ * Uses the document already fetched for the quote preview. No extra HTTP.
+ * Returns true when those attachments are stored on the quoted object, so the
+ * quoting event must not also keep them.
+ *
+ * @param array<string,mixed> $quotedDoc
+ */
+function ap_quote_cache_target_from_doc(?string $quotedUrl, array $quotedDoc): bool
+{
+    if (function_exists('ap_unwrap_as2_object')) {
+        $quotedDoc = ap_unwrap_as2_object($quotedDoc);
+    }
+    $canonical = '';
+    if (function_exists('ap_as_id')) {
+        $canonical = (string) (ap_as_id($quotedDoc['id'] ?? null) ?: '');
+    }
+    if ($canonical === '' && is_string($quotedUrl)) {
+        $canonical = $quotedUrl;
+    }
+    $canonical = rtrim(trim($canonical), '/');
+    if ($canonical === '' || !str_starts_with($canonical, 'https://')) {
+        return false;
+    }
+    if (str_contains($canonical, 'bsky.app/') || str_contains($canonical, 'bsky.brid.gy')) {
+        return false;
+    }
+    if (function_exists('ap_quote_target_is_bluesky') && ap_quote_target_is_bluesky($canonical)) {
+        return false;
+    }
+    $media = ap_extract_media_urls($quotedDoc);
+    if ($media === []) {
+        return false;
+    }
+    $candidates = [$canonical];
+    if (is_string($quotedUrl) && str_starts_with($quotedUrl, 'https://')) {
+        $candidates[] = rtrim($quotedUrl, '/');
+    }
+    if (function_exists('ap_object_url_lookup_candidates')) {
+        foreach ($candidates as $cand) {
+            foreach (ap_object_url_lookup_candidates($cand) as $alt) {
+                $candidates[] = rtrim($alt, '/');
+            }
+        }
+    }
+    $candidates = array_values(array_unique(array_filter($candidates, static function ($cand): bool {
+        return is_string($cand) && str_starts_with($cand, 'https://');
+    })));
+    $existing = null;
+    if (function_exists('ap_event_by_object_id')) {
+        foreach ($candidates as $cand) {
+            $row = ap_event_by_object_id($cand);
+            if (is_array($row)) {
+                $existing = $row;
+                break;
+            }
+        }
+    }
+    $mediaJson = json_encode(array_values($media), JSON_UNESCAPED_SLASHES);
+    if (!is_string($mediaJson) || $mediaJson === '' || $mediaJson === '[]') {
+        return false;
+    }
+    if (is_array($existing)) {
+        $old = trim((string) ($existing['media_urls'] ?? ''));
+        if ($old !== '' && $old !== '[]' && $old !== 'null') {
+            return true;
+        }
+        $eventId = (int) ($existing['id'] ?? 0);
+        if ($eventId < 1 || !function_exists('ap_db')) {
+            return false;
+        }
+        ap_db()->prepare('UPDATE events SET media_urls = ? WHERE id = ? AND (media_urls IS NULL OR media_urls = \'\' OR media_urls = \'[]\' OR media_urls = \'null\')')
+            ->execute([$mediaJson, $eventId]);
+        return true;
+    }
+    $visibility = function_exists('ap_visibility_from_activity')
+        ? ap_visibility_from_activity($quotedDoc)
+        : 'public';
+    if (!in_array($visibility, ['public', 'unlisted'], true) || !function_exists('ap_metrics_record')) {
+        return false;
+    }
+    $actor = null;
+    if (function_exists('ap_as_id')) {
+        $actor = ap_as_id($quotedDoc['attributedTo'] ?? null) ?: ap_as_id($quotedDoc['actor'] ?? null);
+    }
+    if (!is_string($actor) || !str_starts_with($actor, 'https://')) {
+        return false;
+    }
+    $summary = function_exists('ap_as2_text_summary') ? ap_as2_text_summary($quotedDoc) : null;
+    if (!is_string($summary) || trim(strip_tags($summary)) === '') {
+        $summary = is_string($quotedDoc['content'] ?? null) ? $quotedDoc['content'] : '(attachment)';
+    }
+    $inReplyTo = function_exists('ap_as_id') ? ap_as_id($quotedDoc['inReplyTo'] ?? null) : null;
+    if (!is_string($inReplyTo) || !str_starts_with($inReplyTo, 'https://')) {
+        $inReplyTo = null;
+    }
+    ap_metrics_record(
+        'Create',
+        $actor,
+        $canonical,
+        null,
+        0,
+        'local_observe',
+        is_string($summary) ? $summary : null,
+        $media,
+        is_string($quotedDoc['published'] ?? null) ? $quotedDoc['published'] : null,
+        $inReplyTo,
+        is_string($quotedDoc['summary'] ?? null) ? $quotedDoc['summary'] : '',
+        !empty($quotedDoc['sensitive']),
+        $visibility
+    );
+    return true;
 }
 
 function ap_resolve_inbox_from_actor_doc(array $doc): ?string

@@ -1091,6 +1091,10 @@ function ap_cmdr_shell_start(string $title, array $meta = []): void
       .quote-block .qt-label{display:block;font-size:.72rem;text-transform:uppercase;letter-spacing:.05em;color:#7a8a9a;margin-bottom:.3rem}
       .quote-block a{color:#9ad4e8}
       .quote-block .qt-url{color:#8ab;font-size:.78rem}
+      .quote-block .media-row,.quote-media .media-row{margin-top:.45rem;border-radius:8px}
+      .quote-block .media-row.media-count-1 img,.quote-media .media-row.media-count-1 img,.quote-block .media-row .media-video,.quote-media .media-row .media-video{max-height:min(36vh,280px);min-height:0}
+      .quote-block .media-row.media-count-3,.quote-block .media-row.media-count-4,.quote-media .media-row.media-count-3,.quote-media .media-row.media-count-4{grid-template-rows:minmax(96px,1fr) minmax(96px,1fr)}
+      .quote-block .media-audio-card,.quote-media .media-audio-card{min-height:96px}
       .link-card{display:flex;gap:.75rem;margin:.65rem 0 0;padding:0;border-radius:12px;border:1px solid #2a3340;background:#0e1218;overflow:hidden;text-decoration:none;color:inherit;max-width:520px}
       .link-card:hover,.post:hover .link-card{border-color:#3d4a5c;text-decoration:none}
       .link-card--static{cursor:inherit}
