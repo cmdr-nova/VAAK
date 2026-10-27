@@ -37,6 +37,14 @@ function parity_check(bool $ok, string $message): void
     $GLOBALS['checks']++;
 }
 
+/** Include Rust's fallback reason code. The body is not printed. */
+function parity_http_detail(string $label, array $result): string
+{
+    $reason = $result['json']['reason'] ?? null;
+    $suffix = is_string($reason) && preg_match('/^[a-z0-9_]{1,40}$/', $reason) === 1 ? ' reason ' . $reason : '';
+    return $label . ' returned HTTP ' . $result['code'] . $suffix;
+}
+
 $prefix = $actor . '/notes/';
 $insertNote = $pdo->prepare(
     'INSERT INTO outbox_notes (id, create_id, published, content, in_reply_to, to_json, cc_json, raw_create_json, kind, visibility)
@@ -202,7 +210,7 @@ try {
             'status_preview_budget' => 0,
             'quote_preview_budget' => 0,
         ]);
-        parity_check($result['code'] === 200 && ($result['json']['ok'] ?? false) === true, $tab . ' offset ' . $offset . ' returned HTTP ' . $result['code']);
+        parity_check($result['code'] === 200 && ($result['json']['ok'] ?? false) === true, parity_http_detail($tab . ' offset ' . $offset, $result));
         $html = '';
         foreach ($result['json']['cards'] ?? [] as $card) {
             $html .= (string) ($card['html'] ?? '');
@@ -258,7 +266,7 @@ try {
             'status_preview_budget' => 0,
             'quote_preview_budget' => 0,
         ]);
-        parity_check($result['code'] === 200 && ($result['json']['ok'] ?? false) === true, 'pinned profile returned HTTP ' . $result['code']);
+        parity_check($result['code'] === 200 && ($result['json']['ok'] ?? false) === true, parity_http_detail('pinned profile', $result));
         return (string) ($result['json']['html'] ?? '');
     };
     $guestPins = $full($guest);

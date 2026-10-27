@@ -18,9 +18,24 @@ pub(crate) fn ensure_budget()->Result<()>{
   Ok(false)=>bail!("profile_fallback_code=budget"),
  }
 }
+/// Production ceiling for one complete-profile request. A warmed 50-card paint
+/// is a few hundred milliseconds, and the database work sits on top of that,
+/// so 250ms refused real pages. `VAAK_PROFILE_COMPLETE_BUDGET_MS` overrides
+/// this (clamped to 50–5000). The PHP caller timeout stays above the default.
 fn complete_budget()->std::time::Duration{
- let ms=std::env::var("VAAK_PROFILE_COMPLETE_BUDGET_MS").ok().and_then(|raw|raw.trim().parse::<u64>().ok()).unwrap_or(250).clamp(50,5_000);
+ let ms=std::env::var("VAAK_PROFILE_COMPLETE_BUDGET_MS").ok().and_then(|raw|raw.trim().parse::<u64>().ok()).unwrap_or(1_000).clamp(50,5_000);
  std::time::Duration::from_millis(ms)
+}
+/// Static regexes compile on first use. Doing that inside `PROFILE_DEADLINE`
+/// spends the budget on process warmup. Later requests reuse the same OnceLocks.
+pub(crate) fn prewarm_complete_profile(){
+ static ONCE:std::sync::OnceLock<()>=std::sync::OnceLock::new();
+ ONCE.get_or_init(||{
+  crate::profile_raw::prewarm_static_regexes();
+  crate::profile_context::prewarm_complete_profile_regexes();
+  crate::library::facts::prewarm_profile_regexes();
+  crate::profile_header::prewarm_static_regexes();
+ });
 }
 pub(crate) async fn with_production_budget<T>(fut:impl std::future::Future<Output=T>)->T{
  PROFILE_DEADLINE.scope(std::time::Instant::now()+complete_budget(),fut).await
@@ -96,6 +111,7 @@ async fn paint(cfg:&crate::config::Config,db:&tokio_postgres::Client,request:&Re
  prepared.require_current(db).await?;Ok(bytes)
 }
 pub(crate) async fn render(cfg:&crate::config::Config,headers:HeaderMap,bytes:Bytes)->Response{
+ if enabled(){prewarm_complete_profile();}
  with_production_budget(render_request(cfg,secret().as_deref(),headers,bytes,&crate::direct_preview::PreviewDependencies::production(),None)).await
 }
 async fn render_request(cfg:&crate::config::Config,secret:Option<&str>,headers:HeaderMap,bytes:Bytes,deps:&crate::direct_preview::PreviewDependencies<'_>,warm:Option<std::sync::Arc<crate::profile_enrichment::WarmContext>>)->Response{

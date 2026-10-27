@@ -174,14 +174,17 @@ pub(crate) struct AuthenticatedProfileSession {
     source_actor:String,
     direct:crate::direct_context::DirectSession,
 }
+fn local_profile_key(actor:&str)->Option<String>{
+    static RE:std::sync::OnceLock<regex::Regex>=std::sync::OnceLock::new();
+    RE.get_or_init(||regex::Regex::new(r"^https://mkultra\.monster/users/([A-Za-z0-9_]+)$").unwrap()).captures(actor).map(|capture|capture[1].to_owned())
+}
 impl AuthenticatedProfileSession {
     pub(crate) fn from_php_session(owner:i64,csrf:String,actor_key:String,source_actor:String,lazy_media:bool,budget:i64)->Result<Self>{
         if actor_key.is_empty()||actor_key.len()>80||!actor_key.bytes().all(|b|b.is_ascii_lowercase()||b.is_ascii_digit()||b==b'_'){bail!("invalid canonical local profile key")}
         let canonical_actor=format!("https://mkultra.monster/users/{actor_key}");
         let source_actor=source_actor.trim().trim_end_matches('/').to_owned();
-        let actor_pattern=regex::Regex::new(r"^https://mkultra\.monster/users/([A-Za-z0-9_]+)$").unwrap();
-        let captured=actor_pattern.captures(&source_actor).context("invalid original local profile actor")?;
-        if captured[1].to_ascii_lowercase()!=actor_key{bail!("profile actor/key binding differs")}
+        let captured=local_profile_key(&source_actor).context("invalid original local profile actor")?;
+        if captured.to_ascii_lowercase()!=actor_key{bail!("profile actor/key binding differs")}
         let direct=crate::direct_context::DirectSession::from_php_session(owner,csrf,crate::direct_context::DirectRoute::RemoteProfile,"remote_profile".into(),false,true,false,lazy_media,source_actor.clone())?.with_status_preview_budget(budget)?;
         Ok(Self{owner,actor_key,canonical_actor,source_actor,direct})
     }
@@ -211,9 +214,8 @@ impl GuestProfileSession {
         if !(0..=100).contains(&status_preview_budget){bail!("invalid trusted guest preview budget")}
         if actor_key.is_empty()||actor_key.len()>80||!actor_key.bytes().all(|b|b.is_ascii_lowercase()||b.is_ascii_digit()||b==b'_'){bail!("invalid canonical guest profile key")}
         let source_actor=source_actor.trim().trim_end_matches('/').to_owned();
-        let pattern=regex::Regex::new(r"^https://mkultra\.monster/users/([A-Za-z0-9_]+)$").unwrap();
-        let captured=pattern.captures(&source_actor).context("invalid original guest profile actor")?;
-        if captured[1].to_ascii_lowercase()!=actor_key{bail!("guest profile actor/key binding differs")}
+        let captured=local_profile_key(&source_actor).context("invalid original guest profile actor")?;
+        if captured.to_ascii_lowercase()!=actor_key{bail!("guest profile actor/key binding differs")}
         Ok(Self{canonical_actor:format!("https://mkultra.monster/users/{actor_key}"),actor_key,source_actor,lazy_media,status_preview_budget,quote_preview_budget:None,warm_context:None})
     }
     pub(crate) fn with_warm_context(mut self,context:std::sync::Arc<crate::profile_enrichment::WarmContext>)->Self{self.warm_context=Some(context);self}
@@ -512,6 +514,14 @@ fn embedded_quote_media(value:&Value)->Vec<Value>{
   media.push(serde_json::json!({"url":url,"mediaType":media_type,"preview_url":preview}));if media.len()==4{break}
  }
  media
+}
+/// Compile quote and actor patterns before a complete-profile budget starts.
+pub(crate) fn prewarm_complete_profile_regexes(){
+ let _=local_profile_key("https://mkultra.monster/users/fixture");
+ let _=raw_quote_summary_present("QT note");
+ let _=raw_quote_summary_present("hello\nRE: https://example.test/post");
+ let _=bsky_rkey("https://bsky.app/profile/name.example/post/abc");
+ let _=bsky_rkey("at://did:plc:abc/app.bsky.feed.post/xyz");
 }
 fn bsky_rkey(url:&str)->Option<String>{
  fn compiled(pattern:&'static str)->regex::Regex{static CACHE:std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<&'static str,regex::Regex>>>=std::sync::OnceLock::new();CACHE.get_or_init(Default::default).lock().expect("bsky rkey").entry(pattern).or_insert_with(||regex::Regex::new(pattern).unwrap()).clone()}

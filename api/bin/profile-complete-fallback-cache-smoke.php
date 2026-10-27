@@ -24,13 +24,13 @@ function fallback_fail(string $message): never
     throw new RuntimeException($message);
 }
 
-if (ap_profile_complete_timeout_ms() !== 400) fallback_fail('default timeout is 400ms');
-putenv('VAAK_PROFILE_COMPLETE_TIMEOUT_MS=2500');
-if (ap_profile_complete_timeout_ms() !== 2000) fallback_fail('timeout clamps high');
+if (ap_profile_complete_timeout_ms() !== 2000) fallback_fail('default timeout is 2000ms');
+putenv('VAAK_PROFILE_COMPLETE_TIMEOUT_MS=9000');
+if (ap_profile_complete_timeout_ms() !== 8000) fallback_fail('timeout clamps high');
 putenv('VAAK_PROFILE_COMPLETE_TIMEOUT_MS=50');
 if (ap_profile_complete_timeout_ms() !== 100) fallback_fail('timeout clamps low');
 putenv('VAAK_PROFILE_COMPLETE_TIMEOUT_MS=');
-if (ap_profile_complete_timeout_ms() !== 400) fallback_fail('empty timeout uses 400ms');
+if (ap_profile_complete_timeout_ms() !== 2000) fallback_fail('empty timeout uses 2000ms');
 if (ap_profile_complete_fallback_ttl() !== 30) fallback_fail('default fallback ttl is 30s');
 putenv('VAAK_PROFILE_COMPLETE_FALLBACK_TTL=1');
 if (ap_profile_complete_fallback_ttl() !== 5) fallback_fail('ttl clamps low');

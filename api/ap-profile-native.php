@@ -21,12 +21,14 @@ function ap_profile_complete_native_enabled(): bool
     return getenv('VAAK_PROFILE_COMPLETE_NATIVE') === '1'
         && strlen((string) getenv('VAAK_PROFILE_COMPLETE_SECRET')) >= 32;
 }
-/** Loopback budget. A refusal must not hold the PHP page for multiple seconds. */
+/** Loopback caller timeout. The default sits above Rust's 1000ms complete-profile
+ * budget, including the one-time regex compile that happens before that clock
+ * starts, so PHP receives a reason instead of cutting the request off. */
 function ap_profile_complete_timeout_ms(): int
 {
     $raw = getenv('VAAK_PROFILE_COMPLETE_TIMEOUT_MS');
-    $ms = is_string($raw) && ctype_digit(trim($raw)) ? (int) trim($raw) : 400;
-    return max(100, min(2000, $ms));
+    $ms = is_string($raw) && ctype_digit(trim($raw)) ? (int) trim($raw) : 2000;
+    return max(100, min(8000, $ms));
 }
 function ap_profile_complete_fallback_ttl(): int
 {

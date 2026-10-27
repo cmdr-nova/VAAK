@@ -62,6 +62,7 @@ async fn paint_full_with_warm(db:&tokio_postgres::Client,request:&FullRequest,de
  prepared.require_current(db).await?;Ok(bytes)
 }
 pub(crate) async fn render_full(cfg:&crate::config::Config,headers:HeaderMap,bytes:Bytes)->Response{
+ if super::enabled(){super::prewarm_complete_profile();}
  let response=super::with_production_budget(async{
   let Some(secret)=secret()else{return StatusCode::NOT_FOUND.into_response()};if !authorized(&headers,&secret){return StatusCode::UNAUTHORIZED.into_response()}
   let started=std::time::Instant::now();
