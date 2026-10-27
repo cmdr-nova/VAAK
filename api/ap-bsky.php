@@ -10289,6 +10289,7 @@ function ap_bsky_mute_actor(int $ownerUserId, string $did): array
             ap_bsky_graph_sync_upsert($ownerUserId, 'mute', $did, null, 'vaak');
             ap_bsky_hide_did_add($ownerUserId, $did, 'mute');
             ap_bsky_tl_cache_clear_owner($ownerUserId);
+            ap_bsky_hide_notifications_touch($ownerUserId);
             return ['ok' => true];
         }
         $lastErr = (string) ($r['error'] ?? $lastErr);
@@ -10330,6 +10331,7 @@ function ap_bsky_unmute_actor(int $ownerUserId, string $did): array
             ap_bsky_graph_sync_delete($ownerUserId, 'mute', $did);
             ap_bsky_hide_did_remove($ownerUserId, $did, 'mute');
             ap_bsky_tl_cache_clear_owner($ownerUserId);
+            ap_bsky_hide_notifications_touch($ownerUserId);
             return ['ok' => true];
         }
         $lastErr = (string) ($r['error'] ?? $lastErr);
@@ -10351,6 +10353,7 @@ function ap_bsky_block_actor(int $ownerUserId, string $did): array
     $existing = ap_bsky_graph_sync_get($ownerUserId, 'block', $did);
     if (is_array($existing) && !empty($existing['bsky_uri'])) {
         ap_bsky_hide_did_add($ownerUserId, $did, 'block');
+        ap_bsky_hide_notifications_touch($ownerUserId);
         return ['ok' => true, 'uri' => (string) $existing['bsky_uri'], 'skipped' => true];
     }
     $row = ap_bsky_session_row($ownerUserId);
@@ -10386,6 +10389,7 @@ function ap_bsky_block_actor(int $ownerUserId, string $did): array
     ap_bsky_graph_sync_upsert($ownerUserId, 'block', $did, $uri !== '' ? $uri : null, 'vaak');
     ap_bsky_hide_did_add($ownerUserId, $did, 'block');
     ap_bsky_tl_cache_clear_owner($ownerUserId);
+    ap_bsky_hide_notifications_touch($ownerUserId);
     return ['ok' => true, 'uri' => $uri];
 }
 
@@ -10407,6 +10411,7 @@ function ap_bsky_unblock_actor(int $ownerUserId, string $did): array
         // No stored rkey — still clear local hide + sync row.
         ap_bsky_graph_sync_delete($ownerUserId, 'block', $did);
         ap_bsky_hide_did_remove($ownerUserId, $did, 'block');
+        ap_bsky_hide_notifications_touch($ownerUserId);
         return ['ok' => true, 'skipped' => true];
     }
     $rkey = $m[1];
@@ -10433,6 +10438,7 @@ function ap_bsky_unblock_actor(int $ownerUserId, string $did): array
     ap_bsky_graph_sync_delete($ownerUserId, 'block', $did);
     ap_bsky_hide_did_remove($ownerUserId, $did, 'block');
     ap_bsky_tl_cache_clear_owner($ownerUserId);
+    ap_bsky_hide_notifications_touch($ownerUserId);
     if (empty($del['ok'])) {
         return ['ok' => false, 'error' => (string) ($del['error'] ?? 'unblock failed')];
     }
@@ -10547,6 +10553,21 @@ function ap_bsky_hide_did_set_clear_cache(?int $ownerUserId = null): void
         }
     }
     if (function_exists('ap_trends_policy_epoch_bump')) ap_trends_policy_epoch_bump($ownerUserId);
+}
+
+/**
+ * One Bluesky hide-set change (mute, block, unmute, unblock).
+ * Bulk list refresh invalidates once at the end instead of calling this per DID.
+ */
+function ap_bsky_hide_notifications_touch(int $ownerUserId): void
+{
+    if ($ownerUserId < 1) {
+        return;
+    }
+    ap_bsky_hide_did_set_clear_cache($ownerUserId);
+    if (function_exists('ap_notification_projection_invalidate_owner')) {
+        ap_notification_projection_invalidate_owner($ownerUserId);
+    }
 }
 
 /**
@@ -10742,6 +10763,9 @@ function ap_bsky_refresh_hide_set(int $ownerUserId, bool $force = false): array
     ], JSON_UNESCAPED_SLASHES), LOCK_EX);
 
     // Hide-set memo can be stale within this long request — clear request cache.
+    // Notification reads also drop these DIDs, so a list cached before this
+    // rebuild cannot keep serving a newly hidden sender. Invalidation still
+    // drops the stale projection and Redis pages.
     ap_bsky_hide_did_set_clear_cache($ownerUserId);
     if (function_exists('ap_timeline_cache_invalidate_owner')) {
         ap_timeline_cache_invalidate_owner($ownerUserId);
@@ -14420,6 +14444,32 @@ function ap_bsky_notification_subjects_backfill(int $ownerUserId, int $days, int
 }
 
 /**
+ * True when this Bluesky notification's author DID is on the owner's hide set.
+ * Local caches only. Does not federate and does not write.
+ *
+ * @param array<string,mixed> $notif
+ */
+function ap_bsky_notification_author_hidden(int $ownerUserId, array $notif): bool
+{
+    if ($ownerUserId < 1) {
+        return false;
+    }
+    $author = is_array($notif['author'] ?? null) ? $notif['author'] : [];
+    $did = trim((string) ($author['did'] ?? ''));
+    if (!str_starts_with($did, 'did:')) {
+        $uri = trim((string) ($notif['uri'] ?? ''));
+        if (preg_match('~^at://(did:[^/]+)~', $uri, $m)) {
+            $did = $m[1];
+        }
+    }
+    if (!str_starts_with($did, 'did:')) {
+        return false;
+    }
+    $set = ap_bsky_hide_did_set($ownerUserId);
+    return isset($set[$did]);
+}
+
+/**
  * @param list<array> $notifs
  * @return array{ok:bool,inserted:int,skipped:int,pushed:int,errors:list<string>}
  */
@@ -14450,6 +14500,10 @@ function ap_bsky_ingest_notifications(int $ownerUserId, array $notifs, bool $pus
             continue;
         }
         try {
+            if (ap_bsky_notification_author_hidden($ownerUserId, $notif)) {
+                $skipped++;
+                continue;
+            }
             $reason = strtolower(trim((string) ($notif['reason'] ?? '')));
             if ($reason === 'follow') {
                 $fr = ap_bsky_ingest_follow_notification($ownerUserId, $ownerActorId, $notif, $pushNew);

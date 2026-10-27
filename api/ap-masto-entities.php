@@ -7080,6 +7080,14 @@ function ap_notification_projection_write(int $ownerUserId, array $items): void
     if ($ownerUserId <= 0 || $items === []) {
         return;
     }
+    // A hidden Bluesky sender must not land in the projection. Read-time
+    // filtering still drops a row written before this check existed.
+    if (function_exists('ap_notifications_drop_bsky_hidden_senders')) {
+        $items = ap_notifications_drop_bsky_hidden_senders($items, $ownerUserId);
+        if ($items === []) {
+            return;
+        }
+    }
     try {
         $db = ap_db();
         $st = $db->prepare(
@@ -7147,6 +7155,9 @@ function ap_notification_projection_read(int $ownerUserId, int $limit, array $wa
             $item = ap_notification_projection_item($item);
             if ($item === null) return [];
             $items[] = $item;
+        }
+        if (function_exists('ap_notifications_drop_bsky_hidden_senders')) {
+            $items = ap_notifications_drop_bsky_hidden_senders($items, $ownerUserId);
         }
         foreach ($items as $item) {
             $type = (string) ($item['type'] ?? '');
@@ -7925,9 +7936,10 @@ function ap_masto_timeline_home_hydrate_warm_async(int $ownerUserId, int $limit 
 
 /**
  * Drop notifications whose notifier is muted or blocked for this viewer,
- * personally or server-wide. Cached lists (Redis, projection, Axum) are built
- * before a mute/block can land, so this runs at read time: hiding is immediate
- * and unmuting/unblocking brings the rows back.
+ * personally or server-wide, including a Bluesky DID on the owner's hide set
+ * (block, mute, listblock, listmute). Cached lists (Redis, projection, Axum)
+ * are built before a mute/block can land, so this runs at read time: hiding
+ * is immediate and unmuting/unblocking brings the rows back.
  * The embedded status is often the viewer's own post, so only the notifier counts.
  *
  * @param list<mixed> $items
@@ -7951,6 +7963,9 @@ function ap_masto_notifications_drop_hidden(array $items, ?int $ownerUserId = nu
             continue;
         }
         $out[] = $item;
+    }
+    if (function_exists('ap_notifications_drop_bsky_hidden_senders')) {
+        $out = ap_notifications_drop_bsky_hidden_senders($out, (int) $ownerUserId);
     }
     return $out;
 }
@@ -8288,8 +8303,8 @@ function ap_masto_notifications_follow_exclusive_id(string $ownerActorId, int $m
 }
 
 /**
- * Block, mute, and missing-note hides are known from the raw row. Mark them
- * before the limit is chosen so they do not shorten the page.
+ * Block, mute, missing-note, and Bluesky hide-set rows are known from the
+ * raw row. Mark them before the limit is chosen so they do not shorten the page.
  *
  * @param list<array<string,mixed>> $pool
  */
@@ -8341,6 +8356,36 @@ function ap_masto_notifications_mark_cheap_hidden(int $ownerUserId, array &$pool
         }
         if ($phrases !== [] && function_exists('ap_notification_mention_row_muted')
             && ap_notification_mention_row_muted($ownerUserId, $row, $texts)) {
+            $pool[$i]['hidden'] = true;
+        }
+    }
+    // Bluesky block, mute, listblock, and listmute. One hide-set read for the
+    // new rows, before this batch is counted toward the page.
+    if (!function_exists('ap_notifications_drop_bsky_hidden_senders')) {
+        return;
+    }
+    $pending = [];
+    for ($i = $from; $i < count($pool); $i++) {
+        if (!empty($pool[$i]['hidden']) || !is_array($pool[$i]['row'] ?? null)) {
+            continue;
+        }
+        $pending[] = $pool[$i];
+    }
+    if ($pending === []) {
+        return;
+    }
+    $keptIds = [];
+    foreach (ap_notifications_drop_bsky_hidden_senders($pending, $ownerUserId) as $item) {
+        if (is_array($item)) {
+            $keptIds[(string) ($item['id'] ?? '')] = true;
+        }
+    }
+    for ($i = $from; $i < count($pool); $i++) {
+        if (!empty($pool[$i]['hidden'])) {
+            continue;
+        }
+        $id = (string) ($pool[$i]['id'] ?? '');
+        if ($id !== '' && empty($keptIds[$id])) {
             $pool[$i]['hidden'] = true;
         }
     }
@@ -8464,13 +8509,13 @@ function ap_masto_notifications_db_page(
             $followWhere = ap_masto_notifications_follow_where();
             if ($sources['follow']['before'] === null) {
                 $st = ap_db()->prepare(
-                    'SELECT id, created_at, actor_id, target_actor, action_taken FROM events WHERE '
+                    'SELECT id, created_at, actor_id, object_id, target_actor, action_taken FROM events WHERE '
                     . $followWhere . ' ORDER BY id DESC LIMIT ' . $batch
                 );
                 $st->execute([$bskyFollowAction, $ownerActorId, $ownerActorId . '/']);
             } else {
                 $st = ap_db()->prepare(
-                    'SELECT id, created_at, actor_id, target_actor, action_taken FROM events WHERE '
+                    'SELECT id, created_at, actor_id, object_id, target_actor, action_taken FROM events WHERE '
                     . $followWhere . ' AND id < ? ORDER BY id DESC LIMIT ' . $batch
                 );
                 $st->execute([$bskyFollowAction, $ownerActorId, $ownerActorId . '/', (int) $sources['follow']['before']]);

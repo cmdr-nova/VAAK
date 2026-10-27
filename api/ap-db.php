@@ -7068,8 +7068,364 @@ function ap_notification_item_targets_missing(array $item, array $missing): bool
 }
 
 /**
- * Drop hydrated notifications whose local target post is gone, and those whose
- * status text matches a muted phrase. No phrase list and no local note URL
+ * DID or handle carried by one sender reference. No network and no database.
+ *
+ * @return array{did:?string,handle:?string}
+ */
+function ap_notification_bsky_ref_identity(string $raw): array
+{
+    $none = ['did' => null, 'handle' => null];
+    $raw = trim($raw);
+    if ($raw === '' || ctype_digit($raw)) {
+        return $none;
+    }
+    if (preg_match('~^did:(?:plc|web):[A-Za-z0-9._:%-]+$~', $raw)) {
+        return ['did' => $raw, 'handle' => null];
+    }
+    if (preg_match('~^at://(did:[^/\s?#]+)~', $raw, $m)) {
+        return ['did' => $m[1], 'handle' => null];
+    }
+    if (preg_match('~^https://bsky\.app/profile/([^/?#]+)~i', $raw, $m)) {
+        $part = rawurldecode((string) $m[1]);
+        if (str_starts_with($part, 'did:')) {
+            return ['did' => $part, 'handle' => null];
+        }
+        $handle = strtolower(ltrim($part, '@'));
+        if ($handle !== '' && !str_contains($handle, '/')) {
+            return ['did' => null, 'handle' => $handle];
+        }
+        return $none;
+    }
+    if (preg_match('~/(did:plc:[a-z0-9]+)~i', $raw, $m)) {
+        return ['did' => $m[1], 'handle' => null];
+    }
+    if (preg_match('/^@?([^@\s]+)@bsky\.app$/i', $raw, $m)) {
+        $raw = (string) $m[1];
+    }
+    $handle = strtolower(ltrim($raw, '@'));
+    if ($handle !== ''
+        && !str_contains($handle, '/')
+        && !str_contains($handle, ':')
+        && preg_match('/^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?)+$/i', $handle)
+    ) {
+        return ['did' => null, 'handle' => $handle];
+    }
+    return $none;
+}
+
+/**
+ * Sender references for one notification. Likes and reposts embed the
+ * viewer's own post, so the status author is not a sender.
+ *
+ * @param array<string,mixed> $item
+ * @return list<string>
+ */
+function ap_notification_bsky_sender_refs(array $item): array
+{
+    $refs = [];
+    $push = static function (mixed $value) use (&$refs): void {
+        if (!is_string($value)) {
+            return;
+        }
+        $value = trim($value);
+        if ($value !== '') {
+            $refs[] = $value;
+        }
+    };
+    $sources = [$item];
+    if (isset($item['row']) && is_array($item['row'])) {
+        $sources[] = $item['row'];
+    }
+    foreach ($sources as $src) {
+        foreach (['activity_id', 'actor_id'] as $key) {
+            $push($src[$key] ?? null);
+        }
+        $object = isset($src['object_id']) && is_string($src['object_id']) ? trim($src['object_id']) : '';
+        if (str_starts_with($object, 'at://')) {
+            $push($object);
+        }
+        $author = is_array($src['author'] ?? null) ? $src['author'] : [];
+        $push($author['did'] ?? null);
+        $push($author['handle'] ?? null);
+        $account = is_array($src['account'] ?? null) ? $src['account'] : [];
+        $bluesky = false;
+        foreach (['uri', 'url', 'id'] as $key) {
+            if (!isset($account[$key]) || !is_string($account[$key])) {
+                continue;
+            }
+            $push($account[$key]);
+            $value = $account[$key];
+            if (stripos($value, 'https://bsky.app/profile/') === 0
+                || str_starts_with($value, 'at://')
+                || str_starts_with($value, 'did:')) {
+                $bluesky = true;
+            }
+        }
+        if ($bluesky) {
+            $push($account['username'] ?? null);
+            $push($account['acct'] ?? null);
+        }
+    }
+    return $refs;
+}
+
+/**
+ * Bluesky DID for this notification's sender. `$handleToDid` is a page-level
+ * cache (`handle => did`); pass [] to read only DIDs already on the item.
+ *
+ * @param array<string,mixed> $item
+ * @param array<string,string> $handleToDid
+ */
+function ap_notification_bsky_sender_did(array $item, array $handleToDid = []): ?string
+{
+    $handle = null;
+    foreach (ap_notification_bsky_sender_refs($item) as $ref) {
+        $identity = ap_notification_bsky_ref_identity($ref);
+        if (is_string($identity['did']) && $identity['did'] !== '') {
+            return $identity['did'];
+        }
+        if ($handle === null && is_string($identity['handle']) && $identity['handle'] !== '') {
+            $handle = $identity['handle'];
+        }
+    }
+    if ($handle !== null && isset($handleToDid[$handle]) && is_string($handleToDid[$handle])
+        && str_starts_with($handleToDid[$handle], 'did:')) {
+        return $handleToDid[$handle];
+    }
+    return null;
+}
+
+/**
+ * Owner hide set from ap_bsky_hide_did_set when that helper is loaded, otherwise
+ * the same one-query cache (`$GLOBALS['ap_bsky_hide_did_cache']`).
+ *
+ * @return array<string,true>
+ */
+function ap_notification_owner_bsky_hide_set(int $ownerUserId): array
+{
+    if ($ownerUserId < 1) {
+        return [];
+    }
+    if (function_exists('ap_bsky_hide_did_set')) {
+        $set = ap_bsky_hide_did_set($ownerUserId);
+        return is_array($set) ? $set : [];
+    }
+    if (!isset($GLOBALS['ap_bsky_hide_did_cache']) || !is_array($GLOBALS['ap_bsky_hide_did_cache'])) {
+        $GLOBALS['ap_bsky_hide_did_cache'] = [];
+    }
+    if (isset($GLOBALS['ap_bsky_hide_did_cache'][$ownerUserId])
+        && is_array($GLOBALS['ap_bsky_hide_did_cache'][$ownerUserId])) {
+        return $GLOBALS['ap_bsky_hide_did_cache'][$ownerUserId];
+    }
+    $out = [];
+    try {
+        $st = ap_db()->prepare('SELECT DISTINCT did FROM bsky_hide_dids WHERE owner_user_id = ?');
+        $st->execute([$ownerUserId]);
+        while ($row = $st->fetch()) {
+            $did = trim((string) ($row['did'] ?? ''));
+            if (str_starts_with($did, 'did:')) {
+                $out[$did] = true;
+            }
+        }
+    } catch (Throwable $e) {
+        return [];
+    }
+    $GLOBALS['ap_bsky_hide_did_cache'][$ownerUserId] = $out;
+    return $out;
+}
+
+/**
+ * Handle → DID from bsky_posts and bsky_actor_profiles. One or two queries
+ * for the whole page, remembered for a minute. Failures are not remembered.
+ *
+ * @param list<string> $handles
+ * @return array<string,string>
+ */
+function ap_notifications_bsky_handle_did_map(array $handles): array
+{
+    $want = [];
+    foreach ($handles as $handle) {
+        $handle = strtolower(ltrim(trim((string) $handle), '@'));
+        if ($handle !== '') {
+            $want[$handle] = true;
+        }
+    }
+    if ($want === []) {
+        return [];
+    }
+    $now = time();
+    if (!isset($GLOBALS['ap_notification_bsky_handle_memo'])
+        || !is_array($GLOBALS['ap_notification_bsky_handle_memo'])
+        || (int) ($GLOBALS['ap_notification_bsky_handle_memo_at'] ?? 0) < $now - 60) {
+        $GLOBALS['ap_notification_bsky_handle_memo'] = [];
+        $GLOBALS['ap_notification_bsky_handle_memo_at'] = $now;
+    }
+    $missing = [];
+    foreach (array_keys($want) as $handle) {
+        if (!array_key_exists($handle, $GLOBALS['ap_notification_bsky_handle_memo'])) {
+            $missing[] = $handle;
+        }
+    }
+    if ($missing !== []) {
+        $found = [];
+        $postsOk = true;
+        try {
+            foreach (array_chunk($missing, 80) as $chunk) {
+                $ph = implode(',', array_fill(0, count($chunk), '?'));
+                $st = ap_db()->prepare(
+                    "SELECT lower(author_handle) AS h, author_did AS d
+                     FROM bsky_posts
+                     WHERE lower(author_handle) IN ($ph)
+                       AND author_did IS NOT NULL AND author_did <> ''"
+                );
+                $st->execute($chunk);
+                while ($row = $st->fetch()) {
+                    $handle = strtolower(trim((string) ($row['h'] ?? '')));
+                    $did = trim((string) ($row['d'] ?? ''));
+                    if ($handle !== '' && str_starts_with($did, 'did:')) {
+                        $found[$handle] = $did;
+                    }
+                }
+            }
+        } catch (Throwable $e) {
+            $postsOk = false;
+        }
+        $still = [];
+        foreach ($missing as $handle) {
+            if (!isset($found[$handle])) {
+                $still[] = $handle;
+            }
+        }
+        $profilesOk = true;
+        if ($still !== []) {
+            try {
+                $refs = [];
+                $refHandle = [];
+                foreach ($still as $handle) {
+                    $refs[] = $handle;
+                    $refHandle[$handle] = $handle;
+                    $url = 'https://bsky.app/profile/' . $handle;
+                    $refs[] = $url;
+                    $refHandle[$url] = $handle;
+                }
+                foreach (array_chunk($refs, 80) as $chunk) {
+                    $ph = implode(',', array_fill(0, count($chunk), '?'));
+                    $st = ap_db()->prepare(
+                        'SELECT did, actor_ref, profile_json FROM bsky_actor_profiles WHERE actor_ref IN (' . $ph . ')'
+                    );
+                    $st->execute($chunk);
+                    while ($row = $st->fetch()) {
+                        $ref = strtolower(trim((string) ($row['actor_ref'] ?? '')));
+                        $did = trim((string) ($row['did'] ?? ''));
+                        if (!str_starts_with($did, 'did:')) {
+                            $profile = json_decode((string) ($row['profile_json'] ?? ''), true);
+                            $did = is_array($profile) ? trim((string) ($profile['did'] ?? '')) : '';
+                        }
+                        $handle = $refHandle[$ref] ?? null;
+                        if (is_string($handle) && str_starts_with($did, 'did:') && !isset($found[$handle])) {
+                            $found[$handle] = $did;
+                        }
+                    }
+                }
+            } catch (Throwable $e) {
+                $profilesOk = false;
+            }
+        }
+        if ($postsOk || $profilesOk) {
+            foreach ($missing as $handle) {
+                if (isset($found[$handle])) {
+                    $GLOBALS['ap_notification_bsky_handle_memo'][$handle] = $found[$handle];
+                } elseif ($postsOk && $profilesOk) {
+                    $GLOBALS['ap_notification_bsky_handle_memo'][$handle] = '';
+                }
+            }
+        }
+    }
+    $out = [];
+    foreach (array_keys($want) as $handle) {
+        $did = $GLOBALS['ap_notification_bsky_handle_memo'][$handle] ?? '';
+        if (is_string($did) && str_starts_with($did, 'did:')) {
+            $out[$handle] = $did;
+        }
+    }
+    return $out;
+}
+
+/**
+ * Drop notifications whose Bluesky sender is on the owner's hide set
+ * (block, mute, listblock, listmute). One hide-set read and at most two
+ * handle-cache reads for the page. No network. Fediverse senders stay.
+ * Already-stored rows come back when the DID leaves the set.
+ *
+ * @param list<mixed> $items
+ * @return list<mixed>
+ */
+function ap_notifications_drop_bsky_hidden_senders(array $items, int $ownerUserId): array
+{
+    if ($items === [] || $ownerUserId < 1) {
+        return $items;
+    }
+    $pendingHandles = [];
+    $idents = [];
+    $sawBluesky = false;
+    foreach ($items as $index => $item) {
+        if (!is_array($item)) {
+            continue;
+        }
+        $did = null;
+        $handle = null;
+        foreach (ap_notification_bsky_sender_refs($item) as $ref) {
+            $identity = ap_notification_bsky_ref_identity($ref);
+            if (is_string($identity['did']) && $identity['did'] !== '') {
+                $did = $identity['did'];
+                $sawBluesky = true;
+                break;
+            }
+            if ($handle === null && is_string($identity['handle']) && $identity['handle'] !== '') {
+                $handle = $identity['handle'];
+                $sawBluesky = true;
+            }
+        }
+        $idents[$index] = ['did' => $did, 'handle' => $handle];
+        if ($did === null && $handle !== null) {
+            $pendingHandles[$handle] = true;
+        }
+    }
+    if (!$sawBluesky) {
+        return $items;
+    }
+    $hide = ap_notification_owner_bsky_hide_set($ownerUserId);
+    if ($hide === []) {
+        return $items;
+    }
+    $handleToDid = $pendingHandles === []
+        ? []
+        : ap_notifications_bsky_handle_did_map(array_keys($pendingHandles));
+    $out = [];
+    foreach ($items as $index => $item) {
+        if (!is_array($item)) {
+            $out[] = $item;
+            continue;
+        }
+        $did = $idents[$index]['did'] ?? null;
+        if (!is_string($did) || $did === '') {
+            $handle = $idents[$index]['handle'] ?? null;
+            if (is_string($handle) && isset($handleToDid[$handle])) {
+                $did = $handleToDid[$handle];
+            }
+        }
+        if (is_string($did) && $did !== '' && isset($hide[$did])) {
+            continue;
+        }
+        $out[] = $item;
+    }
+    return $out;
+}
+
+/**
+ * Drop hydrated notifications whose local target post is gone, whose status
+ * text matches a muted phrase, or whose Bluesky sender is on the owner's
+ * hide set. No phrase list, no local note URL, and no hidden Bluesky sender
  * means the list is returned unchanged.
  *
  * @param list<mixed> $items
@@ -7082,6 +7438,12 @@ function ap_notifications_apply_viewer_filters(array $items, int $ownerUserId = 
     }
     if ($ownerUserId < 1 && function_exists('ap_db_masto_owner_user_id')) {
         $ownerUserId = (int) ap_db_masto_owner_user_id();
+    }
+    if (function_exists('ap_notifications_drop_bsky_hidden_senders')) {
+        $items = ap_notifications_drop_bsky_hidden_senders($items, $ownerUserId);
+        if ($items === []) {
+            return [];
+        }
     }
     $uris = [];
     foreach ($items as $item) {

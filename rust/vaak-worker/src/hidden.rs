@@ -3,6 +3,8 @@
 use anyhow::{Context, Result};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 use tokio_postgres::Client;
 
 #[derive(Debug, Default, Clone)]
@@ -867,6 +869,387 @@ pub async fn is_favourited(db: &Client, owner_user_id: i64, object_id: &str) -> 
     Ok(row.is_some())
 }
 
+/// `bsky_hide_dids` primary key is `(owner_user_id, did, reason, list_uri)`.
+/// This is one index range for the owner, not a lookup per notification.
+pub const BSKY_HIDE_DIDS_SQL: &str =
+    "SELECT DISTINCT did FROM bsky_hide_dids WHERE owner_user_id = $1";
+
+/// Cached `bsky_posts.author_handle → author_did`. Expression index
+/// `idx_bsky_posts_lower_handle` covers `lower(author_handle)`.
+pub const BSKY_HANDLE_DID_SQL: &str =
+    "SELECT lower(author_handle), author_did FROM bsky_posts \
+     WHERE lower(author_handle) = ANY($1::text[]) AND author_did LIKE 'did:%'";
+
+/// `bsky_actor_profiles.actor_ref` is the primary key.
+pub const BSKY_PROFILE_DID_SQL: &str =
+    "SELECT actor_ref, did, profile_json FROM bsky_actor_profiles WHERE actor_ref = ANY($1::text[])";
+
+const BSKY_HIDE_TTL: Duration = Duration::from_secs(10);
+
+struct BskyHideEntry {
+    at: Instant,
+    dids: HashSet<String>,
+}
+
+fn bsky_hide_cache() -> &'static Mutex<HashMap<i64, BskyHideEntry>> {
+    static CACHE: OnceLock<Mutex<HashMap<i64, BskyHideEntry>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Forget the in-memory hide sets. Tests and a hide-set rebuild use this.
+pub fn clear_bsky_hide_cache() {
+    if let Ok(mut guard) = bsky_hide_cache().lock() {
+        guard.clear();
+    }
+}
+
+/// One indexed read of the owner's Bluesky hide set, reused for a few seconds.
+/// A miss or a database error is not cached.
+pub async fn load_bsky_hide_dids(db: &Client, owner: i64) -> Result<HashSet<String>> {
+    if owner < 1 {
+        return Ok(HashSet::new());
+    }
+    {
+        let guard = bsky_hide_cache()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        if let Some(hit) = guard.get(&owner) {
+            if hit.at.elapsed() < BSKY_HIDE_TTL {
+                return Ok(hit.dids.clone());
+            }
+        }
+    }
+    let rows = db
+        .query(BSKY_HIDE_DIDS_SQL, &[&owner])
+        .await
+        .context("bsky hide dids")?;
+    let mut dids = HashSet::new();
+    for row in rows {
+        let did = row
+            .try_get::<_, Option<String>>(0)?
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if did.starts_with("did:") {
+            dids.insert(did);
+        }
+    }
+    let mut guard = bsky_hide_cache().lock().unwrap_or_else(|err| err.into_inner());
+    if guard.len() > 32 {
+        guard.clear();
+    }
+    guard.insert(
+        owner,
+        BskyHideEntry {
+            at: Instant::now(),
+            dids: dids.clone(),
+        },
+    );
+    Ok(dids)
+}
+
+/// Bluesky DID for a notification sender, or the handle that still needs the
+/// local cache. The embedded status is the viewer's own post for likes and
+/// reposts, so only the notifier is read.
+pub fn notification_sender_bsky_identity(item: &Value) -> (Option<String>, Option<String>) {
+    let mut handle = None;
+    for reference in notification_sender_refs(item) {
+        let (did, next_handle) = bsky_ref_identity(&reference);
+        if did.is_some() {
+            return (did, None);
+        }
+        if handle.is_none() {
+            handle = next_handle;
+        }
+    }
+    (None, handle)
+}
+
+pub fn notification_sender_did(item: &Value, handles: &HashMap<String, String>) -> Option<String> {
+    let (did, handle) = notification_sender_bsky_identity(item);
+    if did.is_some() {
+        return did;
+    }
+    handle.and_then(|name| handles.get(&name).cloned()).filter(|did| did.starts_with("did:"))
+}
+
+/// Drop notifications whose Bluesky sender is in `hide`. `handles` is the
+/// page's local handle→DID cache. Senders that are not Bluesky stay.
+pub fn drop_bsky_hidden_senders(
+    items: &mut Vec<Value>,
+    hide: &HashSet<String>,
+    handles: &HashMap<String, String>,
+) {
+    if hide.is_empty() {
+        return;
+    }
+    items.retain(|item| match notification_sender_did(item, handles) {
+        Some(did) => !hide.contains(&did),
+        None => true,
+    });
+}
+
+/// Drop notifications from DIDs in the owner's `bsky_hide_dids` rows
+/// (block, mute, listblock, listmute). One indexed read, cached briefly,
+/// plus at most two handle-cache reads for the whole page. No network.
+///
+/// `audience::filter_notifications` calls this for the web page, the
+/// Mastodon notifications route, and the warm Redis list.
+/// `notif_page::load_notification_page` calls it on each database batch
+/// before that batch is counted as full. A hide-set read failure keeps
+/// the page (mutes and blocks still apply) instead of failing the list.
+pub async fn drop_bsky_hidden_notifications(
+    db: &Client,
+    owner: i64,
+    items: &mut Vec<Value>,
+) -> Result<()> {
+    if owner < 1 || items.is_empty() || !items.iter().any(notification_may_be_bluesky) {
+        return Ok(());
+    }
+    let hide = match load_bsky_hide_dids(db, owner).await {
+        Ok(set) => set,
+        Err(error) => {
+            tracing::warn!(%error, "notification bsky hide set skipped");
+            return Ok(());
+        }
+    };
+    if hide.is_empty() {
+        return Ok(());
+    }
+    let mut pending = Vec::new();
+    for item in items.iter() {
+        let (did, handle) = notification_sender_bsky_identity(item);
+        if did.is_none() {
+            if let Some(handle) = handle {
+                if !pending.contains(&handle) {
+                    pending.push(handle);
+                }
+            }
+        }
+    }
+    let handles = if pending.is_empty() {
+        HashMap::new()
+    } else {
+        match load_bsky_handle_dids(db, &pending).await {
+            Ok(map) => map,
+            Err(error) => {
+                tracing::warn!(%error, "notification bsky handle cache skipped");
+                HashMap::new()
+            }
+        }
+    };
+    drop_bsky_hidden_senders(items, &hide, &handles);
+    Ok(())
+}
+
+async fn load_bsky_handle_dids(db: &Client, handles: &[String]) -> Result<HashMap<String, String>> {
+    let mut found = HashMap::new();
+    if handles.is_empty() {
+        return Ok(found);
+    }
+    let handle_list = handles.to_vec();
+    for row in db
+        .query(BSKY_HANDLE_DID_SQL, &[&handle_list])
+        .await
+        .context("bsky handle dids")?
+    {
+        let handle = row
+            .try_get::<_, Option<String>>(0)?
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        let did = row.try_get::<_, Option<String>>(1)?.unwrap_or_default().trim().to_string();
+        if !handle.is_empty() && did.starts_with("did:") {
+            found.insert(handle, did);
+        }
+    }
+    let still: Vec<String> = handles
+        .iter()
+        .filter(|handle| !found.contains_key(handle.as_str()))
+        .flat_map(|handle| {
+            [
+                handle.clone(),
+                format!("https://bsky.app/profile/{handle}"),
+            ]
+        })
+        .collect();
+    if still.is_empty() {
+        return Ok(found);
+    }
+    let rows = match db.query(BSKY_PROFILE_DID_SQL, &[&still]).await {
+        Ok(rows) => rows,
+        Err(error) => {
+            tracing::warn!(%error, "notification bsky profile cache skipped");
+            return Ok(found);
+        }
+    };
+    for row in rows {
+        let actor_ref = row.try_get::<_, Option<String>>(0)?.unwrap_or_default();
+        let mut did = row.try_get::<_, Option<String>>(1)?.unwrap_or_default().trim().to_string();
+        if !did.starts_with("did:") {
+            let profile: String = row.try_get::<_, Option<String>>(2)?.unwrap_or_default();
+            did = serde_json::from_str::<Value>(&profile)
+                .ok()
+                .and_then(|json| json.get("did").and_then(Value::as_str).map(str::to_owned))
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+        }
+        let handle = profile_ref_handle(&actor_ref);
+        if let Some(handle) = handle {
+            if did.starts_with("did:") && !found.contains_key(&handle) {
+                found.insert(handle, did);
+            }
+        }
+    }
+    Ok(found)
+}
+
+fn profile_ref_handle(actor_ref: &str) -> Option<String> {
+    let actor_ref = actor_ref.trim();
+    let path = actor_ref
+        .get(..25)
+        .filter(|prefix| prefix.eq_ignore_ascii_case("https://bsky.app/profile/"))
+        .map(|_| &actor_ref[25..])
+        .unwrap_or(actor_ref);
+    let handle = raw_percent_decode(path)
+        .trim()
+        .trim_start_matches('@')
+        .to_ascii_lowercase();
+    let handle = handle.split(['/', '?', '#']).next().unwrap_or("").to_string();
+    if handle.is_empty() || handle.starts_with("did:") || handle.contains('/') {
+        None
+    } else {
+        Some(handle)
+    }
+}
+
+fn notification_may_be_bluesky(item: &Value) -> bool {
+    notification_sender_refs(item).into_iter().any(|reference| {
+        let (did, handle) = bsky_ref_identity(&reference);
+        did.is_some() || handle.is_some()
+    })
+}
+
+fn notification_sender_refs(item: &Value) -> Vec<String> {
+    let mut refs = Vec::new();
+    push_sender_refs(item, &mut refs);
+    if let Some(row) = item.get("row").filter(|row| row.is_object()) {
+        push_sender_refs(row, &mut refs);
+    }
+    refs
+}
+
+fn push_sender_refs(src: &Value, refs: &mut Vec<String>) {
+    for key in ["activity_id", "actor_id"] {
+        push_ref(src.get(key).and_then(Value::as_str), refs);
+    }
+    if let Some(object_id) = src.get("object_id").and_then(Value::as_str) {
+        if object_id.trim_start().starts_with("at://") {
+            push_ref(Some(object_id), refs);
+        }
+    }
+    if let Some(author) = src.get("author").filter(|author| author.is_object()) {
+        push_ref(author.get("did").and_then(Value::as_str), refs);
+        push_ref(author.get("handle").and_then(Value::as_str), refs);
+    }
+    let Some(account) = src.get("account").filter(|account| account.is_object()) else {
+        return;
+    };
+    let mut bluesky = false;
+    for key in ["uri", "url", "id"] {
+        let value = account.get(key).and_then(Value::as_str);
+        if let Some(value) = value {
+            let trimmed = value.trim();
+            if trimmed.len() >= 25 && trimmed[..25].eq_ignore_ascii_case("https://bsky.app/profile/")
+                || trimmed.starts_with("at://")
+                || trimmed.starts_with("did:")
+            {
+                bluesky = true;
+            }
+        }
+        push_ref(value, refs);
+    }
+    if bluesky {
+        push_ref(account.get("username").and_then(Value::as_str), refs);
+        push_ref(account.get("acct").and_then(Value::as_str), refs);
+    }
+}
+
+fn push_ref(value: Option<&str>, refs: &mut Vec<String>) {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return;
+    };
+    refs.push(value.to_string());
+}
+
+fn bsky_ref_identity(raw: &str) -> (Option<String>, Option<String>) {
+    let raw = raw.trim();
+    if raw.is_empty() || raw.bytes().all(|byte| byte.is_ascii_digit()) {
+        return (None, None);
+    }
+    if raw.starts_with("did:plc:") || raw.starts_with("did:web:") {
+        return (Some(raw.to_string()), None);
+    }
+    if let Some(rest) = raw.strip_prefix("at://") {
+        if let Some(did) = rest.split(['/', '?', '#']).next() {
+            if did.starts_with("did:") {
+                return (Some(did.to_string()), None);
+            }
+        }
+    }
+    if raw.len() >= 25 && raw[..25].eq_ignore_ascii_case("https://bsky.app/profile/") {
+        let part = raw_percent_decode(&raw[25..]);
+        let part = part.split(['/', '?', '#']).next().unwrap_or("").trim().trim_start_matches('@');
+        if part.starts_with("did:") {
+            return (Some(part.to_string()), None);
+        }
+        if !part.is_empty() && !part.contains('/') {
+            return (None, Some(part.to_ascii_lowercase()));
+        }
+        return (None, None);
+    }
+    if let Some(index) = raw.to_ascii_lowercase().find("did:plc:") {
+        let did: String = raw[index..]
+            .chars()
+            .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == ':' || *ch == '.' || *ch == '_' || *ch == '-' || *ch == '%')
+            .collect();
+        if did.starts_with("did:plc:") && did.len() > "did:plc:".len() {
+            return (Some(did), None);
+        }
+    }
+    let bare = raw
+        .strip_prefix('@')
+        .unwrap_or(raw)
+        .split('@')
+        .next()
+        .unwrap_or(raw)
+        .trim();
+    if raw.to_ascii_lowercase().ends_with("@bsky.app") || !raw.contains(['/', ':']) {
+        let handle = bare.trim_start_matches('@').to_ascii_lowercase();
+        if is_bsky_handle(&handle) {
+            return (None, Some(handle));
+        }
+    }
+    (None, None)
+}
+
+fn is_bsky_handle(handle: &str) -> bool {
+    let mut labels = handle.split('.');
+    let Some(first) = labels.next() else {
+        return false;
+    };
+    let Some(last) = labels.next_back() else {
+        return false;
+    };
+    !first.is_empty()
+        && first.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
+        && (2..=24).contains(&last.len())
+        && last.chars().all(|ch| ch.is_ascii_alphabetic())
+        && handle.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '.')
+        && !handle.contains("..")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1294,5 +1677,215 @@ mod bridgy_block_tests {
         assert_eq!(fedi_account_of("https://misskey.example/users/9abc"), Some(("9abc".into(), "misskey.example".into())));
         assert_eq!(fedi_account_of("https://misskey.example/users/12345"), None);
         assert_eq!(fedi_account_of("https://app.wafrn.net/fediverse/blog/alice"), None);
+    }
+}
+
+#[cfg(test)]
+mod bsky_hide_notification_tests {
+    use super::{
+        drop_bsky_hidden_senders, notification_sender_did, BSKY_HANDLE_DID_SQL, BSKY_HIDE_DIDS_SQL,
+        BSKY_PROFILE_DID_SQL,
+    };
+    use serde_json::{json, Value};
+    use std::collections::{HashMap, HashSet};
+
+    fn hide() -> HashSet<String> {
+        HashSet::from([
+            "did:plc:listblock".into(),
+            "did:plc:block".into(),
+            "did:plc:mute".into(),
+            "did:plc:listmute".into(),
+        ])
+    }
+
+    fn handles() -> HashMap<String, String> {
+        HashMap::from([
+            ("broadeyeview.bsky.social".into(), "did:plc:listblock".into()),
+            ("blocked.bsky.social".into(), "did:plc:block".into()),
+            ("muted.bsky.social".into(), "did:plc:mute".into()),
+            ("listmuted.bsky.social".into(), "did:plc:listmute".into()),
+            ("friend.bsky.social".into(), "did:plc:friend".into()),
+        ])
+    }
+
+    fn account(uri: &str) -> Value {
+        json!({
+            "id": "9001",
+            "uri": uri,
+            "url": uri,
+            "username": uri.trim_start_matches("https://bsky.app/profile/"),
+            "acct": uri.trim_start_matches("https://bsky.app/profile/"),
+        })
+    }
+
+    fn notif(id: &str, kind: &str, account: Value, activity_id: Option<&str>) -> Value {
+        let mut item = json!({
+            "id": id,
+            "type": kind,
+            "account": account,
+            "status": {"content": "hello", "account": {"uri": "https://mkultra.monster/users/ada"}},
+        });
+        if let Some(activity_id) = activity_id {
+            item["activity_id"] = json!(activity_id);
+        }
+        if kind == "follow" {
+            item["status"] = Value::Null;
+            item["object_id"] = json!(format!("at://{}/app.bsky.graph.follow/{id}", "did:plc:listblock"));
+        }
+        item
+    }
+
+    #[test]
+    fn hide_sql_is_one_indexed_owner_read() {
+        assert_eq!(
+            BSKY_HIDE_DIDS_SQL,
+            "SELECT DISTINCT did FROM bsky_hide_dids WHERE owner_user_id = $1"
+        );
+        assert!(BSKY_HANDLE_DID_SQL.contains("lower(author_handle) = ANY($1::text[])"));
+        assert!(BSKY_PROFILE_DID_SQL.contains("actor_ref = ANY($1::text[])"));
+        assert!(!BSKY_HIDE_DIDS_SQL.contains("http"));
+    }
+
+    #[test]
+    fn every_reason_hides_every_notification_type() {
+        let viewer = account("https://mkultra.monster/users/ada");
+        let mut items = vec![
+            // Production shape: handle URL only, DID comes from the local cache.
+            notif(
+                "1997",
+                "mention",
+                account("https://bsky.app/profile/broadeyeview.bsky.social"),
+                None,
+            ),
+            notif(
+                "reply",
+                "mention",
+                account("https://bsky.app/profile/blocked.bsky.social"),
+                Some("at://did:plc:block/app.bsky.feed.post/reply"),
+            ),
+            notif(
+                "like",
+                "favourite",
+                account("https://bsky.app/profile/muted.bsky.social"),
+                Some("at://did:plc:mute/app.bsky.feed.like/1"),
+            ),
+            notif(
+                "repost",
+                "reblog",
+                account("https://bsky.app/profile/listmuted.bsky.social"),
+                Some("at://did:plc:listmute/app.bsky.feed.repost/1"),
+            ),
+            notif(
+                "follow",
+                "follow",
+                account("https://bsky.app/profile/broadeyeview.bsky.social"),
+                None,
+            ),
+            notif(
+                "quote",
+                "quote",
+                account("https://bsky.app/profile/did:plc:block"),
+                Some("at://did:plc:block/app.bsky.feed.post/quote"),
+            ),
+            notif(
+                "keep-mention",
+                "mention",
+                account("https://bsky.app/profile/friend.bsky.social"),
+                Some("at://did:plc:friend/app.bsky.feed.post/1"),
+            ),
+            notif("keep-fedi", "mention", account("https://friend.example/users/kind"), None),
+            json!({
+                "id": "keep-like",
+                "type": "favourite",
+                "account": account("https://bsky.app/profile/friend.bsky.social"),
+                "status": {
+                    "uri": "https://mkultra.monster/users/ada/notes/live",
+                    "content": "mine",
+                    "account": viewer,
+                },
+            }),
+        ];
+        // A like's embedded status is the viewer's post. A hidden DID on that
+        // status must not drop a visible notifier, and must not keep a hidden one.
+        items[2]["status"]["account"] = account("https://mkultra.monster/users/ada");
+        drop_bsky_hidden_senders(&mut items, &hide(), &handles());
+        let ids: Vec<&str> = items.iter().filter_map(|item| item["id"].as_str()).collect();
+        assert_eq!(ids, vec!["keep-mention", "keep-fedi", "keep-like"]);
+    }
+
+    #[test]
+    fn direct_at_uri_beats_a_stale_handle_and_a_missing_cache_stays() {
+        let item = json!({
+            "id": "1",
+            "type": "reply",
+            "activity_id": "at://did:plc:listblock/app.bsky.feed.post/1",
+            "account": {"uri": "https://bsky.app/profile/renamed.example"},
+            "row": {"actor_id": "https://bsky.app/profile/renamed.example"},
+        });
+        assert_eq!(
+            notification_sender_did(&item, &HashMap::new()).as_deref(),
+            Some("did:plc:listblock")
+        );
+        let unresolved = json!({
+            "id": "2",
+            "type": "mention",
+            "account": {"uri": "https://bsky.app/profile/unknown.bsky.social"},
+        });
+        assert_eq!(notification_sender_did(&unresolved, &HashMap::new()), None);
+        let mut items = vec![unresolved, json!({"id": "3", "type": "follow", "account": {"uri": "https://remote.test/users/ann"}})];
+        drop_bsky_hidden_senders(&mut items, &hide(), &HashMap::new());
+        assert_eq!(items.len(), 2);
+    }
+
+    #[test]
+    fn raw_database_rows_drop_before_the_page_is_counted() {
+        let mut items = vec![
+            json!({
+                "id": "p-listblock",
+                "type": "mention",
+                "activity_id": "at://did:plc:listblock/app.bsky.feed.post/1",
+                "actor_id": "https://bsky.app/profile/broadeyeview.bsky.social",
+            }),
+            json!({
+                "id": "p-block",
+                "type": "mention",
+                "activity_id": "at://did:plc:block/app.bsky.feed.post/reply",
+                "actor_id": "https://bsky.app/profile/blocked.bsky.social",
+            }),
+            json!({
+                "id": "p-mute",
+                "type": "favourite",
+                "activity_id": "at://did:plc:mute/app.bsky.feed.like/1",
+                "actor_id": "https://bsky.app/profile/muted.bsky.social",
+                "object_id": "https://mkultra.monster/users/ada/notes/live",
+            }),
+            json!({
+                "id": "p-listmute",
+                "type": "follow",
+                "actor_id": "https://bsky.app/profile/listmuted.bsky.social",
+                "object_id": "at://did:plc:listmute/app.bsky.graph.follow/1",
+            }),
+            json!({
+                "id": "p-friend",
+                "type": "quote",
+                "activity_id": "at://did:plc:friend/app.bsky.feed.post/1",
+                "actor_id": "https://bsky.app/profile/friend.bsky.social",
+            }),
+        ];
+        drop_bsky_hidden_senders(&mut items, &hide(), &HashMap::new());
+        let ids: Vec<&str> = items.iter().filter_map(|item| item["id"].as_str()).collect();
+        assert_eq!(ids, vec!["p-friend"]);
+    }
+
+    #[test]
+    fn empty_hide_set_keeps_the_page() {
+        let mut items = vec![notif(
+            "1997",
+            "mention",
+            account("https://bsky.app/profile/broadeyeview.bsky.social"),
+            Some("at://did:plc:listblock/app.bsky.feed.post/1"),
+        )];
+        drop_bsky_hidden_senders(&mut items, &HashSet::new(), &handles());
+        assert_eq!(items.len(), 1);
     }
 }

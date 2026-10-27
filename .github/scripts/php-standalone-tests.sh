@@ -100,6 +100,7 @@ php_tests=(
   api/bin/notif-bsky-subject-hydrate-smoke.php
   api/bin/notif-grouped-schema-smoke.php
   api/bin/notif-hidden-filter-smoke.php
+  api/bin/notif-bsky-hide-list-smoke.php
   api/bin/notif-deleted-undo-mute-smoke.php
   api/bin/masto-local-acct-smoke.php
   api/bin/notif-list-epoch-smoke.php
