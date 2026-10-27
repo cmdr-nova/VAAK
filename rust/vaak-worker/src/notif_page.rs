@@ -547,6 +547,13 @@ fn exclusive_from_inclusive(best_inclusive: Option<i64>, fast: bool) -> Option<i
     }
 }
 
+/// Follows aimed at one owner. Same predicate as PHP
+/// `ap_masto_notifications_follow_where`: accepted local follows and Bluesky
+/// follows. Page and seek queries share it instead of each carrying a copy.
+const FOLLOW_OWNER_WHERE: &str = "type = 'Follow'
+    AND action_taken IN ('local_accept_followback', 'bsky_follow')
+    AND (target_actor = $1 OR target_actor = $2)";
+
 async fn follow_before(db: &Client, actor: &str, max_id: Option<&str>) -> Result<Option<i64>> {
     let Some(max_id) = max_id.filter(|s| !digits(s).is_empty()) else {
         return Ok(None);
@@ -558,14 +565,9 @@ async fn follow_before(db: &Client, actor: &str, max_id: Option<&str>) -> Result
         return Ok(Some(0));
     }
     let slash = format!("{actor}/");
+    let span_sql = format!("SELECT MIN(id)::bigint, MAX(id)::bigint FROM events WHERE {FOLLOW_OWNER_WHERE}");
     let span = db
-        .query_opt(
-            "SELECT MIN(id)::bigint, MAX(id)::bigint FROM events
-             WHERE type = 'Follow'
-               AND action_taken IN ('local_accept_followback', 'bsky_follow')
-               AND (target_actor = $1 OR target_actor = $2)",
-            &[&actor, &slash],
-        )
+        .query_opt(&span_sql, &[&actor, &slash])
         .await
         .context("follow id span")?;
     let Some(span) = span else {
@@ -581,16 +583,11 @@ async fn follow_before(db: &Client, actor: &str, max_id: Option<&str>) -> Result
     while lo <= hi && steps < 48 {
         steps += 1;
         let mid = lo + (hi - lo) / 2;
+        let seek_sql = format!(
+            "SELECT id::bigint, created_at FROM events WHERE {FOLLOW_OWNER_WHERE} AND id <= $3::bigint ORDER BY id DESC LIMIT 1"
+        );
         let row = db
-            .query_opt(
-                "SELECT id::bigint, created_at FROM events
-                 WHERE type = 'Follow'
-                   AND action_taken IN ('local_accept_followback', 'bsky_follow')
-                   AND (target_actor = $1 OR target_actor = $2)
-                   AND id <= $3::bigint
-                 ORDER BY id DESC LIMIT 1",
-                &[&actor, &slash, &mid],
-            )
+            .query_opt(&seek_sql, &[&actor, &slash, &mid])
             .await
             .context("follow seek")?;
         let Some(row) = row else {
@@ -652,31 +649,19 @@ async fn load_mention_batch(db: &Client, owner: i64, before: Option<i64>) -> Res
 
 async fn load_follow_batch(db: &Client, actor: &str, before: Option<i64>) -> Result<Vec<tokio_postgres::Row>> {
     let slash = format!("{actor}/");
-    if let Some(before) = before {
-        db.query(
-            "SELECT id::bigint, created_at, actor_id, action_taken FROM events
-             WHERE type = 'Follow'
-               AND action_taken IN ('local_accept_followback', 'bsky_follow')
-               AND (target_actor = $1 OR target_actor = $2)
-               AND id < $3::bigint
-             ORDER BY id DESC
-             LIMIT 80",
-            &[&actor, &slash, &before],
+    let sql = if before.is_some() {
+        format!(
+            "SELECT id::bigint, created_at, actor_id, action_taken FROM events WHERE {FOLLOW_OWNER_WHERE} AND id < $3::bigint ORDER BY id DESC LIMIT 80"
         )
-        .await
-        .context("follow page")
     } else {
-        db.query(
-            "SELECT id::bigint, created_at, actor_id, action_taken FROM events
-             WHERE type = 'Follow'
-               AND action_taken IN ('local_accept_followback', 'bsky_follow')
-               AND (target_actor = $1 OR target_actor = $2)
-             ORDER BY id DESC
-             LIMIT 80",
-            &[&actor, &slash],
+        format!(
+            "SELECT id::bigint, created_at, actor_id, action_taken FROM events WHERE {FOLLOW_OWNER_WHERE} ORDER BY id DESC LIMIT 80"
         )
-        .await
-        .context("follow page")
+    };
+    if let Some(before) = before {
+        db.query(&sql, &[&actor, &slash, &before]).await.context("follow page")
+    } else {
+        db.query(&sql, &[&actor, &slash]).await.context("follow page")
     }
 }
 

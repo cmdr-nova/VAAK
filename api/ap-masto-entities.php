@@ -8224,6 +8224,19 @@ function ap_masto_notifications_mention_exclusive_id(int $ownerUserId, int $maxI
     }
 }
 
+/**
+ * Follows that belong to one owner: accepted local follows and Bluesky
+ * follows aimed at this actor. The unread badge keeps its own copy of this
+ * predicate. Page and seek queries must call this helper instead of pasting
+ * another one — a third copy is a new target-actor scan.
+ */
+function ap_masto_notifications_follow_where(): string
+{
+    return "type = 'Follow'
+               AND action_taken IN ('local_accept_followback', ?)
+               AND (target_actor = ? OR target_actor = ?)";
+}
+
 function ap_masto_notifications_follow_exclusive_id(string $ownerActorId, int $maxId): ?int
 {
     if ($maxId <= 0 || $ownerActorId === '') {
@@ -8235,11 +8248,9 @@ function ap_masto_notifications_follow_exclusive_id(string $ownerActorId, int $m
         return $dbId > 0 ? $dbId : 0;
     }
     try {
+        $where = ap_masto_notifications_follow_where();
         $span = ap_db()->prepare(
-            "SELECT MIN(id) AS lo, MAX(id) AS hi FROM events
-             WHERE type = 'Follow'
-               AND action_taken IN ('local_accept_followback', ?)
-               AND (target_actor = ? OR target_actor = ?)"
+            'SELECT MIN(id) AS lo, MAX(id) AS hi FROM events WHERE ' . $where
         );
         $bsky = defined('AP_BSKY_FOLLOW_ACTION') ? AP_BSKY_FOLLOW_ACTION : 'bsky_follow';
         $span->execute([$bsky, $ownerActorId, $ownerActorId . '/']);
@@ -8253,12 +8264,7 @@ function ap_masto_notifications_follow_exclusive_id(string $ownerActorId, int $m
         for ($step = 0; $step < 48 && $lo <= $hi; $step++) {
             $mid = $lo + intdiv($hi - $lo, 2);
             $probe = ap_db()->prepare(
-                "SELECT id, created_at FROM events
-                 WHERE type = 'Follow'
-                   AND action_taken IN ('local_accept_followback', ?)
-                   AND (target_actor = ? OR target_actor = ?)
-                   AND id <= ?
-                 ORDER BY id DESC LIMIT 1"
+                'SELECT id, created_at FROM events WHERE ' . $where . ' AND id <= ? ORDER BY id DESC LIMIT 1'
             );
             $probe->execute([$bsky, $ownerActorId, $ownerActorId . '/', $mid]);
             $row = $probe->fetch();
@@ -8455,23 +8461,17 @@ function ap_masto_notifications_db_page(
                     $followerSet = [];
                 }
             }
+            $followWhere = ap_masto_notifications_follow_where();
             if ($sources['follow']['before'] === null) {
                 $st = ap_db()->prepare(
-                    "SELECT id, created_at, actor_id, target_actor, action_taken FROM events
-                     WHERE type = 'Follow'
-                       AND action_taken IN ('local_accept_followback', ?)
-                       AND (target_actor = ? OR target_actor = ?)
-                     ORDER BY id DESC LIMIT " . $batch
+                    'SELECT id, created_at, actor_id, target_actor, action_taken FROM events WHERE '
+                    . $followWhere . ' ORDER BY id DESC LIMIT ' . $batch
                 );
                 $st->execute([$bskyFollowAction, $ownerActorId, $ownerActorId . '/']);
             } else {
                 $st = ap_db()->prepare(
-                    "SELECT id, created_at, actor_id, target_actor, action_taken FROM events
-                     WHERE type = 'Follow'
-                       AND action_taken IN ('local_accept_followback', ?)
-                       AND (target_actor = ? OR target_actor = ?)
-                       AND id < ?
-                     ORDER BY id DESC LIMIT " . $batch
+                    'SELECT id, created_at, actor_id, target_actor, action_taken FROM events WHERE '
+                    . $followWhere . ' AND id < ? ORDER BY id DESC LIMIT ' . $batch
                 );
                 $st->execute([$bskyFollowAction, $ownerActorId, $ownerActorId . '/', (int) $sources['follow']['before']]);
             }
