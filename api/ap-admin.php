@@ -12927,8 +12927,9 @@ function admin_render_compose_panel(bool $inline = false): void
         <span>Mark as sensitive (auto-on when CW is set)</span>
       </label>
       <div class="compose-media-row" id="compose-media-previews"></div>
+      <div id="compose-media-live" class="compose-media-live" role="status" aria-live="polite" aria-atomic="true"></div>
       <label class="meta" style="display:block;margin:.55rem 0 .35rem<?= $composeIsEdit ? ';display:none' : '' ?>">
-        <input type="file" name="media[]" id="compose-media-input" accept="image/*,video/mp4,video/webm,video/quicktime,audio/*" multiple style="max-width:100%">
+        <input type="file" name="media[]" id="compose-media-input" accept="image/*,video/mp4,video/webm,video/quicktime,audio/*" multiple style="max-width:100%" aria-label="Add media, or paste an image">
       </label>
       <?php if (!$composeIsEdit): ?>
         <button type="button" class="btn btn-ghost compose-record-btn" id="compose-record-btn" title="Record up to 60 seconds of audio" aria-label="Record audio">
@@ -16729,9 +16730,10 @@ function admin_dm_composer_fields_html(): string
         . '<input type="checkbox" name="sensitive" value="1">'
         . '<span>Mark as sensitive</span></label>'
         . '<label class="meta" style="display:block;margin:.55rem 0 .35rem">'
-        . '<input type="file" name="media[]" class="dm-media-input" accept="image/*,video/mp4,video/webm,video/quicktime,audio/*" multiple style="max-width:100%">'
+        . '<input type="file" name="media[]" class="dm-media-input" accept="image/*,video/mp4,video/webm,video/quicktime,audio/*" multiple style="max-width:100%" aria-label="Add media, or paste an image">'
         . '</label>'
-        . '<div class="dm-media-alts"></div>';
+        . '<div class="dm-media-alts"></div>'
+        . '<div class="dm-media-live" role="status" aria-live="polite" aria-atomic="true"></div>';
 }
 
 /** Compact conversation rail used by the full-page DM workspace. */
@@ -28853,6 +28855,18 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       outline: 2px dashed var(--primary);
       outline-offset: 5px;
     }
+    .compose-media-live,
+    .dm-media-live {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      padding: 0;
+      margin: -1px;
+      overflow: hidden;
+      clip: rect(0, 0, 0, 0);
+      white-space: nowrap;
+      border: 0;
+    }
     .compose-media-card {
       width: 7.5rem; background: #0c0c0c; border: 1px solid var(--border);
       border-radius: 10px; overflow: hidden; padding: .35rem;
@@ -31653,9 +31667,19 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
             form.dataset.dmMediaBound = '1';
             const slot = form.querySelector('.dm-media-alts');
             const dt = new DataTransfer();
+            const dmAlts = [];
             let syncing = false;
+            function captureAlts() {
+              if (!slot) return;
+              const inputs = slot.querySelectorAll('input[name^="media_alt"]');
+              for (let i = 0; i < dmAlts.length; i++) {
+                if (inputs[i]) dmAlts[i] = inputs[i].value;
+              }
+            }
             function render() {
               if (!slot) return;
+              while (dmAlts.length < dt.files.length) dmAlts.push('');
+              if (dmAlts.length > dt.files.length) dmAlts.length = dt.files.length;
               slot.replaceChildren();
               Array.from(dt.files).forEach(function (file, i) {
                 const row = document.createElement('div');
@@ -31669,11 +31693,14 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
                 alt.maxLength = 1500;
                 alt.placeholder = 'Describe this attachment (optional)';
                 alt.autocomplete = 'off';
+                alt.value = dmAlts[i] || '';
                 const remove = document.createElement('button');
                 remove.type = 'button';
                 remove.className = 'btn btn-ghost';
                 remove.textContent = 'Remove';
                 remove.addEventListener('click', function () {
+                  captureAlts();
+                  dmAlts.splice(i, 1);
                   const next = new DataTransfer();
                   Array.from(dt.files).forEach(function (kept, j) {
                     if (j !== i) next.items.add(kept);
@@ -31691,16 +31718,122 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
                 slot.appendChild(row);
               });
             }
-            input.addEventListener('change', function () {
-              if (syncing) return;
-              Array.from(input.files || []).forEach(function (file) {
-                if (dt.files.length >= 4) return;
+            function dmLive() {
+              let live = form.querySelector('.dm-media-live');
+              if (live) return live;
+              live = document.createElement('div');
+              live.className = 'dm-media-live';
+              live.setAttribute('role', 'status');
+              live.setAttribute('aria-live', 'polite');
+              live.setAttribute('aria-atomic', 'true');
+              form.appendChild(live);
+              return live;
+            }
+            function addDmFiles(picked, opts) {
+              const api = window.vaakPasteMedia;
+              let accepted = [];
+              let errors = [];
+              if (api && api.filterMediaFiles) {
+                const filtered = api.filterMediaFiles(dt.files.length, picked, 4);
+                accepted = filtered.accepted;
+                errors = filtered.errors;
+              } else {
+                const list = picked && typeof picked.length === 'number' ? picked : [];
+                for (let i = 0; i < list.length; i++) {
+                  const file = list[i];
+                  if (!file || typeof file.size !== 'number') continue;
+                  if (dt.files.length + accepted.length >= 4) {
+                    errors.push('Too many media attachments (max 4).');
+                    break;
+                  }
+                  accepted.push(file);
+                }
+              }
+              captureAlts();
+              accepted.forEach(function (file) {
                 dt.items.add(file);
+                dmAlts.push('');
+              });
+              errors.forEach(function (msg) {
+                if (window.apAdminToast) window.apAdminToast(msg, true);
               });
               syncing = true;
               input.files = dt.files;
               syncing = false;
               render();
+              if (!opts || !opts.silent) {
+                const parts = [];
+                const notice = api && api.attachmentNotice
+                  ? api.attachmentNotice(accepted)
+                  : (accepted.length === 1 ? 'Attachment added.' : (accepted.length > 1 ? accepted.length + ' attachments added.' : ''));
+                if (notice) parts.push(notice);
+                if (errors.length) parts.push(errors[errors.length - 1]);
+                if (api && api.announceLive) api.announceLive(dmLive(), parts.join(' '));
+              }
+              return { accepted: accepted, errors: errors };
+            }
+            input.addEventListener('change', function () {
+              if (syncing) return;
+              addDmFiles(Array.from(input.files || []));
+            });
+            // Same clipboard rule as the post composer: images attach, text pastes through.
+            form.addEventListener('paste', function (event) {
+              const api = window.vaakPasteMedia;
+              if (!api || !api.clipboardImageFiles || !event.clipboardData) return;
+              let clip = null;
+              try { clip = api.clipboardImageFiles(event.clipboardData); } catch (e) { return; }
+              if (!clip || !clip.sawFile) return;
+              event.preventDefault();
+              const parts = [];
+              if (clip.rejected) {
+                if (window.apAdminToast) window.apAdminToast(api.pasteTypeMessage, true);
+                parts.push(api.pasteTypeMessage);
+              }
+              if (clip.unreadable && !clip.images.length) {
+                if (window.apAdminToast) window.apAdminToast(api.pasteReadMessage, true);
+                parts.push(api.pasteReadMessage);
+              }
+              const added = clip.images.length ? addDmFiles(clip.images, { silent: true }) : { accepted: [], errors: [] };
+              const notice = api.attachmentNotice(added.accepted || []);
+              if (notice) parts.unshift(notice);
+              (added.errors || []).forEach(function (msg) {
+                if (parts.indexOf(msg) === -1) parts.push(msg);
+              });
+              api.announceLive(dmLive(), parts.join(' '));
+            });
+            let dragDepth = 0;
+            function hasDraggedFiles(event) {
+              const types = event && event.dataTransfer && event.dataTransfer.types;
+              if (!types) return false;
+              for (let i = 0; i < types.length; i++) {
+                if (types[i] === 'Files') return true;
+              }
+              return false;
+            }
+            form.addEventListener('dragenter', function (event) {
+              if (!hasDraggedFiles(event)) return;
+              event.preventDefault();
+              dragDepth += 1;
+              form.classList.add('is-dragover');
+            });
+            form.addEventListener('dragover', function (event) {
+              if (!hasDraggedFiles(event)) return;
+              event.preventDefault();
+              if (event.dataTransfer) event.dataTransfer.dropEffect = 'copy';
+              form.classList.add('is-dragover');
+            });
+            form.addEventListener('dragleave', function (event) {
+              if (!hasDraggedFiles(event)) return;
+              event.preventDefault();
+              dragDepth = Math.max(0, dragDepth - 1);
+              if (!dragDepth) form.classList.remove('is-dragover');
+            });
+            form.addEventListener('drop', function (event) {
+              if (!hasDraggedFiles(event)) return;
+              event.preventDefault();
+              dragDepth = 0;
+              form.classList.remove('is-dragover');
+              addDmFiles(Array.from((event.dataTransfer && event.dataTransfer.files) || []));
             });
           });
         })();
@@ -45689,6 +45822,245 @@ $showComposeFab = empty($GLOBALS['vaak_guest_profile'])
   </div>
 </div>
 <script>
+/* vaak-paste-media:start */
+(function (root) {
+  'use strict';
+  var LIMITS = { image: 25 * 1024 * 1024, video: 100 * 1024 * 1024, audio: 20 * 1024 * 1024 };
+
+  function mediaKind(file) {
+    var type = String((file && file.type) || '').toLowerCase();
+    if (type.indexOf('video/') === 0) return 'video';
+    if (type.indexOf('audio/') === 0) return 'audio';
+    if (type.indexOf('image/') === 0 || /\.(heic|heif)$/i.test(String((file && file.name) || ''))) return 'image';
+    return '';
+  }
+
+  // Match ap_media_ingest_upload caps. The server still checks the bytes.
+  function mediaLimitError(file) {
+    var kind = mediaKind(file);
+    if (!kind) return 'Unsupported media type.';
+    var max = LIMITS[kind] || 0;
+    if (file && file.size > max) {
+      return kind.charAt(0).toUpperCase() + kind.slice(1) + ' too large (max ' + Math.round(max / (1024 * 1024)) + 'MB).';
+    }
+    return '';
+  }
+
+  function filterMediaFiles(existingCount, incoming, max) {
+    var accepted = [];
+    var errors = [];
+    var start = existingCount > 0 ? existingCount : 0;
+    var cap = max > 0 ? max : 0;
+    var list = incoming && typeof incoming.length === 'number' ? incoming : [];
+    for (var i = 0; i < list.length; i++) {
+      var file = list[i];
+      if (!file || typeof file.size !== 'number') continue;
+      if (start + accepted.length >= cap) {
+        errors.push('Too many media attachments (max ' + cap + ').');
+        break;
+      }
+      var lim = mediaLimitError(file);
+      if (lim) {
+        errors.push(lim);
+        continue;
+      }
+      accepted.push(file);
+    }
+    return { accepted: accepted, errors: errors };
+  }
+
+  function pasteExtension(mime, name) {
+    var map = {
+      'image/jpeg': 'jpg',
+      'image/jpg': 'jpg',
+      'image/pjpeg': 'jpg',
+      'image/png': 'png',
+      'image/gif': 'gif',
+      'image/webp': 'webp',
+      'image/avif': 'avif',
+      'image/heic': 'heic',
+      'image/heif': 'heif',
+      'image/heic-sequence': 'heic',
+      'image/heif-sequence': 'heif'
+    };
+    var clean = String(mime || '').split(';')[0].trim().toLowerCase();
+    if (map[clean]) return map[clean];
+    var fromName = String(name || '').toLowerCase().match(/\.([a-z0-9]{1,8})$/);
+    if (fromName && /^(jpe?g|png|gif|webp|avif|heic|heif)$/.test(fromName[1])) {
+      return fromName[1] === 'jpeg' ? 'jpg' : fromName[1];
+    }
+    var sub = (clean.split('/')[1] || 'png').split('+')[0].replace(/[^a-z0-9]/g, '');
+    return sub || 'png';
+  }
+
+  function nameIsGeneric(name) {
+    var base = String(name || '').replace(/[\u0000-\u001f\\/]/g, '').trim();
+    if (!base || base === '.' || base === '..') return true;
+    return /^(image|img|blob|clipboard|screenshot|pasted-image|pastedimage|unknown)(\.[a-z0-9]+)?$/i.test(base);
+  }
+
+  function pasteStamp(clock) {
+    var date = clock instanceof Date ? clock : new Date(typeof clock === 'number' ? clock : Date.now());
+    function p(n, w) {
+      var s = String(n);
+      while (s.length < w) s = '0' + s;
+      return s;
+    }
+    return p(date.getUTCFullYear(), 4)
+      + p(date.getUTCMonth() + 1, 2)
+      + p(date.getUTCDate(), 2)
+      + '-'
+      + p(date.getUTCHours(), 2)
+      + p(date.getUTCMinutes(), 2)
+      + p(date.getUTCSeconds(), 2)
+      + '-'
+      + p(date.getUTCMilliseconds(), 3);
+  }
+
+  function pasteMime(type, file) {
+    var mime = String(type || (file && file.type) || '').split(';')[0].trim().toLowerCase();
+    if (mime.indexOf('image/') === 0) return mime;
+    if (/\.(heic|heif)$/i.test(String((file && file.name) || ''))) return 'image/heic';
+    return mime || 'image/png';
+  }
+
+  function looksLikeImage(type, file) {
+    var mime = String(type || (file && file.type) || '').split(';')[0].trim().toLowerCase();
+    return mime.indexOf('image/') === 0 || /\.(heic|heif)$/i.test(String((file && file.name) || ''));
+  }
+
+  function namedPasteFile(file, type, stamp, index) {
+    var mime = pasteMime(type, file);
+    var ext = pasteExtension(mime, file && file.name);
+    var name = String((file && file.name) || '').replace(/[\u0000-\u001f\\/]/g, '').trim();
+    if (nameIsGeneric(name)) {
+      name = 'pasted-image-' + stamp + (index > 1 ? '-' + index : '') + '.' + ext;
+    } else if (!/\.[A-Za-z0-9]{1,8}$/.test(name)) {
+      name = name + '.' + ext;
+    }
+    if (name.length > 80) {
+      var dot = name.lastIndexOf('.');
+      var keepExt = dot > 0 ? name.slice(dot) : '';
+      name = name.slice(0, Math.max(1, 80 - keepExt.length)) + keepExt;
+    }
+    if (file && name === file.name && String(file.type || '').toLowerCase() === mime) return file;
+    try {
+      return new File([file], name, {
+        type: mime || 'image/png',
+        lastModified: (file && file.lastModified) || Date.now()
+      });
+    } catch (e) {
+      return file;
+    }
+  }
+
+  function collectClipboardFiles(clipboardData) {
+    var fromItems = [];
+    var sawItem = false;
+    var items = clipboardData && clipboardData.items;
+    if (items && typeof items.length === 'number') {
+      for (var i = 0; i < items.length; i++) {
+        var item = items[i];
+        if (!item || item.kind !== 'file') continue;
+        sawItem = true;
+        var file = null;
+        try {
+          file = typeof item.getAsFile === 'function' ? item.getAsFile() : null;
+        } catch (e) {
+          file = null;
+        }
+        fromItems.push({
+          type: String((item && item.type) || (file && file.type) || '').split(';')[0].trim().toLowerCase(),
+          file: file
+        });
+      }
+    }
+    var readable = false;
+    for (var j = 0; j < fromItems.length; j++) {
+      if (fromItems[j].file) readable = true;
+    }
+    if (sawItem && readable) return fromItems;
+    var fromFiles = [];
+    var files = clipboardData && clipboardData.files;
+    if (files && typeof files.length === 'number') {
+      for (var k = 0; k < files.length; k++) {
+        var listed = files[k];
+        if (!listed) continue;
+        fromFiles.push({
+          type: String(listed.type || '').split(';')[0].trim().toLowerCase(),
+          file: listed
+        });
+      }
+    }
+    return fromFiles.length ? fromFiles : fromItems;
+  }
+
+  // Image files on the clipboard become attachments. String items are ignored
+  // here so a normal text paste is left to the browser.
+  function clipboardImageFiles(clipboardData, clock) {
+    var out = { sawFile: false, images: [], rejected: 0, unreadable: 0 };
+    if (!clipboardData) return out;
+    var entries = collectClipboardFiles(clipboardData);
+    if (!entries.length) return out;
+    out.sawFile = true;
+    var stamp = pasteStamp(clock);
+    var n = 0;
+    for (var i = 0; i < entries.length; i++) {
+      var entry = entries[i];
+      if (!entry.file) {
+        out.unreadable += 1;
+        continue;
+      }
+      if (!looksLikeImage(entry.type, entry.file)) {
+        out.rejected += 1;
+        continue;
+      }
+      n += 1;
+      out.images.push(namedPasteFile(entry.file, entry.type, stamp, n));
+    }
+    return out;
+  }
+
+  function attachmentNotice(files) {
+    var list = files && typeof files.length === 'number' ? files : [];
+    var n = list.length;
+    if (!n) return '';
+    var images = true;
+    for (var i = 0; i < n; i++) {
+      var file = list[i];
+      var type = String((file && file.type) || '').toLowerCase();
+      if (type.indexOf('image/') !== 0 && !/\.(heic|heif)$/i.test(String((file && file.name) || ''))) {
+        images = false;
+        break;
+      }
+    }
+    if (n === 1) return images ? 'Image attached.' : 'Attachment added.';
+    return String(n) + (images ? ' images attached.' : ' attachments added.');
+  }
+
+  function announceLive(el, message) {
+    if (!el || !message) return;
+    var text = String(message);
+    el.textContent = '';
+    var write = function () { el.textContent = text; };
+    if (typeof root.setTimeout === 'function') root.setTimeout(write, 30);
+    else write();
+  }
+
+  root.vaakPasteMedia = {
+    mediaLimitError: mediaLimitError,
+    filterMediaFiles: filterMediaFiles,
+    clipboardImageFiles: clipboardImageFiles,
+    attachmentNotice: attachmentNotice,
+    announceLive: announceLive,
+    pasteTypeMessage: 'Only images can be pasted. Use the media button for other files.',
+    pasteReadMessage: 'Could not read the pasted image.',
+    pasteEditMessage: 'Media stays attached. You can edit the text and content warning.'
+  };
+})(typeof window !== 'undefined' ? window : globalThis);
+/* vaak-paste-media:end */
+</script>
+<script>
 (function () {
   const modal = document.getElementById('compose-modal');
   const fab = document.getElementById('compose-fab');
@@ -45724,28 +46096,10 @@ $showComposeFab = empty($GLOBALS['vaak_guest_profile'])
   const altAiBtn = document.getElementById('alt-modal-ai');
   const altAiStatus = document.getElementById('alt-modal-ai-status');
   const MAX = 4;
-  // Match ap_media_ingest_upload caps — reject before wasting a mobile upload.
-  const MEDIA_LIMITS = {
-    image: 25 * 1024 * 1024,
-    video: 100 * 1024 * 1024,
-    audio: 20 * 1024 * 1024,
-  };
-  function mediaKindForFile(file) {
-    const t = String((file && file.type) || '').toLowerCase();
-    if (t.startsWith('video/')) return 'video';
-    if (t.startsWith('audio/')) return 'audio';
-    if (t.startsWith('image/') || /\.(heic|heif)$/i.test(String((file && file.name) || ''))) return 'image';
-    return '';
-  }
+  // Same caps as ap_media_ingest_upload, shared with paste so the picker,
+  // drag-and-drop, and clipboard all reject before a wasted upload.
   function mediaLimitError(file) {
-    const kind = mediaKindForFile(file);
-    if (!kind) return 'Unsupported media type.';
-    const max = MEDIA_LIMITS[kind] || 0;
-    if (file && file.size > max) {
-      return kind.charAt(0).toUpperCase() + kind.slice(1)
-        + ' too large (max ' + Math.round(max / (1024 * 1024)) + 'MB).';
-    }
-    return '';
+    return window.vaakPasteMedia.mediaLimitError(file);
   }
   const COMPOSE_LS_KEY = 'vaak-compose-draft-v1';
   const COMPOSE_VISIBILITY_KEY = 'vaak-compose-visibility-v1:' + <?= json_encode((string) $vaakActorKey) ?>;
@@ -45919,8 +46273,8 @@ $showComposeFab = empty($GLOBALS['vaak_guest_profile'])
       mediaBtn.type = 'button';
       mediaBtn.className = 'compose-tool';
       mediaBtn.innerHTML = '<i class="ph ph-image" aria-hidden="true"></i>';
-      mediaBtn.title = 'Add media';
-      mediaBtn.setAttribute('aria-label', 'Add media');
+      mediaBtn.title = 'Add media, or paste an image';
+      mediaBtn.setAttribute('aria-label', 'Add media, or paste an image');
       mediaBtn.addEventListener('click', () => { if (mediaInput) mediaInput.click(); });
       mediaLabel.insertBefore(mediaBtn, mediaInput);
       tools.appendChild(mediaLabel);
@@ -47482,25 +47836,50 @@ $showComposeFab = empty($GLOBALS['vaak_guest_profile'])
     const hint = document.getElementById('compose-media-hint');
     if (hint) hint.textContent = files.length ? (files.length + ' / ' + MAX) : '';
   }
-  function addComposeFiles(picked) {
+  function composeMediaLive() {
+    let live = document.getElementById('compose-media-live');
+    if (live || !form) return live;
+    live = document.createElement('div');
+    live.id = 'compose-media-live';
+    live.className = 'compose-media-live';
+    live.setAttribute('role', 'status');
+    live.setAttribute('aria-live', 'polite');
+    live.setAttribute('aria-atomic', 'true');
+    form.appendChild(live);
+    return live;
+  }
+  function addComposeFiles(picked, opts) {
+    const api = window.vaakPasteMedia;
+    if (!api || !api.filterMediaFiles) {
+      if (window.apAdminToast) window.apAdminToast('Could not attach media.', true);
+      return { accepted: [], errors: ['Could not attach media.'] };
+    }
+    // Edits keep the attachments already on the post. The file control is hidden.
+    if (composeMode === 'edit_status') {
+      if (window.apAdminToast) window.apAdminToast(api.pasteEditMessage, true);
+      api.announceLive(composeMediaLive(), api.pasteEditMessage);
+      return { accepted: [], errors: [] };
+    }
     const existingCount = ((draftMediaField && draftMediaField.value) || '')
       .split(/[\s,]+/).filter((x) => parseInt(x, 10) > 0).length;
-    for (const f of picked) {
-      if (!f || typeof f.size !== 'number') continue;
-      if (files.length + existingCount >= MAX) {
-        if (window.apAdminToast) window.apAdminToast('Too many media attachments (max ' + MAX + ').', true);
-        break;
-      }
-      const lim = mediaLimitError(f);
-      if (lim) {
-        if (window.apAdminToast) window.apAdminToast(lim, true);
-        continue;
-      }
+    const filtered = api.filterMediaFiles(files.length + existingCount, picked, MAX);
+    filtered.errors.forEach((msg) => {
+      if (window.apAdminToast) window.apAdminToast(msg, true);
+    });
+    filtered.accepted.forEach((f) => {
       files.push(f);
       alts.push('');
-    }
+    });
     syncInput();
     render();
+    if (!opts || !opts.silent) {
+      const parts = [];
+      const notice = api.attachmentNotice(filtered.accepted);
+      if (notice) parts.push(notice);
+      if (filtered.errors.length) parts.push(filtered.errors[filtered.errors.length - 1]);
+      api.announceLive(composeMediaLive(), parts.join(' '));
+    }
+    return filtered;
   }
   input.addEventListener('change', () => {
     addComposeFiles(Array.from(input.files || []));
@@ -47540,6 +47919,40 @@ $showComposeFab = empty($GLOBALS['vaak_guest_profile'])
     composeDragDepth = 0;
     form.classList.remove('is-dragover');
     addComposeFiles(Array.from((event.dataTransfer && event.dataTransfer.files) || []));
+  });
+  // Screenshot paste (Ctrl/Cmd+V) joins the same file list as the picker.
+  // Plain text has no file items, so it still lands in the field. An image
+  // file is intercepted so the browser does not also insert its filename.
+  form.addEventListener('paste', (event) => {
+    const api = window.vaakPasteMedia;
+    if (!api || !event.clipboardData) return;
+    let clip = null;
+    try { clip = api.clipboardImageFiles(event.clipboardData); } catch (e) { return; }
+    if (!clip || !clip.sawFile) return;
+    event.preventDefault();
+    if (composeMode === 'edit_status') {
+      if (window.apAdminToast) window.apAdminToast(api.pasteEditMessage, true);
+      api.announceLive(composeMediaLive(), api.pasteEditMessage);
+      return;
+    }
+    const parts = [];
+    if (clip.rejected) {
+      if (window.apAdminToast) window.apAdminToast(api.pasteTypeMessage, true);
+      parts.push(api.pasteTypeMessage);
+    }
+    if (clip.unreadable && !clip.images.length) {
+      if (window.apAdminToast) window.apAdminToast(api.pasteReadMessage, true);
+      parts.push(api.pasteReadMessage);
+    }
+    const added = clip.images.length
+      ? addComposeFiles(clip.images, { silent: true })
+      : { accepted: [], errors: [] };
+    const notice = api.attachmentNotice(added.accepted || []);
+    if (notice) parts.unshift(notice);
+    (added.errors || []).forEach((msg) => {
+      if (parts.indexOf(msg) === -1) parts.push(msg);
+    });
+    api.announceLive(composeMediaLive(), parts.join(' '));
   });
   // Prefer the active compose panel — Home has both inline + modal forms with
   // duplicate IDs; document.getElementById() would stick to the wrong one.

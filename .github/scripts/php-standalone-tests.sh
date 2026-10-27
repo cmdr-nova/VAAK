@@ -170,6 +170,7 @@ node_tests=(
   api/bin/home-signal-dwell-regression.js
   api/bin/profile-end-label-regression.js
   api/bin/soft-nav-address-regression.js
+  api/bin/paste-media-regression.js
 )
 for test in "${node_tests[@]}"; do
   echo "==> ${test}"
