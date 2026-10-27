@@ -37,6 +37,15 @@ pub(crate) fn prewarm_complete_profile(){
   crate::profile_header::prewarm_static_regexes();
  });
 }
+/// Run once when the HTTP worker starts with the switch on: compile the
+/// regexes and park two pooled database connections, so the first visitor
+/// after a restart does not pay for them inside the budget.
+pub(crate) async fn warm_on_start(database_url:String){
+ if !enabled(){return}
+ prewarm_complete_profile();
+ let(first,second)=tokio::join!(crate::db::profile_reused(&database_url),crate::db::profile_reused(&database_url));
+ for conn in [first,second]{match conn{Ok(conn)=>{if let Err(error)=conn.simple_query("SELECT 1").await{tracing::warn!(target:"vaak.profile.complete",error=%error,"profile warm-up query failed");}},Err(_)=>tracing::warn!(target:"vaak.profile.complete","profile warm-up connect failed")}}
+}
 pub(crate) async fn with_production_budget<T>(fut:impl std::future::Future<Output=T>)->T{
  PROFILE_DEADLINE.scope(std::time::Instant::now()+complete_budget(),PROFILE_STAGES.scope(std::cell::Cell::new(StageTimes::default()),fut)).await
 }
@@ -51,7 +60,7 @@ pub(crate) fn past_deadline()->bool{PROFILE_DEADLINE.try_with(|deadline|std::tim
 /// whichever stage awaited them. The header_* sub-stages split header time and
 /// also accrue when recheck/publish rerun the header dependency checks.
 #[derive(Default,Clone,Copy,Debug,PartialEq)]
-pub(crate) struct StageTimes{connect_us:u64,session_us:u64,header_us:u64,source_us:u64,cards_us:u64,materialize_us:u64,effects_us:u64,presentation_us:u64,admission_us:u64,warm_us:u64,dns_us:u64,paint_us:u64,proof_us:u64,recheck_us:u64,render_us:u64,serialize_us:u64,publish_us:u64,header_deps_us:u64,header_probe_us:u64,header_redis_us:u64,header_counts_us:u64,header_bsky_us:u64,header_recheck_us:u64,cards:u64,warm_calls:u64,dns_lookups:u64,ledger_checks:u64,header_deps_runs:u64,header_probes:u64,header_redis_ops:u64,header_rechecks:u64}
+pub(crate) struct StageTimes{connect_us:u64,session_us:u64,header_us:u64,source_us:u64,cards_us:u64,materialize_us:u64,effects_us:u64,presentation_us:u64,admission_us:u64,warm_us:u64,dns_us:u64,paint_us:u64,proof_us:u64,recheck_us:u64,render_us:u64,serialize_us:u64,publish_us:u64,header_deps_us:u64,header_probe_us:u64,header_redis_us:u64,header_counts_us:u64,header_bsky_us:u64,header_recheck_us:u64,cards:u64,warm_calls:u64,dns_lookups:u64,ledger_checks:u64,header_deps_runs:u64,header_probes:u64,header_redis_ops:u64,header_rechecks:u64,step:&'static str}
 #[derive(Clone,Copy,Debug)]
 pub(crate) enum Stage{Connect,Session,Header,Source,Cards,Materialize,Effects,Presentation,Admission,Warm,Dns,Paint,Proof,Recheck,Render,Serialize,Publish,HeaderDeps,HeaderProbe,HeaderRedis,HeaderCounts,HeaderBsky,HeaderRecheck}
 #[derive(Clone,Copy,Debug)]
@@ -65,6 +74,9 @@ impl StageTimes{
 fn ms(us:u64)->u64{us/1_000}
 /// Add the time since `started` to one stage. A no-op outside a production request.
 pub(crate) fn record_stage(stage:Stage,started:std::time::Instant){let us=started.elapsed().as_micros().min(u64::MAX as u128) as u64;let _=PROFILE_STAGES.try_with(|cell|{let mut times=cell.get();times.add(stage,us);cell.set(times)});}
+/// Name the step a request is in now. Steps run in sequence, so after a
+/// failure this is the step that failed: the log carries it beside the reason.
+pub(crate) fn mark_step(step:&'static str){let _=PROFILE_STAGES.try_with(|cell|{let mut times=cell.get();times.step=step;cell.set(times)});}
 pub(crate) fn count_stage(counter:StageCount){let _=PROFILE_STAGES.try_with(|cell|{let mut times=cell.get();times.count(counter);cell.set(times)});}
 /// Time one awaited stage. It is recorded whether the future succeeds or fails.
 pub(crate) async fn timed<T>(stage:Stage,fut:impl std::future::Future<Output=T>)->T{let started=std::time::Instant::now();let out=fut.await;record_stage(stage,started);out}
@@ -99,10 +111,19 @@ pub(crate) fn fallback_reason(err:&anyhow::Error)->&'static str{
  else if text.contains("PHP fallback:"){"unported"}
  else{"unclassified"}
 }
+/// VAAK_PROFILE_COMPLETE_LOG_ERRORS=1 also logs the error chain of an
+/// unclassified fallback, cut to 600 bytes. Off by default: the text can carry
+/// SQL or post text. Only for a diagnosis run.
+fn log_error_detail(reason:&str,err:&anyhow::Error){
+ if reason!="unclassified"||std::env::var("VAAK_PROFILE_COMPLETE_LOG_ERRORS").ok().as_deref()!=Some("1"){return}
+ let mut detail=format!("{err:#}");if detail.len()>600{let mut end=600;while !detail.is_char_boundary(end){end-=1;}detail.truncate(end);}
+ tracing::warn!(target:"vaak.profile.complete",step=stage_times().step,detail,"complete profile fallback detail");
+}
+pub(crate) fn fallback_reason_logged(err:&anyhow::Error)->&'static str{let reason=fallback_reason(err);log_error_detail(reason,err);reason}
 fn fallback_body(reason:&str)->serde_json::Value{json!({"fallback":true,"reason":reason})}
 pub(crate) fn log_fallback(route:&str,profile_target:&str,owner:i64,viewer:&str,tab:&str,offset:i64,reason:&str,started:std::time::Instant){
  let t=stage_times();
- tracing::warn!(target:"vaak.profile.complete",profile_target,owner,viewer,tab,offset,route,reason,elapsed_ms=started.elapsed().as_millis() as u64,over_budget=past_deadline(),connect_ms=ms(t.connect_us),session_ms=ms(t.session_us),header_ms=ms(t.header_us),source_ms=ms(t.source_us),cards_ms=ms(t.cards_us),materialize_ms=ms(t.materialize_us),effects_ms=ms(t.effects_us),presentation_ms=ms(t.presentation_us),admission_ms=ms(t.admission_us),warm_ms=ms(t.warm_us),dns_ms=ms(t.dns_us),paint_ms=ms(t.paint_us),proof_ms=ms(t.proof_us),recheck_ms=ms(t.recheck_us),render_ms=ms(t.render_us),serialize_ms=ms(t.serialize_us),publish_ms=ms(t.publish_us),header_deps_ms=ms(t.header_deps_us),header_probe_ms=ms(t.header_probe_us),header_redis_ms=ms(t.header_redis_us),header_counts_ms=ms(t.header_counts_us),header_bsky_ms=ms(t.header_bsky_us),header_recheck_ms=ms(t.header_recheck_us),cards=t.cards,warm_calls=t.warm_calls,dns_lookups=t.dns_lookups,ledger_checks=t.ledger_checks,header_deps_runs=t.header_deps_runs,header_probes=t.header_probes,header_redis_ops=t.header_redis_ops,header_rechecks=t.header_rechecks,"complete profile fallback");
+ tracing::warn!(target:"vaak.profile.complete",profile_target,owner,viewer,tab,offset,route,reason,step=t.step,elapsed_ms=started.elapsed().as_millis() as u64,over_budget=past_deadline(),connect_ms=ms(t.connect_us),session_ms=ms(t.session_us),header_ms=ms(t.header_us),source_ms=ms(t.source_us),cards_ms=ms(t.cards_us),materialize_ms=ms(t.materialize_us),effects_ms=ms(t.effects_us),presentation_ms=ms(t.presentation_us),admission_ms=ms(t.admission_us),warm_ms=ms(t.warm_us),dns_ms=ms(t.dns_us),paint_ms=ms(t.paint_us),proof_ms=ms(t.proof_us),recheck_ms=ms(t.recheck_us),render_ms=ms(t.render_us),serialize_ms=ms(t.serialize_us),publish_ms=ms(t.publish_us),header_deps_ms=ms(t.header_deps_us),header_probe_ms=ms(t.header_probe_us),header_redis_ms=ms(t.header_redis_us),header_counts_ms=ms(t.header_counts_us),header_bsky_ms=ms(t.header_bsky_us),header_recheck_ms=ms(t.header_recheck_us),cards=t.cards,warm_calls=t.warm_calls,dns_lookups=t.dns_lookups,ledger_checks=t.ledger_checks,header_deps_runs=t.header_deps_runs,header_probes=t.header_probes,header_redis_ops=t.header_redis_ops,header_rechecks=t.header_rechecks,"complete profile fallback");
 }
 pub(crate) fn log_complete(route:&str,profile_target:&str,owner:i64,viewer:&str,tab:&str,offset:i64,started:std::time::Instant){
  let t=stage_times();
@@ -171,7 +192,7 @@ async fn render_request_inner(cfg:&crate::config::Config,secret:Option<&str>,hea
  let request=match decode(&bytes){Ok(request)=>request,Err(_)=>{log_fallback("page","",0,"unknown","",0,"request",started);return(StatusCode::BAD_REQUEST,axum::Json(fallback_body("request"))).into_response()}};
  let(owner,viewer)=viewer_log(&request.viewer);
  let result:Result<Vec<u8>>=async{let db=timed(Stage::Connect,crate::db::profile_reused(&cfg.database_url)).await?;ensure_budget()?;paint(cfg,&db,&request,deps,warm).await}.await;
- match result{Ok(bytes)=>{log_complete("page",&request.actor,owner,viewer,&request.tab,request.offset,started);(StatusCode::OK,[(axum::http::header::CONTENT_TYPE,"application/json")],bytes).into_response()},Err(error)=>{let reason=fallback_reason(&error);log_fallback("page",&request.actor,owner,viewer,&request.tab,request.offset,reason,started);(StatusCode::UNPROCESSABLE_ENTITY,axum::Json(fallback_body(reason))).into_response()}}
+ match result{Ok(bytes)=>{log_complete("page",&request.actor,owner,viewer,&request.tab,request.offset,started);(StatusCode::OK,[(axum::http::header::CONTENT_TYPE,"application/json")],bytes).into_response()},Err(error)=>{let reason=fallback_reason_logged(&error);log_fallback("page",&request.actor,owner,viewer,&request.tab,request.offset,reason,started);(StatusCode::UNPROCESSABLE_ENTITY,axum::Json(fallback_body(reason))).into_response()}}
 }
 #[cfg(test)]
 pub(crate) async fn fixture_request(cfg:&crate::config::Config,secret:&str,headers:HeaderMap,bytes:Bytes,deps:&crate::direct_preview::PreviewDependencies<'_>,warm:std::sync::Arc<crate::profile_enrichment::WarmContext>)->Response{render_request(cfg,Some(secret),headers,bytes,deps,Some(warm)).await}
@@ -221,8 +242,10 @@ mod tests{
    let started=std::time::Instant::now()-std::time::Duration::from_millis(5);record_stage(Stage::Header,started);record_stage(Stage::Header,started);
    timed(Stage::Dns,async{}).await;timed(Stage::Warm,async{}).await;for stage in[Stage::HeaderDeps,Stage::HeaderProbe,Stage::HeaderRedis,Stage::HeaderRecheck,Stage::HeaderCounts,Stage::HeaderBsky]{record_stage(stage,started);}count_stage(StageCount::Card);count_stage(StageCount::Card);count_stage(StageCount::LedgerCheck);
    let failed:Result<()>=timed(Stage::Publish,async{bail!("still timed")}).await;assert!(failed.is_err());
+   mark_step("paint");mark_step("final_proof");assert_eq!(stage_times().step,"final_proof","the last step marked is the one that failed");
    stage_times()
   }).await;
+  mark_step("paint");assert_eq!(stage_times().step,"","no step outside a request");
   assert!(times.header_us>=10_000,"{times:?}");assert!(ms(times.header_us)>=10);
   assert_eq!((times.cards,times.ledger_checks,times.dns_lookups,times.warm_calls),(2,1,1,1));assert_eq!((times.header_deps_runs,times.header_probes,times.header_redis_ops,times.header_rechecks),(1,1,1,1));assert!(times.header_counts_us>=5_000&&times.header_bsky_us>=5_000&&times.header_deps_us>=5_000);
   assert_eq!(times.connect_us,0);assert_eq!(stage_times(),StageTimes::default());

@@ -122,6 +122,7 @@ pub async fn serve(cfg: Config, bind: SocketAddr) -> Result<()> {
     let state = AppState {
         cfg: Arc::new(cfg),
     };
+    tokio::spawn(crate::profile_bridge::warm_on_start(state.cfg.database_url.clone()));
     let shadow_token = crate::shadow_auth::resolve();
     if shadow_token.is_none() {
         tracing::warn!("shadow HTTP token not configured; /shadow/* and /api/v1/* will answer 503");
