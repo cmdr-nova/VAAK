@@ -11,6 +11,7 @@ reference_load(dirname(__DIR__) . '/ap-masto-entities.php', [
     'ap_masto_strip_announce_fragment',
     'ap_masto_status_is_boost_wrapper',
     'ap_masto_quoted_display_status',
+    'ap_masto_attachment_asset_urls',
     'ap_masto_outer_media_without_quote_duplicates',
     'ap_masto_mention_target_object_id',
 ]);

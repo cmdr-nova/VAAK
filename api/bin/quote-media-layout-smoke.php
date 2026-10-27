@@ -65,14 +65,17 @@ function layout_file(string $url, string $type = 'image', ?string $remote = null
     return $item;
 }
 
-function layout_render(array $status, string $view): string
+function layout_render(array $status, string $surface): string
 {
+    // The loop that calls this lives in global scope. Naming that variable
+    // $view would write $GLOBALS['view'], which the painter reads as the
+    // status-page route and then refuses a post with no stored row.
     $previous = $GLOBALS['view'] ?? null;
-    if ($view === 'status') {
+    if ($surface === 'status') {
         $GLOBALS['view'] = 'status';
     }
     ob_start();
-    admin_render_masto_status_card($status, [], $view === 'status' ? 'home' : $view, false, true);
+    admin_render_masto_status_card($status, [], $surface === 'status' ? 'home' : $surface, false, true);
     $html = (string) ob_get_clean();
     if ($previous === null) {
         unset($GLOBALS['view']);
@@ -104,6 +107,10 @@ function layout_assert_outside(string $html, string $url, string $label): void
 $quoter = layout_account('roddie@roddie.social', 'https://roddie.social/users/roddie');
 $quoted = layout_account('EveryPkmnCard@mastodon.social', 'https://mastodon.social/users/EveryPkmnCard');
 $card = 'https://media.test/ambipom.jpg';
+// A status page only paints a post the direct-open gate can find in events.
+$layoutEvent = ap_db()->prepare('INSERT INTO events(id, object_id, type, action_taken, visibility, actor_id) VALUES(?,?,?,?,?,?)');
+$layoutEvent->execute([9001, 'https://roddie.social/users/roddie/statuses/1', 'Create', 'log', 'public', 'https://roddie.social/users/roddie']);
+$layoutEvent->execute([9002, 'https://mastodon.social/@EveryPkmnCard/9', 'Create', 'log', 'public', 'https://mastodon.social/users/EveryPkmnCard']);
 
 $summary = [
     'id' => 'quote-summary',
@@ -125,13 +132,13 @@ $summary = [
         ],
     ],
 ];
-foreach (['home', 'local', 'feed', 'status'] as $view) {
-    $html = layout_render($summary, $view);
-    layout_assert_inside($html, $card, 'summary ' . $view);
+foreach (['home', 'local', 'feed', 'status'] as $surface) {
+    $html = layout_render($summary, $surface);
+    layout_assert_inside($html, $card, 'summary ' . $surface);
     $quoteAt = layout_quote_at($html);
-    layout_assert($quoteAt !== false && strpos($html, 'Ambipom') > $quoteAt, 'summary text left the quote on ' . $view);
-    layout_assert(strpos($html, 'French girls') !== false && strpos($html, 'French girls') < $quoteAt, 'quoting text lost on ' . $view);
-    layout_assert(strpos(substr($html, 0, (int) $quoteAt), 'media-row') === false, 'summary file painted as the quoting post on ' . $view);
+    layout_assert($quoteAt !== false && strpos($html, 'Ambipom') > $quoteAt, 'summary text left the quote on ' . $surface);
+    layout_assert(strpos($html, 'French girls') !== false && strpos($html, 'French girls') < $quoteAt, 'quoting text lost on ' . $surface);
+    layout_assert(strpos(substr($html, 0, (int) $quoteAt), 'media-row') === false, 'summary file painted as the quoting post on ' . $surface);
 }
 
 $loadedEmpty = $summary;
