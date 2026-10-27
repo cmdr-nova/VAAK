@@ -545,6 +545,10 @@ pub async fn filter_notifications(db: &Client, owner: i64, items: &mut Vec<Value
         }
         true
     });
+    // Bluesky blocks, mutes, list blocks, and list mutes. Same decision as
+    // PHP ap_notifications_drop_bsky_hidden_senders. A failed read keeps the
+    // rows the checks above already allowed.
+    crate::hidden::drop_bsky_hidden_notifications(db, owner, items).await?;
     Ok(())
 }
 

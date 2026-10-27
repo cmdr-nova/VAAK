@@ -27,6 +27,12 @@ use crate::config::Config;
 use crate::notif;
 use crate::redis_util;
 
+// Bluesky hide-set filter for every notification page this worker serves.
+// `audience::filter_notifications` calls it on warm Redis pages.
+// `notif_page::load_notification_page` calls it on each database batch
+// before that batch is counted toward a full page.
+pub use crate::hidden::drop_bsky_hidden_notifications;
+
 fn env_flag_default_true(name: &str) -> bool {
     match std::env::var(name) {
         Ok(v) if !v.trim().is_empty() => {

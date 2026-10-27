@@ -4,7 +4,8 @@
 //! `since_id` / `min_id` pulls read mentions, follow events, and polls with
 //! indexed keyset bounds, then keep a page only after the same hides PHP
 //! applies: deleted rows, undone follows, blocks and mutes, muted words,
-//! missing local notes, and type filters. A short page is returned only when
+//! missing local notes, Bluesky hide-set DIDs, and type filters. A short page
+//! is returned only when
 //! the sources are exhausted or the scan cap says the client must continue.
 
 use std::collections::{HashMap, HashSet};
@@ -647,15 +648,58 @@ async fn load_mention_batch(db: &Client, owner: i64, before: Option<i64>) -> Res
     }
 }
 
+/// Hide Bluesky senders on this batch before `decide_page` counts them.
+/// The same helper serves warm Redis lists. A failed read leaves the batch
+/// visible so a missing table cannot empty the page.
+async fn mark_bsky_hidden_candidates(db: &Client, owner: i64, cands: &mut [Cand]) {
+    let mut items = Vec::new();
+    let mut indexes = Vec::new();
+    for (index, cand) in cands.iter().enumerate() {
+        if cand.hidden {
+            continue;
+        }
+        indexes.push(index);
+        items.push(json!({
+            "id": cand.id,
+            "type": cand.type_name,
+            "activity_id": cand.activity_id,
+            "actor_id": cand.actor_id,
+            "object_id": cand.object_id,
+        }));
+    }
+    if items.is_empty() {
+        return;
+    }
+    let before = items.len();
+    if hidden::drop_bsky_hidden_notifications(db, owner, &mut items)
+        .await
+        .is_err()
+    {
+        return;
+    }
+    if items.len() == before {
+        return;
+    }
+    let kept: HashSet<String> = items
+        .iter()
+        .filter_map(|item| item.get("id").and_then(Value::as_str).map(str::to_owned))
+        .collect();
+    for index in indexes {
+        if !kept.contains(&cands[index].id) {
+            cands[index].hidden = true;
+        }
+    }
+}
+
 async fn load_follow_batch(db: &Client, actor: &str, before: Option<i64>) -> Result<Vec<tokio_postgres::Row>> {
     let slash = format!("{actor}/");
     let sql = if before.is_some() {
         format!(
-            "SELECT id::bigint, created_at, actor_id, action_taken FROM events WHERE {FOLLOW_OWNER_WHERE} AND id < $3::bigint ORDER BY id DESC LIMIT 80"
+            "SELECT id::bigint, created_at, actor_id, action_taken, object_id FROM events WHERE {FOLLOW_OWNER_WHERE} AND id < $3::bigint ORDER BY id DESC LIMIT 80"
         )
     } else {
         format!(
-            "SELECT id::bigint, created_at, actor_id, action_taken FROM events WHERE {FOLLOW_OWNER_WHERE} ORDER BY id DESC LIMIT 80"
+            "SELECT id::bigint, created_at, actor_id, action_taken, object_id FROM events WHERE {FOLLOW_OWNER_WHERE} ORDER BY id DESC LIMIT 80"
         )
     };
     if let Some(before) = before {
@@ -1016,6 +1060,7 @@ pub async fn load_notification_page(
     }
 
     let mut cands: Vec<Cand> = Vec::new();
+    let mut bsky_marked = 0usize;
     let mut seen_activity = HashSet::new();
     let mut decision = PageDecision { ids: vec![], has_more: false, next_cursor: None, need_more: true, oldest_seen: None };
     for _round in 0..MAX_ROUNDS {
@@ -1139,6 +1184,7 @@ pub async fn load_notification_page(
                     let actor_id: String = row.try_get::<_, Option<String>>(2)?.unwrap_or_default();
                     let actor_trim = actor_id.trim().trim_end_matches('/').to_string();
                     let action: String = row.try_get::<_, Option<String>>(3)?.unwrap_or_default();
+                    let object_id: String = row.try_get::<_, Option<String>>(4)?.unwrap_or_default();
                     let undone = action == "local_accept_followback"
                         && !actor_trim.is_empty()
                         && !followers.is_empty()
@@ -1168,7 +1214,7 @@ pub async fn load_notification_page(
                         created,
                         actor_id: actor_trim,
                         type_name: "follow".into(),
-                        object_id: String::new(),
+                        object_id,
                         content: String::new(),
                         activity_id: String::new(),
                         is_bsky: action == "bsky_follow",
@@ -1239,6 +1285,10 @@ pub async fn load_notification_page(
                 }
             }
             sources[2].loaded_once = true;
+        }
+        if cands.len() > bsky_marked {
+            mark_bsky_hidden_candidates(db, owner_user_id, &mut cands[bsky_marked..]).await;
+            bsky_marked = cands.len();
         }
         let page_rows: Vec<PageRow> = cands.iter().map(|cand| PageRow { id: cand.id.clone(), sort: cand.sort, hidden: cand.hidden }).collect();
         let open = sources.iter().any(|source| source.wanted && !source.done);
