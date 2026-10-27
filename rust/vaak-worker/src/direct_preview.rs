@@ -13,16 +13,19 @@ pub(crate) trait PreviewDns:Sync {
  fn addrs<'a>(&'a self,host:&'a str)->Pin<Box<dyn Future<Output=Result<Vec<IpAddr>>>+Send+'a>>{Box::pin(async move{Ok(self.ipv4(host).await?.into_iter().map(IpAddr::V4).collect())})}
 }
 pub(crate) struct SystemDns;
+/// The 2s lookup cap is longer than the complete-profile budget. When the
+/// request deadline has already passed, the timeout is that budget.
+fn dns_timeout()->anyhow::Error{if crate::profile_bridge::past_deadline(){anyhow::anyhow!("profile_fallback_code=budget")}else{anyhow::anyhow!("PHP fallback: preview DNS timeout")}}
 impl PreviewDns for SystemDns {
  fn ipv4<'a>(&'a self,host:&'a str)->Pin<Box<dyn Future<Output=Result<Vec<Ipv4Addr>>>+Send+'a>>{Box::pin(async move{
-  let answers=tokio::time::timeout(std::time::Duration::from_secs(2),tokio::net::lookup_host((host,443))).await.context("PHP fallback: preview DNS timeout")??;
+  let answers=crate::profile_bridge::timed(crate::profile_bridge::Stage::Dns,tokio::time::timeout(std::time::Duration::from_secs(2),tokio::net::lookup_host((host,443)))).await.map_err(|_|dns_timeout())?.context("PHP fallback: preview DNS lookup failed")?;
   let ips=answers.filter_map(|address|match address.ip(){std::net::IpAddr::V4(ip)=>Some(ip),_=>None}).collect::<Vec<_>>();
   if ips.is_empty(){bail!("PHP fallback: unresolved IPv4 preview eligibility")};Ok(ips)
  })}
  // Like PHP's guard, judge the AAAA answers too: a host with a public A and a
  // private AAAA is not eligible, since the connection may use either.
  fn addrs<'a>(&'a self,host:&'a str)->Pin<Box<dyn Future<Output=Result<Vec<IpAddr>>>+Send+'a>>{Box::pin(async move{
-  let answers=tokio::time::timeout(std::time::Duration::from_secs(2),tokio::net::lookup_host((host,443))).await.context("PHP fallback: preview DNS timeout")??;
+  let answers=crate::profile_bridge::timed(crate::profile_bridge::Stage::Dns,tokio::time::timeout(std::time::Duration::from_secs(2),tokio::net::lookup_host((host,443)))).await.map_err(|_|dns_timeout())?.context("PHP fallback: preview DNS lookup failed")?;
   let mut ips=answers.map(|address|address.ip()).collect::<Vec<_>>();ips.sort();ips.dedup();
   if ips.is_empty(){bail!("PHP fallback: unresolved preview eligibility")};Ok(ips)
  })}

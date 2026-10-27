@@ -43,6 +43,7 @@ impl SourceLedger {
     pub(crate) fn require_source_row(&self,index:usize,row:&Value)->Result<()>{let position=self.ordinals.as_ref().map(|ordinals|ordinals.iter().position(|ordinal|*ordinal==index)).unwrap_or(Some(index));if position.and_then(|position|self.rows.get(position))!=Some(row){bail!("PHP fallback: raw profile subset differs from original selected row")}Ok(())}
     pub(crate) fn require_target(&self,key:&str,actor:&str)->Result<()>{if self.actor_key!=key||self.source_actor!=actor{bail!("PHP fallback: profile selection target binding differs")}Ok(())}
     pub(crate) async fn require_current(&self,db:&Client)->Result<()> {
+        crate::profile_bridge::count_stage(crate::profile_bridge::StageCount::LedgerCheck);
         if let Some(secondary)=&self.secondary{
          let owner=secondary_owner(db,&self.actor_key,&self.source_actor).await?;if owner!=secondary.owner{bail!("PHP fallback: secondary profile target changed")}
          let owner=owner.as_ref().and_then(|row|row["id"].as_i64()).unwrap_or(0);let(selected,preload,missing)=secondary_rows(db,&self.actor_key,owner,secondary.kind).await?;

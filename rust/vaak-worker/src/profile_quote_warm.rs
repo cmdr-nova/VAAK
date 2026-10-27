@@ -74,7 +74,8 @@ impl QuoteWarmContext{
  pub(crate) fn with_bsky_budget_deadline(mut self,deadline:Option<f64>)->Self{self.bsky_budget_deadline=deadline;self}
  /// Exact final pending branch of ap-admin.php:17962 after real lookup,
  /// Bsky cache and summary/fallback quote options have already missed.
- pub(crate) async fn prepare_pending(&self,db:&Client,target:&str,now:i64,grant:&dyn CurrentQuoteGrant)->Result<PendingQuotePresentation>{
+ pub(crate) async fn prepare_pending(&self,db:&Client,target:&str,now:i64,grant:&dyn CurrentQuoteGrant)->Result<PendingQuotePresentation>{crate::profile_bridge::timed(crate::profile_bridge::Stage::Warm,self.prepare_pending_untimed(db,target,now,grant)).await}
+ async fn prepare_pending_untimed(&self,db:&Client,target:&str,now:i64,grant:&dyn CurrentQuoteGrant)->Result<PendingQuotePresentation>{
   grant.require_current().await?;anyhow::ensure!(!target.is_empty(),"pending quote chrome requires the actual nonempty target");let unavailable=self.unavailable(db,target,now,grant).await?;let denied=unavailable.is_some()||!status_shape(target);grant.require_current().await?;
   Ok(PendingQuotePresentation{facts:crate::profile_raw::RawQuoteFacts{acct:String::new(),text:if denied{"Quoted post unavailable".into()}else{String::new()},url:target.into(),media:vec![],card:None,mentions:vec![],spoiler:String::new(),sensitive:false,is_rss:false,article_url:String::new(),open_label:if denied{"Open original".into()}else{"Quoted post (not cached yet) — open".into()},open_external:denied},warm_needed:!denied})
  }
@@ -94,7 +95,8 @@ impl QuoteWarmContext{
   for(sql,params)in [("SELECT bsky_uri FROM bsky_crossposts WHERE bsky_uri LIKE $1 LIMIT 1",vec![format!("%/app.bsky.feed.post/{key}")]),("SELECT bsky_uri, COALESCE(author_handle, '') FROM bsky_posts WHERE split_part(bsky_uri, '/app.bsky.feed.post/', 2) = $1 AND lower(author_handle)=lower($2) LIMIT 1",vec![key.clone(),actor.clone()]),("SELECT bsky_uri, COALESCE(author_handle, '') FROM bsky_posts WHERE split_part(bsky_uri, '/app.bsky.feed.post/', 2) = $1 LIMIT 1",vec![key.clone()])]{grant.require_current().await?;let refs=params.iter().map(|v|v as &(dyn tokio_postgres::types::ToSql+Sync)).collect::<Vec<_>>();let row=db.query_opt(sql,&refs).await;grant.require_current().await?;if let Some(row)=row.ok().flatten(){if let Some(uri)=row.get::<_,Option<String>>(0).filter(|s|!s.is_empty()&&s!="0"){if sql.contains("crossposts")||uri.starts_with("at://"){return Ok(Some(uri))}}}}
   grant.require_current().await?;anyhow::ensure!(self.bsky_budget_deadline.is_none_or(f64::is_finite),"invalid server-bound Bluesky budget deadline");let bound=BudgetBoundGrant{current:grant,deadline:self.bsky_budget_deadline};let did=self.transport.resolve_handle(&actor,&bound).await?;grant.require_current().await?;Ok(did.filter(|s|s.starts_with("did:")).map(|s|format!("at://{s}/app.bsky.feed.post/{key}")))
  }
- pub(crate) async fn warm(&self,db:&Client,raw:&str,owner:i64,now:i64,grant:&dyn CurrentQuoteGrant)->Result<QuoteWarmEffects>{
+ pub(crate) async fn warm(&self,db:&Client,raw:&str,owner:i64,now:i64,grant:&dyn CurrentQuoteGrant)->Result<QuoteWarmEffects>{crate::profile_bridge::timed(crate::profile_bridge::Stage::Warm,self.warm_untimed(db,raw,owner,now,grant)).await}
+ async fn warm_untimed(&self,db:&Client,raw:&str,owner:i64,now:i64,grant:&dyn CurrentQuoteGrant)->Result<QuoteWarmEffects>{
   grant.require_current().await?;let mut effects=QuoteWarmEffects{helper_requested:true,..Default::default()};let url=normalized(raw);if !status_shape(url){return Ok(effects)}
   effects.unavailable=self.unavailable(db,url,now,grant).await?;if effects.unavailable.is_some(){return Ok(effects)}
   if let Some(uri)=self.at_uri(db,url,grant).await?{effects.bsky_requested=true;grant.require_current().await?;effects.dispatched=self.transport.bsky_warm(&uri,owner.max(0),now,grant).await?;grant.require_current().await?;return Ok(effects)}
