@@ -32,13 +32,61 @@ impl PreviewDns for SystemDns {
 }
 fn s<'a>(v:&'a Value,k:&str)->&'a str{v.get(k).and_then(Value::as_str).unwrap_or("")}
 fn strip_tags(input:&str)->Result<String>{
- // Keep the supported PHP strip_tags grammar explicit. Ambiguous malformed
- // tags are not fed through a browser parser that would invent another URL.
- let tags=regex::Regex::new(r"(?s)<!--.*?-->|<[^>]*>").unwrap();
- let plain=tags.replace_all(input,"");
- if plain.contains(['<','>']){bail!("PHP fallback: ambiguous preview HTML")}
+ // The same bytes PHP strip_tags keeps, so a stray "<" or ">" in a post
+ // (a "<3" or an arrow) leaves the same text, and the same URLs, as PHP.
+ let plain=String::from_utf8(php_strip_tags(input.as_bytes())).context("PHP fallback: non UTF8 preview text")?;
  Ok(crate::home_hydrate_ranked::html_entity_decode(&plain))
 }
+/// PHP strip_tags($s) with no allowed tags (ext/standard/string.c
+/// php_strip_tags_ex), byte for byte. ASCII delimiters never split a UTF-8
+/// sequence, so valid UTF-8 input stays valid.
+pub(crate) fn php_strip_tags(input:&[u8])->Vec<u8>{
+ let space=|b:u8|matches!(b,b' '|b'\t'|b'\n'|0x0b|0x0c|b'\r');
+ let at=|i:usize|input.get(i).copied().unwrap_or(0);
+ let(mut out,mut state,mut depth,mut in_q,mut lc,mut br,mut is_xml)=(Vec::with_capacity(input.len()),0u8,0usize,0u8,0u8,0i64,false);
+ let mut i=0;
+ while i<input.len(){
+  let c=input[i];let prev=if i>0{input[i-1]}else{0};
+  match state{
+   0=>match c{
+    0=>{}
+    b'<'=>{if in_q==0{if space(at(i+1)){out.push(c);}else{lc=b'<';state=1;}}}
+    b'>'=>{if depth>0{depth-=1;}else if in_q==0{out.push(c);}}
+    _=>out.push(c),
+   },
+   1=>match c{
+    0=>{}
+    b'<'=>{if in_q==0&&!space(at(i+1)){depth+=1;}}
+    b'>'=>{if depth>0{depth-=1;}else if in_q==0{lc=b'>';if !(is_xml&&prev==b'-'){in_q=0;state=0;is_xml=false;}}}
+    b'"'|b'\''=>{if in_q==0||c==in_q{in_q=if in_q!=0{0}else{c};}}
+    b'!'=>{if prev==b'<'{state=3;lc=c;}}
+    b'?'=>{if prev==b'<'{br=0;state=2;}}
+    _=>{}
+   },
+   2=>match c{
+    0=>{}
+    b'('=>{if lc!=b'"'&&lc!=b'\''{lc=b'(';br+=1;}}
+    b')'=>{if lc!=b'"'&&lc!=b'\''{lc=b')';br-=1;}}
+    b'>'=>{if depth>0{depth-=1;}else if in_q==0&&br==0&&lc!=b'"'&&prev==b'?'{in_q=0;state=0;}}
+    b'"'|b'\''=>{if prev!=b'\\'{if lc==c{lc=0;}else if lc!=b'\\'{lc=c;}}if i>0&&prev!=b'\\'&&(in_q==0||c==in_q){in_q=if in_q!=0{0}else{c};}}
+    b'l'|b'L'=>{if i>4&&input[i-4..i].eq_ignore_ascii_case(b"<?xm"){state=1;is_xml=true;}}
+    _=>{}
+   },
+   3=>match c{
+    0=>{}
+    b'>'=>{if depth>0{depth-=1;}else if in_q==0{in_q=0;state=0;}}
+    b'"'|b'\''=>{if i>0&&prev!=b'\\'&&(in_q==0||c==in_q){in_q=if in_q!=0{0}else{c};}}
+    b'-'=>{if i>=2&&prev==b'-'&&input[i-2]==b'!'{state=4;}}
+    b'E'|b'e'=>{if i>6&&input[i-6..i].eq_ignore_ascii_case(b"doctyp"){state=1;}}
+    _=>{}
+   },
+   _=>{if c==b'>'&&in_q==0&&i>=2&&prev==b'-'&&input[i-2]==b'-'{in_q=0;state=0;}}
+  }
+  i+=1;
+ }
+ out
+}
+
 fn decode_form(value:&str)->Result<String>{
  let bytes=value.as_bytes();let mut out=Vec::new();let mut index=0;
  while index<bytes.len(){match bytes[index]{b'+'=>out.push(b' '),b'%' if index+2<bytes.len()=>{let digits=std::str::from_utf8(&bytes[index+1..index+3])?;if let Ok(byte)=u8::from_str_radix(digits,16){out.push(byte);index+=2;}else{out.push(bytes[index]);}},byte=>out.push(byte)}index+=1;}
@@ -291,6 +339,20 @@ async fn resolve_prepared(db:&Client,dns:&dyn PreviewDns,st:&Value,original_cont
 #[cfg(test)]
 mod tests {
  use super::*;
+ /// Differential check against the php binary: random strings over the
+ /// characters the strip_tags state machine reacts to. Skipped without php.
+ #[test]
+ fn strip_tags_matches_php_byte_for_byte(){
+  if std::process::Command::new("php").arg("-v").output().is_err(){return}
+  let alpha=b"<>\"'!?--ab xml()\\/doctypeE\n\0";let mut seed:u64=0x9e3779b97f4a7c15;let mut next=||{seed^=seed<<13;seed^=seed>>7;seed^=seed<<17;seed};
+  let mut cases:Vec<Vec<u8>>=vec![b"I <3 you".to_vec(),b"a -> b".to_vec(),b"x < y".to_vec(),b"<p>a > b</p>".to_vec(),b"<a title=\"x>y\">t</a> z".to_vec(),b"<!-- c > d --> e".to_vec(),b"<?xml a?>b".to_vec(),b"<!DOCTYPE html>t".to_vec(),"caf\u{e9} <b>\u{1f600}</b> >".as_bytes().to_vec()];
+  for _ in 0..20_000{let len=(next()%40) as usize;let mut case:Vec<u8>=(0..len).map(|_|alpha[(next()%alpha.len() as u64) as usize]).collect();match next()%10{0=>case.splice(0..0,b"<!DOCTYPE".iter().copied()).for_each(drop),1=>case.splice(0..0,b"<?xml".iter().copied()).for_each(drop),_=>{}}cases.push(case);}
+  let input=cases.iter().map(|c|c.iter().map(|b|format!("{b:02x}")).collect::<String>()).collect::<Vec<_>>().join("\n");
+  let mut child=std::process::Command::new("php").args(["-r","foreach(explode(\"\\n\",stream_get_contents(STDIN)) as $l){echo bin2hex(strip_tags(hex2bin($l))),\"\\n\";}"]).stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).spawn().unwrap();
+  {use std::io::Write;child.stdin.take().unwrap().write_all(input.as_bytes()).unwrap();}
+  let out=String::from_utf8(child.wait_with_output().unwrap().stdout).unwrap();let expected:Vec<&str>=out.lines().collect();assert_eq!(expected.len(),cases.len());
+  for(case,want)in cases.iter().zip(expected){let got=php_strip_tags(case).iter().map(|b|format!("{b:02x}")).collect::<String>();assert_eq!(got,want,"{:?}",String::from_utf8_lossy(case));}
+ }
  #[test]
  fn preview_plain_placeholder_rule_is_unchanged(){
   let fresh=regex::Regex::new(r"(?i)^\((?:attachment|media|poll|quote|boost)\)$").unwrap();
@@ -328,13 +390,13 @@ mod tests {
  #[test]
  fn actual_php_selector_controls()->Result<()> {
   use std::io::Write;
-  let cases=["plain no url", "0", "<p>https://article.test/path</p>", "HTTPS://WWW.ARTICLE.TEST/path/", "https://article.test/path?utm_source=x&b=2&a=hello+world", "https://article.test/path?a=first&a=last", "https://article.test/path?a=%7E&z=x%20y", "https://article.test/", "https://article.test/#frag", "https://article.test/path///#frag", "https://article.test/p?x=1&amp;y=2", "<a href='https://ignored.test'>https://shown.test/x</a>", "https://article.test/a😀", "https://article.test/ahttps://tracker.test/x", "https://article.test/ahttp://tracker.test/x", "https://article.test/a.,);]!", "https://article.test/a.jpg https://article.test/b", "https://article.test/a.png?x=1 https://article.test/b", "https://mkultra.monster/users/cmdr_nova/notes/one https://article.test/b", "https://mkultra.monster/users/other/notes/one", "https://youtu.be/abcdefghi", "https://www.youtube.com/shorts/abcdefghi", "https://youtube.com/watch?v=abcdefghi&extra=1", "https://article.test:443/a", "https://article.test:/a", "https://article.test:0/a", "https://article.test:65535/a", "https://article.test:+443/a", "https://article.test:+0/a", "https://article.test:foo/a", "https://article.test:65536/a", "https://article.test:99999/a", "https://article.test:-443/a", "https://article.test:+/a", "https://user:pass@article.test/a", "https://article.test/p?q=a.b&key.dot=a", "https://article.test/p?q=%2F%3F%26", "<!-- https://hidden.test -->https://article.test/a", "<p title='safe'>https://article.test/a</p>", "&#104;ttps://article.test/a", "https://article.test/p?ref=x&REF_SRC=y&FBCLID=z&ok=1", "https://article.test/p?blank&equals=", "https://article.test/p?%20key%20=x"];
+  let cases=["plain no url", "0", "<p title='>'>https://article.test/a", "I <3 https://article.test/heart", "a -> https://article.test/arrow", "1 < 2 https://article.test/lt", "<p>https://article.test/path</p>", "HTTPS://WWW.ARTICLE.TEST/path/", "https://article.test/path?utm_source=x&b=2&a=hello+world", "https://article.test/path?a=first&a=last", "https://article.test/path?a=%7E&z=x%20y", "https://article.test/", "https://article.test/#frag", "https://article.test/path///#frag", "https://article.test/p?x=1&amp;y=2", "<a href='https://ignored.test'>https://shown.test/x</a>", "https://article.test/a😀", "https://article.test/ahttps://tracker.test/x", "https://article.test/ahttp://tracker.test/x", "https://article.test/a.,);]!", "https://article.test/a.jpg https://article.test/b", "https://article.test/a.png?x=1 https://article.test/b", "https://mkultra.monster/users/cmdr_nova/notes/one https://article.test/b", "https://mkultra.monster/users/other/notes/one", "https://youtu.be/abcdefghi", "https://www.youtube.com/shorts/abcdefghi", "https://youtube.com/watch?v=abcdefghi&extra=1", "https://article.test:443/a", "https://article.test:/a", "https://article.test:0/a", "https://article.test:65535/a", "https://article.test:+443/a", "https://article.test:+0/a", "https://article.test:foo/a", "https://article.test:65536/a", "https://article.test:99999/a", "https://article.test:-443/a", "https://article.test:+/a", "https://user:pass@article.test/a", "https://article.test/p?q=a.b&key.dot=a", "https://article.test/p?q=%2F%3F%26", "<!-- https://hidden.test -->https://article.test/a", "<p title='safe'>https://article.test/a</p>", "&#104;ttps://article.test/a", "https://article.test/p?ref=x&REF_SRC=y&FBCLID=z&ok=1", "https://article.test/p?blank&equals=", "https://article.test/p?%20key%20=x"];
   let root=std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
   let mut process=std::process::Command::new(root.join("api/bin/php-policy-test")).current_dir(&root).args(["-r","require 'api/ap-link-preview.php';$v=json_decode(stream_get_contents(STDIN),true);echo json_encode(array_map(fn($s)=>ap_link_preview_extract_url($s),$v),JSON_THROW_ON_ERROR);"]).stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).spawn()?;
   process.stdin.take().unwrap().write_all(&serde_json::to_vec(cases.as_slice())?)?;
   let result=process.wait_with_output()?;assert!(result.status.success());let expected:Vec<Option<String>>=serde_json::from_slice(&result.stdout)?;
   for (input,expected) in cases.iter().zip(expected){match extract_url(input){Ok(actual)=>assert_eq!(actual,expected,"actual PHP selector {input}"),Err(_) if [":foo/",":65536/",":99999/",":-443/",":+/"].iter().any(|port|input.contains(port))=>assert_eq!(expected,None,"actual PHP invalid port {input}"),Err(error)=>return Err(error)}}
-  for input in ["https://article.test:foo/a", "https://article.test:65536/a", "https://article.test:99999/a", "https://article.test:-443/a", "https://article.test:p/a", "https://article.test/p?2=one&10=two", "https://article.test/p?a[]=one", "https://article.test/p?a=%FF", "<p title='>'>https://article.test/a", "https://[::1]/x"]{assert!(extract_url(input).is_err(),"uncertified selector {input}");}
+  for input in ["https://article.test:foo/a", "https://article.test:65536/a", "https://article.test:99999/a", "https://article.test:-443/a", "https://article.test:p/a", "https://article.test/p?2=one&10=two", "https://article.test/p?a[]=one", "https://article.test/p?a=%FF", "https://[::1]/x"]{assert!(extract_url(input).is_err(),"uncertified selector {input}");}
   assert!(extract_url(&format!("https://article.test/p?{}",(0..65).map(|i|format!("k{i}=x")).collect::<Vec<_>>().join("&"))).is_err());
   Ok(())
  }
