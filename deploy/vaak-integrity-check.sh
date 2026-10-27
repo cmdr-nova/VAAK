@@ -42,10 +42,27 @@ else
   fi
 fi
 
-q="$(runuser -u postgres -- psql -d "${DB_NAME}" -At -F '|' -c "SELECT 'pending_fanout',count(*) FROM ap_fanout_delivery_queue WHERE status='pending' UNION ALL SELECT 'failed_fanout',count(*) FROM ap_fanout_delivery_queue WHERE status='failed' UNION ALL SELECT 'pending_action',count(*) FROM ap_action_queue WHERE status='pending' UNION ALL SELECT 'failed_action',count(*) FROM ap_action_queue WHERE status='failed';")"
+# Dead-host suspension uses the same knobs as api/ap-fanout-host.php.
+# A missing health table keeps the previous total, so this check still runs
+# before the migration has been applied.
+dead_days="${VAAK_FANOUT_DEAD_DAYS:-7}"
+dead_failures="${VAAK_FANOUT_DEAD_FAILURES:-20}"
+if [[ ! "${dead_days}" =~ ^[0-9]+$ ]] || (( dead_days < 1 || dead_days > 90 )); then dead_days=7; fi
+if [[ ! "${dead_failures}" =~ ^[0-9]+$ ]] || (( dead_failures < 1 || dead_failures > 100000 )); then dead_failures=20; fi
+health_table="$(runuser -u postgres -- psql -d "${DB_NAME}" -At -c "SELECT CASE WHEN to_regclass('public.ap_fanout_host_health') IS NULL THEN 0 ELSE 1 END" 2>/dev/null || echo 0)"
+cutoff="$(date -u -d "${dead_days} days ago" +%Y-%m-%dT%H:%M:%S+00:00 2>/dev/null || true)"
+# Host text matches ap_fanout_host_normalize for ordinary https inboxes:
+# lower(split_part(split_part(regexp_replace(inbox_url, '^https://', ''), '/', 1), ':', 1))
+if [[ "${health_table}" == "1" && "${cutoff}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\+00:00$ ]]; then
+  q="$(runuser -u postgres -- psql -d "${DB_NAME}" -At -F '|' -c "SELECT 'pending_fanout',count(*) FROM ap_fanout_delivery_queue WHERE status='pending' UNION ALL SELECT 'failed_fanout_healthy',count(*) FROM ap_fanout_delivery_queue q WHERE q.status='failed' AND NOT EXISTS (SELECT 1 FROM ap_fanout_host_health h WHERE h.host = lower(split_part(split_part(regexp_replace(q.inbox_url, '^https://', ''), '/', 1), ':', 1)) AND h.host <> '*' AND h.consecutive_terminal_failures >= ${dead_failures} AND h.streak_started_at IS NOT NULL AND h.streak_started_at <= '${cutoff}' AND (h.last_success_at IS NULL OR h.last_success_at <= '${cutoff}') AND (h.last_live_at IS NULL OR h.last_live_at <= '${cutoff}')) UNION ALL SELECT 'failed_fanout_suspended',count(*) FROM ap_fanout_delivery_queue q WHERE q.status='failed' AND EXISTS (SELECT 1 FROM ap_fanout_host_health h WHERE h.host = lower(split_part(split_part(regexp_replace(q.inbox_url, '^https://', ''), '/', 1), ':', 1)) AND h.host <> '*' AND h.consecutive_terminal_failures >= ${dead_failures} AND h.streak_started_at IS NOT NULL AND h.streak_started_at <= '${cutoff}' AND (h.last_success_at IS NULL OR h.last_success_at <= '${cutoff}') AND (h.last_live_at IS NULL OR h.last_live_at <= '${cutoff}')) UNION ALL SELECT 'pending_action',count(*) FROM ap_action_queue WHERE status='pending' UNION ALL SELECT 'failed_action',count(*) FROM ap_action_queue WHERE status='failed';")"
+else
+  q="$(runuser -u postgres -- psql -d "${DB_NAME}" -At -F '|' -c "SELECT 'pending_fanout',count(*) FROM ap_fanout_delivery_queue WHERE status='pending' UNION ALL SELECT 'failed_fanout',count(*) FROM ap_fanout_delivery_queue WHERE status='failed' UNION ALL SELECT 'pending_action',count(*) FROM ap_action_queue WHERE status='pending' UNION ALL SELECT 'failed_action',count(*) FROM ap_action_queue WHERE status='failed';")"
+fi
 while IFS='|' read -r kind count; do
   [[ -z "${kind:-}" ]] && continue
+  if [[ "${kind}" == failed_fanout_healthy && "${count}" -gt 1000 ]]; then warn "${count} terminal fan-out failures on live hosts require review"; fi
   if [[ "${kind}" == failed_fanout && "${count}" -gt 1000 ]]; then warn "${count} terminal fan-out failures require review"; fi
+  if [[ "${kind}" == failed_fanout_suspended ]]; then echo "suspended_fanout ${count}"; fi
   if [[ "${kind}" == pending_fanout && "${count}" -gt 500 ]]; then crit "${count} pending fan-out deliveries"; fi
   if [[ "${kind}" == failed_action && "${count}" -gt 25 ]]; then warn "${count} failed user actions require review"; fi
 done <<<"${q}"

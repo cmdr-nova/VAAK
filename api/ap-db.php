@@ -3029,6 +3029,16 @@ SQL);
             error_log('[ap-db] queue priority not provisioned for ' . $priorityTable . ': ' . $e->getMessage());
         }
     }
+    // SQLite dev trees only. Production Postgres gets this from
+    // api/migrations/20261027_fanout_host_health_postgres.sql via migrate.php.
+    try {
+        if (!function_exists('ap_fanout_host_ensure_sqlite')) {
+            require_once __DIR__ . '/ap-fanout-host.php';
+        }
+        ap_fanout_host_ensure_sqlite($db);
+    } catch (Throwable $e) {
+        error_log('[ap-db] fanout host health not provisioned: ' . $e->getMessage());
+    }
     try {
         $st = $db->query('SELECT id FROM ap_queue_settings WHERE id = 1');
         if (!$st->fetch()) {

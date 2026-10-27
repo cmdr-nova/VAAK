@@ -40,6 +40,12 @@ try {
     require_once __DIR__ . '/ap-bsky.php';
     require_once __DIR__ . '/ap-inbox.php';
     $db = ap_db();
+    if (function_exists('ap_fanout_host_backfill')) {
+        ap_fanout_host_backfill($db);
+    }
+    if (function_exists('ap_fanout_host_requeue_probe')) {
+        ap_fanout_host_requeue_probe($db);
+    }
     $pendingCount = (int) $db->query("SELECT COUNT(*) FROM ap_fanout_delivery_queue WHERE status = 'pending'")->fetchColumn();
     if (function_exists('ap_worker_backpressure_limit')) {
         $limit = ap_worker_backpressure_limit('fanout-delivery', $limit, $pendingCount);
@@ -56,25 +62,57 @@ try {
         if ($claim->rowCount() !== 1) continue;
         $stats['claimed']++;
         $activity = json_decode((string) $row['activity_json'], true);
-        $host = strtolower((string) (parse_url((string) $row['inbox_url'], PHP_URL_HOST) ?: 'unknown'));
+        $host = function_exists('ap_fanout_host_normalize')
+            ? ap_fanout_host_normalize((string) $row['inbox_url'])
+            : strtolower((string) (parse_url((string) $row['inbox_url'], PHP_URL_HOST) ?: ''));
+        if ($host === '') {
+            $host = strtolower((string) (parse_url((string) $row['inbox_url'], PHP_URL_HOST) ?: 'unknown'));
+        }
+        $probe = str_starts_with((string) ($row['last_error'] ?? ''), 'host-probe');
+        $blueskyActivity = function_exists('ap_fanout_activity_is_bluesky')
+            && ap_fanout_activity_is_bluesky((string) ($row['activity_json'] ?? ''));
+        $blueskyHost = function_exists('ap_fanout_host_is_bluesky_host') && ap_fanout_host_is_bluesky_host($host);
+        if ($blueskyActivity && !$blueskyHost) {
+            $db->prepare("UPDATE ap_fanout_delivery_queue SET status='failed', attempts=attempts+1, claimed_at=NULL, last_error=?, updated_at=? WHERE id=?")->execute([
+                'Bluesky activity is not delivered', gmdate('c'), (int) $row['id'],
+            ]);
+            $stats['failed']++;
+            continue;
+        }
+        $suspended = function_exists('ap_fanout_host_is_suspended_host') && ap_fanout_host_is_suspended_host($host);
         $circuitUntil = ap_fanout_circuit_open($host);
+        $circuitOpen = $circuitUntil > time();
+        $plan = function_exists('ap_fanout_worker_outcome')
+            ? ap_fanout_worker_outcome($suspended, $probe, $circuitOpen, false, (int) $row['attempts'])
+            : ['try_http' => $circuitUntil <= time(), 'status' => 'pending', 'terminal' => false, 'record_terminal' => false];
         $ok = false;
-        if ($circuitUntil <= time()) {
+        if (!empty($plan['try_http'])) {
             $ok = is_array($activity) && ap_deliver_signed_json((string) $row['inbox_url'], $activity, (string) $row['key_id'], (string) $row['priv_path'], 2.5);
             if ($ok) ap_fanout_circuit_success($host);
             else ap_fanout_circuit_failure($host);
+            if ($ok && function_exists('ap_fanout_host_note_success')) ap_fanout_host_note_success($host);
         }
-        if ($ok) {
+        $outcome = function_exists('ap_fanout_worker_outcome')
+            ? ap_fanout_worker_outcome($suspended, $probe, $circuitOpen, $ok, (int) $row['attempts'])
+            : ['status' => $ok ? 'succeeded' : (((int) $row['attempts'] + 1) >= 12 ? 'failed' : 'pending'), 'terminal' => !$ok && ((int) $row['attempts'] + 1) >= 12, 'record_terminal' => !$ok && ((int) $row['attempts'] + 1) >= 12];
+        if (($outcome['status'] ?? '') === 'succeeded') {
             $db->prepare("UPDATE ap_fanout_delivery_queue SET status='succeeded',claimed_at=NULL,last_error=NULL,updated_at=? WHERE id=?")->execute([gmdate('c'), (int) $row['id']]);
             $stats['succeeded']++;
             continue;
         }
         $attempts = (int) $row['attempts'] + 1;
-        $terminal = $attempts >= 12;
+        $terminal = !empty($outcome['terminal']);
         $delay = $circuitUntil > time() ? max(60, $circuitUntil - time()) : min(3600, 15 * (2 ** min(8, $attempts - 1)));
-        $detail = trim((string) ($GLOBALS['ap_delivery_last_error'] ?? ''));
-        if ($detail === '') {
-            $detail = $circuitUntil > time() ? 'Remote host circuit is open' : 'Remote inbox delivery failed';
+        if ($suspended && !$probe) {
+            $detail = 'Suspended remote host';
+        } else {
+            $detail = trim((string) ($GLOBALS['ap_delivery_last_error'] ?? ''));
+            if ($detail === '') {
+                $detail = $circuitUntil > time() ? 'Remote host circuit is open' : 'Remote inbox delivery failed';
+            }
+        }
+        if ($terminal && !empty($outcome['record_terminal']) && function_exists('ap_fanout_host_note_terminal')) {
+            ap_fanout_host_note_terminal($host, $detail);
         }
         $db->prepare('UPDATE ap_fanout_delivery_queue SET status=?, attempts=?, next_attempt_at=?, claimed_at=NULL, last_error=?, updated_at=? WHERE id=?')->execute([
             $terminal ? 'failed' : 'pending', $attempts, gmdate('c', time() + $delay), substr($detail, 0, 500), gmdate('c'), (int) $row['id']
