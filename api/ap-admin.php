@@ -26661,7 +26661,7 @@ function admin_mentions_html_axum_fetch(int $limit, ?string $maxId, array $types
         CURLOPT_HEADER => true,
         CURLOPT_CONNECTTIMEOUT_MS => 120,
         CURLOPT_TIMEOUT_MS => 1500,
-        CURLOPT_HTTPHEADER => array_merge(['Accept: text/html', 'Connection: close'], ap_shadow_http_auth_headers()),
+        CURLOPT_HTTPHEADER => array_merge(['Accept: text/html'], ap_shadow_http_auth_headers()),
     ]);
     $raw = curl_exec($ch);
     $code = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);

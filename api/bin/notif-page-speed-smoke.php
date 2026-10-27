@@ -213,10 +213,19 @@ speed_check(str_contains($admin, 'ap_visibility_notification_page_prefetch('), '
 speed_check(substr_count($visibility, 'ap_visibility_status_audience_allowed($child, $ownerUserId, $depth + 1)') === 1, 'nested audience recursion unchanged');
 speed_check(!preg_match('/CREATE\s+INDEX\b[^;]*idx_events_object_key_id/', $schema), 'a page load does not build the events expression index');
 speed_check(!preg_match('/CREATE\s+INDEX\b[^;]*idx_mentions_owner_live_id/', $schema), 'a page load does not build the mentions partial index');
+speed_check(!preg_match('/CREATE\s+INDEX\b[^;]*idx_followers_actor_key/', $schema), 'a page load does not build the followers actor index');
+speed_check(!preg_match('/CREATE\s+INDEX\b[^;]*idx_following_owner_actor_key/', $schema), 'a page load does not build the following actor index');
+speed_check(!preg_match('/CREATE\s+INDEX\b[^;]*idx_mentions_owner_object_live/', $schema), 'a page load does not build the mentions object index');
 speed_check(str_contains($migrate, 'vaak_migrate_notification_read_indexes($lock)'), 'migrate.php builds the indexes on its autocommit connection');
 require_once $migratePath;
 $specs = vaak_migrate_notification_index_specs();
-speed_check(isset($specs['idx_events_object_key_id'], $specs['idx_mentions_owner_live_id']), 'deploy knows both notification read indexes');
+speed_check(isset(
+    $specs['idx_events_object_key_id'],
+    $specs['idx_mentions_owner_live_id'],
+    $specs['idx_followers_actor_key'],
+    $specs['idx_following_owner_actor_key'],
+    $specs['idx_mentions_owner_object_live']
+), 'deploy knows the notification read indexes');
 $flatSql = preg_replace('/\s+/', ' ', $indexSql) ?: '';
 foreach ($specs as $name => $spec) {
     speed_check(str_starts_with($spec['create'], 'CREATE INDEX CONCURRENTLY '), $name . ' is created concurrently');

@@ -526,58 +526,73 @@ async fn load_viewer_follows_on(
 ) -> HashSet<String> {
     let mut set = HashSet::new();
     let owner = viewer_actor.trim().trim_end_matches('/').to_string();
-    if owner.starts_with("https://") {
-        let owner_slash = format!("{owner}/");
-        if let Ok(rows) = db
-            .query(
+    let owner_slash = format!("{owner}/");
+    let ap_follows = async {
+        if owner.starts_with("https://") {
+            db.query(
                 "SELECT actor_id FROM following WHERE owner_actor_id = $1 OR owner_actor_id = $2",
                 &[&owner, &owner_slash],
             )
             .await
-        {
-            for row in rows {
-                let aid: String = row
-                    .try_get::<_, Option<String>>(0)
-                    .ok()
-                    .flatten()
-                    .unwrap_or_default();
-                remember_follow(&mut set, &aid);
-            }
+            .ok()
+        } else {
+            None
         }
-    }
-    if owner_user_id > 0 {
-        if let Ok(rows) = db
-            .query(
+    };
+    let graph = async {
+        if owner_user_id > 0 {
+            db.query(
                 "SELECT target_did FROM bsky_graph_sync WHERE owner_user_id = $1 AND kind = 'follow'",
                 &[&owner_user_id],
             )
             .await
-        {
-            for row in rows {
-                let did: String = row
-                    .try_get::<_, Option<String>>(0)
-                    .ok()
-                    .flatten()
-                    .unwrap_or_default();
-                remember_follow(&mut set, did.trim());
-            }
+            .ok()
+        } else {
+            None
         }
-        // Handle URLs are optional. A missing table must not hide Follow back.
-        if let Ok(rows) = db
-            .query(
+    };
+    // Handle URLs are optional. A missing table must not hide Follow back.
+    let viewers = async {
+        if owner_user_id > 0 {
+            db.query(
                 "SELECT actor_ref FROM bsky_actor_viewers WHERE owner_user_id = $1 AND COALESCE(following_uri, '') <> ''",
                 &[&owner_user_id],
             )
             .await
-        {
-            for row in rows {
-                let actor_ref: String = row
-                    .try_get::<_, Option<String>>(0)
-                    .ok()
-                    .flatten()
-                    .unwrap_or_default();
-                remember_follow(&mut set, &actor_ref);
-            }
+            .ok()
+        } else {
+            None
+        }
+    };
+    let (ap_rows, graph_rows, viewer_rows) = tokio::join!(ap_follows, graph, viewers);
+    if let Some(rows) = ap_rows {
+        for row in rows {
+            let aid: String = row
+                .try_get::<_, Option<String>>(0)
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            remember_follow(&mut set, &aid);
+        }
+    }
+    if let Some(rows) = graph_rows {
+        for row in rows {
+            let did: String = row
+                .try_get::<_, Option<String>>(0)
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            remember_follow(&mut set, did.trim());
+        }
+    }
+    if let Some(rows) = viewer_rows {
+        for row in rows {
+            let actor_ref: String = row
+                .try_get::<_, Option<String>>(0)
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            remember_follow(&mut set, &actor_ref);
         }
     }
     set
@@ -815,19 +830,35 @@ fn raw_page(payload: Value, key: String, source_suffix: &str, limit: usize, curs
     Ok(Some(HtmlPage { items, primary_count, next_max_id, source: format!("{source}:{source_suffix}"), redis_key: key }))
 }
 
-async fn html_page_selected(cfg: &Config, owner: i64, limit: i64, types: &[String], max_id: Option<&str>) -> Result<Option<HtmlPage>> {
-    let mut redis = crate::redis_util::connect(&cfg.redis_url).await?;
-    let key = crate::notif_list::notifications_list_redis_key(owner, limit, max_id, None, types);
-    if let Some(payload) = crate::redis_util::json_get(&mut redis, &key).await? {
-        return raw_page(payload, key, "exact-raw", limit as usize, max_id, false);
-    }
-    // Select source consumption before policy admission. Never refill a selected
-    // raw page from older visible rows after a notifier becomes hidden.
+async fn html_page_selected(
+    redis: &mut redis::aio::MultiplexedConnection,
+    owner: i64,
+    limit: i64,
+    types: &[String],
+    max_id: Option<&str>,
+) -> Result<Option<HtmlPage>> {
+    let exact = crate::notif_list::notifications_list_redis_key(owner, limit, max_id, None, types);
+    let mut keys = vec![exact.clone()];
+    let mut heads = Vec::new();
     for alt in crate::notif_list::warm_head_limits(limit) {
         if max_id.is_none() && alt == limit { continue; }
         let key = crate::notif_list::notifications_list_redis_key(owner, alt, None, None, types);
-        if let Some(payload) = crate::redis_util::json_get(&mut redis, &key).await? {
-            if let Some(page) = raw_page(payload, key, if max_id.is_some() { "max-raw" } else { "head-raw" }, limit as usize, max_id, true)? { return Ok(Some(page)); }
+        heads.push(key.clone());
+        keys.push(key);
+    }
+    // One MGET. A parsed exact envelope that raw_page rejects stays a miss for
+    // the caller and does not fall through to a warm head. Unparseable JSON is
+    // a miss, matching json_get.
+    let payloads = crate::redis_util::json_mget(redis, &keys).await?;
+    if let Some(payload) = payloads.first().cloned().flatten() {
+        return raw_page(payload, exact, "exact-raw", limit as usize, max_id, false);
+    }
+    // Select source consumption before policy admission. Never refill a selected
+    // raw page from older visible rows after a notifier becomes hidden.
+    for (index, key) in heads.into_iter().enumerate() {
+        let Some(payload) = payloads.get(index + 1).cloned().flatten() else { continue; };
+        if let Some(page) = raw_page(payload, key, if max_id.is_some() { "max-raw" } else { "head-raw" }, limit as usize, max_id, true)? {
+            return Ok(Some(page));
         }
     }
     Ok(None)
@@ -864,15 +895,24 @@ async fn grouping_facts(db: &tokio_postgres::Client, items: &[Value]) -> Result<
     let mut facts = GroupingFacts::default();
     let refs: Vec<String> = items.iter().filter_map(|n| n.get("account").map(account_ref)).collect();
     let local: Vec<String> = refs.iter().filter(|s| s.starts_with("https://mkultra.monster/users/")).cloned().collect();
-    if !local.is_empty() {
-        for row in db.query("SELECT rtrim(actor_id, '/'), id::text FROM ap_users WHERE rtrim(actor_id, '/') = ANY($1)", &[&local]).await? {
-            unique_fact(&mut facts.identities, row.get(0), format!("vaak:{}", row.get::<_, String>(1)))?;
-        }
-    }
     let bsky: Vec<String> = refs.iter().filter_map(|s| bsky_profile_ref(s)).collect();
+    let handles: Vec<String> = bsky.iter().map(|s| s.to_ascii_lowercase()).collect();
+    let local_rows = async {
+        if local.is_empty() { Ok(Vec::new()) } else {
+            db.query("SELECT rtrim(actor_id, '/'), id::text FROM ap_users WHERE rtrim(actor_id, '/') = ANY($1)", &[&local]).await
+        }
+    };
+    let bsky_rows = async {
+        if bsky.is_empty() { Ok(Vec::new()) } else {
+            db.query("SELECT owner_user_id::text, did, lower(handle) FROM bsky_sessions WHERE did = ANY($1) OR lower(handle) = ANY($2)", &[&bsky, &handles]).await
+        }
+    };
+    let (local_rows, bsky_rows) = tokio::try_join!(local_rows, bsky_rows)?;
+    for row in local_rows {
+        unique_fact(&mut facts.identities, row.get(0), format!("vaak:{}", row.get::<_, String>(1)))?;
+    }
     if !bsky.is_empty() {
-        let handles: Vec<String> = bsky.iter().map(|s| s.to_ascii_lowercase()).collect();
-        let rows = db.query("SELECT owner_user_id::text, did, lower(handle) FROM bsky_sessions WHERE did = ANY($1) OR lower(handle) = ANY($2)", &[&bsky, &handles]).await?;
+        let rows = bsky_rows;
         for reference in &refs {
             let Some(probe) = bsky_profile_ref(reference) else { continue; };
             for row in &rows {
@@ -901,8 +941,10 @@ async fn grouping_facts(db: &tokio_postgres::Client, items: &[Value]) -> Result<
     }
     if !probes.is_empty() {
         let ats: Vec<String> = probes.values().cloned().collect();
-        let cross = db.query("SELECT bsky_uri, note_id FROM bsky_crossposts WHERE bsky_uri = ANY($1)", &[&ats]).await?;
-        let links = db.query("SELECT bsky_uri, COALESCE(fediverse_id, ap_object_id, '') FROM bsky_post_links WHERE bsky_uri = ANY($1)", &[&ats]).await?;
+        let (cross, links) = tokio::try_join!(
+            async { db.query("SELECT bsky_uri, note_id FROM bsky_crossposts WHERE bsky_uri = ANY($1)", &[&ats]).await },
+            async { db.query("SELECT bsky_uri, COALESCE(fediverse_id, ap_object_id, '') FROM bsky_post_links WHERE bsky_uri = ANY($1)", &[&ats]).await },
+        )?;
         let mut mapped = std::collections::HashMap::new();
         for row in cross { let note: String = row.get(1); if note.starts_with("https://") { unique_fact(&mut mapped, row.get(0), note.trim_end_matches('/').to_string())?; } }
         for row in links {
@@ -975,19 +1017,31 @@ pub async fn mentions_html_fill(
     max_id: Option<&str>,
 ) -> Result<Option<MentionsHtmlReport>> {
     let limit = limit.clamp(1, 60);
-    let Some(mut report) = html_page_selected(cfg, owner_user_id, limit, types, max_id).await? else { return Ok(None); };
+    let mut redis = crate::redis_util::connect(&cfg.redis_url).await?;
+    let Some(mut report) = html_page_selected(&mut redis, owner_user_id, limit, types, max_id).await? else { return Ok(None); };
     // Grouped like/boost cards still need PHP's CSRF forms. Decide that from
     // the raw envelope before opening a database connection.
     if page_needs_php_grouped_cards(&report.items) {
         return Ok(None);
     }
-    let policy_db = crate::db::connect(&cfg.database_url).await?;
-    require_active_owner(&policy_db, owner_user_id).await?;
+    let policy_db = crate::db::notif_reused(&cfg.database_url).await?;
+    let phyrian = max_id.is_none() && types.is_empty();
+    let ((), pending) = tokio::try_join!(
+        require_active_owner(&policy_db, owner_user_id),
+        async {
+            if phyrian {
+                let pending: bool = policy_db.query_one(
+                    "SELECT EXISTS(SELECT 1 FROM phyrian_requests WHERE to_owner_id::bigint=$1 AND status='pending')",
+                    &[&owner_user_id],
+                ).await?.get(0);
+                Ok(pending)
+            } else {
+                Ok(false)
+            }
+        },
+    )?;
     // A pending first-All Phyrian offer still needs the actual PHP producer.
-    if max_id.is_none() && types.is_empty() {
-        let pending: bool = policy_db.query_one("SELECT EXISTS(SELECT 1 FROM phyrian_requests WHERE to_owner_id::bigint=$1 AND status='pending')", &[&owner_user_id]).await?.get(0);
-        if pending { return Ok(None); }
-    }
+    if pending { return Ok(None); }
     crate::audience::filter_notifications(&policy_db, owner_user_id, &mut report.items).await?;
 
     // Replies and quote-boosts need the signed-in actor or the ⋯ menu is omitted.
@@ -1030,9 +1084,11 @@ pub async fn mentions_html_fill(
 
     // Facts are presentation-only. The last awaited grant covers both the
     // original status and any canonical alias before HTML is returned.
-    let following = load_viewer_follows_on(&policy_db, owner_user_id, &viewer_actor).await;
+    let (following, facts) = tokio::try_join!(
+        async { Ok::<_, anyhow::Error>(load_viewer_follows_on(&policy_db, owner_user_id, &viewer_actor).await) },
+        grouping_facts(&policy_db, &report.items),
+    )?;
     anyhow::ensure!(active_viewer_actor(&policy_db, owner_user_id).await? == viewer_actor, "notification owner actor changed");
-    let facts = grouping_facts(&policy_db, &report.items).await?;
     final_page_admission(&policy_db, owner_user_id, &mut report.items, &facts).await?;
     let tip_id = report.items.iter().find_map(|item| {
         let raw = item.get("id")?.as_str()?;
@@ -1050,7 +1106,7 @@ pub async fn mentions_html_fill(
     }
     // Fragment cache is a side effect of a page we actually return. A miss
     // must not publish HTML that skipped the final audience grant.
-    if let Ok(mut redis) = crate::redis_util::connect(&cfg.redis_url).await {
+    {
         let mut embeds = Vec::new();
         for item in &report.items {
             if !item.is_object() {
@@ -1110,3 +1166,7 @@ pub async fn mentions_html_fill(
 #[cfg(test)]
 #[path = "mentions_html_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "notif_page_bench.rs"]
+mod notif_page_bench;

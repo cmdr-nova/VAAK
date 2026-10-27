@@ -177,88 +177,80 @@ async fn load_hits(
         return Ok((fav, bm, rb));
     }
 
-    if !status_ids.is_empty() {
-        for row in db
-            .query(
-                "SELECT status_id FROM masto_favourites
-                 WHERE owner_user_id = $1::bigint AND status_id = ANY($2)",
-                &[&owner, &status_ids],
-            )
-            .await
-            .context("select masto_favourites by status_id")?
-        {
-            let sid: String = row.get(0);
-            push_key(&mut fav, &sid);
-        }
-        for row in db
-            .query(
-                "SELECT status_id FROM masto_bookmarks
-                 WHERE owner_user_id = $1::bigint AND status_id = ANY($2)",
-                &[&owner, &status_ids],
-            )
-            .await
-            .context("select masto_bookmarks by status_id")?
-        {
-            let sid: String = row.get(0);
-            push_key(&mut bm, &sid);
-        }
-        for row in db
-            .query(
-                "SELECT status_id FROM masto_reblogs
-                 WHERE owner_user_id = $1::bigint AND status_id = ANY($2)",
-                &[&owner, &status_ids],
-            )
-            .await
-            .context("select masto_reblogs by status_id")?
-        {
-            let sid: String = row.get(0);
-            push_key(&mut rb, &sid);
-        }
+    let fav_status = async {
+        if status_ids.is_empty() { return Ok(Vec::new()); }
+        db.query(
+            "SELECT status_id FROM masto_favourites
+             WHERE owner_user_id = $1::bigint AND status_id = ANY($2)",
+            &[&owner, &status_ids],
+        ).await.context("select masto_favourites by status_id")
+    };
+    let bm_status = async {
+        if status_ids.is_empty() { return Ok(Vec::new()); }
+        db.query(
+            "SELECT status_id FROM masto_bookmarks
+             WHERE owner_user_id = $1::bigint AND status_id = ANY($2)",
+            &[&owner, &status_ids],
+        ).await.context("select masto_bookmarks by status_id")
+    };
+    let rb_status = async {
+        if status_ids.is_empty() { return Ok(Vec::new()); }
+        db.query(
+            "SELECT status_id FROM masto_reblogs
+             WHERE owner_user_id = $1::bigint AND status_id = ANY($2)",
+            &[&owner, &status_ids],
+        ).await.context("select masto_reblogs by status_id")
+    };
+    let fav_object = async {
+        if object_ids.is_empty() { return Ok(Vec::new()); }
+        db.query(
+            "SELECT object_id FROM masto_favourites
+             WHERE owner_user_id = $1::bigint AND object_id = ANY($2)",
+            &[&owner, &object_ids],
+        ).await.context("select masto_favourites by object_id")
+    };
+    let bm_object = async {
+        if object_ids.is_empty() { return Ok(Vec::new()); }
+        db.query(
+            "SELECT object_id FROM masto_bookmarks
+             WHERE owner_user_id = $1::bigint AND object_id = ANY($2)",
+            &[&owner, &object_ids],
+        ).await.context("select masto_bookmarks by object_id")
+    };
+    let rb_object = async {
+        if object_ids.is_empty() { return Ok(Vec::new()); }
+        db.query(
+            "SELECT object_id FROM masto_reblogs
+             WHERE owner_user_id = $1::bigint AND object_id = ANY($2)",
+            &[&owner, &object_ids],
+        ).await.context("select masto_reblogs by object_id")
+    };
+    let (fav_status, bm_status, rb_status, fav_object, bm_object, rb_object) = tokio::try_join!(
+        fav_status, bm_status, rb_status, fav_object, bm_object, rb_object,
+    )?;
+    for row in fav_status {
+        let sid: String = row.get(0);
+        push_key(&mut fav, &sid);
     }
-
-    if !object_ids.is_empty() {
-        for row in db
-            .query(
-                "SELECT object_id FROM masto_favourites
-                 WHERE owner_user_id = $1::bigint AND object_id = ANY($2)",
-                &[&owner, &object_ids],
-            )
-            .await
-            .context("select masto_favourites by object_id")?
-        {
-            let oid: Option<String> = row.get(0);
-            if let Some(oid) = oid {
-                push_key(&mut fav, &oid);
-            }
-        }
-        for row in db
-            .query(
-                "SELECT object_id FROM masto_bookmarks
-                 WHERE owner_user_id = $1::bigint AND object_id = ANY($2)",
-                &[&owner, &object_ids],
-            )
-            .await
-            .context("select masto_bookmarks by object_id")?
-        {
-            let oid: Option<String> = row.get(0);
-            if let Some(oid) = oid {
-                push_key(&mut bm, &oid);
-            }
-        }
-        for row in db
-            .query(
-                "SELECT object_id FROM masto_reblogs
-                 WHERE owner_user_id = $1::bigint AND object_id = ANY($2)",
-                &[&owner, &object_ids],
-            )
-            .await
-            .context("select masto_reblogs by object_id")?
-        {
-            let oid: Option<String> = row.get(0);
-            if let Some(oid) = oid {
-                push_key(&mut rb, &oid);
-            }
-        }
+    for row in bm_status {
+        let sid: String = row.get(0);
+        push_key(&mut bm, &sid);
+    }
+    for row in rb_status {
+        let sid: String = row.get(0);
+        push_key(&mut rb, &sid);
+    }
+    for row in fav_object {
+        let oid: Option<String> = row.get(0);
+        if let Some(oid) = oid { push_key(&mut fav, &oid); }
+    }
+    for row in bm_object {
+        let oid: Option<String> = row.get(0);
+        if let Some(oid) = oid { push_key(&mut bm, &oid); }
+    }
+    for row in rb_object {
+        let oid: Option<String> = row.get(0);
+        if let Some(oid) = oid { push_key(&mut rb, &oid); }
     }
 
     Ok((fav, bm, rb))
@@ -273,25 +265,29 @@ pub async fn apply_to_statuses(db: &Client, owner_user_id: i64, statuses: &mut [
     if statuses.is_empty() {
         return Ok(());
     }
-    let viewer_did = load_viewer_did(db, owner_user_id).await;
-    let (fav, bm, rb) = if owner_user_id > 0 {
-        let mut status_ids = HashSet::new();
-        let mut object_ids = HashSet::new();
-        for st in statuses.iter() {
-            if st.is_object() {
-                collect_keys(st, &mut status_ids, &mut object_ids);
+    let viewer_did_fut = load_viewer_did(db, owner_user_id);
+    let hits_fut = async {
+        if owner_user_id > 0 {
+            let mut status_ids = HashSet::new();
+            let mut object_ids = HashSet::new();
+            for st in statuses.iter() {
+                if st.is_object() {
+                    collect_keys(st, &mut status_ids, &mut object_ids);
+                }
             }
-        }
-        if status_ids.is_empty() && object_ids.is_empty() {
-            (HashSet::new(), HashSet::new(), HashSet::new())
+            if status_ids.is_empty() && object_ids.is_empty() {
+                Ok((HashSet::new(), HashSet::new(), HashSet::new()))
+            } else {
+                let sid_list: Vec<String> = status_ids.into_iter().collect();
+                let oid_list: Vec<String> = object_ids.into_iter().collect();
+                load_hits(db, owner_user_id, &sid_list, &oid_list).await
+            }
         } else {
-            let sid_list: Vec<String> = status_ids.into_iter().collect();
-            let oid_list: Vec<String> = object_ids.into_iter().collect();
-            load_hits(db, owner_user_id, &sid_list, &oid_list).await?
+            Ok((HashSet::new(), HashSet::new(), HashSet::new()))
         }
-    } else {
-        (HashSet::new(), HashSet::new(), HashSet::new())
     };
+    let (viewer_did, hits) = tokio::join!(viewer_did_fut, hits_fut);
+    let (fav, bm, rb) = hits?;
     let did = viewer_did.as_deref();
     for st in statuses.iter_mut() {
         if st.is_object() {
