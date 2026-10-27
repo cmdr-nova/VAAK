@@ -680,6 +680,14 @@ fn render_core_mode(status:&Value,facts:&CardFacts,direct:Option<&crate::direct_
             st = inner;
         }
     }
+    let rehomed_status = if st.get("quote").is_some_and(Value::is_object) || st.get("vaak_quote_preview").is_some_and(Value::is_object) {
+        let mut cloned = st.clone();
+        crate::quote_media::rehome_flattened_quote_media(&mut cloned);
+        Some(cloned)
+    } else {
+        None
+    };
+    let st = rehomed_status.as_ref().unwrap_or(st);
     let account = st.get("account").unwrap_or(&Value::Null);
     let actor_ref=account_actor_ref(account);
     let actor = actor_ref.as_str();

@@ -19872,6 +19872,39 @@ function admin_render_masto_status_card(
             }
         }
     }
+    // A QT line with no loaded quote is the flattened-summary case: the
+    // quoted file is still on this post. Give the stub the attachments
+    // before the media row is copied, so they paint inside the quote card.
+    if (!is_array($st['quote'] ?? null) && $plain !== '' && function_exists('admin_split_quote_summary')) {
+        $splitEarly = admin_split_quote_summary($plain);
+        $quotedLine = is_array($splitEarly) ? trim((string) ($splitEarly['quoted'] ?? '')) : '';
+        if ($quotedLine !== '' && preg_match('/^↪\s*QT(?:\s+@(\S+))?\s*:\s*(.*)$/us', $quotedLine, $qm)) {
+            $qText = trim((string) ($qm[2] ?? ''));
+            $qAcct = ltrim(trim((string) ($qm[1] ?? '')), '@');
+            $qUrl = '';
+            if ($qText !== '' && str_starts_with($qText, 'https://') && !str_contains($qText, ' ')) {
+                $qUrl = rtrim($qText, '.,);]');
+                $qText = '';
+            }
+            $st['quote'] = [
+                'state' => 'accepted',
+                'quoted_status' => [
+                    'source' => 'quote-summary',
+                    'uri' => $qUrl,
+                    'url' => $qUrl,
+                    'content' => $qText,
+                    'account' => [
+                        'acct' => $qAcct,
+                        'display_name' => $qAcct !== '' ? $qAcct : 'Quoted post',
+                    ],
+                    'media_attachments' => [],
+                ],
+            ];
+        }
+    }
+    if (function_exists('ap_masto_rehome_flattened_quote_media')) {
+        $st = ap_masto_rehome_flattened_quote_media($st);
+    }
     $media = [];
     foreach (($st['media_attachments'] ?? []) as $att) {
         if (!is_array($att)) {
@@ -19879,6 +19912,7 @@ function admin_render_masto_status_card(
         }
         $u = (string) ($att['url'] ?? $att['preview_url'] ?? '');
         $preview = (string) ($att['preview_url'] ?? '');
+        $remote = (string) ($att['remote_url'] ?? '');
         if (!str_starts_with($u, 'https://')) {
             continue;
         }
@@ -19890,6 +19924,7 @@ function admin_render_masto_status_card(
                 ? ($attMime !== '' ? $attMime : 'video/mp4')
                 : ($atype === 'audio' ? ($attMime !== '' ? $attMime : 'audio/mpeg') : null),
             'preview_url' => str_starts_with($preview, 'https://') ? $preview : null,
+            'remote_url' => str_starts_with($remote, 'https://') ? $remote : null,
         ];
         // Alt text rides with the attachment. The shared media row escapes it.
         foreach (['description', 'name', 'alt'] as $altKey) {
@@ -22120,7 +22155,7 @@ function admin_render_outbox_card(array $n, string $returnView): void
                   $ownInner .= '<div class="body feed-body" style="white-space:pre-wrap">'
                       . admin_linkify_body_html($bodyPlain, $returnView, [], $actor !== '' ? $actor : null) . '</div>';
               }
-              $ownInner .= $quoteHtml . $mediaHtml;
+              $ownInner .= $mediaHtml . $quoteHtml;
               $pollHtml = ($noteId !== '' && function_exists('admin_poll_block_html'))
                   ? admin_poll_block_html($noteId, true, (string) $returnView)
                   : '';
@@ -22722,8 +22757,8 @@ function admin_render_bsky_feed_item(array $item, string $feedKey = 'following',
       <?php if ($bodyHtml !== ''): ?>
         <div class="body feed-body"><?= $bodyHtml ?></div>
       <?php endif; ?>
-      <?= $quoteHtml ?>
       <?= $mediaHtml ?>
+      <?= $quoteHtml ?>
       <?= $linkCardHtml ?>
       <div class="tweet-actions">
         <?php
@@ -30370,6 +30405,29 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     .tweet-bsky .quote-block { white-space: normal; }
     .tweet-bsky-home .quote-block { margin-top: .45rem; }
     .quote-block .qt-label { color: var(--primary); font-size: .75rem; letter-spacing: .04em; }
+    /* Quoted attachments sit inside the quote card, smaller than the outer post's media. */
+    .quote-block .media-row,
+    .quote-media .media-row {
+      margin-top: .45rem;
+      border-radius: 8px;
+    }
+    .quote-block .media-row.media-count-1 img,
+    .quote-media .media-row.media-count-1 img,
+    .quote-block .media-row .media-video,
+    .quote-media .media-row .media-video {
+      max-height: min(36vh, 280px);
+      min-height: 0;
+    }
+    .quote-block .media-row.media-count-3,
+    .quote-block .media-row.media-count-4,
+    .quote-media .media-row.media-count-3,
+    .quote-media .media-row.media-count-4 {
+      grid-template-rows: minmax(96px, 1fr) minmax(96px, 1fr);
+    }
+    .quote-block .media-audio-card,
+    .quote-media .media-audio-card {
+      min-height: 96px;
+    }
     .compose-reply-context:has(.compose-reply-preview) .qt-label { display: block; margin-bottom: .35rem; }
     .compose-reply-preview {
       display: flex; gap: .65rem; align-items: flex-start;

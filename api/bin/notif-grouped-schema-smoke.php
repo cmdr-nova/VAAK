@@ -16,6 +16,13 @@ if (!function_exists('reference_load')) {
 stream_wrapper_unregister('http');
 stream_wrapper_unregister('https');
 reference_load($api . '/ap-masto-entities.php', [
+    'ap_masto_strip_announce_fragment',
+    'ap_masto_status_is_boost_wrapper',
+    'ap_masto_quoted_display_status',
+    'ap_masto_attachment_asset_urls',
+    'ap_masto_outer_media_without_quote_duplicates',
+    'ap_masto_quoted_media_is_authoritative',
+    'ap_masto_rehome_flattened_quote_media',
     'ap_masto_format_time',
     'ap_masto_https_avatar_fallback',
     'ap_masto_https_header_fallback',

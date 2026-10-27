@@ -71,7 +71,30 @@ function ap_masto_quoted_display_status(array $quoted): array
     return $quoted;
 }
 
-/** Remove only exact quoted-asset copies from a parent's flattened media list. */
+/**
+ * HTTPS asset identities for one attachment.
+ * `url` is what we paint; `remote_url` is the original before a CDN rewrite.
+ * Preview thumbnails are not identities.
+ *
+ * @param mixed $attachment
+ * @return list<string>
+ */
+function ap_masto_attachment_asset_urls(mixed $attachment): array
+{
+    if (!is_array($attachment)) {
+        return [];
+    }
+    $urls = [];
+    foreach (['url', 'remote_url'] as $key) {
+        $url = $attachment[$key] ?? null;
+        if (is_string($url) && str_starts_with($url, 'https://') && !isset($urls[$url])) {
+            $urls[$url] = true;
+        }
+    }
+    return array_keys($urls);
+}
+
+/** Remove quoted-asset copies from a parent's flattened media list. */
 function ap_masto_outer_media_without_quote_duplicates(array $status): array
 {
     $outer = is_array($status['media_attachments'] ?? null) ? $status['media_attachments'] : [];
@@ -81,20 +104,115 @@ function ap_masto_outer_media_without_quote_duplicates(array $status): array
     }
     $quoted = ap_masto_quoted_display_status($envelope['quoted_status']);
     $media = is_array($quoted['media_attachments'] ?? null) ? $quoted['media_attachments'] : [];
-    $assetUrl = static function ($attachment): ?string {
-        if (!is_array($attachment)) return null;
-        $url = is_string($attachment['url'] ?? null) ? $attachment['url'] : null;
-        return is_string($url) && str_starts_with($url, 'https://') ? $url : null;
-    };
     $quotedUrls = [];
     foreach ($media as $attachment) {
-        $url = $assetUrl($attachment);
-        if ($url !== null) $quotedUrls[$url] = true;
+        foreach (ap_masto_attachment_asset_urls($attachment) as $url) {
+            $quotedUrls[$url] = true;
+        }
     }
-    return array_values(array_filter($outer, static function ($attachment) use ($assetUrl, $quotedUrls): bool {
-        $url = $assetUrl($attachment);
-        return $url === null || !isset($quotedUrls[$url]);
+    return array_values(array_filter($outer, static function ($attachment) use ($quotedUrls): bool {
+        $ids = ap_masto_attachment_asset_urls($attachment);
+        if ($ids === []) {
+            return true;
+        }
+        foreach ($ids as $url) {
+            if (isset($quotedUrls[$url])) {
+                return false;
+            }
+        }
+        return true;
     }));
+}
+
+/**
+ * A loaded quoted status owns its attachment list, even when that list is empty.
+ * Summary stubs do not: ingestion used to flatten the quoted file onto the parent.
+ */
+function ap_masto_quoted_media_is_authoritative(array $quoted): bool
+{
+    if (($quoted['source'] ?? '') === 'quote-summary') {
+        return false;
+    }
+    return array_key_exists('media_attachments', $quoted);
+}
+
+/**
+ * Put flattened quoted attachments back on the quote and drop those copies
+ * from the parent. A resolved quote with its own attachment list is left
+ * alone except for exact url/remote_url duplicates.
+ *
+ * @param array<string,mixed> $status
+ * @return array<string,mixed>
+ */
+function ap_masto_rehome_flattened_quote_media(array $status): array
+{
+    $quote = is_array($status['quote'] ?? null) ? $status['quote'] : null;
+    if ($quote === null && is_array($status['vaak_quote_preview'] ?? null)) {
+        $quote = ['state' => 'accepted', 'quoted_status' => null];
+    }
+    if ($quote === null) {
+        return $status;
+    }
+    $quoted = is_array($quote['quoted_status'] ?? null) ? $quote['quoted_status'] : null;
+    if (is_array($quoted)) {
+        $quoted = ap_masto_quoted_display_status($quoted);
+    }
+    $childUrls = [];
+    if (is_array($quoted)) {
+        $childMedia = is_array($quoted['media_attachments'] ?? null) ? $quoted['media_attachments'] : [];
+        foreach ($childMedia as $attachment) {
+            foreach (ap_masto_attachment_asset_urls($attachment) as $url) {
+                $childUrls[$url] = true;
+            }
+        }
+    }
+    $parent = is_array($status['media_attachments'] ?? null) ? $status['media_attachments'] : [];
+    // A loaded status owns its attachment list, including an empty one.
+    // Only a summary stub, or a quote that has not resolved to a status at
+    // all, may take files that ingestion flattened onto the parent.
+    $summary = is_array($quoted) && ($quoted['source'] ?? '') === 'quote-summary';
+    $missing = !is_array($quoted);
+    $loaded = is_array($quoted) && ap_masto_quoted_media_is_authoritative($quoted);
+    if (!$loaded && ($summary || $missing) && $childUrls === [] && $parent !== []) {
+        if (!is_array($quoted)) {
+            $preview = is_array($status['vaak_quote_preview'] ?? null) ? $status['vaak_quote_preview'] : [];
+            $text = trim((string) ($preview['text'] ?? ''));
+            $acct = ltrim(trim((string) ($preview['acct'] ?? '')), '@');
+            $url = trim((string) ($preview['url'] ?? ($status['quote_url'] ?? '')));
+            $display = trim((string) ($preview['display_name'] ?? $preview['display'] ?? ''));
+            if ($display === '') {
+                $display = $acct !== '' ? $acct : 'Quoted post';
+            }
+            $quoted = [
+                'source' => 'quote-summary',
+                'id' => $url !== '' ? $url : 'quote:summary',
+                'uri' => $url,
+                'url' => $url,
+                'content' => $text,
+                'account' => [
+                    'acct' => $acct,
+                    'display_name' => $display,
+                    'url' => $url,
+                ],
+                'media_attachments' => $parent,
+                'sensitive' => !empty($preview['sensitive']),
+                'spoiler_text' => trim((string) ($preview['spoiler_text'] ?? '')),
+            ];
+        } else {
+            $quoted['media_attachments'] = $parent;
+            $quoted['source'] = 'quote-summary';
+        }
+        $quote['state'] = 'accepted';
+        $quote['quoted_status'] = $quoted;
+        if (!isset($quote['quoted_status_id']) || $quote['quoted_status_id'] === null || $quote['quoted_status_id'] === '') {
+            $quote['quoted_status_id'] = (string) ($quoted['id'] ?? '');
+        }
+    } elseif (is_array($quoted)) {
+        $quote['quoted_status'] = $quoted;
+    }
+    $status['quote'] = $quote;
+    $status['media_attachments'] = ap_masto_outer_media_without_quote_duplicates($status);
+    return $status;
 }
 
 /**
@@ -6718,6 +6836,9 @@ function ap_masto_api_status(?array $status, int $depth = 0): ?array
     if ($status === null || $depth > 3) {
         return null;
     }
+    if ($depth === 0) {
+        $status = ap_masto_rehome_flattened_quote_media($status);
+    }
     $id = ap_masto_api_string_id($status['id'] ?? null);
     $account = ap_masto_api_account(is_array($status['account'] ?? null) ? $status['account'] : null);
     if ($id === null || $account === null) {
@@ -10089,9 +10210,10 @@ function ap_masto_status_from_event(array $row, ?string $profileBoostActor = nul
                         }
                     }
                 }
-                // A quoted status with no attachment metadata does not establish
-                // ownership of the parent's media. Keep distinct parent assets.
-                $status['media_attachments'] = ap_masto_outer_media_without_quote_duplicates($status);
+                // Known quoted assets leave the parent (url or remote_url). A loaded
+                // quote with an explicit empty attachment list does not take the
+                // parent's own files. A summary stub still holds the flattened copy.
+                $status = ap_masto_rehome_flattened_quote_media($status);
             }
         }
     }

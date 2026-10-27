@@ -3932,6 +3932,18 @@ pub fn paint_lean_embed_from(
     viewer_actor: &str,
     show_actions: bool,
 ) -> String {
+    // Flattened quote files live on the parent until paint. Rehome a clone so
+    // the quoted card owns them and the caller's status JSON stays put.
+    let rehomed_status = if status.get("quote").is_some_and(Value::is_object)
+        || status.get("vaak_quote_preview").is_some_and(Value::is_object)
+    {
+        let mut cloned = status.clone();
+        crate::quote_media::rehome_flattened_quote_media(&mut cloned);
+        Some(cloned)
+    } else {
+        None
+    };
+    let status = rehomed_status.as_ref().unwrap_or(status);
     // A nested quote (show_actions false) is checked with its outer card.
     if show_actions {
         warn_card_contract(status, from);
@@ -5470,6 +5482,54 @@ mod tests {
         unresolved["quote"]["quoted_status"]["media_attachments"] = json!([]);
         let html = paint_lean_feed_card(&unresolved);
         assert!(html.find("https://media.test/quoted.jpg").unwrap() < html.find("class=\"quote-block\"").unwrap(), "unproved ownership must not move parent media");
+    }
+
+    #[test]
+    fn quote_summary_media_paints_inside_the_quote_card() {
+        let account = |acct: &str, uri: &str| json!({
+            "acct": acct, "display_name": acct, "avatar": "https://example.com/a.png", "uri": uri
+        });
+        let mut status = json!({
+            "id": "outer",
+            "uri": "https://roddie.social/users/roddie/statuses/1",
+            "url": "https://roddie.social/users/roddie/statuses/1",
+            "content": "<p>Paint me like one of your French girls</p>",
+            "created_at": "2026-10-05T05:00:00.000Z",
+            "account": account("roddie@roddie.social", "https://roddie.social/users/roddie"),
+            "media_attachments": [{"type":"image","url":"https://media.test/ambipom.jpg","preview_url":"https://media.test/ambipom.jpg"}],
+            "quote": {"state":"accepted","quoted_status":{
+                "source":"quote-summary",
+                "id":"https://mastodon.social/@EveryPkmnCard/9",
+                "uri":"https://mastodon.social/@EveryPkmnCard/9",
+                "url":"https://mastodon.social/@EveryPkmnCard/9",
+                "content":"<p>Ambipom</p>",
+                "account": account("EveryPkmnCard@mastodon.social", "https://mastodon.social/users/EveryPkmnCard"),
+                "media_attachments": []
+            }}
+        });
+        let html = paint_lean_feed_card(&status);
+        let quote = html.find("class=\"quote-block\"").expect(&html);
+        let media = html.find("https://media.test/ambipom.jpg").expect(&html);
+        assert!(media > quote, "summary image painted as the quoting post's media: {html}");
+        assert!(html.contains("Ambipom"), "{html}");
+        assert!(html.contains("EveryPkmnCard@mastodon.social"), "{html}");
+
+        status["quote"]["quoted_status"]["content"] = json!("");
+        status["quote"]["quoted_status"]["sensitive"] = json!(true);
+        status["quote"]["quoted_status"]["spoiler_text"] = json!("Card back");
+        status["media_attachments"] = json!([
+            {"type":"image","url":"https://media.test/one.jpg"},
+            {"type":"gifv","url":"https://media.test/two.mp4"},
+            {"type":"video","url":"https://media.test/three.mp4"},
+            {"type":"audio","url":"https://media.test/four.mp3"}
+        ]);
+        let html = paint_lean_feed_card(&status);
+        let quote = html.find("class=\"quote-block\"").expect(&html);
+        for url in ["https://media.test/one.jpg", "https://media.test/two.mp4", "https://media.test/three.mp4", "https://media.test/four.mp3"] {
+            assert!(html.find(url).expect(url) > quote, "{url} left the quote: {html}");
+        }
+        assert!(html[quote..].contains("Card back") || html[quote..].contains("cw-gate"), "quoted warning left the card: {html}");
+        assert_eq!(html[..quote].matches("class=\"media-row").count(), 0, "quoting post painted the quoted files: {html}");
     }
 
     #[test]

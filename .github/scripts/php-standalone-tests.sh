@@ -141,6 +141,7 @@ php_tests=(
   api/bin/timeline-newer-counter-smoke.php
   api/bin/timeline-cursor-smoke.php
   api/bin/timeline-quote-boost-smoke.php
+  api/bin/quote-media-layout-smoke.php
   api/bin/wafrn-crosspost-smoke.php
 )
 
