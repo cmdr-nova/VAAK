@@ -650,6 +650,10 @@ function ap_rss_add_feed(int $ownerUserId, string $rawUrl): array
         $url = $rewritten;
         $viaRsshub = true;
     }
+    $redditFeed = ap_rss_reddit_canonical_feed_url($url);
+    if ($redditFeed !== null) {
+        $url = $redditFeed;
+    }
     $existing = ap_db()->prepare('SELECT id FROM rss_feeds WHERE owner_user_id = ? AND feed_url = ?');
     $existing->execute([$ownerUserId, $url]);
     if ($existing->fetchColumn()) {
@@ -671,8 +675,13 @@ function ap_rss_add_feed(int $ownerUserId, string $rawUrl): array
 
     $discovered = $viaRsshub;
     // Interactive add: one attempt so a Tumblr 429 does not stall the page for retries.
-    $fetch = ap_rss_http_get($url, '', '', ['max_attempts' => 1]);
-    if ($fetch['ok'] && ap_rss_looks_like_feed($fetch['body'])) {
+    $fetch = $redditFeed !== null
+        ? ap_rss_reddit_fetch($url, ['max_attempts' => 1])
+        : ap_rss_http_get($url, '', '', ['max_attempts' => 1]);
+    if ($fetch['ok'] && $redditFeed !== null) {
+        $feedUrl = $url;
+        $parsed = ap_rss_parse_reddit_json($fetch['body'], $feedUrl);
+    } elseif ($fetch['ok'] && ap_rss_looks_like_feed($fetch['body'])) {
         $feedUrl = $url;
         $parsed = ap_rss_parse_feed($fetch['body'], $feedUrl);
     } else {
@@ -685,6 +694,13 @@ function ap_rss_add_feed(int $ownerUserId, string $rawUrl): array
             $err = ap_rss_rsshub_failure_message($status, $fetch['body'] ?? '', $err);
         }
         $rateLimited = ($status === 429 || $status === 503);
+        if ($redditFeed !== null) {
+            // Reddit feeds have no HTML discovery fallback; let the poller retry soft failures.
+            if ($rateLimited || $status === 0) {
+                return ap_rss_add_feed_deferred($ownerUserId, $url, $err, false);
+            }
+            return ['ok' => false, 'error' => $err];
+        }
 
         // Save locally on rate-limit when we already know the feed URL (Tumblr /rss, etc.).
         $deferUrl = ap_rss_resolve_deferrable_feed_url($url);
@@ -792,25 +808,30 @@ function ap_rss_refresh_feed(int $feedId, ?int $ownerUserId = null, bool $force 
     if ($feed === null) {
         return ['ok' => false, 'error' => 'Feed not found'];
     }
-    $fetch = ap_rss_http_get(
-        (string) $feed['feed_url'],
-        $force ? '' : (string) ($feed['etag'] ?? ''),
-        $force ? '' : (string) ($feed['last_modified'] ?? '')
-    );
+    $reddit = ap_rss_reddit_json_url((string) $feed['feed_url']) !== null;
+    $fetch = $reddit
+        ? ap_rss_reddit_fetch((string) $feed['feed_url'])
+        : ap_rss_http_get(
+            (string) $feed['feed_url'],
+            $force ? '' : (string) ($feed['etag'] ?? ''),
+            $force ? '' : (string) ($feed['last_modified'] ?? '')
+        );
     if ($fetch['status'] === 304) {
         ap_db()->prepare(
             'UPDATE rss_feeds SET last_fetched_at = NOW(), last_error = ? WHERE id = ?'
         )->execute(['', $feedId]);
         return ['ok' => true, 'added' => 0, 'unchanged' => true];
     }
-    if (!$fetch['ok'] || !ap_rss_looks_like_feed($fetch['body'])) {
+    if (!$fetch['ok'] || (!$reddit && !ap_rss_looks_like_feed($fetch['body']))) {
         $err = $fetch['error'] !== '' ? $fetch['error'] : ('HTTP ' . $fetch['status']);
         ap_db()->prepare(
             'UPDATE rss_feeds SET last_fetched_at = NOW(), last_error = ? WHERE id = ?'
         )->execute([mb_substr($err, 0, 500), $feedId]);
         return ['ok' => false, 'error' => $err];
     }
-    $parsed = ap_rss_parse_feed($fetch['body'], (string) $feed['feed_url']);
+    $parsed = $reddit
+        ? ap_rss_parse_reddit_json($fetch['body'], (string) $feed['feed_url'])
+        : ap_rss_parse_feed($fetch['body'], (string) $feed['feed_url']);
     if ($parsed === null) {
         ap_db()->prepare(
             'UPDATE rss_feeds SET last_fetched_at = NOW(), last_error = ? WHERE id = ?'
@@ -825,6 +846,10 @@ function ap_rss_refresh_feed(int $feedId, ?int $ownerUserId = null, bool $force 
         );
     }
     $title = $parsed['title'] !== '' ? $parsed['title'] : (string) $feed['title'];
+    if ($reddit && trim((string) $feed['title']) !== '') {
+        // Keep the name the Atom feed gave this subscription.
+        $title = (string) $feed['title'];
+    }
     $site = $parsed['site_url'] !== '' ? $parsed['site_url'] : (string) $feed['site_url'];
     ap_db()->prepare(
         'UPDATE rss_feeds
@@ -1478,6 +1503,12 @@ function ap_rss_http_error_message(int $status, string $url = ''): string
  * @param array{max_attempts?:int} $opts Interactive add uses max_attempts=1 so 429 does not stall the page.
  * @return array{ok:bool,status:int,body:string,etag:string,last_modified:string,error:string}
  */
+/** Browser-ish feed reader UA — Tumblr is harsher on bare bot strings from datacenter IPs. */
+function ap_rss_user_agent(): string
+{
+    return 'Mozilla/5.0 (compatible; VAAK-RSS/0.5; +https://vaak.monster/)';
+}
+
 function ap_rss_http_get(string $url, string $etag = '', string $lastModified = '', array $opts = []): array
 {
     $backoffLeft = ap_rss_host_backoff_until($url) - time();
@@ -1493,11 +1524,13 @@ function ap_rss_http_get(string $url, string $etag = '', string $lastModified = 
     }
 
     $headers = [
-        'Accept: application/rss+xml, application/atom+xml, application/xml;q=0.9, text/xml;q=0.8, */*;q=0.7',
-        // Browser-ish feed reader UA — Tumblr is harsher on bare bot strings from datacenter IPs.
-        'User-Agent: Mozilla/5.0 (compatible; VAAK-RSS/0.5; +https://vaak.monster/)',
+        'Accept: ' . (string) ($opts['accept'] ?? 'application/rss+xml, application/atom+xml, application/xml;q=0.9, text/xml;q=0.8, */*;q=0.7'),
+        'User-Agent: ' . ap_rss_user_agent(),
         'Accept-Language: en-US,en;q=0.8',
     ];
+    foreach ((array) ($opts['headers'] ?? []) as $extra) {
+        $headers[] = (string) $extra;
+    }
     if ($etag !== '') {
         $headers[] = 'If-None-Match: ' . $etag;
     }
@@ -1733,6 +1766,275 @@ function ap_rss_favicon_for_url(string $pageUrl): string
 /**
  * @return array{title:string,site_url:string,image_url:string,items:list<array<string,mixed>>}|null
  */
+/*
+ * Reddit is retiring RSS/Atom. Reddit listing feeds (subreddits, users, the
+ * front page, one thread's comments) are fetched from the JSON listing of the
+ * same path instead. rss_feeds.feed_url keeps its .rss spelling, so existing
+ * subscriptions, the "already added" check and item guids (t3_… / t1_…, the
+ * same ids the Atom feed used) carry over untouched.
+ *
+ * Optional app-only OAuth: set AP_REDDIT_CLIENT_ID and AP_REDDIT_CLIENT_SECRET
+ * (a "script" or "web app" at reddit.com/prefs/apps) and listings come from
+ * oauth.reddit.com, which Reddit rate-limits far less than anonymous .json.
+ */
+
+/**
+ * Listing path and query for a Reddit feed or page URL, or null when the URL
+ * is not one. Path has no trailing slash and no .rss/.json suffix ('' is the
+ * front page); /u/ is spelled /user/.
+ *
+ * @return array{path:string,query:array<string,string>,feed:bool}|null
+ */
+function ap_rss_reddit_listing(string $url): ?array
+{
+    $parts = parse_url(trim($url));
+    if (!is_array($parts) || strtolower((string) ($parts['scheme'] ?? '')) !== 'https') {
+        return null;
+    }
+    $host = strtolower((string) ($parts['host'] ?? ''));
+    if (!in_array($host, ['reddit.com', 'www.reddit.com', 'old.reddit.com', 'new.reddit.com', 'np.reddit.com'], true)) {
+        return null;
+    }
+    $path = (string) ($parts['path'] ?? '');
+    $feed = false;
+    if (preg_match('#/?\.(?:rss|json)$#i', $path)) {
+        $path = (string) preg_replace('#/?\.(?:rss|json)$#i', '', $path);
+        $feed = true;
+    }
+    $path = rtrim($path, '/');
+    $path = (string) preg_replace('#^/u/#i', '/user/', $path);
+    if ($path !== '' && !preg_match('#^/(?:r|user)/[A-Za-z0-9_+\-]+(?:/[A-Za-z0-9_\-]+){0,3}$#', $path)) {
+        return null;
+    }
+    $query = [];
+    parse_str((string) ($parts['query'] ?? ''), $query);
+    $clean = [];
+    foreach ($query as $k => $v) {
+        if (is_string($k) && is_string($v) && in_array($k, ['t', 'sort', 'limit', 'q', 'restrict_sr'], true)) {
+            $clean[$k] = $v;
+        }
+    }
+    return ['path' => $path, 'query' => $clean, 'feed' => $feed];
+}
+
+/**
+ * Subscribing to a subreddit or user page (no .rss) stores the canonical
+ * …/.rss URL. Reddit pages no longer advertise a feed once RSS is gone, so
+ * discovery would fail. Null for non-Reddit URLs and the bare front page.
+ */
+function ap_rss_reddit_canonical_feed_url(string $url): ?string
+{
+    $l = ap_rss_reddit_listing($url);
+    if ($l === null) {
+        return null;
+    }
+    if ($l['feed']) {
+        return $url;
+    }
+    if ($l['path'] === '') {
+        return null;
+    }
+    $q = $l['query'] !== [] ? ('?' . http_build_query($l['query'])) : '';
+    return 'https://www.reddit.com' . $l['path'] . '/.rss' . $q;
+}
+
+/** JSON listing URL for a stored Reddit feed URL (null when not a Reddit feed). */
+function ap_rss_reddit_json_url(string $feedUrl, bool $oauth = false): ?string
+{
+    $l = ap_rss_reddit_listing($feedUrl);
+    if ($l === null || !$l['feed']) {
+        return null;
+    }
+    $query = $l['query'] + ['limit' => '25'];
+    $query['raw_json'] = '1';
+    return ($oauth ? 'https://oauth.reddit.com' : 'https://www.reddit.com')
+        . ($l['path'] === '' ? '/' : $l['path']) . '.json?' . http_build_query($query);
+}
+
+/** App-only OAuth bearer token, cached on disk until shortly before expiry. '' when not configured or on failure. */
+function ap_rss_reddit_oauth_token(): string
+{
+    $id = trim((string) (getenv('AP_REDDIT_CLIENT_ID') ?: ''));
+    $secret = trim((string) (getenv('AP_REDDIT_CLIENT_SECRET') ?: ''));
+    if ($id === '' || $secret === '') {
+        return '';
+    }
+    static $mem = ['token' => '', 'until' => 0];
+    if ($mem['token'] !== '' && $mem['until'] > time()) {
+        return $mem['token'];
+    }
+    $cache = sys_get_temp_dir() . '/vaak-reddit-token-' . substr(hash('sha256', $id), 0, 16) . '.json';
+    $cached = is_file($cache) ? json_decode((string) @file_get_contents($cache), true) : null;
+    if (is_array($cached) && is_string($cached['token'] ?? null) && (int) ($cached['until'] ?? 0) > time()) {
+        $mem = ['token' => $cached['token'], 'until' => (int) $cached['until']];
+        return $mem['token'];
+    }
+    $url = 'https://www.reddit.com/api/v1/access_token';
+    $ch = curl_init();
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_CONNECTTIMEOUT => 8,
+        CURLOPT_TIMEOUT => 15,
+        CURLOPT_PROTOCOLS => CURLPROTO_HTTPS,
+        CURLOPT_POST => true,
+        CURLOPT_POSTFIELDS => 'grant_type=client_credentials',
+        CURLOPT_USERPWD => $id . ':' . $secret,
+        CURLOPT_HTTPHEADER => ['User-Agent: ' . ap_rss_user_agent()],
+    ]);
+    $raw = ap_net_curl_exec($ch, $url, 0);
+    $status = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+    curl_close($ch);
+    $json = ($status === 200 && is_string($raw)) ? json_decode($raw, true) : null;
+    $token = is_array($json) ? (string) ($json['access_token'] ?? '') : '';
+    if ($token === '') {
+        return '';
+    }
+    $until = time() + max(60, (int) ($json['expires_in'] ?? 3600) - 300);
+    $mem = ['token' => $token, 'until' => $until];
+    $tmp = $cache . '.' . bin2hex(random_bytes(4));
+    if (@file_put_contents($tmp, json_encode($mem)) !== false) {
+        @chmod($tmp, 0600);
+        @rename($tmp, $cache);
+    }
+    return $token;
+}
+
+/**
+ * Fetch a Reddit feed as its JSON listing. Same result shape as ap_rss_http_get;
+ * body is JSON. No conditional headers: listings do not send validators.
+ */
+function ap_rss_reddit_fetch(string $feedUrl, array $opts = []): array
+{
+    $token = ap_rss_reddit_oauth_token();
+    $jsonUrl = ap_rss_reddit_json_url($feedUrl, $token !== '');
+    if ($jsonUrl === null) {
+        return ['ok' => false, 'status' => 0, 'body' => '', 'etag' => '', 'last_modified' => '', 'error' => 'Not a Reddit feed'];
+    }
+    $opts['accept'] = 'application/json';
+    if ($token !== '') {
+        $opts['headers'] = ['Authorization: Bearer ' . $token];
+    }
+    $fetch = ap_rss_http_get($jsonUrl, '', '', $opts);
+    if ($fetch['ok'] && !is_array(json_decode((string) $fetch['body'], true))) {
+        // Reddit answers some blocks with a 200 HTML page.
+        $fetch['ok'] = false;
+        $fetch['error'] = 'Reddit did not return a listing';
+    }
+    $fetch['etag'] = '';
+    $fetch['last_modified'] = '';
+    return $fetch;
+}
+
+/**
+ * Parse a Reddit JSON listing (or a thread's [post, comments] pair) into the
+ * ap_rss_parse_feed shape.
+ */
+function ap_rss_parse_reddit_json(string $json, string $feedUrl): ?array
+{
+    $data = json_decode($json, true);
+    if (!is_array($data)) {
+        return null;
+    }
+    $listings = array_is_list($data) ? $data : [$data];
+    $children = [];
+    foreach ($listings as $listing) {
+        if (is_array($listing) && ($listing['kind'] ?? '') === 'Listing' && is_array($listing['data']['children'] ?? null)) {
+            foreach ($listing['data']['children'] as $child) {
+                $children[] = $child;
+            }
+        }
+    }
+    if ($children === [] && !(is_array($listings[0] ?? null) && ($listings[0]['kind'] ?? '') === 'Listing')) {
+        return null;
+    }
+    $items = [];
+    foreach ($children as $child) {
+        $item = is_array($child) ? ap_rss_reddit_item($child) : null;
+        if ($item !== null) {
+            $items[] = $item;
+        }
+        if (count($items) >= 80) {
+            break;
+        }
+    }
+    $l = ap_rss_reddit_listing($feedUrl);
+    $path = $l['path'] ?? '';
+    if (preg_match('#^/r/([^/]+)#', $path, $m)) {
+        $title = 'r/' . $m[1];
+    } elseif (preg_match('#^/user/([^/]+)#', $path, $m)) {
+        $title = 'u/' . $m[1];
+    } else {
+        $title = 'Reddit';
+    }
+    return [
+        'title' => $title,
+        'site_url' => 'https://www.reddit.com' . $path . '/',
+        'image_url' => '',
+        'items' => $items,
+    ];
+}
+
+/** One listing child (t3 post or t1 comment) → feed item, or null. */
+function ap_rss_reddit_item(array $child): ?array
+{
+    $kind = (string) ($child['kind'] ?? '');
+    $d = $child['data'] ?? null;
+    if (!is_array($d) || !in_array($kind, ['t3', 't1'], true)) {
+        return null;
+    }
+    $guid = (string) ($d['name'] ?? '');
+    $permalink = (string) ($d['permalink'] ?? '');
+    if ($guid === '' || !str_starts_with($permalink, '/')) {
+        return null;
+    }
+    $itemUrl = 'https://www.reddit.com' . $permalink;
+    $created = (int) ($d['created_utc'] ?? 0);
+    $published = $created > 0 ? gmdate('c', $created) : null;
+    if ($kind === 't1') {
+        return [
+            'guid' => $guid,
+            'url' => $itemUrl,
+            'title' => '/u/' . (string) ($d['author'] ?? '') . ' on ' . (string) ($d['link_title'] ?? ''),
+            'summary_text' => ap_rss_summary_from_html((string) ($d['body_html'] ?? ''), $itemUrl),
+            'image_url' => '',
+            'published_at' => $published,
+            'video' => false,
+        ];
+    }
+    $link = (string) ($d['url_overridden_by_dest'] ?? ($d['url'] ?? ''));
+    // Same rule as the Atom path: Reddit-hosted video drops the item; a YouTube link post stays.
+    $video = !empty($d['is_video']) || (bool) preg_match('#//v\.redd\.it/#i', $link);
+    $candidates = [];
+    if (preg_match('#^https://(?:i\.redd\.it|i\.imgur\.com)/#i', $link)
+        || preg_match('/\.(jpe?g|png|webp|gif)(?:$|[?#])/i', $link)) {
+        $candidates[] = $link;
+    }
+    $gallery = $d['gallery_data']['items'][0]['media_id'] ?? null;
+    if (is_string($gallery)) {
+        $src = $d['media_metadata'][$gallery]['s']['u'] ?? null;
+        if (is_string($src)) {
+            $candidates[] = $src;
+        }
+    }
+    $preview = $d['preview']['images'][0]['source']['url'] ?? null;
+    if (is_string($preview)) {
+        $candidates[] = $preview;
+    }
+    $thumb = (string) ($d['thumbnail'] ?? '');
+    if (preg_match('#^https://#i', $thumb)) {
+        $candidates[] = $thumb;
+    }
+    return [
+        'guid' => $guid,
+        'url' => $itemUrl,
+        'title' => (string) ($d['title'] ?? ''),
+        'summary_text' => ap_rss_summary_from_html((string) ($d['selftext_html'] ?? ''), $itemUrl),
+        'image_url' => $video ? '' : ap_rss_pick_best_image($candidates),
+        'published_at' => $published,
+        'video' => $video,
+    ];
+}
+
 function ap_rss_parse_feed(string $xml, string $feedUrl): ?array
 {
     $xml = trim($xml);
