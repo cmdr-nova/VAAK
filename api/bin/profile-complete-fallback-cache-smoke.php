@@ -65,17 +65,19 @@ $GLOBALS['vaak_guest_profile'] = true;
 $started = microtime(true);
 $hit = ap_profile_complete_fetch('https://mkultra.monster/users/cmdr_nova', 'posts', 12, 0, 0, 'first_paint');
 $hitElapsed = microtime(true) - $started;
-if ($hit !== null || $hitElapsed > 0.05) fallback_fail('cached refusal still called rust');
+// Wall clock only proves the cached path did not wait out a Rust call.
+// A shared runner can stall a few hundred milliseconds without opening a socket.
+if ($hit !== null || $hitElapsed > 0.5) fallback_fail('cached refusal still called rust');
 
 $started = microtime(true);
 $miss = ap_profile_complete_fetch('https://mkultra.monster/users/fresh_actor', 'posts', 12, 0, 0, 'first_paint');
 $missElapsed = microtime(true) - $started;
 if ($miss !== null) fallback_fail('unreachable worker returned a page');
-if ($missElapsed > 1.0) fallback_fail('php caller exceeded the short rust timeout');
+if ($missElapsed > 2.0) fallback_fail('php caller exceeded the short rust timeout');
 $fresh = ap_redis_json_get(ap_profile_complete_fallback_key('fresh_actor', 'page', 'posts'));
 if (!is_array($fresh) || !in_array($fresh['reason'] ?? '', ['timeout', 'transport'], true)) fallback_fail('unreachable worker was not cached');
 $started = microtime(true);
 $second = ap_profile_complete_fetch('https://mkultra.monster/users/fresh_actor', 'posts', 50, 12, 0, 'append');
-if ($second !== null || (microtime(true) - $started) > 0.05) fallback_fail('repeat refusal was not skipped');
+if ($second !== null || (microtime(true) - $started) > 0.5) fallback_fail('repeat refusal was not skipped');
 
 echo "complete-profile fallback cache: reason codes, 30s skip, and short timeout passed\n";

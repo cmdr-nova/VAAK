@@ -6,7 +6,10 @@
 // remain uncached. Each callsite retains exactly its original regex literal.
 macro_rules! static_regex { ($pattern:literal) => {{
  static REGEX: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
- REGEX.get_or_init(||regex::Regex::new($pattern).unwrap())
+ REGEX.get_or_init(||{
+  #[cfg(test)] { crate::library::note_static_regex_compile(); }
+  regex::Regex::new($pattern).unwrap()
+ })
  }}; }
 
 use anyhow::{bail, Result};
@@ -265,9 +268,12 @@ mod tests{
    assert_eq!(render_quote(&q,&facts).unwrap(),string(case,"html"),"actual PHP raw quote {}",string(case,"case"));
   }
  }
- /// Pure painter timing for a 50-card guest page. The old per-card regex compile
- /// made this about 1.3s. Production requests compile these OnceLocks before
- /// the budget clock starts; this guard is the warmed paint only.
+ /// Pure painter guard for a 50-card guest page. The old per-card regex compile
+ /// made this about 1.3s. CI debug runners share the machine with the rest of
+ /// the suite, so a single wall-clock sample is not the gate: after a warmup
+ /// paint, another 50 cards must not call `Regex::new`. The absolute ceiling
+ /// is the best of three samples and runs only for release builds or when
+ /// `VAAK_PERF_ASSERT=1`. It stays under three quarters of the old 1,339ms cost.
  #[test]
  fn fifty_raw_cards_paint_under_budget(){
   let mut card=presentation_facts();card.owner_id=0;card.csrf.clear();
@@ -280,15 +286,24 @@ mod tests{
   let raw=json!({"id":"https://mkultra.monster/users/luna_naloc/notes/mirrored","published":"2026-10-01T00:00:00Z","visibility":"public","content":"<p>Mirrored post with a quote</p>","in_reply_to":"https://mkultra.monster/users/luna_naloc/notes/parent","raw_create_json":serde_json::to_string(&json!({"object":{"vaakOrigin":"bluesky","blueskyUri":"at://did:plc:abc/app.bsky.feed.post/xyz","attachment":attachments,"oneOf":[{"name":"Yes"},{"name":"No"}]}})).unwrap()});
   let profile=RawProfileFacts{card,actor_key:"luna_naloc".into(),actor:"https://mkultra.monster/users/luna_naloc".into(),display_name:"Luna".into(),note_dom_id:"0123456789abcdef0123456789abcdef".into(),masto_row:Some(json!({"edited_at":"2026-10-02T00:00:00Z","spoiler_text":"","sensitive":false,"visibility":"public","content_text":"Mirrored post with a quote"})),status_id:String::new(),own_note:false,guest:true,quote_html,link_card:None,media_preview_by_url:Default::default()};
   let _warmup=render_core(&raw,&profile).unwrap();
-  let started=std::time::Instant::now();
+  let compiles_before=crate::library::static_regex_compiles();
+  assert!(compiles_before>0,"warmup paint did not compile the static painter regexes");
   let mut html=String::new();
-  for _ in 0..50{html=render_core(&raw,&profile).unwrap();}
-  let elapsed=started.elapsed();
+  let mut best=std::time::Duration::from_secs(60);
+  for _ in 0..3{
+   let started=std::time::Instant::now();
+   for _ in 0..50{html=render_core(&raw,&profile).unwrap();}
+   best=best.min(started.elapsed());
+  }
+  let compiles_after=crate::library::static_regex_compiles();
+  assert_eq!(compiles_after,compiles_before,"regex compiled again while painting 50 warmed cards ({compiles_before} -> {compiles_after})");
   assert!(html.contains("quote-media")&&html.contains("quote-block")&&html.contains("parent post")&&html.contains("edited")&&html.contains("Open on Bluesky")&&html.contains("cdn.test/4.jpg"),"{html}");
-  eprintln!("fifty raw cards: {}ms",elapsed.as_millis());
-  // Debug paint of this fixture is about 200ms alone. The suite runs it beside
-  // the other tests, so the guard stays under the old 1,339ms compile-every-call cost.
-  assert!(elapsed.as_millis()<500,"50 raw cards took {elapsed:?}; static regex paint regressed toward the old 1339ms cost");
+  eprintln!("fifty raw cards best of 3: {}ms, static compiles stayed at {compiles_after}",best.as_millis());
+  let perf=std::env::var("VAAK_PERF_ASSERT").ok().as_deref()==Some("1");
+  if perf || !cfg!(debug_assertions){
+   let ceiling_ms:u128=1_000;
+   assert!(best.as_millis()<ceiling_ms,"50 raw cards took {best:?}; static regex paint regressed toward the old 1339ms cost");
+  }
  }
  #[test]
  fn prewarm_static_regexes_paints(){prewarm_static_regexes();}

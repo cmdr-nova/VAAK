@@ -6,7 +6,10 @@
 // remain uncached. Each callsite retains exactly its original regex literal.
 macro_rules! static_regex { ($pattern:literal) => {{
  static REGEX: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
- REGEX.get_or_init(||regex::Regex::new($pattern).unwrap())
+ REGEX.get_or_init(||{
+  #[cfg(test)] { crate::library::note_static_regex_compile(); }
+  regex::Regex::new($pattern).unwrap()
+ })
  }}; }
 
 use anyhow::{bail, Result};
