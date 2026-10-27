@@ -66,11 +66,14 @@ async fn paint(db:&tokio_postgres::Client,warm:&std::sync::Arc<crate::profile_en
  let header_us=started.elapsed().as_micros();crate::profile_bridge::record_stage(crate::profile_bridge::Stage::Header,started);header.require_current(db).await?;header.require_current(db).await?;
  Ok((super::render(&header)?,header_us,started.elapsed().as_micros()))
 }
-// Digests of the header HTML produced by the pre-optimization code for this seed.
-const EXPECTED:&[(&str,i64,&str,&str)]=&[
- ("cmdr_nova",0,"posts","e00bc13032c1ea20b67116bf2e1af4d29f4bf8b2d947c1c0b2d65d4ad2b8b2f6"),("luna_naloc",0,"posts","148180bd44c3bc1682eb324d68e0d7fbfaec846f1bde58fa280a7cfa7685d94a"),
- ("cmdr_nova",2,"posts","9eed33801961234bfb3f2f1cabe8bf3e2540e83763cae0c49c50f632fd616848"),("cmdr_nova",0,"pinned","d3f8f254cef18194ccc2a22be037e0bf9224d9c6ee496fead91fe0a064d66fe8"),
- ("cmdr_nova",2,"blog","78f53cce2b3400e4dda7de10c98fe6e45d77998b785066c4922d299f666b6098"),
+// Digests of the header HTML produced by the pre-optimization code for this seed, per scale.
+const EXPECTED:&[(i64,&str,i64,&str,&str)]=&[
+ (20000,"cmdr_nova",0,"posts","77434f7a4e90ddb7e290d67fc3f9cc3fcd278e1aaff1c7bddf6135938a05bb04"),(20000,"luna_naloc",0,"posts","f91dc5b7089a67b8bb389592021fd8e3e14555a0fbfb85f031e540de47f34124"),
+ (20000,"cmdr_nova",2,"posts","de33e5fbb8bbe4fadf3b346ae96ffbb3c66ce1a3c0ea7dfb3f5674552acb7d31"),(20000,"cmdr_nova",0,"pinned","e342af666822c720f8ad374bd093ab4d9e7e98026cd6d4120c27810c9a2a09e2"),
+ (20000,"cmdr_nova",2,"blog","5c0cb3722c5de6e3f8092ef0efd5e25de26789d626c4c8d5113e2a494f81a16c"),
+ (4000,"cmdr_nova",0,"posts","e00bc13032c1ea20b67116bf2e1af4d29f4bf8b2d947c1c0b2d65d4ad2b8b2f6"),(4000,"luna_naloc",0,"posts","148180bd44c3bc1682eb324d68e0d7fbfaec846f1bde58fa280a7cfa7685d94a"),
+ (4000,"cmdr_nova",2,"posts","9eed33801961234bfb3f2f1cabe8bf3e2540e83763cae0c49c50f632fd616848"),(4000,"cmdr_nova",0,"pinned","d3f8f254cef18194ccc2a22be037e0bf9224d9c6ee496fead91fe0a064d66fe8"),
+ (4000,"cmdr_nova",2,"blog","78f53cce2b3400e4dda7de10c98fe6e45d77998b785066c4922d299f666b6098"),
 ];
 // The pre-optimization per-table dependency query, without the column prefilter.
 async fn unfiltered_dependencies(db:&tokio_postgres::Client,key:&str,actor:&str,owner:i64,viewer:&str,target:i64)->Result<serde_json::Map<String,serde_json::Value>>{
@@ -97,6 +100,6 @@ async fn header_speed_fixture_html_parity()->Result<()>{
   header_us.sort();total_us.sort();eprintln!("{}",json!({"key":key,"owner":owner,"tab":tab,"scale":scale,"sha256":digest,"max_header_ms":header_us.last().map(|v|*v as f64/1000.0),"median_header_ms":header_us[header_us.len()/2] as f64/1000.0,"median_header_plus_rechecks_ms":total_us[total_us.len()/2] as f64/1000.0}));
   seen.push((key,owner,tab,digest));
  }
- if scale==4000&&!EXPECTED.is_empty(){for(key,owner,tab,digest)in &seen{let expected=EXPECTED.iter().find(|e|e.0==*key&&e.1==*owner&&e.2==*tab).context("expected digest missing")?;assert_eq!(digest,expected.3,"header HTML changed for {key}/{owner}/{tab}");}}
+ if EXPECTED.iter().any(|e|e.0==scale){for(key,owner,tab,digest)in &seen{let expected=EXPECTED.iter().find(|e|e.0==scale&&e.1==*key&&e.2==*owner&&e.3==*tab).context("expected digest missing")?;assert_eq!(digest,expected.4,"header HTML changed for {key}/{owner}/{tab}");}}
 Ok(())
 }
