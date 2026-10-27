@@ -5,6 +5,8 @@
 pub(crate) mod cache;
 #[path="profile_secondary.rs"]
 mod secondary;
+#[cfg(test)]#[path="profile_header_speed_fixture.rs"]
+mod speed_fixture;
 use anyhow::{bail,Context,Result};
 use serde_json::{json,Value};
 use std::collections::HashMap;
@@ -57,7 +59,48 @@ fn selection(request:&HeaderRequest,profile:&Value,counts:&HeaderCounts,has_blog
  let slug=card::php_trim(&request.post).to_ascii_lowercase().chars().filter(|c|c.is_ascii_lowercase()||c.is_ascii_digit()||matches!(c,'_'|'-')).collect();
  (requested,tab,from,slug)
 }
-async fn exists_table(db:&Client,table:&str)->Result<bool>{Ok(db.query_one("SELECT to_regclass($1)::text IS NOT NULL",&[&table]).await?.get(0))}
+// Schema probes. Tables are not dropped at runtime, so a present table (and
+// its column types) is remembered for SCHEMA_PRESENT_TTL and a missing one is
+// re-probed after SCHEMA_MISSING_TTL, so a later migration is still picked up.
+// Only production complete-profile requests (reused pool, one fixed
+// search_path) use the memo; fixtures that switch search_path or create tables
+// mid-test probe on every call, as before.
+const SCHEMA_MISSING_TTL:std::time::Duration=std::time::Duration::from_secs(30);
+const SCHEMA_PRESENT_TTL:std::time::Duration=std::time::Duration::from_secs(300);
+/// None: the table is missing. Some: column name to format_type.
+type TableShape=Option<std::sync::Arc<HashMap<String,String>>>;
+#[derive(Default)]
+struct ProbeMemo(HashMap<String,(TableShape,std::time::Instant)>);
+impl ProbeMemo{
+ fn known(&self,table:&str,now:std::time::Instant)->Option<TableShape>{let(shape,at)=self.0.get(table)?;(now.saturating_duration_since(*at)<if shape.is_some(){SCHEMA_PRESENT_TTL}else{SCHEMA_MISSING_TTL}).then(||shape.clone())}
+ fn record(&mut self,table:&str,shape:TableShape,now:std::time::Instant){self.0.insert(table.to_owned(),(shape,now));}
+}
+static SCHEMA_PROBES:std::sync::LazyLock<std::sync::Mutex<ProbeMemo>>=std::sync::LazyLock::new(Default::default);
+async fn exists_table(db:&Client,table:&str)->Result<bool>{Ok(table_shapes(db,&[table]).await?[0].is_some())}
+/// to_regclass (plus column types) for each name, in order; unknown names share one probe query.
+async fn table_shapes(db:&Client,tables:&[&str])->Result<Vec<TableShape>>{
+ let memo=crate::profile_bridge::in_production_request();let now=std::time::Instant::now();
+ let mut known:Vec<Option<TableShape>>=match memo.then(||SCHEMA_PROBES.lock().ok()).flatten(){Some(m)=>tables.iter().map(|t|m.known(t,now)).collect(),None=>vec![None;tables.len()]};
+ let unknown:Vec<&str>=tables.iter().zip(&known).filter(|(_,k)|k.is_none()).map(|(t,_)|*t).collect();
+ if !unknown.is_empty(){
+  let started=std::time::Instant::now();let rows=db.query("SELECT to_regclass(u.t)::text IS NOT NULL,(SELECT jsonb_object_agg(a.attname,format_type(a.atttypid,a.atttypmod)) FROM pg_attribute a WHERE a.attrelid=to_regclass(u.t) AND a.attnum>0 AND NOT a.attisdropped) FROM unnest($1::text[]) WITH ORDINALITY u(t,i) ORDER BY u.i",&[&unknown]).await;crate::profile_bridge::record_stage(crate::profile_bridge::Stage::HeaderProbe,started);
+  let found=rows?.iter().map(|r|r.get::<_,bool>(0).then(||std::sync::Arc::new(r.get::<_,Option<Value>>(1).and_then(|v|serde_json::from_value::<HashMap<String,String>>(v).ok()).unwrap_or_default()))).collect::<Vec<TableShape>>();anyhow::ensure!(found.len()==unknown.len(),"schema probe row count");
+  if memo{if let Ok(mut m)=SCHEMA_PROBES.lock(){for(t,shape)in unknown.iter().zip(&found){m.record(t,shape.clone(),now);}}}
+  let mut found=found.into_iter();for k in known.iter_mut().filter(|k|k.is_none()){*k=found.next();}
+ }
+ Ok(known.into_iter().map(Option::flatten).collect())
+}
+/// The same predicate over the row's own columns, so to_jsonb(t) is built only
+/// for rows that match. `to_jsonb(t)->>'c'` equals `to_jsonb(t.c)#>>'{}'` for
+/// every type and equals `t.c` for text/varchar. None when a column is absent
+/// (where `j->>'c'` would read NULL). The original predicate still applies.
+fn column_prefilter(condition:&str,columns:&HashMap<String,String>)->Option<String>{
+ let mut out=String::new();let mut rest=condition;
+ while let Some(at)=rest.find("j->>'"){out.push_str(&rest[..at]);let tail=&rest[at+5..];let end=tail.find('\'')?;let name=&tail[..end];
+  if name.is_empty()||!name.bytes().all(|b|b.is_ascii_lowercase()||b.is_ascii_digit()||b==b'_'){return None}
+  match columns.get(name)?.as_str(){"text"|"character varying"=>out.push_str(&format!("t.\"{name}\"")),_=>out.push_str(&format!("(to_jsonb(t.\"{name}\")#>>'{{}}')"))}rest=&tail[end+1..];}
+ out.push_str(rest);Some(out.replace("$1","$1::text[]").replace("$2","$2::text[]").replace("$3","$3::text"))
+}
 async fn optional_rows(db:&Client,table:&str,sql:&str,args:&[&(dyn tokio_postgres::types::ToSql+Sync)])->Result<Vec<Value>>{
  if !exists_table(db,table).await?{return Ok(vec![])}Ok(db.query(sql,args).await?.iter().map(|r|r.get(0)).collect())
 }
@@ -71,10 +114,7 @@ async fn authorized_badges(db:&Client,key:&str,raw:&Value)->Result<Vec<String>>{
  if admin{badges.insert(0,"admin".into());}
  if supporter_awarded(db,key).await?{badges.insert(0,"supporter".into());}Ok(badges)
 }
-async fn header_dependencies(db:&Client,key:&str,actor:&str,owner:i64,viewer:&str,target:i64,blocked:bool)->Result<Value>{
- let aliases=vec![actor.trim_end_matches('/').to_owned(),format!("{}/",actor.trim_end_matches('/')),viewer.trim_end_matches('/').to_owned(),format!("{}/",viewer.trim_end_matches('/'))];
- let owners=vec![owner.to_string(),target.to_string()];let mut result=serde_json::Map::new();
- for (table,condition) in [
+const DEPENDENCY_TABLES:[(&str,&str);15]=[
   ("ap_users","j->>'id'=ANY($2) OR lower(j->>'actor_key')=$3 OR lower(j->>'username')=$3"),
   ("following","j->>'owner_actor_id'=ANY($1)"),("followers","j->>'owner_actor_id'=ANY($1)"),
   ("ap_follow_requests","j->>'owner_actor_id'=ANY($1) OR j->>'actor_id'=ANY($1)"),
@@ -85,18 +125,25 @@ async fn header_dependencies(db:&Client,key:&str,actor:&str,owner:i64,viewer:&st
   ("ap_sl_links","j->>'owner_user_id'=ANY($2)"),("ap_wow_links","j->>'owner_user_id'=ANY($2)"),
   ("phyrian_bridge_links","j->>'owner_user_id'=ANY($2)"),("bsky_sessions","j->>'owner_user_id'=ANY($2) OR j->>'owner_user_id' IN(SELECT id::text FROM ap_users WHERE lower(actor_key)=$3 OR lower(username)=$3)"),
   ("bsky_graph_sync","(j->>'owner_user_id'=ANY($2) OR j->>'owner_user_id' IN(SELECT id::text FROM ap_users WHERE lower(actor_key)=$3 OR lower(username)=$3)) AND j->>'kind'='meta' AND j->>'target_did'='graph_sync_v1'"),
- ]{
-  if blocked&&!matches!(table,"ap_users"|"ap_user_blocks"|"ap_mutes"|"ap_deprioritized_actors"){continue}
-  if !exists_table(db,table).await?{result.insert(table.into(),Value::Null);continue;}
+];
+async fn header_dependencies(db:&Client,key:&str,actor:&str,owner:i64,viewer:&str,target:i64,blocked:bool)->Result<Value>{crate::profile_bridge::timed(crate::profile_bridge::Stage::HeaderDeps,header_dependencies_current(db,key,actor,owner,viewer,target,blocked)).await}
+async fn header_dependencies_current(db:&Client,key:&str,actor:&str,owner:i64,viewer:&str,target:i64,blocked:bool)->Result<Value>{
+ let aliases=vec![actor.trim_end_matches('/').to_owned(),format!("{}/",actor.trim_end_matches('/')),viewer.trim_end_matches('/').to_owned(),format!("{}/",viewer.trim_end_matches('/'))];
+ let owners=vec![owner.to_string(),target.to_string()];let mut result=serde_json::Map::new();
+ let tables=DEPENDENCY_TABLES.into_iter().filter(|(table,_)|!blocked||matches!(*table,"ap_users"|"ap_user_blocks"|"ap_mutes"|"ap_deprioritized_actors")).collect::<Vec<_>>();
+ let shapes=table_shapes(db,&tables.iter().map(|(table,_)|*table).collect::<Vec<_>>()).await?;let mut parts=Vec::new();
+ for((table,condition),shape)in tables.iter().zip(&shapes){let Some(columns)=shape else{continue};
   // Bind both arrays explicitly even where a scoped predicate needs only one.
   // The grant dependency remains the complete current row digest. Restrict
   // conversion to the same two account IDs first so its existing partial
   // used_by index can avoid scanning every issued reward. Preserve the bound
   // text-array contract used by the other dependency predicates.
-  let scoped=if table=="ap_supporter_codes"{" WHERE used_by=ANY($2::text[]::bigint[]) AND used_at IS NOT NULL"}else{""};
-  let sql=format!("SELECT jsonb_build_object('count',COUNT(*),'digest',md5(COALESCE(string_agg(j::text,'' ORDER BY j::text),''))) FROM (SELECT to_jsonb(t) j FROM {table} t{scoped}) q WHERE ($1::text[] IS NOT NULL AND $2::text[] IS NOT NULL AND $3::text IS NOT NULL) AND ({condition})");
-  result.insert(table.into(),db.query_one(&sql,&[&aliases,&owners,&key]).await?.get(0));
+  let scoped=if *table=="ap_supporter_codes"{" WHERE used_by=ANY($2::text[]::bigint[]) AND used_at IS NOT NULL".to_owned()}else{column_prefilter(condition,columns).map(|p|format!(" WHERE ({p})")).unwrap_or_default()};
+  parts.push(format!("(SELECT jsonb_build_object('count',COUNT(*),'digest',md5(COALESCE(string_agg(j::text,'' ORDER BY j::text),''))) FROM (SELECT to_jsonb(t) j FROM {table} t{scoped}) q WHERE ($1::text[] IS NOT NULL AND $2::text[] IS NOT NULL AND $3::text IS NOT NULL) AND ({condition}))"));
  }
+ // One statement per check: each table's digest is the same subquery as before.
+ let mut digests=if parts.is_empty(){Vec::new()}else{match db.query_one(&format!("SELECT jsonb_build_array({})",parts.join(",")),&[&aliases,&owners,&key]).await?.get::<_,Value>(0){Value::Array(v)if v.len()==parts.len()=>v,_=>bail!("header dependency digest shape")}}.into_iter();
+ for((table,_),shape)in tables.iter().zip(shapes){result.insert((*table).into(),if shape.is_some(){digests.next().context("header dependency digest missing")?}else{Value::Null});}
  result.insert("key".into(),json!(key));Ok(Value::Object(result))
 }
 pub(crate) async fn resolve_authenticated(db:&Client,session:&AuthenticatedProfileSession,request:&HeaderRequest)->Result<HeaderFacts>{
@@ -115,16 +162,24 @@ async fn resolve_local(db:&Client,key:&str,actor:&str,owner:i64,owner_actor:Stri
  let profile=cache::profile(warm.map(|w|w.cfg()),key,&current_profile).await;
  let is_own=actor.trim_end_matches('/')==owner_actor.trim_end_matches('/')&&!guest;
  let cfg=warm.map(|w|w.cfg());let mut counts=HeaderCounts::default();let prefix=format!("{canonical}/%");
- let total=cache::count(db,cfg,&format!("vaak:profile:outbox-count:v2:{key}"),60,"SELECT COUNT(*) FROM outbox_notes WHERE id LIKE $1 AND COALESCE(visibility, 'public') = 'public'",&[&prefix]).await?;
- if total>0{counts.replies=cache::count(db,cfg,&format!("vaak:profile:reply-count:v2:{key}"),60,"SELECT COUNT(*) FROM outbox_notes WHERE id LIKE $1 AND COALESCE(visibility, 'public') = 'public' AND TRIM(COALESCE(in_reply_to, '')) <> ''",&[&prefix]).await?;}
- counts.posts=(total-counts.replies).max(0);counts.media=cache::count(db,cfg,&format!("vaak:profile:media-count:v2:{key}"),60,"SELECT COUNT(*) FROM outbox_notes WHERE id LIKE $1 AND COALESCE(visibility, 'public') = 'public' AND raw_create_json LIKE '%\"attachment\"%'",&[&prefix]).await?;
- if target_id>0&&!card::boolean(&profile,"hide_profile_boosts"){counts.boosts=cache::count(db,cfg,&format!("vaak:profile:boost-count:v1:{target_id}"),60,"SELECT COUNT(*) FROM masto_reblogs WHERE owner_user_id::bigint=$1",&[&target_id]).await?;}
- let pin_rows=db.query("SELECT to_jsonb(s) FROM masto_pins p INNER JOIN masto_statuses s ON s.local_id=p.status_local_id WHERE p.owner_user_id::bigint=$1 AND s.note_id LIKE $2 ORDER BY p.pinned_at DESC LIMIT 5",&[&target_id,&format!("{canonical}/notes/%")]).await?.iter().map(|r|r.get::<_,Value>(0)).collect::<Vec<_>>();counts.pinned=pin_rows.len()as i64;
- counts.asks=db.query_one("SELECT COUNT(*) FROM ap_asks WHERE owner_user_id::bigint=$1 AND answered::bigint=1 AND answer_note_id IS NOT NULL AND answer_note_id<>''",&[&target_id]).await?.get(0);
- let featured_rows=optional_rows(db,"ap_featured_accounts","SELECT to_jsonb(f) FROM ap_featured_accounts f WHERE owner_user_id::bigint=$1 ORDER BY position ASC,id ASC LIMIT 40",&[&target_id]).await?;counts.featured=featured_rows.len()as i64;
- let blog_table=exists_table(db,"vaak_blog_posts").await?;counts.blog=if blog_table{cache::count(db,cfg,&format!("vaak:profile:blog-count:v1:{key}:published"),60,"SELECT COUNT(*) FROM vaak_blog_posts WHERE actor_key=$1 AND status='published'",&[&key]).await?}else{0};
  let raw_slug=card::php_trim(&request.post).to_ascii_lowercase().chars().filter(|c|c.is_ascii_lowercase()||c.is_ascii_digit()||matches!(c,'_'|'-')).collect::<String>();
- let blog_post=if raw_slug.is_empty(){None}else{optional_rows(db,"vaak_blog_posts","SELECT to_jsonb(b) FROM vaak_blog_posts b WHERE actor_key=$1 AND slug=$2 AND status='published' LIMIT 1",&[&key,&raw_slug]).await?.into_iter().next()};
+ // Independent count/selection reads run concurrently (pipelined on one client).
+ // Results are taken in the original order, so the first error is unchanged.
+ let counts_started=std::time::Instant::now();let(boost_key,pin_like,blog_key)=(format!("vaak:profile:boost-count:v1:{target_id}"),format!("{canonical}/notes/%"),format!("vaak:profile:blog-count:v1:{key}:published"));
+ let targets=vec![canonical.clone(),format!("{canonical}/")];let(graph_following_key,graph_followers_key,graph_ttl)=(cache::graph_key("following",&canonical),cache::graph_key("followers",&canonical),cache::graph_ttl());
+ let(total_replies,media,boosts,pin_rows,asks,featured_rows,blog_count,blog_post,graph_following,graph_followers)=tokio::join!(
+  async{let total=cache::count(db,cfg,&format!("vaak:profile:outbox-count:v2:{key}"),60,"SELECT COUNT(*) FROM outbox_notes WHERE id LIKE $1 AND COALESCE(visibility, 'public') = 'public'",&[&prefix]).await?;let replies=if total>0{cache::count(db,cfg,&format!("vaak:profile:reply-count:v2:{key}"),60,"SELECT COUNT(*) FROM outbox_notes WHERE id LIKE $1 AND COALESCE(visibility, 'public') = 'public' AND TRIM(COALESCE(in_reply_to, '')) <> ''",&[&prefix]).await?}else{0};anyhow::Ok((total,replies))},
+  async{cache::count(db,cfg,&format!("vaak:profile:media-count:v2:{key}"),60,"SELECT COUNT(*) FROM outbox_notes WHERE id LIKE $1 AND COALESCE(visibility, 'public') = 'public' AND raw_create_json LIKE '%\"attachment\"%'",&[&prefix]).await},
+  async{if target_id>0&&!card::boolean(&profile,"hide_profile_boosts"){cache::count(db,cfg,&boost_key,60,"SELECT COUNT(*) FROM masto_reblogs WHERE owner_user_id::bigint=$1",&[&target_id]).await}else{Ok(0)}},
+  async{anyhow::Ok(db.query("SELECT to_jsonb(s) FROM masto_pins p INNER JOIN masto_statuses s ON s.local_id=p.status_local_id WHERE p.owner_user_id::bigint=$1 AND s.note_id LIKE $2 ORDER BY p.pinned_at DESC LIMIT 5",&[&target_id,&pin_like]).await?.iter().map(|r|r.get::<_,Value>(0)).collect::<Vec<_>>())},
+  async{anyhow::Ok(db.query_one("SELECT COUNT(*) FROM ap_asks WHERE owner_user_id::bigint=$1 AND answered::bigint=1 AND answer_note_id IS NOT NULL AND answer_note_id<>''",&[&target_id]).await?.get::<_,i64>(0))},
+  async{optional_rows(db,"ap_featured_accounts","SELECT to_jsonb(f) FROM ap_featured_accounts f WHERE owner_user_id::bigint=$1 ORDER BY position ASC,id ASC LIMIT 40",&[&target_id]).await},
+  async{if exists_table(db,"vaak_blog_posts").await?{cache::count(db,cfg,&blog_key,60,"SELECT COUNT(*) FROM vaak_blog_posts WHERE actor_key=$1 AND status='published'",&[&key]).await}else{Ok(0)}},
+  async{anyhow::Ok(if raw_slug.is_empty(){None}else{optional_rows(db,"vaak_blog_posts","SELECT to_jsonb(b) FROM vaak_blog_posts b WHERE actor_key=$1 AND slug=$2 AND status='published' LIMIT 1",&[&key,&raw_slug]).await?.into_iter().next()})},
+  async{cache::count(db,cfg,&graph_following_key,graph_ttl,"SELECT COUNT(*) FROM following WHERE owner_actor_id=ANY($1)",&[&targets]).await},
+  async{cache::count(db,cfg,&graph_followers_key,graph_ttl,"SELECT COUNT(*) FROM followers WHERE owner_actor_id=ANY($1)",&[&targets]).await},
+ );crate::profile_bridge::record_stage(crate::profile_bridge::Stage::HeaderCounts,counts_started);
+ let(total,replies)=total_replies?;counts.replies=replies;counts.posts=(total-counts.replies).max(0);counts.media=media?;counts.boosts=boosts?;let pin_rows=pin_rows?;counts.pinned=pin_rows.len()as i64;counts.asks=asks?;let featured_rows=featured_rows?;counts.featured=featured_rows.len()as i64;counts.blog=blog_count?;let blog_post=blog_post?;
  let(requested_tab,effective_tab,from,blog_slug)=selection(request,&profile,&counts,blog_post.is_some());
  if effective_tab=="asks"{counts.asks=counts.asks.min(200);}
  let blog_offset=if requested_tab=="blog"&&blog_slug.is_empty(){blog_list_offset(request.page)}else{0};
@@ -137,8 +192,7 @@ async fn resolve_local(db:&Client,key:&str,actor:&str,owner:i64,owner_actor:Stri
   if !following&&exists_table(db,"ap_follow_requests").await?{requested=db.query_one("SELECT EXISTS(SELECT 1 FROM ap_follow_requests WHERE owner_actor_id=ANY($1) AND actor_id=ANY($2) AND status='pending')",&[&targets,&viewers]).await?.get(0);}
   if !is_own&&exists_table(db,"ap_post_subscriptions").await?{post_subscription=db.query_one("SELECT EXISTS(SELECT 1 FROM ap_post_subscriptions WHERE owner_user_id::bigint=$1 AND target_actor_id=ANY($2))",&[&owner,&targets]).await?.get(0);}
  }
- let targets=vec![canonical.clone(),format!("{canonical}/")];
- counts.following=cache::count(db,cfg,&cache::graph_key("following",&canonical),cache::graph_ttl(),"SELECT COUNT(*) FROM following WHERE owner_actor_id=ANY($1)",&[&targets]).await?;counts.followers=cache::count(db,cfg,&cache::graph_key("followers",&canonical),cache::graph_ttl(),"SELECT COUNT(*) FROM followers WHERE owner_actor_id=ANY($1)",&[&targets]).await?;
+ counts.following=graph_following?;counts.followers=graph_followers?;
  let mut moderation=ModerationContext{is_self:is_own,is_local:true,is_local_admin:is_own||card::boolean(&target,"is_admin"),is_admin,..Default::default()};
  if !guest{
   let rows=db.query("SELECT to_jsonb(b) FROM ap_user_blocks b WHERE owner_user_id::bigint=$1 ORDER BY created_at DESC,id DESC",&[&owner]).await?.iter().map(|r|r.get::<_,Value>(0)).collect::<Vec<_>>();moderation.personal_block_id=facts::personal_block(&rows,actor).map(|r|card::integer(r,"id"));
@@ -147,13 +201,17 @@ async fn resolve_local(db:&Client,key:&str,actor:&str,owner:i64,owner_actor:Stri
  let mut name=card::php_trim(s(&profile,"name")).to_owned();if name.is_empty(){name=key.into();}if card::boolean(&profile,"vanity_verified"){name.push_str(" ✓");}if card::boolean(&profile,"automated"){name.push_str(" 🤖");}
  let avatar=sanitized_url(s(&profile,"icon_url"));let banner=sanitized_url(s(&profile,"image_url")).or_else(||avatar.clone());
  let fields=profile["attachment"].as_array().cloned().unwrap_or_default();
- let badges=authorized_badges(db,key,&profile["profile_badges"]).await?;
- let mut emoji=HashMap::new();for row in db.query("SELECT shortcode,url FROM remote_custom_emojis WHERE host='mkultra.monster'",&[]).await?{let k:String=row.get(0);let u:String=row.get(1);if !k.is_empty()&&u.starts_with("https://"){emoji.insert(k,u);}}
- let mut links=Vec::new();for(table,alias,extra)in[("ap_sl_links","l",""),("ap_wow_links","l",""),("phyrian_bridge_links","l"," AND l.status='verified' AND l.unlinked_at IS NULL")]{let sql=format!("SELECT to_jsonb({alias}) FROM {table} {alias} INNER JOIN ap_users u ON u.id=l.owner_user_id WHERE u.actor_key=$1 AND u.disabled_at IS NULL{extra} LIMIT 1");links.push(optional_rows(db,table,&sql,&[&key]).await?.into_iter().next());}
+ // Read-only presentation lookups run concurrently; results (and the first
+ // error) are taken in the original order, combined's queue write stays after.
+ let link_sql=[("ap_sl_links","l",""),("ap_wow_links","l",""),("phyrian_bridge_links","l"," AND l.status='verified' AND l.unlinked_at IS NULL")].map(|(table,alias,extra)|(table,format!("SELECT to_jsonb({alias}) FROM {table} {alias} INNER JOIN ap_users u ON u.id=l.owner_user_id WHERE u.actor_key=$1 AND u.disabled_at IS NULL{extra} LIMIT 1")));
+ let(badges,emoji_rows,sl,wow,bridge,fallback_avatar)=tokio::join!(authorized_badges(db,key,&profile["profile_badges"]),db.query("SELECT shortcode,url FROM remote_custom_emojis WHERE host='mkultra.monster'",&[]),async{optional_rows(db,link_sql[0].0,&link_sql[0].1,&[&key]).await},async{optional_rows(db,link_sql[1].0,&link_sql[1].1,&[&key]).await},async{optional_rows(db,link_sql[2].0,&link_sql[2].1,&[&key]).await},facts::avatar(db,&Value::Null,actor));
+ let badges=badges?;
+ let mut emoji=HashMap::new();for row in emoji_rows?{let k:String=row.get(0);let u:String=row.get(1);if !k.is_empty()&&u.starts_with("https://"){emoji.insert(k,u);}}
+ let mut links=Vec::new();for rows in[sl,wow,bridge]{links.push(rows?.into_iter().next());}
  let tab_href=format!("/vaak/users/{}{}tab=",q(key),if from.is_empty(){"?".into()}else{format!("?from={}&",form_query(&from))});
  let combined=cache::combined(db,key,counts.followers,counts.following,warm.is_some()).await?;counts.followers=combined.followers;counts.following=combined.following;
  let locked=card::boolean(&profile,"manually_approves");let bio=crate::library::body::html_to_plain(s(&profile,"summary"));
- let fallback_avatar=facts::avatar(db,&Value::Null,actor).await?;
+ let fallback_avatar=fallback_avatar?;
  anyhow::ensure!(dependencies==header_dependencies(db,key,actor,owner,&owner_actor,target_id,false).await?,"header dependencies changed during enrichment");
  Ok(HeaderFacts{dependencies,actor:actor.into(),key:key.into(),profile,current_profile,owner,owner_actor,csrf:csrf.into(),guest,is_own,requested_tab,effective_tab,from,blog_slug,tab_href,following,follows_you,requested,locked,post_subscription,moderation,counts,name,bio,avatar,banner,fallback_avatar,emoji,fields,badges,sl:links[0].take(),wow:links[1].take(),bridge:links[2].take(),bsky_handle:combined.handle,pin_rows,featured_rows,blog_rows,blog_post,blog_offset})
 }
@@ -555,4 +613,22 @@ mod supporter_tests {
         drop(db);connection_task.await??;Ok(())
     }
 
+}
+#[cfg(test)]
+mod speed_tests{
+ use super::*;
+ #[test]fn missing_table_is_reprobed_after_ttl_and_present_table_is_kept(){
+  let now=std::time::Instant::now();let mut memo=ProbeMemo::default();assert!(memo.known("vaak_blog_posts",now).is_none());
+  memo.record("vaak_blog_posts",None,now);memo.record("following",Some(std::sync::Arc::new(HashMap::from([("owner_actor_id".to_owned(),"text".to_owned())]))),now);
+  assert_eq!(memo.known("vaak_blog_posts",now+SCHEMA_MISSING_TTL-std::time::Duration::from_millis(1)),Some(None));assert_eq!(memo.known("vaak_blog_posts",now+SCHEMA_MISSING_TTL),None,"a missing table is probed again so a later migration is seen");
+  assert!(memo.known("following",now+SCHEMA_MISSING_TTL*2).is_some_and(|s|s.is_some()));assert_eq!(memo.known("following",now+SCHEMA_PRESENT_TTL),None);
+  memo.record("vaak_blog_posts",Some(Default::default()),now+SCHEMA_MISSING_TTL);assert!(memo.known("vaak_blog_posts",now+SCHEMA_MISSING_TTL*2).is_some_and(|s|s.is_some()));
+ }
+ #[test]fn column_prefilter_is_the_same_predicate_over_present_columns(){
+  let cols=|v:&[(&str,&str)]|v.iter().map(|(a,b)|(a.to_string(),b.to_string())).collect::<HashMap<_,_>>();
+  assert_eq!(column_prefilter("j->>'owner_actor_id'=ANY($1) OR j->>'actor_id'=ANY($1)",&cols(&[("owner_actor_id","text"),("actor_id","character varying")])).as_deref(),Some("t.\"owner_actor_id\"=ANY($1::text[]) OR t.\"actor_id\"=ANY($1::text[])"));
+  assert_eq!(column_prefilter("j->>'owner_user_id'=ANY($2)",&cols(&[("owner_user_id","bigint")])).as_deref(),Some("(to_jsonb(t.\"owner_user_id\")#>>'{}')=ANY($2::text[])"));
+  assert_eq!(column_prefilter("j->>'id'=ANY($2) OR lower(j->>'actor_key')=$3",&cols(&[("id","integer")])),None,"absent column keeps the unfiltered query");
+  for(table,condition)in DEPENDENCY_TABLES{let all=condition.match_indices("j->>'").map(|(at,_)|{let tail=&condition[at+5..];tail[..tail.find('\'').unwrap()].to_owned()}).map(|c|(c,"text".to_owned())).collect::<HashMap<_,_>>();let p=column_prefilter(condition,&all).unwrap();assert!(!p.contains("j->>")&&!p.contains(" j")&&!p.contains("(j"),"{table}: {p}");}
+ }
 }

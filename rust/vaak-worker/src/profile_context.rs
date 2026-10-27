@@ -11,7 +11,8 @@ pub(crate) struct AdmittedProfileHeader {
 }
 impl AdmittedProfileHeader {
     pub(crate) fn facts(&self)->&crate::profile_header::HeaderFacts{&self.facts}
-    pub(crate) async fn require_current(&self,db:&Client)->Result<()>{
+    pub(crate) async fn require_current(&self,db:&Client)->Result<()>{crate::profile_bridge::timed(crate::profile_bridge::Stage::HeaderRecheck,self.require_current_untimed(db)).await}
+    async fn require_current_untimed(&self,db:&Client)->Result<()>{
         if root_content_blocked_for(db,self.owner,&self.canonical_actor).await?{bail!("profile header root changed before publication")}
         let profile=db.query_opt("SELECT to_jsonb(p) FROM actor_profile p WHERE actor_key=$1",&[&self.key]).await?.map(|r|r.get::<_,Value>(0));
         if profile.unwrap_or(Value::Null)!=*self.facts.profile_snapshot(){bail!("profile header presentation identity changed")}
@@ -48,7 +49,8 @@ pub(crate) struct AdmittedBlockedProfileHeader {
 }
 impl AdmittedBlockedProfileHeader {
  pub(crate) fn facts(&self)->&crate::profile_header::BlockedHeaderFacts{&self.facts}
- pub(crate) async fn require_current(&self,db:&Client)->Result<()>{
+ pub(crate) async fn require_current(&self,db:&Client)->Result<()>{crate::profile_bridge::timed(crate::profile_bridge::Stage::HeaderRecheck,self.require_current_untimed(db)).await}
+ async fn require_current_untimed(&self,db:&Client)->Result<()>{
   if !root_content_blocked_for(db,self.owner,&self.actor).await?{bail!("blocked profile branch changed before publication")}
   let target=db.query_opt("SELECT to_jsonb(u) FROM ap_users u WHERE lower(actor_key)=$1 LIMIT 1",&[&self.key]).await?.map(|r|r.get::<_,Value>(0));
   if target.unwrap_or(Value::Null)!=self.target_snapshot{bail!("blocked profile target changed")}
