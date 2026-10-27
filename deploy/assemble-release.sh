@@ -101,6 +101,10 @@ assemble() {
   [[ ! -e "${output}/api/bin/library-client-smoke.php" ]] || { echo "release leaked replay tooling" >&2; return 1; }
   [[ -f "${output}/api/bin/home-timeline-warm.php" ]] || { echo "missing production CLI" >&2; return 1; }
   [[ -f "${output}/vaak/index.php" ]] || { echo "missing vaak front controller" >&2; return 1; }
+  # Activation rsync --delete removes anything absent from the release.
+  for name in vaak/sw.js vaak/manifest.webmanifest api/fediverse-comments.php; do
+    [[ -f "${output}/${name}" ]] || { echo "missing public file ${name}" >&2; return 1; }
+  done
   echo "assembled ${output} version=${version} revision=${revision}"
 }
 
