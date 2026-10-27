@@ -7,6 +7,23 @@ use anyhow::{Context, Result};
 use serde::Serialize;
 use serde_json::Value;
 
+// How many times this thread's static painter macros have called `Regex::new`.
+// Warmed cards must not increment this. Thread-local so a parallel test
+// compiling its own pattern cannot fail the 50-card guard. Omitted from
+// production builds.
+#[cfg(test)]
+thread_local! {
+    static STATIC_REGEX_COMPILES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+#[cfg(test)]
+pub(crate) fn note_static_regex_compile() {
+    STATIC_REGEX_COMPILES.with(|cell| cell.set(cell.get().saturating_add(1)));
+}
+#[cfg(test)]
+pub(crate) fn static_regex_compiles() -> usize {
+    STATIC_REGEX_COMPILES.with(|cell| cell.get())
+}
+
 #[path = "library_mixed.rs"]
 pub mod mixed;
 #[path = "library_actions.rs"]
