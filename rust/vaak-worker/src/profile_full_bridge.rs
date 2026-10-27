@@ -30,11 +30,12 @@ async fn paint_full(cfg:&crate::config::Config,db:&tokio_postgres::Client,reques
 }
 async fn paint_full_with_warm(db:&tokio_postgres::Client,request:&FullRequest,deps:&crate::direct_preview::PreviewDependencies<'_>,warm:std::sync::Arc<crate::profile_enrichment::WarmContext>,clock:Option<chrono::DateTime<chrono::Utc>>)->Result<Vec<u8>>{
  super::ensure_budget()?;
- let guest;let authenticated;
+ let guest;let authenticated;let session_started=std::time::Instant::now();
  let viewer=match &request.viewer{
   Viewer::Guest{}=>{guest=crate::profile_context::GuestProfileSession::from_php_guest_profile(request.actor_key.clone(),request.actor.clone(),request.lazy_media,request.status_preview_budget)?.with_quote_preview_budget(request.quote_preview_budget).with_warm_context(warm);crate::profile_materialize::ProfileViewer::Guest(&guest)},
   Viewer::Authenticated{owner_id,csrf,bsky}=>{let mut session=crate::profile_context::AuthenticatedProfileSession::from_php_session(*owner_id,csrf.clone(),request.actor_key.clone(),request.actor.clone(),request.lazy_media,request.status_preview_budget)?.with_quote_preview_budget(request.quote_preview_budget).with_warm_context(warm);if let Some(bsky)=bsky{session=session.with_php_bsky(db,bsky.clone()).await?}authenticated=session;crate::profile_materialize::ProfileViewer::Auth(&authenticated)}
  };
+ super::record_stage(super::Stage::Session,session_started);
  let header_request=crate::profile_header::HeaderRequest{tab:request.tab.clone(),from:request.from.clone(),post:request.post.clone(),page:request.page};
  let mut prepared=crate::profile_context::prepare_local_profile_first_paint(db,&viewer,&header_request,deps.dns).await?;
  #[cfg(test)] if let (Some(clock),crate::profile_context::LocalProfileFirstPaint::Timeline{body,..}|crate::profile_context::LocalProfileFirstPaint::Secondary{body,..})=(clock,&mut prepared){body.set_render_clock_for_fixture(clock)?;}
@@ -45,6 +46,7 @@ async fn paint_full_with_warm(db:&tokio_postgres::Client,request:&FullRequest,de
   crate::profile_context::LocalProfileFirstPaint::Blog(header)=>(0,request.status_preview_budget,request.quote_preview_budget,0,0,header.facts().effective_tab().to_owned()),
   crate::profile_context::LocalProfileFirstPaint::Blocked(_)=>(0,request.status_preview_budget,request.quote_preview_budget,0,0,request.tab.clone()),
  };
+ let render_started=std::time::Instant::now();
  let html=prepared.render()?;
  let(kind,header_bytes,card_ordinals,source_page)=match &prepared{
   crate::profile_context::LocalProfileFirstPaint::Timeline{header,body,..}=>("timeline",crate::profile_header::render(header)?.len(),body.cards().iter().map(|(ordinal,_)|*ordinal).collect(),SourcePage{source_count,next_offset:body.page().next_offset(),has_more:body.page().has_more()}),
@@ -54,12 +56,12 @@ async fn paint_full_with_warm(db:&tokio_postgres::Client,request:&FullRequest,de
   crate::profile_context::LocalProfileFirstPaint::Blocked(_)=>("blocked",html.len(),Vec::new(),SourcePage{source_count:0,next_offset:0,has_more:false}),
  };
  if html.is_empty()||header_bytes==0||header_bytes>html.len(){bail!("incomplete full profile fragment")}
- let fragment=FragmentMetadata{kind,header_bytes,content_bytes:html.len()-header_bytes,card_ordinals};
+ let fragment=FragmentMetadata{kind,header_bytes,content_bytes:html.len()-header_bytes,card_ordinals};super::record_stage(super::Stage::Render,render_started);
 
  let reply=FullReply{protocol_version:1,ok:true,request_binding:FullBinding{actor_key:&request.actor_key,actor:&request.actor,tab:&request.tab,from:&request.from,post:&request.post,shell:request.shell},source_count,effective_tab,html,fragment,source_page,status_preview_state:crate::direct_preview::PreviewState::from_remaining(request.status_preview_budget,status_remaining,source_count)?,quote_preview_state:QuoteState{initial:request.quote_preview_budget,remaining:quote_remaining,attempts:quote_attempts}};
  debug_assert_eq!(status_attempts,reply.status_preview_state.attempts());
- let bytes=serde_json::to_vec(&reply)?;if bytes.len()>MAX_REPLY{bail!("full profile reply size")}
- prepared.require_current(db).await?;Ok(bytes)
+ let serialize_started=std::time::Instant::now();let bytes=serde_json::to_vec(&reply)?;super::record_stage(super::Stage::Serialize,serialize_started);if bytes.len()>MAX_REPLY{bail!("full profile reply size")}
+ super::timed(super::Stage::Publish,prepared.require_current(db)).await?;Ok(bytes)
 }
 pub(crate) async fn render_full(cfg:&crate::config::Config,headers:HeaderMap,bytes:Bytes)->Response{
  if super::enabled(){super::prewarm_complete_profile();}
@@ -68,8 +70,8 @@ pub(crate) async fn render_full(cfg:&crate::config::Config,headers:HeaderMap,byt
   let started=std::time::Instant::now();
   let request=match decode_full(&bytes){Ok(request)=>request,Err(_)=>{super::log_fallback("full","",0,"unknown","",0,"request",started);return(StatusCode::BAD_REQUEST,axum::Json(json!({"fallback":true,"reason":"request"}))).into_response()}};
   let(owner,viewer)=match &request.viewer{Viewer::Guest{}=>(0,"guest"),Viewer::Authenticated{owner_id,..}=>(*owner_id,"authenticated")};
-  let result:Result<Vec<u8>>=async{let db=crate::db::connect(&cfg.database_url).await?;super::ensure_budget()?;paint_full(cfg,&db,&request,&crate::direct_preview::PreviewDependencies::production()).await}.await;
-  match result{Ok(bytes)=>(StatusCode::OK,[(axum::http::header::CONTENT_TYPE,"application/json")],bytes).into_response(),Err(error)=>{let reason=super::fallback_reason(&error);super::log_fallback("full",&request.actor,owner,viewer,&request.tab,request.page,reason,started);(StatusCode::UNPROCESSABLE_ENTITY,axum::Json(json!({"fallback":true,"reason":reason}))).into_response()}}
+  let result:Result<Vec<u8>>=async{let db=super::timed(super::Stage::Connect,crate::db::profile_reused(&cfg.database_url)).await?;super::ensure_budget()?;paint_full(cfg,&db,&request,&crate::direct_preview::PreviewDependencies::production()).await}.await;
+  match result{Ok(bytes)=>{super::log_complete("full",&request.actor,owner,viewer,&request.tab,request.page,started);(StatusCode::OK,[(axum::http::header::CONTENT_TYPE,"application/json")],bytes).into_response()},Err(error)=>{let reason=super::fallback_reason(&error);super::log_fallback("full",&request.actor,owner,viewer,&request.tab,request.page,reason,started);(StatusCode::UNPROCESSABLE_ENTITY,axum::Json(json!({"fallback":true,"reason":reason}))).into_response()}}
  }).await;
  no_store(response).await
 }

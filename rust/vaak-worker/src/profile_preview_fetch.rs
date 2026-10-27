@@ -15,7 +15,7 @@ impl PreviewCacheWrite{pub(crate) fn url(&self)->&str{&self.url}pub(crate) fn be
 pub(crate) struct PreviewFetchContext{transport:Arc<dyn PreviewFetchTransport+Send>}
 impl PreviewFetchContext{
  pub(crate) fn new(transport:Arc<dyn PreviewFetchTransport+Send>)->Self{Self{transport}}
- pub(crate) async fn warm_text(&self,text:&str,grant:&dyn CurrentQuoteGrant)->Result<bool>{grant.require_current().await?;let Some(url)=crate::direct_preview::extract_url(text)?else{return Ok(false)};let warmed=self.transport.warm(&url,grant).await?;grant.require_current().await?;Ok(warmed)}
+ pub(crate) async fn warm_text(&self,text:&str,grant:&dyn CurrentQuoteGrant)->Result<bool>{crate::profile_bridge::timed(crate::profile_bridge::Stage::Warm,async{grant.require_current().await?;let Some(url)=crate::direct_preview::extract_url(text)?else{return Ok(false)};let warmed=self.transport.warm(&url,grant).await?;grant.require_current().await?;Ok(warmed)}).await}
  pub(crate) async fn resolve_text(&self,db:&tokio_postgres::Client,dns:&dyn crate::direct_preview::PreviewDns,text:&str,allow_fetch:bool,now:chrono::DateTime<chrono::Utc>,grant:&dyn CurrentQuoteGrant)->Result<Option<Value>>{
   grant.require_current().await?;let Some(url)=crate::direct_preview::extract_url(text)?else{return Ok(None)};let row=self.for_url(db,dns,&url,allow_fetch,now,grant).await?;Ok(row.and_then(|row|masto_preview(&row)))
  }

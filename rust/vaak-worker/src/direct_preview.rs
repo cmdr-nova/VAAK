@@ -13,16 +13,19 @@ pub(crate) trait PreviewDns:Sync {
  fn addrs<'a>(&'a self,host:&'a str)->Pin<Box<dyn Future<Output=Result<Vec<IpAddr>>>+Send+'a>>{Box::pin(async move{Ok(self.ipv4(host).await?.into_iter().map(IpAddr::V4).collect())})}
 }
 pub(crate) struct SystemDns;
+/// The 2s lookup cap is longer than the complete-profile budget. When the
+/// request deadline has already passed, the timeout is that budget.
+fn dns_timeout()->anyhow::Error{if crate::profile_bridge::past_deadline(){anyhow::anyhow!("profile_fallback_code=budget")}else{anyhow::anyhow!("PHP fallback: preview DNS timeout")}}
 impl PreviewDns for SystemDns {
  fn ipv4<'a>(&'a self,host:&'a str)->Pin<Box<dyn Future<Output=Result<Vec<Ipv4Addr>>>+Send+'a>>{Box::pin(async move{
-  let answers=tokio::time::timeout(std::time::Duration::from_secs(2),tokio::net::lookup_host((host,443))).await.context("PHP fallback: preview DNS timeout")??;
+  let answers=crate::profile_bridge::timed(crate::profile_bridge::Stage::Dns,tokio::time::timeout(std::time::Duration::from_secs(2),tokio::net::lookup_host((host,443)))).await.map_err(|_|dns_timeout())?.context("PHP fallback: preview DNS lookup failed")?;
   let ips=answers.filter_map(|address|match address.ip(){std::net::IpAddr::V4(ip)=>Some(ip),_=>None}).collect::<Vec<_>>();
   if ips.is_empty(){bail!("PHP fallback: unresolved IPv4 preview eligibility")};Ok(ips)
  })}
  // Like PHP's guard, judge the AAAA answers too: a host with a public A and a
  // private AAAA is not eligible, since the connection may use either.
  fn addrs<'a>(&'a self,host:&'a str)->Pin<Box<dyn Future<Output=Result<Vec<IpAddr>>>+Send+'a>>{Box::pin(async move{
-  let answers=tokio::time::timeout(std::time::Duration::from_secs(2),tokio::net::lookup_host((host,443))).await.context("PHP fallback: preview DNS timeout")??;
+  let answers=crate::profile_bridge::timed(crate::profile_bridge::Stage::Dns,tokio::time::timeout(std::time::Duration::from_secs(2),tokio::net::lookup_host((host,443)))).await.map_err(|_|dns_timeout())?.context("PHP fallback: preview DNS lookup failed")?;
   let mut ips=answers.map(|address|address.ip()).collect::<Vec<_>>();ips.sort();ips.dedup();
   if ips.is_empty(){bail!("PHP fallback: unresolved preview eligibility")};Ok(ips)
  })}
@@ -199,7 +202,8 @@ pub(crate) fn preview_plain(st:&Value,answer:Option<&str>)->String{
  let quoted_plain=quoted.map(|q|crate::library::body::scrub_as2(&crate::library::body::html_to_plain(s(q,"content"))));
  let mut plain=crate::library::body::strip_raw_quotes(&crate::library::body::scrub_as2(&crate::library::body::html_to_plain(s(st,"content"))),quoted_plain.as_deref());
  if let Some(answer)=answer.filter(|answer|!crate::library::card::php_trim(answer).is_empty()){plain=crate::library::card::php_trim(answer).into();}
- if regex::Regex::new(r"(?i)^\((?:attachment|media|poll|quote|boost)\)$").unwrap().is_match(crate::library::card::php_trim(&plain)){plain.clear();}
+ static PLACEHOLDER:std::sync::OnceLock<regex::Regex>=std::sync::OnceLock::new();
+ if PLACEHOLDER.get_or_init(||regex::Regex::new(r"(?i)^\((?:attachment|media|poll|quote|boost)\)$").unwrap()).is_match(crate::library::card::php_trim(&plain)){plain.clear();}
  plain
 }
 
@@ -287,6 +291,15 @@ async fn resolve_prepared(db:&Client,dns:&dyn PreviewDns,st:&Value,original_cont
 #[cfg(test)]
 mod tests {
  use super::*;
+ #[test]
+ fn preview_plain_placeholder_rule_is_unchanged(){
+  let fresh=regex::Regex::new(r"(?i)^\((?:attachment|media|poll|quote|boost)\)$").unwrap();
+  for content in ["(media)","(MEDIA)","<p>(quote)</p>"," (boost) ","(attachment)","(poll)","(media) and words","words (media)","(video)",""]{
+   let plain=preview_plain(&json!({"content":content}),None);let raw=crate::library::body::strip_raw_quotes(&crate::library::body::scrub_as2(&crate::library::body::html_to_plain(content)),None);
+   let expected=if fresh.is_match(crate::library::card::php_trim(&raw)){String::new()}else{raw};assert_eq!(plain,expected,"{content}");
+  }
+  assert_eq!(preview_plain(&json!({"content":"(media)"}),None),"");assert_eq!(preview_plain(&json!({"content":"(media)"}),Some("answer")),"answer");
+ }
  #[tokio::test]
  #[ignore="opt-in disposable PostgreSQL actual PHP cache-only preview differential"]
  async fn actual_profile_cache_only_preview_replay(){

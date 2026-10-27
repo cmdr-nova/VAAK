@@ -105,15 +105,15 @@ impl LocalProfileFirstPaint {
 }
 pub(crate) async fn prepare_local_profile_first_paint(db:&Client,viewer:&crate::profile_materialize::ProfileViewer<'_>,request:&crate::profile_header::HeaderRequest,dns:&dyn crate::direct_preview::PreviewDns)->Result<LocalProfileFirstPaint>{
  let(owner,key,actor)=match viewer{crate::profile_materialize::ProfileViewer::Auth(session)=>(session.owner_id(),session.actor_key(),session.source_actor()),crate::profile_materialize::ProfileViewer::Guest(session)=>(0,session.actor_key(),session.source_actor())};
- let canonical=format!("https://mkultra.monster/users/{key}");
+ let canonical=format!("https://mkultra.monster/users/{key}");let header_started=std::time::Instant::now();
  if root_content_blocked_for(db,owner,&canonical).await?{return Ok(LocalProfileFirstPaint::Blocked(match viewer{crate::profile_materialize::ProfileViewer::Auth(session)=>admit_blocked_header_authenticated(db,session,request).await?,crate::profile_materialize::ProfileViewer::Guest(session)=>admit_blocked_header_guest(db,session,request).await?}));}
  let mut header=match viewer{crate::profile_materialize::ProfileViewer::Auth(session)=>admit_header_authenticated(db,session,request).await?,crate::profile_materialize::ProfileViewer::Guest(session)=>admit_header_guest(db,session,request).await?};
  let featured=if crate::library::card::php_trim(&request.tab).eq_ignore_ascii_case("featured"){let content=featured::prepare(db,&header,&request.from).await?;header.facts.apply_featured_presentation_count(content.displayed_count())?;Some(content)}else{None};
- let tab=header.facts().effective_tab().to_owned();
+ let tab=header.facts().effective_tab().to_owned();crate::profile_bridge::record_stage(crate::profile_bridge::Stage::Header,header_started);
  let result=if tab=="featured"{LocalProfileFirstPaint::Featured{header,content:featured.context("missing native Featured selection")?}}else if tab=="blog"{LocalProfileFirstPaint::Blog(header)}else if matches!(tab.as_str(),"posts"|"replies"|"boosts"|"media"){
-  let selection=crate::profile_source::select(db,key,actor,&tab,12,0).await?;let body=prepare_ordered_profile_page(db,viewer,selection,dns).await?;LocalProfileFirstPaint::Timeline{header,body,actor:actor.into(),tab,featured_preload:featured}
- }else if matches!(tab.as_str(),"pinned"|"asks"){let selection=crate::profile_source::select_secondary(db,key,actor,if tab=="pinned"{"pinned"}else{"asks"}).await?;let body=prepare_ordered_profile_page(db,viewer,selection,dns).await?;LocalProfileFirstPaint::Secondary{header,body,tab}}else{bail!("PHP fallback: full secondary profile content assembly incomplete")};
- result.require_current(db).await?;Ok(result)
+  let selection=crate::profile_bridge::timed(crate::profile_bridge::Stage::Source,crate::profile_source::select(db,key,actor,&tab,12,0)).await?;let body=crate::profile_bridge::timed(crate::profile_bridge::Stage::Cards,prepare_ordered_profile_page(db,viewer,selection,dns)).await?;LocalProfileFirstPaint::Timeline{header,body,actor:actor.into(),tab,featured_preload:featured}
+ }else if matches!(tab.as_str(),"pinned"|"asks"){let selection=crate::profile_bridge::timed(crate::profile_bridge::Stage::Source,crate::profile_source::select_secondary(db,key,actor,if tab=="pinned"{"pinned"}else{"asks"})).await?;let body=crate::profile_bridge::timed(crate::profile_bridge::Stage::Cards,prepare_ordered_profile_page(db,viewer,selection,dns)).await?;LocalProfileFirstPaint::Secondary{header,body,tab}}else{bail!("PHP fallback: full secondary profile content assembly incomplete")};
+ crate::profile_bridge::timed(crate::profile_bridge::Stage::Recheck,result.require_current(db)).await?;Ok(result)
 }
 #[derive(Clone,PartialEq)]
 pub(crate) struct ProfilePage {
@@ -872,37 +872,39 @@ async fn prepare_shared_pending_quote(db:&Client,viewer:&crate::profile_material
 pub(crate) async fn prepare_ordered_profile_page(db:&Client,viewer:&crate::profile_materialize::ProfileViewer<'_>,selection:crate::profile_source::SelectedProfilePage,dns:&dyn crate::direct_preview::PreviewDns)->Result<OrderedProfilePage>{
  crate::audience::profile_reader_scope(prepare_ordered_profile_page_inner(db,viewer,selection,dns)).await
 }
-#[cfg(test)]
-fn profile_perf_stage(stage:&str,index:usize,started:std::time::Instant){if std::env::var("PROFILE_PERF_STAGES").ok().as_deref()==Some("1"){eprintln!("PROFILE_STAGE {stage} {index} {}",started.elapsed().as_micros());}}
+/// Production requests add each stage to the bridge's stage clock; fixtures
+/// can also print them with PROFILE_PERF_STAGES=1.
+fn profile_perf_stage(stage:&str,kind:crate::profile_bridge::Stage,index:usize,started:std::time::Instant){crate::profile_bridge::record_stage(kind,started);#[cfg(test)] if std::env::var("PROFILE_PERF_STAGES").ok().as_deref()==Some("1"){eprintln!("PROFILE_STAGE {stage} {index} {}",started.elapsed().as_micros());}#[cfg(not(test))] let _=(stage,index);}
 async fn prepare_ordered_profile_page_inner(db:&Client,viewer:&crate::profile_materialize::ProfileViewer<'_>,selection:crate::profile_source::SelectedProfilePage,dns:&dyn crate::direct_preview::PreviewDns)->Result<OrderedProfilePage>{
  let(owner,key,actor,warm,initial,quote_initial)=match viewer{
   crate::profile_materialize::ProfileViewer::Auth(session)=>(session.owner_id(),session.actor_key(),session.source_actor(),session.warm_context(),session.direct.status_preview_budget(),session.direct.quote_preview_budget()),
   crate::profile_materialize::ProfileViewer::Guest(session)=>(0,session.actor_key(),session.source_actor(),session.warm_context(),session.status_preview_budget,session.quote_preview_budget)
  };
- #[cfg(test)] let timer=std::time::Instant::now();
+ let timer=std::time::Instant::now();
  let pinned=selection.tab()=="pinned";
  crate::profile_bridge::ensure_budget()?;
  reject_unsupported_profile_quotes(selection.rows())?;
  let mut projection=crate::profile_materialize::materialize(db,viewer,selection).await?;
- #[cfg(test)] profile_perf_stage("materialize",0,timer);
- #[cfg(test)] let timer=std::time::Instant::now();
+ profile_perf_stage("materialize",crate::profile_bridge::Stage::Materialize,0,timer);
+ let timer=std::time::Instant::now();
  let grant=admit_projection_sources(db,viewer,&projection).await?;
- #[cfg(test)] profile_perf_stage("projection_admission",0,timer);
+ profile_perf_stage("projection_admission",crate::profile_bridge::Stage::Materialize,0,timer);
  let page=projection.page().clone();let mut graphs=crate::profile_materialize::FollowGraphPresentation::new(warm.map(|context|context.cfg()));
  let mut indices=projection.sources().iter().map(|source|source.source_index()).collect::<Vec<_>>();let mut frames:Vec<PreparedProfileFrame>=Vec::new();let mut remaining=initial;let mut quote_remaining=quote_initial;let mut quote_attempts=0;let mut pending_quotes:Vec<crate::profile_materialize::ProjectedQuoteTarget>=Vec::new();
  if !indices.is_empty()&&projection.sources().iter().all(|source|matches!(source.source(),crate::profile_materialize::ProfileSourceKind::Raw(_))&&source.presentation_ready()){
-  crate::profile_bridge::ensure_budget()?;
+  crate::profile_bridge::ensure_budget()?;let timer=std::time::Instant::now();
   projection.require_current(db).await?;
   let rows=indices.iter().filter_map(|index|projection.sources().iter().find(|source|source.source_index()==*index).and_then(|source|match source.source(){crate::profile_materialize::ProfileSourceKind::Raw(raw)=>Some((*index,raw.clone())),_=>None})).collect::<Vec<_>>();
   let frame=match viewer{
    crate::profile_materialize::ProfileViewer::Guest(session)=>{let mut session=(*session).clone();session.status_preview_budget=remaining;session.quote_preview_budget=quote_remaining;let selection=crate::profile_source::SelectedProfilePage::raw_subset(page.clone(),rows,key,actor)?;PreparedProfileFrame::GuestRaw(admit_guest_raw_with_dns(db,&session,selection,dns).await?)},
    crate::profile_materialize::ProfileViewer::Auth(session)=>{let mut session=(*session).clone();session.direct=session.direct.with_status_preview_budget(remaining)?;if let Some(budget)=quote_remaining{session.direct=session.direct.with_quote_preview_budget(budget);}let selection=crate::profile_source::SelectedProfilePage::raw_subset(page.clone(),rows,key,actor)?;PreparedProfileFrame::AuthenticatedRaw(admit_authenticated_raw_with_dns(db,&session,selection,dns).await?)},
   };
+  for _ in 0..indices.len(){crate::profile_bridge::count_stage(crate::profile_bridge::StageCount::Card);}profile_perf_stage("raw_batch_admission",crate::profile_bridge::Stage::Admission,0,timer);
   frame.apply_raw_quote_state(&mut quote_remaining,&mut quote_attempts)?;frames.push(frame);indices.clear();
  }
  for index in indices{
-  crate::profile_bridge::ensure_budget()?;
-  #[cfg(test)] let timer=std::time::Instant::now();
+  crate::profile_bridge::ensure_budget()?;crate::profile_bridge::count_stage(crate::profile_bridge::StageCount::Card);
+  let timer=std::time::Instant::now();
   let source=projection.sources().iter().find(|source|source.source_index()==index).context("profile source ordinal disappeared")?;
   let before=match source.source(){crate::profile_materialize::ProfileSourceKind::Shared(status)=>Some(status.clone()),_=>None};
   if let Some(status)=before.as_ref(){
@@ -918,11 +920,11 @@ async fn prepare_ordered_profile_page_inner(db:&Client,viewer:&crate::profile_ma
     grant.require_current(db,index,status).await?;
    }
   }
-  #[cfg(test)] profile_perf_stage("source_effects",index,timer);
-  #[cfg(test)] let timer=std::time::Instant::now();
+  profile_perf_stage("source_effects",crate::profile_bridge::Stage::Effects,index,timer);
+  let timer=std::time::Instant::now();
   projection.complete_source_presentation_with_preview(db,dns,&grant,index,&mut graphs,warm.and_then(|warm|warm.preview_context())).await?;
-  #[cfg(test)] profile_perf_stage("source_presentation",index,timer);
-  #[cfg(test)] let timer=std::time::Instant::now();
+  profile_perf_stage("source_presentation",crate::profile_bridge::Stage::Presentation,index,timer);
+  let timer=std::time::Instant::now();
   let source=projection.sources().iter().find(|source|source.source_index()==index).context("profile source ordinal disappeared after cache completion")?;
   let mut preview_writes=None;
   let frame=match(source.source(),viewer){
@@ -947,7 +949,7 @@ async fn prepare_ordered_profile_page_inner(db:&Client,viewer:&crate::profile_ma
     let mut session=(*session).clone();session.status_preview_budget=remaining;session.quote_preview_budget=quote_remaining;let selection=crate::profile_source::SelectedProfilePage::raw_subset(page.clone(),vec![(index,raw.clone())],key,actor)?;PreparedProfileFrame::GuestRaw(admit_guest_raw_with_dns(db,&session,selection,dns).await?)
    }
   };
-  #[cfg(test)] profile_perf_stage("frame_admission",index,timer);
+  profile_perf_stage("frame_admission",crate::profile_bridge::Stage::Admission,index,timer);
   if let Some(journal)=preview_writes{let changes=journal.drain_changes()?;projection.reconcile_account_changes(&changes)?;for previous in &mut frames{previous.reconcile_account_changes(&changes)?;}for product in &mut pending_quotes{product.reconcile_account_changes(&changes)?;}}
   // Previously prepared frames remain private until the last source. Their
   // final proof survives this frame's cache/fact/warming awaits.
@@ -956,14 +958,14 @@ async fn prepare_ordered_profile_page_inner(db:&Client,viewer:&crate::profile_ma
  // Painting performs no async IO. Revalidate the complete private page once
  // after this synchronous paint, rather than reading identical snapshots both
  // immediately before and immediately after it.
- #[cfg(test)] let timer=std::time::Instant::now();
+ let timer=std::time::Instant::now();
  let mut cards=Vec::new();for frame in &frames{cards.extend(frame.render_mode(pinned)?);}
  if cards.windows(2).any(|pair|pair[0].0>=pair[1].0){bail!("ordered profile publication lost source positions")}
- #[cfg(test)] profile_perf_stage("paint",0,timer);
- #[cfg(test)] let timer=std::time::Instant::now();
+ profile_perf_stage("paint",crate::profile_bridge::Stage::Paint,0,timer);
+ let timer=std::time::Instant::now();
  let status_state=crate::direct_preview::PreviewState::from_remaining(initial,remaining,page.source_count())?;
  let bsky=match viewer{crate::profile_materialize::ProfileViewer::Auth(session)=>session.direct.profile_bsky().cloned(),crate::profile_materialize::ProfileViewer::Guest(_)=>None};let result=OrderedProfilePage{pinned,page,cards,status_state,quote_initial,quote_remaining,quote_attempts,frames,projection,owner,pending_quotes,bsky};result.require_current(db).await?;
- #[cfg(test)] profile_perf_stage("final_proof",0,timer);
+ profile_perf_stage("final_proof",crate::profile_bridge::Stage::Proof,0,timer);
  Ok(result)
 }
 #[cfg(test)]
