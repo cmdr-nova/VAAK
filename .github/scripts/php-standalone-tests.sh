@@ -105,6 +105,7 @@ php_tests=(
   api/bin/masto-local-acct-smoke.php
   api/bin/notif-list-epoch-smoke.php
   api/bin/notif-page-speed-smoke.php
+  api/bin/notif-db-page-parity-smoke.php
   api/bin/notif-reply-content-smoke.php
   api/bin/notif-reply-preview-smoke.php
   api/bin/phyrian-parity-smoke.php

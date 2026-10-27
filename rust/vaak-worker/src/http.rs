@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use axum::extract::{Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -1231,11 +1231,11 @@ async fn shadow_notifications(
 }
 
 /// Mastodon-shaped body: a bare notification array (Ice Cubes decodes this).
-/// Link uses the public origin (VAAK_PUBLIC_ORIGIN, default https://vaak.monster).
-/// PHP rewrites that origin to the request host when it proxies this result.
-/// `min_id` is the same newer-than cursor as `since_id`.
+/// The Link origin is the request host when that host is local. `min_id` is
+/// the same newer-than cursor as `since_id`.
 async fn shadow_notifications_masto(
     State(state): State<AppState>,
+    request_headers: HeaderMap,
     Query(q): Query<OwnerQuery>,
 ) -> impl IntoResponse {
     let owner = q.owner_id.filter(|v| *v > 0).unwrap_or(state.cfg.default_owner_id);
@@ -1259,7 +1259,8 @@ async fn shadow_notifications_masto(
     )
     .await
     {
-        Ok(report) if report.cache_hit || report.answered || report.source == "db" => {
+        Ok(mut report) if report.cache_hit || report.answered || report.source == "db" => {
+            crate::notif_entity::api_notifications(&mut report.items);
             let mut headers = axum::http::HeaderMap::new();
             if let Ok(v) = axum::http::HeaderValue::from_str(&report.source) {
                 headers.insert(axum::http::HeaderName::from_static("x-vaak-notif-source"), v);
@@ -1282,8 +1283,16 @@ async fn shadow_notifications_masto(
             } else {
                 Some(report.next_cursor.as_str())
             };
+            let origin = crate::notif_page::notification_request_origin(
+                request_headers
+                    .get("x-forwarded-host")
+                    .and_then(|value| value.to_str().ok()),
+                request_headers
+                    .get(axum::http::header::HOST)
+                    .and_then(|value| value.to_str().ok()),
+            );
             let link = crate::notif_page::notification_link(
-                &crate::notif_page::public_origin(),
+                &origin,
                 first,
                 report.has_more,
                 next,

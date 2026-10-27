@@ -1383,8 +1383,11 @@ pub async fn load_post_subscriptions(db: &Client, owner_user_id: i64) -> Result<
     Ok(out)
 }
 
+/// PHP `ap_content_addresses_local_actor`. The actor URL counts in the raw
+/// HTML. A bare `@key` counts only on a word boundary after tags are stripped
+/// and entities decoded, so `@cmdr_novae` and `name@cmdr_nova` do not.
 pub fn content_addresses_local(content: &str, local_actor_id: &str) -> bool {
-    let local = local_actor_id.trim_end_matches('/');
+    let local = local_actor_id.trim().trim_end_matches('/');
     if local.is_empty() || content.is_empty() {
         return false;
     }
@@ -1395,13 +1398,21 @@ pub fn content_addresses_local(content: &str, local_actor_id: &str) -> bool {
     if key.is_empty() || !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
         return false;
     }
-    let host = host_of(local).unwrap_or_else(|| "mkultra.monster".into());
-    let plain = strip_tags_light(content);
-    // @key or @key@host
-    let needle1 = format!("@{key}");
-    let needle2 = format!("@{key}@{host}");
-    plain.to_ascii_lowercase().contains(&needle1.to_ascii_lowercase())
-        || plain.to_ascii_lowercase().contains(&needle2.to_ascii_lowercase())
+    let host = host_of(local).unwrap_or_else(|| "mkultra.monster".into()).to_ascii_lowercase();
+    let plain = crate::home_hydrate_ranked::html_entity_decode(&strip_tags_light(content));
+    if plain.is_empty() {
+        return false;
+    }
+    let at = format!(
+        r"(?i)(^|[^A-Za-z0-9_])@{}(@{})?\b",
+        regex::escape(key),
+        regex::escape(&host)
+    );
+    if regex::Regex::new(&at).is_ok_and(|re| re.is_match(&plain)) {
+        return true;
+    }
+    let acct = format!(r"(?i)acct:{}@{}\b", regex::escape(key), regex::escape(&host));
+    regex::Regex::new(&acct).is_ok_and(|re| re.is_match(&plain))
 }
 
 fn strip_tags_light(s: &str) -> String {

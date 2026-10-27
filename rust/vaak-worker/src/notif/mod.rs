@@ -426,6 +426,40 @@ async fn status_texts_for_notes(db: &Client, uris: &[String]) -> Result<std::col
     Ok(out)
 }
 
+/// PHP `ap_masto_mention_is_quote_of_ours`. The `RE:` form is hardcoded to
+/// cmdr_nova's notes, matching PHP. A bare link is not a quote.
+pub(crate) fn quote_of_ours(activity: &str, obj: &str, object_id: &str, content: &str) -> bool {
+    if activity == "quote" || activity == "quotepost" || obj == "quote" || obj == "quotepost" {
+        return true;
+    }
+    if object_id.contains("#quote-") {
+        return true;
+    }
+    let plain = crate::home_hydrate_ranked::html_entity_decode(&{
+        let mut out = String::with_capacity(content.len());
+        let mut tag = false;
+        for ch in content.chars() {
+            if ch == '<' {
+                tag = true;
+            } else if ch == '>' {
+                tag = false;
+            } else if !tag {
+                out.push(ch);
+            }
+        }
+        out
+    });
+    let plain = plain.trim();
+    if plain.contains("↪ QT") {
+        return true;
+    }
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(r"(?i)^RE:\s*https://mkultra\.monster/users/cmdr_nova/notes/[a-f0-9]+").unwrap()
+    });
+    re.is_match(plain)
+}
+
 /// Thin port of PHP `ap_masto_mention_notif_type` — returns Some(kind) when the
 /// row should count toward the badge. `update` returns None so the caller can
 /// run the favourites lookup.
@@ -469,7 +503,7 @@ pub(crate) fn mention_notif_type(
             || obj == "quote"
             || obj == "quotepost"
             || object_id.contains("#quote-")
-            || content.contains('↪')
+            || content.contains("↪ QT")
         {
             return Some("quote");
         }
@@ -490,12 +524,7 @@ pub(crate) fn mention_notif_type(
             || object_id.starts_with(&format!("{our}/statuses/"));
         return Some(if our_note { "reblog" } else { "mention" });
     }
-    if activity == "quote"
-        || activity == "quotepost"
-        || obj == "quote"
-        || obj == "quotepost"
-        || object_id.contains("#quote-")
-    {
+    if quote_of_ours(&activity, &obj, object_id, content) {
         return Some("quote");
     }
     // Caller handles Update + favourite lookup.

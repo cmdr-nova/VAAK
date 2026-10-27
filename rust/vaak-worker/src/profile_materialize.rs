@@ -1009,6 +1009,33 @@ pub(crate) use search::{SearchHit,SearchProjector,post_media_resolve};
 #[path="profile_materialize_entities.rs"]
 mod entities;
 
+/// Shared status presentation for notification pages. Callers pass text and
+/// mention rows they already loaded; this does not query or fetch.
+pub(crate) fn notification_plain_html(text: &str) -> Result<String> {
+    plain_html(text)
+}
+pub(crate) fn notification_normalized_html(raw: &str) -> String {
+    normalized_html(raw)
+}
+pub(crate) fn notification_html_tags(html: &str) -> (String, Vec<Value>) {
+    entities::html_tags(html)
+}
+pub(crate) fn notification_render_pack(text: &str, mentions: &[Value]) -> Result<Value> {
+    entities::render_pack(text, mentions)
+}
+pub(crate) fn notification_clean_text(raw: &str) -> String {
+    entities::clean_event_text(raw)
+}
+pub(crate) fn notification_media_json(row: &Value) -> Value {
+    media_entity(row)
+}
+pub(crate) fn notification_profile_fields(profile: &Value) -> Vec<Value> {
+    profile_fields(profile).unwrap_or_default()
+}
+pub(crate) fn notification_poll_json(row: &Value, owner_actor: &str) -> Option<Value> {
+    poll_entity(row, owner_actor).ok()
+}
+
 #[path="profile_materialize_moderation.rs"]
 mod moderation;
 
