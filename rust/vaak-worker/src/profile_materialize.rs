@@ -48,18 +48,25 @@ struct DeferredFollowGraph {source_index:usize,actor:String}
 pub(crate) struct FollowGraphPresentation {cfg:Option<crate::config::Config>,memo:std::collections::HashMap<String,Value>}
 impl FollowGraphPresentation {
     pub(crate) fn new(cfg:Option<&crate::config::Config>)->Self{Self{cfg:cfg.cloned(),memo:Default::default()}}
-    async fn load(&self,db:&Client,kind:&str,actor:&str,guard:&dyn crate::profile_enrichment::CurrentEnrichmentGrant)->Result<(String,Value,bool,Option<Dependency>)>{
+    fn cache_key(kind:&str,actor:&str)->String{
         use sha2::{Digest,Sha256};
-        let key=format!("vaak:follow-graph:v1:{kind}:{}",hex::encode(Sha256::digest(actor.trim_end_matches('/').as_bytes())));
-        if let Some(value)=self.memo.get(&key){return Ok((key,value.clone(),false,None))}
+        format!("vaak:follow-graph:v1:{kind}:{}",hex::encode(Sha256::digest(actor.trim_end_matches('/').as_bytes())))
+    }
+    fn cached(&self,kind:&str,actor:&str)->Option<Value>{self.memo.get(&Self::cache_key(kind,actor)).cloned()}
+    async fn load(&self,db:&Client,kind:&str,actor:&str,guard:&dyn crate::profile_enrichment::CurrentEnrichmentGrant)->Result<(String,Value,bool,Option<Dependency>)>{
+        let key=Self::cache_key(kind,actor);
+        if let Some(value)=self.cached(kind,actor){return Ok((key,value,false,None))}
         if let Some(cfg)=&self.cfg{guard.require_current(db).await?;let cached=crate::profile_header::cache::read_json(cfg,&key).await;guard.require_current(db).await?;if let Some(value)=cached.filter(|v|v.is_array()||v.is_object()){return Ok((key,value,false,None))}}
+        // The card shows a count. COUNT(*) is the same number as the full list
+        // and stays a current snapshot, without re-reading every follow row.
         let sql=match kind{
-            "followers"=>"SELECT to_jsonb(f) FROM followers f WHERE owner_actor_id IN($1::jsonb->>'actor',($1::jsonb->>'actor')||'/') ORDER BY followed_at DESC",
-            "following"=>"SELECT to_jsonb(f) FROM following f WHERE owner_actor_id IN($1::jsonb->>'actor',($1::jsonb->>'actor')||'/') ORDER BY followed_at DESC",
+            "followers"=>"SELECT jsonb_build_object('c', COUNT(*)) FROM followers f WHERE owner_actor_id IN($1::jsonb->>'actor',($1::jsonb->>'actor')||'/')",
+            "following"=>"SELECT jsonb_build_object('c', COUNT(*)) FROM following f WHERE owner_actor_id IN($1::jsonb->>'actor',($1::jsonb->>'actor')||'/')",
             _=>bail!("invalid private graph list kind")
         };
         let parameters=json!({"actor":actor.trim_end_matches('/')});guard.require_current(db).await?;let rows=Dependency::read(db,sql,&parameters).await?;guard.require_current(db).await?;
-        Ok((key,Value::Array(rows.clone()),true,Some(Dependency::new(sql,parameters,rows))))
+        let value=rows.first().cloned().unwrap_or(json!({"c":0}));
+        Ok((key,value,true,Some(Dependency::new(sql,parameters,rows))))
     }
     async fn retain(&mut self,key:String,value:Value,write:bool){
         if write{if let Some(cfg)=&self.cfg{
@@ -68,7 +75,7 @@ impl FollowGraphPresentation {
         }}self.memo.insert(key,value);
     }
 }
-fn graph_array_count(value:&Value)->usize{match value{Value::Array(v)=>v.len(),Value::Object(v)=>v.len(),_=>0}}
+fn graph_array_count(value:&Value)->usize{if let Some(count)=value.get("c").and_then(Value::as_i64){return count.max(0) as usize}match value{Value::Array(v)=>v.len(),Value::Object(v)=>v.len(),_=>0}}
 fn apply_graph_count(status:&mut Value,actor:&str,kind:&str,count:usize){
     if s(&status["account"],"uri").trim_end_matches('/')==actor.trim_end_matches('/'){
         status["account"][format!("{kind}_count")]=json!(count);
@@ -103,17 +110,40 @@ fn static_count_snapshot(api_root:&std::path::Path)->Result<(i64,StaticCountDepe
     Ok((blog.checked_add(notes).context("PHP fallback: static count sum exceeds native range")?,StaticCountDependency{path,bytes}))
 }
 #[derive(Clone)]
-struct Dependency {sql:&'static str,key:Value,rows:Vec<Value>,plans:std::sync::Arc<tokio::sync::Mutex<Vec<DependencyPlan>>>}
+struct Dependency {sql:&'static str,key:Value,rows:Vec<Value>,plans:std::sync::Arc<tokio::sync::Mutex<Vec<DependencyPlan>>>,origins:std::sync::Arc<std::sync::Mutex<std::collections::BTreeSet<usize>>>}
 struct DependencyPlan {sql:String,backend:i32,schemas:Vec<String>,statement:tokio_postgres::Statement}
 impl Dependency {
-    fn new(sql:&'static str,key:Value,rows:Vec<Value>)->Self{Self{sql,key,rows,plans:Default::default()}}
+    fn new(sql:&'static str,key:Value,rows:Vec<Value>)->Self{Self{sql,key,rows,plans:Default::default(),origins:Default::default()}}
+    fn tag(&self,origin:usize){self.origins.lock().expect("dependency origins").insert(origin);}
+    /// Untagged snapshots stay on every guard. A tagged snapshot is rechecked
+    /// for the sources that consumed it, and still for the final page.
+    fn relevant_to_source(&self,origin:usize)->bool{let origins=self.origins.lock().expect("dependency origins");origins.is_empty()||origins.contains(&origin)}
     async fn read(db:&Client,sql:&'static str,key:&Value)->Result<Vec<Value>>{
         let rows=if sql.contains("$1"){db.query(sql,&[key]).await?}else{db.query(sql,&[]).await?};
         Ok(rows.into_iter().map(|r|r.get(0)).collect())
     }
 }
-/// One fresh statement per guard boundary; keys are bound values and SQL is
-/// exclusively projector-owned static text. Every original full-row snapshot
+/// Bind every `$1` to the lateral key. `$10` is not a placeholder here.
+fn dependency_bind_key(sql:&str)->String{
+    let chars:Vec<char>=sql.chars().collect();let mut out=String::with_capacity(sql.len()+16);let mut i=0;
+    while i<chars.len(){
+        if chars[i]=='$'&&i+1<chars.len()&&chars[i+1]=='1'&&(i+2==chars.len()||!chars[i+2].is_ascii_digit()){out.push_str("(input.key)");i+=2;}
+        else{out.push(chars[i]);i+=1;}
+    }
+    out
+}
+/// One stable statement per projector SQL template. Keys travel as one jsonb
+/// array; the original SQL text is not rebuilt when another post is added.
+fn dependency_batch_sql(sql:&str)->String{
+    if sql.contains("$1"){
+        let inner=dependency_bind_key(sql);
+        format!("SELECT (input.ordinality - 1)::bigint AS source_index, COALESCE((SELECT jsonb_agg(snapshot.value) FROM ({inner}) AS snapshot(value)), '[]'::jsonb) AS rows FROM jsonb_array_elements($1::jsonb) WITH ORDINALITY AS input(key, ordinality)")
+    }else{
+        format!("SELECT COALESCE((SELECT jsonb_agg(snapshot.value) FROM ({sql}) AS snapshot(value)), '[]'::jsonb) AS rows")
+    }
+}
+/// One fresh statement per template and guard boundary; keys are bound values
+/// and SQL is exclusively projector-owned static text. Every original snapshot
 /// remains required, including duplicate reads with conflicting expectations.
 async fn require_dependencies(db:&Client,dependencies:&[Dependency],message:&'static str)->Result<()>{
     if dependencies.is_empty(){return Ok(())}
@@ -125,26 +155,41 @@ async fn require_dependencies(db:&Client,dependencies:&[Dependency],message:&'st
         // exact JSON key/full ordered row comparisons for candidate duplicates.
         if !candidates.iter().any(|&index|unique[index].key==dependency.key&&unique[index].rows==dependency.rows){candidates.push(unique.len());unique.push(dependency)}
     }
-    let keys=json!(unique.iter().map(|d|&d.key).collect::<Vec<_>>());
-    let sql=unique.iter().enumerate().map(|(index,d)|{
-        let sql=d.sql.replace("$1",&format!("($1::jsonb->{index})"));
-        format!("SELECT {index}::bigint AS source_index,COALESCE(jsonb_agg(snapshot.value),'[]'::jsonb) AS rows FROM ({sql}) AS snapshot(value)")
-    }).collect::<Vec<_>>().join(" UNION ALL ");
+    let mut groups:Vec<(&str,Vec<usize>)>=Vec::new();
+    for (index,dependency) in unique.iter().enumerate(){
+        if let Some(group)=groups.iter_mut().find(|(sql,_)|*sql==dependency.sql){group.1.push(index);}
+        else{groups.push((dependency.sql,vec![index]));}
+    }
     // Plans belong to retained request snapshots, not a process/global cache.
     // Fresh connection/schema identity prevents a Statement from crossing a
     // fixture search_path or database connection boundary. Results are never
     // retained here; every guard still executes its exact bound SQL.
     let identity=db.query_one("SELECT pg_backend_pid(),current_schemas(true)",&[]).await?;
     let backend:i32=identity.get(0);let schemas:Vec<String>=identity.get(1);
-    let statement={let mut plans=unique[0].plans.lock().await;
-        if let Some(plan)=plans.iter().find(|p|p.sql==sql&&p.backend==backend&&p.schemas==schemas){plan.statement.clone()}
-        else{let statement=db.prepare(&sql).await?;if plans.len()>=16{plans.remove(0);}plans.push(DependencyPlan{sql:sql.clone(),backend,schemas,statement:statement.clone()});statement}
-    };
-    let rows=if sql.contains("$1"){db.query(&statement,&[&keys]).await?}else{db.query(&statement,&[]).await?};
-    if rows.len()!=unique.len(){bail!("{message}")}
-    let mut seen=std::collections::HashSet::new();
-    for row in rows{let index:usize=row.get::<_,i64>(0).try_into().context("native dependency index invalid")?;if index>=unique.len()||!seen.insert(index){bail!("{message}")}
-        let actual:Value=row.get(1);if actual!=json!(unique[index].rows){bail!("{message}")}}
+    for (template,members) in groups{
+        let batch=dependency_batch_sql(template);
+        let anchor=&unique[members[0]];
+        let statement={let mut plans=anchor.plans.lock().await;
+            if let Some(plan)=plans.iter().find(|p|p.sql==batch&&p.backend==backend&&p.schemas==schemas){plan.statement.clone()}
+            else{let statement=db.prepare(&batch).await?;if plans.len()>=16{plans.remove(0);}plans.push(DependencyPlan{sql:batch.clone(),backend,schemas:schemas.clone(),statement:statement.clone()});statement}
+        };
+        if template.contains("$1"){
+            let keys=json!(members.iter().map(|&index|&unique[index].key).collect::<Vec<_>>());
+            let rows=db.query(&statement,&[&keys]).await?;
+            if rows.len()!=members.len(){bail!("{message}")}
+            let mut seen=std::collections::HashSet::new();
+            for row in rows{
+                let ordinal:usize=row.get::<_,i64>(0).try_into().context("native dependency index invalid")?;
+                if ordinal>=members.len()||!seen.insert(ordinal){bail!("{message}")}
+                let actual:Value=row.get(1);
+                if actual!=json!(unique[members[ordinal]].rows){bail!("{message}")}
+            }
+        }else{
+            let rows=db.query(&statement,&[]).await?;
+            let actual:Value=rows.first().map(|row|row.get(0)).unwrap_or(json!([]));
+            if members.iter().any(|&index|actual!=json!(unique[index].rows)){bail!("{message}")}
+        }
+    }
     Ok(())
 }
 enum CompletionAudience<'a> {
@@ -157,7 +202,13 @@ impl crate::profile_enrichment::CurrentEnrichmentGrant for CompletionGrant<'_> {
         Box::pin(async move {
             for d in self.static_counts{d.require_current()?;}
             if let Some(page)=self.page{match self.audience{CompletionAudience::Source(grant,_)=>grant.require_same_page(page)?,CompletionAudience::Quote(_,_)=>page.require_current_ledger(db).await?}}
-            require_dependencies(db,self.dependencies,"PHP fallback: projection changed before enrichment dependency").await?;
+            // A source guard rechecks the snapshots that source consumed.
+            // Untagged snapshots and the final page guard still see every row.
+            let scoped:Vec<Dependency>=match self.audience{
+                CompletionAudience::Source(_,index)=>self.dependencies.iter().filter(|dependency|dependency.relevant_to_source(index)).cloned().collect(),
+                CompletionAudience::Quote(_,_)=>self.dependencies.to_vec(),
+            };
+            require_dependencies(db,&scoped,"PHP fallback: projection changed before enrichment dependency").await?;
             match self.audience {
                 CompletionAudience::Source(grant,index)=>grant.require_current(db,index,self.status).await?,
                 CompletionAudience::Quote(grant,target)=>grant.require_current(db,target,self.status).await?,
@@ -215,8 +266,24 @@ impl MaterializedProfilePage {
     pub(crate) async fn complete_source_presentation(&mut self,db:&Client,dns:&dyn crate::direct_preview::PreviewDns,grant:&crate::profile_context::AdmittedProjectionSources,source_index:usize,graphs:&mut FollowGraphPresentation)->Result<()>{
         self.complete_source_presentation_with_preview(db,dns,grant,source_index,graphs,None).await
     }
+    /// Recheck the snapshots this source consumed. The final page guard still
+    /// rechecks every snapshot, including ones tagged to other sources.
+    async fn require_source_dependencies(&self,db:&Client,index:usize)->Result<()>{
+        self.page.require_current_ledger(db).await?;
+        for d in &self.static_counts{d.require_current()?;}
+        let scoped:Vec<Dependency>=self.dependencies.iter().filter(|dependency|dependency.relevant_to_source(index)).cloned().collect();
+        require_dependencies(db,&scoped,"PHP fallback: profile projection dependency changed before publication").await?;
+        for d in &self.static_counts{d.require_current()?;}
+        self.page.require_current_ledger(db).await
+    }
     pub(crate) async fn complete_source_presentation_with_preview(&mut self,db:&Client,dns:&dyn crate::direct_preview::PreviewDns,grant:&crate::profile_context::AdmittedProjectionSources,source_index:usize,graphs:&mut FollowGraphPresentation,preview:Option<&crate::profile_preview_fetch::PreviewFetchContext>)->Result<()>{
-        self.require_current(db).await?;
+        if !self.sources.iter().any(|source|source.source_index==source_index){bail!("PHP fallback: source cache ordinal absent from native selected page")}
+        self.require_source_dependencies(db,source_index).await?;
+        let graph_actors=self.graphs.iter().filter(|task|task.source_index==source_index).map(|task|task.actor.clone()).collect::<Vec<_>>();
+        let cache_pending=self.cache.iter().any(|task|task.source_index==source_index);
+        // A later post on the same page reuses the request memo. The first miss
+        // still loads under the source guard; publication rechecks that snapshot.
+        let memo_ready=!cache_pending&&graph_actors.iter().all(|actor|graphs.cached("followers",actor).is_some()&&graphs.cached("following",actor).is_some());
         let bound_dependencies=self.dependencies.clone();let bound_static=self.static_counts.clone();
         let mut found=false;
         for source in &mut self.sources{
@@ -225,37 +292,52 @@ impl MaterializedProfilePage {
             let ProfileSourceKind::Shared(status)=&mut source.source else{if source.cache_complete{continue}bail!("deferred preview bound to nonshared source")};
             let allowed=grant.disposition(source.source_index,status).context("PHP fallback: source cache grant differs from native ordinal/status")?;
             if source.cache_complete{continue}
+            if allowed&&memo_ready{
+                for actor in &graph_actors{
+                    for kind in ["followers","following"]{
+                        let value=graphs.cached(kind,actor).context("follow graph memo missing")?;
+                        apply_graph_count(status,actor,kind,graph_array_count(&value));
+                    }
+                }
+                source.cache_complete=true;
+                continue;
+            }
             let admission_status=status.clone();
             let guard=CompletionGrant{audience:CompletionAudience::Source(grant,source.source_index),status:&admission_status,page:Some(&self.page),dependencies:&bound_dependencies,static_counts:&bound_static};
             // Validate against the exact pre-completion tree once. Filling a
             // nested presentation card must not turn a later path into a new
             // source or a new capability.
             if allowed{
-                for task in self.graphs.iter().filter(|t|t.source_index==source.source_index){
+                for actor in &graph_actors{
                     for kind in ["followers","following"]{
+                        if let Some(value)=graphs.cached(kind,actor){
+                            apply_graph_count(status,actor,kind,graph_array_count(&value));
+                            continue;
+                        }
                         grant.require_current(db,source.source_index,&admission_status).await?;
-                        let(key,value,write,dependency)=graphs.load(db,kind,&task.actor,&guard).await?;
+                        let(key,value,write,dependency)=graphs.load(db,kind,actor,&guard).await?;
                         grant.require_current(db,source.source_index,&admission_status).await?;
-                        if let Some(dependency)=dependency{self.dependencies.push(dependency)}
+                        if let Some(dependency)=dependency{dependency.tag(source.source_index);self.dependencies.push(dependency)}
                         let count=graph_array_count(&value);graphs.retain(key,value,write).await;
                         grant.require_current(db,source.source_index,&admission_status).await?;
-                        apply_graph_count(status,&task.actor,kind,count);
+                        apply_graph_count(status,actor,kind,count);
                     }
                 }
-                for task in self.cache.iter().filter(|t|t.source_index==source.source_index){
+                let cache_tasks=self.cache.iter().filter(|task|task.source_index==source.source_index).map(|task|(task.path.clone(),task.text.clone(),task.require_hit)).collect::<Vec<_>>();
+                for (path,text,require_hit) in cache_tasks{
                     grant.require_current(db,source.source_index,&admission_status).await?;
-                    let Some(url)=crate::direct_preview::extract_url(&task.text)?else{continue};
+                    let Some(url)=crate::direct_preview::extract_url(&text)?else{continue};
                     let key=crate::direct_preview::normalize(&url)?;
                     let sql="SELECT to_jsonb(c) FROM link_preview_cards c WHERE url=$1::jsonb->>'url' LIMIT 1";
                     let key=json!({"url":key});let rows=Dependency::read(db,sql,&key).await?;
                     grant.require_current(db,source.source_index,&admission_status).await?;
-                    let card=crate::direct_preview::resolve_cache_only_guarded(db,dns,&task.text,chrono::Utc::now(),Some(&guard)).await?;
+                    let card=crate::direct_preview::resolve_cache_only_guarded(db,dns,&text,chrono::Utc::now(),Some(&guard)).await?;
                     grant.require_current(db,source.source_index,&admission_status).await?;
                     if Dependency::read(db,sql,&key).await?!=rows{bail!("PHP fallback: projection cache changed during DNS eligibility")}
-                    self.dependencies.push(Dependency::new(sql,key,rows));
-                    if task.require_hit&&card.is_none(){let preview=preview.context("PHP fallback: cold remote link preview warm capability absent")?;let bridge=CompletionQuoteGrant{db,grant:&guard};preview.warm_text(&task.text,&bridge).await?;}
+                    let dependency=Dependency::new(sql,key,rows);dependency.tag(source.source_index);self.dependencies.push(dependency);
+                    if require_hit&&card.is_none(){let preview=preview.context("PHP fallback: cold remote link preview warm capability absent")?;let bridge=CompletionQuoteGrant{db,grant:&guard};preview.warm_text(&text,&bridge).await?;}
                     let mut node=&mut *status;
-                    for part in &task.path{node=node.get_mut(part).context("deferred preview path lost source tree")?;}
+                    for part in &path{node=node.get_mut(part).context("deferred preview path lost source tree")?;}
                     node["card"]=card.as_ref().map(masto_preview_card).unwrap_or(Value::Null);
                 }
             }
@@ -264,7 +346,7 @@ impl MaterializedProfilePage {
             source.cache_complete=true;
         }
         if !found{bail!("PHP fallback: source cache ordinal absent from native selected page")}
-        self.require_current(db).await
+        self.require_source_dependencies(db,source_index).await
     }
     pub(crate) async fn require_current(&self,db:&Client)->Result<()>{
         self.page.require_current_ledger(db).await?;
@@ -383,9 +465,9 @@ impl Projector<'_> {
         // Projection is read-only until the separately admitted effect stage.
         // Keep the first exact snapshot for identical request-local lookups;
         // concurrent changes remain visible to fresh admission/final checks.
-        if let Some(snapshot)=self.dependencies.iter().find(|d|d.sql==sql&&d.key==key){return Ok(snapshot.rows.clone())}
+        if let Some(snapshot)=self.dependencies.iter().find(|d|d.sql==sql&&d.key==key){snapshot.tag(self.source_index);return Ok(snapshot.rows.clone())}
         let rows=Dependency::read(self.db,sql,&key).await?;
-        self.dependencies.push(Dependency::new(sql,key,rows.clone()));Ok(rows)
+        let dependency=Dependency::new(sql,key,rows.clone());dependency.tag(self.source_index);self.dependencies.push(dependency);Ok(rows)
     }
     fn effect(&mut self,effect:ProjectionEffect){self.effects.push(DeferredProjectionEffect{source_index:self.source_index,effect});}
 }
@@ -651,7 +733,10 @@ impl Projector<'_>{
         let actor=if s(user,"actor_id").is_empty(){format!("https://mkultra.monster/users/{key}")}else{s(user,"actor_id").trim_end_matches('/').to_owned()};
         let followers=self.rows("SELECT jsonb_build_object('c',COUNT(*)) FROM followers WHERE owner_actor_id IN($1::jsonb->>'actor',($1::jsonb->>'actor')||'/')",json!({"actor":actor})).await?;
         let following=self.rows("SELECT jsonb_build_object('c',COUNT(*)) FROM following WHERE owner_actor_id IN($1::jsonb->>'actor',($1::jsonb->>'actor')||'/')",json!({"actor":actor})).await?;
-        let mut count=self.rows("SELECT to_jsonb(n) FROM outbox_notes n WHERE id LIKE $1::jsonb->>'prefix' ORDER BY published DESC LIMIT 200",json!({"prefix":format!("https://mkultra.monster/users/{key}/%") })).await?.len();
+        // Same cap as ap_outbox_list(200): the count is the page length, not the
+        // full note bodies. Re-checking this snapshot must stay a count.
+        let capped=self.rows("SELECT jsonb_build_object('c', COUNT(*)) FROM (SELECT 1 FROM outbox_notes n WHERE id LIKE $1::jsonb->>'prefix' ORDER BY published DESC LIMIT 200) capped",json!({"prefix":format!("https://mkultra.monster/users/{key}/%")})).await?;
+        let mut count:usize=i(capped.first().context("status count snapshot absent")?,"c").try_into().context("PHP fallback: status count exceeds native range")?;
         if key=="cmdr_nova"{
             // Same server-owned root as the private process warm transport.
             // A browser cannot select the path or supply these counts.
@@ -668,16 +753,51 @@ impl Projector<'_>{
         if profile_only{account["source"]=json!({"privacy":"public","sensitive":false,"language":"en","note":strip_html(s(profile,"summary")),"fields":profile_source_fields(profile)?});}
         Ok(account)
     }
+    /// Reply parent identity used by the status and by mention packing.
+    /// The parent actor is the same extra mention PHP passes into the pack.
+    async fn reply_context(&mut self,row:&Value,outbox:&Value)->Result<(Value,Value,Vec<String>)>{
+        let mut reply_id=Value::Null;let mut reply_account=Value::Null;let mut parent_actor=None;
+        if row.get("in_reply_to_local_id").is_some_and(|v|!v.is_null()){
+            let parents=self.rows("SELECT to_jsonb(s) FROM masto_statuses s WHERE local_id=($1::jsonb->>'id')::bigint LIMIT 1",json!({"id":i(row,"in_reply_to_local_id")})).await?;
+            if let Some(parent)=parents.first(){
+                reply_id=json!(snowflake(&format_time(s(parent,"published"))?,i(parent,"local_id"),0)?);
+                let account=self.local_account(s(parent,"note_id")).await?;
+                reply_account=account["id"].clone();
+                let actor=s(&account,"uri").trim_end_matches('/').to_owned();
+                if actor.starts_with("https://"){parent_actor=Some(actor);}
+            }
+        }
+        if reply_id.is_null(){
+            let parent=s(outbox,"in_reply_to").trim_end_matches('/');
+            if parent.starts_with("https://"){
+                let local_parent=self.rows("SELECT to_jsonb(s) FROM masto_statuses s WHERE note_id IN($1::jsonb->>'note',($1::jsonb->>'note')||'/') LIMIT 1",json!({"note":parent})).await?;
+                if let Some(parent_row)=local_parent.first(){
+                    reply_id=json!(snowflake(&format_time(s(parent_row,"published"))?,i(parent_row,"local_id"),0)?);
+                    let account=self.local_account(s(parent_row,"note_id")).await?;
+                    reply_account=account["id"].clone();
+                    let actor=s(&account,"uri").trim_end_matches('/').to_owned();
+                    if actor.starts_with("https://"){parent_actor=Some(actor);}
+                }else{
+                    let events=self.rows("SELECT to_jsonb(e) FROM events e WHERE object_id IN($1::jsonb->>'note',($1::jsonb->>'note')||'/') ORDER BY id DESC",json!({"note":parent})).await?;
+                    let mentions=self.rows("SELECT to_jsonb(m) FROM mentions m WHERE object_id IN($1::jsonb->>'note',($1::jsonb->>'note')||'/') AND deleted_at IS NULL ORDER BY id DESC",json!({"note":parent})).await?;
+                    if !events.is_empty()||!mentions.is_empty(){bail!("PHP fallback: cached remote reply needs native event/mention normalization")}
+                    reply_id=json!((900_000_000+crc32(parent.as_bytes()) as i64%99_999_999).to_string());
+                    if let Some(actor)=actor_from_object(parent){reply_account=json!(self.remote_account_id(&actor).await?);parent_actor=Some(actor);}
+                }
+            }
+        }
+        Ok((reply_id,reply_account,parent_actor.into_iter().collect()))
+    }
     async fn local_status(&mut self,row:&Value,outbox:&Value,attach_quote:bool)->Result<Value>{
         let note=s(row,"note_id");if note.is_empty(){bail!("PHP fallback: Mastodon source note identity missing")}
         let account=self.local_account(note).await?;let local=i(row,"local_id");let published=format_time(s(row,"published"))?;let sid=snowflake(&published,local,0)?;
         let mut text=s(row,"content_text");if matches!(text,"(quote)"|"(media)"|"(poll)"){text=""}
         let mut content=if !s(outbox,"content").is_empty()&&!crate::library::card::php_trim(&strip_html(s(outbox,"content"))).is_empty(){normalized_html(s(outbox,"content"))}else{plain_html(text)?};
         let plain_for_entities=if !text.is_empty(){text.to_owned()}else{crate::library::card::php_trim(&crate::home_hydrate_ranked::html_entity_decode(&strip_html(&content))).to_owned()};
+        let (reply_id,reply_account,parent_actors)=self.reply_context(row,outbox).await?;
         let mut mentions=json!([]);let mut tags=json!([]);
         if !plain_for_entities.is_empty()&&(plain_for_entities.contains('@')||plain_for_entities.contains('#')){
-            if !s(outbox,"in_reply_to").is_empty()||row.get("in_reply_to_local_id").is_some_and(|v|!v.is_null()){bail!("PHP fallback: canonical reply-parent entity resolver unfinished")}
-            let pack=self.canonical_pack(&plain_for_entities).await?;mentions=pack["mentions"].clone();tags=pack["tags"].clone();
+            let pack=self.canonical_pack_with_actors(&plain_for_entities,&parent_actors).await?;mentions=pack["mentions"].clone();tags=pack["tags"].clone();
             let markup=content.contains("class=\"u-url mention\"")||content.contains("class='u-url mention'")||content.contains("class=\"mention\"");
             if !markup&&!s(&pack,"content").is_empty(){content=s(&pack,"content").into()}
             else if !content.is_empty()&&content.contains('<'){let(html,found)=entities::html_tags(&content);content=html;if !found.is_empty(){tags=json!(found)}}
@@ -686,25 +806,6 @@ impl Projector<'_>{
         let raw:Value=serde_json::from_str(s(outbox,"raw_create_json")).unwrap_or(Value::Null);
         let quote_target=if attach_quote{quote_url(&raw)}else{None};
         let asks=self.rows("SELECT to_jsonb(a) FROM ap_asks a WHERE answer_note_id IN($1::jsonb->>'note',($1::jsonb->>'note')||'/') ORDER BY id DESC LIMIT 1",json!({"note":note})).await?;
-        let mut reply_id=Value::Null;let mut reply_account=Value::Null;
-        if row.get("in_reply_to_local_id").is_some_and(|v|!v.is_null()){
-            let parents=self.rows("SELECT to_jsonb(s) FROM masto_statuses s WHERE local_id=($1::jsonb->>'id')::bigint LIMIT 1",json!({"id":i(row,"in_reply_to_local_id")})).await?;
-            if let Some(parent)=parents.first(){reply_id=json!(snowflake(&format_time(s(parent,"published"))?,i(parent,"local_id"),0)?);reply_account=self.local_account(s(parent,"note_id")).await?["id"].clone();}
-        }
-        if reply_id.is_null(){
-            let parent=s(outbox,"in_reply_to").trim_end_matches('/');
-            if parent.starts_with("https://"){
-                let local_parent=self.rows("SELECT to_jsonb(s) FROM masto_statuses s WHERE note_id IN($1::jsonb->>'note',($1::jsonb->>'note')||'/') LIMIT 1",json!({"note":parent})).await?;
-                if let Some(parent)=local_parent.first(){reply_id=json!(snowflake(&format_time(s(parent,"published"))?,i(parent,"local_id"),0)?);reply_account=self.local_account(s(parent,"note_id")).await?["id"].clone();}
-                else{
-                    let events=self.rows("SELECT to_jsonb(e) FROM events e WHERE object_id IN($1::jsonb->>'note',($1::jsonb->>'note')||'/') ORDER BY id DESC",json!({"note":parent})).await?;
-                    let mentions=self.rows("SELECT to_jsonb(m) FROM mentions m WHERE object_id IN($1::jsonb->>'note',($1::jsonb->>'note')||'/') AND deleted_at IS NULL ORDER BY id DESC",json!({"note":parent})).await?;
-                    if !events.is_empty()||!mentions.is_empty(){bail!("PHP fallback: cached remote reply needs native event/mention normalization")}
-                    reply_id=json!((900_000_000+crc32(parent.as_bytes()) as i64%99_999_999).to_string());
-                    if let Some(actor)=actor_from_object(parent){reply_account=json!(self.remote_account_id(&actor).await?);}
-                }
-            }
-        }
         let media=self.rows("SELECT to_jsonb(m) FROM masto_media m WHERE status_local_id=($1::jsonb->>'id')::bigint ORDER BY local_id ASC",json!({"id":local})).await?.iter().map(media_entity).collect::<Vec<_>>();
         let pins=self.rows("SELECT to_jsonb(p) FROM masto_pins p WHERE status_local_id=($1::jsonb->>'id')::bigint AND owner_user_id=($1::jsonb->>'owner')::bigint",json!({"id":local,"owner":self.owner})).await?;
         let polls=self.rows("SELECT to_jsonb(p) FROM masto_polls p WHERE status_local_id=($1::jsonb->>'id')::bigint LIMIT 1",json!({"id":local})).await?;
@@ -719,7 +820,7 @@ impl Projector<'_>{
         if let Some(target)=quote_target{
             let author=s(&raw["object"],"attributedTo").trim_end_matches('/');
             let child=self.rows("SELECT to_jsonb(s) FROM masto_statuses s WHERE note_id IN($1::jsonb->>'note',($1::jsonb->>'note')||'/') LIMIT 1",json!({"note":target})).await?;
-            let authorized=truth(&raw["object"]["quoteAuthorization"])||(!author.is_empty()&&format!("{target}/").starts_with(&format!("{author}/notes/")))||!child.is_empty();
+            let authorized=truth(&raw["object"]["quoteAuthorization"])||(!author.is_empty()&&format!("{target}/").starts_with(&format!("{author}/notes/")))||!child.is_empty()||quote_target_is_bluesky(&target);
             let quote=if !authorized{json!({"state":"pending","quoted_status":null,"quoted_status_id":null})}else if let Some(child)=child.first(){
                 let notes=self.rows("SELECT to_jsonb(n) FROM outbox_notes n WHERE id=$1::jsonb->>'note'",json!({"note":s(child,"note_id")})).await?;
                 let child_outbox=notes.first().context("PHP fallback: quote local Mastodon row has no durable outbox")?;
@@ -856,8 +957,13 @@ fn actor_from_object(raw:&str)->Option<String>{
 fn quote_url(raw:&Value)->Option<String>{
     for key in ["quote","quoteUri","quoteUrl","_misskey_quote"]{
         let v=&raw["object"][key];let url=v.as_str().or_else(||["id","url","href"].iter().find_map(|k|v.get(k).and_then(Value::as_str)));
-        if let Some(url)=url.filter(|v|v.starts_with("https://")){return Some(url.trim_end_matches('/').into())}
+        if let Some(url)=url.map(str::trim).filter(|v|v.starts_with("https://")||v.starts_with("at://")){return Some(url.trim_end_matches('/').into())}
     }None
+}
+/// ap_quote_target_is_bluesky: bsky.app, AT URIs, and Bridgy Bluesky objects.
+fn quote_target_is_bluesky(url:&str)->bool{
+    let url=url.trim();
+    url.starts_with("https://bsky.app/")||url.starts_with("at://")||url.contains("bsky.brid.gy")
 }
 fn poll_entity(row:&Value,owner_actor:&str)->Result<Value>{
     let options:Value=serde_json::from_str(s(row,"options_json")).unwrap_or(json!([]));let options=options.as_array().into_iter().flatten().filter(|v|v.is_object()).map(|v|json!({"title":s(v,"title"),"votes_count":i(v,"votes_count")})).collect::<Vec<_>>();
@@ -902,6 +1008,18 @@ mod tests {
     }
 
     use super::*;
+    #[test]
+    fn quote_target_matches_php_bluesky_classifier(){
+        assert!(quote_target_is_bluesky("https://bsky.app/profile/example/post/1"));
+        assert!(quote_target_is_bluesky("at://did:plc:example/app.bsky.feed.post/1"));
+        assert!(quote_target_is_bluesky("https://bsky.brid.gy/convert/ap/at://did:plc:example/app.bsky.feed.post/1"));
+        assert!(!quote_target_is_bluesky("https://example.social/users/a/statuses/1"));
+        assert!(!quote_target_is_bluesky("https://mkultra.monster/users/example/notes/1"));
+    }
+    #[test]
+    fn dependency_bind_key_leaves_higher_placeholders(){
+        assert_eq!(dependency_bind_key("WHERE id=$1 AND n=$10 AND x=$1"),"WHERE id=(input.key) AND n=$10 AND x=(input.key)");
+    }
     #[tokio::test]
     #[ignore="request-owned prepared dependency plans across fresh SQL and schema boundaries"]
     async fn actual_dependency_plan_schema_binding(){

@@ -60,6 +60,15 @@ impl AdmittedDirectStatus {
  pub(crate) fn presentation(&self)->&DirectPresentation{&self.presentation}
 }
 fn text<'a>(v:&'a Value,key:&str)->&'a str{v.get(key).and_then(Value::as_str).unwrap_or("")}
+fn local_note_prefix(uri:&str)->bool{
+ static RE:std::sync::OnceLock<regex::Regex>=std::sync::OnceLock::new();
+ RE.get_or_init(||regex::Regex::new(r"^https://mkultra\.monster/users/[^/]+/notes/").expect("local note prefix")).is_match(uri)
+}
+pub(crate) fn local_note_author(uri:&str)->Option<String>{
+ static RE:std::sync::OnceLock<regex::Regex>=std::sync::OnceLock::new();
+ let re=RE.get_or_init(||regex::Regex::new(r"^https://mkultra\.monster/users/([A-Za-z0-9_]+)/notes/").expect("local note author"));
+ re.captures(uri).map(|captures|captures[1].to_owned())
+}
 fn children(value:&Value)->Vec<(&str,&Value)>{["reblog","quote","vaak_quote_preview"].iter().filter_map(|key|value.get(*key).filter(|v|v.is_object()).map(|v|(*key,v.get("quoted_status").or_else(||v.get("status")).filter(|v|v.is_object()).unwrap_or(v)))).collect()}
 pub(crate) fn local_outbox_tree<'a>(db:&'a Client,status:&'a Value,depth:usize)->std::pin::Pin<Box<dyn std::future::Future<Output=Result<bool>>+Send+'a>>{
  Box::pin(async move{
@@ -67,7 +76,7 @@ pub(crate) fn local_outbox_tree<'a>(db:&'a Client,status:&'a Value,depth:usize)-
   let uri=crate::library::card::php_trim(status.get("uri").or_else(||status.get("url")).and_then(Value::as_str).unwrap_or("")).split('#').next().unwrap_or("").trim_end_matches('/');
   // Local durable audience proof precedes ordinary preview effects. A live
   // remote-style event cannot replace the canonical local outbox grant.
-  if regex::Regex::new(r"^https://mkultra\.monster/users/[^/]+/notes/").unwrap().is_match(uri)&&!db.query_one("SELECT EXISTS(SELECT 1 FROM outbox_notes WHERE id IN ($1,$2))",&[&uri,&format!("{uri}/")]).await?.get::<_,bool>(0){return Ok(false)}
+  if local_note_prefix(uri)&&!db.query_one("SELECT EXISTS(SELECT 1 FROM outbox_notes WHERE id IN ($1,$2))",&[&uri,&format!("{uri}/")]).await?.get::<_,bool>(0){return Ok(false)}
   for (_,child) in children(status){if !local_outbox_tree(db,child,depth+1).await?{return Ok(false)}}
   Ok(true)
  })
@@ -77,7 +86,7 @@ pub(crate) fn current_tree<'a>(db:&'a Client,status:&'a Value,depth:usize)->std:
   if depth>16{return Ok(false)}
   let uri=crate::library::card::php_trim(status.get("uri").or_else(||status.get("url")).and_then(Value::as_str).unwrap_or("")).split('#').next().unwrap_or("").trim_end_matches('/');
   if uri.is_empty(){return Ok(matches!(text(status,"state"),"pending"|"accepted"|"fallback")&&["account","content","text","media","media_attachments"].iter().all(|key|status.get(*key).is_none()))}
-  if regex::Regex::new(r"^https://mkultra\.monster/users/[^/]+/notes/").unwrap().is_match(uri){
+  if local_note_prefix(uri){
    if !db.query_one("SELECT EXISTS(SELECT 1 FROM masto_statuses WHERE rtrim(note_id,'/')=$1)",&[&uri]).await?.get::<_,bool>(0){return Ok(false)}
    // Canonical audience requires local outbox proof even if remote-style
    // event metadata exists or a cached current Mastodon row still survives.
@@ -99,7 +108,7 @@ pub(crate) async fn profile_trees_current(db:&Client,statuses:&[&Value])->Result
   let uri=crate::library::card::php_trim(status.get("uri").or_else(||status.get("url")).and_then(Value::as_str).unwrap_or("")).split('#').next().unwrap_or("").trim_end_matches('/');
   let mut child_current=current;
   if uri.is_empty(){if current&&!(matches!(text(status,"state"),"pending"|"accepted"|"fallback")&&["account","content","text","media","media_attachments"].iter().all(|key|status.get(*key).is_none())){return false}child_current=false;}
-  else{let local=regex::Regex::new(r"^https://mkultra\.monster/users/[^/]+/notes/").unwrap().is_match(uri);let entry=items.entry(uri.into()).or_insert((local,false));entry.1|=current;}
+  else{let local=local_note_prefix(uri);let entry=items.entry(uri.into()).or_insert((local,false));entry.1|=current;}
   children(status).iter().all(|(_,child)|collect(child,depth+1,child_current,items))
  }
  let mut items=std::collections::BTreeMap::new();for status in statuses{if !collect(status,0,true,&mut items){return Ok(false)}}
@@ -107,6 +116,27 @@ pub(crate) async fn profile_trees_current(db:&Client,statuses:&[&Value])->Result
  let input=Value::Array(items.iter().map(|(uri,(local,current))|serde_json::json!({"uri":uri,"local":local,"current":current})).collect());
  let rows=db.query("SELECT CASE WHEN (i->>'local')::boolean THEN EXISTS(SELECT 1 FROM outbox_notes WHERE id IN (i->>'uri',(i->>'uri')||'/')) AND (NOT (i->>'current')::boolean OR EXISTS(SELECT 1 FROM masto_statuses WHERE rtrim(note_id,'/')=i->>'uri')) WHEN NOT (i->>'current')::boolean THEN true WHEN e.type IS NOT NULL THEN COALESCE(e.action_taken,'')<>'deleted' AND e.type NOT IN ('Delete','Tombstone') WHEN m.id IS NOT NULL THEN COALESCE(m.deleted_at::text,'') IN ('','0') ELSE false END FROM jsonb_array_elements($1::jsonb) i LEFT JOIN LATERAL (SELECT type,action_taken FROM events WHERE object_id IN (i->>'uri',(i->>'uri')||'/') AND (type IN ('Create','Update','Delete','Tombstone') OR (type IN ('Quote','QuotePost') AND NOT EXISTS(SELECT 1 FROM events note_source WHERE note_source.object_id IN (i->>'uri',(i->>'uri')||'/') AND note_source.type IN ('Create','Update')))) ORDER BY id DESC LIMIT 1) e ON true LEFT JOIN LATERAL (SELECT id,deleted_at FROM mentions WHERE object_id IN (i->>'uri',(i->>'uri')||'/') ORDER BY id DESC LIMIT 1) m ON true",&[&input]).await?;
  Ok(rows.len()==items.len()&&rows.iter().all(|row|row.get::<_,bool>(0)))
+}
+/// Per-root form of profile_trees_current. One SQL snapshot; a failed root does
+/// not hide which other roots are still current.
+pub(crate) async fn profile_tree_mask(db:&Client,statuses:&[&Value])->Result<Vec<bool>>{
+ fn collect(status:&Value,depth:usize,current:bool,root:usize,items:&mut std::collections::BTreeMap<String,(bool,bool,Vec<usize>)>)->bool{
+  if depth>16{return false}
+  let uri=crate::library::card::php_trim(status.get("uri").or_else(||status.get("url")).and_then(Value::as_str).unwrap_or("")).split('#').next().unwrap_or("").trim_end_matches('/');
+  let mut child_current=current;
+  if uri.is_empty(){if current&&!(matches!(text(status,"state"),"pending"|"accepted"|"fallback")&&["account","content","text","media","media_attachments"].iter().all(|key|status.get(*key).is_none())){return false}child_current=false;}
+  else{let local=local_note_prefix(uri);let entry=items.entry(uri.into()).or_insert((local,false,Vec::new()));entry.1|=current;if !entry.2.contains(&root){entry.2.push(root);}}
+  children(status).iter().all(|(_,child)|collect(child,depth+1,child_current,root,items))
+ }
+ let mut ok=vec![true;statuses.len()];
+ let mut items=std::collections::BTreeMap::new();
+ for (root,status) in statuses.iter().enumerate(){if !collect(status,0,true,root,&mut items){ok[root]=false;}}
+ if items.is_empty(){return Ok(ok)}
+ let input=Value::Array(items.iter().map(|(uri,(local,current,_))|serde_json::json!({"uri":uri,"local":local,"current":current})).collect());
+ let rows=db.query("SELECT CASE WHEN (i->>'local')::boolean THEN EXISTS(SELECT 1 FROM outbox_notes WHERE id IN (i->>'uri',(i->>'uri')||'/')) AND (NOT (i->>'current')::boolean OR EXISTS(SELECT 1 FROM masto_statuses WHERE rtrim(note_id,'/')=i->>'uri')) WHEN NOT (i->>'current')::boolean THEN true WHEN e.type IS NOT NULL THEN COALESCE(e.action_taken,'')<>'deleted' AND e.type NOT IN ('Delete','Tombstone') WHEN m.id IS NOT NULL THEN COALESCE(m.deleted_at::text,'') IN ('','0') ELSE false END FROM jsonb_array_elements($1::jsonb) i LEFT JOIN LATERAL (SELECT type,action_taken FROM events WHERE object_id IN (i->>'uri',(i->>'uri')||'/') AND (type IN ('Create','Update','Delete','Tombstone') OR (type IN ('Quote','QuotePost') AND NOT EXISTS(SELECT 1 FROM events note_source WHERE note_source.object_id IN (i->>'uri',(i->>'uri')||'/') AND note_source.type IN ('Create','Update')))) ORDER BY id DESC LIMIT 1) e ON true LEFT JOIN LATERAL (SELECT id,deleted_at FROM mentions WHERE object_id IN (i->>'uri',(i->>'uri')||'/') ORDER BY id DESC LIMIT 1) m ON true",&[&input]).await?;
+ if rows.len()!=items.len(){return Ok(vec![false;statuses.len()])}
+ for ((_,(_,_,roots)),row) in items.iter().zip(rows.iter()){if !row.get::<_,bool>(0){for root in roots{ok[*root]=false;}}}
+ Ok(ok)
 }
 fn supported_tree(status:&Value,depth:usize)->Result<()> {supported_tree_mode(status,depth,false,false)}
 fn supported_tree_mode(status:&Value,depth:usize,plain_quote_effects:bool,pending_quote:bool)->Result<()> {

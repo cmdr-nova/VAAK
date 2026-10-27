@@ -48,10 +48,15 @@ redis_hostport="${redis_dsn#redis://}"
 redis_hostport="${redis_hostport%%/*}"
 
 worker_pid=""
+profile_pid=""
 cleanup() {
   if [[ -n "$worker_pid" ]]; then
     kill "$worker_pid" 2>/dev/null || true
     wait "$worker_pid" 2>/dev/null || true
+  fi
+  if [[ -n "$profile_pid" ]]; then
+    kill "$profile_pid" 2>/dev/null || true
+    wait "$profile_pid" 2>/dev/null || true
   fi
   rm -rf "$work"
 }
@@ -132,4 +137,30 @@ run "$runner" api/bin/search-direct-undo-smoke.php
 UNDO_FIXTURE_WIDTH=BIGINT run "$runner" api/bin/search-direct-undo-smoke.php
 run "$runner" api/bin/direct-partial-blocks-smoke.php
 
-echo "db smokes: 12 passed"
+# Complete-profile routes stay unregistered on the worker above. This process
+# gets a one-shot secret so the parity smoke can call them. The secret is not
+# printed.
+profile_port="${VAAK_CI_PROFILE_PORT:-18788}"
+profile_secret="$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')"
+VAAK_ENV_FILE=/nonexistent VAAK_PHYRIAN_BRIDGE_ENV_FILE=/nonexistent \
+  VAAK_PROFILE_COMPLETE_NATIVE=1 VAAK_PROFILE_COMPLETE_SECRET="$profile_secret" \
+  VAAK_DATABASE_URL="postgresql://${PGUSER}@${PGHOST}:${PGPORT}/${db}" \
+  VAAK_REDIS_URL="redis://${redis_hostport}/0" VAAK_REDIS_QUEUE_URL="redis://${redis_hostport}/1" \
+  VAAK_JETSTREAM_STATE="${work}/worker/jetstream-profile" VAAK_NOTIF_CACHE_DIR="${work}/worker" \
+  RUST_LOG=debug "$worker_bin" serve --bind "127.0.0.1:${profile_port}" &
+profile_pid=$!
+profile_url="http://127.0.0.1:${profile_port}"
+for _ in $(seq 1 60); do
+  if php -r 'exit(@file_get_contents($argv[1]) === false ? 1 : 0);' "${profile_url}/healthz"; then
+    break
+  fi
+  if ! kill -0 "$profile_pid" 2>/dev/null; then
+    echo "profile vaak-worker exited" >&2
+    exit 1
+  fi
+  sleep 1
+done
+VAAK_PROFILE_PARITY_RUST_URL="$profile_url" VAAK_PROFILE_COMPLETE_SECRET="$profile_secret" \
+  run "$runner" api/bin/profile-complete-parity-smoke.php
+
+echo "db smokes: 13 passed"

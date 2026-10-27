@@ -275,8 +275,7 @@ pub(crate) async fn admit_guest_raw_with_dns(db:&Client,session:&GuestProfileSes
     let mut cards=Vec::new();let mut dependencies=Vec::new();let mut quote_products:Vec<(crate::profile_materialize::ProjectedQuoteTarget,bool)>=Vec::new();let mut mapping_changes=Vec::new();
     for (index,raw) in selected_rows{
         let note=raw.get("id").and_then(Value::as_str).context("raw profile source is not an outbox note")?;
-        let captured=regex::Regex::new(r"^https://mkultra\.monster/users/([A-Za-z0-9_]+)/notes/").unwrap();
-        let source_key=captured.captures(note).context("PHP fallback: raw note author shape")?[1].to_owned();
+        let source_key=crate::direct_context::local_note_author(note).context("PHP fallback: raw note author shape")?;
         let actor=format!("https://mkultra.monster/users/{source_key}");let key=source_key.to_ascii_lowercase();
         let profile=db.query_opt("SELECT to_jsonb(p) FROM actor_profile p WHERE actor_key=$1",&[&key]).await?.map(|row|row.get::<_,Value>(0)).context("PHP fallback: raw profile author unavailable")?;
         let status=serde_json::json!({"id":"","uri":note,"url":note,"visibility":raw.get("visibility").cloned().unwrap_or(serde_json::json!("public")),"content":raw.get("content").cloned().unwrap_or(serde_json::json!("")),"account":{"uri":actor,"url":actor,"acct":key},"media_attachments":[]});
@@ -477,13 +476,20 @@ pub(crate) async fn admit_projection_sources(db:&Client,viewer:&crate::profile_m
  };
  page.page().require_target(key,source_actor)?;page.require_current(db).await?;
  if root_content_blocked_for(db,owner,actor).await?{bail!("PHP fallback: profile projection root blocked")}
- let mut sources=Vec::new();let mut denied=Vec::new();
+ let mut shared=Vec::new();
  for source in page.sources(){
   let crate::profile_materialize::ProfileSourceKind::Shared(status)=source.source() else{continue};
-  let mut checked=vec![status.clone()];crate::audience::filter_profile_statuses(db,owner,crate::audience::Surface::Direct,&mut checked).await?;
-  if checked.is_empty(){denied.push((source.source_index(),status.clone()));continue}
-  if !crate::direct_context::local_outbox_tree(db,status,0).await?||!crate::direct_context::current_tree(db,status,0).await?{denied.push((source.source_index(),status.clone()));continue}
-  sources.push((source.source_index(),status.clone()));
+  shared.push((source.source_index(),status.clone()));
+ }
+ let mut tagged=Vec::with_capacity(shared.len());
+ for (index,status) in &shared{let mut copy=status.clone();copy["__vaak_profile_ordinal"]=serde_json::json!(*index);tagged.push(copy);}
+ crate::audience::filter_profile_statuses(db,owner,crate::audience::Surface::Direct,&mut tagged).await?;
+ let allowed_audience:std::collections::HashSet<usize>=tagged.iter().filter_map(|status|status.get("__vaak_profile_ordinal").and_then(serde_json::Value::as_u64).map(|ordinal|ordinal as usize)).collect();
+ let refs:Vec<&serde_json::Value>=shared.iter().map(|(_,status)|status).collect();
+ let trees=crate::direct_context::profile_tree_mask(db,&refs).await?;
+ let mut sources=Vec::new();let mut denied=Vec::new();
+ for ((index,status),tree_ok) in shared.into_iter().zip(trees){
+  if allowed_audience.contains(&index)&&tree_ok{sources.push((index,status));}else{denied.push((index,status));}
  }
  page.require_current(db).await?;let owner_snapshot=if owner>0{db.query_opt("SELECT to_jsonb(u) FROM ap_users u WHERE id=$1::bigint AND disabled_at IS NULL",&[&owner]).await?.map(|row|row.get::<_,Value>(0))}else{None};
  Ok(AdmittedProjectionSources{sources,denied,owner,owner_snapshot,root_actor:actor.into(),page:page.page().clone()})
@@ -504,8 +510,7 @@ pub(crate) async fn admit_authenticated_raw_with_dns(db:&Client,session:&Authent
     let mut cards=Vec::new();let mut dependencies=Vec::new();let mut quote_products:Vec<(crate::profile_materialize::ProjectedQuoteTarget,bool)>=Vec::new();let mut mapping_changes=Vec::new();
     for (index,raw) in selected_rows{
         let note=raw.get("id").and_then(Value::as_str).context("raw profile source is not an outbox note")?;
-        let captured=regex::Regex::new(r"^https://mkultra\.monster/users/([A-Za-z0-9_]+)/notes/").unwrap();
-        let source_key=captured.captures(note).context("PHP fallback: raw note author shape")?[1].to_owned();
+        let source_key=crate::direct_context::local_note_author(note).context("PHP fallback: raw note author shape")?;
         let actor=format!("https://mkultra.monster/users/{source_key}");let key=source_key.to_ascii_lowercase();
         let profile=db.query_opt("SELECT to_jsonb(p) FROM actor_profile p WHERE actor_key=$1",&[&key]).await?.map(|row|row.get::<_,Value>(0)).context("PHP fallback: raw profile author unavailable")?;
         let status=serde_json::json!({"id":"","uri":note,"url":note,"visibility":raw.get("visibility").cloned().unwrap_or(serde_json::json!("public")),"content":raw.get("content").cloned().unwrap_or(serde_json::json!("")),"account":{"uri":actor,"url":actor,"acct":key},"media_attachments":[]});
