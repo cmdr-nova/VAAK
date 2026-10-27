@@ -7315,10 +7315,12 @@ function ap_mention_soft_delete(string $objectId): int
            object_id = ? OR object_id = ? OR object_id LIKE ? ' . $escape . '
          )';
     $params = [$objectId, $objectId . '/', addcslashes($objectId, '\\%_') . '#%'];
-    $owners = ap_mention_active_owner_ids(
-        'SELECT DISTINCT owner_user_id FROM mentions WHERE ' . $where,
-        $params
-    );
+    $owners = function_exists('ap_mention_active_owner_ids')
+        ? ap_mention_active_owner_ids(
+            'SELECT DISTINCT owner_user_id FROM mentions WHERE ' . $where,
+            $params
+        )
+        : [];
     $st = ap_db()->prepare('UPDATE mentions SET deleted_at = ? WHERE ' . $where);
     $st->execute(array_merge([$now], $params));
     $n = (int) $st->rowCount();
@@ -7326,8 +7328,12 @@ function ap_mention_soft_delete(string $objectId): int
         ap_search_fts_delete_object($objectId);
     }
     if ($n > 0) {
-        ap_notification_projection_invalidate_all();
-        ap_notification_unread_invalidate_owners($owners);
+        if (function_exists('ap_notification_projection_invalidate_all')) {
+            ap_notification_projection_invalidate_all();
+        }
+        if (function_exists('ap_notification_unread_invalidate_owners')) {
+            ap_notification_unread_invalidate_owners($owners);
+        }
     }
     return $n;
 }
@@ -7365,10 +7371,12 @@ function ap_mention_soft_delete_interaction(string $actorId, string $targetObjec
     $owners = [];
 
     if ($activityId !== null && $activityId !== '') {
-        $owners = array_merge($owners, ap_mention_active_owner_ids(
-            'SELECT DISTINCT owner_user_id FROM mentions WHERE deleted_at IS NULL AND activity_id = ?',
-            [$activityId]
-        ));
+        if (function_exists('ap_mention_active_owner_ids')) {
+            $owners = array_merge($owners, ap_mention_active_owner_ids(
+                'SELECT DISTINCT owner_user_id FROM mentions WHERE deleted_at IS NULL AND activity_id = ?',
+                [$activityId]
+            ));
+        }
         $st = $db->prepare(
             'UPDATE mentions SET deleted_at = ?
              WHERE deleted_at IS NULL AND activity_id = ?'
@@ -7380,13 +7388,15 @@ function ap_mention_soft_delete_interaction(string $actorId, string $targetObjec
     if ($actorId !== '' && $targetObjectId !== '' && in_array($kind, ['like', 'reblog', 'quote', 'update'], true)) {
         $stableId = ap_mention_interaction_object_id($targetObjectId, $actorId, $kind);
         $likePattern = $targetObjectId . '#' . $kind . '-%';
-        $owners = array_merge($owners, ap_mention_active_owner_ids(
-            'SELECT DISTINCT owner_user_id FROM mentions WHERE deleted_at IS NULL AND (
-               object_id = ?
-               OR ((actor_id = ? OR actor_id = ?) AND object_id LIKE ?)
-             )',
-            [$stableId, $actorId, $actorId . '/', $likePattern]
-        ));
+        if (function_exists('ap_mention_active_owner_ids')) {
+            $owners = array_merge($owners, ap_mention_active_owner_ids(
+                'SELECT DISTINCT owner_user_id FROM mentions WHERE deleted_at IS NULL AND (
+                   object_id = ?
+                   OR ((actor_id = ? OR actor_id = ?) AND object_id LIKE ?)
+                 )',
+                [$stableId, $actorId, $actorId . '/', $likePattern]
+            ));
+        }
         // Stable key + any legacy activity-id-keyed rows for same actor/target/kind
         $st = $db->prepare(
             'UPDATE mentions SET deleted_at = ?
@@ -7400,8 +7410,12 @@ function ap_mention_soft_delete_interaction(string $actorId, string $targetObjec
     }
 
     if ($touched > 0) {
-        ap_notification_projection_invalidate_all();
-        ap_notification_unread_invalidate_owners($owners);
+        if (function_exists('ap_notification_projection_invalidate_all')) {
+            ap_notification_projection_invalidate_all();
+        }
+        if (function_exists('ap_notification_unread_invalidate_owners')) {
+            ap_notification_unread_invalidate_owners($owners);
+        }
     }
 
     return $touched;
@@ -15743,7 +15757,9 @@ function ap_masto_favourite_remove(string $statusId, ?int $ownerUserId = null, ?
         }
         $target = rtrim((string) ($row['object_id'] ?? $objectId), '/');
         $activity = trim((string) ($row['like_activity_id'] ?? ''));
-        ap_notification_dismiss_local_interaction($actor, $target, 'like', $activity !== '' ? $activity : null);
+        if (function_exists('ap_notification_dismiss_local_interaction')) {
+            ap_notification_dismiss_local_interaction($actor, $target, 'like', $activity !== '' ? $activity : null);
+        }
     }
     return $row;
 }
@@ -16063,7 +16079,9 @@ function ap_masto_reblog_remove(string $statusId, ?int $ownerUserId = null): ?ar
         }
         $target = rtrim((string) ($row['object_id'] ?? ''), '/');
         $activity = trim((string) ($row['announce_activity_id'] ?? ''));
-        ap_notification_dismiss_local_interaction($actor, $target, 'reblog', $activity !== '' ? $activity : null);
+        if (function_exists('ap_notification_dismiss_local_interaction')) {
+            ap_notification_dismiss_local_interaction($actor, $target, 'reblog', $activity !== '' ? $activity : null);
+        }
     }
     return $row;
 }
@@ -16096,7 +16114,9 @@ function ap_masto_reblog_remove_by_object_id(string $objectId, ?int $ownerUserId
             }
             $target = rtrim((string) ($row['object_id'] ?? $objectId), '/');
             $activity = trim((string) ($row['announce_activity_id'] ?? ''));
-            ap_notification_dismiss_local_interaction($actor, $target, 'reblog', $activity !== '' ? $activity : null);
+            if (function_exists('ap_notification_dismiss_local_interaction')) {
+                ap_notification_dismiss_local_interaction($actor, $target, 'reblog', $activity !== '' ? $activity : null);
+            }
         }
         return $n;
     } catch (Throwable $e) {
