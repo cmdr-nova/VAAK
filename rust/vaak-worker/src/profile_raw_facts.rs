@@ -110,7 +110,7 @@ pub(crate) async fn resolve_authenticated(db:&Client,session:&AuthenticatedProfi
  let note_dom_id:String=db.query_one("SELECT md5($1)",&[&note]).await?.get(0);
  let inbound=facts::reply_inbound_block_keys(db,&owner_actor).await?;
  let reply_mentions=raw_reply_mentions(actor,&plain,obj,&owner_actor,&owner_key,&blocks,&inbound);
- Ok(RawProfileFacts{card:CardFacts{bsky:None,owner_id:owner,owner_actor,return_view:session.return_view().into(),auto_unblur_sensitive:auto,resolved_avatar:facts::avatar_with_context(db,&Value::Null,actor,session.warm_context()).await?,csrf:session.csrf().into(),favourited,bookmarked,boosted,own,current_action_counts:None,rss_row:None,rss_quote_row:None,rss_quoted:false,emoji_by_actor,reply_mentions,moderation,poll_row,ask_row,now,lazy_media:session.lazy_media()},actor_key:key.into(),actor:actor.into(),display_name:card::php_trim(text(profile,"name")).into(),note_dom_id,masto_row,status_id,own_note,guest:false,quote_html:String::new(),link_card:None,media_preview_by_url})
+ Ok(RawProfileFacts{card:CardFacts{bsky:None,owner_id:owner,owner_actor,return_view:session.return_view().into(),auto_unblur_sensitive:auto,resolved_avatar:facts::avatar_with_context(db,&Value::Null,actor,session.warm_context()).await?,csrf:session.csrf().into(),favourited,bookmarked,boosted,own,current_action_counts:None,rss_row:None,rss_quote_row:None,rss_quoted:false,emoji_by_actor,reply_mentions,moderation,poll_row,ask_row,now,lazy_media:session.lazy_media()},actor_key:key.into(),actor:actor.into(),display_name:card::php_trim(text(profile,"name")).into(),note_dom_id,masto_row,status_id,own_note,guest:false,quote_html:String::new(),link_card:None,media_preview_by_url,body_mentions:None})
 }
 
 #[cfg(test)]
