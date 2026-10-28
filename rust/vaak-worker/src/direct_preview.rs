@@ -202,17 +202,19 @@ pub(crate) async fn resolve_cache_only(db:&Client,dns:&dyn PreviewDns,text:&str,
  resolve_cache_only_guarded(db,dns,text,now,None).await
 }
 struct GuardedCacheDns<'a>{db:&'a Client,dns:&'a dyn PreviewDns,grant:&'a dyn crate::profile_enrichment::CurrentEnrichmentGrant}
-impl PreviewDns for GuardedCacheDns<'_>{fn ipv4<'a>(&'a self,host:&'a str)->std::pin::Pin<Box<dyn std::future::Future<Output=Result<Vec<Ipv4Addr>>>+Send+'a>>{Box::pin(async move{self.grant.require_current(self.db).await?;let result=self.dns.ipv4(host).await?;self.grant.require_current(self.db).await?;Ok(result)})}
- fn addrs<'a>(&'a self,host:&'a str)->std::pin::Pin<Box<dyn std::future::Future<Output=Result<Vec<IpAddr>>>+Send+'a>>{Box::pin(async move{self.grant.require_current(self.db).await?;let result=self.dns.addrs(host).await?;self.grant.require_current(self.db).await?;Ok(result)})}}
+// A lookup is the only outward effect here, so authority is checked before
+// each one. Reads after it are covered by the single check on return.
+impl PreviewDns for GuardedCacheDns<'_>{fn ipv4<'a>(&'a self,host:&'a str)->std::pin::Pin<Box<dyn std::future::Future<Output=Result<Vec<Ipv4Addr>>>+Send+'a>>{Box::pin(async move{self.grant.require_current(self.db).await?;self.dns.ipv4(host).await})}
+ fn addrs<'a>(&'a self,host:&'a str)->std::pin::Pin<Box<dyn std::future::Future<Output=Result<Vec<IpAddr>>>+Send+'a>>{Box::pin(async move{self.grant.require_current(self.db).await?;self.dns.addrs(host).await})}}
 pub(crate) async fn resolve_cache_only_guarded(db:&Client,dns:&dyn PreviewDns,text:&str,now:chrono::DateTime<chrono::Utc>,grant:Option<&dyn crate::profile_enrichment::CurrentEnrichmentGrant>)->Result<Option<Value>>{
- if let Some(grant)=grant{grant.require_current(db).await?;}
-
- let Some(url)=extract_url(text)?else{return Ok(None)};
+ let Some(url)=extract_url(text)?else{if let Some(grant)=grant{grant.require_current(db).await?;}return Ok(None)};
  let key=normalize(&url)?;
- let allowed=if let Some(grant)=grant{eligible(&key,&GuardedCacheDns{db,dns,grant}).await?}else{eligible(&key,dns).await?};if !allowed{return Ok(None)}
+ let allowed=if let Some(grant)=grant{eligible(&key,&GuardedCacheDns{db,dns,grant}).await?}else{eligible(&key,dns).await?};
+ let row=if allowed{db.query_opt("SELECT to_jsonb(c) FROM link_preview_cards c WHERE url=$1 LIMIT 1",&[&key]).await?}else{None};
+ // One check after the last read: the answer is only used if authority
+ // still holds once every read it depends on has finished.
  if let Some(grant)=grant{grant.require_current(db).await?;}
- let row=db.query_opt("SELECT to_jsonb(c) FROM link_preview_cards c WHERE url=$1 LIMIT 1",&[&key]).await?;
- if let Some(grant)=grant{grant.require_current(db).await?;}
+ if !allowed{return Ok(None)}
  if let Some(row)=row{
   let row:Value=row.get(0);let expiry=s(&row,"expires_at");
   let expired=if expiry.is_empty(){false}else{
