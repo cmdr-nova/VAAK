@@ -51,6 +51,7 @@ require_once __DIR__ . '/ap-lists.php'; // Library → Lists (private follow sub
 require_once __DIR__ . '/ap-bites.php'; // Wafrn-compatible Bite
 require_once __DIR__ . '/ap-reports.php'; // Moderation → Reports (Flag)
 require_once __DIR__ . '/ap-relays.php'; // Admin → Relays (Mastodon-compatible)
+require_once __DIR__ . '/ap-nostr.php'; // Nostr npub link, actions, Favourites and Relays tabs
 require_once __DIR__ . '/ap-import-export.php'; // You → Import/Export + Move/aliases
 require_once __DIR__ . '/ap-r2.php'; // avatar URL helpers / async warm
 require_once __DIR__ . '/ap-masto-entities.php'; // status ids, favourites/bookmarks
@@ -3691,6 +3692,19 @@ $vaakAdminOnlyActions = [
             $notice = 'Relay disabled (Undo Follow sent if it was pending/accepted).';
         } else {
             $error = $res['error'] ?? 'Disable failed.';
+        }
+    } elseif (in_array($action, ['nostr_relay_add', 'nostr_relay_remove', 'nostr_relay_restore', 'nostr_relay_check', 'nostr_relay_check_all'], true)) {
+        $view = 'relays';
+        $_GET['network'] = 'nostr';
+        if (empty($vaakIsAdmin)) {
+            $error = 'Admin only.';
+        } else {
+            $res = ap_nostr_relay_admin_action($action, $_POST);
+            if (!empty($res['ok'])) {
+                $notice = (string) ($res['notice'] ?? 'Saved.');
+            } else {
+                $error = (string) ($res['error'] ?? 'Could not update Nostr relays.');
+            }
         }
     } elseif ($action === 'relay_remove') {
         $view = 'relays';
@@ -33228,7 +33242,19 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
         <?php endif; ?>
 
       <?php elseif ($view === 'relays'): ?>
-        <?php if (($adminNativeBody = ap_admin_native_read_body('relays')) !== null): ?>
+        <?php
+          $relayNostrOn = function_exists('ap_nostr_relays_tab_html') && ap_nostr_form_visible(!empty($vaakIsAdmin));
+          $relayNet = $relayNostrOn && (string) ($_GET['network'] ?? '') === 'nostr' ? 'nostr' : 'ap';
+        ?>
+        <?php if ($relayNostrOn): ?>
+        <nav class="notification-tabs" aria-label="Relay network" style="display:flex;gap:.5rem;flex-wrap:wrap;margin:0 0 1rem">
+          <a class="btn <?= $relayNet === 'ap' ? 'btn-primary' : 'btn-ghost' ?>" role="tab" aria-selected="<?= $relayNet === 'ap' ? 'true' : 'false' ?>" href="?view=relays" style="padding:.3rem .7rem;font-size:.82rem">ActivityPub</a>
+          <a class="btn <?= $relayNet === 'nostr' ? 'btn-primary' : 'btn-ghost' ?>" role="tab" aria-selected="<?= $relayNet === 'nostr' ? 'true' : 'false' ?>" href="?view=relays&amp;network=nostr" style="padding:.3rem .7rem;font-size:.82rem">Nostr</a>
+        </nav>
+        <?php endif; ?>
+        <?php if ($relayNet === 'nostr'): ?>
+          <?= ap_nostr_relays_tab_html(ap_auth_csrf_token()) ?>
+        <?php elseif (($adminNativeBody = ap_admin_native_read_body('relays')) !== null): ?>
           <?= $adminNativeBody ?>
         <?php else: ?>
         <?php $relayRows = function_exists('ap_relays_list') ? ap_relays_list() : []; ?>

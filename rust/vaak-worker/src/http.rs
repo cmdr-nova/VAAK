@@ -187,6 +187,7 @@ pub async fn serve(cfg: Config, bind: SocketAddr) -> Result<()> {
         // One Nostr card's HTML, for PHP pages that fall back from Rust.
         .route("/shadow/nostr-card", post(shadow_nostr_card))
         .route("/shadow/nostr-likes", post(shadow_nostr_likes))
+        .route("/shadow/nostr-relay-check", post(shadow_nostr_relay_check))
         .route_layer(axum::middleware::from_fn_with_state(shadow_token, crate::shadow_auth::require));
     let mut app = Router::new()
         .route("/healthz", get(healthz))
@@ -265,7 +266,8 @@ async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
             "/shadow/nostr-publish (POST)",
             "/shadow/nostr-statuses (POST)",
             "/shadow/nostr-card (POST)",
-            "/shadow/nostr-likes (POST)"
+            "/shadow/nostr-likes (POST)",
+            "/shadow/nostr-relay-check (POST)"
         ],
     }))
 }
@@ -768,6 +770,28 @@ async fn shadow_nostr_likes(State(state): State<AppState>, Json(body): Json<Nost
         crate::nostr::act::stamp_viewer_flags(&db, body.owner_id, &mut statuses).await;
         let htmls: Vec<String> = statuses.iter().map(|st| crate::notif_embed::paint_lean_feed_card_opts(st, "favourites", "")).collect();
         Ok(serde_json::json!({"ok": true, "htmls": htmls, "has_more": more}))
+    }
+    .await;
+    nostr_reply(res)
+}
+
+#[derive(serde::Deserialize)]
+struct NostrRelayCheckBody {
+    urls: Vec<String>,
+}
+
+/// Admin > Relays > Nostr "Check now": probe relays and record the results.
+async fn shadow_nostr_relay_check(State(state): State<AppState>, Json(body): Json<NostrRelayCheckBody>) -> axum::response::Response {
+    let urls: Vec<String> = body.urls.iter().filter_map(|u| crate::nostr::relay::normalize_relay_url(u)).collect();
+    if urls.is_empty() || urls.len() > 60 {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"ok": false, "error": "Relay URLs required"}))).into_response();
+    }
+    let res = async {
+        let db = crate::db::connect(&state.cfg.database_url).await?;
+        let outcomes = crate::nostr::relay_book::check(&db, &urls, chrono::Utc::now().timestamp()).await;
+        let results: Vec<serde_json::Value> =
+            outcomes.iter().map(|o| serde_json::json!({"url": o.url, "ok": o.ok, "error": o.error})).collect();
+        Ok(serde_json::json!({"ok": true, "results": results}))
     }
     .await;
     nostr_reply(res)
