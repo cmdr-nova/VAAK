@@ -81,11 +81,15 @@ fn tls_config() -> Arc<rustls::ClientConfig> {
         .get_or_init(|| {
             let mut roots = rustls::RootCertStore::empty();
             roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-            let config = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
                 .with_safe_default_protocol_versions()
                 .expect("rustls protocol versions")
                 .with_root_certificates(roots)
                 .with_no_client_auth();
+            // Websocket upgrades are HTTP/1.1. Cloudflare-fronted relays
+            // (relay.damus.io) answered 503 to a handshake with no ALPN while
+            // curl --http1.1, which offers http/1.1, got 101.
+            config.alpn_protocols = vec![b"http/1.1".to_vec()];
             Arc::new(config)
         })
         .clone()
@@ -171,6 +175,10 @@ fn handshake_request(url: &str) -> Result<tokio_tungstenite::tungstenite::handsh
     request.headers_mut().insert(
         tokio_tungstenite::tungstenite::http::header::USER_AGENT,
         tokio_tungstenite::tungstenite::http::HeaderValue::from_static(USER_AGENT),
+    );
+    request.headers_mut().insert(
+        tokio_tungstenite::tungstenite::http::header::ACCEPT,
+        tokio_tungstenite::tungstenite::http::HeaderValue::from_static("*/*"),
     );
     Ok(request)
 }
@@ -288,6 +296,15 @@ pub fn newest_by_author_kind(events: Vec<Event>) -> HashMap<(String, i64), Event
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn handshake_looks_like_http11_websocket_client() {
+        assert_eq!(tls_config().alpn_protocols, vec![b"http/1.1".to_vec()]);
+        let req = handshake_request("wss://relay.damus.io").unwrap();
+        assert_eq!(req.headers()["user-agent"], USER_AGENT);
+        assert_eq!(req.headers()["accept"], "*/*");
+        assert_eq!(req.headers()["host"], "relay.damus.io");
+    }
 
     #[test]
     fn relay_urls_are_normalized_and_guarded() {
