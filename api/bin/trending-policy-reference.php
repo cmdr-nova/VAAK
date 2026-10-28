@@ -21,6 +21,7 @@ reference_load(getenv('TREND_REFERENCE_ENTITIES')?:dirname(__DIR__).'/ap-masto-e
 $sidebarSource=getenv('TREND_REFERENCE_SOURCE')?:dirname(__DIR__).'/ap-admin.php';$names=['admin_home_suppression_map','admin_trend_downrank_ref_set','admin_trend_status_is_downranked','admin_trends_sidebar_html'];
 if(str_contains(file_get_contents($sidebarSource),'function admin_trend_actor_refs('))$names=array_merge($names,['admin_trend_actor_refs','admin_trend_status_hidden']);
 if(str_contains(file_get_contents($sidebarSource),'function admin_trend_sparkline_svg('))$names[]='admin_trend_sparkline_svg';
+if(str_contains(file_get_contents($sidebarSource),'function admin_trend_status_media('))$names[]='admin_trend_status_media';
 reference_load($sidebarSource,$names);
 $before=!in_array('admin_trend_actor_refs',$names,true);$results=[];
 function trend_check(bool $value,string $name):void{if(!$value)throw new RuntimeException($name);$GLOBALS['checks'][]=$name;}

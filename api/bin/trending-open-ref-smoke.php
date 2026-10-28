@@ -234,7 +234,7 @@ $GLOBALS['sidebar_items'] = [
         ['uri' => 'https://social.example/users/a/statuses/4', 'url' => 'https://social.example/@a/4', 'content' => 'FEDI-OK', 'visibility' => 'public', 'account' => ['acct' => 'a']],
     ],
 ];
-reference_load(dirname(__DIR__) . '/ap-admin.php', ['admin_status_href', 'admin_trends_sidebar_html']);
+reference_load(dirname(__DIR__) . '/ap-admin.php', ['admin_status_href', 'admin_trend_status_media', 'admin_trends_sidebar_html']);
 $meta = null;
 $sidebar = admin_trends_sidebar_html('home', true, $meta, false, 'statuses');
 check(str_contains($sidebar, 'KEPT-POST') && str_contains($sidebar, 'FEDI-OK'), 'sidebar keeps resolvable public posts');

@@ -143,6 +143,9 @@ php_tests=(
   api/bin/trends-response-cache-smoke.php
   api/bin/trending-open-ref-smoke.php
   api/bin/trend-sparkline-smoke.php
+  api/bin/trend-numeric-tag-smoke.php
+  api/bin/trend-post-media-smoke.php
+  api/bin/trend-statuses-mixed-rank-smoke.php
   api/bin/timeline-newer-counter-smoke.php
   api/bin/timeline-cursor-smoke.php
   api/bin/timeline-quote-boost-smoke.php
