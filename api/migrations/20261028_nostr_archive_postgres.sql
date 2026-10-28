@@ -29,8 +29,6 @@ CREATE TABLE IF NOT EXISTS nostr_archive (
 CREATE INDEX IF NOT EXISTS idx_nostr_archive_author
     ON nostr_archive (pubkey, kind, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_nostr_archive_created ON nostr_archive (created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_nostr_archive_tags ON nostr_archive USING gin (tags jsonb_path_ops);
-CREATE INDEX IF NOT EXISTS idx_nostr_archive_deletes ON nostr_archive USING gin (deletes) WHERE kind = 5;
 
 -- Pull progress per linked key. backfill_until is the oldest created_at
 -- read so far (0 = not started); backfill_done once a page came back empty.
