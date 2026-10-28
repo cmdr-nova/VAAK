@@ -404,6 +404,49 @@ function ap_nostr_action(string $action, int $ownerUserId, bool $isAdmin, array 
 }
 
 /**
+ * The same post crosspost for an app with an access token instead of a
+ * browser (Shana, api/bin/vaak-nostr-signer.py): `prepare` takes the id
+ * POST /api/v1/statuses returned and answers the unsigned note, the app
+ * signs it with a key that never leaves its machine, and `publish` hands it
+ * back for the worker to check and relay. Blog posts stay on VAAK.
+ *
+ * @param array<string,mixed> $user ap_users row the token belongs to
+ * @param array<string,mixed> $in
+ * @return array{status:int, body:array<string,mixed>}
+ */
+function ap_nostr_api_action(string $step, array $user, array $in, ?PDO $db = null): array
+{
+    $ownerId = (int) ($user['id'] ?? 0);
+    $isAdmin = !empty($user['is_admin']);
+    if ($step === 'publish') {
+        $event = $in['event'] ?? null;
+        return ap_nostr_action('nostr_publish', $ownerId, $isAdmin, [
+            'nonce' => (string) ($in['nonce'] ?? ''),
+            'event' => is_array($event) ? (string) json_encode($event, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) : (string) $event,
+        ]);
+    }
+    if ($step !== 'prepare') {
+        return ['status' => 404, 'body' => ['ok' => false, 'error' => 'Unknown Nostr step.']];
+    }
+    $sid = (string) ($in['status_id'] ?? '');
+    if (!preg_match('/^\d{1,20}$/', $sid)) {
+        return ['status' => 400, 'body' => ['ok' => false, 'error' => 'status_id required.']];
+    }
+    $row = ap_masto_local_row_from_public_id((int) $sid) ?? (((int) $sid < 2000000) ? ap_masto_status_by_local_id((int) $sid) : null);
+    $noteId = is_array($row) ? (string) ($row['note_id'] ?? '') : '';
+    if ($noteId === '') {
+        return ['status' => 200, 'body' => ['ok' => false, 'error' => 'The post is still being saved.', 'retry' => true]];
+    }
+    $db = $db ?? ap_db();
+    $kind = $db->prepare('SELECT kind FROM outbox_notes WHERE id = ?');
+    $kind->execute([$noteId]);
+    if ((string) ($kind->fetchColumn() ?: '') === 'blog') {
+        return ['status' => 200, 'body' => ['ok' => false, 'error' => 'Blog posts stay on VAAK.', 'skip' => true]];
+    }
+    return ap_nostr_action('nostr_prepare', $ownerId, $isAdmin, ['purpose' => 'post', 'target' => $noteId]);
+}
+
+/**
  * Who the composer's "Nostr" box posts as: the linked key and its kind 0
  * name and picture. Null when the user can't crosspost (no linked npub, or
  * Nostr not open to them).

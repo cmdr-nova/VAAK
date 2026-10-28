@@ -107,6 +107,12 @@ $check(ap_nostr_action('nostr_prepare', 1, true, ['purpose' => 'unrepost', 'targ
 $check(ap_nostr_action('nostr_publish', 1, true, ['nonce' => 'xyz', 'event' => '{}'])['status'] === 400, 'bad nonce refused');
 $check(ap_nostr_action('nostr_publish', 1, true, ['nonce' => str_repeat('a', 32), 'event' => 'not json'])['status'] === 400, 'non-JSON event refused');
 $check(ap_nostr_action('nostr_sign_anything', 1, true, [])['status'] === 400, 'unknown action refused');
+// Token apps (Shana's signer): same gate and checks, by status id.
+$admin = ['id' => 1, 'is_admin' => true];
+$check(ap_nostr_api_action('sign', $admin, [])['status'] === 404, 'api: unknown step refused');
+$check(ap_nostr_api_action('prepare', $admin, ['status_id' => 'abc'])['status'] === 400, 'api: non-numeric status id refused');
+$check(ap_nostr_api_action('publish', $admin, ['nonce' => 'xyz', 'event' => ['id' => 'x']])['status'] === 400, 'api: bad nonce refused');
+$check(ap_nostr_api_action('publish', ['id' => 2, 'is_admin' => false], ['nonce' => str_repeat('a', 32), 'event' => []])['status'] === 403, 'api: admin-only rollout refuses other users');
 
 // Favourites > Nostr: gated like the npub form, and a missing worker
 // paints a retry note instead of an empty list.
