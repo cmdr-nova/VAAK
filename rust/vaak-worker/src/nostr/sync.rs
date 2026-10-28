@@ -143,8 +143,15 @@ async fn fan_out(
     futures_util::stream::iter(jobs.into_iter().map(|(url, queries)| async move {
         let deadline = (Instant::now() + RELAY_TIMEOUT).min(run_deadline);
         let res = relay::fetch(&url, &queries, deadline).await;
-        if let Err(e) = &res {
-            tracing::warn!(relay = %url, "nostr relay failed: {e:#}");
+        match &res {
+            Err(e) => tracing::warn!(relay = %url, "nostr relay failed: {e:#}"),
+            Ok(r) if r.completed == 0 => tracing::warn!(
+                relay = %url,
+                events = r.events.len(),
+                "nostr relay never finished a query: {}",
+                r.notices.join(" | ")
+            ),
+            Ok(_) => {}
         }
         (url, res)
     }))
@@ -252,6 +259,7 @@ async fn sync_links(db: &mut Client, s: &Settings, now: i64, deadline: Instant, 
     }
     relays.truncate(8);
     let queries = vec![Query::new(keys.clone(), vec![0, 3, 10002], None, (keys.len() as i64 * 6).max(20))];
+    let asked = relays.len();
     let jobs = relays.into_iter().map(|r| (r, queries.clone())).collect();
     let mut all = Vec::new();
     let mut answered = 0usize;
@@ -305,9 +313,10 @@ async fn sync_links(db: &mut Client, s: &Settings, now: i64, deadline: Instant, 
         .await?;
         tx.commit().await?;
         log.push(format!(
-            "link owner={} follows={}",
+            "link owner={} follows={} answered={answered}/{asked}{}",
             link.owner,
-            follows.map(|(l, _)| l.len().to_string()).unwrap_or_else(|| "kept".into())
+            follows.map(|(l, _)| l.len().to_string()).unwrap_or_else(|| "kept".into()),
+            if error.is_empty() { String::new() } else { format!(" error=\"{error}\"") }
         ));
     }
     Ok(())

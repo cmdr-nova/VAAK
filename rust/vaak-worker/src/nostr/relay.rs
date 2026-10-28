@@ -18,9 +18,12 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::time::{timeout_at, Instant};
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
 
 use super::event::Event;
+
+const USER_AGENT: &str = "VAAK-Nostr/1.0 (+https://mkultra.monster/vaak)";
 
 /// Largest websocket message accepted from a relay.
 const MAX_MESSAGE_BYTES: usize = 512 * 1024;
@@ -162,12 +165,22 @@ pub struct FetchResult {
 /// Connect to one relay and run `queries` one after another on the same
 /// socket. Returns what arrived before `deadline`. Events are not verified
 /// here; the caller checks id and signature before storing.
+/// Some relays sit behind CDNs that refuse a handshake with no User-Agent.
+fn handshake_request(url: &str) -> Result<tokio_tungstenite::tungstenite::handshake::client::Request> {
+    let mut request = url.into_client_request().context("websocket request")?;
+    request.headers_mut().insert(
+        tokio_tungstenite::tungstenite::http::header::USER_AGENT,
+        tokio_tungstenite::tungstenite::http::HeaderValue::from_static(USER_AGENT),
+    );
+    Ok(request)
+}
+
 pub async fn fetch(url: &str, queries: &[Query], deadline: Instant) -> Result<FetchResult> {
     let url = normalize_relay_url(url).ok_or_else(|| anyhow!("unusable relay url"))?;
     if let Some(base) = test_relay_base() {
         let target = format!("{base}/{}", url.trim_start_matches("wss://"));
         let tcp = TcpStream::connect(base.trim_start_matches("ws://").split('/').next().unwrap_or("")).await?;
-        let (ws, _) = tokio_tungstenite::client_async_with_config(target, tcp, Some(ws_config())).await?;
+        let (ws, _) = tokio_tungstenite::client_async_with_config(handshake_request(&target)?, tcp, Some(ws_config())).await?;
         return run_queries(ws, queries, deadline).await;
     }
     let host = host_of(&url).to_string();
@@ -177,7 +190,7 @@ pub async fn fetch(url: &str, queries: &[Query], deadline: Instant) -> Result<Fe
         .await
         .map_err(|_| anyhow!("tls timeout"))?
         .context("tls")?;
-    let (ws, _) = timeout_at(deadline, tokio_tungstenite::client_async_with_config(url.as_str(), tls, Some(ws_config())))
+    let (ws, _) = timeout_at(deadline, tokio_tungstenite::client_async_with_config(handshake_request(&url)?, tls, Some(ws_config())))
         .await
         .map_err(|_| anyhow!("websocket timeout"))?
         .context("websocket")?;
