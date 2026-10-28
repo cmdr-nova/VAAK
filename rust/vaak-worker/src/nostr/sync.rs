@@ -466,6 +466,15 @@ async fn cleanup(db: &Client, s: &Settings, now: i64) -> Result<u64> {
     n += db
         .execute("DELETE FROM nostr_events e WHERE NOT EXISTS (SELECT 1 FROM nostr_follows f WHERE f.pubkey = e.pubkey)", &[])
         .await?;
+    // Added by a later migration; skip quietly until it has run.
+    n += db
+        .execute(
+            "DELETE FROM nostr_reactions r WHERE r.created_at < $1
+               OR NOT EXISTS (SELECT 1 FROM nostr_links l WHERE l.owner_user_id = r.owner_user_id)",
+            &[&cutoff],
+        )
+        .await
+        .unwrap_or(0);
     n += db
         .execute(
             "DELETE FROM nostr_profiles p WHERE NOT EXISTS (SELECT 1 FROM nostr_follows f WHERE f.pubkey = p.pubkey)

@@ -281,6 +281,7 @@ pub fn materialize(row: &NostrRow) -> Value {
     v["application"] = json!({"name": "Nostr", "website": Value::Null});
     v["source"] = json!("nostr");
     v["vaak_nostr_event_id"] = json!(row.id);
+    v["vaak_nostr_pubkey"] = json!(row.pubkey);
     v
 }
 
@@ -359,7 +360,7 @@ mod tests {
     }
 
     #[test]
-    fn home_card_is_read_only_and_opens_on_nostr() {
+    fn home_card_signs_through_the_extension_and_opens_on_nostr() {
         let mut r = row("hello nostr", json!([["content-warning", "spoilers"]]));
         r.display_name = "Alice".into();
         let st = materialize(&r);
@@ -368,11 +369,22 @@ mod tests {
         assert!(njump.starts_with("https://njump.me/note1"), "{njump}");
         assert!(html.contains("Open on Nostr"), "{html}");
         assert!(html.contains(&format!("href=\"{njump}\" target=\"_blank\"")), "{html}");
-        assert!(!html.contains("data-eng=\"1\""), "no engagement buttons: {html}");
+        assert!(!html.contains("data-eng=\"1\""), "no VAAK engagement buttons: {html}");
+        assert!(html.contains(&format!("data-nostr-act=\"reply\" data-nostr-target=\"{}\"", r.id)), "{html}");
+        assert!(html.contains(&format!("data-nostr-act=\"like\" data-nostr-target=\"{}\"", r.id)), "{html}");
+        assert!(html.contains(&format!("data-nostr-act=\"unfollow\" data-nostr-target=\"{}\"", r.pubkey)), "{html}");
+        assert!(!html.contains("ph-repeat") && !html.contains("ph-quotes"), "no boost or quote on Nostr: {html}");
         assert!(!html.contains("compose=1"), "no reply or quote links: {html}");
         assert!(!html.contains("view=status"), "links stay off the in-app status view: {html}");
         assert!(html.contains(&format!("data-copy-value=\"{njump}\"")), "copy gives the njump link: {html}");
         assert!(html.contains("spoilers"), "{html}");
         assert!(html.contains("Alice"), "{html}");
+
+        let mut liked = st.clone();
+        liked["vaak_nostr_liked"] = json!(true);
+        liked["vaak_nostr_following"] = json!(false);
+        let html = crate::notif_embed::paint_lean_embed_from(&liked, false, "home", "", true);
+        assert!(html.contains("aria-pressed=\"true\" title=\"Unlike on Nostr\""), "{html}");
+        assert!(html.contains(">Follow on Nostr</button>"), "{html}");
     }
 }

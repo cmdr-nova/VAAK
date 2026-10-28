@@ -2823,16 +2823,9 @@ fn paint_lean_timeline_actions(status: &Value, from: &str, viewer_actor: &str) -
     let mut actions = String::new();
 
     if crate::nostr::render::is_nostr_status(status) {
-        // Read-only Nostr note: VAAK holds no key, so no reply/boost/like.
-        let open = status.get("url").and_then(|v| v.as_str()).unwrap_or("");
-        if open.starts_with("https://") {
-            actions.push_str(&format!(
-                "<details class=\"post-action-menu\"><summary class=\"icon-btn\" title=\"More actions\" aria-label=\"More actions\">⋯</summary>\
-                 <div class=\"post-action-menu__body\"><a class=\"menu-action\" href=\"{0}\" target=\"_blank\" rel=\"noopener noreferrer\">Open on Nostr</a>\
-                 <button type=\"button\" class=\"menu-action\" data-copy-value=\"{0}\" title=\"Copy link to post\">Copy link</button></div></details>",
-                esc(open)
-            ));
-        }
+        // Nostr note: VAAK holds no key. Reply, like and follow are signed by
+        // the viewer's browser extension (see nostr::act); no boost or quote.
+        actions.push_str(&nostr_card_actions(status));
     } else if rss {
         let rss_item = status
             .get("vaak_rss_item_id")
@@ -4313,6 +4306,58 @@ pub fn paint_lean_feed_card(status: &Value) -> String {
 }
 
 /// Lean feed card with `from=` + viewer actor (own-post Delete/Edit/Pin overflow).
+/// Reply, like and the ⋯ menu for a Nostr card. The `data-nostr-*` buttons
+/// are wired by the page script, which asks the signer extension to sign.
+fn nostr_card_actions(status: &Value) -> String {
+    let hex = |key: &str| {
+        status
+            .get(key)
+            .and_then(|v| v.as_str())
+            .filter(|v| crate::nostr::event::is_hex64(v))
+            .unwrap_or("")
+            .to_string()
+    };
+    let note = hex("vaak_nostr_event_id");
+    let author = hex("vaak_nostr_pubkey");
+    let liked = json_flag(status, "vaak_nostr_liked");
+    // Home only carries notes from people the viewer follows.
+    let following = status.get("vaak_nostr_following").and_then(|v| v.as_bool()).unwrap_or(true);
+    let mut out = String::new();
+    if !note.is_empty() {
+        out.push_str(&format!(
+            "<button type=\"button\" class=\"icon-btn\" data-nostr-act=\"reply\" data-nostr-target=\"{note}\" title=\"Reply on Nostr\" aria-label=\"Reply on Nostr\"><i class=\"ph ph-arrow-bend-up-left\" aria-hidden=\"true\"></i></button>"
+        ));
+        out.push_str(&format!(
+            "<button type=\"button\" class=\"icon-btn{on}\" data-nostr-act=\"like\" data-nostr-target=\"{note}\" aria-pressed=\"{pressed}\" title=\"{label}\" aria-label=\"{label}\"><i class=\"{icon} ph-heart\" aria-hidden=\"true\"></i></button>",
+            on = if liked { " on" } else { "" },
+            pressed = if liked { "true" } else { "false" },
+            label = if liked { "Unlike on Nostr" } else { "Like on Nostr" },
+            icon = if liked { "ph-fill" } else { "ph" },
+        ));
+    }
+    let open = status.get("url").and_then(|v| v.as_str()).unwrap_or("");
+    let mut menu = String::new();
+    if open.starts_with("https://") {
+        menu.push_str(&format!(
+            "<a class=\"menu-action\" href=\"{0}\" target=\"_blank\" rel=\"noopener noreferrer\">Open on Nostr</a>\
+             <button type=\"button\" class=\"menu-action\" data-copy-value=\"{0}\" title=\"Copy link to post\">Copy link</button>",
+            esc(open)
+        ));
+    }
+    if !author.is_empty() {
+        let (act, label) = if following { ("unfollow", "Unfollow on Nostr") } else { ("follow", "Follow on Nostr") };
+        menu.push_str(&format!(
+            "<button type=\"button\" class=\"menu-action\" data-nostr-act=\"{act}\" data-nostr-target=\"{author}\">{label}</button>"
+        ));
+    }
+    if !menu.is_empty() {
+        out.push_str(&format!(
+            "<details class=\"post-action-menu\"><summary class=\"icon-btn\" title=\"More actions\" aria-label=\"More actions\">⋯</summary><div class=\"post-action-menu__body\">{menu}</div></details>"
+        ));
+    }
+    out
+}
+
 pub fn paint_lean_feed_card_opts(status: &Value, from: &str, viewer_actor: &str) -> String {
     let from_q = if from.is_empty() { "home" } else { from };
     let mut st = status.clone();
