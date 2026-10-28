@@ -353,7 +353,9 @@ mod tests{
   let profile=RawProfileFacts{card,actor_key:"luna_naloc".into(),actor:"https://mkultra.monster/users/luna_naloc".into(),display_name:"Luna".into(),note_dom_id:"0123456789abcdef0123456789abcdef".into(),masto_row:Some(json!({"edited_at":"2026-10-02T00:00:00Z","spoiler_text":"","sensitive":false,"visibility":"public","content_text":"Mirrored post with a quote"})),status_id:String::new(),own_note:false,guest:true,quote_html,link_card:None,media_preview_by_url:Default::default(),body_mentions:None};
   let _warmup=render_core(&raw,&profile).unwrap();
   let compiles_before=crate::library::static_regex_compiles();
-  assert!(compiles_before>0,"warmup paint did not compile the static painter regexes");
+  // The statics are process-wide but the counter is per thread: a parallel
+  // test that paints first leaves this thread at 0, so only the no-new-compiles
+  // check below is meaningful.
   let mut html=String::new();
   let mut best=std::time::Duration::from_secs(60);
   for _ in 0..3{
