@@ -2526,6 +2526,15 @@ function ap_masto_api(string $method, string $path): void
         return;
     }
 
+    // Nostr crosspost for token apps that sign on their own machine
+    // (ap_nostr_api_action in api/ap-nostr.php).
+    if (preg_match('#^/api/v1/vaak/nostr/(prepare|publish)$#', $path, $nm) && $method === 'POST') {
+        ap_masto_require_token('write');
+        require_once __DIR__ . '/ap-nostr.php';
+        $reply = ap_nostr_api_action($nm[1], (array) ($GLOBALS['vaak_user'] ?? []), ap_masto_input());
+        ap_masto_json($reply['body'], $reply['status']);
+        return;
+    }
     if ($path === '/api/v1/statuses' && $method === 'POST') {
         ap_masto_require_token('write');
         $in = ap_masto_input();

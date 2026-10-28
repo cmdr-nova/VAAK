@@ -242,6 +242,16 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn python_signer_event_verifies() {
+        // Signed by ops/nostr-signer/vaak_nostr.py (Shana's crosspost signer):
+        // its id serialization (quotes, newline, tab, control char, emoji)
+        // must match ours or every crosspost is refused.
+        let raw = include_str!("fixtures/python-signer-note.json");
+        let ev: Event = serde_json::from_str(raw).unwrap();
+        assert_eq!(ev.verify(), Ok(()));
+    }
+
+    #[test]
     fn signed_events_verify_and_tampering_fails() {
         let ev = signed(7, 1_800_000_000, 1, tags(&[&["t", "nostr"]]), "hi \"there\"\n\u{1}✨");
         assert_eq!(ev.verify(), Ok(()));
