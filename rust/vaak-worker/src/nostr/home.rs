@@ -47,6 +47,25 @@ fn reply_in_graph(c: &Candidate, follows: &HashSet<String>, parent_author: Optio
 /// Newest-first Home keys for one owner. `muted` filters on note text the
 /// same way Home filters fediverse posts.
 pub async fn fetch_keys<F: Fn(&str) -> bool + Sync>(db: &Client, owner: i64, muted: F) -> Result<Vec<NostrKey>> {
+    let since = chrono::Utc::now().timestamp() - HOME_WINDOW_SECS;
+    select_keys(db, owner, since, i64::MAX, HOME_MAX_NOTES, muted).await
+}
+
+/// Keys for Home older pages: notes at or before `at_most` (unix seconds),
+/// newest first. Storage retention bounds how far back this reaches. Mutes
+/// are applied when the page is hydrated, like every other source.
+pub async fn older_keys(db: &Client, owner: i64, at_most: i64, limit: i64) -> Result<Vec<NostrKey>> {
+    select_keys(db, owner, 0, at_most, limit, |_: &str| false).await
+}
+
+async fn select_keys<F: Fn(&str) -> bool + Sync>(
+    db: &Client,
+    owner: i64,
+    since: i64,
+    at_most: i64,
+    limit: i64,
+    muted: F,
+) -> Result<Vec<NostrKey>> {
     if super::sync::disabled_by_env() || owner < 1 || !super::sync::tables_ready(db).await {
         return Ok(Vec::new());
     }
@@ -67,16 +86,15 @@ pub async fn fetch_keys<F: Fn(&str) -> bool + Sync>(db: &Client, owner: i64, mut
     if follows.is_empty() {
         return Ok(Vec::new());
     }
-    let since = chrono::Utc::now().timestamp() - HOME_WINDOW_SECS;
     let rows = db
         .query(
             "SELECT e.id, e.pubkey, e.created_at, e.is_reply, e.reply_pubkeys, e.reply_to, left(e.content, 4000)
              FROM nostr_events e
              WHERE e.pubkey IN (SELECT pubkey FROM nostr_follows WHERE owner_user_id = $1)
-               AND e.kind = 1 AND e.created_at >= $2
-             ORDER BY e.created_at DESC, e.id
-             LIMIT $3",
-            &[&owner, &since, &HOME_MAX_NOTES],
+               AND e.kind = 1 AND e.created_at >= $2 AND e.created_at <= $3
+             ORDER BY e.created_at DESC, e.id DESC
+             LIMIT $4",
+            &[&owner, &since, &at_most, &limit],
         )
         .await
         .context("nostr notes for home")?;

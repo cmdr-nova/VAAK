@@ -140,6 +140,10 @@ pub async fn raw_window(
         let (rows, full) = bsky_page(db, dids, &cursor, fetch_limit, hidden).await;
         pull(rows, full, &mut parts, &mut any_full);
     }
+    if view == "home" {
+        let (rows, full) = nostr_page(db, owner_user_id, &cursor, fetch_limit).await;
+        pull(rows, full, &mut parts, &mut any_full);
+    }
 
     let mut rows = Vec::new();
     for part in parts {
@@ -653,4 +657,98 @@ async fn bsky_page(
         });
     }
     (rows, full)
+}
+
+/// Same text form PHP `gmdate('c')` gives events, so cursors compare as strings.
+pub fn nostr_at(created_at: i64) -> String {
+    chrono::DateTime::from_timestamp(created_at, 0)
+        .map(|t| t.format("%Y-%m-%dT%H:%M:%S+00:00").to_string())
+        .unwrap_or_default()
+}
+
+/// Cursor time as unix seconds, rounded up so the SQL bound never drops a
+/// row the string comparison would keep. None when the time is unreadable.
+fn cursor_epoch_ceil(at: &str) -> Option<i64> {
+    let at = at.trim();
+    let parsed = chrono::DateTime::parse_from_rfc3339(at)
+        .ok()
+        .or_else(|| chrono::DateTime::parse_from_str(at, "%Y-%m-%d %H:%M:%S%.f%#z").ok())?;
+    let secs = parsed.timestamp();
+    Some(if parsed.timestamp_subsec_nanos() > 0 { secs + 1 } else { secs })
+}
+
+/// Linked Nostr follows (Settings > Profile npub). The warm head carries
+/// these as ranked keys; older pages read them here so scrolling past the
+/// head keeps them.
+async fn nostr_page(
+    db: &Client,
+    owner_user_id: i64,
+    cursor: &Option<TlCursor>,
+    fetch_limit: i64,
+) -> (Vec<OlderRow>, bool) {
+    let at_most = match cursor {
+        None => i64::MAX,
+        Some(c) => match cursor_epoch_ceil(&c.at) {
+            Some(secs) => secs,
+            None => return (Vec::new(), false),
+        },
+    };
+    let keys = match crate::nostr::home::older_keys(db, owner_user_id, at_most, fetch_limit).await {
+        Ok(keys) => keys,
+        Err(e) => {
+            tracing::warn!(error = %format!("{e:#}"), "older nostr");
+            return (Vec::new(), false);
+        }
+    };
+    let full = keys.len() as i64 >= fetch_limit;
+    let rows = keys
+        .into_iter()
+        .map(|k| OlderRow {
+            at: nostr_at(k.sort),
+            source: "nostr".into(),
+            id: k.id.clone(),
+            lookup: k.id,
+            actor: String::new(),
+            keep: true,
+        })
+        .filter(|row| !row.at.is_empty() && row.is_older_than(cursor.as_ref()))
+        .collect();
+    (rows, full)
+}
+
+#[cfg(test)]
+mod nostr_tests {
+    use super::*;
+
+    #[test]
+    fn nostr_rows_use_the_events_time_format() {
+        assert_eq!(nostr_at(1_793_178_282), "2026-10-28T09:04:42+00:00");
+    }
+
+    #[test]
+    fn cursor_bound_reads_php_and_postgres_times() {
+        assert_eq!(cursor_epoch_ceil("2026-10-28T09:04:42+00:00"), Some(1_793_178_282));
+        assert_eq!(cursor_epoch_ceil("2026-10-28T11:04:42+02:00"), Some(1_793_178_282));
+        assert_eq!(cursor_epoch_ceil("2026-10-28 09:04:41.5+00"), Some(1_793_178_282));
+        assert_eq!(cursor_epoch_ceil("not a time"), None);
+    }
+
+    #[test]
+    fn same_second_nostr_rows_follow_the_cursor_order() {
+        let cursor = TlCursor { at: nostr_at(100), source: "nostr".into(), id: "bb".into() };
+        let row = |id: &str, at: i64| OlderRow {
+            at: nostr_at(at),
+            source: "nostr".into(),
+            id: id.into(),
+            lookup: id.into(),
+            actor: String::new(),
+            keep: true,
+        };
+        assert!(row("aa", 100).is_older_than(Some(&cursor)));
+        assert!(!row("bb", 100).is_older_than(Some(&cursor)));
+        assert!(!row("cc", 100).is_older_than(Some(&cursor)));
+        assert!(row("zz", 99).is_older_than(Some(&cursor)));
+        let event_cursor = TlCursor { at: nostr_at(100), source: "event".into(), id: "7".into() };
+        assert!(row("zz", 100).is_older_than(Some(&event_cursor)), "nostr ranks after events at one time");
+    }
 }
