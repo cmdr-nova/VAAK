@@ -23,7 +23,9 @@ use tokio_tungstenite::tungstenite::Message;
 
 use super::event::Event;
 
-const USER_AGENT: &str = "VAAK-Nostr/1.0 (+https://mkultra.monster/vaak)";
+// relay.damus.io answers 503 to some agents ("VAAK-Nostr/1.0", none at all,
+// "VAAK-Nostr/1.0 (+https://…)") and 101 to this form, checked from prod.
+const USER_AGENT: &str = "Mozilla/5.0 (compatible; VAAK-Nostr/1.0)";
 
 /// Largest websocket message accepted from a relay.
 const MAX_MESSAGE_BYTES: usize = 512 * 1024;
@@ -86,9 +88,7 @@ fn tls_config() -> Arc<rustls::ClientConfig> {
                 .expect("rustls protocol versions")
                 .with_root_certificates(roots)
                 .with_no_client_auth();
-            // Websocket upgrades are HTTP/1.1. Cloudflare-fronted relays
-            // (relay.damus.io) answered 503 to a handshake with no ALPN while
-            // curl --http1.1, which offers http/1.1, got 101.
+            // Websocket upgrades are HTTP/1.1; offer it like curl --http1.1.
             config.alpn_protocols = vec![b"http/1.1".to_vec()];
             Arc::new(config)
         })
