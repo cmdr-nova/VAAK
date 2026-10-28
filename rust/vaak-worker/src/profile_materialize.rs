@@ -172,6 +172,7 @@ async fn require_dependencies(db:&Client,dependencies:&[Dependency],message:&'st
     // retained here; every guard still executes its exact bound SQL.
     let identity=db.query_one("SELECT pg_backend_pid(),current_schemas(true)",&[]).await?;
     let backend:i32=identity.get(0);let schemas:Vec<String>=identity.get(1);
+    let mut prepared=Vec::with_capacity(groups.len());
     for (template,members) in groups{
         let batch=dependency_batch_sql(template);
         let anchor=&unique[members[0]];
@@ -179,9 +180,16 @@ async fn require_dependencies(db:&Client,dependencies:&[Dependency],message:&'st
             if let Some(plan)=plans.iter().find(|p|p.sql==batch&&p.backend==backend&&p.schemas==schemas){plan.statement.clone()}
             else{let statement=db.prepare(&batch).await?;if plans.len()>=16{plans.remove(0);}plans.push(DependencyPlan{sql:batch.clone(),backend,schemas:schemas.clone(),statement:statement.clone()});statement}
         };
-        if template.contains("$1"){
-            let keys=json!(members.iter().map(|&index|&unique[index].key).collect::<Vec<_>>());
-            let rows=db.query(&statement,&[&keys]).await?;
+        let keys=template.contains("$1").then(||json!(members.iter().map(|&index|&unique[index].key).collect::<Vec<_>>()));
+        prepared.push((members,statement,keys));
+    }
+    // The connection pipelines these reads: one round trip for the whole set
+    // instead of one per template. Every row is still compared below.
+    let results=futures_util::future::try_join_all(prepared.iter().map(|(_,statement,keys)|async move{
+        match keys{Some(keys)=>db.query(statement,&[keys]).await,None=>db.query(statement,&[]).await}
+    })).await?;
+    for ((members,_,keys),rows) in prepared.iter().zip(results){
+        if keys.is_some(){
             if rows.len()!=members.len(){bail!("{message}")}
             let mut seen=std::collections::HashSet::new();
             for row in rows{
@@ -191,7 +199,6 @@ async fn require_dependencies(db:&Client,dependencies:&[Dependency],message:&'st
                 if actual!=json!(unique[members[ordinal]].rows){bail!("{message}")}
             }
         }else{
-            let rows=db.query(&statement,&[]).await?;
             let actual:Value=rows.first().map(|row|row.get(0)).unwrap_or(json!([]));
             if members.iter().any(|&index|actual!=json!(unique[index].rows)){bail!("{message}")}
         }
@@ -402,7 +409,9 @@ impl ProjectedQuoteTarget {
         let status=self.status.as_ref().context("PHP fallback: missing quote projection has no cache authority")?;
         if !grant.permits(&self.requested,status){bail!("PHP fallback: quote cache grant differs from current projected target")}
         let admission_status=status.clone();
-        self.require_current(db).await?;if self.cache_complete{return Ok(())}
+        // The caller checks this projection's snapshot once this step ends;
+        // DNS and a cold warm below are guarded before they run.
+        if self.cache_complete{return Ok(())}
         let bound_dependencies=self.ledger.dependencies.clone();let bound_static=self.ledger.static_counts.clone();
         let guard=CompletionGrant{audience:CompletionAudience::Quote(grant,&self.requested),status:&admission_status,page:None,dependencies:&bound_dependencies,static_counts:&bound_static};
         if let Some(status)=self.status.as_mut(){
@@ -434,7 +443,7 @@ impl ProjectedQuoteTarget {
             }
         }
         if !self.graphs.is_empty()||!self.cache.is_empty(){grant.require_current(db,&self.requested,&admission_status).await?;}
-        self.cache_complete=true;self.require_current(db).await
+        self.cache_complete=true;Ok(())
     }
     pub(crate) fn into_parts(self)->Result<(String,Option<Value>,ProjectionLedger,Vec<DeferredProjectionEffect>)>{
         if !self.cache_complete{bail!("PHP fallback: native quote cache phase unfinished")};Ok((self.requested,self.status,self.ledger,self.effects))
@@ -1063,6 +1072,23 @@ mod tests {
     }
 
     use super::*;
+    #[tokio::test]
+    #[ignore="disposable local PostgreSQL (LIBRARY_FIXTURE_DB)"]
+    async fn pipelined_dependency_recheck_sees_each_template(){
+        let url=std::env::var("LIBRARY_FIXTURE_DB").unwrap();assert!(url.contains("/tmp/"));let db=crate::db::connect(&url).await.unwrap();
+        let schema=format!("profile_dependency_pipeline_{}",std::process::id());db.batch_execute(&format!("CREATE SCHEMA {schema};SET search_path={schema};CREATE TABLE a(k TEXT,v TEXT);CREATE TABLE b(k TEXT,v TEXT);INSERT INTO a VALUES('x','1'),('y','2');INSERT INTO b VALUES('x','3')")).await.unwrap();
+        const A:&str="SELECT to_jsonb(t) FROM a t WHERE k=$1::jsonb->>'k' LIMIT 1";const B:&str="SELECT to_jsonb(t) FROM b t WHERE k=$1::jsonb->>'k' LIMIT 1";const C:&str="SELECT jsonb_build_object('c',COUNT(*)) FROM a";
+        let mut deps=vec![];for(sql,key)in [(A,json!({"k":"x"})),(A,json!({"k":"y"})),(B,json!({"k":"x"})),(B,json!({"k":"missing"})),(C,json!({}))]{deps.push(Dependency::new(sql,key.clone(),Dependency::read(&db,sql,&key).await.unwrap()));}
+        require_dependencies(&db,&deps,"changed").await.unwrap();
+        // A change behind any one template, keyed or not, still fails the set.
+        for change in ["UPDATE b SET v='4'","INSERT INTO b VALUES('missing','5')","INSERT INTO a VALUES('z','6')","UPDATE a SET v='7' WHERE k='y'"]{
+            db.batch_execute("BEGIN").await.unwrap();db.batch_execute(change).await.unwrap();
+            assert!(require_dependencies(&db,&deps,"changed").await.is_err(),"{change}");
+            db.batch_execute("ROLLBACK").await.unwrap();
+        }
+        require_dependencies(&db,&deps,"changed").await.unwrap();
+        db.batch_execute(&format!("DROP SCHEMA {schema} CASCADE")).await.unwrap();
+    }
     #[test]
     fn quote_target_matches_php_bluesky_classifier(){
         assert!(quote_target_is_bluesky("https://bsky.app/profile/example/post/1"));

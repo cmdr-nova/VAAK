@@ -605,8 +605,8 @@ async fn prepare_raw_quote(db:&Client,viewer:&crate::profile_materialize::Profil
   return Ok((html,crate::profile_materialize::ProjectedQuoteTarget::absent(intent.url.clone()),Vec::new()));
  }
  let mut product=crate::profile_bridge::timed(crate::profile_bridge::Stage::QuoteMaterialize,crate::profile_materialize::materialize_quote_target(db,viewer,target)).await?;let mut mapping_changes=Vec::new();
- crate::profile_bridge::timed(crate::profile_bridge::Stage::QuoteCurrent,product.require_current(db)).await?;
  let Some(child)=product.status().cloned()else{
+  crate::profile_bridge::timed(crate::profile_bridge::Stage::QuoteCurrent,product.require_current(db)).await?;
   let quote=crate::profile_bridge::timed(crate::profile_bridge::Stage::QuoteExternal,external_quote_facts(db,intent,bsky)).await?;
   let html=crate::profile_raw::render_quote(&quote,facts)?;
   return Ok((html,product,Vec::new()));
@@ -618,9 +618,10 @@ async fn prepare_raw_quote(db:&Client,viewer:&crate::profile_materialize::Profil
  let effects_started=std::time::Instant::now();
  if allowed{
   let warm=match viewer{crate::profile_materialize::ProfileViewer::Auth(session)=>session.warm_context(),crate::profile_materialize::ProfileViewer::Guest(session)=>session.warm_context()};
-  // Each effect is followed by a recheck (the mapping and touch writers do
-  // their own), which also serves as the next effect's precheck.
-  let effects=product.effects().to_vec();if !effects.is_empty(){grant.require_current(db,product.requested_target(),&admission_status).await?;}
+  // The snapshot and grant are checked before the first write. Each effect
+  // is followed by a recheck (the mapping and touch writers do their own),
+  // which also serves as the next effect's precheck.
+  let effects=product.effects().to_vec();if !effects.is_empty(){crate::profile_bridge::timed(crate::profile_bridge::Stage::QuoteCurrent,product.require_current(db)).await?;grant.require_current(db,product.requested_target(),&admission_status).await?;}
   for effect in &effects{
    match effect.effect(){
     crate::profile_materialize::ProjectionEffect::ActorWarm(actor)=>{let current=product.effect_current_grant(&admission_status,&grant);warm.context("PHP fallback: quoted actor effect transport unavailable")?.actor_with_grant(db,actor,&current).await?;},
@@ -633,6 +634,8 @@ async fn prepare_raw_quote(db:&Client,viewer:&crate::profile_materialize::Profil
   }
  }
  crate::profile_bridge::record_stage(crate::profile_bridge::Stage::QuoteEffects,effects_started);
+ // The cache step only reads, apart from DNS and a cold warm, which its
+ // guard checks first; the check after rendering covers its reads.
  if allowed{crate::profile_bridge::timed(crate::profile_bridge::Stage::QuoteCache,product.complete_cache(db,dns,&grant)).await?;}
  let html=if allowed{crate::profile_raw::render_quote(&raw_quote_facts(product.status().unwrap(),target),facts)?}else{String::new()};
  crate::profile_bridge::timed(crate::profile_bridge::Stage::QuoteCurrent,async{product.require_current(db).await?;page.require_current_ledger(db).await}).await?;
