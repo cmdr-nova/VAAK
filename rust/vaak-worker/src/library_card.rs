@@ -617,7 +617,7 @@ fn render_core(status:&Value,facts:&CardFacts,direct:Option<&crate::direct_conte
 
 /// Same attribute order as PHP `admin_tl_card_identity_attrs`. A boost keeps
 /// the outer status id and does not claim the boosted note.
-fn poll_identity_attrs(boost: bool, timeline_key: &str, status_id: &str, note_id: &str, announce_id: &str, sort: i64) -> String {
+pub(crate) fn poll_identity_attrs(boost: bool, timeline_key: &str, status_id: &str, note_id: &str, announce_id: &str, sort: i64) -> String {
     let mut status_id = status_id.trim().trim_end_matches('/').to_string();
     let mut note_id = note_id.trim().trim_end_matches('/').to_string();
     let announce_id = announce_id.trim().trim_end_matches('/').to_string();

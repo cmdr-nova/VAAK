@@ -86,6 +86,19 @@ pub(crate) fn render_quote(q:&RawQuoteFacts,f:&CardFacts)->Result<String>{
  html.push_str("</div>");Ok(html)
 }
 fn string<'a>(v:&'a Value,key:&str)->&'a str{v.get(key).and_then(Value::as_str).unwrap_or("")}
+/// PHP admin_render_outbox_card identity: the snowflake uses the outbox
+/// `published` (admin_masto_row_for_note never selects masto `published`),
+/// strtotime failure or an empty value falls back to the request clock, and
+/// data-sort is admin_tl_status_created_ts of the same outbox value.
+fn identity_attrs(n:&Value,masto:Option<&Value>,now:chrono::DateTime<chrono::Utc>)->String{
+ let published=string(n,"published");
+ let parsed=chrono::DateTime::parse_from_rfc3339(published.trim()).map(|v|v.timestamp())
+  .or_else(|_|chrono::NaiveDateTime::parse_from_str(published.trim(),"%Y-%m-%d %H:%M:%S").map(|v|v.and_utc().timestamp())).ok();
+ let status_id=masto.map(|row|card::integer(row,"local_id")).filter(|id|*id!=0)
+  .map(|id|(parsed.unwrap_or_else(||now.timestamp()) as i128*1_000_000_000+(id%100_000_000) as i128).to_string()).unwrap_or_default();
+ let sort=if !published.is_empty()&&published.bytes().all(|b|b.is_ascii_digit()){published.parse().unwrap_or(0)}else{parsed.unwrap_or(0).max(0)};
+ card::poll_identity_attrs(false,"",&status_id,string(n,"id"),"",sort)
+}
 pub(crate) fn current_plain(raw:&Value,facts:&RawProfileFacts)->String{
  let mut plain=body::html_to_plain(string(raw,"content"));
  if let Some(row)=&facts.masto_row{let text=string(row,"content_text");if !text.is_empty()&&!matches!(text,"(quote)"|"(media)"|"(poll)"){plain=text.into();}}
@@ -163,8 +176,9 @@ fn render_core(n:&Value,f:&RawProfileFacts)->Result<String>{
  let avatar=format!("<img class=\"tweet-av\" src=\"{}\" alt=\"\" width=\"40\" height=\"40\" data-profile-hover-actor=\"{}\" loading=\"lazy\" decoding=\"async\" referrerpolicy=\"no-referrer\" onerror=\"this.onerror=null;this.src='https://mkultra.monster/img/avatar/default.webp'\">",esc(&facts.resolved_avatar),esc(actor.trim_end_matches('/')));
  let name=if f.display_name.trim().is_empty(){&f.actor_key}else{f.display_name.trim()};
  let emoji=facts.emoji_by_actor.get(actor).cloned().unwrap_or_default();
- let mut html=format!("<article class=\"tweet tweet-own\"{rank} id=\"note-{}\" data-note-id=\"{}\"><div class=\"tweet-hd\">{avatar}<div class=\"tweet-hd-main tweet-hd-main--fedi\"><div><span class=\"who\">{}</span><span class=\"meta\"> @{}@mkultra.monster</span><span class=\"meta\"> · {}</span>",esc(&f.note_dom_id),esc(note),body::emojis(&esc(name),&emoji,true),esc(&f.actor_key),esc(&card::relative_time(string(n,"published"),facts.now)));
- if let Some(edited)=f.masto_row.as_ref().map(|r|string(r,"edited_at")).filter(|v|!v.is_empty()){html.push_str(&format!("<span class=\"meta\" title=\"{}\"> · edited</span>",esc(edited)));}
+ let mut html=format!("<article class=\"tweet tweet-own\"{rank} id=\"note-{}\"{}><div class=\"tweet-hd\">{avatar}<div class=\"tweet-hd-main tweet-hd-main--fedi\"><div><span class=\"who\">{}</span><span class=\"meta\"> @{}@mkultra.monster</span><span class=\"meta\"> · {}</span>",esc(&f.note_dom_id),identity_attrs(n,f.masto_row.as_ref(),facts.now),body::emojis(&esc(name),&emoji,true),esc(&f.actor_key),esc(&card::relative_time(string(n,"published"),facts.now)));
+ // PHP's admin_masto_row_for_note never selects edited_at, so its raw card
+ // edited label never paints; a full masto row here must not add one.
  if own_note&&facts.own.as_ref().is_some_and(|o|o.pinned){html.push_str("<span class=\"tag\" style=\"margin-left:.35rem\" title=\"Pinned on profile\">pinned</span>");}
  html.push_str("</div><div class=\"meta\">mkultra.monster</div></div>");
  html.push_str(&vaak_types::visibility_badge_html(vis));
@@ -263,6 +277,24 @@ pub(crate) fn prewarm_static_regexes(){
 #[cfg(test)]
 mod tests{
  use super::*;
+ #[test]
+ fn identity_attrs_match_php_outbox_card(){
+  // Expected values from PHP 8.3: ap_masto_snowflake_id(published, local_id, 0)
+  // and admin_tl_card_identity_attrs with admin_tl_status_created_ts.
+  let now=chrono::DateTime::parse_from_rfc3339("2026-10-28T00:00:00Z").unwrap().with_timezone(&chrono::Utc);
+  let note="https://mkultra.monster/users/fixture/notes/a";
+  let masto=json!({"local_id":123456789});
+  assert_eq!(identity_attrs(&json!({"id":format!("{note}/"),"published":"2026-10-27T10:00:00Z"}),Some(&masto),now),
+   format!(" data-timeline-key=\"1793095200023456789\" data-note-id=\"{note}\" data-status-id=\"1793095200023456789\" data-sort=\"1793095200\""));
+  assert_eq!(identity_attrs(&json!({"id":note,"published":"2026-10-27T10:00:00.123+02:00"}),Some(&masto),now),
+   format!(" data-timeline-key=\"1793088000023456789\" data-note-id=\"{note}\" data-status-id=\"1793088000023456789\" data-sort=\"1793088000\""));
+  // No masto row (or local_id 0): key falls back to the note, no status id.
+  assert_eq!(identity_attrs(&json!({"id":note,"published":"2026-10-27T10:00:00Z"}),Some(&json!({"local_id":0})),now),
+   format!(" data-timeline-key=\"{note}\" data-note-id=\"{note}\" data-sort=\"1793095200\""));
+  // strtotime failure: snowflake uses the request clock, sort is omitted.
+  assert_eq!(identity_attrs(&json!({"id":note,"published":"not a date"}),Some(&masto),now),
+   format!(" data-timeline-key=\"1793145600023456789\" data-note-id=\"{note}\" data-status-id=\"1793145600023456789\""));
+ }
  fn quote_from_opts(o:&Value)->RawQuoteFacts{RawQuoteFacts{acct:string(o,"acct").into(),text:string(o,"text").into(),url:string(o,"url").into(),media:o.get("media").and_then(Value::as_array).cloned().unwrap_or_default(),card:o.get("card").filter(|v|v.is_object()).cloned(),mentions:o.get("mentions").and_then(Value::as_array).cloned().unwrap_or_default(),spoiler:string(o,"spoiler_text").into(),sensitive:card::boolean(o,"sensitive"),is_rss:card::boolean(o,"is_rss"),article_url:string(o,"article_url").into(),open_label:o.get("open_label").and_then(Value::as_str).unwrap_or("Open quoted").into(),open_external:card::boolean(o,"open_external")}}
  fn presentation_facts()->CardFacts{CardFacts{bsky:None,owner_id:1,owner_actor:"https://mkultra.monster/users/fixture".into(),return_view:"remote_profile".into(),auto_unblur_sensitive:false,resolved_avatar:String::new(),csrf:"fixture-csrf-token".into(),favourited:false,bookmarked:false,boosted:false,own:None,current_action_counts:None,rss_row:None,rss_quote_row:None,rss_quoted:false,emoji_by_actor:Default::default(),reply_mentions:vec![],moderation:Default::default(),poll_row:None,ask_row:None,now:chrono::DateTime::from_timestamp(1791673200,0).unwrap(),lazy_media:false}}
  #[test]
@@ -331,7 +363,7 @@ mod tests{
   }
   let compiles_after=crate::library::static_regex_compiles();
   assert_eq!(compiles_after,compiles_before,"regex compiled again while painting 50 warmed cards ({compiles_before} -> {compiles_after})");
-  assert!(html.contains("quote-media")&&html.contains("quote-block")&&html.contains("parent post")&&html.contains("edited")&&html.contains("Open on Bluesky")&&html.contains("cdn.test/4.jpg"),"{html}");
+  assert!(html.contains("quote-media")&&html.contains("quote-block")&&html.contains("parent post")&&!html.contains("· edited")&&html.contains("data-sort=\"")&&html.contains("Open on Bluesky")&&html.contains("cdn.test/4.jpg"),"{html}");
   eprintln!("fifty raw cards best of 3: {}ms, static compiles stayed at {compiles_after}",best.as_millis());
   let perf=std::env::var("VAAK_PERF_ASSERT").ok().as_deref()==Some("1");
   if perf || !cfg!(debug_assertions){
