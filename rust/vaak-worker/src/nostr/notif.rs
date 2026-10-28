@@ -6,7 +6,8 @@
 //! linked key (`#p`), since the last good read. What notifies:
 //!  - a note from someone the user follows on Nostr (mention or reply);
 //!  - a reply to one of the user's own notes, from anyone;
-//!  - a repost or like of one of the user's notes, from someone they follow.
+//!  - a repost or like of one of the user's notes, from anyone (Notifications
+//!    groups repeated likes and reposts of one note like any other post's).
 //!
 //! Keys the user muted or hid, and admin-blocked keys, never notify. Kept
 //! events are staged in `nostr_notifs` with their `mentions` row already
@@ -64,12 +65,12 @@ fn notifies(ev: &Event, me: &str, followed: bool, mine: &dyn Fn(&str) -> bool) -
         }
         6 => {
             let (target, _) = ev.repost_target()?;
-            (followed && mine(&target)).then_some(target)
+            mine(&target).then_some(target)
         }
         // NIP-25: "-" is a dislike; it never notifies.
         7 if ev.content.trim() != "-" => {
             let target = ev.reaction_target()?;
-            (followed && mine(&target)).then_some(target)
+            mine(&target).then_some(target)
         }
         _ => None,
     }
@@ -532,13 +533,15 @@ mod tests {
         assert_eq!(notifies(&mention, &me.pubkey, false, &is_mine), None);
         assert_eq!(notifies(&thread_reply, &me.pubkey, false, &is_mine), None);
         assert_eq!(notifies(&reply, &me.pubkey, false, &is_mine), Some(mine_note.clone()));
-        // Likes and reposts: followed people, my notes only, no dislikes.
+        // Likes and reposts: anyone, my notes only, no dislikes.
         let like = signed(2, 20, 7, vec![tag(&["e", &mine_note]), p.clone()], "+");
         let dislike = signed(2, 20, 7, vec![tag(&["e", &mine_note]), p.clone()], "-");
         let like_other = signed(2, 20, 7, vec![tag(&["e", &other]), p.clone()], "🔥");
         let repost = signed(2, 20, 6, vec![tag(&["e", &mine_note]), p.clone()], "");
         assert_eq!(notifies(&like, &me.pubkey, true, &is_mine), Some(mine_note.clone()));
-        assert_eq!(notifies(&like, &me.pubkey, false, &is_mine), None);
+        assert_eq!(notifies(&like, &me.pubkey, false, &is_mine), Some(mine_note.clone()));
+        assert_eq!(notifies(&repost, &me.pubkey, false, &is_mine), Some(mine_note.clone()));
+        assert_eq!(notifies(&like_other, &me.pubkey, false, &is_mine), None);
         assert_eq!(notifies(&dislike, &me.pubkey, true, &is_mine), None);
         assert_eq!(notifies(&like_other, &me.pubkey, true, &is_mine), None);
         assert_eq!(notifies(&repost, &me.pubkey, true, &is_mine), Some(mine_note.clone()));
