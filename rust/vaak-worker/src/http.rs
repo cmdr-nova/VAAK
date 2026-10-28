@@ -123,6 +123,10 @@ pub async fn serve(cfg: Config, bind: SocketAddr) -> Result<()> {
         cfg: Arc::new(cfg),
     };
     tokio::spawn(crate::profile_bridge::warm_on_start(state.cfg.database_url.clone()));
+    // Rust cutover F1: repeat PHP's inbox signature checks and log agreement.
+    if std::env::var("VAAK_INBOX_SIG_SHADOW").is_ok_and(|v| v.trim() == "1") {
+        tokio::spawn(crate::inbox_sig_shadow::run(state.cfg.clone()));
+    }
     let shadow_token = crate::shadow_auth::resolve();
     if shadow_token.is_none() {
         tracing::warn!("shadow HTTP token not configured; /shadow/* and /api/v1/* will answer 503");
