@@ -592,29 +592,30 @@ async fn external_quote_facts(db:&Client,intent:&RawQuoteIntent,preloaded:Option
  Ok(embedded_stub_facts(intent))
 }
 async fn prepare_raw_quote(db:&Client,viewer:&crate::profile_materialize::ProfileViewer<'_>,page:&ProfilePage,index:usize,raw:&Value,root:&Value,intent:&RawQuoteIntent,facts:&crate::library::card::CardFacts,dns:&dyn crate::direct_preview::PreviewDns,bsky:Option<&std::collections::HashMap<String,(String,String,String)>>)->Result<(String,crate::profile_materialize::ProjectedQuoteTarget,Vec<crate::profile_materialize::AccountMappingChanges>)>{
- page.require_source_row(index,raw)?;page.require_current_ledger(db).await?;
+ crate::profile_bridge::count_stage(crate::profile_bridge::StageCount::Quote);
+ page.require_source_row(index,raw)?;crate::profile_bridge::timed(crate::profile_bridge::Stage::QuoteCurrent,page.require_current_ledger(db)).await?;
  crate::profile_bridge::ensure_budget()?;
  let owner=match viewer{crate::profile_materialize::ProfileViewer::Auth(session)=>session.owner_id(),crate::profile_materialize::ProfileViewer::Guest(_)=>0};
- let mut roots=vec![root.clone()];crate::audience::filter_profile_statuses(db,owner,crate::audience::Surface::Direct,&mut roots).await?;
+ let mut roots=vec![root.clone()];crate::profile_bridge::timed(crate::profile_bridge::Stage::QuoteAudience,crate::audience::filter_profile_statuses(db,owner,crate::audience::Surface::Direct,&mut roots)).await?;
  if roots.len()!=1{bail!("PHP fallback: raw quote parent changed before child assembly")}
  let target=intent.url.as_str();
  if intent.tombstone||crate::profile_materialize::local_key(target).is_none()||crate::profile_materialize::quote_target_is_bluesky(target){
-  let quote=external_quote_facts(db,intent,bsky).await?;
+  let quote=crate::profile_bridge::timed(crate::profile_bridge::Stage::QuoteExternal,external_quote_facts(db,intent,bsky)).await?;
   let html=crate::profile_raw::render_quote(&quote,facts)?;
   return Ok((html,crate::profile_materialize::ProjectedQuoteTarget::absent(intent.url.clone()),Vec::new()));
  }
  let mut product=crate::profile_bridge::timed(crate::profile_bridge::Stage::QuoteMaterialize,crate::profile_materialize::materialize_quote_target(db,viewer,target)).await?;let mut mapping_changes=Vec::new();
- product.require_current(db).await?;
+ crate::profile_bridge::timed(crate::profile_bridge::Stage::QuoteCurrent,product.require_current(db)).await?;
  let Some(child)=product.status().cloned()else{
-  let quote=external_quote_facts(db,intent,bsky).await?;
+  let quote=crate::profile_bridge::timed(crate::profile_bridge::Stage::QuoteExternal,external_quote_facts(db,intent,bsky)).await?;
   let html=crate::profile_raw::render_quote(&quote,facts)?;
   return Ok((html,product,Vec::new()));
  };
- let mut checked=vec![child.clone()];crate::audience::filter_profile_statuses(db,owner,crate::audience::Surface::Direct,&mut checked).await?;
- let allowed=checked.len()==1&&crate::direct_context::local_outbox_tree(db,&child,0).await?&&crate::direct_context::current_tree(db,&child,0).await?;
+ let allowed=crate::profile_bridge::timed(crate::profile_bridge::Stage::QuoteAudience,async{let mut checked=vec![child.clone()];crate::audience::filter_profile_statuses(db,owner,crate::audience::Surface::Direct,&mut checked).await?;anyhow::Ok(checked.len()==1&&crate::direct_context::local_outbox_tree(db,&child,0).await?&&crate::direct_context::current_tree(db,&child,0).await?)}).await?;
  let root_actor=match viewer{crate::profile_materialize::ProfileViewer::Auth(session)=>session.canonical_actor(),crate::profile_materialize::ProfileViewer::Guest(session)=>session.canonical_actor()};
  let owner_snapshot=if owner>0{db.query_opt("SELECT to_jsonb(u) FROM ap_users u WHERE id=$1::bigint AND disabled_at IS NULL",&[&owner]).await?.map(|row|row.get::<_,Value>(0))}else{None};
  let admission_status=child.clone();let grant=AdmittedQuoteProjection{requested:product.requested_target().into(),status:if allowed{Some(child.clone())}else{None},owner,owner_snapshot,root_actor:root_actor.into(),page:page.clone(),parent:root.clone()};
+ let effects_started=std::time::Instant::now();
  if allowed{
   let warm=match viewer{crate::profile_materialize::ProfileViewer::Auth(session)=>session.warm_context(),crate::profile_materialize::ProfileViewer::Guest(session)=>session.warm_context()};
   // Each effect is followed by a recheck (the mapping and touch writers do
@@ -631,9 +632,10 @@ async fn prepare_raw_quote(db:&Client,viewer:&crate::profile_materialize::Profil
    if !matches!(effect.effect(),crate::profile_materialize::ProjectionEffect::RememberAccount{..}|crate::profile_materialize::ProjectionEffect::PostMediaTouch{..}){grant.require_current(db,product.requested_target(),&admission_status).await?;}
   }
  }
+ crate::profile_bridge::record_stage(crate::profile_bridge::Stage::QuoteEffects,effects_started);
  if allowed{crate::profile_bridge::timed(crate::profile_bridge::Stage::QuoteCache,product.complete_cache(db,dns,&grant)).await?;}
  let html=if allowed{crate::profile_raw::render_quote(&raw_quote_facts(product.status().unwrap(),target),facts)?}else{String::new()};
- product.require_current(db).await?;page.require_current_ledger(db).await?;
+ crate::profile_bridge::timed(crate::profile_bridge::Stage::QuoteCurrent,async{product.require_current(db).await?;page.require_current_ledger(db).await}).await?;
  Ok((html,product,mapping_changes))
 }
 impl AdmittedProjectionSources {
