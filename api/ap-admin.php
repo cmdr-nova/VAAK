@@ -7112,6 +7112,36 @@ function admin_trend_sparkline_svg(array $history): string
         . '<polyline class="trend-spark-line" points="' . $line . '"/></svg>';
 }
 
+/**
+ * Media summary for a trending post row: first attachment's small preview,
+ * its alt text, and a short label. Sensitive or CW'd posts get no thumbnail.
+ *
+ * @return array{thumb:string,description:string,label:string,count:int}|null
+ */
+function admin_trend_status_media(array $status): ?array
+{
+    $items = array_values(array_filter(
+        is_array($status['media_attachments'] ?? null) ? $status['media_attachments'] : [],
+        'is_array'
+    ));
+    if ($items === []) return null;
+    $first = $items[0];
+    $count = count($items);
+    $type = (string) ($first['type'] ?? 'image');
+    $label = in_array($type, ['video', 'gifv'], true) ? ($type === 'gifv' ? 'GIF' : 'Video')
+        : ($type === 'audio' ? 'Audio' : ($count > 1 ? $count . ' images' : 'Image'));
+    if ($count > 1 && $type !== 'image') $label .= ' +' . ($count - 1);
+    $hidden = !empty($status['sensitive']) || trim((string) ($status['spoiler_text'] ?? '')) !== '';
+    $thumb = (string) ($first['preview_url'] ?? '');
+    if ($hidden || $type === 'audio' || !str_starts_with($thumb, 'https://')) $thumb = '';
+    return [
+        'thumb' => $thumb,
+        'description' => $hidden ? '' : trim(preg_replace('/\s+/u', ' ', (string) ($first['description'] ?? '')) ?? ''),
+        'label' => $hidden ? $label . ' (sensitive)' : $label,
+        'count' => $count,
+    ];
+}
+
 /** Fresh local display preference, independent of cached candidate/HTML authority. */
 function admin_trends_display_state(?array $user = null): array
 {
@@ -7261,16 +7291,25 @@ function admin_trends_sidebar_html(string $viewForTrends, bool $allowStale = tru
             $surl = function_exists('ap_masto_trend_status_open_ref')
                 ? ap_masto_trend_status_open_ref($ts)
                 : (string) ($ts['uri'] ?? $ts['url'] ?? '');
-            $html .= '<div style="margin:0 0 .65rem;line-height:1.35">';
-            $html .= '<div class="meta" style="margin-bottom:.15rem">' . h($who) . '</div>';
+            $media = admin_trend_status_media($ts);
+            if ($excerpt === '' && $media !== null) {
+                $excerpt = $media['description'] !== '' ? $admin_strim($media['description'], 96) : $media['label'];
+            }
+            $label = h($excerpt !== '' ? $excerpt : '(media)');
+            $html .= '<div class="trend-post">';
+            if ($media !== null && $media['thumb'] !== '') {
+                // Small preview_url thumbnail: lazy, fixed box, never the full-size original.
+                $html .= '<img class="trend-post-thumb" src="' . h($media['thumb']) . '" alt="" width="44" height="44" loading="lazy" decoding="async" referrerpolicy="no-referrer">';
+            }
+            $html .= '<div class="trend-post-text"><div class="meta">' . h($who)
+                . ($media !== null && $media['count'] > 1 && $content !== '' ? ' · ' . h($media['label']) : '') . '</div>';
             if ($surl !== '') {
                 $html .= '<a href="' . h(admin_status_href($surl, $viewForTrends))
-                    . '" style="color:var(--text);text-decoration:none">'
-                    . h($excerpt !== '' ? $excerpt : '(media)') . '</a>';
+                    . '" style="color:var(--text);text-decoration:none">' . $label . '</a>';
             } else {
-                $html .= '<span>' . h($excerpt !== '' ? $excerpt : '(media)') . '</span>';
+                $html .= '<span>' . $label . '</span>';
             }
-            $html .= '</div>';
+            $html .= '</div></div>';
         }
     }
     $html .= '</div>';
@@ -30009,6 +30048,10 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     .trend-tag-text a { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .trend-tag-text .meta { font-size: .72rem; }
     .trend-spark { flex: none; color: var(--primary); overflow: visible; }
+    .trend-post { display: flex; align-items: flex-start; gap: .55rem; margin: 0 0 .65rem; line-height: 1.35; min-width: 0; }
+    .trend-post-thumb { flex: none; width: 44px; height: 44px; object-fit: cover; border-radius: 6px; border: 1px solid var(--border); background: var(--bg); }
+    .trend-post-text { min-width: 0; overflow-wrap: anywhere; }
+    .trend-post-text .meta { margin-bottom: .15rem; }
     .trend-spark-area { fill: currentColor; fill-opacity: .14; stroke: none; }
     .trend-spark-line { fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linejoin: round; stroke-linecap: round; vector-effect: non-scaling-stroke; }
     .bar-row span:last-child { color: var(--primary); }
