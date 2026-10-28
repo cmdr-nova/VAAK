@@ -111,6 +111,7 @@ $check(ap_nostr_action('nostr_sign_anything', 1, true, [])['status'] === 400, 'u
 $admin = ['id' => 1, 'is_admin' => true];
 $check(ap_nostr_api_action('sign', $admin, [])['status'] === 404, 'api: unknown step refused');
 $check(ap_nostr_api_action('prepare', $admin, ['status_id' => 'abc'])['status'] === 400, 'api: non-numeric status id refused');
+$check(ap_nostr_api_action('prepare', $admin, ['note_id' => 'http://x/notes/1'])['status'] === 400, 'api: non-https note id refused');
 $check(ap_nostr_api_action('publish', $admin, ['nonce' => 'xyz', 'event' => ['id' => 'x']])['status'] === 400, 'api: bad nonce refused');
 $check(ap_nostr_api_action('publish', ['id' => 2, 'is_admin' => false], ['nonce' => str_repeat('a', 32), 'event' => []])['status'] === 403, 'api: admin-only rollout refuses other users');
 

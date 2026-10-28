@@ -8,7 +8,8 @@ receives it.
 How a crosspost works:
 
 1. The app posts on VAAK as usual (`POST /api/v1/statuses`).
-2. `POST /api/v1/vaak/nostr/prepare {"status_id": ...}` makes VAAK build the
+2. `POST /api/v1/vaak/nostr/prepare {"status_id": ...}` (or
+   `{"note_id": "https://.../notes/..."}` for posts made another way) makes VAAK build the
    Nostr note from the stored post (same as the composer's "Nostr" box:
    text, media links, hashtags, content warning, link back to VAAK).
    Blog posts answer `{"ok": false, "skip": true}`; replies and non-public
@@ -26,7 +27,8 @@ also reads the account, so `read write` is simplest.
 ```sh
 pip install websockets          # only the profile command needs it
 export VAAK_URL=https://mkultra.monster
-export VAAK_TOKEN=...           # shana_flux's API token
+export VAAK_TOKEN=...           # shana_flux's API token, or
+export VAAK_TOKEN_FILE=...      # a JSON file with it as "access_token"
 
 python3 vaak_nostr.py new-key   # saves ~/.config/vaak-nostr/nsec (mode 600)
 ```
@@ -53,6 +55,7 @@ From Python, right after the VAAK post:
 ```python
 import vaak_nostr
 result = vaak_nostr.crosspost(status["id"])   # status = VAAK's JSON answer
+result = vaak_nostr.crosspost(note_id)        # or the post's note URL
 ```
 
 or from a shell:

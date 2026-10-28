@@ -13,12 +13,14 @@ Commands:
     npub                    print the npub of the saved key
     profile                 copy the VAAK name, bio, avatar and header to
                             Nostr (kind 0); flags override single fields
-    crosspost STATUS_ID     send an existing VAAK post to Nostr
+    crosspost ID_OR_URL     send an existing VAAK post to Nostr (status id
+                            or the post's note URL)
     post "text"             post on VAAK, then crosspost it
 
 Settings come from the environment (or flags):
     VAAK_URL        e.g. https://mkultra.monster
-    VAAK_TOKEN      the account's API access token (write scope)
+    VAAK_TOKEN      the account's API access token (write scope), or
+    VAAK_TOKEN_FILE a JSON file holding it as "access_token"
     VAAK_NOSTR_KEY  key file, default ~/.config/vaak-nostr/nsec
 
 From Python, after Shana posts:
@@ -244,8 +246,10 @@ def new_key(path: str | None = None) -> tuple[str, str]:
 def _api(path: str, body: dict | None, url: str | None, token: str | None) -> dict:
     url = (url or os.environ.get("VAAK_URL") or "").rstrip("/")
     token = token or os.environ.get("VAAK_TOKEN") or ""
+    if not token and os.environ.get("VAAK_TOKEN_FILE"):
+        token = str(json.loads(Path(os.environ["VAAK_TOKEN_FILE"]).expanduser().read_text()).get("access_token", ""))
     if not url or not token:
-        raise SystemExit("Set VAAK_URL and VAAK_TOKEN (or pass --url/--token).")
+        raise SystemExit("Set VAAK_URL and VAAK_TOKEN or VAAK_TOKEN_FILE (or pass --url/--token).")
     req = urllib.request.Request(
         url + path,
         data=None if body is None else json.dumps(body).encode(),
@@ -262,12 +266,16 @@ def _api(path: str, body: dict | None, url: str | None, token: str | None) -> di
             return {"ok": False, "http": e.code, "error": f"HTTP {e.code}"}
 
 
-def crosspost(status_id, url: str | None = None, token: str | None = None, key: str | None = None, tries: int = 5) -> dict:
-    """Send VAAK post `status_id` to Nostr. Returns VAAK's answer; never raises
-    for a refused post (check result["ok"], and "skip" for blog posts)."""
+def crosspost(post, url: str | None = None, token: str | None = None, key: str | None = None, tries: int = 5) -> dict:
+    """Send a VAAK post to Nostr: `post` is the status id POST /api/v1/statuses
+    returned, or the post's note URL (https://.../notes/...). Returns VAAK's
+    answer; never raises for a refused post (check result["ok"], and "skip"
+    for blog posts)."""
     secret = load_secret(key)
+    ref = str(post).strip()
+    body = {"note_id": ref} if ref.startswith("https://") else {"status_id": ref}
     for attempt in range(tries):
-        prep = _api("/api/v1/vaak/nostr/prepare", {"status_id": str(status_id)}, url, token)
+        prep = _api("/api/v1/vaak/nostr/prepare", body, url, token)
         if prep.get("ok") or not prep.get("retry"):
             break
         time.sleep(2 * (attempt + 1))
@@ -343,7 +351,7 @@ def main(argv=None) -> int:
     pr.add_argument("--dry-run", action="store_true", help="print the profile instead of publishing it")
     pr.add_argument("--relay", action="append", help="repeat for each relay (default: a few big public ones)")
     cp = sub.add_parser("crosspost")
-    cp.add_argument("status_id")
+    cp.add_argument("post", help="status id or note URL")
     po = sub.add_parser("post")
     po.add_argument("text")
     a = ap.parse_args(argv)
@@ -368,7 +376,7 @@ def main(argv=None) -> int:
         if not a.dry_run:
             publish_profile(fields, a.relay or DEFAULT_RELAYS, a.key)
         return 0
-    res = crosspost(a.status_id, a.url, a.token, a.key) if a.cmd == "crosspost" else post_and_crosspost(a.text, a.url, a.token, a.key)
+    res = crosspost(a.post, a.url, a.token, a.key) if a.cmd == "crosspost" else post_and_crosspost(a.text, a.url, a.token, a.key)
     print(json.dumps(res, indent=2, ensure_ascii=False))
     return 0 if res.get("ok") or res.get("skip") else 1
 
