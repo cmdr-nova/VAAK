@@ -1,0 +1,772 @@
+{
+    "cases": [
+        {
+            "id": "cavage-classic",
+            "input": {
+                "v": 1,
+                "now": 1793177726,
+                "headers": {
+                    "host": "mkultra.monster",
+                    "date": "Wed, 28 Oct 2026 08:55:24 GMT",
+                    "digest": "SHA-256=dBv6ESjEGkMCnfBfRAFulbu98g7/4KwJfLhA9FJmAPQ=",
+                    "signature": "keyId=\"https://example.com/users/alice#main-key\",algorithm=\"rsa-sha256\",headers=\"(request-target) host date digest\",signature=\"aDqgKj/PditmC94sATQ5xdTpKxJM/LPVJ7cHOoDs0fTSmFcVlQgzzaon9uRVb/ieK/UtLoNxNZ9o8kUVoy3H0mJYOOGhJWJ8301n8HUfz4WitrG4FIy11TTQVcCv42QJnceEp2O8ureHQZ6lonqO2Ww6pW9ZV5zHf1of7Pgo7rszovjTlVDX096WG4VHNzZss/NNUrjpgxuRgXl6ZGbCMgFyAv0vH/g3BD/V3ufz8FoqFYxyXCW4KW+Vw2xjCTEa2k4/iFqWP/QGThmVYluq7uD3zphZ2xzD08g1ZQQAFtVi5w+hPcxVZjOCmiInqy5xXT5goS6FkBXGoXVswyPi5g==\""
+                },
+                "server": {
+                    "REQUEST_URI": "/api/ap-inbox.php",
+                    "REQUEST_METHOD": "POST",
+                    "HTTP_HOST": "mkultra.monster"
+                },
+                "request_actor": null,
+                "body_b64": "eyJAY29udGV4dCI6Imh0dHBzOi8vd3d3LnczLm9yZy9ucy9hY3Rpdml0eXN0cmVhbXMiLCJpZCI6Imh0dHBzOi8vZXhhbXBsZS5jb20vdXNlcnMvYWxpY2Uvc3RhdHVzZXMvMS9hY3Rpdml0eSIsInR5cGUiOiJDcmVhdGUiLCJhY3RvciI6Imh0dHBzOi8vZXhhbXBsZS5jb20vdXNlcnMvYWxpY2UiLCJvYmplY3QiOnsiaWQiOiJodHRwczovL2V4YW1wbGUuY29tL3VzZXJzL2FsaWNlL3N0YXR1c2VzLzEiLCJ0eXBlIjoiTm90ZSIsImF0dHJpYnV0ZWRUbyI6Imh0dHBzOi8vZXhhbXBsZS5jb20vdXNlcnMvYWxpY2UiLCJjb250ZW50IjoiaGkifX0=",
+                "pem": "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA1LWo9qpvR2YV2A8n60TC\nUNdvp1xa9AzDzvih6D69Uy9OWdAPOveiN3VelLchdtLtaFmAqGSIsRcmwal89Iz5\nJKFNq8VQZIAgSfu5zZktat+4aIlzWqWY8BSupPanenI8GaxJJCt2E8DqyCAi3joL\nTjnKwvT2OliJBnRl54cbng8eMLOtntJZ6JrHvsQnfWc+/KdQbGW8klYI14hpJ+VS\nhEPxE2OXckwVdJk/m2HNiYcHrC9xWh9Wck3ukyGSNLoyaOuvOKIClSEQfp8fHwI9\nZWRr0BRJFGxjsd1BWK6lf2qTqlo5HVvt9XynbWzUBd+cctPMz6+n84orHLA3/Elh\nIwIDAQAB\n-----END PUBLIC KEY-----\n",
+                "php": {
+                    "ok": true,
+                    "path": "/inbox",
+                    "code": 200,
+                    "error": null
+                }
+            },
+            "output": {
+                "ok": true,
+                "path": "/inbox",
+                "code": 200,
+                "error": null
+            }
+        },
+        {
+            "id": "mastodon-port-host",
+            "input": {
+                "v": 1,
+                "now": 1793177726,
+                "headers": {
+                    "content-type": "application/activity+json",
+                    "host": "mkultra.monster:443",
+                    "date": "Wed, 28 Oct 2026 08:55:24 GMT",
+                    "digest": "SHA-256=dBv6ESjEGkMCnfBfRAFulbu98g7/4KwJfLhA9FJmAPQ=",
+                    "signature": "keyId=\"https://example.com/users/alice#main-key\",algorithm=\"rsa-sha256\",headers=\"host date content-type digest (request-target)\",signature=\"ETsHmXmfs6tXzC+v4l973EpaT8ue76XWjLJH2DmJ9cGkJLsHqErUpSLFoLG9mnGDgjNDeP8z5MKtr+vKnDEYN/q257l3MLAY/tU5KhbypGYaUia3u+XtZzpOXDGg9Kdi7WjmbN9N0EIKs7QVGYWKWTKXVR9PSI4gVQ9YyVQ32MFYqw9NY16fKruRJg1zEkl18nTaaNRfFp5Mlm/9qikW6We4KbtD7Aot5VjE0No0hypbK1BZsMdmGp/Xh2qVe8Rfd+WhBUClwkekDPqOd3kG0HCt3DEEWTf7Wup2OFAgiOYaY9QzOLETjU0isE9C457eCS/REeBWMzWzw6wXCY38KA==\""
+                },
+                "server": {
+                    "REQUEST_URI": "/api/ap-inbox.php",
+                    "REQUEST_METHOD": "POST",
+                    "HTTP_HOST": "mkultra.monster:443"
+                },
+                "request_actor": null,
+                "body_b64": "eyJAY29udGV4dCI6Imh0dHBzOi8vd3d3LnczLm9yZy9ucy9hY3Rpdml0eXN0cmVhbXMiLCJpZCI6Imh0dHBzOi8vZXhhbXBsZS5jb20vdXNlcnMvYWxpY2Uvc3RhdHVzZXMvMS9hY3Rpdml0eSIsInR5cGUiOiJDcmVhdGUiLCJhY3RvciI6Imh0dHBzOi8vZXhhbXBsZS5jb20vdXNlcnMvYWxpY2UiLCJvYmplY3QiOnsiaWQiOiJodHRwczovL2V4YW1wbGUuY29tL3VzZXJzL2FsaWNlL3N0YXR1c2VzLzEiLCJ0eXBlIjoiTm90ZSIsImF0dHJpYnV0ZWRUbyI6Imh0dHBzOi8vZXhhbXBsZS5jb20vdXNlcnMvYWxpY2UiLCJjb250ZW50IjoiaGkifX0=",
+                "pem": "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA1LWo9qpvR2YV2A8n60TC\nUNdvp1xa9AzDzvih6D69Uy9OWdAPOveiN3VelLchdtLtaFmAqGSIsRcmwal89Iz5\nJKFNq8VQZIAgSfu5zZktat+4aIlzWqWY8BSupPanenI8GaxJJCt2E8DqyCAi3joL\nTjnKwvT2OliJBnRl54cbng8eMLOtntJZ6JrHvsQnfWc+/KdQbGW8klYI14hpJ+VS\nhEPxE2OXckwVdJk/m2HNiYcHrC9xWh9Wck3ukyGSNLoyaOuvOKIClSEQfp8fHwI9\nZWRr0BRJFGxjsd1BWK6lf2qTqlo5HVvt9XynbWzUBd+cctPMz6+n84orHLA3/Elh\nIwIDAQAB\n-----END PUBLIC KEY-----\n",
+                "php": {
+                    "ok": true,
+                    "path": "/inbox",
+                    "code": 200,
+                    "error": null
+                }
+            },
+            "output": {
+                "ok": true,
+                "path": "/inbox",
+                "code": 200,
+                "error": null
+            }
+        },
+        {
+            "id": "charset-stripped",
+            "input": {
+                "v": 1,
+                "now": 1793177726,
+                "headers": {
+                    "content-type": "application/activity+json; charset=utf-8",
+                    "host": "mkultra.monster",
+                    "date": "Wed, 28 Oct 2026 08:55:24 GMT",
+                    "digest": "SHA-256=dBv6ESjEGkMCnfBfRAFulbu98g7/4KwJfLhA9FJmAPQ=",
+                    "signature": "keyId=\"https://example.com/users/alice#main-key\",algorithm=\"rsa-sha256\",headers=\"host date content-type digest (request-target)\",signature=\"ETsHmXmfs6tXzC+v4l973EpaT8ue76XWjLJH2DmJ9cGkJLsHqErUpSLFoLG9mnGDgjNDeP8z5MKtr+vKnDEYN/q257l3MLAY/tU5KhbypGYaUia3u+XtZzpOXDGg9Kdi7WjmbN9N0EIKs7QVGYWKWTKXVR9PSI4gVQ9YyVQ32MFYqw9NY16fKruRJg1zEkl18nTaaNRfFp5Mlm/9qikW6We4KbtD7Aot5VjE0No0hypbK1BZsMdmGp/Xh2qVe8Rfd+WhBUClwkekDPqOd3kG0HCt3DEEWTf7Wup2OFAgiOYaY9QzOLETjU0isE9C457eCS/REeBWMzWzw6wXCY38KA==\""
+                },
+                "server": {
+                    "REQUEST_URI": "/api/ap-inbox.php",
+                    "REQUEST_METHOD": "POST",
+                    "HTTP_HOST": "mkultra.monster"
+                },
+                "request_actor": null,
+                "body_b64": "eyJAY29udGV4dCI6Imh0dHBzOi8vd3d3LnczLm9yZy9ucy9hY3Rpdml0eXN0cmVhbXMiLCJpZCI6Imh0dHBzOi8vZXhhbXBsZS5jb20vdXNlcnMvYWxpY2Uvc3RhdHVzZXMvMS9hY3Rpdml0eSIsInR5cGUiOiJDcmVhdGUiLCJhY3RvciI6Imh0dHBzOi8vZXhhbXBsZS5jb20vdXNlcnMvYWxpY2UiLCJvYmplY3QiOnsiaWQiOiJodHRwczovL2V4YW1wbGUuY29tL3VzZXJzL2FsaWNlL3N0YXR1c2VzLzEiLCJ0eXBlIjoiTm90ZSIsImF0dHJpYnV0ZWRUbyI6Imh0dHBzOi8vZXhhbXBsZS5jb20vdXNlcnMvYWxpY2UiLCJjb250ZW50IjoiaGkifX0=",
+                "pem": "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA1LWo9qpvR2YV2A8n60TC\nUNdvp1xa9AzDzvih6D69Uy9OWdAPOveiN3VelLchdtLtaFmAqGSIsRcmwal89Iz5\nJKFNq8VQZIAgSfu5zZktat+4aIlzWqWY8BSupPanenI8GaxJJCt2E8DqyCAi3joL\nTjnKwvT2OliJBnRl54cbng8eMLOtntJZ6JrHvsQnfWc+/KdQbGW8klYI14hpJ+VS\nhEPxE2OXckwVdJk/m2HNiYcHrC9xWh9Wck3ukyGSNLoyaOuvOKIClSEQfp8fHwI9\nZWRr0BRJFGxjsd1BWK6lf2qTqlo5HVvt9XynbWzUBd+cctPMz6+n84orHLA3/Elh\nIwIDAQAB\n-----END PUBLIC KEY-----\n",
+                "php": {
+                    "ok": true,
+                    "path": "/inbox",
+                    "code": 200,
+                    "error": null
+                }
+            },
+            "output": {
+                "ok": true,
+                "path": "/inbox",
+                "code": 200,
+                "error": null
+            }
+        },
+        {
+            "id": "personal-inbox-slash",
+            "input": {
+                "v": 1,
+                "now": 1793177726,
+                "headers": {
+                    "host": "mkultra.monster",
+                    "date": "Wed, 28 Oct 2026 08:55:24 GMT",
+                    "digest": "SHA-256=dBv6ESjEGkMCnfBfRAFulbu98g7/4KwJfLhA9FJmAPQ=",
+                    "signature": "keyId=\"https://example.com/users/alice#main-key\",algorithm=\"rsa-sha256\",headers=\"(request-target) host date digest\",signature=\"sXXgn5aqklV7f41O0tqDMkpGlcJHt1ifRF52BvrfPBzenAD8RWyDQe4C2GQwXf99QNhfbHuody2SQd/u4x5BBE/Ntn7OUBYSxfE4owJcvmc7aaMF3mZOjfSTT2Oe+SOOBVBdC4vbaAOzkvF+UcbDmiAMh2+HVO5PDZ6lwME7kw4SzuotrY96h2FfdvslZKr0BgqOasI6W/Kwvuj3e0HJNGpIknW7A9pGbBlVp8ICdZysHiHN6aRMdWC0K7rzXAM/ssfFi20yjCZHJIVddEK/s975qX1Ro1ZjT5jtwiInU4jwpYlEtRjbIn09BLpjtMK9Mrzgo5o6S7bez/HgNjG7bQ==\""
+                },
+                "server": {
+                    "REQUEST_URI": "/users/cmdr_nova/inbox/",
+                    "REQUEST_METHOD": "POST",
+                    "HTTP_HOST": "mkultra.monster"
+                },
+                "request_actor": null,
+                "body_b64": "eyJAY29udGV4dCI6Imh0dHBzOi8vd3d3LnczLm9yZy9ucy9hY3Rpdml0eXN0cmVhbXMiLCJpZCI6Imh0dHBzOi8vZXhhbXBsZS5jb20vdXNlcnMvYWxpY2Uvc3RhdHVzZXMvMS9hY3Rpdml0eSIsInR5cGUiOiJDcmVhdGUiLCJhY3RvciI6Imh0dHBzOi8vZXhhbXBsZS5jb20vdXNlcnMvYWxpY2UiLCJvYmplY3QiOnsiaWQiOiJodHRwczovL2V4YW1wbGUuY29tL3VzZXJzL2FsaWNlL3N0YXR1c2VzLzEiLCJ0eXBlIjoiTm90ZSIsImF0dHJpYnV0ZWRUbyI6Imh0dHBzOi8vZXhhbXBsZS5jb20vdXNlcnMvYWxpY2UiLCJjb250ZW50IjoiaGkifX0=",
+                "pem": "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA1LWo9qpvR2YV2A8n60TC\nUNdvp1xa9AzDzvih6D69Uy9OWdAPOveiN3VelLchdtLtaFmAqGSIsRcmwal89Iz5\nJKFNq8VQZIAgSfu5zZktat+4aIlzWqWY8BSupPanenI8GaxJJCt2E8DqyCAi3joL\nTjnKwvT2OliJBnRl54cbng8eMLOtntJZ6JrHvsQnfWc+/KdQbGW8klYI14hpJ+VS\nhEPxE2OXckwVdJk/m2HNiYcHrC9xWh9Wck3ukyGSNLoyaOuvOKIClSEQfp8fHwI9\nZWRr0BRJFGxjsd1BWK6lf2qTqlo5HVvt9XynbWzUBd+cctPMz6+n84orHLA3/Elh\nIwIDAQAB\n-----END PUBLIC KEY-----\n",
+                "php": {
+                    "ok": true,
+                    "path": "/users/cmdr_nova/inbox/",
+                    "code": 200,
+                    "error": null
+                }
+            },
+            "output": {
+                "ok": true,
+                "path": "/users/cmdr_nova/inbox/",
+                "code": 200,
+                "error": null
+            }
+        },
+        {
+            "id": "request-actor-inbox",
+            "input": {
+                "v": 1,
+                "now": 1793177726,
+                "headers": {
+                    "host": "mkultra.monster",
+                    "date": "Wed, 28 Oct 2026 08:55:24 GMT",
+                    "digest": "SHA-256=dBv6ESjEGkMCnfBfRAFulbu98g7/4KwJfLhA9FJmAPQ=",
+                    "signature": "keyId=\"https://example.com/users/alice#main-key\",algorithm=\"rsa-sha256\",headers=\"(request-target) host date digest\",signature=\"XfxnCcTgcTAN0uPkXtpGAYkFLHjha7u7wIyZkXVSDNXlhmZg3fNSdtnTvBAhlCpwpH6nuF0lqR+5/WEg8dF4wUFCGLevXuHQu1MNYx7uCIeNB+SFf2rxKaHoeYuP9jQgtEwWJ2r0XQk3M65i8FsrINV1j9gniRqDNF+Mi+4cw+zoy4Xt4zFTKl/AanXvzfSjGN5c9JpyKjHT+K7Tnav1zjWH112U/z4oTl0BJyIqIZTkRhUp66UwHBERM84F6dtXRb8nl6BqiDnQyvUEv+3afVrWjm/xhUhoLSgSYxMQ0VNQAJFe3JNJ0V0rUcH8eVnibU6gvpUkPH+j5oNHbU8QHA==\""
+                },
+                "server": {
+                    "REQUEST_URI": "/api/ap-inbox.php",
+                    "REQUEST_METHOD": "POST",
+                    "HTTP_HOST": "mkultra.monster"
+                },
+                "request_actor": "juno_flux",
+                "body_b64": "eyJAY29udGV4dCI6Imh0dHBzOi8vd3d3LnczLm9yZy9ucy9hY3Rpdml0eXN0cmVhbXMiLCJpZCI6Imh0dHBzOi8vZXhhbXBsZS5jb20vdXNlcnMvYWxpY2Uvc3RhdHVzZXMvMS9hY3Rpdml0eSIsInR5cGUiOiJDcmVhdGUiLCJhY3RvciI6Imh0dHBzOi8vZXhhbXBsZS5jb20vdXNlcnMvYWxpY2UiLCJvYmplY3QiOnsiaWQiOiJodHRwczovL2V4YW1wbGUuY29tL3VzZXJzL2FsaWNlL3N0YXR1c2VzLzEiLCJ0eXBlIjoiTm90ZSIsImF0dHJpYnV0ZWRUbyI6Imh0dHBzOi8vZXhhbXBsZS5jb20vdXNlcnMvYWxpY2UiLCJjb250ZW50IjoiaGkifX0=",
+                "pem": "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA1LWo9qpvR2YV2A8n60TC\nUNdvp1xa9AzDzvih6D69Uy9OWdAPOveiN3VelLchdtLtaFmAqGSIsRcmwal89Iz5\nJKFNq8VQZIAgSfu5zZktat+4aIlzWqWY8BSupPanenI8GaxJJCt2E8DqyCAi3joL\nTjnKwvT2OliJBnRl54cbng8eMLOtntJZ6JrHvsQnfWc+/KdQbGW8klYI14hpJ+VS\nhEPxE2OXckwVdJk/m2HNiYcHrC9xWh9Wck3ukyGSNLoyaOuvOKIClSEQfp8fHwI9\nZWRr0BRJFGxjsd1BWK6lf2qTqlo5HVvt9XynbWzUBd+cctPMz6+n84orHLA3/Elh\nIwIDAQAB\n-----END PUBLIC KEY-----\n",
+                "php": {
+                    "ok": true,
+                    "path": "/users/juno_flux/inbox",
+                    "code": 200,
+                    "error": null
+                }
+            },
+            "output": {
+                "ok": true,
+                "path": "/users/juno_flux/inbox",
+                "code": 200,
+                "error": null
+            }
+        },
+        {
+            "id": "hs2019-forwarded-host",
+            "input": {
+                "v": 1,
+                "now": 1793177726,
+                "headers": {
+                    "host": "127.0.0.1",
+                    "date": "Wed, 28 Oct 2026 08:55:24 GMT",
+                    "digest": "SHA-256=dBv6ESjEGkMCnfBfRAFulbu98g7/4KwJfLhA9FJmAPQ=",
+                    "x-forwarded-host": "mkultra.monster",
+                    "signature": "keyId=\"https://example.com/users/alice#main-key\",algorithm=\"hs2019\",headers=\"(request-target) host (created) (expires) digest\",signature=\"WfE9oxuDDDITSHctCMXaPCgxYPK9qrTObPpqlZyyEgBW33ws9APbIOVw4/I6fusDlwzgEfN5Cv697Xvu0LrjaX6ti2FbBDpmIE84OJJuaexUl48sYSV7qNrWTFh1JJA6hFzFJvGDK2q3WOPqhHyA60Rvg+GVO4iTI+SkAtH2bfS1Wt4ulBukqh6GVaWrItoIOAcmMWquQTu0j2ROUS5x3WEtTbxuAUhe/LAjbIWvZF+DkSEIYWDmopZK/1oUBN+y2mqgCMYwIz+Wyms/fah7pVVQX8lxx7oBBfQ0klrlxkIT+c8Cj+otbKu3bVRAI5GGNUMaGLJirZ1BxmfCh7N+YQ==\",created=1793177724,expires=1793178024"
+                },
+                "server": {
+                    "REQUEST_URI": "/api/ap-inbox.php",
+                    "REQUEST_METHOD": "POST",
+                    "HTTP_HOST": "127.0.0.1",
+                    "HTTP_X_FORWARDED_HOST": "mkultra.monster"
+                },
+                "request_actor": null,
+                "body_b64": "eyJAY29udGV4dCI6Imh0dHBzOi8vd3d3LnczLm9yZy9ucy9hY3Rpdml0eXN0cmVhbXMiLCJpZCI6Imh0dHBzOi8vZXhhbXBsZS5jb20vdXNlcnMvYWxpY2Uvc3RhdHVzZXMvMS9hY3Rpdml0eSIsInR5cGUiOiJDcmVhdGUiLCJhY3RvciI6Imh0dHBzOi8vZXhhbXBsZS5jb20vdXNlcnMvYWxpY2UiLCJvYmplY3QiOnsiaWQiOiJodHRwczovL2V4YW1wbGUuY29tL3VzZXJzL2FsaWNlL3N0YXR1c2VzLzEiLCJ0eXBlIjoiTm90ZSIsImF0dHJpYnV0ZWRUbyI6Imh0dHBzOi8vZXhhbXBsZS5jb20vdXNlcnMvYWxpY2UiLCJjb250ZW50IjoiaGkifX0=",
+                "pem": "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA1LWo9qpvR2YV2A8n60TC\nUNdvp1xa9AzDzvih6D69Uy9OWdAPOveiN3VelLchdtLtaFmAqGSIsRcmwal89Iz5\nJKFNq8VQZIAgSfu5zZktat+4aIlzWqWY8BSupPanenI8GaxJJCt2E8DqyCAi3joL\nTjnKwvT2OliJBnRl54cbng8eMLOtntJZ6JrHvsQnfWc+/KdQbGW8klYI14hpJ+VS\nhEPxE2OXckwVdJk/m2HNiYcHrC9xWh9Wck3ukyGSNLoyaOuvOKIClSEQfp8fHwI9\nZWRr0BRJFGxjsd1BWK6lf2qTqlo5HVvt9XynbWzUBd+cctPMz6+n84orHLA3/Elh\nIwIDAQAB\n-----END PUBLIC KEY-----\n",
+                "php": {
+                    "ok": true,
+                    "path": "/inbox",
+                    "code": 200,
+                    "error": null
+                }
+            },
+            "output": {
+                "ok": true,
+                "path": "/inbox",
+                "code": 200,
+                "error": null
+            }
+        },
+        {
+            "id": "hs2019-expired",
+            "input": {
+                "v": 1,
+                "now": 1793177726,
+                "headers": {
+                    "host": "mkultra.monster",
+                    "date": "Wed, 28 Oct 2026 08:55:24 GMT",
+                    "digest": "SHA-256=dBv6ESjEGkMCnfBfRAFulbu98g7/4KwJfLhA9FJmAPQ=",
+                    "signature": "keyId=\"https://example.com/users/alice#main-key\",algorithm=\"hs2019\",headers=\"(request-target) host (created) digest\",signature=\"EZuZv48a8iSWZ1hAiT04cq+LqnSUznf/cSNH7VUx02KY4KE323NKwDI4trBOp+c3TDpXQOur5QXGFgrONsxIaLkOHuwruJVyc719ZWSECmB07NN2SC5OQqbsBfQKFOSkIZ6AYA6/S6Wvo4HinPQs5ur/Z6ASUuqEjCWQXtZNaF+8wze6DHQYcyXBcPlLUtYzN/l+/zaKbxaAD+08WoI9l0VGXZK5Chm+iCOP4gyz2jKuxBjiCHzsy4lfuJJfEW5snISGJuPbxQLh9JkD0NI5G6hUykO9UAG4elnEWvFUJzcVSS/6hjXLoeHwnmp3UQm5OWi/5VIhpr3jBhYOYABF+g==\",created=1793170424"
+                },
+                "server": {
+                    "REQUEST_URI": "/api/ap-inbox.php",
+                    "REQUEST_METHOD": "POST",
+                    "HTTP_HOST": "mkultra.monster"
+                },
+                "request_actor": null,
+                "body_b64": "eyJAY29udGV4dCI6Imh0dHBzOi8vd3d3LnczLm9yZy9ucy9hY3Rpdml0eXN0cmVhbXMiLCJpZCI6Imh0dHBzOi8vZXhhbXBsZS5jb20vdXNlcnMvYWxpY2Uvc3RhdHVzZXMvMS9hY3Rpdml0eSIsInR5cGUiOiJDcmVhdGUiLCJhY3RvciI6Imh0dHBzOi8vZXhhbXBsZS5jb20vdXNlcnMvYWxpY2UiLCJvYmplY3QiOnsiaWQiOiJodHRwczovL2V4YW1wbGUuY29tL3VzZXJzL2FsaWNlL3N0YXR1c2VzLzEiLCJ0eXBlIjoiTm90ZSIsImF0dHJpYnV0ZWRUbyI6Imh0dHBzOi8vZXhhbXBsZS5jb20vdXNlcnMvYWxpY2UiLCJjb250ZW50IjoiaGkifX0=",
+                "pem": null,
+                "php": {
+                    "ok": false,
+                    "path": null,
+                    "code": 401,
+                    "error": "Signature created/expires out of range"
+                }
+            },
+            "output": {
+                "ok": false,
+                "path": null,
+                "code": 401,
+                "error": "Signature created/expires out of range"
+            }
+        },
+        {
+            "id": "wrong-key",
+            "input": {
+                "v": 1,
+                "now": 1793177726,
+                "headers": {
+                    "host": "mkultra.monster",
+                    "date": "Wed, 28 Oct 2026 08:55:24 GMT",
+                    "digest": "SHA-256=dBv6ESjEGkMCnfBfRAFulbu98g7/4KwJfLhA9FJmAPQ=",
+                    "signature": "keyId=\"https://example.com/users/alice#main-key\",algorithm=\"rsa-sha256\",headers=\"(request-target) host date digest\",signature=\"OBUhI7Iyw14WNTBM5Zr1WowUN5azvwLSpLyrjyk2j2zFxCcDJrnxTs6mn87ZUlkIDu9aCnYIpeiPQtqr8wyS0sN6Rt+COZdr2o3BaypSZuxcj1l7B9a+uvTEU8siLyRKeGkqpNlHYuW4Fx5ZIKVkHWCD/gKH/qkFmVJwBztolth3f7k4EYb9XL6lKx1X67g8RrvGRuuJmKcYq810U16kAOF6yQXC8JX1JNXjwn1vwjBBQJz9vHc9ViGctpYxQ3yhsxIAGUwAgdAuxwYNHw3TiKZhFSvWLyXqQVNheRou7RPeMSaSgK9c4U4mtTq/+bLmplUNv4lMMJ79w9xmkCI1Ag==\""
+                },
+                "server": {
+                    "REQUEST_URI": "/api/ap-inbox.php",
+                    "REQUEST_METHOD": "POST",
+                    "HTTP_HOST": "mkultra.monster"
+                },
+                "request_actor": null,
+                "body_b64": "eyJAY29udGV4dCI6Imh0dHBzOi8vd3d3LnczLm9yZy9ucy9hY3Rpdml0eXN0cmVhbXMiLCJpZCI6Imh0dHBzOi8vZXhhbXBsZS5jb20vdXNlcnMvYWxpY2Uvc3RhdHVzZXMvMS9hY3Rpdml0eSIsInR5cGUiOiJDcmVhdGUiLCJhY3RvciI6Imh0dHBzOi8vZXhhbXBsZS5jb20vdXNlcnMvYWxpY2UiLCJvYmplY3QiOnsiaWQiOiJodHRwczovL2V4YW1wbGUuY29tL3VzZXJzL2FsaWNlL3N0YXR1c2VzLzEiLCJ0eXBlIjoiTm90ZSIsImF0dHJpYnV0ZWRUbyI6Imh0dHBzOi8vZXhhbXBsZS5jb20vdXNlcnMvYWxpY2UiLCJjb250ZW50IjoiaGkifX0=",
+                "pem": "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA1LWo9qpvR2YV2A8n60TC\nUNdvp1xa9AzDzvih6D69Uy9OWdAPOveiN3VelLchdtLtaFmAqGSIsRcmwal89Iz5\nJKFNq8VQZIAgSfu5zZktat+4aIlzWqWY8BSupPanenI8GaxJJCt2E8DqyCAi3joL\nTjnKwvT2OliJBnRl54cbng8eMLOtntJZ6JrHvsQnfWc+/KdQbGW8klYI14hpJ+VS\nhEPxE2OXckwVdJk/m2HNiYcHrC9xWh9Wck3ukyGSNLoyaOuvOKIClSEQfp8fHwI9\nZWRr0BRJFGxjsd1BWK6lf2qTqlo5HVvt9XynbWzUBd+cctPMz6+n84orHLA3/Elh\nIwIDAQAB\n-----END PUBLIC KEY-----\n",
+                "php": {
+                    "ok": false,
+                    "path": null,
+                    "code": 401,
+                    "error": "Invalid signature"
+                }
+            },
+            "output": {
+                "ok": false,
+                "path": null,
+                "code": 401,
+                "error": "Invalid signature"
+            }
+        },
+        {
+            "id": "wrong-path",
+            "input": {
+                "v": 1,
+                "now": 1793177726,
+                "headers": {
+                    "host": "mkultra.monster",
+                    "date": "Wed, 28 Oct 2026 08:55:24 GMT",
+                    "digest": "SHA-256=dBv6ESjEGkMCnfBfRAFulbu98g7/4KwJfLhA9FJmAPQ=",
+                    "signature": "keyId=\"https://example.com/users/alice#main-key\",algorithm=\"rsa-sha256\",headers=\"(request-target) host date digest\",signature=\"ntdrjsA3Pdq9dZbTc+GEKwGOSmcI4PwKwALmZnAZYBkS64PF7/EopE69OUP1mv0fFtPxgq97K4aTNP094kQO+yGrNbKotryTDIcoUTnSzNd38haghzno1TMeQrP1guxiCKWQlk269djsRZmt8lOKuZW4fRysh3T9Z5oZe4YiU/Fy7NrOU798npv1PfEiLGnjCYtLtNCJ3bJzFKtzfV7enkA6jepfum5NZqVpMBiZurADvdgCMuFwBvDLr0jj38lVNOg/PdWUDBgbYOfHtD1/4qeDvOAStD5sqD9qcGf7Sc/jN0XA5c7TOr4Z3MtUPaaALc446JIC/dHPbEy1AAwpcg==\""
+                },
+                "server": {
+                    "REQUEST_URI": "/api/ap-inbox.php",
+                    "REQUEST_METHOD": "POST",
+                    "HTTP_HOST": "mkultra.monster"
+                },
+                "request_actor": null,
+                "body_b64": "eyJAY29udGV4dCI6Imh0dHBzOi8vd3d3LnczLm9yZy9ucy9hY3Rpdml0eXN0cmVhbXMiLCJpZCI6Imh0dHBzOi8vZXhhbXBsZS5jb20vdXNlcnMvYWxpY2Uvc3RhdHVzZXMvMS9hY3Rpdml0eSIsInR5cGUiOiJDcmVhdGUiLCJhY3RvciI6Imh0dHBzOi8vZXhhbXBsZS5jb20vdXNlcnMvYWxpY2UiLCJvYmplY3QiOnsiaWQiOiJodHRwczovL2V4YW1wbGUuY29tL3VzZXJzL2FsaWNlL3N0YXR1c2VzLzEiLCJ0eXBlIjoiTm90ZSIsImF0dHJpYnV0ZWRUbyI6Imh0dHBzOi8vZXhhbXBsZS5jb20vdXNlcnMvYWxpY2UiLCJjb250ZW50IjoiaGkifX0=",
+                "pem": "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA1LWo9qpvR2YV2A8n60TC\nUNdvp1xa9AzDzvih6D69Uy9OWdAPOveiN3VelLchdtLtaFmAqGSIsRcmwal89Iz5\nJKFNq8VQZIAgSfu5zZktat+4aIlzWqWY8BSupPanenI8GaxJJCt2E8DqyCAi3joL\nTjnKwvT2OliJBnRl54cbng8eMLOtntJZ6JrHvsQnfWc+/KdQbGW8klYI14hpJ+VS\nhEPxE2OXckwVdJk/m2HNiYcHrC9xWh9Wck3ukyGSNLoyaOuvOKIClSEQfp8fHwI9\nZWRr0BRJFGxjsd1BWK6lf2qTqlo5HVvt9XynbWzUBd+cctPMz6+n84orHLA3/Elh\nIwIDAQAB\n-----END PUBLIC KEY-----\n",
+                "php": {
+                    "ok": false,
+                    "path": null,
+                    "code": 401,
+                    "error": "Invalid signature"
+                }
+            },
+            "output": {
+                "ok": false,
+                "path": null,
+                "code": 401,
+                "error": "Invalid signature"
+            }
+        },
+        {
+            "id": "digest-mismatch",
+            "input": {
+                "v": 1,
+                "now": 1793177726,
+                "headers": {
+                    "host": "mkultra.monster",
+                    "date": "Wed, 28 Oct 2026 08:55:24 GMT",
+                    "digest": "SHA-256=2SmKENGwc1g33EvYXaxkGw887yekfl1TpU8vP1svz/o=",
+                    "signature": "keyId=\"https://example.com/users/alice#main-key\",algorithm=\"rsa-sha256\",headers=\"(request-target) host date digest\",signature=\"aDqgKj/PditmC94sATQ5xdTpKxJM/LPVJ7cHOoDs0fTSmFcVlQgzzaon9uRVb/ieK/UtLoNxNZ9o8kUVoy3H0mJYOOGhJWJ8301n8HUfz4WitrG4FIy11TTQVcCv42QJnceEp2O8ureHQZ6lonqO2Ww6pW9ZV5zHf1of7Pgo7rszovjTlVDX096WG4VHNzZss/NNUrjpgxuRgXl6ZGbCMgFyAv0vH/g3BD/V3ufz8FoqFYxyXCW4KW+Vw2xjCTEa2k4/iFqWP/QGThmVYluq7uD3zphZ2xzD08g1ZQQAFtVi5w+hPcxVZjOCmiInqy5xXT5goS6FkBXGoXVswyPi5g==\""
+                },
+                "server": {
+                    "REQUEST_URI": "/api/ap-inbox.php",
+                    "REQUEST_METHOD": "POST",
+                    "HTTP_HOST": "mkultra.monster"
+                },
+                "request_actor": null,
+                "body_b64": "eyJAY29udGV4dCI6Imh0dHBzOi8vd3d3LnczLm9yZy9ucy9hY3Rpdml0eXN0cmVhbXMiLCJpZCI6Imh0dHBzOi8vZXhhbXBsZS5jb20vdXNlcnMvYWxpY2Uvc3RhdHVzZXMvMS9hY3Rpdml0eSIsInR5cGUiOiJDcmVhdGUiLCJhY3RvciI6Imh0dHBzOi8vZXhhbXBsZS5jb20vdXNlcnMvYWxpY2UiLCJvYmplY3QiOnsiaWQiOiJodHRwczovL2V4YW1wbGUuY29tL3VzZXJzL2FsaWNlL3N0YXR1c2VzLzEiLCJ0eXBlIjoiTm90ZSIsImF0dHJpYnV0ZWRUbyI6Imh0dHBzOi8vZXhhbXBsZS5jb20vdXNlcnMvYWxpY2UiLCJjb250ZW50IjoiaGkifX0=",
+                "pem": null,
+                "php": {
+                    "ok": false,
+                    "path": null,
+                    "code": 401,
+                    "error": "Digest mismatch"
+                }
+            },
+            "output": {
+                "ok": false,
+                "path": null,
+                "code": 401,
+                "error": "Digest mismatch"
+            }
+        },
+        {
+            "id": "date-out-of-range",
+            "input": {
+                "v": 1,
+                "now": 1793177726,
+                "headers": {
+                    "host": "mkultra.monster",
+                    "date": "Wed, 28 Oct 2026 06:55:24 GMT",
+                    "digest": "SHA-256=dBv6ESjEGkMCnfBfRAFulbu98g7/4KwJfLhA9FJmAPQ=",
+                    "signature": "keyId=\"https://example.com/users/alice#main-key\",algorithm=\"rsa-sha256\",headers=\"(request-target) host date digest\",signature=\"aDqgKj/PditmC94sATQ5xdTpKxJM/LPVJ7cHOoDs0fTSmFcVlQgzzaon9uRVb/ieK/UtLoNxNZ9o8kUVoy3H0mJYOOGhJWJ8301n8HUfz4WitrG4FIy11TTQVcCv42QJnceEp2O8ureHQZ6lonqO2Ww6pW9ZV5zHf1of7Pgo7rszovjTlVDX096WG4VHNzZss/NNUrjpgxuRgXl6ZGbCMgFyAv0vH/g3BD/V3ufz8FoqFYxyXCW4KW+Vw2xjCTEa2k4/iFqWP/QGThmVYluq7uD3zphZ2xzD08g1ZQQAFtVi5w+hPcxVZjOCmiInqy5xXT5goS6FkBXGoXVswyPi5g==\""
+                },
+                "server": {
+                    "REQUEST_URI": "/api/ap-inbox.php",
+                    "REQUEST_METHOD": "POST",
+                    "HTTP_HOST": "mkultra.monster"
+                },
+                "request_actor": null,
+                "body_b64": "eyJAY29udGV4dCI6Imh0dHBzOi8vd3d3LnczLm9yZy9ucy9hY3Rpdml0eXN0cmVhbXMiLCJpZCI6Imh0dHBzOi8vZXhhbXBsZS5jb20vdXNlcnMvYWxpY2Uvc3RhdHVzZXMvMS9hY3Rpdml0eSIsInR5cGUiOiJDcmVhdGUiLCJhY3RvciI6Imh0dHBzOi8vZXhhbXBsZS5jb20vdXNlcnMvYWxpY2UiLCJvYmplY3QiOnsiaWQiOiJodHRwczovL2V4YW1wbGUuY29tL3VzZXJzL2FsaWNlL3N0YXR1c2VzLzEiLCJ0eXBlIjoiTm90ZSIsImF0dHJpYnV0ZWRUbyI6Imh0dHBzOi8vZXhhbXBsZS5jb20vdXNlcnMvYWxpY2UiLCJjb250ZW50IjoiaGkifX0=",
+                "pem": null,
+                "php": {
+                    "ok": false,
+                    "path": null,
+                    "code": 401,
+                    "error": "Date out of range"
+                }
+            },
+            "output": {
+                "ok": false,
+                "path": null,
+                "code": 401,
+                "error": "Date out of range"
+            }
+        },
+        {
+            "id": "missing-digest",
+            "input": {
+                "v": 1,
+                "now": 1793177726,
+                "headers": {
+                    "host": "mkultra.monster",
+                    "date": "Wed, 28 Oct 2026 08:55:24 GMT",
+                    "signature": "keyId=\"https://example.com/users/alice#main-key\",algorithm=\"rsa-sha256\",headers=\"(request-target) host date digest\",signature=\"aDqgKj/PditmC94sATQ5xdTpKxJM/LPVJ7cHOoDs0fTSmFcVlQgzzaon9uRVb/ieK/UtLoNxNZ9o8kUVoy3H0mJYOOGhJWJ8301n8HUfz4WitrG4FIy11TTQVcCv42QJnceEp2O8ureHQZ6lonqO2Ww6pW9ZV5zHf1of7Pgo7rszovjTlVDX096WG4VHNzZss/NNUrjpgxuRgXl6ZGbCMgFyAv0vH/g3BD/V3ufz8FoqFYxyXCW4KW+Vw2xjCTEa2k4/iFqWP/QGThmVYluq7uD3zphZ2xzD08g1ZQQAFtVi5w+hPcxVZjOCmiInqy5xXT5goS6FkBXGoXVswyPi5g==\""
+                },
+                "server": {
+                    "REQUEST_URI": "/api/ap-inbox.php",
+                    "REQUEST_METHOD": "POST",
+                    "HTTP_HOST": "mkultra.monster"
+                },
+                "request_actor": null,
+                "body_b64": "eyJAY29udGV4dCI6Imh0dHBzOi8vd3d3LnczLm9yZy9ucy9hY3Rpdml0eXN0cmVhbXMiLCJpZCI6Imh0dHBzOi8vZXhhbXBsZS5jb20vdXNlcnMvYWxpY2Uvc3RhdHVzZXMvMS9hY3Rpdml0eSIsInR5cGUiOiJDcmVhdGUiLCJhY3RvciI6Imh0dHBzOi8vZXhhbXBsZS5jb20vdXNlcnMvYWxpY2UiLCJvYmplY3QiOnsiaWQiOiJodHRwczovL2V4YW1wbGUuY29tL3VzZXJzL2FsaWNlL3N0YXR1c2VzLzEiLCJ0eXBlIjoiTm90ZSIsImF0dHJpYnV0ZWRUbyI6Imh0dHBzOi8vZXhhbXBsZS5jb20vdXNlcnMvYWxpY2UiLCJjb250ZW50IjoiaGkifX0=",
+                "pem": null,
+                "php": {
+                    "ok": false,
+                    "path": null,
+                    "code": 401,
+                    "error": "Missing Digest, Date, or Signature"
+                }
+            },
+            "output": {
+                "ok": false,
+                "path": null,
+                "code": 401,
+                "error": "Missing Digest, Date, or Signature"
+            }
+        },
+        {
+            "id": "malformed-signature",
+            "input": {
+                "v": 1,
+                "now": 1793177727,
+                "headers": {
+                    "host": "mkultra.monster",
+                    "date": "Wed, 28 Oct 2026 08:55:24 GMT",
+                    "digest": "SHA-256=dBv6ESjEGkMCnfBfRAFulbu98g7/4KwJfLhA9FJmAPQ=",
+                    "signature": "keyId=\"https://example.com/users/alice#main-key\",signature=\"abc\""
+                },
+                "server": {
+                    "REQUEST_URI": "/api/ap-inbox.php",
+                    "REQUEST_METHOD": "POST",
+                    "HTTP_HOST": "mkultra.monster"
+                },
+                "request_actor": null,
+                "body_b64": "eyJAY29udGV4dCI6Imh0dHBzOi8vd3d3LnczLm9yZy9ucy9hY3Rpdml0eXN0cmVhbXMiLCJpZCI6Imh0dHBzOi8vZXhhbXBsZS5jb20vdXNlcnMvYWxpY2Uvc3RhdHVzZXMvMS9hY3Rpdml0eSIsInR5cGUiOiJDcmVhdGUiLCJhY3RvciI6Imh0dHBzOi8vZXhhbXBsZS5jb20vdXNlcnMvYWxpY2UiLCJvYmplY3QiOnsiaWQiOiJodHRwczovL2V4YW1wbGUuY29tL3VzZXJzL2FsaWNlL3N0YXR1c2VzLzEiLCJ0eXBlIjoiTm90ZSIsImF0dHJpYnV0ZWRUbyI6Imh0dHBzOi8vZXhhbXBsZS5jb20vdXNlcnMvYWxpY2UiLCJjb250ZW50IjoiaGkifX0=",
+                "pem": null,
+                "php": {
+                    "ok": false,
+                    "path": null,
+                    "code": 401,
+                    "error": "Malformed Signature"
+                }
+            },
+            "output": {
+                "ok": false,
+                "path": null,
+                "code": 401,
+                "error": "Malformed Signature"
+            }
+        },
+        {
+            "id": "unsupported-algorithm",
+            "input": {
+                "v": 1,
+                "now": 1793177727,
+                "headers": {
+                    "host": "mkultra.monster",
+                    "date": "Wed, 28 Oct 2026 08:55:24 GMT",
+                    "digest": "SHA-256=dBv6ESjEGkMCnfBfRAFulbu98g7/4KwJfLhA9FJmAPQ=",
+                    "signature": "keyId=\"https://example.com/users/alice#main-key\",algorithm=\"ed25519\",headers=\"(request-target) host date digest\",signature=\"aDqgKj/PditmC94sATQ5xdTpKxJM/LPVJ7cHOoDs0fTSmFcVlQgzzaon9uRVb/ieK/UtLoNxNZ9o8kUVoy3H0mJYOOGhJWJ8301n8HUfz4WitrG4FIy11TTQVcCv42QJnceEp2O8ureHQZ6lonqO2Ww6pW9ZV5zHf1of7Pgo7rszovjTlVDX096WG4VHNzZss/NNUrjpgxuRgXl6ZGbCMgFyAv0vH/g3BD/V3ufz8FoqFYxyXCW4KW+Vw2xjCTEa2k4/iFqWP/QGThmVYluq7uD3zphZ2xzD08g1ZQQAFtVi5w+hPcxVZjOCmiInqy5xXT5goS6FkBXGoXVswyPi5g==\""
+                },
+                "server": {
+                    "REQUEST_URI": "/api/ap-inbox.php",
+                    "REQUEST_METHOD": "POST",
+                    "HTTP_HOST": "mkultra.monster"
+                },
+                "request_actor": null,
+                "body_b64": "eyJAY29udGV4dCI6Imh0dHBzOi8vd3d3LnczLm9yZy9ucy9hY3Rpdml0eXN0cmVhbXMiLCJpZCI6Imh0dHBzOi8vZXhhbXBsZS5jb20vdXNlcnMvYWxpY2Uvc3RhdHVzZXMvMS9hY3Rpdml0eSIsInR5cGUiOiJDcmVhdGUiLCJhY3RvciI6Imh0dHBzOi8vZXhhbXBsZS5jb20vdXNlcnMvYWxpY2UiLCJvYmplY3QiOnsiaWQiOiJodHRwczovL2V4YW1wbGUuY29tL3VzZXJzL2FsaWNlL3N0YXR1c2VzLzEiLCJ0eXBlIjoiTm90ZSIsImF0dHJpYnV0ZWRUbyI6Imh0dHBzOi8vZXhhbXBsZS5jb20vdXNlcnMvYWxpY2UiLCJjb250ZW50IjoiaGkifX0=",
+                "pem": null,
+                "php": {
+                    "ok": false,
+                    "path": null,
+                    "code": 401,
+                    "error": "Unsupported signature algorithm"
+                }
+            },
+            "output": {
+                "ok": false,
+                "path": null,
+                "code": 401,
+                "error": "Unsupported signature algorithm"
+            }
+        },
+        {
+            "id": "signed-header-missing",
+            "input": {
+                "v": 1,
+                "now": 1793177727,
+                "headers": {
+                    "host": "mkultra.monster",
+                    "date": "Wed, 28 Oct 2026 08:55:24 GMT",
+                    "digest": "SHA-256=dBv6ESjEGkMCnfBfRAFulbu98g7/4KwJfLhA9FJmAPQ=",
+                    "signature": "keyId=\"https://example.com/users/alice#main-key\",algorithm=\"rsa-sha256\",headers=\"(request-target) host date digest accept\",signature=\"jRLGfsQ5fdnECA8thmM3R/m2hCYGEKO652o/fv81K5Sdyhgwqc2FnIf7zGQTH2Nu0KzWtqvXf1kcOjDmXRdSKyKF610csCDN4elTfZp0rqWfpgqFqQuEh+TbMkBL+ynA0NzRtg4JhLCIKtH8fjXE+0vDj0aTLZEfhoqPD3NkQenVCiSMa69lrYSjMP1C8J5RjlrhnDJIwd9Z9oQIGT2de+wdjH/TZyeF4lJ+F9xFNJ69Q4vdvmEd31xrmrrj5XCG83l4dlTk/wBBrNqa1IQ0+sEd0aFbn5sQ+YNcA2cRMQ1jz/1lpHD21qqv/PbmVujmiXBwW9KGWpoUjl3ZG7o4xg==\""
+                },
+                "server": {
+                    "REQUEST_URI": "/api/ap-inbox.php",
+                    "REQUEST_METHOD": "POST",
+                    "HTTP_HOST": "mkultra.monster"
+                },
+                "request_actor": null,
+                "body_b64": "eyJAY29udGV4dCI6Imh0dHBzOi8vd3d3LnczLm9yZy9ucy9hY3Rpdml0eXN0cmVhbXMiLCJpZCI6Imh0dHBzOi8vZXhhbXBsZS5jb20vdXNlcnMvYWxpY2Uvc3RhdHVzZXMvMS9hY3Rpdml0eSIsInR5cGUiOiJDcmVhdGUiLCJhY3RvciI6Imh0dHBzOi8vZXhhbXBsZS5jb20vdXNlcnMvYWxpY2UiLCJvYmplY3QiOnsiaWQiOiJodHRwczovL2V4YW1wbGUuY29tL3VzZXJzL2FsaWNlL3N0YXR1c2VzLzEiLCJ0eXBlIjoiTm90ZSIsImF0dHJpYnV0ZWRUbyI6Imh0dHBzOi8vZXhhbXBsZS5jb20vdXNlcnMvYWxpY2UiLCJjb250ZW50IjoiaGkifX0=",
+                "pem": "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA1LWo9qpvR2YV2A8n60TC\nUNdvp1xa9AzDzvih6D69Uy9OWdAPOveiN3VelLchdtLtaFmAqGSIsRcmwal89Iz5\nJKFNq8VQZIAgSfu5zZktat+4aIlzWqWY8BSupPanenI8GaxJJCt2E8DqyCAi3joL\nTjnKwvT2OliJBnRl54cbng8eMLOtntJZ6JrHvsQnfWc+/KdQbGW8klYI14hpJ+VS\nhEPxE2OXckwVdJk/m2HNiYcHrC9xWh9Wck3ukyGSNLoyaOuvOKIClSEQfp8fHwI9\nZWRr0BRJFGxjsd1BWK6lf2qTqlo5HVvt9XynbWzUBd+cctPMz6+n84orHLA3/Elh\nIwIDAQAB\n-----END PUBLIC KEY-----\n",
+                "php": {
+                    "ok": false,
+                    "path": null,
+                    "code": 401,
+                    "error": "Invalid signature"
+                }
+            },
+            "output": {
+                "ok": false,
+                "path": null,
+                "code": 401,
+                "error": "Invalid signature"
+            }
+        },
+        {
+            "id": "extra-signed-header",
+            "input": {
+                "v": 1,
+                "now": 1793177727,
+                "headers": {
+                    "host": "mkultra.monster",
+                    "date": "Wed, 28 Oct 2026 08:55:24 GMT",
+                    "digest": "SHA-256=dBv6ESjEGkMCnfBfRAFulbu98g7/4KwJfLhA9FJmAPQ=",
+                    "accept": "application/activity+json",
+                    "signature": "keyId=\"https://example.com/users/alice#main-key\",algorithm=\"rsa-sha256\",headers=\"(request-target) host accept date digest\",signature=\"Yo5biIiyHyEUm0vDzTzUuSWDTRjdi+2ZjH89kEBiOh34R0WrMbLBBqi7xjpA8/wLufXeKci0WQMOqthtQMKXxLRBk92kRl5sHITcJoC8kjC+wENgAOzuY2/uZQt+CbMjL04R0TpZ5apL2WO+B5S9PsVhmc1XEmSuv8YoUbiPkHMfDwSeok6FapZjSiuLLmuTUArPk/u/5apLgTSoYa8CFOkSDDZnaFcIY7I4etrAxwOBBeQF4eKfG8+1U899qVoL6sNSFMRhHwuhEfyUzt3ePRp3AMJeEc7uu+sN6UHS4VP12LGi3HrCMp9/sWdOqokDKf0iAOJQgFucQvdgy7MipQ==\""
+                },
+                "server": {
+                    "REQUEST_URI": "/api/ap-inbox.php",
+                    "REQUEST_METHOD": "POST",
+                    "HTTP_HOST": "mkultra.monster"
+                },
+                "request_actor": null,
+                "body_b64": "eyJAY29udGV4dCI6Imh0dHBzOi8vd3d3LnczLm9yZy9ucy9hY3Rpdml0eXN0cmVhbXMiLCJpZCI6Imh0dHBzOi8vZXhhbXBsZS5jb20vdXNlcnMvYWxpY2Uvc3RhdHVzZXMvMS9hY3Rpdml0eSIsInR5cGUiOiJDcmVhdGUiLCJhY3RvciI6Imh0dHBzOi8vZXhhbXBsZS5jb20vdXNlcnMvYWxpY2UiLCJvYmplY3QiOnsiaWQiOiJodHRwczovL2V4YW1wbGUuY29tL3VzZXJzL2FsaWNlL3N0YXR1c2VzLzEiLCJ0eXBlIjoiTm90ZSIsImF0dHJpYnV0ZWRUbyI6Imh0dHBzOi8vZXhhbXBsZS5jb20vdXNlcnMvYWxpY2UiLCJjb250ZW50IjoiaGkifX0=",
+                "pem": "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA1LWo9qpvR2YV2A8n60TC\nUNdvp1xa9AzDzvih6D69Uy9OWdAPOveiN3VelLchdtLtaFmAqGSIsRcmwal89Iz5\nJKFNq8VQZIAgSfu5zZktat+4aIlzWqWY8BSupPanenI8GaxJJCt2E8DqyCAi3joL\nTjnKwvT2OliJBnRl54cbng8eMLOtntJZ6JrHvsQnfWc+/KdQbGW8klYI14hpJ+VS\nhEPxE2OXckwVdJk/m2HNiYcHrC9xWh9Wck3ukyGSNLoyaOuvOKIClSEQfp8fHwI9\nZWRr0BRJFGxjsd1BWK6lf2qTqlo5HVvt9XynbWzUBd+cctPMz6+n84orHLA3/Elh\nIwIDAQAB\n-----END PUBLIC KEY-----\n",
+                "php": {
+                    "ok": true,
+                    "path": "/inbox",
+                    "code": 200,
+                    "error": null
+                }
+            },
+            "output": {
+                "ok": true,
+                "path": "/inbox",
+                "code": 200,
+                "error": null
+            }
+        },
+        {
+            "id": "no-key",
+            "input": {
+                "v": 1,
+                "now": 1793177727,
+                "headers": {
+                    "host": "mkultra.monster",
+                    "date": "Wed, 28 Oct 2026 08:55:24 GMT",
+                    "digest": "SHA-256=dBv6ESjEGkMCnfBfRAFulbu98g7/4KwJfLhA9FJmAPQ=",
+                    "signature": "keyId=\"http://example.com/users/alice#main-key\",algorithm=\"rsa-sha256\",headers=\"(request-target) host date digest\",signature=\"aDqgKj/PditmC94sATQ5xdTpKxJM/LPVJ7cHOoDs0fTSmFcVlQgzzaon9uRVb/ieK/UtLoNxNZ9o8kUVoy3H0mJYOOGhJWJ8301n8HUfz4WitrG4FIy11TTQVcCv42QJnceEp2O8ureHQZ6lonqO2Ww6pW9ZV5zHf1of7Pgo7rszovjTlVDX096WG4VHNzZss/NNUrjpgxuRgXl6ZGbCMgFyAv0vH/g3BD/V3ufz8FoqFYxyXCW4KW+Vw2xjCTEa2k4/iFqWP/QGThmVYluq7uD3zphZ2xzD08g1ZQQAFtVi5w+hPcxVZjOCmiInqy5xXT5goS6FkBXGoXVswyPi5g==\""
+                },
+                "server": {
+                    "REQUEST_URI": "/api/ap-inbox.php",
+                    "REQUEST_METHOD": "POST",
+                    "HTTP_HOST": "mkultra.monster"
+                },
+                "request_actor": null,
+                "body_b64": "eyJAY29udGV4dCI6Imh0dHBzOi8vd3d3LnczLm9yZy9ucy9hY3Rpdml0eXN0cmVhbXMiLCJpZCI6Imh0dHBzOi8vZXhhbXBsZS5jb20vdXNlcnMvYWxpY2Uvc3RhdHVzZXMvMS9hY3Rpdml0eSIsInR5cGUiOiJDcmVhdGUiLCJhY3RvciI6Imh0dHBzOi8vZXhhbXBsZS5jb20vdXNlcnMvYWxpY2UiLCJvYmplY3QiOnsiaWQiOiJodHRwczovL2V4YW1wbGUuY29tL3VzZXJzL2FsaWNlL3N0YXR1c2VzLzEiLCJ0eXBlIjoiTm90ZSIsImF0dHJpYnV0ZWRUbyI6Imh0dHBzOi8vZXhhbXBsZS5jb20vdXNlcnMvYWxpY2UiLCJjb250ZW50IjoiaGkifX0=",
+                "pem": null,
+                "php": {
+                    "ok": false,
+                    "path": null,
+                    "code": 401,
+                    "error": "Unable to fetch key"
+                }
+            },
+            "output": {
+                "ok": false,
+                "path": null,
+                "code": 401,
+                "error": "Unable to fetch key"
+            }
+        },
+        {
+            "id": "legacy-1024-bit",
+            "input": {
+                "v": 1,
+                "now": 1793177727,
+                "headers": {
+                    "host": "mkultra.monster",
+                    "date": "Wed, 28 Oct 2026 08:55:24 GMT",
+                    "digest": "SHA-256=dBv6ESjEGkMCnfBfRAFulbu98g7/4KwJfLhA9FJmAPQ=",
+                    "signature": "keyId=\"https://example.com/users/alice#main-key\",algorithm=\"rsa-sha256\",headers=\"(request-target) host date digest\",signature=\"nr8Ps522kZj7oNgHbTxwSQMObSok+l2yqNiLQxfstMvSzaVXqgnhPNoSGPvlaKFZMAxmQN/A5jIVwmQjpLva3QsgKFMcpNP+D9Z9fPlvUarGlF0mYjyNMNauqeyUxjrsm9SlWj4bimSR0Sj0FwS5oXpygTdhywef29voIeJ2TSY=\""
+                },
+                "server": {
+                    "REQUEST_URI": "/api/ap-inbox.php",
+                    "REQUEST_METHOD": "POST",
+                    "HTTP_HOST": "mkultra.monster"
+                },
+                "request_actor": null,
+                "body_b64": "eyJAY29udGV4dCI6Imh0dHBzOi8vd3d3LnczLm9yZy9ucy9hY3Rpdml0eXN0cmVhbXMiLCJpZCI6Imh0dHBzOi8vZXhhbXBsZS5jb20vdXNlcnMvYWxpY2Uvc3RhdHVzZXMvMS9hY3Rpdml0eSIsInR5cGUiOiJDcmVhdGUiLCJhY3RvciI6Imh0dHBzOi8vZXhhbXBsZS5jb20vdXNlcnMvYWxpY2UiLCJvYmplY3QiOnsiaWQiOiJodHRwczovL2V4YW1wbGUuY29tL3VzZXJzL2FsaWNlL3N0YXR1c2VzLzEiLCJ0eXBlIjoiTm90ZSIsImF0dHJpYnV0ZWRUbyI6Imh0dHBzOi8vZXhhbXBsZS5jb20vdXNlcnMvYWxpY2UiLCJjb250ZW50IjoiaGkifX0=",
+                "pem": "-----BEGIN PUBLIC KEY-----\nMIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQC0a/74U3Fu47bjcnF32n9WSLV+\n0DuAhzILAGV/GA/iq5l7gxU0kQhvJtqqCjnwlaxiu+yyMNm3qAIiAQHqqRDdAF8d\njeVtrLgQRoumbunqYQk8CINu3zEMvSsV1Rxm7tWOu5Vkio4iTkaNf2wyg1UkudYy\niWgXUWi5Wp82UGBhewIDAQAB\n-----END PUBLIC KEY-----\n",
+                "php": {
+                    "ok": true,
+                    "path": "/inbox",
+                    "code": 200,
+                    "error": null
+                }
+            },
+            "output": {
+                "ok": true,
+                "path": "/inbox",
+                "code": 200,
+                "error": null
+            }
+        },
+        {
+            "id": "rfc9421-content-digest",
+            "input": {
+                "v": 1,
+                "now": 1793177727,
+                "headers": {
+                    "host": "mkultra.monster:443",
+                    "date": "Wed, 28 Oct 2026 08:55:24 GMT",
+                    "content-digest": "sha-256=:dBv6ESjEGkMCnfBfRAFulbu98g7/4KwJfLhA9FJmAPQ=:",
+                    "signature-input": "sig1=(\"@method\" \"@target-uri\" \"content-digest\");created=1793177724;keyid=\"https://example.com/users/alice#main-key\";alg=\"rsa-v1_5-sha256\"",
+                    "signature": "sig1=:f6CwCkRjaAyOfHr7LmbP2S9uYUee8T31kOpI8Vj3+gEB+QtAmhnEjQ7XF6c2WWV0l+GwuNuBzjr01bVXMOWJ8ZAWEItliwrN9ylViuq4sO3F7UYs53u0p/DDZL4T59b4h2tIbHfVpChWkB8xekF5G9HkCaU/7ekw2pij0K/FXA0R5I8uedtzdkj9hAKOzTNC9OSgQAMTdYGv36jWPLOtyP6SmPD5F3Zq3iFIucNckmxXEpaDO47nGGtEDQ5HTHq3TJzouco7WJPk8j9VGgJskvNNv6wInRC+FNqRxCWgQbRGqS9iwG7dXu6m/f5GLrgUEHimuYPh6X2M1IYe8w7I0Q==:"
+                },
+                "server": {
+                    "REQUEST_URI": "/api/ap-inbox.php",
+                    "REQUEST_METHOD": "POST",
+                    "HTTP_HOST": "mkultra.monster:443"
+                },
+                "request_actor": null,
+                "body_b64": "eyJAY29udGV4dCI6Imh0dHBzOi8vd3d3LnczLm9yZy9ucy9hY3Rpdml0eXN0cmVhbXMiLCJpZCI6Imh0dHBzOi8vZXhhbXBsZS5jb20vdXNlcnMvYWxpY2Uvc3RhdHVzZXMvMS9hY3Rpdml0eSIsInR5cGUiOiJDcmVhdGUiLCJhY3RvciI6Imh0dHBzOi8vZXhhbXBsZS5jb20vdXNlcnMvYWxpY2UiLCJvYmplY3QiOnsiaWQiOiJodHRwczovL2V4YW1wbGUuY29tL3VzZXJzL2FsaWNlL3N0YXR1c2VzLzEiLCJ0eXBlIjoiTm90ZSIsImF0dHJpYnV0ZWRUbyI6Imh0dHBzOi8vZXhhbXBsZS5jb20vdXNlcnMvYWxpY2UiLCJjb250ZW50IjoiaGkifX0=",
+                "pem": "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA1LWo9qpvR2YV2A8n60TC\nUNdvp1xa9AzDzvih6D69Uy9OWdAPOveiN3VelLchdtLtaFmAqGSIsRcmwal89Iz5\nJKFNq8VQZIAgSfu5zZktat+4aIlzWqWY8BSupPanenI8GaxJJCt2E8DqyCAi3joL\nTjnKwvT2OliJBnRl54cbng8eMLOtntJZ6JrHvsQnfWc+/KdQbGW8klYI14hpJ+VS\nhEPxE2OXckwVdJk/m2HNiYcHrC9xWh9Wck3ukyGSNLoyaOuvOKIClSEQfp8fHwI9\nZWRr0BRJFGxjsd1BWK6lf2qTqlo5HVvt9XynbWzUBd+cctPMz6+n84orHLA3/Elh\nIwIDAQAB\n-----END PUBLIC KEY-----\n",
+                "php": {
+                    "ok": true,
+                    "path": "/inbox",
+                    "code": 200,
+                    "error": null
+                }
+            },
+            "output": {
+                "ok": true,
+                "path": "/inbox",
+                "code": 200,
+                "error": null
+            }
+        },
+        {
+            "id": "rfc9421-wrong-key",
+            "input": {
+                "v": 1,
+                "now": 1793177727,
+                "headers": {
+                    "host": "mkultra.monster:443",
+                    "date": "Wed, 28 Oct 2026 08:55:24 GMT",
+                    "content-digest": "sha-256=:dBv6ESjEGkMCnfBfRAFulbu98g7/4KwJfLhA9FJmAPQ=:",
+                    "signature-input": "sig1=(\"@method\" \"@target-uri\" \"content-digest\");created=1793177724;keyid=\"https://example.com/users/alice#main-key\";alg=\"rsa-v1_5-sha256\"",
+                    "signature": "sig1=:Ha5mR8PsfVmUEB+cy9rNuj1B65FcUNJ2HzYfllGX93lou7u5Ln/K41oltikswsrHYBeZJoOk0DEQsqIyn13/+SfOZaeOWCt0TVxwocZJ6IkJQ+iPTZqDBqa5WAvxfbv9oXwUKfpGjyefJAcq4dPxFMDtEPBCXpS824QGS0PdznjLcAAXGtLaT8QaqNd5UYZUypiqKjDERBmlS9XINGlYTp+NQ3JlQ49x2/yZjXzskLagRho3l/PJ2XeYXWNMrbEl8xp/9gcjxOQKt2Tvvv6CT86w4q4/MrEP/sO3xnoHPwJ77VOAD/eCyoLuspmN7pXsyg533xq/Q57q4GhggvlQTQ==:"
+                },
+                "server": {
+                    "REQUEST_URI": "/api/ap-inbox.php",
+                    "REQUEST_METHOD": "POST",
+                    "HTTP_HOST": "mkultra.monster:443"
+                },
+                "request_actor": null,
+                "body_b64": "eyJAY29udGV4dCI6Imh0dHBzOi8vd3d3LnczLm9yZy9ucy9hY3Rpdml0eXN0cmVhbXMiLCJpZCI6Imh0dHBzOi8vZXhhbXBsZS5jb20vdXNlcnMvYWxpY2Uvc3RhdHVzZXMvMS9hY3Rpdml0eSIsInR5cGUiOiJDcmVhdGUiLCJhY3RvciI6Imh0dHBzOi8vZXhhbXBsZS5jb20vdXNlcnMvYWxpY2UiLCJvYmplY3QiOnsiaWQiOiJodHRwczovL2V4YW1wbGUuY29tL3VzZXJzL2FsaWNlL3N0YXR1c2VzLzEiLCJ0eXBlIjoiTm90ZSIsImF0dHJpYnV0ZWRUbyI6Imh0dHBzOi8vZXhhbXBsZS5jb20vdXNlcnMvYWxpY2UiLCJjb250ZW50IjoiaGkifX0=",
+                "pem": "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA1LWo9qpvR2YV2A8n60TC\nUNdvp1xa9AzDzvih6D69Uy9OWdAPOveiN3VelLchdtLtaFmAqGSIsRcmwal89Iz5\nJKFNq8VQZIAgSfu5zZktat+4aIlzWqWY8BSupPanenI8GaxJJCt2E8DqyCAi3joL\nTjnKwvT2OliJBnRl54cbng8eMLOtntJZ6JrHvsQnfWc+/KdQbGW8klYI14hpJ+VS\nhEPxE2OXckwVdJk/m2HNiYcHrC9xWh9Wck3ukyGSNLoyaOuvOKIClSEQfp8fHwI9\nZWRr0BRJFGxjsd1BWK6lf2qTqlo5HVvt9XynbWzUBd+cctPMz6+n84orHLA3/Elh\nIwIDAQAB\n-----END PUBLIC KEY-----\n",
+                "php": {
+                    "ok": false,
+                    "path": null,
+                    "code": 401,
+                    "error": "Invalid signature"
+                }
+            },
+            "output": {
+                "ok": false,
+                "path": null,
+                "code": 401,
+                "error": "Invalid signature"
+            }
+        },
+        {
+            "id": "rfc9421-label-missing",
+            "input": {
+                "v": 1,
+                "now": 1793177727,
+                "headers": {
+                    "host": "mkultra.monster:443",
+                    "date": "Wed, 28 Oct 2026 08:55:24 GMT",
+                    "content-digest": "sha-256=:dBv6ESjEGkMCnfBfRAFulbu98g7/4KwJfLhA9FJmAPQ=:",
+                    "signature-input": "sig1=(\"@method\" \"@target-uri\" \"content-digest\");created=1793177724;keyid=\"https://example.com/users/alice#main-key\";alg=\"rsa-v1_5-sha256\"",
+                    "signature": "sig2=:f6CwCkRjaAyOfHr7LmbP2S9uYUee8T31kOpI8Vj3+gEB+QtAmhnEjQ7XF6c2WWV0l+GwuNuBzjr01bVXMOWJ8ZAWEItliwrN9ylViuq4sO3F7UYs53u0p/DDZL4T59b4h2tIbHfVpChWkB8xekF5G9HkCaU/7ekw2pij0K/FXA0R5I8uedtzdkj9hAKOzTNC9OSgQAMTdYGv36jWPLOtyP6SmPD5F3Zq3iFIucNckmxXEpaDO47nGGtEDQ5HTHq3TJzouco7WJPk8j9VGgJskvNNv6wInRC+FNqRxCWgQbRGqS9iwG7dXu6m/f5GLrgUEHimuYPh6X2M1IYe8w7I0Q==:"
+                },
+                "server": {
+                    "REQUEST_URI": "/api/ap-inbox.php",
+                    "REQUEST_METHOD": "POST",
+                    "HTTP_HOST": "mkultra.monster:443"
+                },
+                "request_actor": null,
+                "body_b64": "eyJAY29udGV4dCI6Imh0dHBzOi8vd3d3LnczLm9yZy9ucy9hY3Rpdml0eXN0cmVhbXMiLCJpZCI6Imh0dHBzOi8vZXhhbXBsZS5jb20vdXNlcnMvYWxpY2Uvc3RhdHVzZXMvMS9hY3Rpdml0eSIsInR5cGUiOiJDcmVhdGUiLCJhY3RvciI6Imh0dHBzOi8vZXhhbXBsZS5jb20vdXNlcnMvYWxpY2UiLCJvYmplY3QiOnsiaWQiOiJodHRwczovL2V4YW1wbGUuY29tL3VzZXJzL2FsaWNlL3N0YXR1c2VzLzEiLCJ0eXBlIjoiTm90ZSIsImF0dHJpYnV0ZWRUbyI6Imh0dHBzOi8vZXhhbXBsZS5jb20vdXNlcnMvYWxpY2UiLCJjb250ZW50IjoiaGkifX0=",
+                "pem": null,
+                "php": {
+                    "ok": false,
+                    "path": null,
+                    "code": 401,
+                    "error": "Malformed Signature"
+                }
+            },
+            "output": {
+                "ok": false,
+                "path": null,
+                "code": 401,
+                "error": "Malformed Signature"
+            }
+        },
+        {
+            "id": "rfc9421-stale-created",
+            "input": {
+                "v": 1,
+                "now": 1793177727,
+                "headers": {
+                    "host": "mkultra.monster:443",
+                    "date": "Wed, 28 Oct 2026 08:55:24 GMT",
+                    "content-digest": "sha-256=:dBv6ESjEGkMCnfBfRAFulbu98g7/4KwJfLhA9FJmAPQ=:",
+                    "signature-input": "sig1=(\"@method\" \"@target-uri\" \"content-digest\");created=1793170424;keyid=\"https://example.com/users/alice#main-key\"",
+                    "signature": "sig1=:f6CwCkRjaAyOfHr7LmbP2S9uYUee8T31kOpI8Vj3+gEB+QtAmhnEjQ7XF6c2WWV0l+GwuNuBzjr01bVXMOWJ8ZAWEItliwrN9ylViuq4sO3F7UYs53u0p/DDZL4T59b4h2tIbHfVpChWkB8xekF5G9HkCaU/7ekw2pij0K/FXA0R5I8uedtzdkj9hAKOzTNC9OSgQAMTdYGv36jWPLOtyP6SmPD5F3Zq3iFIucNckmxXEpaDO47nGGtEDQ5HTHq3TJzouco7WJPk8j9VGgJskvNNv6wInRC+FNqRxCWgQbRGqS9iwG7dXu6m/f5GLrgUEHimuYPh6X2M1IYe8w7I0Q==:"
+                },
+                "server": {
+                    "REQUEST_URI": "/api/ap-inbox.php",
+                    "REQUEST_METHOD": "POST",
+                    "HTTP_HOST": "mkultra.monster:443"
+                },
+                "request_actor": null,
+                "body_b64": "eyJAY29udGV4dCI6Imh0dHBzOi8vd3d3LnczLm9yZy9ucy9hY3Rpdml0eXN0cmVhbXMiLCJpZCI6Imh0dHBzOi8vZXhhbXBsZS5jb20vdXNlcnMvYWxpY2Uvc3RhdHVzZXMvMS9hY3Rpdml0eSIsInR5cGUiOiJDcmVhdGUiLCJhY3RvciI6Imh0dHBzOi8vZXhhbXBsZS5jb20vdXNlcnMvYWxpY2UiLCJvYmplY3QiOnsiaWQiOiJodHRwczovL2V4YW1wbGUuY29tL3VzZXJzL2FsaWNlL3N0YXR1c2VzLzEiLCJ0eXBlIjoiTm90ZSIsImF0dHJpYnV0ZWRUbyI6Imh0dHBzOi8vZXhhbXBsZS5jb20vdXNlcnMvYWxpY2UiLCJjb250ZW50IjoiaGkifX0=",
+                "pem": null,
+                "php": {
+                    "ok": false,
+                    "path": null,
+                    "code": 401,
+                    "error": "Signature created/expires out of range"
+                }
+            },
+            "output": {
+                "ok": false,
+                "path": null,
+                "code": 401,
+                "error": "Signature created/expires out of range"
+            }
+        },
+        {
+            "id": "rfc9421-digest-mismatch",
+            "input": {
+                "v": 1,
+                "now": 1793177727,
+                "headers": {
+                    "host": "mkultra.monster:443",
+                    "date": "Wed, 28 Oct 2026 08:55:24 GMT",
+                    "content-digest": "sha-256=:2SmKENGwc1g33EvYXaxkGw887yekfl1TpU8vP1svz/o=:",
+                    "signature-input": "sig1=(\"@method\" \"@target-uri\" \"content-digest\");created=1793177724;keyid=\"https://example.com/users/alice#main-key\";alg=\"rsa-v1_5-sha256\"",
+                    "signature": "sig1=:f6CwCkRjaAyOfHr7LmbP2S9uYUee8T31kOpI8Vj3+gEB+QtAmhnEjQ7XF6c2WWV0l+GwuNuBzjr01bVXMOWJ8ZAWEItliwrN9ylViuq4sO3F7UYs53u0p/DDZL4T59b4h2tIbHfVpChWkB8xekF5G9HkCaU/7ekw2pij0K/FXA0R5I8uedtzdkj9hAKOzTNC9OSgQAMTdYGv36jWPLOtyP6SmPD5F3Zq3iFIucNckmxXEpaDO47nGGtEDQ5HTHq3TJzouco7WJPk8j9VGgJskvNNv6wInRC+FNqRxCWgQbRGqS9iwG7dXu6m/f5GLrgUEHimuYPh6X2M1IYe8w7I0Q==:"
+                },
+                "server": {
+                    "REQUEST_URI": "/api/ap-inbox.php",
+                    "REQUEST_METHOD": "POST",
+                    "HTTP_HOST": "mkultra.monster:443"
+                },
+                "request_actor": null,
+                "body_b64": "eyJAY29udGV4dCI6Imh0dHBzOi8vd3d3LnczLm9yZy9ucy9hY3Rpdml0eXN0cmVhbXMiLCJpZCI6Imh0dHBzOi8vZXhhbXBsZS5jb20vdXNlcnMvYWxpY2Uvc3RhdHVzZXMvMS9hY3Rpdml0eSIsInR5cGUiOiJDcmVhdGUiLCJhY3RvciI6Imh0dHBzOi8vZXhhbXBsZS5jb20vdXNlcnMvYWxpY2UiLCJvYmplY3QiOnsiaWQiOiJodHRwczovL2V4YW1wbGUuY29tL3VzZXJzL2FsaWNlL3N0YXR1c2VzLzEiLCJ0eXBlIjoiTm90ZSIsImF0dHJpYnV0ZWRUbyI6Imh0dHBzOi8vZXhhbXBsZS5jb20vdXNlcnMvYWxpY2UiLCJjb250ZW50IjoiaGkifX0=",
+                "pem": null,
+                "php": {
+                    "ok": false,
+                    "path": null,
+                    "code": 401,
+                    "error": "Digest mismatch"
+                }
+            },
+            "output": {
+                "ok": false,
+                "path": null,
+                "code": 401,
+                "error": "Digest mismatch"
+            }
+        }
+    ]
+}

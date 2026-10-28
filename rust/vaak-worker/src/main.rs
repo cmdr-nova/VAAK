@@ -95,6 +95,7 @@ mod cleanup;
 mod fanout_host;
 mod follow_fallback;
 mod inbox_origin;
+mod inbox_sig_shadow;
 mod parity_replay;
 
 use std::net::SocketAddr;

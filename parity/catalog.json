@@ -108,6 +108,12 @@
       "php": {"script": "parity/php/inbox-origin.php", "args": []}
     },
     {
+      "id": "inbox-sig-verify",
+      "area": "ActivityPub inbox",
+      "summary": "Inbox HTTP signature verdicts for the cutover F1 shadow. Draft-cavage rsa-sha256 and hs2019, RFC 9421, port-qualified and forwarded hosts, personal inbox paths, charset-stripped Content-Type, legacy 1024-bit keys, and each early refusal message. Keys are generated per run; no network and no database.",
+      "php": {"script": "parity/php/inbox-sig-verify.php", "args": []}
+    },
+    {
       "id": "wafrn-crosspost",
       "area": "Timelines",
       "summary": "Wafrn ActivityPub/Bluesky post identity, alsoKnownAs DID extraction, text ask cards, linkage dedupe, and the 10 minute text fallback. Fixture api/fixtures/wafrn-crosspost.json. Both sides call the pure planner and do not open a database.",

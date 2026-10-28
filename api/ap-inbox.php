@@ -9,6 +9,8 @@
 declare(strict_types=1);
 
 const AP_INBOX_MAX_BODY = 262144;          // 256 KiB
+const AP_INBOX_SIG_SHADOW_MAX_BODY = 65536; // larger bodies are not copied to the Rust shadow check
+const AP_INBOX_SIG_SHADOW_QUEUE_CAP = 200;
 const AP_INBOX_DATE_SKEW = 3600;           // ±1 hour, same clock-skew margin Mastodon uses
 const AP_INBOX_RATE_MAX = 600;             // requests / window / IP (normal peers; 120 starved active instances)
 /** Accepted ActivityPub relays forward a firehose — low caps cause 429 retry-storms. */
@@ -734,6 +736,7 @@ function ap_verify_http_signature(string $headersList, string $body, string $sig
 function ap_inbox_select(string $raw): ?array
 {
     $verified = ap_inbox_try_verify($raw);
+    ap_inbox_sig_shadow_record($raw, $verified);
     if ($verified !== null) {
         $json = json_decode($raw, true);
         if (!is_array($json)) {
@@ -773,6 +776,106 @@ function ap_inbox_select(string $raw): ?array
     ];
 }
 
+/**
+ * Everything the Rust shadow verifier needs to repeat this request's
+ * signature check: the headers ap_header() would read, the request values the
+ * path and host candidates come from, the body, the key PHP verified with,
+ * and PHP's verdict. Cookies and Authorization are left out.
+ *
+ * @param array{sig:array<string,mixed>,path:string}|null $verified
+ * @return array<string,mixed>|null null when the body is too big to copy
+ */
+function ap_inbox_sig_shadow_payload(string $raw, ?array $verified): ?array
+{
+    if (strlen($raw) > AP_INBOX_SIG_SHADOW_MAX_BODY) {
+        return null;
+    }
+    $headers = [];
+    $put = static function (string $name, $value) use (&$headers): void {
+        $name = strtolower($name);
+        if (in_array($name, ['cookie', 'authorization', 'proxy-authorization'], true) || isset($headers[$name])) {
+            return;
+        }
+        if (is_string($value) && trim($value) !== '') {
+            $headers[$name] = trim($value);
+        }
+    };
+    if (function_exists('getallheaders')) {
+        foreach (getallheaders() ?: [] as $k => $v) {
+            $put((string) $k, $v);
+        }
+    }
+    $put('content-type', $_SERVER['CONTENT_TYPE'] ?? '');
+    $put('content-length', $_SERVER['CONTENT_LENGTH'] ?? '');
+    foreach ($_SERVER as $k => $v) {
+        if (is_string($k) && str_starts_with($k, 'HTTP_')) {
+            $put(str_replace('_', '-', substr($k, 5)), $v);
+        }
+    }
+    $server = [];
+    $env = getenv('AP_ORIGINAL_PATH');
+    if (is_string($env) && $env !== '') {
+        $server['AP_ORIGINAL_PATH'] = $env;
+    }
+    foreach ([
+        'HTTP_X_ORIGINAL_URI', 'HTTP_X_ORIGINAL_URL', 'HTTP_X_FORWARDED_URI', 'HTTP_X_REWRITE_URL',
+        'REDIRECT_URI', 'REQUEST_URI', 'REQUEST_METHOD', 'HTTP_HOST', 'HTTP_X_FORWARDED_HOST', 'SERVER_NAME',
+    ] as $key) {
+        $v = $_SERVER[$key] ?? '';
+        if (is_string($v) && $v !== '') {
+            $server[$key] = $v;
+        }
+    }
+    $reqActor = function_exists('ap_request_actor_get') ? ap_request_actor_get() : null;
+    $pem = $GLOBALS['ap_inbox_verify_pem'] ?? null;
+    return [
+        'v' => 1,
+        'now' => time(),
+        'headers' => $headers,
+        'server' => $server,
+        'request_actor' => is_array($reqActor) && !empty($reqActor['key']) ? (string) $reqActor['key'] : null,
+        'body_b64' => base64_encode($raw),
+        'pem' => is_string($pem) ? $pem : null,
+        'php' => [
+            'ok' => $verified !== null,
+            'path' => $verified['path'] ?? null,
+            'code' => $verified !== null ? 200 : (int) ($GLOBALS['ap_inbox_verify_code'] ?? 401),
+            'error' => $verified !== null ? null : (string) ($GLOBALS['ap_inbox_verify_error'] ?? 'Invalid signature'),
+        ],
+    ];
+}
+
+/**
+ * F1 of the Rust cutover: hand a copy of this verdict to the Rust worker,
+ * which checks the same signature and logs whether it agrees. Off unless
+ * VAAK_INBOX_SIG_SHADOW=1. Best effort: it never changes PHP's verdict.
+ *
+ * @param array{sig:array<string,mixed>,path:string}|null $verified
+ */
+function ap_inbox_sig_shadow_record(string $raw, ?array $verified): void
+{
+    if (trim((string) getenv('VAAK_INBOX_SIG_SHADOW')) !== '1') {
+        return;
+    }
+    try {
+        $payload = ap_inbox_sig_shadow_payload($raw, $verified);
+        if ($payload === null || !function_exists('ap_redis_client')) {
+            return;
+        }
+        $json = json_encode($payload, JSON_UNESCAPED_SLASHES);
+        $redis = ap_redis_client('queue');
+        if (!is_string($json) || !$redis) {
+            return;
+        }
+        $key = 'vaak:queue:inbox_sig_shadow';
+        $redis->lPush($key, $json);
+        $redis->lTrim($key, 0, AP_INBOX_SIG_SHADOW_QUEUE_CAP - 1);
+        $redis->expire($key, 3600);
+    } catch (Throwable $e) {
+        error_log('[ap-inbox] signature shadow push failed: ' . $e->getMessage());
+    }
+}
+
 function ap_inbox_verify_fail(string $message, int $code = 401): null
 {
     $GLOBALS['ap_inbox_verify_error'] = $message;
@@ -790,6 +893,7 @@ function ap_inbox_try_verify(string $raw): ?array
 {
     $GLOBALS['ap_inbox_verify_error'] = 'Invalid signature';
     $GLOBALS['ap_inbox_verify_code'] = 401;
+    $GLOBALS['ap_inbox_verify_pem'] = null;
     $digestHdr = ap_header('Digest');
     $contentDigest = ap_header('Content-Digest');
     $dateHdr = ap_header('Date');
@@ -841,6 +945,7 @@ function ap_inbox_try_verify(string $raw): ?array
         }
         $okPath = ($pem !== null) ? ap_verify_http_signature($sig['headers'], $raw, $sigRaw, $pem, $sig) : null;
     }
+    $GLOBALS['ap_inbox_verify_pem'] = $pem;
     if ($pem === null) {
         if (!empty($GLOBALS['ap_inbox_fetch_throttled'])) {
             return ap_inbox_verify_fail('Too many key fetches', 429);
@@ -961,6 +1066,7 @@ function ap_inbox_try_verify_rfc9421(string $raw, string $sigHdr, string $sigInp
         }
         $okPath = ($pem !== null) ? ap_inbox_verify_rfc9421_base($parsed, $sigRaw, $pem, $contentDigest) : null;
     }
+    $GLOBALS['ap_inbox_verify_pem'] = $pem;
     if ($pem === null) {
         if (!empty($GLOBALS['ap_inbox_fetch_throttled'])) {
             return ap_inbox_verify_fail('Too many key fetches', 429);

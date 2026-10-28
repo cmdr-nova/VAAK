@@ -333,4 +333,28 @@ if (!is_array($rfcParsed) || !preg_match('/sig1\s*=\s*:([A-Za-z0-9+\/=]+):/', $r
     check($rfcPath === '/inbox', 'Mastodon RFC 9421 double-knock verifies for https://mkultra.monster/inbox');
 }
 
+// Rust shadow copy (cutover F1): verdict, key and request values, but no
+// cookies or Authorization, and nothing pushed while the switch is off.
+$GLOBALS['ap_inbox_pubkey_override'] = static fn(): string => $pem;
+$_SERVER = [
+    'REQUEST_METHOD' => 'POST',
+    'HTTP_HOST' => 'mkultra.monster',
+    'HTTP_DATE' => $date,
+    'HTTP_DIGEST' => $digest,
+    'HTTP_COOKIE' => 'vaak_session=secret',
+    'HTTP_AUTHORIZATION' => 'Bearer secret',
+    'REQUEST_URI' => '/api/ap-inbox.php',
+    'HTTP_SIGNATURE' => sign_headers($classic, $privPem, $keyId, '(request-target) host date digest'),
+];
+$verified = ap_inbox_try_verify($postedBody);
+$shadow = ap_inbox_sig_shadow_payload($postedBody, $verified);
+check(is_array($shadow) && $shadow['php'] === ['ok' => true, 'path' => '/inbox', 'code' => 200, 'error' => null], 'shadow payload carries the PHP verdict');
+check(is_array($shadow) && $shadow['pem'] === $pem && base64_decode($shadow['body_b64']) === $postedBody, 'shadow payload carries the verifying key and body');
+check(is_array($shadow) && !isset($shadow['headers']['cookie']) && !isset($shadow['headers']['authorization']), 'shadow payload drops cookies and Authorization');
+check(is_array($shadow) && ($shadow['headers']['signature'] ?? '') === $_SERVER['HTTP_SIGNATURE'] && ($shadow['server']['REQUEST_URI'] ?? '') === '/api/ap-inbox.php', 'shadow payload keeps signed headers and request values');
+check(ap_inbox_sig_shadow_payload(str_repeat('x', AP_INBOX_SIG_SHADOW_MAX_BODY + 1), null) === null, 'shadow payload skips oversized bodies');
+putenv('VAAK_INBOX_SIG_SHADOW');
+ap_inbox_sig_shadow_record($postedBody, $verified);
+check(true, 'shadow record is a no-op while VAAK_INBOX_SIG_SHADOW is unset');
+
 echo "inbox-signature: {$GLOBALS['n']} checks passed\n";

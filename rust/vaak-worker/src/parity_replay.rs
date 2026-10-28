@@ -53,6 +53,7 @@ fn produce(producer: &str, cases: &[InputCase]) -> Result<Vec<Value>> {
             "settings-fields" => settings_fields(&case.id)?,
             "follow-fallback" => follow_fallback(&case.input)?,
             "inbox-origin" => crate::inbox_origin::replay(&case.input)?,
+            "inbox-sig-verify" => crate::inbox_sig_shadow::replay(&case.input)?,
             "profile-local-chrome" => profile_local_chrome(&case.input)?,
             "profile-reply-split" => crate::profile_header::profile_reply_split(&case.input),
             "profile-remote-chrome" => profile_remote_chrome(&case.input)?,
