@@ -18830,6 +18830,11 @@ function ap_remote_actor_ensure(string $actorId, bool $allowFetch = true): ?arra
     if ($actorId === '' || !str_starts_with($actorId, 'https://')) {
         return null;
     }
+    // Nostr notifiers (njump.me/npub…) have no ActivityPub actor to fetch;
+    // nostr-notif-ingest.php keeps their cached row.
+    if (str_starts_with($actorId, 'https://njump.me/')) {
+        return ap_remote_actor_get($actorId);
+    }
     if (ap_remote_actor_id_is_unfederated_local($actorId)) {
         return null;
     }

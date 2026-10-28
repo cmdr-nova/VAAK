@@ -153,6 +153,22 @@ $nip19 = '7e7e9c42a91bfef19fa929e5fda1b72e0ebc1a4c1141673e2794234d86addf4e';
 $names = ap_nostr_names([$nip19, 'bad'], $modDb);
 $check(array_keys($names) === [$nip19] && ($names[$nip19]['name'] ?? '') === 'npub10elfc…zvjptg', 'names fall back to a short npub');
 
+// Notifications (nostr/notif.rs stages rows; PHP types and paints them).
+if (!function_exists('reference_load')) {
+    require __DIR__ . '/migration-reference-functions.php';
+}
+reference_load(dirname(__DIR__) . '/ap-masto-entities.php', ['ap_masto_mention_is_nostr', 'ap_masto_nostr_status_fields']);
+$noteHex = str_repeat('ab', 32);
+$noteUrl = 'https://njump.me/' . ap_nostr_bech32_encode('note', (string) hex2bin($noteHex));
+$actorUrl = 'https://njump.me/' . $npub;
+$check(ap_masto_mention_is_nostr(['activity_id' => 'nostr:' . $noteHex]) && ap_masto_mention_is_nostr(['actor_id' => $actorUrl]), 'staged Nostr rows are recognised');
+$check(!ap_masto_mention_is_nostr(['activity_id' => 'at://did:plc:x/app.bsky.feed.post/1', 'actor_id' => 'https://bsky.app/profile/x']), 'Bluesky rows are not Nostr');
+$fields = ap_masto_nostr_status_fields(['id' => '9'], $noteUrl, $actorUrl);
+$check($fields['source'] === 'nostr' && $fields['vaak_nostr_event_id'] === $noteHex && $fields['vaak_nostr_pubkey'] === $nip19 && $fields['id'] === '9', 'notification cards carry the note id and author key');
+$own = ap_masto_nostr_status_fields([], $noteUrl, '');
+$check($own['vaak_nostr_pubkey'] === '' && $own['url'] === $noteUrl, 'a liked note of yours has no author key from the row');
+$check(ap_masto_nostr_status_fields([], 'https://example.com/x', $actorUrl)['vaak_nostr_event_id'] === '', 'only njump note links decode');
+
 if ($failures !== []) {
     fwrite(STDERR, "nostr-smoke: " . count($failures) . " of {$checks} checks failed\n - " . implode("\n - ", $failures) . "\n");
     exit(1);

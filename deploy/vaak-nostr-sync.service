@@ -1,5 +1,7 @@
 # Nostr read-only sync: linked npubs' follow lists, followee profiles and
-# write relays, then recent kind 1 notes for Home. Prunes notes older than
+# write relays, recent kind 1 notes for Home, and replies, mentions, likes and
+# reposts aimed at linked npubs for Notifications (handed to
+# api/bin/nostr-notif-ingest.php). Prunes notes older than
 # VAAK_NOSTR_RETENTION_DAYS (default 30). VAAK_NOSTR=0 makes it a no-op.
 #
 #   cp deploy/vaak-nostr-sync.{service,timer} /etc/systemd/system/

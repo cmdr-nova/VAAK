@@ -4,13 +4,15 @@
 //! are signed in the browser by the user's signer extension; `act` checks
 //! and relays them. `share` shows boosted and quoted notes on VAAK.
 //! `relay_book` is the admin's relay list (Admin > Relays > Nostr), and
-//! `moderation` the mutes, hides and admin blocks every Nostr read obeys.
+//! `moderation` the mutes, hides and admin blocks every Nostr read obeys,
+//! and `notif` the replies, mentions, likes and reposts in Notifications.
 
 pub mod act;
 pub mod bech32;
 pub mod event;
 pub mod home;
 pub mod moderation;
+pub mod notif;
 pub mod relay;
 pub mod relay_book;
 pub mod render;

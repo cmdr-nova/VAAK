@@ -154,6 +154,12 @@ impl Event {
         Some((id, tag.get(2).cloned().unwrap_or_default()))
     }
 
+    /// NIP-25: the note a kind 7 reaction is about (its last `e` tag).
+    pub fn reaction_target(&self) -> Option<String> {
+        let id = self.tag_values("e").last()?.get(1)?.trim().to_ascii_lowercase();
+        is_hex64(&id).then_some(id)
+    }
+
     /// The reposted kind 1 a kind 6 carries in its content, when it is the
     /// note the `e` tag names and its signature checks out.
     pub fn embedded_repost(&self) -> Option<Event> {
@@ -293,6 +299,9 @@ pub(crate) mod tests {
         assert_eq!(root_only.reply_info(), (true, e1.clone(), vec![]));
         let positional = signed(1, 1, 1, tags(&[&["e", &e1], &["e", &e2]]), "re");
         assert_eq!(positional.reply_info().1, e2);
+        let reaction = signed(1, 1, 7, tags(&[&["e", &e1], &["e", &e2], &["p", &p1]]), "+");
+        assert_eq!(reaction.reaction_target(), Some(e2.clone()));
+        assert_eq!(signed(1, 1, 7, tags(&[&["p", &p1]]), "+").reaction_target(), None);
     }
 
     #[test]
