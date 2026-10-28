@@ -1,0 +1,32 @@
+# Nostr backup relay for npubs linked to VAAK accounts (nostr_archive).
+#   systemctl enable --now vaak-nostr-relay.service
+#
+# Anyone can read; only linked npubs can write, and only the kinds the
+# archive keeps. Listens on loopback; Caddy terminates TLS and proxies the
+# websocket (see docs/nostr-backup-relay.md). nostr-sync fills the archive
+# from public relays either way, so stopping this unit only stops serving it.
+# The caps keep a busy client from crowding out the app.
+[Unit]
+Description=VAAK Nostr backup relay (loopback websocket)
+After=network.target postgresql.service
+Wants=postgresql.service
+ConditionPathExists=/usr/local/bin/vaak-worker
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+Nice=10
+Environment=VAAK_ENV_FILE=/etc/mkultra/vaak.env
+Environment=RUST_LOG=info
+ExecStart=/usr/local/bin/vaak-worker nostr-relay --bind 127.0.0.1:8795
+Restart=on-failure
+RestartSec=10
+MemoryMax=128M
+CPUQuota=25%
+TasksMax=64
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

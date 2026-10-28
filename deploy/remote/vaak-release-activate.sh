@@ -199,6 +199,13 @@ restart_units() {
       echo "vaak-release: skip ${unit} (diff does not touch Jetstream)"
     done
   fi
+  # Optional and installed by hand. A missing sudoers line only warns, so
+  # it can never fail a deploy.
+  if unit_installed vaak-nostr-relay.service && unit_enabled vaak-nostr-relay.service; then
+    sudo_restart vaak-nostr-relay.service || echo "vaak-release: warn: could not restart vaak-nostr-relay.service (sudoers line missing?)" >&2
+  else
+    echo "vaak-release: skip vaak-nostr-relay.service (not enabled)"
+  fi
 }
 
 health_check() {
@@ -611,6 +618,7 @@ PY
   grep -q -F "restart php8.3-fpm.service" "${SYSTEMCTL_LOG}"
   grep -q -F "restart vaak-worker-shadow-http.service" "${SYSTEMCTL_LOG}"
   grep -q -F "restart vaak-worker-shadow.service" "${SYSTEMCTL_LOG}"
+  grep -q -F "restart vaak-nostr-relay.service" "${SYSTEMCTL_LOG}"
   grep -q -F "restart ap-bsky-jetstream@0.service" "${SYSTEMCTL_LOG}"
   grep -q -F "restart ap-bsky-jetstream@1.service" "${SYSTEMCTL_LOG}"
   if grep -E 'restart ap-bsky-jetstream\.service( |$)' "${SYSTEMCTL_LOG}"; then

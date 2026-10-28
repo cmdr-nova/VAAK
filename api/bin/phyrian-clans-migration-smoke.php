@@ -51,6 +51,7 @@ $check(
         '20261028_nostr_relays_postgres.sql',
         '20261028_nostr_moderation_postgres.sql',
         '20261028_nostr_notifs_postgres.sql',
+        '20261028_nostr_archive_postgres.sql',
     ],
     'deploy runner picks up the clans migration and the quote-target table'
 );

@@ -610,6 +610,7 @@ pub async fn publish(cfg: &Config, owner: i64, nonce: &str, signed: &Value) -> R
     if let Err(e) = check_signed(&ev, &pending, &me, now) {
         return refuse(&e);
     }
+    super::archive::keep_own(&db, &ev).await;
     if let Some(base) = pending.base.as_ref().filter(|b| b.kind == 3) {
         db.execute(
             "INSERT INTO nostr_contact_backups (owner_user_id, event_id, event_json, follow_count, backed_up_at)
