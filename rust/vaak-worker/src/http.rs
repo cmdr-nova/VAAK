@@ -676,6 +676,9 @@ struct NostrPrepareBody {
     /// NIP-56 report type, for purpose "report".
     #[serde(default)]
     reason: String,
+    /// The note itself, for purpose "post" (a VAAK post sent to Nostr too).
+    #[serde(default)]
+    note: Option<crate::nostr::act::NewNote>,
 }
 
 #[derive(serde::Deserialize)]
@@ -703,7 +706,7 @@ async fn shadow_nostr_prepare(State(state): State<AppState>, Json(body): Json<No
     if body.owner_id < 1 {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"ok": false, "error": "owner required"}))).into_response();
     }
-    nostr_reply(crate::nostr::act::prepare(&state.cfg, body.owner_id, &body.purpose, &body.target, &body.reason).await)
+    nostr_reply(crate::nostr::act::prepare(&state.cfg, body.owner_id, &body.purpose, &body.target, &body.reason, body.note.as_ref()).await)
 }
 
 async fn shadow_nostr_publish(State(state): State<AppState>, Json(body): Json<NostrPublishBody>) -> axum::response::Response {

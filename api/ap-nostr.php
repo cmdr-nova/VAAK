@@ -359,6 +359,20 @@ function ap_nostr_action(string $action, int $ownerUserId, bool $isAdmin, array 
     if ($ownerUserId < 1) {
         return $fail(401, 'Sign in first.');
     }
+    if ($action === 'nostr_prepare' && (string) ($post['purpose'] ?? '') === 'post') {
+        // A VAAK post going to Nostr too: built here from the stored post,
+        // so the page can only ask for a post the user already made.
+        $note = ap_nostr_post_note($ownerUserId, trim((string) ($post['target'] ?? '')));
+        if (empty($note['ok'])) {
+            return ['status' => 200, 'body' => ['ok' => false, 'error' => $note['error'], 'retry' => !empty($note['retry'])]];
+        }
+        return ap_nostr_worker_call('/shadow/nostr-prepare', [
+            'owner_id' => $ownerUserId,
+            'purpose' => 'post',
+            'target' => '',
+            'note' => ['content' => $note['content'], 'tags' => $note['tags']],
+        ], 30000);
+    }
     if ($action === 'nostr_prepare') {
         $purpose = (string) ($post['purpose'] ?? '');
         $target = strtolower(trim((string) ($post['target'] ?? '')));
@@ -387,6 +401,118 @@ function ap_nostr_action(string $action, int $ownerUserId, bool $isAdmin, array 
     }
     // Follow edits read the current list from relays before answering.
     return ap_nostr_worker_call($path, $payload, 30000);
+}
+
+/**
+ * Who the composer's "Nostr" box posts as: the linked key and its kind 0
+ * name and picture. Null when the user can't crosspost (no linked npub, or
+ * Nostr not open to them).
+ *
+ * @return array{npub:string, name:string, picture:string}|null
+ */
+function ap_nostr_compose_identity(int $userId, bool $isAdmin, ?PDO $db = null): ?array
+{
+    if (!ap_nostr_form_visible($isAdmin)) {
+        return null;
+    }
+    try {
+        $db ??= ap_db();
+        $link = ap_nostr_link_for_user($userId, $db);
+        $pubkey = is_array($link) ? (string) ($link['pubkey'] ?? '') : '';
+        $npub = ap_nostr_npub($pubkey);
+        if ($npub === '') {
+            return null;
+        }
+        $st = $db->prepare('SELECT name, display_name, picture FROM nostr_profiles WHERE pubkey = ? LIMIT 1');
+        $st->execute([$pubkey]);
+        $p = $st->fetch(PDO::FETCH_ASSOC) ?: [];
+    } catch (Throwable $e) {
+        return null;
+    }
+    $name = trim((string) ($p['display_name'] ?? ''));
+    if ($name === '') {
+        $name = trim((string) ($p['name'] ?? ''));
+    }
+    if ($name === '') {
+        $name = substr($npub, 0, 10) . '…' . substr($npub, -6);
+    }
+    $picture = trim((string) ($p['picture'] ?? ''));
+    return [
+        'npub' => $npub,
+        'name' => $name,
+        'picture' => str_starts_with($picture, 'https://') ? $picture : '',
+    ];
+}
+
+/**
+ * The Nostr copy of one of the user's own public, top-level VAAK posts:
+ * its text, then its media links (NIP-92 imeta for each), hashtags as `t`
+ * tags, the content warning (NIP-36) and a NIP-48 `proxy` tag naming the
+ * VAAK post. Replies and non-public posts stay on VAAK. `retry` means the
+ * post isn't stored yet (the publication queue is still writing it).
+ *
+ * @return array{ok:bool, content?:string, tags?:list<list<string>>, error?:string, retry?:bool}
+ */
+function ap_nostr_post_note(int $ownerUserId, string $noteId, ?PDO $db = null): array
+{
+    $db = $db ?? ap_db();
+    $owner = function_exists('ap_db_owner_actor_id_for_user_id') ? rtrim(ap_db_owner_actor_id_for_user_id($ownerUserId), '/') : '';
+    if ($owner === '' || !str_starts_with($noteId, $owner . '/notes/') || strlen($noteId) > 300) {
+        return ['ok' => false, 'error' => 'Only your own posts can go to Nostr.'];
+    }
+    $st = $db->prepare('SELECT local_id, content_text, visibility, spoiler_text, in_reply_to_local_id FROM masto_statuses WHERE note_id = ?');
+    $st->execute([$noteId]);
+    $row = $st->fetch(PDO::FETCH_ASSOC);
+    if (!is_array($row)) {
+        return ['ok' => false, 'error' => 'The post is still being saved.', 'retry' => true];
+    }
+    $reply = $db->prepare('SELECT in_reply_to FROM outbox_notes WHERE id = ?');
+    $reply->execute([$noteId]);
+    if ($row['in_reply_to_local_id'] !== null || trim((string) ($reply->fetchColumn() ?: '')) !== '') {
+        return ['ok' => false, 'error' => 'Replies stay on VAAK.'];
+    }
+    if ((string) $row['visibility'] !== 'public') {
+        return ['ok' => false, 'error' => 'Only public posts go to Nostr.'];
+    }
+    $text = trim((string) $row['content_text']);
+    $tags = [];
+    if (preg_match_all('/(?<![\w&#\/])#([\p{L}\p{N}_]{1,64})/u', $text, $m)) {
+        foreach (array_unique(array_map(static fn (string $t): string => mb_strtolower($t), $m[1])) as $t) {
+            if (count($tags) < 10) {
+                $tags[] = ['t', $t];
+            }
+        }
+    }
+    $spoiler = trim((string) $row['spoiler_text']);
+    if ($spoiler !== '') {
+        $tags[] = ['content-warning', mb_substr($spoiler, 0, 500)];
+    }
+    $media = $db->prepare('SELECT public_url, mime, description FROM masto_media WHERE status_local_id = ? ORDER BY local_id LIMIT 4');
+    $media->execute([(int) $row['local_id']]);
+    $links = [];
+    foreach ($media->fetchAll(PDO::FETCH_ASSOC) as $item) {
+        $url = (string) $item['public_url'];
+        if (!str_starts_with($url, 'https://')) {
+            continue;
+        }
+        $links[] = $url;
+        $meta = ['imeta', 'url ' . $url];
+        $mime = trim((string) ($item['mime'] ?? ''));
+        if ($mime !== '') {
+            $meta[] = 'm ' . $mime;
+        }
+        $alt = trim(preg_replace('/\s+/', ' ', (string) ($item['description'] ?? '')) ?? '');
+        if ($alt !== '') {
+            $meta[] = 'alt ' . mb_substr($alt, 0, 1500);
+        }
+        $tags[] = $meta;
+    }
+    $content = trim($text . ($links !== [] ? "\n\n" . implode("\n", $links) : ''));
+    if ($content === '') {
+        return ['ok' => false, 'error' => 'There\'s nothing to post.'];
+    }
+    $tags[] = ['proxy', $noteId, 'activitypub'];
+    return ['ok' => true, 'content' => $content, 'tags' => $tags];
 }
 
 /**

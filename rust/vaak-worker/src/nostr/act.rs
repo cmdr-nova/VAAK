@@ -280,7 +280,27 @@ async fn newest_list(me: &str, kind: i64, relays: &[String]) -> (Option<Event>, 
     (newest, answered)
 }
 
-pub async fn prepare(cfg: &Config, owner: i64, purpose: &str, target: &str, reason: &str) -> Result<Value> {
+/// A VAAK post going to Nostr too (purpose "post"). PHP builds it from the
+/// stored post (api/ap-nostr.php `ap_nostr_post_note`); the browser only signs.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct NewNote {
+    pub content: String,
+    pub tags: Vec<Vec<String>>,
+}
+
+/// Tags a crossposted note may carry: hashtags, a content warning, media
+/// metadata, and the NIP-48 link back to the VAAK post.
+fn note_tags_ok(tags: &[Vec<String>]) -> bool {
+    tags.len() <= 40
+        && tags.iter().all(|t| {
+            matches!(t.first().map(String::as_str), Some("t" | "content-warning" | "imeta" | "proxy"))
+                && t.len() >= 2
+                && t.len() <= 8
+                && t.iter().all(|v| v.chars().count() <= 2000)
+        })
+}
+
+pub async fn prepare(cfg: &Config, owner: i64, purpose: &str, target: &str, reason: &str, note: Option<&NewNote>) -> Result<Value> {
     if super::sync::disabled_by_env() {
         return refuse("Nostr is turned off on this server.");
     }
@@ -292,12 +312,31 @@ pub async fn prepare(cfg: &Config, owner: i64, purpose: &str, target: &str, reas
         return refuse("Link your npub in Settings > Profile first.");
     };
     let target = target.trim().to_ascii_lowercase();
-    if !event::is_hex64(&target) {
+    if purpose != "post" && !event::is_hex64(&target) {
         return refuse("That isn't a Nostr note or person.");
     }
     let mut s = super::sync::Settings::from_env(30);
     super::relay_book::apply(&db, &mut s, chrono::Utc::now().timestamp()).await?;
     let mut pending = match purpose {
+        "post" => {
+            let Some(note) = note.filter(|n| !n.content.trim().is_empty()) else {
+                return refuse("There's nothing to post.");
+            };
+            if note.content.chars().count() > MAX_REPLY_CHARS || !note_tags_ok(&note.tags) {
+                return refuse("That post can't go to Nostr.");
+            }
+            let mine = write_relays_of(&db, std::slice::from_ref(&me)).await;
+            Pending {
+                purpose: "post".into(),
+                target: String::new(),
+                kind: 1,
+                tags: note.tags.clone(),
+                content: Some(note.content.clone()),
+                suffix: None,
+                base: None,
+                relays: merge_relays(&[&mine, &s.fallback_relays]),
+            }
+        }
         "like" | "reply" | "repost" | "quote" | "report" => {
             let Some(row) = db
                 .query_opt("SELECT pubkey, relay, tags FROM nostr_events WHERE id = $1", &[&target])
@@ -705,7 +744,7 @@ pub async fn publish(cfg: &Config, owner: i64, nonce: &str, signed: &Value) -> R
         "purpose": pending.purpose,
         "accepted": accepted,
         "asked": results.len(),
-        "note": if matches!(pending.purpose.as_str(), "reply" | "quote") { Value::String(super::bech32::note(&ev.id)) } else { Value::Null },
+        "note": if matches!(pending.purpose.as_str(), "reply" | "quote" | "post") { Value::String(super::bech32::note(&ev.id)) } else { Value::Null },
     }))
 }
 
@@ -772,6 +811,15 @@ mod tests {
         assert_eq!(edit_mute_tags(&base, B, false), Err("They aren't on your Nostr mute list."));
         assert_eq!(report_tags(P, A, "spam"), vec![tag(&["e", P, "spam"]), tag(&["p", A, "spam"])]);
         assert!(REPORT_TYPES.contains(&"other") && !REPORT_TYPES.contains(&""));
+    }
+
+    #[test]
+    fn crossposts_carry_only_note_tags() {
+        assert!(note_tags_ok(&[tag(&["t", "art"]), tag(&["content-warning", "spoilers"]), tag(&["imeta", "url https://x/a.png", "m image/png"]), tag(&["proxy", "https://mkultra.monster/users/a/notes/1", "activitypub"])]));
+        assert!(note_tags_ok(&[]));
+        assert!(!note_tags_ok(&[tag(&["p", A])]), "no tagging people through a crosspost");
+        assert!(!note_tags_ok(&[tag(&["e", P])]));
+        assert!(!note_tags_ok(&[tag(&["t"])]));
     }
 
     #[test]
