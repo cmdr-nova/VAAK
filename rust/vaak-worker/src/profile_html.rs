@@ -793,7 +793,7 @@ pub async fn profile_html_fill(
     }
     // Apply after quote and self-thread hydration, including off-page parents.
     let source_count = statuses.len();
-    let mut hidden = crate::hidden::load_hidden_sets(&db, viewer_owner_id).await?;
+    let mut hidden = crate::hidden::load_timeline_hidden_sets(&db, viewer_owner_id).await?;
     crate::audience::filter_statuses(&db, viewer_owner_id, crate::audience::Surface::Profile, &mut statuses).await?;
     let selected:Vec<String> = statuses.iter().filter_map(|status|status.get("uri").and_then(Value::as_str).map(str::to_owned)).collect();
     crate::hidden::load_ordinary_owned_notes(&db, viewer_owner_id, &selected, &mut hidden).await?;
