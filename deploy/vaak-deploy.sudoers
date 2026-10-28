@@ -27,6 +27,7 @@ vaak-deploy ALL=(root) NOPASSWD: /usr/bin/systemctl restart vaak-worker-ap-actor
 vaak-deploy ALL=(root) NOPASSWD: /usr/bin/systemctl restart vaak-worker-timeline-fanout.service
 vaak-deploy ALL=(root) NOPASSWD: /usr/bin/systemctl restart vaak-worker-shadow-http.service
 vaak-deploy ALL=(root) NOPASSWD: /usr/bin/systemctl restart vaak-worker-shadow.service
+vaak-deploy ALL=(root) NOPASSWD: /usr/bin/systemctl restart vaak-nostr-relay.service
 vaak-deploy ALL=(root) NOPASSWD: /usr/bin/systemctl restart ap-bsky-jetstream@0.service
 vaak-deploy ALL=(root) NOPASSWD: /usr/bin/systemctl restart ap-bsky-jetstream@1.service
 vaak-deploy ALL=(www-data) NOPASSWD: /usr/bin/php /srv/mkultra/html/api/bin/deploy-canary.php

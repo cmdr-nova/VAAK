@@ -6,8 +6,12 @@
 //! `relay_book` is the admin's relay list (Admin > Relays > Nostr), and
 //! `moderation` the mutes, hides and admin blocks every Nostr read obeys,
 //! and `notif` the replies, mentions, likes and reposts in Notifications.
+//! `archive` keeps a permanent copy of linked users' own events, which
+//! `backup_relay` serves as a write-restricted relay.
 
 pub mod act;
+pub mod archive;
+pub mod backup_relay;
 pub mod bech32;
 pub mod event;
 pub mod home;

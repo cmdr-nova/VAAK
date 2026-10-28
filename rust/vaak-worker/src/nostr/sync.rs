@@ -20,7 +20,9 @@
 //!     signature are checked before it is stored.
 //!  4. Notifications (`notif`): events tagging each linked key, staged and
 //!     handed to PHP's `ap_mention_store`.
-//!  5. Clean-up: notes older than the retention window, notes and profiles
+//!  5. Backup (`archive`): linked keys' own events, kept with no retention
+//!     for the backup relay.
+//!  6. Clean-up: notes older than the retention window, notes and profiles
 //!     nobody follows any more, follows of removed links. Notes a VAAK user
 //!     boosted, quoted, bookmarked or liked stay (and their authors' profiles),
 //!     as do notes a stored repost points at.
@@ -398,7 +400,7 @@ const META_CHASE_RELAYS: usize = 8;
 
 /// Each key's own relays: its NIP-65 write relays plus the relays VAAK
 /// stored its notes from, most notes first.
-async fn own_relays(db: &Client, keys: &[String]) -> Result<Vec<(String, Vec<String>)>> {
+pub(super) async fn own_relays(db: &Client, keys: &[String]) -> Result<Vec<(String, Vec<String>)>> {
     let rows = db
         .query(
             "SELECT k.pubkey,
@@ -814,6 +816,11 @@ pub async fn run_once(cfg: &Config, budget_secs: u64) -> Result<String> {
     let meta = sync_followee_meta(&db, &s, now, deadline).await?;
     let notes = sync_notes(&mut db, &s, now, deadline).await?;
     let notifs = super::notif::sync(&mut db, &s, now, deadline).await?;
+    // The backup copy never holds up Home, notifications or clean-up.
+    let archive = super::archive::pull(&db, &s, now, deadline).await.unwrap_or_else(|e| {
+        tracing::warn!(error = %format!("{e:#}"), "nostr archive pull failed");
+        super::archive::PullReport::default()
+    });
     db.execute(
         "UPDATE nostr_links SET synced_at = $1 WHERE show_in_home AND follow_list_at > 0",
         &[&now],
@@ -822,7 +829,7 @@ pub async fn run_once(cfg: &Config, budget_secs: u64) -> Result<String> {
     let cleaned = cleanup(&db, &s, now).await?;
     relay_book::prune(&db, now).await?;
     Ok(format!(
-        "nostr-sync {}meta={meta} authors={} relays={}/{} stored={} rejected={} notifs={}/{} ingest={} cleaned={cleaned} ms={}",
+        "nostr-sync {}meta={meta} authors={} relays={}/{} stored={} rejected={} notifs={}/{} ingest={} {} cleaned={cleaned} ms={}",
         if log.is_empty() { String::new() } else { format!("{} ", log.join(" ")) },
         notes.authors,
         notes.relays_ok,
@@ -832,6 +839,7 @@ pub async fn run_once(cfg: &Config, budget_secs: u64) -> Result<String> {
         notifs.staged,
         notifs.owners,
         if notifs.ingest.is_empty() { "-" } else { notifs.ingest.as_str() },
+        archive.summary(),
         started.elapsed().as_millis()
     ))
 }

@@ -161,6 +161,12 @@ impl Query {
         Self { filter, authors, kinds, ids: Vec::new(), tagged: String::new() }
     }
 
+    /// Only events at or before `until` (paging back through history).
+    pub fn until(mut self, until: i64) -> Self {
+        self.filter["until"] = json!(until);
+        self
+    }
+
     /// Events of `kinds` from anyone that tag `pubkey` (notifications).
     pub fn tagging(pubkey: &str, kinds: Vec<i64>, since: i64, limit: i64) -> Self {
         let filter = json!({"#p": [pubkey], "kinds": kinds, "since": since, "limit": limit});

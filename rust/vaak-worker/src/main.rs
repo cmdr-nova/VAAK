@@ -298,6 +298,13 @@ enum Command {
         #[arg(long, default_value_t = 100)]
         budget_secs: u64,
     },
+    /// Backup Nostr relay over nostr_archive: anyone reads, only npubs
+    /// linked to VAAK accounts write. Behind Caddy on loopback
+    /// (deploy/vaak-nostr-relay.service). VAAK_NOSTR=0 turns it off.
+    NostrRelay {
+        #[arg(long, default_value = "127.0.0.1:8795")]
+        bind: String,
+    },
     /// Print the cleanup retention plan. PHP still owns deletes.
     CleanupShadow {
         /// Refused. Present so a cutover attempt fails closed.
@@ -572,6 +579,10 @@ async fn worker_main() -> Result<()> {
         }
         Command::NostrSync { budget_secs } => {
             println!("{}", nostr::sync::run_once(&cfg, budget_secs).await?);
+        }
+        Command::NostrRelay { bind } => {
+            let addr: SocketAddr = bind.parse()?;
+            nostr::backup_relay::serve(&cfg, addr).await?;
         }
         Command::CleanupShadow { execute } => {
             match cleanup::shadow_report(execute) {
