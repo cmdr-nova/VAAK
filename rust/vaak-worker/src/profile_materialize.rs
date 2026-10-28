@@ -125,9 +125,28 @@ impl Dependency {
     /// for the sources that consumed it, and still for the final page.
     fn relevant_to_source(&self,origin:usize)->bool{let origins=self.origins.lock().expect("dependency origins");origins.is_empty()||origins.contains(&origin)}
     async fn read(db:&Client,sql:&'static str,key:&Value)->Result<Vec<Value>>{
-        let rows=if sql.contains("$1"){db.query(sql,&[key]).await?}else{db.query(sql,&[]).await?};
+        let rows=match dependency_statement(db,sql).await?{
+            Some(statement)=>if sql.contains("$1"){db.query(&statement,&[key]).await?}else{db.query(&statement,&[]).await?},
+            None=>if sql.contains("$1"){db.query(sql,&[key]).await?}else{db.query(sql,&[]).await?},
+        };
         Ok(rows.into_iter().map(|r|r.get(0)).collect())
     }
+}
+// One render reads the same few SQL shapes many times. Inside a profile
+// render each shape is prepared once per connection, so a read is one round
+// trip instead of a parse plus an execute. Postgres re-parses a prepared
+// statement itself if search_path changes, and rows are never cached here.
+tokio::task_local! { static DEPENDENCY_STATEMENTS: std::cell::RefCell<std::collections::HashMap<(usize,&'static str),tokio_postgres::Statement>>; }
+pub(crate) async fn dependency_statement_scope<F:std::future::Future>(future:F)->F::Output{
+    DEPENDENCY_STATEMENTS.scope(Default::default(),future).await
+}
+async fn dependency_statement(db:&Client,sql:&'static str)->Result<Option<tokio_postgres::Statement>>{
+    let key=(db as *const Client as usize,sql);
+    let Ok(cached)=DEPENDENCY_STATEMENTS.try_with(|cache|cache.borrow().get(&key).cloned())else{return Ok(None)};
+    if let Some(statement)=cached{return Ok(Some(statement))}
+    let statement=db.prepare(sql).await?;
+    DEPENDENCY_STATEMENTS.with(|cache|{let mut cache=cache.borrow_mut();if cache.len()<256{cache.insert(key,statement.clone());}});
+    Ok(Some(statement))
 }
 /// Bind every `$1` to the lateral key. `$10` is not a placeholder here.
 fn dependency_bind_key(sql:&str)->String{
@@ -1072,6 +1091,23 @@ mod tests {
     }
 
     use super::*;
+    #[tokio::test]
+    #[ignore="disposable local PostgreSQL (LIBRARY_FIXTURE_DB)"]
+    async fn cached_dependency_statements_follow_rows_and_search_path(){
+        let url=std::env::var("LIBRARY_FIXTURE_DB").unwrap();assert!(url.contains("/tmp/"));let db=crate::db::connect(&url).await.unwrap();
+        let pid=std::process::id();let one=format!("profile_statement_one_{pid}");let two=format!("profile_statement_two_{pid}");
+        db.batch_execute(&format!("CREATE SCHEMA {one};CREATE SCHEMA {two};CREATE TABLE {one}.t(k TEXT,v TEXT);CREATE TABLE {two}.t(k TEXT,v TEXT);INSERT INTO {one}.t VALUES('x','one');INSERT INTO {two}.t VALUES('x','two');SET search_path={one}")).await.unwrap();
+        const SQL:&str="SELECT to_jsonb(t) FROM t WHERE k=$1::jsonb->>'k'";let key=json!({"k":"x"});
+        dependency_statement_scope(async{
+            assert_eq!(Dependency::read(&db,SQL,&key).await.unwrap()[0]["v"],"one");
+            db.batch_execute(&format!("UPDATE {one}.t SET v='changed'")).await.unwrap();
+            // The cached statement still reads current rows.
+            assert_eq!(Dependency::read(&db,SQL,&key).await.unwrap()[0]["v"],"changed");
+            db.batch_execute(&format!("SET search_path={two}")).await.unwrap();
+            assert_eq!(Dependency::read(&db,SQL,&key).await.unwrap()[0]["v"],"two");
+        }).await;
+        db.batch_execute(&format!("DROP SCHEMA {one} CASCADE;DROP SCHEMA {two} CASCADE")).await.unwrap();
+    }
     #[tokio::test]
     #[ignore="disposable local PostgreSQL (LIBRARY_FIXTURE_DB)"]
     async fn pipelined_dependency_recheck_sees_each_template(){

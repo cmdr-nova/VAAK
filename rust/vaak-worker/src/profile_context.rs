@@ -898,7 +898,7 @@ async fn prepare_shared_pending_quote(db:&Client,viewer:&crate::profile_material
  let grant=PendingSourceQuoteGrant{db,current,product:&product};let context=warm.quote_context().context("PHP fallback: pending quote warming transport unavailable")?;let now=chrono::Utc::now().timestamp();let presentation=context.prepare_pending(db,&target,now,&grant).await?;if presentation.warm_needed(){let owner=match viewer{crate::profile_materialize::ProfileViewer::Auth(session)=>session.owner_id(),crate::profile_materialize::ProfileViewer::Guest(_)=>0};let effect=context.warm(db,&target,owner,now,&grant).await?;if effect.helper_requested{warm.record_quote_request(&target);}}crate::profile_quote_warm::CurrentQuoteGrant::require_current(&grant).await?;Ok((Some(std::sync::Arc::new(presentation)),product))
 }
 pub(crate) async fn prepare_ordered_profile_page(db:&Client,viewer:&crate::profile_materialize::ProfileViewer<'_>,selection:crate::profile_source::SelectedProfilePage,dns:&dyn crate::direct_preview::PreviewDns)->Result<OrderedProfilePage>{
- crate::audience::profile_reader_scope(prepare_ordered_profile_page_inner(db,viewer,selection,dns)).await
+ crate::audience::profile_reader_scope(crate::profile_materialize::dependency_statement_scope(Box::pin(prepare_ordered_profile_page_inner(db,viewer,selection,dns)))).await
 }
 /// Production requests add each stage to the bridge's stage clock; fixtures
 /// can also print them with PROFILE_PERF_STAGES=1.
