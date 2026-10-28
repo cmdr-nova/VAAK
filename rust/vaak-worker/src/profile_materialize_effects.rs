@@ -80,7 +80,8 @@ pub(super) async fn apply(db:&Client,deps:&mut Vec<Dependency>,effect:&DeferredP
  if let ProjectionEffect::PostMediaTouch{source_url}=effect.effect(){return touch_post_media(db,deps,source_url,grant,status).await}
  let ProjectionEffect::RememberAccount{account_id,actor}=effect.effect()else{bail!("native projection writer accepts only stored RememberAccount/PostMediaTouch")};
  let id=crate::library::card::php_trim(account_id);let actor=crate::library::card::php_trim(actor).trim_end_matches('/');if id.is_empty()||actor.is_empty(){return Ok(AccountMappingChanges::empty())}
- grant.current(db,status).await?;
+ // Authority is checked right before each write and once after the last
+ // one. The reads in between write nothing, so they need no check.
  // Mapping snapshots are refreshed only for this exact id. Future lookup
  // query shapes must define their own scoped writer reconciliation first.
  if deps.iter().any(|d|d.sql.contains("masto_account_actors")&&d.sql!=MAP){bail!("PHP fallback: mapping writer cannot reconcile unrelated mapping dependency")}
@@ -88,14 +89,22 @@ pub(super) async fn apply(db:&Client,deps:&mut Vec<Dependency>,effect:&DeferredP
  let aliases=aliases(db,&mut new_deps,actor).await?;let canonical=aliases.first().map(|a|a.trim_end_matches('/')).unwrap_or(actor);
  require_dependencies(db,&new_deps,"PHP fallback: mapping alias dependency changed before writer").await?;
  let mut roots=Vec::new();for a in aliases.iter().map(|a|a.trim_end_matches('/')).chain(std::iter::once(canonical)){if !a.is_empty()&&(a.starts_with("https://")||a==canonical)&&!roots.contains(&a){roots.push(a)}}
+ // A mapping that already holds this id and actor, with no other id on its
+ // aliases, would only get a new updated_at, which nothing reads. Skip it.
+ let key=json!({"account_id":id});
+ let variants=roots.iter().flat_map(|a|[a.to_string(),format!("{a}/")]).collect::<Vec<_>>();
+ let other=db.query_opt("SELECT 1 FROM masto_account_actors WHERE actor_id=ANY($1) AND account_id<>$2 LIMIT 1",&[&variants,&id]).await?.is_some();
+ if !other{
+  let before=Dependency::read(db,MAP,&key).await?;
+  if before.len()==1&&s(&before[0],"actor_id")==canonical&&deps.iter().chain(new_deps.iter()).filter(|d|d.sql==MAP&&s(&d.key,"account_id")==id).all(|d|d.rows==before){deps.extend(new_deps);return Ok(AccountMappingChanges::empty())}
+ }
  let mut changes=AccountMappingChanges::empty();
  for alias in roots{
   grant.current(db,status).await?;
   let deleted=db.query("DELETE FROM masto_account_actors m WHERE actor_id IN($1,$2) AND account_id<>$3 RETURNING to_jsonb(m)",&[&alias,&format!("{alias}/"),&id]).await?;
   for row in deleted{let before:Value=row.get(0);let delta=AccountMappingChanges{changes:vec![MappingChange{sql:MAP,key:json!({"account_id":s(&before,"account_id")}),before:vec![before],after:vec![]}]};reconcile(deps,&delta)?;reconcile(&mut new_deps,&delta)?;changes.changes.extend(delta.changes);}
  }
- grant.current(db,status).await?;
- let key=json!({"account_id":id});let before=Dependency::read(db,MAP,&key).await?;
+ let before=Dependency::read(db,MAP,&key).await?;
  // Every retained lookup for the written id must agree before replacing it.
  for d in deps.iter().chain(new_deps.iter()).filter(|d|d.sql==MAP&&s(&d.key,"account_id")==id){if d.rows!=before{bail!("PHP fallback: mapping changed before authorized upsert")}}
  grant.current(db,status).await?;let now=chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs,false);
@@ -105,12 +114,14 @@ pub(super) async fn apply(db:&Client,deps:&mut Vec<Dependency>,effect:&DeferredP
  deps.extend(new_deps);Ok(changes)
 }
 async fn touch_post_media(db:&Client,deps:&mut Vec<Dependency>,source_url:&str,grant:&Grant<'_>,status:&Value)->Result<AccountMappingChanges>{
- grant.current(db,status).await?;
  let key=json!({"source_url":source_url});let before=Dependency::read(db,POST_MEDIA,&key).await?;
- grant.current(db,status).await?;
  if before.len()!=1||!truth(&before[0]["public_url"]){bail!("PHP fallback: cached post-media touch source disappeared")}
  let matching=deps.iter().filter(|d|d.sql==POST_MEDIA&&d.key==key).collect::<Vec<_>>();
  if matching.is_empty()||matching.iter().any(|d|d.rows!=before){bail!("PHP fallback: post-media touch differs from native projection snapshot")}
+ // last_used_at only orders eviction. Like the timeline cache, a row used
+ // within the last day is not touched again.
+ let cutoff=(chrono::Utc::now()-chrono::Duration::seconds(crate::post_media_cache::TOUCH_AFTER_SECS)).to_rfc3339_opts(chrono::SecondsFormat::Secs,false);
+ if before[0].get("last_used_at").and_then(Value::as_str).is_some_and(|used|used>=cutoff.as_str()){return Ok(AccountMappingChanges::empty())}
  let now=chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs,false);
  require_dependencies(db,deps,"PHP fallback: projection changed before cached post-media writer").await?;
  grant.current(db,status).await?;
@@ -123,6 +134,38 @@ async fn touch_post_media(db:&Client,deps:&mut Vec<Dependency>,source_url:&str,g
 #[cfg(test)]
 mod tests{
  use super::*;
+ #[tokio::test]
+ #[ignore="disposable local PostgreSQL (LIBRARY_FIXTURE_DB)"]
+ async fn current_mapping_and_fresh_touch_skip_writes(){
+  let url=std::env::var("LIBRARY_FIXTURE_DB").unwrap();assert!(url.contains("/tmp/"));let db=crate::db::connect(&url).await.unwrap();
+  let schema=format!("profile_effect_skip_{}",std::process::id());db.batch_execute(&format!("CREATE SCHEMA {schema};SET search_path={schema};CREATE TABLE ap_users(id BIGINT,actor_key TEXT,disabled_at TEXT);CREATE TABLE remote_actors(actor_id TEXT,username TEXT,host TEXT);CREATE TABLE following(actor_id TEXT,host TEXT);CREATE TABLE events(actor_id TEXT,type TEXT);CREATE TABLE masto_account_actors(account_id TEXT PRIMARY KEY,actor_id TEXT UNIQUE,updated_at TEXT);CREATE TABLE remote_post_media_cache(source_url TEXT,public_url TEXT,last_used_at TEXT)")).await.unwrap();
+  let actor="https://remote.test/users/a";let remember=DeferredProjectionEffect{source_index:0,effect:ProjectionEffect::RememberAccount{account_id:"123".into(),actor:actor.into()}};
+  async fn mapping(db:&Client)->Vec<String>{db.query("SELECT account_id||' '||actor_id||' '||updated_at FROM masto_account_actors ORDER BY account_id",&[]).await.unwrap().iter().map(|r|r.get::<_,String>(0)).collect()}
+  // Already current: no write, so updated_at keeps its value.
+  db.execute("INSERT INTO masto_account_actors VALUES('123',$1,'original')",&[&actor]).await.unwrap();
+  assert!(apply(&db,&mut vec![],&remember,&Grant::Search,&json!({})).await.unwrap().changes.is_empty());
+  assert_eq!(mapping(&db).await,vec![format!("123 {actor} original")]);
+  // A slash variant is not current and is rewritten to the canonical actor.
+  db.execute("UPDATE masto_account_actors SET actor_id=$1",&[&format!("{actor}/")]).await.unwrap();
+  assert!(!apply(&db,&mut vec![],&remember,&Grant::Search,&json!({})).await.unwrap().changes.is_empty());
+  assert_eq!(mapping(&db).await.len(),1);assert!(mapping(&db).await[0].starts_with(&format!("123 {actor} ")));
+  // Another id on the alias still gets deleted even when 123 is current.
+  db.batch_execute("ALTER TABLE masto_account_actors DROP CONSTRAINT masto_account_actors_actor_id_key").await.unwrap();
+  db.execute("INSERT INTO masto_account_actors VALUES('999',$1,'other')",&[&format!("{actor}/")]).await.unwrap();
+  apply(&db,&mut vec![],&remember,&Grant::Search,&json!({})).await.unwrap();
+  assert!(mapping(&db).await.iter().all(|row|row.starts_with("123 ")));
+  // Media used within a day is not touched again; older rows are.
+  let source="https://remote.test/media/a.jpg";let touch=DeferredProjectionEffect{source_index:0,effect:ProjectionEffect::PostMediaTouch{source_url:source.into()}};
+  let fresh=chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs,false);
+  db.execute("INSERT INTO remote_post_media_cache VALUES($1,'https://media.test/a.webp',$2)",&[&source,&fresh]).await.unwrap();
+  let key=json!({"source_url":source});let mut deps=vec![Dependency::new(POST_MEDIA,key.clone(),Dependency::read(&db,POST_MEDIA,&key).await.unwrap())];
+  assert!(apply(&db,&mut deps,&touch,&Grant::Search,&json!({})).await.unwrap().changes.is_empty());
+  db.execute("UPDATE remote_post_media_cache SET last_used_at='2020-01-01T00:00:00+00:00'",&[]).await.unwrap();
+  let mut deps=vec![Dependency::new(POST_MEDIA,key.clone(),Dependency::read(&db,POST_MEDIA,&key).await.unwrap())];
+  assert!(!apply(&db,&mut deps,&touch,&Grant::Search,&json!({})).await.unwrap().changes.is_empty());
+  let used:String=db.query_one("SELECT last_used_at FROM remote_post_media_cache",&[]).await.unwrap().get(0);assert!(used.as_str()>"2020-01-01T00:00:00+00:00");
+  db.batch_execute(&format!("DROP SCHEMA {schema} CASCADE")).await.unwrap();
+ }
  #[tokio::test]
  #[ignore="actual PHP account remember helper in disposable SQL"]
  async fn actual_account_writer_helpers_and_bound_sources(){
