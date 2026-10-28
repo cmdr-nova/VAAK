@@ -7083,6 +7083,35 @@ function admin_trend_status_hidden(array $item, int $ownerUserId, array $refs, i
     return false;
 }
 
+/**
+ * Seven-day usage sparkline for a trending tag, oldest day on the left.
+ * Mastodon history lists today first; the shape is drawn from those counts only.
+ *
+ * @param array<int,mixed> $history
+ */
+function admin_trend_sparkline_svg(array $history): string
+{
+    $uses = [];
+    foreach (array_slice(array_values($history), 0, 7) as $day) {
+        $uses[] = is_array($day) ? max(0, (int) ($day['uses'] ?? 0)) : 0;
+    }
+    while (count($uses) < 7) $uses[] = 0;
+    $uses = array_reverse($uses);
+    $w = 56; $h = 24; $pad = 2;
+    $max = max($uses);
+    $step = $w / (count($uses) - 1);
+    $points = [];
+    foreach ($uses as $i => $n) {
+        $y = $max > 0 ? $h - $pad - ($n / $max) * ($h - 2 * $pad) : $h - $pad;
+        $points[] = round($i * $step, 1) . ',' . round($y, 1);
+    }
+    $line = implode(' ', $points);
+    return '<svg class="trend-spark" viewBox="0 0 ' . $w . ' ' . $h . '" width="' . $w . '" height="' . $h
+        . '" preserveAspectRatio="none" aria-hidden="true" focusable="false">'
+        . '<polygon class="trend-spark-area" points="0,' . $h . ' ' . $line . ' ' . $w . ',' . $h . '"/>'
+        . '<polyline class="trend-spark-line" points="' . $line . '"/></svg>';
+}
+
 /** Fresh local display preference, independent of cached candidate/HTML authority. */
 function admin_trends_display_state(?array $user = null): array
 {
@@ -7204,9 +7233,10 @@ function admin_trends_sidebar_html(string $viewForTrends, bool $allowStale = tru
                     $usesWeek += (int) ($hday['uses'] ?? 0);
                 }
             }
-            $html .= '<div class="bar-row"><span><a href="?view=search&amp;q='
-                . urlencode('#' . $tname) . '">#' . h($tname) . '</a></span>'
-                . '<span class="meta" title="uses today / 7d">' . $usesToday . '/' . $usesWeek . '</span></div>';
+            $html .= '<div class="trend-tag-row"><span class="trend-tag-text"><a href="?view=search&amp;q='
+                . urlencode('#' . $tname) . '">#' . h($tname) . '</a>'
+                . '<span class="meta">' . $usesToday . ' today · ' . $usesWeek . ' this week</span></span>'
+                . admin_trend_sparkline_svg(is_array($tg['history'] ?? null) ? $tg['history'] : []) . '</div>';
         }
     }
     $html .= '</div>';
@@ -29972,6 +30002,13 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     details.side-drop .side-drop-body a { color: var(--muted); font-size: .9rem; }
     details.side-drop .side-drop-body a:hover { color: var(--primary); }
     .bar-row { display: flex; justify-content: space-between; gap: .5rem; font-size: .85rem; margin: .3rem 0; }
+    .trend-tag-row { display: flex; align-items: center; justify-content: space-between; gap: .6rem; margin: .45rem 0; font-size: .85rem; min-width: 0; }
+    .trend-tag-text { display: flex; flex-direction: column; min-width: 0; }
+    .trend-tag-text a { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .trend-tag-text .meta { font-size: .72rem; }
+    .trend-spark { flex: none; color: var(--primary); overflow: visible; }
+    .trend-spark-area { fill: currentColor; fill-opacity: .14; stroke: none; }
+    .trend-spark-line { fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linejoin: round; stroke-linecap: round; vector-effect: non-scaling-stroke; }
     .bar-row span:last-child { color: var(--primary); }
 
     .flash {
