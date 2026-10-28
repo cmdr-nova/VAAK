@@ -182,6 +182,10 @@ pub async fn serve(cfg: Config, bind: SocketAddr) -> Result<()> {
         // copy the viewer's signer extension signed (nostr::act).
         .route("/shadow/nostr-prepare", post(shadow_nostr_prepare))
         .route("/shadow/nostr-publish", post(shadow_nostr_publish))
+        // Stored notes as timeline statuses, for PHP bookmark rows (nostr:{id}).
+        .route("/shadow/nostr-statuses", post(shadow_nostr_statuses))
+        // One Nostr card's HTML, for PHP pages that fall back from Rust.
+        .route("/shadow/nostr-card", post(shadow_nostr_card))
         .route_layer(axum::middleware::from_fn_with_state(shadow_token, crate::shadow_auth::require));
     let mut app = Router::new()
         .route("/healthz", get(healthz))
@@ -257,7 +261,9 @@ async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
             "/shadow/feed-since-html",
             "/api/v1/notifications",
             "/shadow/nostr-prepare (POST)",
-            "/shadow/nostr-publish (POST)"
+            "/shadow/nostr-publish (POST)",
+            "/shadow/nostr-statuses (POST)",
+            "/shadow/nostr-card (POST)"
         ],
     }))
 }
@@ -698,6 +704,46 @@ async fn shadow_nostr_publish(State(state): State<AppState>, Json(body): Json<No
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"ok": false, "error": "owner required"}))).into_response();
     }
     nostr_reply(crate::nostr::act::publish(&state.cfg, body.owner_id, &body.nonce, &body.event).await)
+}
+
+#[derive(serde::Deserialize)]
+struct NostrStatusesBody {
+    ids: Vec<String>,
+}
+
+async fn shadow_nostr_statuses(State(state): State<AppState>, Json(body): Json<NostrStatusesBody>) -> axum::response::Response {
+    let mut ids: Vec<String> = body.ids.into_iter().map(|id| id.to_ascii_lowercase()).filter(|id| crate::nostr::event::is_hex64(id)).collect();
+    ids.sort();
+    ids.dedup();
+    ids.truncate(100);
+    let res = async {
+        let db = crate::db::connect(&state.cfg.database_url).await?;
+        Ok(serde_json::json!({"ok": true, "statuses": crate::nostr::share::cards(&db, &ids).await}))
+    }
+    .await;
+    nostr_reply(res)
+}
+
+#[derive(serde::Deserialize)]
+struct NostrCardBody {
+    owner_id: i64,
+    from: String,
+    status: serde_json::Value,
+}
+
+async fn shadow_nostr_card(State(state): State<AppState>, Json(body): Json<NostrCardBody>) -> axum::response::Response {
+    if body.owner_id < 1 || !crate::nostr::render::is_nostr_status(&body.status) {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"ok": false, "error": "Nostr status required"}))).into_response();
+    }
+    let from: String = body.from.chars().filter(|c| c.is_ascii_lowercase() || *c == '_').take(32).collect();
+    let res = async {
+        let db = crate::db::connect(&state.cfg.database_url).await?;
+        let mut statuses = vec![body.status];
+        crate::nostr::act::stamp_viewer_flags(&db, body.owner_id, &mut statuses).await;
+        Ok(serde_json::json!({"ok": true, "html": crate::notif_embed::paint_lean_feed_card_opts(&statuses[0], &from, "")}))
+    }
+    .await;
+    nostr_reply(res)
 }
 
 async fn shadow_home_html(

@@ -3124,6 +3124,16 @@ pub async fn warm_home_native(cfg: &Config, owner_user_id: i64) -> Result<String
             "native home nostr merge skipped"
         ),
     }
+    // VAAK boosts and quotes of Nostr notes by accounts the owner follows
+    // (and the owner's own), like RSS boosts but on Home too.
+    match crate::nostr::share::home_boost_keys(&db, owner_user_id, true, i64::MAX, 120).await {
+        Ok(keys) => ranked = crate::nostr::share::merge_home_boosts(ranked, &keys),
+        Err(e) => tracing::warn!(
+            owner = owner_user_id,
+            error = %format!("{e:#}"),
+            "native home nostr boosts skipped"
+        ),
+    }
     if let Err(e) = collapse_bridgy_twins(&db, &mut ranked).await {
         tracing::warn!(
             owner = owner_user_id,

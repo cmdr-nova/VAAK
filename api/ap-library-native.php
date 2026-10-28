@@ -146,6 +146,11 @@ function ap_library_native_render_batch(array $statuses, string $view, array $sa
             if (!is_array($status) || ap_library_native_quote_tree_requires_php($status)) {
                 return null;
             }
+            // Nostr bookmarks have no native Library painter yet; the PHP
+            // path asks the worker for their Home card (ap_nostr_card_html).
+            if (str_starts_with((string) ($status['id'] ?? ''), 'nostr:')) {
+                return null;
+            }
         }
     } catch (Throwable $error) {
         return null;

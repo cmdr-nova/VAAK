@@ -16,7 +16,8 @@
 //!     since that key's last good sync (at most 48 h back). Every event's id
 //!     and signature are checked before it is stored.
 //!  4. Clean-up: notes older than the retention window, notes and profiles
-//!     nobody follows any more, follows of removed links.
+//!     nobody follows any more, follows of removed links. Notes a VAAK user
+//!     boosted, quoted or bookmarked stay (and their authors' profiles).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Duration;
@@ -535,15 +536,43 @@ async fn sync_notes(db: &mut Client, s: &Settings, now: i64, deadline: Instant) 
     Ok(report)
 }
 
+/// Notes a VAAK user boosted, quoted (both their quote and the quoted
+/// note) or bookmarked stay past retention and unfollows, like a boosted
+/// remote post outlives media clean-up. `e` is the nostr_events row.
+const KEPT_NOTE_SQL: &str = "EXISTS (SELECT 1 FROM masto_reblogs r WHERE r.status_id = 'nostr:' || e.id)
+    OR EXISTS (SELECT 1 FROM masto_bookmarks b WHERE b.status_id = 'nostr:' || e.id)
+    OR EXISTS (SELECT 1 FROM nostr_shares s WHERE s.event_id = e.id OR s.note_id = e.id)";
+
+async fn shares_ready(db: &Client) -> bool {
+    db.query_one("SELECT to_regclass('nostr_shares') IS NOT NULL", &[])
+        .await
+        .map(|r| r.get::<_, bool>(0))
+        .unwrap_or(false)
+}
+
 async fn cleanup(db: &Client, s: &Settings, now: i64) -> Result<u64> {
     let cutoff = now - s.retention_days * 86_400;
-    let mut n = db.execute("DELETE FROM nostr_events WHERE created_at < $1", &[&cutoff]).await?;
+    // Until the nostr_shares migration has run nothing can be shared yet.
+    let keep = if shares_ready(db).await { format!(" AND NOT ({KEPT_NOTE_SQL})") } else { String::new() };
+    let mut n = db.execute(&format!("DELETE FROM nostr_events e WHERE e.created_at < $1{keep}"), &[&cutoff]).await?;
     n += db
         .execute("DELETE FROM nostr_follows f WHERE NOT EXISTS (SELECT 1 FROM nostr_links l WHERE l.owner_user_id = f.owner_user_id)", &[])
         .await?;
     n += db
-        .execute("DELETE FROM nostr_events e WHERE NOT EXISTS (SELECT 1 FROM nostr_follows f WHERE f.pubkey = e.pubkey)", &[])
+        .execute(
+            &format!("DELETE FROM nostr_events e WHERE NOT EXISTS (SELECT 1 FROM nostr_follows f WHERE f.pubkey = e.pubkey){keep}"),
+            &[],
+        )
         .await?;
+    // Shares of a removed link go with it; their VAAK boosts stay as rows
+    // until the user undoes them, so keep the notes those rows show.
+    n += db
+        .execute(
+            "DELETE FROM nostr_shares s WHERE NOT EXISTS (SELECT 1 FROM nostr_links l WHERE l.owner_user_id = s.owner_user_id)",
+            &[],
+        )
+        .await
+        .unwrap_or(0);
     // Added by a later migration; skip quietly until it has run.
     n += db
         .execute(
@@ -556,7 +585,8 @@ async fn cleanup(db: &Client, s: &Settings, now: i64) -> Result<u64> {
     n += db
         .execute(
             "DELETE FROM nostr_profiles p WHERE NOT EXISTS (SELECT 1 FROM nostr_follows f WHERE f.pubkey = p.pubkey)
-               AND NOT EXISTS (SELECT 1 FROM nostr_links l WHERE l.pubkey = p.pubkey)",
+               AND NOT EXISTS (SELECT 1 FROM nostr_links l WHERE l.pubkey = p.pubkey)
+               AND NOT EXISTS (SELECT 1 FROM nostr_events e WHERE e.pubkey = p.pubkey)",
             &[],
         )
         .await?;

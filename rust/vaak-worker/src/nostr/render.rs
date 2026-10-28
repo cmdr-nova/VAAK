@@ -262,11 +262,53 @@ fn iso_time(ts: i64) -> String {
         .to_string()
 }
 
+/// The note a NIP-18 quote points at: its first `q` tag with an event id.
+pub fn quote_target(tags: &Value) -> Option<String> {
+    tags.as_array()?
+        .iter()
+        .filter_map(Value::as_array)
+        .filter(|t| t.first().and_then(Value::as_str) == Some("q"))
+        .filter_map(|t| t.get(1).and_then(Value::as_str))
+        .map(str::to_ascii_lowercase)
+        .find(|id| super::event::is_hex64(id))
+}
+
+/// Drop the `nostr:note1…` / `nostr:nevent1…` reference to `quoted` that a
+/// quote's text carries; the quoted card shows it instead.
+fn strip_quote_reference(content: &str, quoted: &str) -> String {
+    let mut out = String::with_capacity(content.len());
+    for (i, part) in content.split(' ').enumerate() {
+        let mut kept = String::new();
+        for (j, line) in part.split('\n').enumerate() {
+            let points_at_quote = trim_url_tail(line)
+                .strip_prefix("nostr:")
+                .and_then(bech32::decode_entity)
+                .is_some_and(|(hrp, hex)| matches!(hrp.as_str(), "note" | "nevent") && hex == quoted);
+            if j > 0 {
+                kept.push('\n');
+            }
+            if !points_at_quote {
+                kept.push_str(line);
+            }
+        }
+        if i > 0 {
+            out.push(' ');
+        }
+        out.push_str(&kept);
+    }
+    out.trim().to_string()
+}
+
 pub fn materialize(row: &NostrRow) -> Value {
     let status_id = format!("nostr:{}", row.id);
     let note = bech32::note(&row.id);
     let url = format!("{VIEWER}{note}");
-    let (content, media) = content_and_media(&status_id, &row.content, &row.tags);
+    let quoted = quote_target(&row.tags);
+    let text = match &quoted {
+        Some(q) => strip_quote_reference(&row.content, q),
+        None => row.content.clone(),
+    };
+    let (content, media) = content_and_media(&status_id, &text, &row.tags);
     let mut st = vaak_types::TimelineStatus::base(&status_id, &iso_time(row.created_at), &content, &format!("nostr:{note}"), &url, account(row));
     let (typed_media, bad) = vaak_types::TimelineStatus::media_from_values(media);
     for e in bad {
@@ -282,6 +324,9 @@ pub fn materialize(row: &NostrRow) -> Value {
     v["source"] = json!("nostr");
     v["vaak_nostr_event_id"] = json!(row.id);
     v["vaak_nostr_pubkey"] = json!(row.pubkey);
+    if let Some(q) = quoted {
+        v["vaak_nostr_quote_id"] = json!(q);
+    }
     v
 }
 
@@ -373,8 +418,20 @@ mod tests {
         assert!(html.contains(&format!("data-nostr-act=\"reply\" data-nostr-target=\"{}\"", r.id)), "{html}");
         assert!(html.contains(&format!("data-nostr-act=\"like\" data-nostr-target=\"{}\"", r.id)), "{html}");
         assert!(html.contains(&format!("data-nostr-act=\"unfollow\" data-nostr-target=\"{}\"", r.pubkey)), "{html}");
-        assert!(!html.contains("ph-repeat") && !html.contains("ph-quotes"), "no boost or quote on Nostr: {html}");
-        assert!(!html.contains("compose=1"), "no reply or quote links: {html}");
+        assert!(!html.contains("compose=1"), "no VAAK reply or quote links: {html}");
+        // Same order as other posts: reply, quote, boost, like, bookmark, ⋯.
+        let at = |needle: &str| html.find(needle).unwrap_or_else(|| panic!("{needle} missing: {html}"));
+        let order = [
+            at("data-nostr-act=\"reply\""),
+            at("data-nostr-act=\"quote\""),
+            at("data-nostr-act=\"repost\""),
+            at("data-nostr-act=\"like\""),
+            at("value=\"bookmark_status\""),
+            at("post-action-menu"),
+        ];
+        assert!(order.windows(2).all(|w| w[0] < w[1]), "action order {order:?}: {html}");
+        assert!(html.contains(&format!("name=\"status_id\" value=\"nostr:{}\"", r.id)), "VAAK bookmark key: {html}");
+        assert!(!html.contains("Delete on Nostr"), "{html}");
         assert!(!html.contains("view=status"), "links stay off the in-app status view: {html}");
         assert!(html.contains(&format!("data-copy-value=\"{njump}\"")), "copy gives the njump link: {html}");
         assert!(html.contains("spoilers"), "{html}");
@@ -386,5 +443,27 @@ mod tests {
         let html = crate::notif_embed::paint_lean_embed_from(&liked, false, "home", "", true);
         assert!(html.contains("aria-pressed=\"true\" title=\"Unlike on Nostr\""), "{html}");
         assert!(html.contains(">Follow on Nostr</button>"), "{html}");
+
+        let mut own = st.clone();
+        own["vaak_nostr_mine"] = json!(true);
+        own["vaak_nostr_reposted"] = json!(true);
+        own["bookmarked"] = json!(true);
+        let html = crate::notif_embed::paint_lean_embed_from(&own, false, "home", "", true);
+        assert!(html.contains(&format!("data-nostr-act=\"delete\" data-nostr-target=\"{}\"", r.id)), "{html}");
+        assert!(!html.contains("Follow on Nostr"), "no follow on your own note: {html}");
+        assert!(html.contains("aria-pressed=\"true\" title=\"Undo repost\""), "{html}");
+        assert!(html.contains("value=\"unbookmark_status\""), "{html}");
+    }
+
+    #[test]
+    fn quote_drops_its_reference_and_names_the_target() {
+        let target = "ab".repeat(32);
+        let text = format!("look at this\n\nnostr:{}", bech32::note(&target));
+        let st = materialize(&row(&text, json!([["q", target, "wss://nos.lol", "aa"]])));
+        assert_eq!(st["vaak_nostr_quote_id"], target);
+        assert_eq!(st["content"], "<p>look at this</p>");
+        let other = "cd".repeat(32);
+        let st = materialize(&row(&format!("x nostr:{}", bech32::note(&other)), json!([["q", target]])));
+        assert!(st["content"].as_str().unwrap().contains("njump.me/note1"), "other references stay: {}", st["content"]);
     }
 }

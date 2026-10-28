@@ -146,6 +146,11 @@ pub fn merge_ranked(ranked: Vec<Value>, keys: &[NostrKey]) -> Vec<Value> {
         .filter(|k| !seen.contains(k.id.as_str()))
         .map(|k| json!({"k": "nostr", "id": k.id, "s": "nostr", "sort": k.sort}))
         .collect();
+    interleave(ranked, queued)
+}
+
+/// Merge `queued` (newest first) into `ranked` by `sort`, newest first.
+pub fn interleave(ranked: Vec<Value>, queued: Vec<Value>) -> Vec<Value> {
     if queued.is_empty() {
         return ranked;
     }

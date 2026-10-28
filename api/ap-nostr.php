@@ -360,7 +360,7 @@ function ap_nostr_action(string $action, int $ownerUserId, bool $isAdmin, array 
     if ($action === 'nostr_prepare') {
         $purpose = (string) ($post['purpose'] ?? '');
         $target = strtolower(trim((string) ($post['target'] ?? '')));
-        if (!in_array($purpose, ['like', 'reply', 'follow', 'unfollow'], true) || !preg_match('/^[0-9a-f]{64}$/', $target)) {
+        if (!in_array($purpose, ['like', 'reply', 'repost', 'quote', 'delete', 'follow', 'unfollow'], true) || !preg_match('/^[0-9a-f]{64}$/', $target)) {
             return $fail(400, 'Unknown Nostr action.');
         }
         $path = '/shadow/nostr-prepare';
@@ -376,6 +376,18 @@ function ap_nostr_action(string $action, int $ownerUserId, bool $isAdmin, array 
     } else {
         return $fail(400, 'Unknown Nostr action.');
     }
+    // Follow edits read the current list from relays before answering.
+    return ap_nostr_worker_call($path, $payload, 30000);
+}
+
+/**
+ * POST to the worker's shadow API on loopback.
+ *
+ * @return array{status:int, body:array<string,mixed>}
+ */
+function ap_nostr_worker_call(string $path, array $payload, int $timeoutMs): array
+{
+    $fail = static fn (int $status, string $error): array => ['status' => $status, 'body' => ['ok' => false, 'error' => $error]];
     $base = getenv('VAAK_SHADOW_HTTP');
     $base = is_string($base) && trim($base) !== '' ? rtrim(trim($base), '/') : 'http://127.0.0.1:8787';
     $host = parse_url($base, PHP_URL_HOST);
@@ -393,13 +405,12 @@ function ap_nostr_action(string $action, int $ownerUserId, bool $isAdmin, array 
     if ($ch === false) {
         return $fail(503, 'The Nostr worker is not reachable.');
     }
-    // Follow edits read the current list from relays before answering.
     curl_setopt_array($ch, [
         CURLOPT_POST => true,
         CURLOPT_POSTFIELDS => $json,
         CURLOPT_RETURNTRANSFER => true,
         CURLOPT_CONNECTTIMEOUT_MS => 250,
-        CURLOPT_TIMEOUT_MS => 30000,
+        CURLOPT_TIMEOUT_MS => $timeoutMs,
         CURLOPT_FOLLOWLOCATION => false,
         CURLOPT_HTTPHEADER => array_merge(['Content-Type: application/json', 'Accept: application/json'], ap_shadow_http_auth_headers()),
     ]);
@@ -411,4 +422,52 @@ function ap_nostr_action(string $action, int $ownerUserId, bool $isAdmin, array 
         return $fail(502, 'The Nostr worker did not answer. Try again in a minute.');
     }
     return ['status' => $code === 200 ? 200 : max(400, $code), 'body' => $body];
+}
+
+/**
+ * Stored Nostr notes as Mastodon-shaped statuses (the worker paints them the
+ * same way Home does), keyed by hex id. Missing or unreachable: left out.
+ * Cached for the request, so a Bookmarks page asks once per note.
+ *
+ * @param list<string> $ids
+ * @return array<string, array<string,mixed>>
+ */
+function ap_nostr_statuses(array $ids): array
+{
+    static $cache = [];
+    $want = [];
+    foreach ($ids as $id) {
+        $id = strtolower(trim((string) $id));
+        if (preg_match('/^[0-9a-f]{64}$/', $id) && !array_key_exists($id, $cache)) {
+            $want[$id] = true;
+        }
+    }
+    if ($want !== []) {
+        $res = ap_nostr_worker_call('/shadow/nostr-statuses', ['ids' => array_keys($want)], 3000);
+        $found = is_array($res['body']['statuses'] ?? null) ? $res['body']['statuses'] : [];
+        foreach (array_keys($want) as $id) {
+            $cache[$id] = is_array($found[$id] ?? null) ? $found[$id] : null;
+        }
+    }
+    $out = [];
+    foreach ($ids as $id) {
+        $id = strtolower(trim((string) $id));
+        if (is_array($cache[$id] ?? null)) {
+            $out[$id] = $cache[$id];
+        }
+    }
+    return $out;
+}
+
+/**
+ * Card HTML for one Nostr status, painted by the worker like Home paints it
+ * (signed actions, VAAK bookmark). '' when the worker can't be reached.
+ */
+function ap_nostr_card_html(array $status, int $ownerUserId, string $view): string
+{
+    if ($ownerUserId < 1 || !str_starts_with((string) ($status['id'] ?? ''), 'nostr:')) {
+        return '';
+    }
+    $res = ap_nostr_worker_call('/shadow/nostr-card', ['owner_id' => $ownerUserId, 'from' => $view, 'status' => $status], 3000);
+    return !empty($res['body']['ok']) && is_string($res['body']['html'] ?? null) ? $res['body']['html'] : '';
 }

@@ -143,6 +143,8 @@ pub async fn raw_window(
     if view == "home" {
         let (rows, full) = nostr_page(db, owner_user_id, &cursor, fetch_limit).await;
         pull(rows, full, &mut parts, &mut any_full);
+        let (rows, full) = nostr_boost_page(db, owner_user_id, &cursor, fetch_limit).await;
+        pull(rows, full, &mut parts, &mut any_full);
     }
 
     let mut rows = Vec::new();
@@ -714,6 +716,39 @@ async fn nostr_page(
         .filter(|row| !row.at.is_empty() && row.is_older_than(cursor.as_ref()))
         .collect();
     (rows, full)
+}
+
+/// VAAK boosts of Nostr notes by local accounts the owner follows (see
+/// nostr::share). The owner's own boosts already come from `reblog_page`.
+async fn nostr_boost_page(
+    db: &Client,
+    owner_user_id: i64,
+    cursor: &Option<TlCursor>,
+    fetch_limit: i64,
+) -> (Vec<OlderRow>, bool) {
+    if owner_user_id < 1 || crate::nostr::sync::disabled_by_env() {
+        return (Vec::new(), false);
+    }
+    let bound = bound_of(cursor, "boost");
+    let (pred, next_n) = predicate(&bound, "created_at", "id", 3);
+    let pred_sql = if bound.op == "none" { String::new() } else { format!(" AND ({pred})") };
+    let limit_n = if bound.op == "none" { 3 } else { next_n };
+    let sql = format!(
+        "SELECT id::bigint, COALESCE(status_id,''), COALESCE(created_at::text,''), \
+                COALESCE(owner_actor_id,''), COALESCE(object_id,'') \
+         FROM masto_reblogs \
+         WHERE status_id LIKE 'nostr:%' AND owner_user_id::bigint <> $1 AND owner_actor_id LIKE $2 \
+           AND rtrim(owner_actor_id, '/') IN ( \
+             SELECT rtrim(f.actor_id, '/') FROM following f \
+             JOIN ap_users u ON rtrim(f.owner_actor_id, '/') = rtrim(u.actor_id, '/') \
+             WHERE u.id::bigint = $1){pred_sql} \
+         ORDER BY created_at DESC, id DESC LIMIT ${limit_n}"
+    );
+    let prefix = format!("{}%", crate::nostr::share::LOCAL_ACTOR_PREFIX);
+    let id_i = bound.id.parse::<i64>().unwrap_or(0);
+    let mut params: Vec<&(dyn ToSql + Sync)> = vec![&owner_user_id, &prefix];
+    bind_bound(&bound, true, &id_i, &fetch_limit, &mut params);
+    map_reblogs(db, &sql, &params, fetch_limit, true).await
 }
 
 #[cfg(test)]

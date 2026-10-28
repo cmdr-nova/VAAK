@@ -98,6 +98,12 @@ $check(ap_nostr_action('nostr_prepare', 1, false, ['purpose' => 'like', 'target'
 $check(ap_nostr_action('nostr_prepare', 0, true, ['purpose' => 'like', 'target' => $hex])['status'] === 401, 'no user, no action');
 $check(ap_nostr_action('nostr_prepare', 1, true, ['purpose' => 'boost_everything', 'target' => $hex])['status'] === 400, 'unknown purpose refused');
 $check(ap_nostr_action('nostr_prepare', 1, true, ['purpose' => 'like', 'target' => 'note1abc'])['status'] === 400, 'non-hex target refused');
+foreach (['repost', 'quote', 'delete'] as $purpose) {
+    $res = ap_nostr_action('nostr_prepare', 1, true, ['purpose' => $purpose, 'target' => $hex]);
+    $check(($res['body']['error'] ?? '') !== 'Unknown Nostr action.', "{$purpose} passes PHP checks and goes to the worker");
+    $check(ap_nostr_action('nostr_prepare', 1, true, ['purpose' => $purpose, 'target' => 'nope'])['status'] === 400, "{$purpose} still needs a hex target");
+}
+$check(ap_nostr_action('nostr_prepare', 1, true, ['purpose' => 'unrepost', 'target' => $hex])['status'] === 400, 'unrepost is chosen by the worker, not asked for');
 $check(ap_nostr_action('nostr_publish', 1, true, ['nonce' => 'xyz', 'event' => '{}'])['status'] === 400, 'bad nonce refused');
 $check(ap_nostr_action('nostr_publish', 1, true, ['nonce' => str_repeat('a', 32), 'event' => 'not json'])['status'] === 400, 'non-JSON event refused');
 $check(ap_nostr_action('nostr_sign_anything', 1, true, [])['status'] === 400, 'unknown action refused');
