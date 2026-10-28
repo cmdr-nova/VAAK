@@ -19,6 +19,12 @@ const HOME_MAX_NOTES: i64 = 600;
 pub struct NostrKey {
     pub id: String,
     pub sort: i64,
+    /// Author of the note the card shows (the reposted note's author for a
+    /// repost) and its text, for downranking.
+    pub author: String,
+    pub text: String,
+    /// The shown note's id (differs from `id` for a repost).
+    pub note: String,
 }
 
 struct Candidate {
@@ -29,12 +35,44 @@ struct Candidate {
     reply_pubkeys: Vec<String>,
     reply_to: String,
     content: String,
+    /// Kind 6 only: the reposted note's author and text, when stored.
+    repost_of: Option<(String, String)>,
+    is_repost: bool,
+}
+
+impl Candidate {
+    /// The note the card shows: itself, or the note it reposts.
+    fn shown(&self) -> (&str, &str, &str) {
+        match &self.repost_of {
+            Some((pk, text)) => (self.reply_to.as_str(), pk.as_str(), text.as_str()),
+            None => (self.id.as_str(), self.pubkey.as_str(), self.content.as_str()),
+        }
+    }
+}
+
+/// Drop what the owner hid, reposts whose note isn't stored, muted text,
+/// and second copies of a note (a note and its reposts show once, newest).
+fn pick(candidates: Vec<Candidate>, hidden: &HashSet<String>, muted: impl Fn(&str) -> bool) -> Vec<NostrKey> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for c in candidates {
+        if c.is_repost && c.repost_of.is_none() {
+            continue;
+        }
+        let (note, author, text) = c.shown();
+        if hidden.contains(&c.pubkey) || hidden.contains(author) || muted(text) || !seen.insert(note.to_string()) {
+            continue;
+        }
+        let (note, author, text) = (note.to_string(), author.to_string(), text.to_string());
+        out.push(NostrKey { id: c.id, sort: c.created_at, author, text, note });
+    }
+    out
 }
 
 /// A reply stays when everyone it answers is followed (or the author
 /// themself): by its p tags, or else by the stored parent note's author.
 fn reply_in_graph(c: &Candidate, follows: &HashSet<String>, parent_author: Option<&String>) -> bool {
-    if !c.is_reply {
+    if !c.is_reply || c.is_repost {
         return true;
     }
     let ok = |pk: &String| pk == &c.pubkey || follows.contains(pk);
@@ -86,12 +124,15 @@ async fn select_keys<F: Fn(&str) -> bool + Sync>(
     if follows.is_empty() {
         return Ok(Vec::new());
     }
+    // A repost's reply_to is the note it reposts (nostr::sync).
     let rows = db
         .query(
-            "SELECT e.id, e.pubkey, e.created_at, e.is_reply, e.reply_pubkeys, e.reply_to, left(e.content, 4000)
+            "SELECT e.id, e.pubkey, e.created_at, e.is_reply, e.reply_pubkeys, e.reply_to, left(e.content, 4000),
+                    e.kind, t.pubkey, left(t.content, 4000)
              FROM nostr_events e
+             LEFT JOIN nostr_events t ON e.kind = 6 AND t.id = e.reply_to AND t.kind = 1
              WHERE e.pubkey IN (SELECT pubkey FROM nostr_follows WHERE owner_user_id = $1)
-               AND e.kind = 1 AND e.created_at >= $2 AND e.created_at <= $3
+               AND e.kind IN (1, 6) AND e.created_at >= $2 AND e.created_at <= $3
              ORDER BY e.created_at DESC, e.id DESC
              LIMIT $4",
             &[&owner, &since, &at_most, &limit],
@@ -100,19 +141,25 @@ async fn select_keys<F: Fn(&str) -> bool + Sync>(
         .context("nostr notes for home")?;
     let candidates: Vec<Candidate> = rows
         .iter()
-        .map(|r| Candidate {
-            id: r.get(0),
-            pubkey: r.get(1),
-            created_at: r.get(2),
-            is_reply: r.get(3),
-            reply_pubkeys: r.get(4),
-            reply_to: r.get(5),
-            content: r.get(6),
+        .map(|r| {
+            let is_repost = r.get::<_, i32>(7) == 6;
+            let target: Option<String> = r.get(8);
+            Candidate {
+                id: r.get(0),
+                pubkey: r.get(1),
+                created_at: r.get(2),
+                is_reply: r.get(3),
+                reply_pubkeys: r.get(4),
+                reply_to: r.get(5),
+                content: r.get(6),
+                repost_of: target.map(|pk| (pk, r.get::<_, Option<String>>(9).unwrap_or_default())),
+                is_repost,
+            }
         })
         .collect();
     let parents: Vec<String> = candidates
         .iter()
-        .filter(|c| c.is_reply && c.reply_pubkeys.is_empty() && !c.reply_to.is_empty())
+        .filter(|c| c.is_reply && !c.is_repost && c.reply_pubkeys.is_empty() && !c.reply_to.is_empty())
         .map(|c| c.reply_to.clone())
         .collect();
     let parent_authors: HashMap<String, String> = if parents.is_empty() {
@@ -125,12 +172,12 @@ async fn select_keys<F: Fn(&str) -> bool + Sync>(
             .map(|r| (r.get(0), r.get(1)))
             .collect()
     };
-    Ok(candidates
+    let hidden = super::moderation::hidden_keys(db, owner).await;
+    let in_graph: Vec<Candidate> = candidates
         .into_iter()
         .filter(|c| reply_in_graph(c, &follows, parent_authors.get(&c.reply_to)))
-        .filter(|c| !muted(&c.content))
-        .map(|c| NostrKey { id: c.id, sort: c.created_at })
-        .collect())
+        .collect();
+    Ok(pick(in_graph, &hidden, muted))
 }
 
 /// Interleave Nostr keys into a ranked Home list by `sort` (newest first),
@@ -171,17 +218,38 @@ pub fn interleave(ranked: Vec<Value>, queued: Vec<Value>) -> Vec<Value> {
     out
 }
 
-/// Stored note + author profile for each id, for hydration.
+/// Stored note + author profile for each id, for hydration. A repost
+/// comes back with the note it reposts attached.
 pub async fn fetch_rows(db: &Client, ids: &[String]) -> Result<HashMap<String, NostrRow>> {
     if ids.is_empty() || super::sync::disabled_by_env() || !super::sync::tables_ready(db).await {
         return Ok(HashMap::new());
     }
+    let mut out = load_rows(db, ids).await?;
+    let targets: Vec<String> = out
+        .values()
+        .filter_map(|(row, kind, reply_to)| (*kind == 6 && !reply_to.is_empty() && row.reposted.is_none()).then(|| reply_to.clone()))
+        .collect();
+    let notes = if targets.is_empty() { HashMap::new() } else { load_rows(db, &targets).await? };
+    for (row, kind, reply_to) in out.values_mut() {
+        if *kind == 6 {
+            row.reposted = notes.get(reply_to).filter(|(_, k, _)| *k == 1).map(|(n, _, _)| Box::new(n.clone()));
+        }
+    }
+    Ok(out
+        .into_iter()
+        .filter(|(_, (row, kind, _))| *kind == 1 || row.reposted.is_some())
+        .map(|(id, (row, _, _))| (id, row))
+        .collect())
+}
+
+async fn load_rows(db: &Client, ids: &[String]) -> Result<HashMap<String, (NostrRow, i32, String)>> {
     let rows = db
         .query(
             "SELECT e.id, e.pubkey, e.created_at, e.content, e.tags,
-                    COALESCE(p.name, ''), COALESCE(p.display_name, ''), COALESCE(p.picture, ''), COALESCE(p.nip05, '')
+                    COALESCE(p.name, ''), COALESCE(p.display_name, ''), COALESCE(p.picture, ''), COALESCE(p.nip05, ''),
+                    e.kind, e.reply_to
              FROM nostr_events e LEFT JOIN nostr_profiles p ON p.pubkey = e.pubkey
-             WHERE e.id = ANY($1)",
+             WHERE e.id = ANY($1) AND e.kind IN (1, 6)",
             &[&ids],
         )
         .await
@@ -199,8 +267,9 @@ pub async fn fetch_rows(db: &Client, ids: &[String]) -> Result<HashMap<String, N
                 display_name: r.get(6),
                 picture: r.get(7),
                 nip05: r.get(8),
+                reposted: None,
             };
-            (row.id.clone(), row)
+            (row.id.clone(), (row, r.get(9), r.get(10)))
         })
         .collect())
 }
@@ -218,7 +287,50 @@ mod tests {
             reply_pubkeys: pks.iter().map(|s| s.to_string()).collect(),
             reply_to: parent.into(),
             content: String::new(),
+            repost_of: None,
+            is_repost: false,
         }
+    }
+
+    fn key(id: &str, sort: i64) -> NostrKey {
+        NostrKey { id: id.into(), sort, author: String::new(), text: String::new(), note: id.into() }
+    }
+
+    #[test]
+    fn reposts_show_once_and_respect_hides_and_mutes() {
+        let note = |id: &str, pk: &str, at: i64, text: &str| Candidate {
+            id: id.into(),
+            pubkey: pk.into(),
+            created_at: at,
+            content: text.into(),
+            ..cand(pk, false, &[], "")
+        };
+        let repost = |id: &str, pk: &str, at: i64, target: &str, of: Option<(&str, &str)>| Candidate {
+            id: id.into(),
+            pubkey: pk.into(),
+            created_at: at,
+            reply_to: target.into(),
+            repost_of: of.map(|(a, t)| (a.to_string(), t.to_string())),
+            is_repost: true,
+            ..cand(pk, false, &[], "")
+        };
+        let list = vec![
+            repost("r1", "alice", 50, "n1", Some(("bob", "hello"))),
+            note("n1", "bob", 40, "hello"),
+            repost("r2", "alice", 39, "gone", None),
+            repost("r3", "alice", 38, "n9", Some(("troll", "hi"))),
+            repost("r4", "troll", 37, "n8", Some(("bob", "fine"))),
+            repost("r5", "alice", 36, "n7", Some(("bob", "buy crypto"))),
+            note("n2", "carol", 30, "plain"),
+        ];
+        let hidden: HashSet<String> = ["troll".to_string()].into();
+        let keys = pick(list, &hidden, |t: &str| t.contains("crypto"));
+        let ids: Vec<&str> = keys.iter().map(|k| k.id.as_str()).collect();
+        assert_eq!(ids, vec!["r1", "n2"]);
+        assert_eq!(keys[0].author, "bob");
+        assert_eq!(keys[0].text, "hello");
+        assert_eq!(keys[0].note, "n1");
+        assert!(reply_in_graph(&repost("r", "alice", 1, "x", None), &HashSet::new(), None), "a repost is never a reply");
     }
 
     #[test]
@@ -243,10 +355,10 @@ mod tests {
             json!({"k": "bsky", "id": "at://x", "sort": 100}),
         ];
         let keys = vec![
-            NostrKey { id: "n1".into(), sort: 400 },
-            NostrKey { id: "n0".into(), sort: 250 },
-            NostrKey { id: "n2".into(), sort: 200 },
-            NostrKey { id: "n3".into(), sort: 50 },
+            key("n1", 400),
+            key("n0", 250),
+            key("n2", 200),
+            key("n3", 50),
         ];
         let ids: Vec<String> = merge_ranked(ranked, &keys)
             .iter()

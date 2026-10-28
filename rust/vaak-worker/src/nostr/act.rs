@@ -1,5 +1,5 @@
-//! Likes, replies, reposts, quotes, deletes and follow-list edits from
-//! Home cards.
+//! Likes, replies, reposts, quotes, deletes, follow-list and mute-list
+//! edits, and reports from Home cards.
 //!
 //! VAAK never holds a Nostr private key. The browser's signer extension
 //! (NIP-07) signs. `prepare` builds the unsigned event and parks it in Redis
@@ -11,7 +11,9 @@
 //! A follow or unfollow replaces the whole kind 3 list, so `prepare` starts
 //! from the newest list the relays hold, refuses one that looks older or
 //! shorter than the last sync saw, and `publish` keeps the replaced list in
-//! nostr_contact_backups.
+//! nostr_contact_backups. A mute or unmute edits the NIP-51 mute list
+//! (kind 10000) the same way, keeping its encrypted private part untouched.
+//! A report is a NIP-56 kind 1984 naming the note and its author.
 
 use std::collections::HashSet;
 use std::time::Duration;
@@ -35,6 +37,9 @@ const QUOTE_KIND: i32 = 1;
 const MAX_PUBLISH_RELAYS: usize = 8;
 const RELAY_DEADLINE: Duration = Duration::from_secs(12);
 const BACKUPS_KEPT: i64 = 20;
+const MUTE_LIST_KIND: i64 = 10000;
+/// NIP-56 report types.
+pub const REPORT_TYPES: [&str; 7] = ["nudity", "malware", "profanity", "illegal", "spam", "impersonation", "other"];
 
 /// What `prepare` promised the browser it would relay.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -119,11 +124,19 @@ pub fn reply_tags(parent_id: &str, parent_author: &str, parent_tags: &[Vec<Strin
 /// The base list's tags with `who` added (at the end) or every `p` for it
 /// removed. Other tags stay as they were, in order.
 pub fn edit_follow_tags(base: &[Vec<String>], who: &str, add: bool) -> Result<Vec<Vec<String>>, &'static str> {
+    edit_p_tags(base, who, add, "You already follow them on Nostr.", "You don't follow them on Nostr.")
+}
+
+pub fn edit_mute_tags(base: &[Vec<String>], who: &str, add: bool) -> Result<Vec<Vec<String>>, &'static str> {
+    edit_p_tags(base, who, add, "You already muted them on Nostr.", "They aren't on your Nostr mute list.")
+}
+
+fn edit_p_tags(base: &[Vec<String>], who: &str, add: bool, already: &'static str, missing: &'static str) -> Result<Vec<Vec<String>>, &'static str> {
     let is_who = |t: &Vec<String>| t.first().map(String::as_str) == Some("p") && t.get(1).is_some_and(|p| p.eq_ignore_ascii_case(who));
     let present = base.iter().any(is_who);
     match (add, present) {
-        (true, true) => Err("You already follow them on Nostr."),
-        (false, false) => Err("You don't follow them on Nostr."),
+        (true, true) => Err(already),
+        (false, false) => Err(missing),
         (true, false) => {
             let mut out = base.to_vec();
             out.push(tag(&["p", who]));
@@ -131,6 +144,11 @@ pub fn edit_follow_tags(base: &[Vec<String>], who: &str, add: bool) -> Result<Ve
         }
         (false, true) => Ok(base.iter().filter(|t| !is_who(t)).cloned().collect()),
     }
+}
+
+/// NIP-56 tags: the note and its author, each with the report type.
+pub fn report_tags(note: &str, author: &str, reason: &str) -> Vec<Vec<String>> {
+    vec![tag(&["e", note, reason]), tag(&["p", author, reason])]
 }
 
 /// A fetched list is refused when it is older than the last one the sync
@@ -240,10 +258,11 @@ fn merge_relays(lists: &[&[String]]) -> Vec<String> {
     out
 }
 
-/// Newest verified kind 3 for `me` across `relays`, and how many answered.
-async fn newest_contacts(me: &str, relays: &[String]) -> (Option<Event>, usize) {
+/// Newest verified replaceable list (kind 3 or 10000) for `me` across
+/// `relays`, and how many answered.
+async fn newest_list(me: &str, kind: i64, relays: &[String]) -> (Option<Event>, usize) {
     let deadline = Instant::now() + RELAY_DEADLINE;
-    let query = vec![Query::new(vec![me.to_string()], vec![3], None, 4)];
+    let query = vec![Query::new(vec![me.to_string()], vec![kind], None, 4)];
     let results: Vec<_> = futures_util::stream::iter(relays.iter().cloned().map(|url| {
         let query = query.clone();
         async move { relay::fetch(&url, &query, deadline).await }
@@ -255,13 +274,13 @@ async fn newest_contacts(me: &str, relays: &[String]) -> (Option<Event>, usize) 
     let mut events = Vec::new();
     for res in results.into_iter().flatten() {
         answered += usize::from(res.completed > 0);
-        events.extend(res.events.into_iter().filter(|e| e.pubkey == me && e.kind == 3 && e.verify().is_ok()));
+        events.extend(res.events.into_iter().filter(|e| e.pubkey == me && e.kind == kind && e.verify().is_ok()));
     }
-    let newest = relay::newest_by_author_kind(events).remove(&(me.to_string(), 3));
+    let newest = relay::newest_by_author_kind(events).remove(&(me.to_string(), kind));
     (newest, answered)
 }
 
-pub async fn prepare(cfg: &Config, owner: i64, purpose: &str, target: &str) -> Result<Value> {
+pub async fn prepare(cfg: &Config, owner: i64, purpose: &str, target: &str, reason: &str) -> Result<Value> {
     if super::sync::disabled_by_env() {
         return refuse("Nostr is turned off on this server.");
     }
@@ -279,7 +298,7 @@ pub async fn prepare(cfg: &Config, owner: i64, purpose: &str, target: &str) -> R
     let mut s = super::sync::Settings::from_env(30);
     super::relay_book::apply(&db, &mut s, chrono::Utc::now().timestamp()).await?;
     let mut pending = match purpose {
-        "like" | "reply" | "repost" | "quote" => {
+        "like" | "reply" | "repost" | "quote" | "report" => {
             let Some(row) = db
                 .query_opt("SELECT pubkey, relay, tags FROM nostr_events WHERE id = $1", &[&target])
                 .await
@@ -294,7 +313,24 @@ pub async fn prepare(cfg: &Config, owner: i64, purpose: &str, target: &str) -> R
             let mine = write_relays_of(&db, std::slice::from_ref(&me)).await;
             let theirs = write_relays_of(&db, std::slice::from_ref(&author)).await;
             let relays = merge_relays(&[&mine, &theirs, &s.fallback_relays]);
-            if purpose == "repost" {
+            if purpose == "report" {
+                if !REPORT_TYPES.contains(&reason) {
+                    return refuse("Pick a reason for the report.");
+                }
+                if author == me {
+                    return refuse("That's your own note.");
+                }
+                Pending {
+                    purpose: "report".into(),
+                    target: target.clone(),
+                    kind: 1984,
+                    tags: report_tags(&target, &author, reason),
+                    content: Some(String::new()),
+                    suffix: None,
+                    base: None,
+                    relays,
+                }
+            } else if purpose == "repost" {
                 let shared: Option<String> = db
                     .query_opt(
                         "SELECT event_id FROM nostr_shares WHERE owner_user_id = $1 AND note_id = $2 AND kind = $3",
@@ -406,7 +442,7 @@ pub async fn prepare(cfg: &Config, owner: i64, purpose: &str, target: &str) -> R
             }
             let mine = write_relays_of(&db, std::slice::from_ref(&me)).await;
             let read_from = super::relay_book::without_skipped(merge_relays(&[&mine, &s.index_relays]), &s.skip);
-            let (base, answered) = newest_contacts(&me, &read_from).await;
+            let (base, answered) = newest_list(&me, 3, &read_from).await;
             let Some(base) = base else {
                 return refuse(if answered == 0 {
                     "No relay answered. Try again in a minute."
@@ -429,6 +465,52 @@ pub async fn prepare(cfg: &Config, owner: i64, purpose: &str, target: &str) -> R
                 content: Some(base.content.clone()),
                 suffix: None,
                 base: Some(base),
+                relays: merge_relays(&[&mine, &s.index_relays, &s.fallback_relays]),
+            }
+        }
+        "mute" | "unmute" => {
+            if target == me {
+                return refuse("That's you.");
+            }
+            if !super::sync::moderation_ready(&db).await {
+                return refuse("Nostr muting isn't set up on this server yet.");
+            }
+            let stored_at: i64 = db
+                .query_opt("SELECT list_at FROM nostr_mute_lists WHERE owner_user_id = $1", &[&owner])
+                .await
+                .context("nostr mute list stamp")?
+                .map(|r| r.get(0))
+                .unwrap_or(0);
+            let mine = write_relays_of(&db, std::slice::from_ref(&me)).await;
+            let read_from = super::relay_book::without_skipped(merge_relays(&[&mine, &s.index_relays]), &s.skip);
+            let (base, answered) = newest_list(&me, MUTE_LIST_KIND, &read_from).await;
+            if answered == 0 {
+                return refuse("No relay answered. Try again in a minute.");
+            }
+            // No list yet starts an empty one; a list VAAK saw before must
+            // turn up again, so nothing on it gets lost.
+            let (base_tags, base_content) = match &base {
+                Some(b) if b.created_at < stored_at => {
+                    return refuse("Relays only returned an older copy of your mute list. Try again in a minute so no mutes get lost.");
+                }
+                Some(b) => (b.tags.clone(), b.content.clone()),
+                None if stored_at > 0 => {
+                    return refuse("Couldn't find your current mute list on any relay, so VAAK won't risk replacing it.");
+                }
+                None => (Vec::new(), String::new()),
+            };
+            let tags = match edit_mute_tags(&base_tags, &target, purpose == "mute") {
+                Ok(tags) => tags,
+                Err(e) => return refuse(e),
+            };
+            Pending {
+                purpose: purpose.into(),
+                target: target.clone(),
+                kind: MUTE_LIST_KIND,
+                tags,
+                content: Some(base_content),
+                suffix: None,
+                base,
                 relays: merge_relays(&[&mine, &s.index_relays, &s.fallback_relays]),
             }
         }
@@ -489,7 +571,7 @@ pub async fn publish(cfg: &Config, owner: i64, nonce: &str, signed: &Value) -> R
     if let Err(e) = check_signed(&ev, &pending, &me, now) {
         return refuse(&e);
     }
-    if let Some(base) = &pending.base {
+    if let Some(base) = pending.base.as_ref().filter(|b| b.kind == 3) {
         db.execute(
             "INSERT INTO nostr_contact_backups (owner_user_id, event_id, event_json, follow_count, backed_up_at)
              VALUES ($1, $2, $3, $4, $5)",
@@ -613,6 +695,9 @@ pub async fn publish(cfg: &Config, owner: i64, nonce: &str, signed: &Value) -> R
             )
             .await?;
         }
+        "mute" | "unmute" => {
+            super::sync::store_mute_list(&db, owner, &ev).await?;
+        }
         _ => {}
     }
     Ok(json!({
@@ -676,6 +761,18 @@ mod tests {
     const C: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
     const R: &str = "1111111111111111111111111111111111111111111111111111111111111111";
     const P: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+
+    #[test]
+    fn mute_edits_keep_other_tags_and_reports_name_the_type() {
+        let base = vec![tag(&["p", A]), tag(&["t", "nsfw"]), tag(&["word", "crypto"])];
+        let added = edit_mute_tags(&base, B, true).unwrap();
+        assert_eq!(added, vec![tag(&["p", A]), tag(&["t", "nsfw"]), tag(&["word", "crypto"]), tag(&["p", B])]);
+        assert_eq!(edit_mute_tags(&added, B, false).unwrap(), base);
+        assert_eq!(edit_mute_tags(&base, A, true), Err("You already muted them on Nostr."));
+        assert_eq!(edit_mute_tags(&base, B, false), Err("They aren't on your Nostr mute list."));
+        assert_eq!(report_tags(P, A, "spam"), vec![tag(&["e", P, "spam"]), tag(&["p", A, "spam"])]);
+        assert!(REPORT_TYPES.contains(&"other") && !REPORT_TYPES.contains(&""));
+    }
 
     #[test]
     fn reply_to_a_top_level_note_marks_it_root() {

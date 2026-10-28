@@ -25,6 +25,8 @@ pub struct NostrRow {
     pub display_name: String,
     pub picture: String,
     pub nip05: String,
+    /// Set on a kind 6 repost: the note it reposts.
+    pub reposted: Option<Box<NostrRow>>,
 }
 
 fn esc(s: &str) -> String {
@@ -300,6 +302,9 @@ fn strip_quote_reference(content: &str, quoted: &str) -> String {
 }
 
 pub fn materialize(row: &NostrRow) -> Value {
+    if let Some(inner) = &row.reposted {
+        return repost_wrapper(row, materialize(inner));
+    }
     let status_id = format!("nostr:{}", row.id);
     let note = bech32::note(&row.id);
     let url = format!("{VIEWER}{note}");
@@ -327,6 +332,25 @@ pub fn materialize(row: &NostrRow) -> Value {
     if let Some(q) = quoted {
         v["vaak_nostr_quote_id"] = json!(q);
     }
+    v
+}
+
+/// A kind 6 repost as a boost card: the reposter on the outside, the
+/// note inside, the same shape a VAAK boost wrapper has.
+fn repost_wrapper(row: &NostrRow, mut inner: Value) -> Value {
+    let status_id = format!("nostr:{}", row.id);
+    let url = inner.get("url").and_then(Value::as_str).unwrap_or("").to_string();
+    let uri = format!("nostr:{}", bech32::note(&row.id));
+    let st = vaak_types::TimelineStatus::base(&status_id, &iso_time(row.created_at), "", &uri, &url, account(row));
+    let mut v = st.to_value();
+    inner["reblog"] = Value::Null;
+    v["reblog"] = inner;
+    v["reblogs_count"] = json!(1);
+    v["application"] = json!({"name": "Nostr", "website": Value::Null});
+    v["source"] = json!("nostr");
+    v["vaak_nostr_event_id"] = json!(row.id);
+    v["vaak_nostr_pubkey"] = json!(row.pubkey);
+    v["vaak_nostr_repost"] = json!(true);
     v
 }
 
@@ -418,6 +442,10 @@ mod tests {
         assert!(html.contains(&format!("data-nostr-act=\"reply\" data-nostr-target=\"{}\"", r.id)), "{html}");
         assert!(html.contains(&format!("data-nostr-act=\"like\" data-nostr-target=\"{}\"", r.id)), "{html}");
         assert!(html.contains(&format!("data-nostr-act=\"unfollow\" data-nostr-target=\"{}\"", r.pubkey)), "{html}");
+        assert!(html.contains(&format!("data-nostr-act=\"mute\" data-nostr-target=\"{}\"", r.pubkey)), "{html}");
+        assert!(html.contains(&format!("data-nostr-vaak=\"nostr_hide\" data-nostr-target=\"{}\"", r.pubkey)), "{html}");
+        assert!(html.contains(&format!("data-nostr-act=\"report\" data-nostr-target=\"{}\"", r.id)), "{html}");
+        assert!(html.contains("nostr-admin-only\" data-nostr-vaak=\"nostr_block\""), "{html}");
         assert!(!html.contains("compose=1"), "no VAAK reply or quote links: {html}");
         // Same order as other posts: reply, quote, boost, like, bookmark, ⋯.
         let at = |needle: &str| html.find(needle).unwrap_or_else(|| panic!("{needle} missing: {html}"));
@@ -451,8 +479,32 @@ mod tests {
         let html = crate::notif_embed::paint_lean_embed_from(&own, false, "home", "", true);
         assert!(html.contains(&format!("data-nostr-act=\"delete\" data-nostr-target=\"{}\"", r.id)), "{html}");
         assert!(!html.contains("Follow on Nostr"), "no follow on your own note: {html}");
+        assert!(!html.contains("Mute on Nostr") && !html.contains("Report on Nostr"), "no mute or report on your own note: {html}");
         assert!(html.contains("aria-pressed=\"true\" title=\"Undo repost\""), "{html}");
         assert!(html.contains("value=\"unbookmark_status\""), "{html}");
+    }
+
+    #[test]
+    fn repost_paints_as_a_boost_of_the_note() {
+        let mut note = row("hello from bob", json!([]));
+        note.display_name = "Bob".into();
+        let mut repost = row("", json!([["e", note.id.clone()]]));
+        repost.id = "9".repeat(64);
+        repost.pubkey = "ab".repeat(32);
+        repost.display_name = "Alice".into();
+        repost.reposted = Some(Box::new(note.clone()));
+        let st = materialize(&repost);
+        assert_eq!(st["id"], format!("nostr:{}", repost.id));
+        assert_eq!(st["content"], "");
+        assert_eq!(st["account"]["display_name"], "Alice");
+        assert_eq!(st["reblog"]["id"], format!("nostr:{}", note.id));
+        assert_eq!(st["reblog"]["account"]["display_name"], "Bob");
+        assert_eq!(st["vaak_nostr_pubkey"], repost.pubkey);
+        assert!(vaak_types::check_timeline_status(&st).is_empty(), "{:?}", vaak_types::check_timeline_status(&st));
+        let html = crate::notif_embed::paint_lean_feed_card_opts(&st, "home", "");
+        assert!(html.contains("Alice"), "booster header: {html}");
+        assert!(html.contains("hello from bob"), "{html}");
+        assert!(html.contains(&format!("data-nostr-act=\"like\" data-nostr-target=\"{}\"", note.id)), "actions target the note: {html}");
     }
 
     #[test]

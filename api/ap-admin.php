@@ -1061,9 +1061,12 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
     }
     // Nostr like/reply/follow from Home cards: JSON in and out, signed by the
     // browser's signer extension (ap_nostr_action, nostr/act.rs).
-    if ($action === 'nostr_prepare' || $action === 'nostr_publish') {
+    $nostrModeration = in_array($action, ['nostr_hide', 'nostr_unhide', 'nostr_block', 'nostr_unblock'], true);
+    if ($action === 'nostr_prepare' || $action === 'nostr_publish' || $nostrModeration) {
         require_once __DIR__ . '/ap-nostr.php';
-        $nostrReply = ap_nostr_action($action, (int) admin_owner_user_id(), !empty($vaakIsAdmin), $_POST);
+        $nostrReply = $nostrModeration
+            ? ap_nostr_moderation_action($action, (int) admin_owner_user_id(), !empty($vaakIsAdmin), $_POST)
+            : ap_nostr_action($action, (int) admin_owner_user_id(), !empty($vaakIsAdmin), $_POST);
         if (function_exists('ap_auth_session_write_close')) {
             ap_auth_session_write_close();
         }
@@ -30689,6 +30692,13 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       font-size: .9rem; line-height: 1.35;
     }
     .nostr-toast[hidden] { display: none; }
+    /* Admin-only card actions; the server checks again. */
+    body:not([data-vaak-admin="1"]) .nostr-admin-only { display: none !important; }
+    form.nostr-report { display: flex; gap: .5rem; align-items: center; flex-wrap: wrap; margin: .5rem 0 .2rem; }
+    form.nostr-report select { padding: .35rem .5rem; border-radius: 8px; border: 1px solid var(--border); background: var(--panel-2); color: var(--text); font: inherit; }
+    details.nostr-moderation { margin-top: .5rem; }
+    details.nostr-moderation > summary { cursor: pointer; }
+    .nostr-moderation-row { padding: .3rem 0; }
     .profile-preview {
       display: flex; gap: 1rem; align-items: center; margin-bottom: 1rem;
       padding: .85rem; border-radius: 12px; background: var(--panel-2); border: 1px solid var(--border);
@@ -30835,7 +30845,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     }
   </style>
 </head>
-<body class="<?= !empty($GLOBALS['vaak_guest_profile']) ? 'vaak-guest-profile ' : '' ?><?= $view === 'dms' ? ('dm-fullscreen' . (!empty($_GET['peer']) ? ' dm-peer-open' : '')) : ($view === 'blog' ? 'blog-fullscreen' : '') ?>">
+<body class="<?= !empty($GLOBALS['vaak_guest_profile']) ? 'vaak-guest-profile ' : '' ?><?= $view === 'dms' ? ('dm-fullscreen' . (!empty($_GET['peer']) ? ' dm-peer-open' : '')) : ($view === 'blog' ? 'blog-fullscreen' : '') ?>"<?= !empty($vaakIsAdmin) ? ' data-vaak-admin="1"' : '' ?>>
 <div id="vaak-loading-indicator" class="vaak-loading-indicator" role="status" aria-live="polite" aria-hidden="true">
   <span class="vaak-spinner" aria-hidden="true"></span><span data-vaak-loading-label>Loading…</span>
 </div>
@@ -32870,11 +32880,15 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
             }
             $allDownrankedActors = $downrankedNativeBody !== null ? [] : admin_home_downranked_actor_rows();
             $downrankedBsky = admin_downranked_bsky_prefetch($allDownrankedActors, (int) ($GLOBALS['vaak_owner_id'] ?? 0));
+            // Nostr authors are keyed nostr:{hex pubkey} (ranked_warm.rs).
+            $downrankedNostrKeys = array_values(array_filter(array_map(static fn (array $row): string => ap_nostr_downranked_pubkey((string) ($row['actor_id'] ?? '')), $allDownrankedActors)));
+            $downrankedNostr = $downrankedNostrKeys !== [] ? ap_nostr_names($downrankedNostrKeys) : [];
             if ($downrankedQuery !== '') {
                 $needle = strtolower(ltrim($downrankedQuery, '@'));
-                $allDownrankedActors = array_values(array_filter($allDownrankedActors, static function (array $row) use ($needle, $downrankedBsky): bool {
+                $allDownrankedActors = array_values(array_filter($allDownrankedActors, static function (array $row) use ($needle, $downrankedBsky, $downrankedNostr): bool {
                     $ident = $downrankedBsky['identities'][admin_downranked_bsky_did((string) ($row['actor_id'] ?? ''))] ?? [];
-                    $hay = strtolower((string) ($row['actor_id'] ?? '') . ' ' . implode(' ', (array) ($row['categories'] ?? [])) . ' ' . ($ident['handle'] ?? '') . ' ' . ($ident['display_name'] ?? ''));
+                    $nostrIdent = $downrankedNostr[ap_nostr_downranked_pubkey((string) ($row['actor_id'] ?? ''))] ?? [];
+                    $hay = strtolower((string) ($row['actor_id'] ?? '') . ' ' . implode(' ', (array) ($row['categories'] ?? [])) . ' ' . ($ident['handle'] ?? '') . ' ' . ($ident['display_name'] ?? '') . ' ' . ($nostrIdent['name'] ?? '') . ' ' . ($nostrIdent['npub'] ?? ''));
                     return str_contains($hay, $needle);
                 }));
             }
@@ -32909,15 +32923,20 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
                   $drDid = admin_downranked_bsky_did($drActor);
                   $drIdent = $drDid !== '' ? ($downrankedBsky['identities'][$drDid] ?? null) : null;
                   if ($drIdent) $drName = $drIdent['display_name'] !== '' ? $drIdent['display_name'] : '@' . $drIdent['handle'];
-                  $drEvidence = $drDid !== ''
+                  $drNostr = ap_nostr_downranked_pubkey($drActor);
+                  $drNostrIdent = $drNostr !== '' ? ($downrankedNostr[$drNostr] ?? null) : null;
+                  if ($drNostrIdent) $drName = $drNostrIdent['name'];
+                  $drEvidence = $drNostr !== ''
+                      ? ap_nostr_downranked_evidence($drNostr, $drCategoryList, (array) ($dr['seen'] ?? []))
+                      : ($drDid !== ''
                       ? admin_downranked_bsky_evidence_rows($drDid, $drCategoryList, (array) ($dr['seen'] ?? []), $downrankedBsky['posts'])
-                      : admin_home_downrank_evidence_rows($drActor, $drCategoryList, 5, (string) ($dr['last_object_id'] ?? ''));
+                      : admin_home_downrank_evidence_rows($drActor, $drCategoryList, 5, (string) ($dr['last_object_id'] ?? '')));
                 ?>
                 <article class="tweet downranked-item" data-dr-index="<?= (int) $drIndex ?>" style="padding:.85rem 1rem;display:none">
                   <div class="tweet-hd">
                     <div style="min-width:0">
                       <div class="who" style="overflow-wrap:anywhere"><?= h($drName !== '' ? $drName : $drActor) ?></div>
-                      <div class="meta" style="overflow-wrap:anywhere"><?php if ($drIdent): ?>@<?= h($drIdent['handle']) ?> · <?php endif; ?><?= h($drActor) ?></div>
+                      <div class="meta" style="overflow-wrap:anywhere"><?php if ($drIdent): ?>@<?= h($drIdent['handle']) ?> · <?php endif; ?><?= h($drNostrIdent ? 'Nostr · ' . $drNostrIdent['npub'] : $drActor) ?></div>
                     </div>
                     <span class="tag">active</span>
                   </div>
@@ -32934,7 +32953,7 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
                           $evidenceSummary = is_string($evidenceSummary) ? trim($evidenceSummary) : '';
                           $evidenceLabel = mb_substr($evidenceSummary, 0, $drDid !== '' ? 280 : 140);
                           if ($evidenceLabel === '') $evidenceLabel = 'Open matching status';
-                          $evidenceHref = admin_status_href((string) ($evidence['object_id'] ?? ''), 'downranked');
+                          $evidenceHref = (string) ($evidence['href'] ?? '') !== '' ? (string) $evidence['href'] : admin_status_href((string) ($evidence['object_id'] ?? ''), 'downranked');
                         ?>
                         <a class="meta" href="<?= h($evidenceHref) ?>" style="overflow-wrap:anywhere;text-decoration:underline" title="<?= h($evidenceSummary) ?>">
                           <?= h($evidenceLabel) ?> · <?= h(implode(', ', (array) ($evidence['categories'] ?? []))) ?>
@@ -32943,13 +32962,16 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
                     </div>
                   <?php endif; ?>
                   <div class="tweet-actions" style="flex-wrap:wrap;margin-top:.55rem">
-                    <?php if (str_starts_with($drActor, 'https://')): ?><a href="<?= h(admin_remote_actor_href($drActor)) ?>" target="_blank" rel="noopener noreferrer">Open profile</a><?php endif; ?>
+                    <?php if ($drNostrIdent): ?><a href="https://njump.me/<?= h($drNostrIdent['npub']) ?>" target="_blank" rel="noopener noreferrer">Open profile</a><?php elseif (str_starts_with($drActor, 'https://')): ?><a href="<?= h(admin_remote_actor_href($drActor)) ?>" target="_blank" rel="noopener noreferrer">Open profile</a><?php endif; ?>
                     <form method="post" action="?view=downranked" style="display:inline">
                       <input type="hidden" name="action" value="downrank_signal_clear">
                       <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
                       <input type="hidden" name="actor_id" value="<?= h($drActor) ?>">
                       <button class="btn btn-ghost" type="submit" style="padding:.25rem .7rem;font-size:.8rem">Clear signal</button>
                     </form>
+                    <?php if ($drNostr !== ''): ?>
+                    <button type="button" class="btn btn-ghost" data-nostr-vaak="nostr_block" data-nostr-target="<?= h($drNostr) ?>" style="padding:.25rem .7rem;font-size:.8rem;color:var(--danger)">Block on VAAK</button>
+                    <?php else: ?>
                     <form method="post" action="?view=downranked" style="display:inline">
                       <input type="hidden" name="action" value="block_actor">
                       <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
@@ -32968,6 +32990,7 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
                       <input type="hidden" name="return_view" value="downranked">
                       <button class="btn btn-ghost" type="submit" style="padding:.25rem .7rem;font-size:.8rem;color:var(--danger)">Server block</button>
                     </form>
+                    <?php endif; ?>
                   </div>
                 </article>
               <?php endforeach; ?>
@@ -33698,6 +33721,7 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
             <label class="meta" style="font-weight:400"><input type="checkbox" form="nostr-link-form" name="nostr_show_in_home" value="1"<?= $nostrShow ? ' checked' : '' ?>> Show posts from people I follow on Nostr in Home</label>
             <div class="meta">VAAK only needs your public npub. Never paste your nsec anywhere on VAAK. Leave it empty to unlink.<?php if ($nostrStatus !== ''): ?> <?= h($nostrStatus) ?><?php endif; ?></div>
             <div class="meta">To like, reply and follow on Nostr from Home, install a Nostr signer extension in your browser, such as <a href="https://github.com/fiatjaf/nos2x" target="_blank" rel="noopener noreferrer">nos2x</a> or <a href="https://getalby.com/" target="_blank" rel="noopener noreferrer">Alby</a> (on iPhone, Nostore for Safari), and add your key there. The extension signs each action and can ask you first; VAAK never sees your key. It must hold the same key as the npub above.</div>
+            <?php if ($nostrHex !== ''): ?><?= ap_nostr_moderation_settings_html((int) $vaakOwnerId, !empty($vaakIsAdmin)) ?><?php endif; ?>
           </div>
           <?php endif; ?>
         </div>
@@ -50277,13 +50301,15 @@ if (VIEW === 'analytics') loadAnalytics();
     return { ok: false, error: 'VAAK did not answer. Try again.' };
   }
 
-  async function run(purpose, target, content) {
+  async function run(purpose, target, content, reason) {
     const signer = window.nostr;
     if (!signer || typeof signer.signEvent !== 'function' || typeof signer.getPublicKey !== 'function') {
       toast('To act on Nostr posts, install a signer extension such as nos2x or Alby, then reload this page.');
       return null;
     }
-    const prep = await post({ action: 'nostr_prepare', purpose: purpose, target: target });
+    const prepFields = { action: 'nostr_prepare', purpose: purpose, target: target };
+    if (reason) prepFields.reason = reason;
+    const prep = await post(prepFields);
     if (!prep.ok) { toast(prep.error || 'Could not prepare that.'); return null; }
     let pubkey = '';
     try { pubkey = String(await signer.getPublicKey() || '').toLowerCase(); } catch (e) {}
@@ -50341,6 +50367,79 @@ if (VIEW === 'analytics') loadAnalytics();
       btn.title = label;
       btn.setAttribute('aria-label', label);
     });
+  }
+
+  // Cards by an author leave the page once they're muted, hidden or
+  // blocked; Settings rows go once they're undone.
+  function dropAuthor(author) {
+    sameTarget('mute', author).forEach(function (btn) {
+      const card = btn.closest('article');
+      if (card) card.remove();
+    });
+  }
+
+  function dropRow(btn) {
+    const row = btn.closest('[data-nostr-row]');
+    if (!row) return;
+    row.querySelectorAll('[data-nostr-act], [data-nostr-vaak]').length > 1 ? btn.remove() : row.remove();
+  }
+
+  const REPORT_TYPES = [['spam', 'Spam'], ['nudity', 'Nudity'], ['profanity', 'Hateful or abusive'], ['illegal', 'Illegal'], ['impersonation', 'Impersonation'], ['malware', 'Malware or scam'], ['other', 'Something else']];
+
+  function openReport(btn, target) {
+    const card = btn.closest('article');
+    if (!card) return;
+    const open = card.querySelector('form.nostr-report');
+    if (open) { open.remove(); return; }
+    const menu = btn.closest('details');
+    if (menu) menu.open = false;
+    const form = document.createElement('form');
+    form.className = 'nostr-report';
+    const pick = document.createElement('select');
+    pick.setAttribute('aria-label', 'Why are you reporting this?');
+    REPORT_TYPES.forEach(function (t) {
+      const o = document.createElement('option');
+      o.value = t[0];
+      o.textContent = t[1];
+      pick.appendChild(o);
+    });
+    const send = document.createElement('button');
+    send.type = 'submit';
+    send.className = 'btn btn-primary';
+    send.textContent = 'Report on Nostr';
+    const cancel = document.createElement('button');
+    cancel.type = 'button';
+    cancel.className = 'btn btn-ghost';
+    cancel.textContent = 'Cancel';
+    cancel.addEventListener('click', function () { form.remove(); });
+    form.append(pick, send, cancel);
+    form.addEventListener('submit', async function (event) {
+      event.preventDefault();
+      send.disabled = true;
+      const res = await run('report', target, '', pick.value);
+      send.disabled = false;
+      if (!res) return;
+      const done = document.createElement('div');
+      done.className = 'meta nostr-reply-done';
+      done.textContent = 'Reported on Nostr. Relays and clients that read reports will see it.';
+      form.replaceWith(done);
+    });
+    card.appendChild(form);
+    pick.focus();
+  }
+
+  // Hide on VAAK and the admin Block: no signing, VAAK only.
+  async function vaakOnly(btn, action, target) {
+    if (action === 'nostr_block' && !window.confirm('Block this Nostr account on VAAK for everyone? Their posts stop showing for all users.')) return;
+    const res = await post({ action: action, target: target });
+    if (!res.ok) { toast(res.error || 'Could not save that.'); return; }
+    if (action === 'nostr_hide' || action === 'nostr_block') {
+      dropAuthor(target);
+      toast(action === 'nostr_hide' ? 'Hidden on VAAK. Nothing was sent to Nostr.' : 'Blocked on VAAK for everyone.');
+    } else {
+      dropRow(btn);
+      toast(action === 'nostr_unhide' ? 'Unhidden. Their posts come back on the next refresh.' : 'Unblocked.');
+    }
   }
 
   // Reply and quote share one inline box under the card.
@@ -50401,6 +50500,15 @@ if (VIEW === 'analytics') loadAnalytics();
   }
 
   document.addEventListener('click', async function (event) {
+    const vaakBtn = event.target.closest('[data-nostr-vaak]');
+    if (vaakBtn) {
+      event.preventDefault();
+      const vTarget = (vaakBtn.getAttribute('data-nostr-target') || '').toLowerCase();
+      if (!/^[0-9a-f]{64}$/.test(vTarget) || vaakBtn.dataset.nostrBusy === '1') return;
+      vaakBtn.dataset.nostrBusy = '1';
+      try { await vaakOnly(vaakBtn, vaakBtn.getAttribute('data-nostr-vaak') || '', vTarget); } finally { vaakBtn.dataset.nostrBusy = ''; }
+      return;
+    }
     const btn = event.target.closest('[data-nostr-act]');
     if (!btn) return;
     event.preventDefault();
@@ -50408,6 +50516,7 @@ if (VIEW === 'analytics') loadAnalytics();
     const target = (btn.getAttribute('data-nostr-target') || '').toLowerCase();
     if (!/^[0-9a-f]{64}$/.test(target)) return;
     if (act === 'reply' || act === 'quote') { openCompose(btn, target, act); return; }
+    if (act === 'report') { openReport(btn, target); return; }
     if (act === 'delete' && !window.confirm('Delete this note on Nostr? Relays are asked to drop it, but copies elsewhere may stay.')) return;
     if (btn.dataset.nostrBusy === '1') return;
     btn.dataset.nostrBusy = '1';
@@ -50426,6 +50535,12 @@ if (VIEW === 'analytics') loadAnalytics();
         const card = btn.closest('article');
         if (card) card.remove();
         toast('Deleted on Nostr.');
+      } else if (res.purpose === 'mute') {
+        dropAuthor(target);
+        toast('Muted on Nostr. Other Nostr apps that read your mute list hide them too.');
+      } else if (res.purpose === 'unmute') {
+        dropRow(btn);
+        toast('Unmuted on Nostr.');
       }
     } finally {
       btn.dataset.nostrBusy = '';

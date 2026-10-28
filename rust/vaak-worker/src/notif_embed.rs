@@ -4388,6 +4388,20 @@ fn nostr_card_actions(status: &Value, action_base: &str, from_q: &str) -> String
         menu.push_str(&format!(
             "<button type=\"button\" class=\"menu-action\" data-nostr-act=\"{act}\" data-nostr-target=\"{author}\">{label}</button>"
         ));
+        // Mute edits the viewer's NIP-51 list (signed like a follow); Hide
+        // and the admin Block stay on VAAK. Report is NIP-56 on the note.
+        menu.push_str(&format!(
+            "<button type=\"button\" class=\"menu-action\" data-nostr-act=\"mute\" data-nostr-target=\"{author}\">Mute on Nostr</button>\
+             <button type=\"button\" class=\"menu-action\" data-nostr-vaak=\"nostr_hide\" data-nostr-target=\"{author}\">Hide on VAAK</button>"
+        ));
+        if !note.is_empty() {
+            menu.push_str(&format!(
+                "<button type=\"button\" class=\"menu-action\" data-nostr-act=\"report\" data-nostr-target=\"{note}\">Report on Nostr</button>"
+            ));
+        }
+        menu.push_str(&format!(
+            "<button type=\"button\" class=\"menu-action nostr-admin-only\" data-nostr-vaak=\"nostr_block\" data-nostr-target=\"{author}\" style=\"color:var(--danger)\">Block on VAAK</button>"
+        ));
     }
     if !menu.is_empty() {
         out.push_str(&format!(

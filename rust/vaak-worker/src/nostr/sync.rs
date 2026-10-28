@@ -7,17 +7,21 @@
 //! runs never overlap.
 //!
 //! Per run:
-//!  1. Links due (`next_sync_at`): newest kind 3 / 0 / 10002 of the linked
-//!     key from the index relays and the key's own write relays. A kind 3
-//!     replaces that user's `nostr_follows` only if it is newer than the one
-//!     stored. Rechecked hourly.
-//!  2. Followed keys without fresh metadata (daily): kind 0 and kind 10002.
-//!  3. Notes: kind 1 from each followed key's write relays (NIP-65 outbox),
-//!     since that key's last good sync (at most 48 h back). Every event's id
-//!     and signature are checked before it is stored.
+//!  1. Links due (`next_sync_at`): newest kind 3 / 0 / 10000 / 10002 of the
+//!     linked key from the index relays and the key's own write relays. A
+//!     kind 3 replaces that user's `nostr_follows`, and a kind 10000 (mute
+//!     list) their Nostr mutes, only if newer than the one stored.
+//!     Rechecked hourly.
+//!  2. Followed keys, and authors of notes they reposted, without fresh
+//!     metadata (daily): kind 0 and kind 10002.
+//!  3. Notes: kind 1 and reposts (kind 6) from each followed key's write
+//!     relays (NIP-65 outbox), since that key's last good sync (at most 48 h
+//!     back), plus the notes those reposts point at. Every event's id and
+//!     signature are checked before it is stored.
 //!  4. Clean-up: notes older than the retention window, notes and profiles
 //!     nobody follows any more, follows of removed links. Notes a VAAK user
-//!     boosted, quoted, bookmarked or liked stay (and their authors' profiles).
+//!     boosted, quoted, bookmarked or liked stay (and their authors' profiles),
+//!     as do notes a stored repost points at.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Duration;
@@ -269,7 +273,8 @@ async fn sync_links(db: &mut Client, s: &Settings, now: i64, deadline: Instant, 
         }
     }
     relays.truncate(8);
-    let queries = vec![Query::new(keys.clone(), vec![0, 3, 10002], None, (keys.len() as i64 * 6).max(20))];
+    let queries = vec![Query::new(keys.clone(), vec![0, 3, 10000, 10002], None, (keys.len() as i64 * 8).max(20))];
+    let mutes_ready = moderation_ready(db).await;
     let asked = relays.len();
     let jobs = relays.into_iter().map(|r| (r, queries.clone())).collect();
     let mut all = Vec::new();
@@ -314,6 +319,11 @@ async fn sync_links(db: &mut Client, s: &Settings, now: i64, deadline: Instant, 
             )
             .await?;
         }
+        if mutes_ready {
+            if let Some(list) = newest.get(&(link.pubkey.clone(), 10000)) {
+                store_mute_list(&tx, link.owner, list).await?;
+            }
+        }
         let failed = answered == 0;
         let failures = if failed { link.failures.saturating_add(1) } else { 0 };
         let next = if failed { now + (300i64 << failures.clamp(0, 4)).min(LINK_REFRESH_SECS) } else { now + LINK_REFRESH_SECS };
@@ -330,6 +340,50 @@ async fn sync_links(db: &mut Client, s: &Settings, now: i64, deadline: Instant, 
             if error.is_empty() { String::new() } else { format!(" error=\"{error}\"") }
         ));
     }
+    Ok(())
+}
+
+pub async fn moderation_ready(db: &Client) -> bool {
+    db.query_one("SELECT to_regclass('nostr_mutes') IS NOT NULL AND to_regclass('nostr_mute_lists') IS NOT NULL", &[])
+        .await
+        .map(|r| r.get::<_, bool>(0))
+        .unwrap_or(false)
+}
+
+/// Mirror the public part of a linked user's NIP-51 mute list (kind 10000)
+/// into `nostr_mutes.on_nostr`, unless it is older than the stored one.
+/// VAAK-only hides are left alone; encrypted (private) entries are not read.
+pub async fn store_mute_list(db: &impl tokio_postgres::GenericClient, owner: i64, list: &Event) -> Result<()> {
+    let stored: i64 = db
+        .query_opt("SELECT list_at FROM nostr_mute_lists WHERE owner_user_id = $1", &[&owner])
+        .await?
+        .map(|r| r.get(0))
+        .unwrap_or(0);
+    // Equal stamps re-apply (idempotent): a mute and an unmute signed in
+    // the same second must both land.
+    if list.created_at < stored {
+        return Ok(());
+    }
+    let keys = list.follow_list();
+    let now = chrono::Utc::now().timestamp();
+    db.execute(
+        "INSERT INTO nostr_mute_lists (owner_user_id, list_at) VALUES ($1, $2)
+         ON CONFLICT (owner_user_id) DO UPDATE SET list_at = EXCLUDED.list_at",
+        &[&owner, &list.created_at],
+    )
+    .await?;
+    db.execute(
+        "UPDATE nostr_mutes SET on_nostr = FALSE WHERE owner_user_id = $1 AND on_nostr AND NOT (pubkey = ANY($2))",
+        &[&owner, &keys],
+    )
+    .await?;
+    db.execute(
+        "INSERT INTO nostr_mutes (owner_user_id, pubkey, on_nostr, created_at) SELECT $1, unnest($2::text[]), TRUE, $3
+         ON CONFLICT (owner_user_id, pubkey) DO UPDATE SET on_nostr = TRUE",
+        &[&owner, &keys, &now],
+    )
+    .await?;
+    db.execute("DELETE FROM nostr_mutes WHERE owner_user_id = $1 AND NOT on_nostr AND NOT hidden_vaak", &[&owner]).await?;
     Ok(())
 }
 
@@ -386,12 +440,16 @@ async fn sync_followee_meta(db: &Client, s: &Settings, now: i64, deadline: Insta
     let stale = now - META_REFRESH_SECS;
     let rows = db
         .query(
-            "SELECT f.pubkey FROM nostr_follows f
-             JOIN nostr_links l ON l.owner_user_id = f.owner_user_id AND l.show_in_home
-             LEFT JOIN nostr_profiles p ON p.pubkey = f.pubkey
+            "WITH wanted AS (
+               SELECT f.pubkey FROM nostr_follows f
+               JOIN nostr_links l ON l.owner_user_id = f.owner_user_id AND l.show_in_home
+               UNION
+               SELECT t.pubkey FROM nostr_events r JOIN nostr_events t ON t.id = r.reply_to AND t.kind = 1 WHERE r.kind = 6
+             )
+             SELECT w.pubkey FROM wanted w
+             LEFT JOIN nostr_profiles p ON p.pubkey = w.pubkey
              WHERE p.pubkey IS NULL OR p.meta_fetched_at < $1
-             GROUP BY f.pubkey
-             ORDER BY MIN(COALESCE(p.meta_fetched_at, 0)), f.pubkey
+             ORDER BY COALESCE(p.meta_fetched_at, 0), w.pubkey
              LIMIT $2",
             &[&stale, &META_AUTHORS_PER_RUN],
         )
@@ -500,7 +558,7 @@ async fn sync_notes(db: &mut Client, s: &Settings, now: i64, deadline: Instant) 
                 .min()
                 .map(|t| (t - NOTES_OVERLAP_SECS).max(floor))
                 .unwrap_or(floor);
-            (url.clone(), chunk_queries(keys, &[1], Some(since), 5))
+            (url.clone(), chunk_queries(keys, &[1, 6], Some(since), 6))
         })
         .collect();
     let mut events = Vec::new();
@@ -525,6 +583,7 @@ async fn sync_notes(db: &mut Client, s: &Settings, now: i64, deadline: Instant) 
         plain.push(ev);
     }
     let good = verified(plain, now, &mut report.rejected);
+    let reposted = reposted_notes(db, s, &good, &relay_of, keep_after, now, deadline, &mut report.rejected).await?;
     let tx = db.transaction().await?;
     let insert = tx
         .prepare(
@@ -532,13 +591,26 @@ async fn sync_notes(db: &mut Client, s: &Settings, now: i64, deadline: Instant) 
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) ON CONFLICT (id) DO NOTHING",
         )
         .await?;
-    for ev in good.iter().filter(|e| e.kind == 1 && e.created_at >= keep_after) {
+    // Notes, then the notes followed people reposted (any age: the repost
+    // keeps them), then the reposts whose note is now stored.
+    let notes = good.iter().filter(|e| e.kind == 1 && e.created_at >= keep_after).chain(reposted.notes.iter());
+    for ev in notes {
         let (is_reply, parent, pks) = ev.reply_info();
         let tags = serde_json::to_value(&ev.tags).unwrap_or(Value::Array(Vec::new()));
         let kind = ev.kind as i32;
         let relay = relay_of.get(&ev.id).cloned().unwrap_or_default();
         report.stored += tx
             .execute(&insert, &[&ev.id, &ev.pubkey, &kind, &ev.created_at, &ev.content, &tags, &is_reply, &pks, &parent, &relay, &now])
+            .await?;
+    }
+    let no_pks: Vec<String> = Vec::new();
+    for ev in &reposted.reposts {
+        let Some((target, _)) = ev.repost_target() else { continue };
+        let tags = serde_json::to_value(&ev.tags).unwrap_or(Value::Array(Vec::new()));
+        let relay = relay_of.get(&ev.id).cloned().unwrap_or_default();
+        // The embedded copy is stored as its own row; keep the repost small.
+        report.stored += tx
+            .execute(&insert, &[&ev.id, &ev.pubkey, &6i32, &ev.created_at, &"", &tags, &false, &no_pks, &target, &relay, &now])
             .await?;
     }
     let good_list: Vec<String> = good_authors.into_iter().collect();
@@ -554,14 +626,108 @@ async fn sync_notes(db: &mut Client, s: &Settings, now: i64, deadline: Instant) 
     Ok(report)
 }
 
+struct Reposted {
+    /// Reposts (kind 6) whose note is stored or arrives in `notes`.
+    reposts: Vec<Event>,
+    /// Reposted notes to store: embedded in the repost, or fetched by id.
+    notes: Vec<Event>,
+}
+
+/// Most reposted notes fetched by id per run, and relays asked for them.
+const REPOSTED_LOOKUPS: usize = 100;
+const REPOSTED_RELAYS: usize = 4;
+
+/// Reposts from followed people and the notes they point at. A note
+/// carried in the repost is used when its signature checks out; the rest
+/// are asked for by id on the repost's relay hint, the relay the repost
+/// came from and the fallback relays. A repost whose note can't be found
+/// is dropped (it would paint as an empty card).
+#[allow(clippy::too_many_arguments)]
+async fn reposted_notes(
+    db: &Client,
+    s: &Settings,
+    good: &[Event],
+    relay_of: &HashMap<String, String>,
+    keep_after: i64,
+    now: i64,
+    deadline: Instant,
+    rejected: &mut usize,
+) -> Result<Reposted> {
+    let reposts: Vec<&Event> = good.iter().filter(|e| e.kind == 6 && e.created_at >= keep_after).collect();
+    let mut out = Reposted { reposts: Vec::new(), notes: Vec::new() };
+    if reposts.is_empty() {
+        return Ok(out);
+    }
+    let mut have: HashSet<String> = good.iter().filter(|e| e.kind == 1 && e.created_at >= keep_after).map(|e| e.id.clone()).collect();
+    for r in &reposts {
+        if let Some(inner) = r.embedded_repost().filter(|n| n.created_at <= now + FUTURE_SLACK_SECS) {
+            if have.insert(inner.id.clone()) {
+                out.notes.push(inner);
+            }
+        }
+    }
+    let wanted: Vec<String> = reposts.iter().filter_map(|r| r.repost_target()).map(|(id, _)| id).filter(|id| !have.contains(id)).collect();
+    if !wanted.is_empty() {
+        for row in db.query("SELECT id FROM nostr_events WHERE id = ANY($1)", &[&wanted]).await.context("stored reposted notes")? {
+            have.insert(row.get(0));
+        }
+    }
+    let mut missing: Vec<String> = Vec::new();
+    let mut ask: Vec<String> = Vec::new();
+    for r in &reposts {
+        let Some((id, hint)) = r.repost_target() else { continue };
+        if have.contains(&id) || missing.contains(&id) || missing.len() >= REPOSTED_LOOKUPS {
+            continue;
+        }
+        missing.push(id);
+        for url in [relay::normalize_relay_url(&hint), relay_of.get(&r.id).cloned()].into_iter().flatten() {
+            if !ask.contains(&url) && !s.skip.contains(&url) {
+                ask.push(url);
+            }
+        }
+    }
+    if !missing.is_empty() && Instant::now() < deadline {
+        ask.truncate(REPOSTED_RELAYS.saturating_sub(1).max(1));
+        for url in &s.fallback_relays {
+            if ask.len() >= REPOSTED_RELAYS {
+                break;
+            }
+            if !ask.contains(url) {
+                ask.push(url.clone());
+            }
+        }
+        let query = vec![Query::by_ids(missing.clone(), vec![1])];
+        let jobs = ask.into_iter().map(|u| (u, query.clone())).collect();
+        let mut found = Vec::new();
+        for (_, res) in fan_out(db, s, jobs, deadline).await {
+            if let Ok(res) = res {
+                found.extend(res.events);
+            }
+        }
+        for ev in verified(found, now, rejected) {
+            if ev.kind == 1 && missing.contains(&ev.id) && have.insert(ev.id.clone()) {
+                out.notes.push(ev);
+            }
+        }
+    }
+    out.reposts = reposts
+        .into_iter()
+        .filter(|r| r.repost_target().is_some_and(|(id, _)| have.contains(&id)))
+        .cloned()
+        .collect();
+    Ok(out)
+}
+
 /// Notes a VAAK user boosted, quoted (both their quote and the quoted
 /// note), bookmarked or liked (Favourites) stay past retention and
-/// unfollows, like a boosted remote post outlives media clean-up. `e` is
-/// the nostr_events row.
+/// unfollows, like a boosted remote post outlives media clean-up, and so
+/// does a note while a stored repost (kind 6) points at it. `e` is the
+/// nostr_events row.
 const KEPT_NOTE_SQL: &str = "EXISTS (SELECT 1 FROM masto_reblogs r WHERE r.status_id = 'nostr:' || e.id)
     OR EXISTS (SELECT 1 FROM masto_bookmarks b WHERE b.status_id = 'nostr:' || e.id)
     OR EXISTS (SELECT 1 FROM nostr_shares s WHERE s.event_id = e.id OR s.note_id = e.id)
-    OR EXISTS (SELECT 1 FROM nostr_reactions x WHERE x.note_id = e.id)";
+    OR EXISTS (SELECT 1 FROM nostr_reactions x WHERE x.note_id = e.id)
+    OR EXISTS (SELECT 1 FROM nostr_events r WHERE r.kind = 6 AND r.reply_to = e.id)";
 
 async fn shares_ready(db: &Client) -> bool {
     db.query_one("SELECT to_regclass('nostr_shares') IS NOT NULL", &[])

@@ -5031,6 +5031,7 @@ pub async fn warm_view(
     }
     let _ = hydrate_local_quote_targets(&db, &mut statuses).await;
     crate::nostr::share::attach_quotes(&db, &mut statuses).await;
+    crate::nostr::moderation::filter_statuses(&db, owner_user_id, &mut statuses).await;
     crate::recommendations::filter_statuses(&db, owner_user_id, &mut statuses).await?;
     link_outbox_reply_ids(&mut statuses);
 
@@ -5603,6 +5604,7 @@ pub(crate) async fn statuses_for_older_hits(
         statuses.push(st);
     }
     crate::nostr::share::attach_quotes(db, &mut statuses).await;
+    crate::nostr::moderation::filter_statuses(db, owner_user_id, &mut statuses).await;
     Ok(statuses)
 }
 

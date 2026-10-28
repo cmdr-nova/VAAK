@@ -135,6 +135,24 @@ foreach (['https://relay.example.com', 'ws://relay.example.com', 'wss://127.0.0.
 $check(!ap_nostr_relay_admin_action('nostr_relay_add', ['relay_url' => 'wss://10.0.0.1'])['ok'], 'admin add refuses a private relay');
 $check(ap_nostr_relay_age(0, 100) === 'never' && ap_nostr_relay_age(9400, 10000) === '10 min ago', 'relay ages read naturally');
 
+// Moderation: Hide/Block validate before touching the database; Block is
+// admin only; without the Postgres tables nothing is written.
+$modDb = new PDO('sqlite::memory:');
+$modDb->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+$check(ap_nostr_moderation_action('nostr_hide', 1, true, ['target' => 'zz'], $modDb)['status'] === 400, 'hide refuses a bad key');
+$check(ap_nostr_moderation_action('nostr_block', 1, false, ['target' => $hex], $modDb)['status'] === 403, 'block is admin only');
+$check(ap_nostr_moderation_action('nostr_hide', 0, true, ['target' => $hex], $modDb)['status'] === 401, 'hide needs a user');
+$check(ap_nostr_moderation_action('nostr_hide', 1, true, ['target' => $hex], $modDb)['status'] === 503, 'hide waits for the moderation tables');
+$check(ap_nostr_moderation_action('nostr_bogus', 1, true, ['target' => $hex], $modDb)['status'] === 503, 'unknown moderation action is never written');
+$check(ap_nostr_moderation_settings_html(1, true, $modDb) === '', 'no moderation tables, no Settings list');
+$rep = ap_nostr_action('nostr_prepare', 1, true, ['purpose' => 'report', 'target' => $hex, 'reason' => 'rude']);
+$check($rep['status'] === 400 && str_contains((string) $rep['body']['error'], 'reason'), 'report needs a NIP-56 type');
+$check(ap_nostr_action('nostr_prepare', 1, true, ['purpose' => 'mutelist', 'target' => $hex])['status'] === 400, 'unknown purpose refused');
+$check(ap_nostr_downranked_pubkey('nostr:' . $hex) === $hex && ap_nostr_downranked_pubkey('https://bsky.app/profile/did:plc:x') === '', 'downranked Nostr actors are nostr:{hex}');
+$nip19 = '7e7e9c42a91bfef19fa929e5fda1b72e0ebc1a4c1141673e2794234d86addf4e';
+$names = ap_nostr_names([$nip19, 'bad'], $modDb);
+$check(array_keys($names) === [$nip19] && ($names[$nip19]['name'] ?? '') === 'npub10elfc…zvjptg', 'names fall back to a short npub');
+
 if ($failures !== []) {
     fwrite(STDERR, "nostr-smoke: " . count($failures) . " of {$checks} checks failed\n - " . implode("\n - ", $failures) . "\n");
     exit(1);
