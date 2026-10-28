@@ -7184,7 +7184,9 @@ function admin_trends_sidebar_html(string $viewForTrends, bool $allowStale = tru
                 if (admin_trend_status_hidden($candidate, $viewerId, $downrankRefs)) continue;
                 if (function_exists('ap_masto_trend_status_listable') && !ap_masto_trend_status_listable($candidate)) continue;
             } elseif (ap_masto_trend_item_hidden($candidate, $viewerId, [], false)
-                || admin_trend_status_is_downranked($candidate, $downrankRefs)) {
+                || admin_trend_status_is_downranked($candidate, $downrankRefs)
+                // Rows cached before the recount skipped number-only tags (#039).
+                || preg_match('/^[\p{N}_]+$/u', (string) ($candidate['name'] ?? '')) === 1) {
                 continue;
             }
             // Skip bare-domain link cards (host only, no title/path context).

@@ -14061,8 +14061,8 @@ function ap_masto_trend_tags_recount(array $sources, int $ownerUserId = 0): arra
             if ($key === '' || isset($seenInPost[$key])) {
                 continue;
             }
-            // Skip ultra-common spammy short tags
-            if (in_array($key, ['nsfw', 'cw'], true)) {
+            // Skip ultra-common spammy short tags and number-only "tags" (#039, #2026)
+            if (in_array($key, ['nsfw', 'cw'], true) || ap_masto_trend_tag_is_numeric($key)) {
                 continue;
             }
             $seenInPost[$key] = true;
@@ -14389,11 +14389,29 @@ function ap_masto_trend_links_recount(array $sources,int $ownerUserId=0,bool $al
     return $out;
 }
 
+/** Digit/underscore-only tags (#039) are not hashtags in VAAK; see the PR #181 linkify rule. */
+function ap_masto_trend_tag_is_numeric(string $name): bool
+{
+    return $name !== '' && preg_match('/^[\p{N}_]+$/u', $name) === 1;
+}
+
+/**
+ * Drop number-only tags from already cached trend rows.
+ *
+ * @param array<int,mixed> $items
+ * @return list<mixed>
+ */
+function ap_masto_trend_tags_without_numeric(array $items): array
+{
+    return array_values(array_filter($items, static fn($tag): bool =>
+        !is_array($tag) || !ap_masto_trend_tag_is_numeric((string) ($tag['name'] ?? ''))));
+}
+
 function ap_masto_trends_tags(int $limit = 10, int $ownerUserId = 0): array
 {
     $limit = max(1, min(30, $limit));
     $cached = ap_masto_trends_cache_get('tags', 1, $ownerUserId);
-    if (is_array($cached)) return array_slice($cached, 0, $limit);
+    if (is_array($cached)) return array_slice(ap_masto_trend_tags_without_numeric($cached), 0, $limit);
     $sources = ap_masto_trend_tag_source_window();
     $items = ap_masto_trend_tags_recount($sources);
     ap_masto_trends_cache_set('tags', $items, $sources);
