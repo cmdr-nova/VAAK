@@ -143,6 +143,9 @@ async fn fan_out(
     futures_util::stream::iter(jobs.into_iter().map(|(url, queries)| async move {
         let deadline = (Instant::now() + RELAY_TIMEOUT).min(run_deadline);
         let res = relay::fetch(&url, &queries, deadline).await;
+        if let Err(e) = &res {
+            tracing::warn!(relay = %url, "nostr relay failed: {e:#}");
+        }
         (url, res)
     }))
     .buffer_unordered(concurrency.max(1))
