@@ -302,7 +302,7 @@ enum Command {
     /// linked to VAAK accounts write. Behind Caddy on loopback
     /// (deploy/vaak-nostr-relay.service). VAAK_NOSTR=0 turns it off.
     NostrRelay {
-        #[arg(long, default_value = "127.0.0.1:8795")]
+        #[arg(long, default_value = "127.0.0.1:8797")]
         bind: String,
     },
     /// Print the cleanup retention plan. PHP still owns deletes.

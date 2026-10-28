@@ -19,7 +19,7 @@ Group=www-data
 Nice=10
 Environment=VAAK_ENV_FILE=/etc/mkultra/vaak.env
 Environment=RUST_LOG=info
-ExecStart=/usr/local/bin/vaak-worker nostr-relay --bind 127.0.0.1:8795
+ExecStart=/usr/local/bin/vaak-worker nostr-relay --bind 127.0.0.1:8797
 Restart=on-failure
 RestartSec=10
 MemoryMax=128M
