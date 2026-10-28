@@ -298,7 +298,7 @@ check(decide({
 
 const handlerAt = source.indexOf('const followup = vaakDecideComposeFollowup({');
 const refreshCallAt = source.indexOf('novaRefreshTimelinePreservingPosition({ freshPost: true', handlerAt);
-const reloadAt = source.indexOf('window.location.reload();', refreshCallAt);
+const reloadAt = source.indexOf('reloadAfterNostr();', refreshCallAt);
 const stayAt = source.indexOf("if (followup === 'stay')", handlerAt);
 const hydrateAt = source.indexOf("if (followup === 'hydrate-thread')", handlerAt);
 check(handlerAt > 0 && stayAt > handlerAt && hydrateAt > stayAt && refreshCallAt > hydrateAt && reloadAt > refreshCallAt,

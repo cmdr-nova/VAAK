@@ -49212,12 +49212,15 @@ $showComposeFab = empty($GLOBALS['vaak_guest_profile'])
         }
       }
       if (mode === 'reply') playPostAudio();
+      let nostrCrosspost = null;
+      const reloadAfterNostr = () => Promise.resolve(nostrCrosspost).finally(() => window.location.reload());
       // "Nostr" box: sign the same post as a Nostr note via the browser's
       // signer extension. Runs in the background; the post is already in.
+      // A page reload below would kill it, so reloads wait for it first.
       if (actionName === 'reply' && !submittedIsReply && data.kind !== 'quote' && data.note_id
           && typeof window.vaakComposeNostrWanted === 'function' && window.vaakComposeNostrWanted(form)
           && typeof window.vaakNostrCrosspost === 'function') {
-        window.vaakNostrCrosspost(String(data.note_id));
+        nostrCrosspost = Promise.resolve(window.vaakNostrCrosspost(String(data.note_id))).catch(() => null);
       }
       // The box starts unticked for every post.
       form.querySelectorAll('#compose-nostr-box').forEach((box) => { box.checked = false; });
@@ -49302,7 +49305,7 @@ $showComposeFab = empty($GLOBALS['vaak_guest_profile'])
       // cannot run. Replies never reach this branch.
       if (followup === 'refresh-timeline') {
         Promise.resolve(window.novaRefreshTimelinePreservingPosition({ freshPost: true, published: data.published }))
-          .then((refreshed) => { if (refreshed === false) window.location.reload(); }).catch(() => {});
+          .then((refreshed) => { if (refreshed === false) reloadAfterNostr(); }).catch(() => {});
         return;
       }
       if (followup === 'poll-insert') {
@@ -49313,7 +49316,7 @@ $showComposeFab = empty($GLOBALS['vaak_guest_profile'])
         }).catch(() => {});
         return;
       }
-      window.location.reload();
+      reloadAfterNostr();
     } catch (err) {
       if (window.apAdminToast) window.apAdminToast('Upload or network error — try again.', true);
       else alert('Upload or network error — try again.');
