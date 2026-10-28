@@ -142,6 +142,25 @@ impl Event {
         }
         (true, parent, pks)
     }
+
+    /// NIP-18: the note a kind 6 repost points at (its first `e` tag) and
+    /// that tag's relay hint, if any.
+    pub fn repost_target(&self) -> Option<(String, String)> {
+        let tag = self.tag_values("e").next()?;
+        let id = tag.get(1)?.trim().to_ascii_lowercase();
+        if !is_hex64(&id) {
+            return None;
+        }
+        Some((id, tag.get(2).cloned().unwrap_or_default()))
+    }
+
+    /// The reposted kind 1 a kind 6 carries in its content, when it is the
+    /// note the `e` tag names and its signature checks out.
+    pub fn embedded_repost(&self) -> Option<Event> {
+        let (target, _) = self.repost_target()?;
+        let inner: Event = serde_json::from_str(self.content.trim()).ok()?;
+        (inner.kind == 1 && inner.id == target && inner.verify().is_ok()).then_some(inner)
+    }
 }
 
 /// Kind 0 fields VAAK paints. Only https pictures are kept.

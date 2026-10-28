@@ -140,12 +140,14 @@ fn test_relay_base() -> Option<String> {
         .filter(|s| s.starts_with("ws://127.0.0.1:"))
 }
 
-/// One REQ: its filter and the authors/kinds an answer must match.
+/// One REQ: its filter and the authors/kinds (or ids) an answer must match.
 #[derive(Debug, Clone)]
 pub struct Query {
     pub filter: Value,
     pub authors: Vec<String>,
     pub kinds: Vec<i64>,
+    /// Set for an id lookup: only these events are kept, whoever wrote them.
+    pub ids: Vec<String>,
 }
 
 impl Query {
@@ -154,7 +156,20 @@ impl Query {
         if let Some(since) = since {
             filter["since"] = json!(since);
         }
-        Self { filter, authors, kinds }
+        Self { filter, authors, kinds, ids: Vec::new() }
+    }
+
+    /// Fetch these events by id (reposted notes VAAK hasn't stored).
+    pub fn by_ids(ids: Vec<String>, kinds: Vec<i64>) -> Self {
+        let filter = json!({"ids": ids, "kinds": kinds, "limit": ids.len().max(1)});
+        Self { filter, authors: Vec::new(), kinds, ids }
+    }
+
+    fn wants(&self, ev: &Event) -> bool {
+        if !self.ids.is_empty() {
+            return self.ids.iter().any(|id| id == &ev.id) && self.kinds.contains(&ev.kind);
+        }
+        self.authors.iter().any(|a| a == &ev.pubkey) && self.kinds.contains(&ev.kind)
     }
 }
 
@@ -275,7 +290,6 @@ where
     for (n, query) in queries.iter().enumerate() {
         let sub = format!("vaak{n}");
         ws.send(Message::text(json!(["REQ", sub, query.filter]).to_string())).await?;
-        let wanted_authors: std::collections::HashSet<&str> = query.authors.iter().map(String::as_str).collect();
         let mut done = false;
         while !done {
             let next = match timeout_at(deadline, ws.next()).await {
@@ -311,7 +325,7 @@ where
                     let Ok(ev) = serde_json::from_value::<Event>(raw.clone()) else {
                         continue;
                     };
-                    if wanted_authors.contains(ev.pubkey.as_str()) && query.kinds.contains(&ev.kind) {
+                    if query.wants(&ev) {
                         out.events.push(ev);
                     }
                 }

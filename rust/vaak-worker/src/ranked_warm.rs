@@ -1187,6 +1187,34 @@ async fn apply_bsky_toxicity_downrank(db: &Client, owner: i64, keys: &mut [BskyK
     Ok(())
 }
 
+/// Nostr notes go through the same toxicity downrank, keyed by author as
+/// `nostr:{pubkey}` (Admin > Downranked names them from their profile).
+/// Keys linked to VAAK accounts are exempt, like local accounts.
+async fn apply_nostr_toxicity_downrank(db: &Client, owner: i64, keys: &mut Vec<crate::nostr::home::NostrKey>) -> Result<()> {
+    let local: HashSet<String> = db
+        .query("SELECT pubkey FROM nostr_links", &[])
+        .await
+        .context("nostr linked keys")?
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    let mut items: Vec<TimelineItem> = keys
+        .iter()
+        .map(|key| {
+            // An empty actor is skipped by apply_toxicity_downrank.
+            let actor = if local.contains(&key.author) { String::new() } else { format!("nostr:{}", key.author) };
+            let object = format!("nostr:{}", key.note);
+            TimelineItem::event(key.id.clone(), key.sort, actor.clone(), actor, key.text.clone(), "public".into(), object, "Create".into(), "nostr")
+        })
+        .collect();
+    apply_toxicity_downrank(db, owner, &mut items).await?;
+    for (key, item) in keys.iter_mut().zip(items) {
+        key.sort = item.sort;
+    }
+    keys.sort_by(|a, b| b.sort.cmp(&a.sort));
+    Ok(())
+}
+
 const BSKY_RECOMMENDATION_MAX: usize = 4;
 
 /// Bluesky posts the owner has seen in their Bluesky feeds from accounts they
@@ -3117,7 +3145,18 @@ pub async fn warm_home_native(cfg: &Config, owner_user_id: i64) -> Result<String
     // placed by post time like unweighted Bluesky posts.
     let muted_phrases = load_muted_phrases(&db, owner_user_id).await;
     match crate::nostr::home::fetch_keys(&db, owner_user_id, |text: &str| text_matches_muted(text, &muted_phrases)).await {
-        Ok(keys) => ranked = crate::nostr::home::merge_ranked(ranked, &keys),
+        Ok(mut keys) => {
+            if downranking_on {
+                if let Err(e) = apply_nostr_toxicity_downrank(&db, owner_user_id, &mut keys).await {
+                    tracing::warn!(
+                        owner = owner_user_id,
+                        error = %format!("{e:#}"),
+                        "native home nostr toxicity downrank skipped"
+                    );
+                }
+            }
+            ranked = crate::nostr::home::merge_ranked(ranked, &keys);
+        }
         Err(e) => tracing::warn!(
             owner = owner_user_id,
             error = %format!("{e:#}"),

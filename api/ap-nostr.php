@@ -25,6 +25,8 @@
 declare(strict_types=1);
 
 const AP_NOSTR_BECH32_CHARSET = 'qpzry9x8gf2tvdw0s3jn54khce6mua7l';
+/** NIP-56 report types, with the label the report box shows. */
+const AP_NOSTR_REPORT_TYPES = ['spam', 'nudity', 'profanity', 'illegal', 'impersonation', 'malware', 'other'];
 
 function ap_nostr_sqlite_ddl(): array
 {
@@ -360,11 +362,18 @@ function ap_nostr_action(string $action, int $ownerUserId, bool $isAdmin, array 
     if ($action === 'nostr_prepare') {
         $purpose = (string) ($post['purpose'] ?? '');
         $target = strtolower(trim((string) ($post['target'] ?? '')));
-        if (!in_array($purpose, ['like', 'reply', 'repost', 'quote', 'delete', 'follow', 'unfollow'], true) || !preg_match('/^[0-9a-f]{64}$/', $target)) {
+        if (!in_array($purpose, ['like', 'reply', 'repost', 'quote', 'delete', 'follow', 'unfollow', 'mute', 'unmute', 'report'], true) || !preg_match('/^[0-9a-f]{64}$/', $target)) {
             return $fail(400, 'Unknown Nostr action.');
         }
         $path = '/shadow/nostr-prepare';
         $payload = ['owner_id' => $ownerUserId, 'purpose' => $purpose, 'target' => $target];
+        if ($purpose === 'report') {
+            $reason = (string) ($post['reason'] ?? '');
+            if (!in_array($reason, AP_NOSTR_REPORT_TYPES, true)) {
+                return $fail(400, 'Pick a reason for the report.');
+            }
+            $payload['reason'] = $reason;
+        }
     } elseif ($action === 'nostr_publish') {
         $nonce = (string) ($post['nonce'] ?? '');
         $event = json_decode((string) ($post['event'] ?? ''), true);
@@ -747,4 +756,232 @@ function ap_nostr_relays_tab_html(string $csrf, ?PDO $db = null): string
         $h .= '</div></article>';
     }
     return $h;
+}
+
+/** True once the moderation migration (nostr_mutes, nostr_blocks) ran. */
+function ap_nostr_moderation_ready(?PDO $db = null): bool
+{
+    try {
+        $db ??= ap_db();
+        if (strtolower((string) $db->getAttribute(PDO::ATTR_DRIVER_NAME)) !== 'pgsql') {
+            return false;
+        }
+        return (bool) $db->query("SELECT to_regclass('public.nostr_mutes') IS NOT NULL AND to_regclass('public.nostr_blocks') IS NOT NULL")->fetchColumn();
+    } catch (Throwable $e) {
+        return false;
+    }
+}
+
+/**
+ * VAAK-side moderation of a Nostr key, no signing needed: Hide on VAAK
+ * (only for this user, never published) and the admin Block on VAAK (for
+ * every user). Mute on Nostr is signed instead (ap_nostr_action, purpose
+ * mute). Home and every timeline drop cards by these keys
+ * (nostr/moderation.rs).
+ *
+ * @param array<string,mixed> $post
+ * @return array{status:int, body:array<string,mixed>}
+ */
+function ap_nostr_moderation_action(string $action, int $ownerUserId, bool $isAdmin, array $post, ?PDO $db = null): array
+{
+    $fail = static fn (int $status, string $error): array => ['status' => $status, 'body' => ['ok' => false, 'error' => $error]];
+    if (!ap_nostr_form_visible($isAdmin)) {
+        return $fail(403, 'Nostr is not open on this server yet.');
+    }
+    if ($ownerUserId < 1) {
+        return $fail(401, 'Sign in first.');
+    }
+    $target = strtolower(trim((string) ($post['target'] ?? '')));
+    if (!preg_match('/^[0-9a-f]{64}$/', $target)) {
+        return $fail(400, 'That isn\'t a Nostr account.');
+    }
+    if (in_array($action, ['nostr_block', 'nostr_unblock'], true) && !$isAdmin) {
+        return $fail(403, 'Only admins can block on VAAK.');
+    }
+    try {
+        $db ??= ap_db();
+        if (!ap_nostr_moderation_ready($db)) {
+            return $fail(503, 'Nostr moderation isn\'t set up on this server yet.');
+        }
+        $now = time();
+        switch ($action) {
+            case 'nostr_hide':
+                $mine = ap_nostr_link_for_user($ownerUserId, $db);
+                if (is_array($mine) && (string) ($mine['pubkey'] ?? '') === $target) {
+                    return $fail(400, 'That\'s you.');
+                }
+                $db->prepare('INSERT INTO nostr_mutes (owner_user_id, pubkey, hidden_vaak, created_at) VALUES (?, ?, TRUE, ?)
+                    ON CONFLICT (owner_user_id, pubkey) DO UPDATE SET hidden_vaak = TRUE')->execute([$ownerUserId, $target, $now]);
+                break;
+            case 'nostr_unhide':
+                $db->prepare('UPDATE nostr_mutes SET hidden_vaak = FALSE WHERE owner_user_id = ? AND pubkey = ?')->execute([$ownerUserId, $target]);
+                $db->prepare('DELETE FROM nostr_mutes WHERE owner_user_id = ? AND pubkey = ? AND NOT on_nostr AND NOT hidden_vaak')->execute([$ownerUserId, $target]);
+                break;
+            case 'nostr_block':
+                $reason = mb_substr(trim((string) ($post['reason'] ?? '')), 0, 300);
+                $db->prepare('INSERT INTO nostr_blocks (pubkey, blocked_by, reason, created_at) VALUES (?, ?, ?, ?)
+                    ON CONFLICT (pubkey) DO NOTHING')->execute([$target, $ownerUserId, $reason, $now]);
+                break;
+            case 'nostr_unblock':
+                $db->prepare('DELETE FROM nostr_blocks WHERE pubkey = ?')->execute([$target]);
+                break;
+            default:
+                return $fail(400, 'Unknown Nostr action.');
+        }
+    } catch (Throwable $e) {
+        error_log('[nostr] moderation failed: ' . $e->getMessage());
+        return $fail(500, 'VAAK couldn\'t save that. Try again.');
+    }
+    return ['status' => 200, 'body' => ['ok' => true, 'purpose' => $action]];
+}
+
+/**
+ * Names for Nostr keys from stored kind 0 profiles, falling back to a
+ * short npub.
+ *
+ * @param list<string> $pubkeys
+ * @return array<string, array{name:string, npub:string}>
+ */
+function ap_nostr_names(array $pubkeys, ?PDO $db = null): array
+{
+    $keys = array_values(array_unique(array_filter(array_map(static fn ($k): string => strtolower((string) $k), $pubkeys), static fn (string $k): bool => (bool) preg_match('/^[0-9a-f]{64}$/', $k))));
+    $out = [];
+    foreach ($keys as $k) {
+        $npub = ap_nostr_npub($k);
+        $out[$k] = ['name' => substr($npub, 0, 10) . '…' . substr($npub, -6), 'npub' => $npub];
+    }
+    if ($keys === []) {
+        return $out;
+    }
+    try {
+        $db ??= ap_db();
+        $marks = implode(',', array_fill(0, count($keys), '?'));
+        $st = $db->prepare("SELECT pubkey, COALESCE(display_name, ''), COALESCE(name, '') FROM nostr_profiles WHERE pubkey IN ($marks)");
+        $st->execute($keys);
+        foreach ($st->fetchAll(PDO::FETCH_NUM) ?: [] as $row) {
+            $name = trim((string) $row[1]) !== '' ? trim((string) $row[1]) : trim((string) $row[2]);
+            if ($name !== '' && isset($out[(string) $row[0]])) {
+                $out[(string) $row[0]]['name'] = mb_substr($name, 0, 80);
+            }
+        }
+    } catch (Throwable $e) {
+    }
+    return $out;
+}
+
+/**
+ * Settings > Profile list of the user's Nostr mutes and VAAK hides (and,
+ * for admins, server blocks), with undo buttons the Home card script runs.
+ */
+function ap_nostr_moderation_settings_html(int $ownerUserId, bool $isAdmin, ?PDO $db = null): string
+{
+    try {
+        $db ??= ap_db();
+        if ($ownerUserId < 1 || !ap_nostr_moderation_ready($db)) {
+            return '';
+        }
+        $st = $db->prepare('SELECT pubkey, on_nostr, hidden_vaak FROM nostr_mutes WHERE owner_user_id = ? ORDER BY created_at DESC, pubkey LIMIT 500');
+        $st->execute([$ownerUserId]);
+        $mutes = $st->fetchAll(PDO::FETCH_ASSOC) ?: [];
+        $blocks = $isAdmin ? ($db->query('SELECT pubkey, reason FROM nostr_blocks ORDER BY created_at DESC, pubkey LIMIT 500')->fetchAll(PDO::FETCH_ASSOC) ?: []) : [];
+    } catch (Throwable $e) {
+        return '';
+    }
+    $names = ap_nostr_names(array_merge(array_column($mutes, 'pubkey'), array_column($blocks, 'pubkey')), $db);
+    $esc = static fn (string $v): string => htmlspecialchars($v, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+    $who = static function (string $pk) use ($names, $esc): string {
+        $n = $names[$pk] ?? ['name' => $pk, 'npub' => ''];
+        return '<a href="https://njump.me/' . $esc($n['npub']) . '" target="_blank" rel="noopener noreferrer">' . $esc($n['name']) . '</a>';
+    };
+    $btn = static fn (string $attr, string $pk, string $label): string => '<button type="button" class="btn btn-ghost" style="padding:.15rem .6rem;font-size:.8rem" ' . $attr . ' data-nostr-target="' . $esc($pk) . '">' . $esc($label) . '</button>';
+    $html = '<details class="nostr-moderation"><summary class="meta">Muted and hidden on Nostr (' . count($mutes) . ')</summary>';
+    if ($mutes === []) {
+        $html .= '<div class="meta">Nobody yet. Use ⋯ on a Nostr post to mute someone on Nostr (your signer signs your mute list) or hide them on VAAK only.</div>';
+    }
+    foreach ($mutes as $m) {
+        $pk = (string) $m['pubkey'];
+        $how = [];
+        $buttons = '';
+        if (!empty($m['on_nostr'])) {
+            $how[] = 'muted on Nostr';
+            $buttons .= $btn('data-nostr-act="unmute"', $pk, 'Unmute');
+        }
+        if (!empty($m['hidden_vaak'])) {
+            $how[] = 'hidden on VAAK';
+            $buttons .= $btn('data-nostr-vaak="nostr_unhide"', $pk, 'Unhide');
+        }
+        $html .= '<div class="meta nostr-moderation-row" data-nostr-row="' . $esc($pk) . '" style="display:flex;gap:.5rem;align-items:center;flex-wrap:wrap">' . $who($pk) . ' · ' . $esc(implode(', ', $how)) . ' ' . $buttons . '</div>';
+    }
+    $html .= '</details>';
+    if ($isAdmin) {
+        $html .= '<details class="nostr-moderation"><summary class="meta">Blocked on VAAK for everyone (' . count($blocks) . ')</summary>';
+        foreach ($blocks as $b) {
+            $pk = (string) $b['pubkey'];
+            $reason = trim((string) ($b['reason'] ?? ''));
+            $html .= '<div class="meta nostr-moderation-row" data-nostr-row="' . $esc($pk) . '" style="display:flex;gap:.5rem;align-items:center;flex-wrap:wrap">' . $who($pk) . ($reason !== '' ? ' · ' . $esc($reason) : '') . ' ' . $btn('data-nostr-vaak="nostr_unblock"', $pk, 'Unblock') . '</div>';
+        }
+        $html .= '</details>';
+    }
+    return $html;
+}
+
+/** Hex pubkey from a `nostr:{hex}` downranking actor, else ''. */
+function ap_nostr_downranked_pubkey(string $actorId): string
+{
+    return preg_match('/^nostr:([0-9a-f]{64})$/', trim($actorId), $m) ? $m[1] : '';
+}
+
+/**
+ * Admin > Downranked evidence for a Nostr author: their stored notes that
+ * raised the signal (`seen` holds `nostr:{note id}`), else recent matching
+ * notes.
+ *
+ * @param list<string> $categories
+ * @param list<string> $seen
+ * @return list<array{object_id:string,href:string,summary:string,categories:list<string>}>
+ */
+function ap_nostr_downranked_evidence(string $pubkey, array $categories, array $seen, int $limit = 5, ?PDO $db = null): array
+{
+    $wanted = array_values(array_filter(array_map('strval', $categories)));
+    if (!preg_match('/^[0-9a-f]{64}$/', $pubkey) || $wanted === []) {
+        return [];
+    }
+    $seenIds = [];
+    foreach ($seen as $s) {
+        if (preg_match('/^nostr:([0-9a-f]{64})$/', (string) $s, $m)) {
+            $seenIds[$m[1]] = true;
+        }
+    }
+    try {
+        $db ??= ap_db();
+        $st = $db->prepare('SELECT id, content FROM nostr_events WHERE pubkey = ? AND kind = 1 ORDER BY created_at DESC, id DESC LIMIT 100');
+        $st->execute([$pubkey]);
+        $out = [];
+        foreach ($st->fetchAll(PDO::FETCH_NUM) ?: [] as $row) {
+            $text = trim((string) $row[1]);
+            if ($text === '') {
+                continue;
+            }
+            $found = function_exists('admin_home_toxicity_categories') ? admin_home_toxicity_categories($text) : [];
+            $matched = array_values(array_intersect($wanted, $found));
+            if ($matched === [] && isset($seenIds[(string) $row[0]])) {
+                $matched = $wanted;
+            }
+            if ($matched === []) {
+                continue;
+            }
+            $out[] = [
+                'object_id' => 'nostr:' . $row[0],
+                'href' => 'https://njump.me/' . ap_nostr_bech32_encode('note', (string) hex2bin((string) $row[0])),
+                'summary' => $text,
+                'categories' => $matched,
+            ];
+            if (count($out) >= $limit) {
+                break;
+            }
+        }
+        return $out;
+    } catch (Throwable $e) {
+        return [];
+    }
 }
