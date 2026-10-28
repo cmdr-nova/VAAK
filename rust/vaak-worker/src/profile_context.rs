@@ -469,7 +469,10 @@ fn raw_quote_facts(status:&Value,target:&str)->crate::profile_raw::RawQuoteFacts
   if !url.starts_with("https://"){continue}
   let media_type=item.get("mediaType").and_then(Value::as_str).map(str::to_owned).or_else(||match item.get("type").and_then(Value::as_str).unwrap_or("").to_ascii_lowercase().as_str(){"video"|"gifv"=>Some("video/mp4".into()),"audio"=>Some("audio/*".into()),"image"=>Some("image/jpeg".into()),_=>None});
   let preview=["preview_url","preview","thumbnail"].iter().find_map(|key|item.get(*key).and_then(Value::as_str).filter(|url|url.starts_with("https://"))).unwrap_or("");
-  media.push(serde_json::json!({"url":url,"mediaType":media_type,"preview_url":preview}));if media.len()==4{break}
+  // admin_quote_media_items_from_status_like keeps string alt keys.
+  let mut entry=serde_json::json!({"url":url,"mediaType":media_type,"preview_url":preview});
+  for key in["description","name","alt"]{if let Some(alt)=item.get(key).filter(|v|v.is_string()){entry[key]=alt.clone();}}
+  media.push(entry);if media.len()==4{break}
  }
  let acct=status.get("account").and_then(|account|account.get("acct")).and_then(Value::as_str).unwrap_or("");
  let spoiler=crate::library::card::php_trim(string("spoiler_text"));
@@ -517,7 +520,10 @@ fn embedded_quote_media(value:&Value)->Vec<Value>{
   if !url.starts_with("https://"){continue}
   let media_type=item.get("mediaType").and_then(Value::as_str).map(str::to_owned).or_else(||match item.get("type").and_then(Value::as_str).unwrap_or("").to_ascii_lowercase().as_str(){"video"|"gifv"=>Some("video/mp4".into()),"audio"=>Some("audio/*".into()),"image"=>Some("image/jpeg".into()),_=>None});
   let preview=["preview_url","preview","thumbnail"].iter().find_map(|key|item.get(*key).and_then(Value::as_str).filter(|url|url.starts_with("https://"))).unwrap_or("");
-  media.push(serde_json::json!({"url":url,"mediaType":media_type,"preview_url":preview}));if media.len()==4{break}
+  // admin_quote_media_items_from_status_like keeps string alt keys.
+  let mut entry=serde_json::json!({"url":url,"mediaType":media_type,"preview_url":preview});
+  for key in["description","name","alt"]{if let Some(alt)=item.get(key).filter(|v|v.is_string()){entry[key]=alt.clone();}}
+  media.push(entry);if media.len()==4{break}
  }
  media
 }
@@ -980,6 +986,22 @@ async fn prepare_ordered_profile_page_inner(db:&Client,viewer:&crate::profile_ma
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn quote_media_alt_matches_actual_php_items(){
+        let root=std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let output=std::process::Command::new(root.join("api/bin/php-policy-test")).arg(root.join("api/bin/profile-raw-quote-components-reference.php")).output().unwrap();
+        assert!(output.status.success(),"{}",String::from_utf8_lossy(&output.stderr));
+        let reference:Value=serde_json::from_slice(&output.stdout).unwrap();
+        let cases=reference["media_items"].as_array().unwrap();assert_eq!(cases.len(),4);
+        for case in cases{
+            let name=case["case"].as_str().unwrap();let attachments=&case["attachments"];
+            let mut expected=case["items"].clone();for item in expected.as_array_mut().unwrap(){if item["preview_url"]==""{item["preview_url"]=Value::String(String::new());}}
+            assert_eq!(embedded_quote_media(&serde_json::json!({"attachment":attachments})),expected.as_array().unwrap().clone(),"AS2 quote media {name}");
+            assert_eq!(raw_quote_facts(&serde_json::json!({"media_attachments":attachments}),"https://remote.test/q").media,expected.as_array().unwrap().clone(),"status quote media {name}");
+            let row=crate::library::card::media_row(&embedded_quote_media(&serde_json::json!({"attachment":attachments})),false);
+            assert!(case["html"].as_str().unwrap().contains(&row),"quote media html {name}");
+        }
+    }
  use super::*;
  #[test]
  fn actual_php_fep_tag_quote_targets()->Result<()>{

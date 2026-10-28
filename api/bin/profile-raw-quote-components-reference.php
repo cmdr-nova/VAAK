@@ -29,4 +29,14 @@ foreach ($cases as $name=>$opts) {
     $GLOBALS['admin_quote_link_preview_budget']=0;
     $rows[]=['case'=>$name,'opts'=>$opts,'html'=>admin_quote_card_html($opts,'remote_profile')];
 }
-echo json_encode(['captures'=>$rows,'scope'=>'Actual pure quote presentation helper under existing declared offline component bootstrap; no native source admission/IO/global budget proof'], JSON_THROW_ON_ERROR | JSON_UNESCAPED_UNICODE);
+$mediaItems=[];
+foreach ([
+    'described' => [['type' => 'Image', 'mediaType' => 'image/png', 'url' => 'https://media.test/a.png', 'name' => 'A meme poster ✨ <b>alt</b>']],
+    'masto_description' => [['type' => 'image', 'url' => 'https://media.test/b.jpg', 'preview_url' => 'https://media.test/b-small.jpg', 'description' => 'First', 'name' => 'Second']],
+    'non_string_alt' => [['type' => 'video', 'url' => 'https://media.test/c.mp4', 'description' => null, 'name' => 7, 'alt' => 'Third']],
+    'no_alt' => [['url' => 'https://media.test/d.jpg', 'mediaType' => 'image/jpeg']],
+] as $name => $attachments) {
+    $items = admin_quote_media_items_from_status_like($attachments);
+    $mediaItems[] = ['case' => $name, 'attachments' => $attachments, 'items' => $items, 'html' => admin_quote_media_html($items)];
+}
+echo json_encode(['media_items'=>$mediaItems,'captures'=>$rows,'scope'=>'Actual pure quote presentation helper under existing declared offline component bootstrap; no native source admission/IO/global budget proof'], JSON_THROW_ON_ERROR | JSON_UNESCAPED_UNICODE);

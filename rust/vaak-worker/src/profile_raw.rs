@@ -173,7 +173,7 @@ fn render_core(n:&Value,f:&RawProfileFacts)->Result<String>{
  }
  let (vis_key,vis_label)=visibility(vis);
  let rank=if own_note{String::new()}else{format!(" data-rank-platform=\"fedi\" data-rank-key=\"{}\" data-rank-actor=\"{}\"",esc(&note.chars().take(2048).collect::<String>()),esc(&actor.chars().take(2048).collect::<String>()))};
- let avatar=format!("<img class=\"tweet-av\" src=\"{}\" alt=\"\" width=\"40\" height=\"40\" data-profile-hover-actor=\"{}\" loading=\"lazy\" decoding=\"async\" referrerpolicy=\"no-referrer\" onerror=\"this.onerror=null;this.src='https://mkultra.monster/img/avatar/default.webp'\">",esc(&facts.resolved_avatar),esc(actor.trim_end_matches('/')));
+ let avatar=format!("<img class=\"tweet-av\" src=\"{}\" alt=\"\" width=\"40\" height=\"40\"  data-profile-hover-actor=\"{}\" loading=\"lazy\" decoding=\"async\" referrerpolicy=\"no-referrer\" onerror=\"this.onerror=null;this.src='https://mkultra.monster/img/avatar/default.webp'\">",esc(&facts.resolved_avatar),esc(actor.trim_end_matches('/')));
  let name=if f.display_name.trim().is_empty(){&f.actor_key}else{f.display_name.trim()};
  let emoji=facts.emoji_by_actor.get(actor).cloned().unwrap_or_default();
  let mut html=format!("<article class=\"tweet tweet-own\"{rank} id=\"note-{}\"{}><div class=\"tweet-hd\">{avatar}<div class=\"tweet-hd-main tweet-hd-main--fedi\"><div><span class=\"who\">{}</span><span class=\"meta\"> @{}@mkultra.monster</span><span class=\"meta\"> · {}</span>",esc(&f.note_dom_id),identity_attrs(n,f.masto_row.as_ref(),facts.now),body::emojis(&esc(name),&emoji,true),esc(&f.actor_key),esc(&card::relative_time(string(n,"published"),facts.now)));

@@ -213,7 +213,10 @@ pub(crate) fn linked_text(text: &str, view: &str) -> Result<String> {
             if let Some(found) = url.find(rest) {
                 let raw = found.as_str();
                 let prefix = if raw.starts_with("http://") || raw.starts_with("https://") { "" } else { "https://" };
-                if !raw.contains("...") && !raw.contains('…') && !raw.contains("..") {
+                // PHP only refuses to invent a scheme for a shortened bare
+                // host/path label; scheme and www. URLs always link.
+                let bare = !prefix.is_empty() && !raw.get(..4).is_some_and(|w| w.eq_ignore_ascii_case("www."));
+                if !(bare && (raw.contains("...") || raw.contains('…') || raw.contains(".."))) {
                     let core = raw.trim_end_matches(['.', ',', ';', ':', '!', '?', ')', ']']);
                     let (core, trail) = if core.ends_with('/') { (raw, "") } else { (core, &raw[core.len()..]) };
                     let target = format!("{prefix}{core}");
@@ -645,7 +648,7 @@ mod tests {
         for fixture in reference["status_links"].as_array().unwrap(){assert_eq!(linked_text(fixture["url"].as_str().unwrap(),"bookmarks").unwrap(),fixture["html"].as_str().unwrap(),"actual PHP status URL classification");}
         for fixture in reference["html_plain"].as_array().unwrap(){assert_eq!(html_to_plain(fixture["input"].as_str().unwrap()),fixture["plain"].as_str().unwrap(),"actual PHP HTML-to-text");}
         for fixture in reference["raw_quotes"].as_array().unwrap(){let input=fixture["input"].as_str().unwrap();assert_eq!(looks_like_as2(input),fixture["looks"].as_bool().unwrap(),"actual AS2 recognition");assert_eq!(scrub_as2(input),fixture["scrub"].as_str().unwrap(),"actual AS2 scrub");assert_eq!(strip_raw_quotes(input,fixture["quoted"].as_str()),fixture["plain"].as_str().unwrap(),"actual raw quote strip");}
-        assert_eq!(count, 8);
+        assert_eq!(count, 12);
         assert!(linked_text("@uncachedperson", "bookmarks").is_err());
     }
     /// The PHP fixture's rows, read with the same SQL semantics in memory.

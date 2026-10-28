@@ -105,7 +105,7 @@ foreach ($mediaInputs as $name=>$items) foreach ([false,true] as $lazy) {
     $media[$name.($lazy?'_lazy':'')]=['items'=>$items,'lazy'=>$lazy,'html'=>admin_media_row_html($items)];
 }
 $links=[];
-foreach (['plain'=>'hello & goodbye','url'=>'Read https://example.test/path?q=1&x=2.','status'=>'https://bsky.app/profile/a.test/post/xyz','www'=>'See www.example.test/path','bare_host'=>'rust-lang.org/tools','hashtag'=>'A #Rust and #Été post','code'=>'Code `<tag>` then #Rust','mention'=>'Hello @alice@example.test','bare_mention'=>'Hello @uncachedperson','unicode'=>'Été 日本語 😀 https://example.test/a'] as $name=>$plain) {
+foreach (['plain'=>'hello & goodbye','url'=>'Read https://example.test/path?q=1&x=2.','status'=>'https://bsky.app/profile/a.test/post/xyz','www'=>'See www.example.test/path','bare_host'=>'rust-lang.org/tools','hashtag'=>'A #Rust and #Été post','code'=>'Code `<tag>` then #Rust','mention'=>'Hello @alice@example.test','bare_mention'=>'Hello @uncachedperson','unicode'=>'Été 日本語 😀 https://example.test/a','ellipsis_scheme'=>'Read https://www.example.test/news/2026-10-27/anibiz-… now','dots_scheme'=>'See https://example.test/a...b.','ellipsis_www'=>'Try www.example.test/news/a…','ellipsis_bare'=>'Try example.test/news/a… and example.test/b..c'] as $name=>$plain) {
     $links[$name]=['plain'=>$plain,'view'=>'bookmarks','html'=>admin_linkify_body_html($plain,'bookmarks')];
 }
 $previews=[];
