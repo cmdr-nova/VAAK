@@ -7,6 +7,7 @@
 //! of local accounts the viewer follows, and the profile Boosts tab shows
 //! the account's own rows. The signed Nostr repost (kind 6) or quote note
 //! is published first; `act::publish` records it in `nostr_shares`.
+//! Notes the user liked (`nostr_reactions`) fill Favourites > Nostr.
 
 use std::collections::HashMap;
 
@@ -135,6 +136,24 @@ pub async fn attach_quotes(db: &Client, statuses: &mut [Value]) {
             }
         }
     }
+}
+
+/// One page of the notes `owner` liked on Nostr (Favourites > Nostr),
+/// newest like first, as cards with quotes attached. Liked notes VAAK no
+/// longer stores are skipped. Returns the cards and whether more rows follow.
+pub async fn liked_cards(db: &Client, owner: i64, offset: i64, limit: i64) -> Result<(Vec<Value>, bool)> {
+    let rows = db
+        .query(
+            "SELECT note_id FROM nostr_reactions WHERE owner_user_id = $1 ORDER BY created_at DESC, note_id DESC OFFSET $2 LIMIT $3",
+            &[&owner, &offset, &(limit + 1)],
+        )
+        .await
+        .context("nostr likes page")?;
+    let mut ids: Vec<String> = rows.iter().map(|r| r.get::<_, String>(0)).collect();
+    let more = ids.len() as i64 > limit;
+    ids.truncate(limit as usize);
+    let mut cards = cards(db, &ids).await;
+    Ok((ids.iter().filter_map(|id| cards.remove(id)).collect(), more))
 }
 
 #[derive(Debug, Clone, PartialEq)]

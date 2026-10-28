@@ -116,6 +116,13 @@ function ap_library_native_quote_tree_requires_php(array $status, int $depth = 0
 /** Validate every indexed card before publishing HTML or preview state. */
 function ap_library_native_validate_reply(array $reply, int $count, int $initial, int $quoteInitial): ?string
 {
+    $cards = ap_library_native_validate_reply_cards($reply, $count, $initial, $quoteInitial);
+    return $cards === null ? null : implode('', $cards);
+}
+
+/** @return array<int,string>|null card HTML by source index; omitted sources paint nothing */
+function ap_library_native_validate_reply_cards(array $reply, int $count, int $initial, int $quoteInitial): ?array
+{
     if (!ap_native_preview_exact_keys($reply, ['ok', 'protocol_version', 'source_count', 'cards', 'status_preview_state', 'quote_preview_state'])
         || $reply['ok'] !== true || $reply['protocol_version'] !== 1 || $reply['source_count'] !== $count
         || !ap_native_preview_state_valid($reply['status_preview_state'], $initial, $count)
@@ -123,7 +130,7 @@ function ap_library_native_validate_reply(array $reply, int $count, int $initial
         || !is_array($reply['cards']) || !array_is_list($reply['cards']) || count($reply['cards']) > $count) {
         return null;
     }
-    $html = '';
+    $cards = [];
     $previous = -1;
     foreach ($reply['cards'] as $card) {
         if (!is_array($card) || !ap_native_preview_exact_keys($card, ['source_index', 'html'])
@@ -132,12 +139,23 @@ function ap_library_native_validate_reply(array $reply, int $count, int $initial
             return null;
         }
         $previous = $card['source_index'];
-        $html .= $card['html'];
+        $cards[$card['source_index']] = $card['html'];
     }
-    return $html;
+    return $cards;
 }
 /** Return complete HTML or null; the caller paints the same assembled sources. */
 function ap_library_native_render_batch(array $statuses, string $view, array $savedSources = []): ?string
+{
+    $cards = ap_library_native_render_cards($statuses, $view, $savedSources);
+    return $cards === null ? null : implode('', $cards);
+}
+
+/**
+ * Card HTML by source index, or null for the PHP fallback. Nostr statuses
+ * are never sent here: callers paint them with ap_nostr_cards_html().
+ * @return array<int,string>|null
+ */
+function ap_library_native_render_cards(array $statuses, string $view, array $savedSources = []): ?array
 {
     if (!ap_library_native_enabled() || !in_array($view, ['bookmarks', 'favourites'], true)
         || !array_is_list($statuses) || count($statuses) > 100 || !function_exists('ap_auth_current_user')) return null;
@@ -146,8 +164,6 @@ function ap_library_native_render_batch(array $statuses, string $view, array $sa
             if (!is_array($status) || ap_library_native_quote_tree_requires_php($status)) {
                 return null;
             }
-            // Nostr bookmarks have no native Library painter yet; the PHP
-            // path asks the worker for their Home card (ap_nostr_card_html).
             if (str_starts_with((string) ($status['id'] ?? ''), 'nostr:')) {
                 return null;
             }
@@ -191,13 +207,13 @@ function ap_library_native_render_batch(array $statuses, string $view, array $sa
     $success = curl_exec($ch); $code = curl_getinfo($ch, CURLINFO_RESPONSE_CODE); curl_close($ch);
     if ($success === false || $code !== 200 || !is_string($response) || strlen($response) > 8 * 1024 * 1024) return null;
     $reply = json_decode($response, true);
-    $html = is_array($reply) ? ap_library_native_validate_reply($reply, count($statuses), $initial, $quoteInitial) : null;
-    if ($html === null) return null;
+    $cards = is_array($reply) ? ap_library_native_validate_reply_cards($reply, count($statuses), $initial, $quoteInitial) : null;
+    if ($cards === null) return null;
     ap_native_preview_commit_state($reply['status_preview_state']);
     if ($reply['quote_preview_state']['attempts'] > 0) {
         $GLOBALS['admin_quote_link_preview_budget'] = $reply['quote_preview_state']['remaining'];
     }
-    return $html;
+    return $cards;
 }
 
 /** Descriptor-only local resolver. A failed/unsupported whole batch leaves the
@@ -214,6 +230,9 @@ function ap_library_native_render_saved_local(array $rows, string $producer, int
     $savedSources = [];
     foreach ($rows as $ordinal => $row) {
         if (!is_array($row) || !isset($row['id'])) return null;
+        // Canonical local resolution has no Nostr source; the entry path
+        // paints those pages (Nostr cards come from the worker).
+        if (str_starts_with((string) ($row['status_id'] ?? ''), 'nostr:')) return null;
         $savedSources[] = ['source_index' => $ordinal, 'producer_kind' => $producer,
             'selected_kind' => 'fedi', 'reference' => (string) $row['id'],
             'selected_ordinal' => $ordinal, 'folder_id' => $folder, 'offset' => $offset, 'limit' => $limit];

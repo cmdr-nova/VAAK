@@ -465,9 +465,71 @@ function ap_nostr_statuses(array $ids): array
  */
 function ap_nostr_card_html(array $status, int $ownerUserId, string $view): string
 {
-    if ($ownerUserId < 1 || !str_starts_with((string) ($status['id'] ?? ''), 'nostr:')) {
-        return '';
+    return ap_nostr_cards_html([$status], $ownerUserId, $view)[0];
+}
+
+/**
+ * Worker-painted cards for Nostr statuses, one HTML string per status in
+ * order ('' where none could be painted).
+ * @param list<array<string,mixed>> $statuses
+ * @return list<string>
+ */
+function ap_nostr_cards_html(array $statuses, int $ownerUserId, string $view): array
+{
+    $out = array_fill(0, count($statuses), '');
+    $send = [];
+    foreach (array_values($statuses) as $i => $status) {
+        if (is_array($status) && str_starts_with((string) ($status['id'] ?? ''), 'nostr:')) {
+            $send[$i] = $status;
+        }
     }
-    $res = ap_nostr_worker_call('/shadow/nostr-card', ['owner_id' => $ownerUserId, 'from' => $view, 'status' => $status], 3000);
-    return !empty($res['body']['ok']) && is_string($res['body']['html'] ?? null) ? $res['body']['html'] : '';
+    if ($ownerUserId < 1 || $send === []) {
+        return $out;
+    }
+    foreach (array_chunk($send, 100, true) as $chunk) {
+        $res = ap_nostr_worker_call('/shadow/nostr-card', ['owner_id' => $ownerUserId, 'from' => $view, 'statuses' => array_values($chunk)], 3000);
+        $htmls = $res['body']['htmls'] ?? null;
+        if (empty($res['body']['ok']) || !is_array($htmls) || count($htmls) !== count($chunk)) {
+            continue;
+        }
+        foreach (array_keys($chunk) as $n => $i) {
+            $out[$i] = is_string($htmls[$n] ?? null) ? $htmls[$n] : '';
+        }
+    }
+    return $out;
+}
+
+/** Favourites > Nostr shows for users who may use Nostr and linked an npub. */
+function ap_nostr_favourites_tab_visible(int $ownerUserId, bool $isAdmin): bool
+{
+    return $ownerUserId > 0 && ap_nostr_form_visible($isAdmin) && ap_nostr_table_ready()
+        && ap_nostr_link_for_user($ownerUserId) !== null;
+}
+
+/**
+ * Favourites > Nostr fragment: the notes the owner liked, painted by the
+ * worker. Rows count toward the offset even when their note is gone.
+ * @return array{html:string,has_more:bool}
+ */
+function ap_nostr_favourites_fragment(int $ownerUserId, int $offset, int $limit): array
+{
+    $offset = max(0, $offset);
+    $limit = max(1, min(40, $limit));
+    $res = ap_nostr_worker_call('/shadow/nostr-likes', ['owner_id' => $ownerUserId, 'offset' => $offset, 'limit' => $limit], 5000);
+    $ok = !empty($res['body']['ok']) && is_array($res['body']['htmls'] ?? null);
+    $htmls = $ok ? array_values(array_filter($res['body']['htmls'], 'is_string')) : [];
+    $hasMore = $ok && !empty($res['body']['has_more']);
+    $html = '<div data-fedi-favourites-fragment data-ajax="favourites_nostr" data-end-label="End of Nostr favourites"'
+        . ' data-offset="' . ($offset + ($hasMore ? $limit : count($htmls))) . '" data-limit="' . $limit
+        . '" data-has-more="' . ($hasMore ? '1' : '0') . '">';
+    if (!$ok && $offset === 0) {
+        $html .= '<div class="empty">Nostr favourites couldn’t load. Try again shortly.</div>';
+    } elseif ($htmls === [] && $offset === 0) {
+        $html .= '<div class="empty">No Nostr favourites yet. Notes you like on Home show up here.</div>';
+    } else {
+        $html .= implode('', $htmls);
+    }
+    $html .= '<div data-fedi-favourites-sentinel class="meta" style="padding:1rem 0 2rem;text-align:center">'
+        . ($hasMore ? 'Scroll for more…' : '') . '</div></div>';
+    return ['html' => $html, 'has_more' => $hasMore];
 }

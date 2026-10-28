@@ -108,6 +108,18 @@ $check(ap_nostr_action('nostr_publish', 1, true, ['nonce' => 'xyz', 'event' => '
 $check(ap_nostr_action('nostr_publish', 1, true, ['nonce' => str_repeat('a', 32), 'event' => 'not json'])['status'] === 400, 'non-JSON event refused');
 $check(ap_nostr_action('nostr_sign_anything', 1, true, [])['status'] === 400, 'unknown action refused');
 
+// Favourites > Nostr: gated like the npub form, and a missing worker
+// paints a retry note instead of an empty list.
+putenv('VAAK_NOSTR=0');
+$check(!ap_nostr_favourites_tab_visible(1, true), 'kill switch hides the Nostr favourites tab');
+putenv('VAAK_NOSTR');
+$check(!ap_nostr_favourites_tab_visible(0, true), 'no user, no Nostr favourites tab');
+putenv('VAAK_SHADOW_HTTP=http://127.0.0.1:1');
+$frag = ap_nostr_favourites_fragment(1, 0, 500);
+$check(str_contains($frag['html'], 'couldn’t load') && !$frag['has_more'] && str_contains($frag['html'], 'data-limit="40"'), 'unreachable worker: retry note, no more pages, limit clamped');
+$check(ap_nostr_cards_html([['id' => 'rss:1'], ['id' => 'nostr:' . $hex]], 1, 'bookmarks') === ['', ''], 'cards keep their slots when nothing paints');
+putenv('VAAK_SHADOW_HTTP');
+
 if ($failures !== []) {
     fwrite(STDERR, "nostr-smoke: " . count($failures) . " of {$checks} checks failed\n - " . implode("\n - ", $failures) . "\n");
     exit(1);

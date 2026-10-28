@@ -17,7 +17,7 @@
 //!     and signature are checked before it is stored.
 //!  4. Clean-up: notes older than the retention window, notes and profiles
 //!     nobody follows any more, follows of removed links. Notes a VAAK user
-//!     boosted, quoted or bookmarked stay (and their authors' profiles).
+//!     boosted, quoted, bookmarked or liked stay (and their authors' profiles).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Duration;
@@ -537,11 +537,13 @@ async fn sync_notes(db: &mut Client, s: &Settings, now: i64, deadline: Instant) 
 }
 
 /// Notes a VAAK user boosted, quoted (both their quote and the quoted
-/// note) or bookmarked stay past retention and unfollows, like a boosted
-/// remote post outlives media clean-up. `e` is the nostr_events row.
+/// note), bookmarked or liked (Favourites) stay past retention and
+/// unfollows, like a boosted remote post outlives media clean-up. `e` is
+/// the nostr_events row.
 const KEPT_NOTE_SQL: &str = "EXISTS (SELECT 1 FROM masto_reblogs r WHERE r.status_id = 'nostr:' || e.id)
     OR EXISTS (SELECT 1 FROM masto_bookmarks b WHERE b.status_id = 'nostr:' || e.id)
-    OR EXISTS (SELECT 1 FROM nostr_shares s WHERE s.event_id = e.id OR s.note_id = e.id)";
+    OR EXISTS (SELECT 1 FROM nostr_shares s WHERE s.event_id = e.id OR s.note_id = e.id)
+    OR EXISTS (SELECT 1 FROM nostr_reactions x WHERE x.note_id = e.id)";
 
 async fn shares_ready(db: &Client) -> bool {
     db.query_one("SELECT to_regclass('nostr_shares') IS NOT NULL", &[])
