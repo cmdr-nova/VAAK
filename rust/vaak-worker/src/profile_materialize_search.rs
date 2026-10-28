@@ -74,9 +74,10 @@ impl<'a> SearchProjector<'a> {
         }
         for task in &graphs{for kind in ["followers","following"]{
             let(key,value,write,_)=self.graphs.load(p.db,kind,&task.actor,&grant).await?;
-            let count=graph_array_count(&value);self.graphs.retain(key,value,write).await;
+            let count=graph_array_count(&value);if self.graphs.writes(write){crate::profile_enrichment::CurrentEnrichmentGrant::require_current(&grant,p.db).await?;}self.graphs.retain(key,value,write).await;
             apply_graph_count(&mut status,&task.actor,kind,count);
         }}
+        if !graphs.is_empty(){crate::profile_enrichment::CurrentEnrichmentGrant::require_current(&grant,p.db).await?;}
         for task in &cache{
             let Some(_)=crate::direct_preview::extract_url(&task.text)? else{continue};
             let card=crate::direct_preview::resolve_cache_only_guarded(p.db,dns,&task.text,chrono::Utc::now(),Some(&grant)).await?;
