@@ -182,6 +182,11 @@ pub async fn serve(cfg: Config, bind: SocketAddr) -> Result<()> {
         // copy the viewer's signer extension signed (nostr::act).
         .route("/shadow/nostr-prepare", post(shadow_nostr_prepare))
         .route("/shadow/nostr-publish", post(shadow_nostr_publish))
+        // Stored notes as timeline statuses, for PHP bookmark rows (nostr:{id}).
+        .route("/shadow/nostr-statuses", post(shadow_nostr_statuses))
+        // One Nostr card's HTML, for PHP pages that fall back from Rust.
+        .route("/shadow/nostr-card", post(shadow_nostr_card))
+        .route("/shadow/nostr-likes", post(shadow_nostr_likes))
         .route_layer(axum::middleware::from_fn_with_state(shadow_token, crate::shadow_auth::require));
     let mut app = Router::new()
         .route("/healthz", get(healthz))
@@ -257,7 +262,10 @@ async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
             "/shadow/feed-since-html",
             "/api/v1/notifications",
             "/shadow/nostr-prepare (POST)",
-            "/shadow/nostr-publish (POST)"
+            "/shadow/nostr-publish (POST)",
+            "/shadow/nostr-statuses (POST)",
+            "/shadow/nostr-card (POST)",
+            "/shadow/nostr-likes (POST)"
         ],
     }))
 }
@@ -698,6 +706,71 @@ async fn shadow_nostr_publish(State(state): State<AppState>, Json(body): Json<No
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"ok": false, "error": "owner required"}))).into_response();
     }
     nostr_reply(crate::nostr::act::publish(&state.cfg, body.owner_id, &body.nonce, &body.event).await)
+}
+
+#[derive(serde::Deserialize)]
+struct NostrStatusesBody {
+    ids: Vec<String>,
+}
+
+async fn shadow_nostr_statuses(State(state): State<AppState>, Json(body): Json<NostrStatusesBody>) -> axum::response::Response {
+    let mut ids: Vec<String> = body.ids.into_iter().map(|id| id.to_ascii_lowercase()).filter(|id| crate::nostr::event::is_hex64(id)).collect();
+    ids.sort();
+    ids.dedup();
+    ids.truncate(100);
+    let res = async {
+        let db = crate::db::connect(&state.cfg.database_url).await?;
+        Ok(serde_json::json!({"ok": true, "statuses": crate::nostr::share::cards(&db, &ids).await}))
+    }
+    .await;
+    nostr_reply(res)
+}
+
+#[derive(serde::Deserialize)]
+struct NostrCardBody {
+    owner_id: i64,
+    from: String,
+    statuses: Vec<serde_json::Value>,
+}
+
+/// Painted Nostr cards for PHP pages (Library), in request order.
+async fn shadow_nostr_card(State(state): State<AppState>, Json(body): Json<NostrCardBody>) -> axum::response::Response {
+    if body.owner_id < 1 || body.statuses.is_empty() || body.statuses.len() > 100 || !body.statuses.iter().all(crate::nostr::render::is_nostr_status) {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"ok": false, "error": "Nostr statuses required"}))).into_response();
+    }
+    let from: String = body.from.chars().filter(|c| c.is_ascii_lowercase() || *c == '_').take(32).collect();
+    let res = async {
+        let db = crate::db::connect(&state.cfg.database_url).await?;
+        let mut statuses = body.statuses;
+        crate::nostr::act::stamp_viewer_flags(&db, body.owner_id, &mut statuses).await;
+        let htmls: Vec<String> = statuses.iter().map(|st| crate::notif_embed::paint_lean_feed_card_opts(st, &from, "")).collect();
+        Ok(serde_json::json!({"ok": true, "htmls": htmls}))
+    }
+    .await;
+    nostr_reply(res)
+}
+
+#[derive(serde::Deserialize)]
+struct NostrLikesBody {
+    owner_id: i64,
+    offset: i64,
+    limit: i64,
+}
+
+/// Favourites > Nostr: one painted page of the owner's liked notes.
+async fn shadow_nostr_likes(State(state): State<AppState>, Json(body): Json<NostrLikesBody>) -> axum::response::Response {
+    if body.owner_id < 1 || body.offset < 0 || !(1..=40).contains(&body.limit) {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"ok": false, "error": "Bad page"}))).into_response();
+    }
+    let res = async {
+        let db = crate::db::connect(&state.cfg.database_url).await?;
+        let (mut statuses, more) = crate::nostr::share::liked_cards(&db, body.owner_id, body.offset, body.limit).await?;
+        crate::nostr::act::stamp_viewer_flags(&db, body.owner_id, &mut statuses).await;
+        let htmls: Vec<String> = statuses.iter().map(|st| crate::notif_embed::paint_lean_feed_card_opts(st, "favourites", "")).collect();
+        Ok(serde_json::json!({"ok": true, "htmls": htmls, "has_more": more}))
+    }
+    .await;
+    nostr_reply(res)
 }
 
 async fn shadow_home_html(

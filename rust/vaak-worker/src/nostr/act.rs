@@ -1,10 +1,12 @@
-//! Likes, replies and follow-list edits from Home cards.
+//! Likes, replies, reposts, quotes, deletes and follow-list edits from
+//! Home cards.
 //!
 //! VAAK never holds a Nostr private key. The browser's signer extension
 //! (NIP-07) signs. `prepare` builds the unsigned event and parks it in Redis
 //! for ten minutes; `publish` takes the signed copy, checks that it is that
-//! exact event from the linked key, and relays it. The only free field is a
-//! reply's text, so a page script cannot get anything else relayed.
+//! exact event from the linked key, and relays it. The only free field is the
+//! text of a reply or quote (a quote must end with its `nostr:note1…`
+//! reference), so a page script cannot get anything else relayed.
 //!
 //! A follow or unfollow replaces the whole kind 3 list, so `prepare` starts
 //! from the newest list the relays hold, refuses one that looks older or
@@ -28,6 +30,8 @@ use crate::config::Config;
 const PENDING_TTL_SECS: u64 = 600;
 const CLOCK_SLACK_SECS: i64 = 600;
 const MAX_REPLY_CHARS: usize = 8000;
+const REPOST_KIND: i32 = 6;
+const QUOTE_KIND: i32 = 1;
 const MAX_PUBLISH_RELAYS: usize = 8;
 const RELAY_DEADLINE: Duration = Duration::from_secs(12);
 const BACKUPS_KEPT: i64 = 20;
@@ -39,8 +43,11 @@ pub struct Pending {
     pub target: String,
     pub kind: i64,
     pub tags: Vec<Vec<String>>,
-    /// None: the user writes it (replies).
+    /// None: the user writes it (replies, quotes).
     pub content: Option<String>,
+    /// Text the user's content must end with (a quote's note reference).
+    #[serde(default)]
+    pub suffix: Option<String>,
     /// The kind 3 list a follow edit starts from.
     pub base: Option<Event>,
     pub relays: Vec<String>,
@@ -141,6 +148,28 @@ pub fn base_list_problem(base: &Event, stored_count: i64, stored_at: i64) -> Opt
     None
 }
 
+/// NIP-18 kind 6 tags. The e tag needs a relay URL: the note's own, else
+/// the first relay the repost goes to.
+pub fn repost_tags(note: &str, author: &str, hint: &str, relays: &[String]) -> Vec<Vec<String>> {
+    let relay = if hint.is_empty() { relays.first().map(String::as_str).unwrap_or("") } else { hint };
+    vec![e_tag(note, relay, None), tag(&["p", author])]
+}
+
+/// NIP-18 quote tags: `q` with the relay and author, and a `p` so the
+/// author is told (not when quoting yourself).
+pub fn quote_tags(note: &str, author: &str, hint: &str, me: &str) -> Vec<Vec<String>> {
+    let mut tags = vec![tag(&["q", note, hint, author])];
+    if author != me {
+        tags.push(tag(&["p", author]));
+    }
+    tags
+}
+
+/// What a quote's text ends with: NIP-21 reference to the quoted note.
+pub fn quote_suffix(note: &str) -> String {
+    format!("\n\nnostr:{}", super::bech32::note(note))
+}
+
 /// The signed event must be the prepared one, from the linked key, signed
 /// recently. Returns the user's reply text check too.
 pub fn check_signed(ev: &Event, pending: &Pending, linked: &str, now: i64) -> Result<(), String> {
@@ -153,8 +182,19 @@ pub fn check_signed(ev: &Event, pending: &Pending, linked: &str, now: i64) -> Re
     }
     match &pending.content {
         Some(c) if &ev.content != c => return Err("The signed event isn't the one VAAK prepared.".into()),
-        None if ev.content.trim().is_empty() => return Err("Write something first.".into()),
-        None if ev.content.chars().count() > MAX_REPLY_CHARS => return Err("That reply is too long.".into()),
+        None if ev.content.chars().count() > MAX_REPLY_CHARS => return Err("That's too long.".into()),
+        None => {
+            let text = match &pending.suffix {
+                Some(suffix) => ev
+                    .content
+                    .strip_suffix(suffix.as_str())
+                    .ok_or("The signed quote is missing its link to the quoted note.")?,
+                None => ev.content.as_str(),
+            };
+            if text.trim().is_empty() {
+                return Err("Write something first.".into());
+            }
+        }
         _ => {}
     }
     if (ev.created_at - now).abs() > CLOCK_SLACK_SECS {
@@ -238,7 +278,7 @@ pub async fn prepare(cfg: &Config, owner: i64, purpose: &str, target: &str) -> R
     }
     let s = super::sync::Settings::from_env(30);
     let mut pending = match purpose {
-        "like" | "reply" => {
+        "like" | "reply" | "repost" | "quote" => {
             let Some(row) = db
                 .query_opt("SELECT pubkey, relay, tags FROM nostr_events WHERE id = $1", &[&target])
                 .await
@@ -253,13 +293,57 @@ pub async fn prepare(cfg: &Config, owner: i64, purpose: &str, target: &str) -> R
             let mine = write_relays_of(&db, std::slice::from_ref(&me)).await;
             let theirs = write_relays_of(&db, std::slice::from_ref(&author)).await;
             let relays = merge_relays(&[&mine, &theirs, &s.fallback_relays]);
-            if purpose == "reply" {
+            if purpose == "repost" {
+                let shared: Option<String> = db
+                    .query_opt(
+                        "SELECT event_id FROM nostr_shares WHERE owner_user_id = $1 AND note_id = $2 AND kind = $3",
+                        &[&owner, &target, &REPOST_KIND],
+                    )
+                    .await
+                    .context("nostr repost")?
+                    .map(|r| r.get(0));
+                match shared {
+                    Some(repost) => Pending {
+                        purpose: "unrepost".into(),
+                        target: target.clone(),
+                        kind: 5,
+                        tags: vec![tag(&["e", &repost]), tag(&["k", "6"])],
+                        content: Some(String::new()),
+                        suffix: None,
+                        base: None,
+                        relays,
+                    },
+                    // NIP-18: the e tag must carry a relay URL.
+                    None => Pending {
+                        purpose: "repost".into(),
+                        target: target.clone(),
+                        kind: 6,
+                        tags: repost_tags(&target, &author, &relay_hint, &relays),
+                        content: Some(String::new()),
+                        suffix: None,
+                        base: None,
+                        relays,
+                    },
+                }
+            } else if purpose == "quote" {
+                Pending {
+                    purpose: "quote".into(),
+                    target: target.clone(),
+                    kind: 1,
+                    tags: quote_tags(&target, &author, &relay_hint, &me),
+                    content: None,
+                    suffix: Some(quote_suffix(&target)),
+                    base: None,
+                    relays,
+                }
+            } else if purpose == "reply" {
                 Pending {
                     purpose: "reply".into(),
                     target: target.clone(),
                     kind: 1,
                     tags: reply_tags(&target, &author, &note_tags, &relay_hint, &me),
                     content: None,
+                    suffix: None,
                     base: None,
                     relays,
                 }
@@ -277,6 +361,7 @@ pub async fn prepare(cfg: &Config, owner: i64, purpose: &str, target: &str) -> R
                         kind: 5,
                         tags: vec![tag(&["e", &reaction]), tag(&["k", "7"])],
                         content: Some(String::new()),
+                        suffix: None,
                         base: None,
                         relays,
                     },
@@ -286,10 +371,32 @@ pub async fn prepare(cfg: &Config, owner: i64, purpose: &str, target: &str) -> R
                         kind: 7,
                         tags: vec![e_tag(&target, &relay_hint, None), tag(&["p", &author]), tag(&["k", "1"])],
                         content: Some("+".into()),
+                        suffix: None,
                         base: None,
                         relays,
                     },
                 }
+            }
+        }
+        "delete" => {
+            let own = db
+                .query_opt("SELECT kind FROM nostr_events WHERE id = $1 AND pubkey = $2", &[&target, &me])
+                .await
+                .context("nostr own note")?;
+            let Some(row) = own else {
+                return refuse("You can only delete your own Nostr notes.");
+            };
+            let kind: i32 = row.get(0);
+            let mine = write_relays_of(&db, std::slice::from_ref(&me)).await;
+            Pending {
+                purpose: "delete".into(),
+                target: target.clone(),
+                kind: 5,
+                tags: vec![tag(&["e", &target]), tag(&["k", &kind.to_string()])],
+                content: Some(String::new()),
+                suffix: None,
+                base: None,
+                relays: merge_relays(&[&mine, &s.fallback_relays]),
             }
         }
         "follow" | "unfollow" => {
@@ -319,6 +426,7 @@ pub async fn prepare(cfg: &Config, owner: i64, purpose: &str, target: &str) -> R
                 kind: 3,
                 tags,
                 content: Some(base.content.clone()),
+                suffix: None,
                 base: Some(base),
                 relays: merge_relays(&[&mine, &s.index_relays, &s.fallback_relays]),
             }
@@ -344,6 +452,7 @@ pub async fn prepare(cfg: &Config, owner: i64, purpose: &str, target: &str) -> R
         "pubkey": me,
         "purpose": pending.purpose,
         "needs_content": pending.content.is_none(),
+        "suffix": pending.suffix.clone().unwrap_or_default(),
         "template": {
             "kind": pending.kind,
             "tags": pending.tags,
@@ -405,10 +514,16 @@ pub async fn publish(cfg: &Config, owner: i64, nonce: &str, signed: &Value) -> R
     .collect()
     .await;
     let mut accepted = 0usize;
+    let mut accepted_by = String::new();
     let mut problems = Vec::new();
     for (url, res) in &results {
         match res {
-            Ok((true, _)) => accepted += 1,
+            Ok((true, _)) => {
+                accepted += 1;
+                if accepted_by.is_empty() {
+                    accepted_by = url.clone();
+                }
+            }
             Ok((false, msg)) => problems.push(format!("{url}: {msg}")),
             Err(e) => problems.push(format!("{url}: {e:#}")),
         }
@@ -435,6 +550,52 @@ pub async fn publish(cfg: &Config, owner: i64, nonce: &str, signed: &Value) -> R
             db.execute("DELETE FROM nostr_reactions WHERE owner_user_id = $1 AND note_id = $2", &[&owner, &pending.target])
                 .await?;
         }
+        "repost" | "quote" => {
+            let kind = if pending.purpose == "repost" { REPOST_KIND } else { QUOTE_KIND };
+            db.execute(
+                "INSERT INTO nostr_shares (owner_user_id, event_id, note_id, kind, created_at) VALUES ($1, $2, $3, $4, $5)
+                 ON CONFLICT (owner_user_id, event_id) DO NOTHING",
+                &[&owner, &ev.id, &pending.target, &kind, &ev.created_at],
+            )
+            .await?;
+            if pending.purpose == "quote" {
+                // The quote is the owner's own note; VAAK shows it like a boost.
+                let (is_reply, parent, pks) = ev.reply_info();
+                let tags = serde_json::to_value(&ev.tags).unwrap_or(Value::Array(Vec::new()));
+                db.execute(
+                    "INSERT INTO nostr_events (id, pubkey, kind, created_at, content, tags, is_reply, reply_pubkeys, reply_to, relay, ingested_at)
+                     VALUES ($1, $2, 1, $3, $4, $5, $6, $7, $8, $9, $10) ON CONFLICT (id) DO NOTHING",
+                    &[&ev.id, &ev.pubkey, &ev.created_at, &ev.content, &tags, &is_reply, &pks, &parent, &accepted_by, &now],
+                )
+                .await?;
+            }
+            let shown = if pending.purpose == "repost" { pending.target.as_str() } else { ev.id.as_str() };
+            super::share::mirror_boost(&db, owner, shown, pending.purpose == "quote", now).await?;
+        }
+        "unrepost" => {
+            db.execute(
+                "DELETE FROM nostr_shares WHERE owner_user_id = $1 AND note_id = $2 AND kind = $3",
+                &[&owner, &pending.target, &REPOST_KIND],
+            )
+            .await?;
+            // Un-reposting your own quote leaves the quote itself on VAAK.
+            let own_quote = db
+                .query_opt(
+                    "SELECT 1 FROM nostr_shares WHERE owner_user_id = $1 AND event_id = $2 AND kind = $3",
+                    &[&owner, &pending.target, &QUOTE_KIND],
+                )
+                .await?
+                .is_some();
+            if !own_quote {
+                super::share::unmirror_boost(&db, owner, &pending.target).await?;
+            }
+        }
+        "delete" => {
+            db.execute("DELETE FROM nostr_shares WHERE owner_user_id = $1 AND event_id = $2", &[&owner, &pending.target])
+                .await?;
+            db.execute("DELETE FROM nostr_events WHERE id = $1 AND pubkey = $2", &[&pending.target, &me]).await?;
+            super::share::unmirror_boost(&db, owner, &pending.target).await?;
+        }
         "follow" | "unfollow" => {
             let list = ev.follow_list();
             let tx_sql = if pending.purpose == "follow" {
@@ -456,43 +617,49 @@ pub async fn publish(cfg: &Config, owner: i64, nonce: &str, signed: &Value) -> R
         "purpose": pending.purpose,
         "accepted": accepted,
         "asked": results.len(),
-        "note": if pending.purpose == "reply" { Value::String(super::bech32::note(&ev.id)) } else { Value::Null },
+        "note": if matches!(pending.purpose.as_str(), "reply" | "quote") { Value::String(super::bech32::note(&ev.id)) } else { Value::Null },
     }))
 }
 
-/// Viewer state on painted Nostr cards: `vaak_nostr_liked` and
-/// `vaak_nostr_following`. Read at paint time so a cached page still shows
-/// a like or unfollow made a moment ago.
+/// Viewer state on painted Nostr cards (boost wrappers included):
+/// `vaak_nostr_liked`, `vaak_nostr_reposted`, `vaak_nostr_following` and
+/// `vaak_nostr_mine`. Read at paint time so a cached page still shows a
+/// like, repost or unfollow made a moment ago.
 pub async fn stamp_viewer_flags(db: &Client, owner: i64, statuses: &mut [Value]) {
-    let ids: Vec<String> = statuses
+    fn cards(statuses: &mut [Value]) -> Vec<&mut Value> {
+        statuses
+            .iter_mut()
+            .map(|s| if s.get("reblog").is_some_and(Value::is_object) { &mut s["reblog"] } else { s })
+            .filter(|s| super::render::is_nostr_status(s))
+            .collect()
+    }
+    let field = |s: &Value, key: &str| s.get(key).and_then(Value::as_str).unwrap_or("").to_string();
+    let (ids, authors): (Vec<String>, Vec<String>) = cards(statuses)
         .iter()
-        .filter(|s| super::render::is_nostr_status(s))
-        .filter_map(|s| s.get("vaak_nostr_event_id").and_then(Value::as_str).map(str::to_owned))
-        .collect();
+        .map(|s| (field(s, "vaak_nostr_event_id"), field(s, "vaak_nostr_pubkey")))
+        .unzip();
     if ids.is_empty() || owner < 1 || !super::sync::tables_ready(db).await {
         return;
     }
-    let authors: Vec<String> = statuses
-        .iter()
-        .filter_map(|s| s.get("vaak_nostr_pubkey").and_then(Value::as_str).map(str::to_owned))
-        .collect();
-    let liked: HashSet<String> = match db
-        .query("SELECT note_id FROM nostr_reactions WHERE owner_user_id = $1 AND note_id = ANY($2)", &[&owner, &ids])
-        .await
-    {
-        Ok(rows) => rows.iter().map(|r| r.get(0)).collect(),
-        Err(_) => return,
+    let set = |rows: Result<Vec<tokio_postgres::Row>, tokio_postgres::Error>| -> HashSet<String> {
+        rows.map(|rows| rows.iter().map(|r| r.get(0)).collect()).unwrap_or_default()
     };
-    let following: HashSet<String> = db
-        .query("SELECT pubkey FROM nostr_follows WHERE owner_user_id = $1 AND pubkey = ANY($2)", &[&owner, &authors])
-        .await
-        .map(|rows| rows.iter().map(|r| r.get(0)).collect())
-        .unwrap_or_default();
-    for st in statuses.iter_mut().filter(|s| super::render::is_nostr_status(s)) {
-        let id = st.get("vaak_nostr_event_id").and_then(Value::as_str).unwrap_or("").to_string();
-        let pk = st.get("vaak_nostr_pubkey").and_then(Value::as_str).unwrap_or("").to_string();
+    let liked = set(db.query("SELECT note_id FROM nostr_reactions WHERE owner_user_id = $1 AND note_id = ANY($2)", &[&owner, &ids]).await);
+    let reposted = set(db
+        .query(
+            "SELECT note_id FROM nostr_shares WHERE owner_user_id = $1 AND kind = $2 AND note_id = ANY($3)",
+            &[&owner, &REPOST_KIND, &ids],
+        )
+        .await);
+    let following = set(db.query("SELECT pubkey FROM nostr_follows WHERE owner_user_id = $1 AND pubkey = ANY($2)", &[&owner, &authors]).await);
+    let me = linked_pubkey(db, owner).await.ok().flatten().map(|(pk, _, _)| pk).unwrap_or_default();
+    for st in cards(statuses) {
+        let id = field(st, "vaak_nostr_event_id");
+        let pk = field(st, "vaak_nostr_pubkey");
         st["vaak_nostr_liked"] = json!(liked.contains(&id));
+        st["vaak_nostr_reposted"] = json!(reposted.contains(&id));
         st["vaak_nostr_following"] = json!(following.contains(&pk));
+        st["vaak_nostr_mine"] = json!(!me.is_empty() && pk == me);
     }
 }
 
@@ -568,6 +735,7 @@ mod tests {
             kind: 7,
             tags: ev_tags,
             content: Some("+".into()),
+            suffix: None,
             base: None,
             relays: vec![],
         }
@@ -600,5 +768,31 @@ mod tests {
         assert!(check_signed(&empty, &pending, &empty.pubkey, 5000).is_err());
         let ok = signed(7, 5000, 1, tags, "hello");
         assert_eq!(check_signed(&ok, &pending, &ok.pubkey, 5000), Ok(()));
+    }
+
+    #[test]
+    fn quotes_must_keep_their_reference_and_have_text() {
+        let tags = quote_tags(P, A, "wss://nos.lol", C);
+        assert_eq!(tags, vec![tag(&["q", P, "wss://nos.lol", A]), tag(&["p", A])]);
+        assert_eq!(quote_tags(P, C, "", C), vec![tag(&["q", P, "", C])], "no p tag when quoting yourself");
+        let mut pending = pending_like(tags.clone());
+        pending.kind = 1;
+        pending.content = None;
+        let suffix = quote_suffix(P);
+        assert!(suffix.starts_with("\n\nnostr:note1"));
+        pending.suffix = Some(suffix.clone());
+        let ok = signed(7, 5000, 1, tags.clone(), &format!("so true{suffix}"));
+        assert_eq!(check_signed(&ok, &pending, &ok.pubkey, 5000), Ok(()));
+        let bare = signed(7, 5000, 1, tags.clone(), "so true");
+        assert!(check_signed(&bare, &pending, &bare.pubkey, 5000).unwrap_err().contains("link"));
+        let empty = signed(7, 5000, 1, tags, &format!("  {suffix}"));
+        assert!(check_signed(&empty, &pending, &empty.pubkey, 5000).unwrap_err().contains("Write"));
+    }
+
+    #[test]
+    fn reposts_always_name_a_relay() {
+        let relays = vec!["wss://nos.lol".to_string()];
+        assert_eq!(repost_tags(P, A, "wss://relay.example", &relays)[0], tag(&["e", P, "wss://relay.example"]));
+        assert_eq!(repost_tags(P, A, "", &relays), vec![tag(&["e", P, "wss://nos.lol"]), tag(&["p", A])]);
     }
 }

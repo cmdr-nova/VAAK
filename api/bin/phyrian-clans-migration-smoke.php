@@ -47,6 +47,7 @@ $check(
         '20261027_listenbrainz_links_postgres.sql',
         '20261028_nostr_postgres.sql',
         '20261028_nostr_actions_postgres.sql',
+        '20261028_nostr_shares_postgres.sql',
     ],
     'deploy runner picks up the clans migration and the quote-target table'
 );

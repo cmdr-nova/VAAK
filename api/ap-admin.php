@@ -1443,7 +1443,50 @@ $vaakAdminOnlyActions = [
         // but local-only (never federate / never queue outbound).
         $isRssLocal = str_starts_with($statusId, 'rss:')
             || str_starts_with($objectId, 'rss:');
-        if ($isRssLocal) {
+        // Nostr notes (nostr:{id}): only the VAAK-private bookmark lives here.
+        // Likes and boosts are signed Nostr events (nostr_prepare/publish).
+        $isNostrLocal = preg_match('/^nostr:[0-9a-f]{64}$/', $statusId) === 1;
+        if ($isNostrLocal) {
+            $objectId = $statusId;
+            $interactKind = 'bookmark';
+            if ($action === 'bookmark_status') {
+                ap_masto_bookmark_add($statusId, $objectId, $vaakOwnerId);
+                $interactOk = true;
+                $interactActive = true;
+                $notice = 'Bookmarked (VAAK only, not on Nostr).';
+            } elseif ($action === 'unbookmark_status') {
+                ap_masto_bookmark_remove($statusId, $vaakOwnerId, $objectId);
+                if (function_exists('vaak_bookmark_folders_on_unbookmark')) {
+                    vaak_bookmark_folders_on_unbookmark($statusId, $vaakOwnerId);
+                }
+                $interactOk = true;
+                $interactActive = false;
+                $notice = 'Bookmark removed.';
+            } else {
+                $interactKind = null;
+                $error = 'Like and boost Nostr posts with the buttons signed by your Nostr extension.';
+            }
+            if ($wantJson) {
+                header('Content-Type: application/json; charset=utf-8');
+                header('Cache-Control: no-store');
+                $folderIds = ($interactOk && $interactActive && function_exists('vaak_bookmark_folders_for_status'))
+                    ? vaak_bookmark_folders_for_status($statusId, $vaakOwnerId)
+                    : [];
+                echo json_encode([
+                    'ok' => $interactOk && $error === null,
+                    'error' => $error,
+                    'notice' => $notice,
+                    'action' => $action,
+                    'kind' => $interactKind,
+                    'active' => $interactActive,
+                    'status_id' => $statusId,
+                    'object_id' => $objectId,
+                    'folder_ids' => $folderIds,
+                    'open_folder_picker' => $interactOk && $interactActive,
+                ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+                exit;
+            }
+        } elseif ($isRssLocal) {
             if (!function_exists('ap_rss_parse_local_status_id')) {
                 @require_once __DIR__ . '/ap-rss.php';
             }
@@ -5586,6 +5629,22 @@ function admin_favourite_fedi_fragment(int $ownerUserId, int $offset = 0, int $l
     return ['html' => $html, 'has_more' => $hasMore, 'source' => $page['source']];
 }
 
+if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'favourites_nostr') {
+    header('Content-Type: text/html; charset=utf-8');
+    header('Cache-Control: no-store');
+    if (session_status() === PHP_SESSION_ACTIVE) {
+        session_write_close();
+    }
+    if (!function_exists('ap_nostr_favourites_tab_visible') || !ap_nostr_favourites_tab_visible((int) $vaakOwnerId, !empty($vaakIsAdmin))) {
+        http_response_code(404);
+        exit;
+    }
+    $frag = ap_nostr_favourites_fragment((int) $vaakOwnerId, (int) ($_GET['offset'] ?? 0), (int) ($_GET['limit'] ?? 20));
+    header('X-Has-More: ' . ($frag['has_more'] ? '1' : '0'));
+    echo $frag['html'];
+    exit;
+}
+
 if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'favourites_fedi') {
     header('Content-Type: text/html; charset=utf-8');
     header('Cache-Control: no-store');
@@ -5639,13 +5698,25 @@ function admin_scroll_loading_html(): string
 function admin_render_library_entries(array $entries, string $returnView): void
 {
     $prepared = false;
-    $nativeHtml = null;
+    $nativeCards = null;
+    $nostrCards = [];
+    $nativeIndex = [];
     if (ap_library_native_enabled() && empty($GLOBALS['admin_library_force_php'])) {
         $sources = [];
         $savedSources = [];
-        foreach ($entries as &$entry) {
+        $nostrAt = [];
+        $nostrItems = [];
+        foreach ($entries as $entryIndex => &$entry) {
             if (!is_array($entry) || !is_array($entry['item'] ?? null)) continue;
-            if (($entry['kind'] ?? '') !== 'bsky' && !str_starts_with((string) ($entry['item']['id'] ?? ''), 'rss:')) {
+            $entryId = (string) ($entry['item']['id'] ?? '');
+            // Nostr cards are painted by the worker in one batch; the native
+            // Library batch carries every other source.
+            if (str_starts_with($entryId, 'nostr:')) {
+                $nostrAt[] = $entryIndex;
+                $nostrItems[] = $entry['item'];
+                continue;
+            }
+            if (($entry['kind'] ?? '') !== 'bsky' && !str_starts_with($entryId, 'rss:')) {
                 $entry['item'] = admin_library_status_enrich($entry['item']);
             }
             // The assembled cached source is a separate value. Canonical PHP
@@ -5653,20 +5724,35 @@ function admin_render_library_entries(array $entries, string $returnView): void
             if (is_array($entry['native_source_binding'] ?? null)) {
                 $savedSources[] = ['source_index' => count($sources)] + $entry['native_source_binding'];
             }
+            $nativeIndex[$entryIndex] = count($sources);
             $sources[] = ap_library_native_assemble_status($entry['item']);
         }
         unset($entry);
         $prepared = true;
-        $nativeHtml = ap_library_native_render_batch($sources, $returnView, $savedSources);
+        $nativeCards = $sources === [] ? [] : ap_library_native_render_cards($sources, $returnView, $savedSources);
+        if ($nativeCards !== null && $nostrItems !== []) {
+            $painted = ap_nostr_cards_html($nostrItems, (int) admin_owner_user_id(), $returnView);
+            foreach ($nostrAt as $n => $entryIndex) {
+                $nostrCards[$entryIndex] = $painted[$n] ?? '';
+            }
+        }
     }
-    if ($nativeHtml !== null) {
-        echo $nativeHtml;
+    if ($nativeCards !== null) {
+        foreach (array_keys($entries) as $entryIndex) {
+            if (isset($nostrCards[$entryIndex])) {
+                echo $nostrCards[$entryIndex];
+            } elseif (isset($nativeIndex[$entryIndex])) {
+                echo $nativeCards[$nativeIndex[$entryIndex]] ?? '';
+            }
+        }
         return;
     }
     foreach ($entries as $entry) {
         if (!is_array($entry) || !is_array($entry['item'] ?? null)) continue;
         if (($entry['kind'] ?? '') === 'bsky') {
             admin_render_bsky_feed_item($entry['item'], 'following', $returnView);
+        } elseif (str_starts_with((string) ($entry['item']['id'] ?? ''), 'nostr:')) {
+            admin_render_library_status_card($entry['item'], $returnView);
         } elseif ($prepared && !str_starts_with((string) ($entry['item']['id'] ?? ''), 'rss:')) {
             if (admin_library_status_allowed($entry['item'], admin_owner_user_id(), true)) {
                 admin_render_masto_status_card($entry['item'], [], $returnView, false, true);
@@ -6646,8 +6732,9 @@ if (isset($_GET['partial'], $_GET['shell'])
         && function_exists('ap_bsky_session_row') && ap_bsky_session_row($vaakOwnerId) !== null;
 
     if ($view === 'favourites') {
+        $nostrFavOn = function_exists('ap_nostr_favourites_tab_visible') && ap_nostr_favourites_tab_visible((int) $vaakOwnerId, !empty($vaakIsAdmin));
         $favNet = strtolower(trim((string) ($_GET['network'] ?? 'fedi')));
-        if (!in_array($favNet, ['fedi', 'bsky'], true) || ($favNet === 'bsky' && !$bskyOn)) {
+        if (!in_array($favNet, ['fedi', 'bsky', 'nostr'], true) || ($favNet === 'bsky' && !$bskyOn) || ($favNet === 'nostr' && !$nostrFavOn)) {
             $favNet = 'fedi';
         }
         echo '<div class="topbar"><h1>Favourites</h1><div class="topbar-actions">'
@@ -6655,15 +6742,23 @@ if (isset($_GET['partial'], $_GET['shell'])
             . '&amp;_r=' . rawurlencode((string) time()) . '" title="Reload this view">↻</a>'
             . '</div></div>';
         echo '<div class="feed timeline-feed">';
-        if ($bskyOn) {
+        if ($bskyOn || $nostrFavOn) {
             echo '<nav class="notification-tabs" aria-label="Favourites network" style="display:flex;gap:.5rem;flex-wrap:wrap;margin:0 0 1rem">';
             echo '<a class="btn ' . ($favNet === 'fedi' ? 'btn-primary' : 'btn-ghost')
                 . '" href="?view=favourites&amp;network=fedi" data-vaak-soft-nav="favourites" data-fav-network="fedi" style="padding:.3rem .7rem;font-size:.82rem">Fediverse</a>';
-            echo '<a class="btn ' . ($favNet === 'bsky' ? 'btn-primary' : 'btn-ghost')
-                . '" href="?view=favourites&amp;network=bsky" data-vaak-soft-nav="favourites" data-fav-network="bsky" style="padding:.3rem .7rem;font-size:.82rem">Bluesky</a>';
+            if ($bskyOn) {
+                echo '<a class="btn ' . ($favNet === 'bsky' ? 'btn-primary' : 'btn-ghost')
+                    . '" href="?view=favourites&amp;network=bsky" data-vaak-soft-nav="favourites" data-fav-network="bsky" style="padding:.3rem .7rem;font-size:.82rem">Bluesky</a>';
+            }
+            if ($nostrFavOn) {
+                echo '<a class="btn ' . ($favNet === 'nostr' ? 'btn-primary' : 'btn-ghost')
+                    . '" href="?view=favourites&amp;network=nostr" data-vaak-soft-nav="favourites" data-fav-network="nostr" style="padding:.3rem .7rem;font-size:.82rem">Nostr</a>';
+            }
             echo '</nav>';
         }
-        if ($favNet === 'bsky') {
+        if ($favNet === 'nostr') {
+            echo ap_nostr_favourites_fragment((int) $vaakOwnerId, 0, 20)['html'];
+        } elseif ($favNet === 'bsky') {
             echo '<div data-bsky-favourites-fragment data-offset="0" data-limit="20" aria-live="polite">'
                 . '<div data-bsky-favourites-sentinel class="meta" style="padding:1rem 0 2rem;text-align:center">'
                 . admin_scroll_loading_html() . '</div></div>';
@@ -25748,6 +25843,14 @@ function admin_render_library_status_card(array $st, string $returnView = 'favou
         }
         return;
     }
+    if (str_starts_with($sid, 'nostr:')) {
+        // Stored Nostr note: the worker paints it with the Nostr actions.
+        if (!function_exists('ap_nostr_card_html')) {
+            @require_once __DIR__ . '/ap-nostr.php';
+        }
+        echo function_exists('ap_nostr_card_html') ? ap_nostr_card_html($st, $owner, $returnView) : '';
+        return;
+    }
     $st = admin_library_status_enrich($st);
     if (!admin_library_status_allowed($st, $owner, true)) return;
     if (function_exists('admin_render_masto_status_card')) {
@@ -31008,7 +31111,7 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
             if ($view === 'dms' && !empty($_GET['peer'])) {
                 $refreshExtra .= '&amp;peer=' . urlencode((string) $_GET['peer']);
             }
-            if ($view === 'favourites' && in_array(strtolower((string) ($_GET['network'] ?? '')), ['fedi', 'bsky'], true)) {
+            if ($view === 'favourites' && in_array(strtolower((string) ($_GET['network'] ?? '')), ['fedi', 'bsky', 'nostr'], true)) {
                 $refreshExtra .= '&amp;network=' . urlencode(strtolower((string) $_GET['network']));
             }
             if (in_array($view, ['followers', 'following'], true) && in_array(strtolower((string) ($_GET['network'] ?? '')), ['all', 'fedi', 'bsky'], true)) {
@@ -31626,25 +31729,33 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
           $bskyFavEnabled = function_exists('ap_bsky_get_favourites')
               && function_exists('ap_bsky_session_row')
               && ap_bsky_session_row($vaakOwnerId) !== null;
+          $nostrFavOn = function_exists('ap_nostr_favourites_tab_visible') && ap_nostr_favourites_tab_visible((int) $vaakOwnerId, !empty($vaakIsAdmin));
           $favNet = strtolower(trim((string) ($_GET['network'] ?? 'fedi')));
-          if (!in_array($favNet, ['fedi', 'bsky'], true)) {
+          if (!in_array($favNet, ['fedi', 'bsky', 'nostr'], true)) {
               $favNet = 'fedi';
           }
-          if ($favNet === 'bsky' && !$bskyFavEnabled) {
+          if (($favNet === 'bsky' && !$bskyFavEnabled) || ($favNet === 'nostr' && !$nostrFavOn)) {
               $favNet = 'fedi';
           }
           $favTabHref = static function (string $net): string {
               return '?view=favourites&network=' . rawurlencode($net);
           };
         ?>
-        <?php if ($bskyFavEnabled): ?>
+        <?php if ($bskyFavEnabled || $nostrFavOn): ?>
         <nav class="notification-tabs" aria-label="Favourites network" style="display:flex;gap:.5rem;flex-wrap:wrap;margin:0 0 1rem">
           <a class="btn <?= $favNet === 'fedi' ? 'btn-primary' : 'btn-ghost' ?>" role="tab" aria-selected="<?= $favNet === 'fedi' ? 'true' : 'false' ?>" href="<?= h($favTabHref('fedi')) ?>" data-vaak-soft-nav="favourites" data-fav-network="fedi" style="padding:.3rem .7rem;font-size:.82rem">Fediverse</a>
+          <?php if ($bskyFavEnabled): ?>
           <a class="btn <?= $favNet === 'bsky' ? 'btn-primary' : 'btn-ghost' ?>" role="tab" aria-selected="<?= $favNet === 'bsky' ? 'true' : 'false' ?>" href="<?= h($favTabHref('bsky')) ?>" data-vaak-soft-nav="favourites" data-fav-network="bsky" style="padding:.3rem .7rem;font-size:.82rem">Bluesky</a>
+          <?php endif; ?>
+          <?php if ($nostrFavOn): ?>
+          <a class="btn <?= $favNet === 'nostr' ? 'btn-primary' : 'btn-ghost' ?>" role="tab" aria-selected="<?= $favNet === 'nostr' ? 'true' : 'false' ?>" href="<?= h($favTabHref('nostr')) ?>" data-vaak-soft-nav="favourites" data-fav-network="nostr" style="padding:.3rem .7rem;font-size:.82rem">Nostr</a>
+          <?php endif; ?>
         </nav>
         <?php endif; ?>
 
-        <?php if ($favNet === 'fedi'): ?>
+        <?php if ($favNet === 'nostr'): ?>
+          <?= ap_nostr_favourites_fragment((int) $vaakOwnerId, 0, 20)['html'] ?>
+        <?php elseif ($favNet === 'fedi'): ?>
           <?php
             $favPage = admin_favourite_fedi_page((int) $vaakOwnerId, 0, 20);
             $favList = $favPage['items'];
@@ -45289,7 +45400,8 @@ window.vaakBootStatusThread();
       try {
         const offset = parseInt(frag.dataset.offset || '0', 10) || 0;
         const limit = frag.dataset.limit || '20';
-        const res = await fetch('?ajax=favourites_fedi&offset=' + encodeURIComponent(offset) + '&limit=' + encodeURIComponent(limit), {
+        const ajax = frag.dataset.ajax === 'favourites_nostr' ? 'favourites_nostr' : 'favourites_fedi';
+        const res = await fetch('?ajax=' + ajax + '&offset=' + encodeURIComponent(offset) + '&limit=' + encodeURIComponent(limit), {
           credentials: 'same-origin', headers: { Accept: 'text/html' }, cache: 'no-store'
         });
         if (!res.ok) throw new Error('fedi favs ' + res.status);
@@ -45304,7 +45416,7 @@ window.vaakBootStatusThread();
         frag.dataset.hasMore = next.dataset.hasMore || res.headers.get('X-Has-More') || '0';
         if (cards.length === 0 && !(parseInt(frag.dataset.offset, 10) > offset)) frag.dataset.hasMore = '0';
         const hasMore = frag.dataset.hasMore === '1';
-        clearLibraryLoading(sentinel, hasMore ? 'Scroll for more…' : 'End of Fediverse favourites');
+        clearLibraryLoading(sentinel, hasMore ? 'Scroll for more…' : (frag.dataset.endLabel || 'End of Fediverse favourites'));
         if (hasMore && sentinel) {
           sentinel.dataset.observed = '0';
           armSentinel(sentinel, root, () => load());
@@ -50098,7 +50210,7 @@ if (VIEW === 'analytics') loadAnalytics();
 })();
 </script>
 <script>
-// Nostr like / reply / follow on Home cards. The browser's signer extension
+// Nostr like / reply / repost / quote / follow on Home cards. The browser's signer extension
 // (NIP-07: nos2x, Alby, Nostore…) signs; VAAK never sees the private key.
 // The worker builds each event (nostr_prepare) and only relays the exact
 // copy the extension signed (nostr_publish). See api/ap-nostr.php.
@@ -50142,7 +50254,7 @@ if (VIEW === 'analytics') loadAnalytics();
   async function run(purpose, target, content) {
     const signer = window.nostr;
     if (!signer || typeof signer.signEvent !== 'function' || typeof signer.getPublicKey !== 'function') {
-      toast('To like, reply or follow on Nostr, install a signer extension such as nos2x or Alby, then reload this page.');
+      toast('To act on Nostr posts, install a signer extension such as nos2x or Alby, then reload this page.');
       return null;
     }
     const prep = await post({ action: 'nostr_prepare', purpose: purpose, target: target });
@@ -50158,7 +50270,8 @@ if (VIEW === 'analytics') loadAnalytics();
       kind: prep.template.kind,
       created_at: Math.floor(Date.now() / 1000),
       tags: prep.template.tags,
-      content: prep.needs_content ? content : prep.template.content
+      // A quote ends with its nostr:note1… link; the worker checks it.
+      content: prep.needs_content ? content + (prep.suffix || '') : prep.template.content
     };
     let signed = null;
     try { signed = await signer.signEvent(unsigned); } catch (e) {}
@@ -50194,24 +50307,41 @@ if (VIEW === 'analytics') loadAnalytics();
     });
   }
 
-  function openReply(btn, target) {
+  function setReposted(target, on) {
+    sameTarget('repost', target).forEach(function (btn) {
+      btn.classList.toggle('on', on);
+      btn.setAttribute('aria-pressed', on ? 'true' : 'false');
+      const label = on ? 'Undo repost' : 'Repost on Nostr';
+      btn.title = label;
+      btn.setAttribute('aria-label', label);
+    });
+  }
+
+  // Reply and quote share one inline box under the card.
+  function openCompose(btn, target, mode) {
     const card = btn.closest('article');
     if (!card) return;
     const open = card.querySelector('form.nostr-reply');
-    if (open) { open.remove(); return; }
+    if (open) {
+      const same = open.dataset.mode === mode;
+      open.remove();
+      if (same) return;
+    }
+    const quote = mode === 'quote';
     const form = document.createElement('form');
     form.className = 'nostr-reply';
+    form.dataset.mode = mode;
     const box = document.createElement('textarea');
     box.rows = 3;
-    box.maxLength = 8000;
-    box.placeholder = 'Reply on Nostr…';
-    box.setAttribute('aria-label', 'Reply on Nostr');
+    box.maxLength = 7900;
+    box.placeholder = quote ? 'Quote on Nostr…' : 'Reply on Nostr…';
+    box.setAttribute('aria-label', quote ? 'Quote on Nostr' : 'Reply on Nostr');
     const row = document.createElement('div');
     row.className = 'nostr-reply-row';
     const send = document.createElement('button');
     send.type = 'submit';
     send.className = 'btn btn-primary';
-    send.textContent = 'Reply';
+    send.textContent = quote ? 'Quote' : 'Reply';
     const cancel = document.createElement('button');
     cancel.type = 'button';
     cancel.className = 'btn btn-ghost';
@@ -50224,12 +50354,12 @@ if (VIEW === 'analytics') loadAnalytics();
       const text = box.value.trim();
       if (!text) { box.focus(); return; }
       send.disabled = true;
-      const res = await run('reply', target, text);
+      const res = await run(mode, target, text);
       send.disabled = false;
       if (!res) return;
       const note = document.createElement('div');
       note.className = 'meta nostr-reply-done';
-      note.append('Replied on Nostr. ');
+      note.append(quote ? 'Quoted on Nostr. It shows on Local and your profile after a refresh. ' : 'Replied on Nostr. ');
       if (res.note) {
         const link = document.createElement('a');
         link.href = 'https://njump.me/' + encodeURIComponent(res.note);
@@ -50251,7 +50381,8 @@ if (VIEW === 'analytics') loadAnalytics();
     const act = btn.getAttribute('data-nostr-act') || '';
     const target = (btn.getAttribute('data-nostr-target') || '').toLowerCase();
     if (!/^[0-9a-f]{64}$/.test(target)) return;
-    if (act === 'reply') { openReply(btn, target); return; }
+    if (act === 'reply' || act === 'quote') { openCompose(btn, target, act); return; }
+    if (act === 'delete' && !window.confirm('Delete this note on Nostr? Relays are asked to drop it, but copies elsewhere may stay.')) return;
     if (btn.dataset.nostrBusy === '1') return;
     btn.dataset.nostrBusy = '1';
     try {
@@ -50262,6 +50393,13 @@ if (VIEW === 'analytics') loadAnalytics();
       } else if (res.purpose === 'follow' || res.purpose === 'unfollow') {
         setFollowing(target, res.purpose === 'follow');
         toast(res.purpose === 'follow' ? 'Followed on Nostr.' : 'Unfollowed on Nostr. Their posts leave Home on the next refresh.');
+      } else if (res.purpose === 'repost' || res.purpose === 'unrepost') {
+        setReposted(target, res.purpose === 'repost');
+        toast(res.purpose === 'repost' ? 'Reposted on Nostr and boosted on VAAK.' : 'Repost undone.');
+      } else if (res.purpose === 'delete') {
+        const card = btn.closest('article');
+        if (card) card.remove();
+        toast('Deleted on Nostr.');
       }
     } finally {
       btn.dataset.nostrBusy = '';

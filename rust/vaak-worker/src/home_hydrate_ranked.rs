@@ -4189,7 +4189,7 @@ fn boost_actor_is_profile(st: &Value) -> bool {
     let inner = st.get("reblog").filter(|v| v.is_object()).unwrap_or(st);
     let account = inner.get("account").unwrap_or(&Value::Null);
     let id = account.get("id").and_then(|v| v.as_str()).unwrap_or("");
-    if id.starts_with("rss-feed:") {
+    if id.starts_with("rss-feed:") || id.starts_with("nostr:") {
         return true;
     }
     let uri = account
@@ -4379,6 +4379,30 @@ async fn fetch_best_boost_objects(
     Ok(map)
 }
 
+/// The Nostr note a VAAK boost row shows (`nostr:{id}` keys, see nostr::share).
+fn reblog_nostr_id(rb: &BoostRow) -> Option<String> {
+    crate::nostr::share::key_note_id(&rb.status_id).or_else(|| crate::nostr::share::key_note_id(&rb.boost_status_id))
+}
+
+/// Nostr cards for the boost rows among `rows`, by note id.
+async fn nostr_boost_cards<'a>(db: &Client, rows: impl Iterator<Item = &'a BoostRow>) -> HashMap<String, Value> {
+    let mut ids: Vec<String> = rows.filter_map(reblog_nostr_id).collect();
+    ids.sort();
+    ids.dedup();
+    crate::nostr::share::cards(db, &ids).await
+}
+
+/// A VAAK boost of a Nostr note, or None while the note is not stored.
+fn materialize_nostr_boost(
+    rb: &BoostRow,
+    cards: &HashMap<String, Value>,
+    local_profiles: &HashMap<String, LocalProfile>,
+    viewer_owner_id: i64,
+) -> Option<Value> {
+    let inner = cards.get(&reblog_nostr_id(rb)?)?.clone();
+    finish_boost_wrapper(rb, inner, local_profiles, viewer_owner_id > 0 && rb.owner_user_id == viewer_owner_id)
+}
+
 fn reblog_rss_id(rb: &BoostRow) -> Option<i64> {
     rss_item_id_from_key(&rb.status_id)
         .or_else(|| rss_item_id_from_key(&rb.object_id))
@@ -4419,6 +4443,9 @@ async fn materialize_profile_reblog_window(
         }
         if let Some(target) = reblog_bsky_target(rb) {
             bsky_targets.push(target);
+            continue;
+        }
+        if reblog_nostr_id(rb).is_some() {
             continue;
         }
         let oid = rb.object_id.trim().trim_end_matches('/').to_string();
@@ -4472,9 +4499,16 @@ async fn materialize_profile_reblog_window(
     let actors = fetch_actors_map(db, &actor_ids).await?;
     let local_profiles = fetch_local_profiles_map(db, &local_keys).await?;
     let outbox = fetch_outbox_map(db, &object_ids).await?;
+    // Nostr notes are public, so every viewer sees these boosts and quotes.
+    let nostr_boosts = nostr_boost_cards(db, rows.iter()).await;
 
     let mut painted = Vec::with_capacity(rows.len());
     for rb in rows {
+        if reblog_nostr_id(rb).is_some() {
+            let card = materialize_nostr_boost(rb, &nostr_boosts, &local_profiles, viewer_owner_id);
+            painted.push(card.filter(|st| boost_card_is_paintable(st) && boost_actor_is_profile(st)));
+            continue;
+        }
         if let Some(rss_id) = reblog_rss_id(rb) {
             if !show_rss {
                 painted.push(None);
@@ -4720,7 +4754,7 @@ pub async fn warm_view(
                 }
             }
             ("home" | "local", "outbox") => outbox_ids.push(e.id.clone()),
-            ("local", "boost") => boost_ids.push(e.id.clone()),
+            ("local" | "home", "boost") => boost_ids.push(e.id.clone()),
             _ => {}
         }
     }
@@ -4867,6 +4901,7 @@ pub async fn warm_view(
         local_keys.push(owner_username.to_ascii_lowercase());
     }
     let local_profiles = fetch_local_profiles_map(&db, &local_keys).await?;
+    let nostr_boosts = nostr_boost_cards(&db, boosts_map.values()).await;
 
     let mut statuses = Vec::new();
     let mut kinds: HashMap<String, usize> = HashMap::new();
@@ -4944,7 +4979,14 @@ pub async fn warm_view(
             ("home" | "local", "outbox") => outbox_map
                 .get(e.id.trim_end_matches('/'))
                 .map(|row| materialize_outbox(row, &owner_username, &local_profiles)),
-            ("local", "boost") => boosts_map.get(&e.id).and_then(|rb| {
+            ("local" | "home", "boost") => boosts_map.get(&e.id).and_then(|rb| {
+                if reblog_nostr_id(rb).is_some() {
+                    return materialize_nostr_boost(rb, &nostr_boosts, &local_profiles, owner_user_id);
+                }
+                if view == "home" {
+                    // Home boost keys are only VAAK boosts of Nostr notes.
+                    return None;
+                }
                 let create = creates_map.get(rb.object_id.trim_end_matches('/'));
                 let rss = rss_item_id_from_key(&rb.status_id)
                     .or_else(|| rss_item_id_from_key(&rb.object_id))
@@ -4988,6 +5030,7 @@ pub async fn warm_view(
         }
     }
     let _ = hydrate_local_quote_targets(&db, &mut statuses).await;
+    crate::nostr::share::attach_quotes(&db, &mut statuses).await;
     crate::recommendations::filter_statuses(&db, owner_user_id, &mut statuses).await?;
     link_outbox_reply_ids(&mut statuses);
 
@@ -5505,7 +5548,13 @@ pub(crate) async fn statuses_for_older_hits(
             local_keys.push(user);
         }
     }
+    for rb in boosts_map.values() {
+        if let Some(user) = local_username_from_url(&rb.owner_actor_id) {
+            local_keys.push(user);
+        }
+    }
     let local_profiles = fetch_local_profiles_map(db, &local_keys).await.unwrap_or_default();
+    let nostr_boosts = nostr_boost_cards(db, boosts_map.values()).await;
     let hidden = crate::hidden::load_timeline_hidden_sets(db, owner_user_id)
         .await
         .unwrap_or_default();
@@ -5536,6 +5585,9 @@ pub(crate) async fn statuses_for_older_hits(
                 .get(hit.lookup.trim_end_matches('/'))
                 .map(|row| materialize_outbox(row, &owner_username, &local_profiles)),
             "boost" => boosts_map.get(&hit.lookup).and_then(|rb| {
+                if reblog_nostr_id(rb).is_some() {
+                    return materialize_nostr_boost(rb, &nostr_boosts, &local_profiles, owner_user_id);
+                }
                 let create = creates_map.get(rb.object_id.trim_end_matches('/'));
                 materialize_boost(rb, create, None, &actors_map, &local_profiles, owner_user_id)
             }),
@@ -5550,6 +5602,7 @@ pub(crate) async fn statuses_for_older_hits(
         st["vaak_tl_cursor"] = json!(crate::timeline_cursor::pack(&hit.cursor()));
         statuses.push(st);
     }
+    crate::nostr::share::attach_quotes(db, &mut statuses).await;
     Ok(statuses)
 }
 

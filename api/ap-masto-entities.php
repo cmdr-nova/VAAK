@@ -16911,6 +16911,16 @@ function ap_masto_interaction_row_to_status(array $row, string $flag): ?array
         }
     }
 
+    // VAAK-only bookmarks of Nostr notes (status_id = nostr:{id}).
+    if ($status === null && preg_match('/^nostr:([0-9a-f]{64})$/', $statusIdRaw, $nostrMatch)) {
+        if (!function_exists('ap_nostr_statuses')) {
+            @require_once __DIR__ . '/ap-nostr.php';
+        }
+        if (function_exists('ap_nostr_statuses')) {
+            $status = ap_nostr_statuses([$nostrMatch[1]])[$nostrMatch[1]] ?? null;
+        }
+    }
+
     if ($sid > 0) {
         $resolved = ap_masto_resolve_status_interaction($sid);
         if ($resolved !== null) {

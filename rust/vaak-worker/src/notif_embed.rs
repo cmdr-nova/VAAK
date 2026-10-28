@@ -2822,10 +2822,10 @@ fn paint_lean_timeline_actions(status: &Value, from: &str, viewer_actor: &str) -
 
     let mut actions = String::new();
 
-    if crate::nostr::render::is_nostr_status(status) {
-        // Nostr note: VAAK holds no key. Reply, like and follow are signed by
-        // the viewer's browser extension (see nostr::act); no boost or quote.
-        actions.push_str(&nostr_card_actions(status));
+    if crate::nostr::render::is_nostr_status(interaction) {
+        // Nostr note (or a VAAK boost of one): VAAK holds no key, so every
+        // Nostr action is signed by the viewer's browser extension (nostr::act).
+        actions.push_str(&nostr_card_actions(interaction, &action_base, from_q));
     } else if rss {
         let rss_item = status
             .get("vaak_rss_item_id")
@@ -4277,7 +4277,11 @@ pub fn paint_lean_embed_from(
     // set as timeline cards: reply, quote, boost, favourite, and bookmark.
     // Nested quotes pass show_actions=false so only the quote-boost is actionable.
     // The Open fallback is an action row too; a quoted post keeps its timestamp link.
-    if show_actions && matches!(from, "home" | "local" | "feed" | "remote_profile" | "outbox" | "mentions") {
+    // Nostr cards keep their signed actions on every surface (Bookmarks too).
+    if show_actions
+        && (matches!(from, "home" | "local" | "feed" | "remote_profile" | "outbox" | "mentions")
+            || crate::nostr::render::is_nostr_status(status))
+    {
         inner.push_str(&paint_lean_timeline_actions(status, from, viewer_actor));
     } else if show_actions && !uri.is_empty() {
         let from_q = if from.is_empty() { "mentions" } else { from };
@@ -4306,9 +4310,11 @@ pub fn paint_lean_feed_card(status: &Value) -> String {
 }
 
 /// Lean feed card with `from=` + viewer actor (own-post Delete/Edit/Pin overflow).
-/// Reply, like and the ⋯ menu for a Nostr card. The `data-nostr-*` buttons
-/// are wired by the page script, which asks the signer extension to sign.
-fn nostr_card_actions(status: &Value) -> String {
+/// Nostr card actions, in the same order as other posts: reply, quote,
+/// boost, like, bookmark, ⋯. The `data-nostr-*` buttons are wired by the
+/// page script, which asks the signer extension to sign; the bookmark is a
+/// VAAK-only `masto_bookmarks` row like an RSS bookmark.
+fn nostr_card_actions(status: &Value, action_base: &str, from_q: &str) -> String {
     let hex = |key: &str| {
         status
             .get(key)
@@ -4320,12 +4326,22 @@ fn nostr_card_actions(status: &Value) -> String {
     let note = hex("vaak_nostr_event_id");
     let author = hex("vaak_nostr_pubkey");
     let liked = json_flag(status, "vaak_nostr_liked");
+    let reposted = json_flag(status, "vaak_nostr_reposted");
+    let mine = json_flag(status, "vaak_nostr_mine");
+    let bm = json_flag(status, "bookmarked");
     // Home only carries notes from people the viewer follows.
     let following = status.get("vaak_nostr_following").and_then(|v| v.as_bool()).unwrap_or(true);
     let mut out = String::new();
     if !note.is_empty() {
         out.push_str(&format!(
-            "<button type=\"button\" class=\"icon-btn\" data-nostr-act=\"reply\" data-nostr-target=\"{note}\" title=\"Reply on Nostr\" aria-label=\"Reply on Nostr\"><i class=\"ph ph-arrow-bend-up-left\" aria-hidden=\"true\"></i></button>"
+            "<button type=\"button\" class=\"icon-btn\" data-nostr-act=\"reply\" data-nostr-target=\"{note}\" title=\"Reply on Nostr\" aria-label=\"Reply on Nostr\"><i class=\"ph ph-arrow-bend-up-left\" aria-hidden=\"true\"></i></button>\
+             <button type=\"button\" class=\"icon-btn\" data-nostr-act=\"quote\" data-nostr-target=\"{note}\" title=\"Quote on Nostr\" aria-label=\"Quote on Nostr\"><i class=\"ph ph-quotes\" aria-hidden=\"true\"></i></button>"
+        ));
+        out.push_str(&format!(
+            "<button type=\"button\" class=\"icon-btn{on}\" data-nostr-act=\"repost\" data-nostr-target=\"{note}\" aria-pressed=\"{pressed}\" title=\"{label}\" aria-label=\"{label}\"><i class=\"ph ph-repeat\" aria-hidden=\"true\"></i></button>",
+            on = if reposted { " on" } else { "" },
+            pressed = if reposted { "true" } else { "false" },
+            label = if reposted { "Undo repost" } else { "Repost on Nostr" },
         ));
         out.push_str(&format!(
             "<button type=\"button\" class=\"icon-btn{on}\" data-nostr-act=\"like\" data-nostr-target=\"{note}\" aria-pressed=\"{pressed}\" title=\"{label}\" aria-label=\"{label}\"><i class=\"{icon} ph-heart\" aria-hidden=\"true\"></i></button>",
@@ -4333,6 +4349,25 @@ fn nostr_card_actions(status: &Value) -> String {
             pressed = if liked { "true" } else { "false" },
             label = if liked { "Unlike on Nostr" } else { "Like on Nostr" },
             icon = if liked { "ph-fill" } else { "ph" },
+        ));
+        let sid = format!("nostr:{note}");
+        out.push_str(&interaction_form(
+            action_base,
+            if bm { "unbookmark_status" } else { "bookmark_status" },
+            from_q,
+            &sid,
+            &sid,
+            "",
+            if bm { "icon-btn on" } else { "icon-btn" },
+            if bm { "Bookmark folders" } else { "Bookmark (VAAK only)" },
+            if bm { "Bookmark folders" } else { "Bookmark" },
+            if bm {
+                "<i class=\"ph-fill ph-bookmark-simple\" aria-hidden=\"true\"></i>"
+            } else {
+                "<i class=\"ph ph-bookmark-simple\" aria-hidden=\"true\"></i>"
+            },
+            "",
+            &format!(" data-bm-picker=\"{}\"", if bm { "1" } else { "0" }),
         ));
     }
     let open = status.get("url").and_then(|v| v.as_str()).unwrap_or("");
@@ -4344,7 +4379,11 @@ fn nostr_card_actions(status: &Value) -> String {
             esc(open)
         ));
     }
-    if !author.is_empty() {
+    if mine && !note.is_empty() {
+        menu.push_str(&format!(
+            "<button type=\"button\" class=\"menu-action\" data-nostr-act=\"delete\" data-nostr-target=\"{note}\" style=\"color:var(--danger)\">Delete on Nostr</button>"
+        ));
+    } else if !author.is_empty() {
         let (act, label) = if following { ("unfollow", "Unfollow on Nostr") } else { ("follow", "Follow on Nostr") };
         menu.push_str(&format!(
             "<button type=\"button\" class=\"menu-action\" data-nostr-act=\"{act}\" data-nostr-target=\"{author}\">{label}</button>"

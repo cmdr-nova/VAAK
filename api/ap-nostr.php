@@ -360,7 +360,7 @@ function ap_nostr_action(string $action, int $ownerUserId, bool $isAdmin, array 
     if ($action === 'nostr_prepare') {
         $purpose = (string) ($post['purpose'] ?? '');
         $target = strtolower(trim((string) ($post['target'] ?? '')));
-        if (!in_array($purpose, ['like', 'reply', 'follow', 'unfollow'], true) || !preg_match('/^[0-9a-f]{64}$/', $target)) {
+        if (!in_array($purpose, ['like', 'reply', 'repost', 'quote', 'delete', 'follow', 'unfollow'], true) || !preg_match('/^[0-9a-f]{64}$/', $target)) {
             return $fail(400, 'Unknown Nostr action.');
         }
         $path = '/shadow/nostr-prepare';
@@ -376,6 +376,18 @@ function ap_nostr_action(string $action, int $ownerUserId, bool $isAdmin, array 
     } else {
         return $fail(400, 'Unknown Nostr action.');
     }
+    // Follow edits read the current list from relays before answering.
+    return ap_nostr_worker_call($path, $payload, 30000);
+}
+
+/**
+ * POST to the worker's shadow API on loopback.
+ *
+ * @return array{status:int, body:array<string,mixed>}
+ */
+function ap_nostr_worker_call(string $path, array $payload, int $timeoutMs): array
+{
+    $fail = static fn (int $status, string $error): array => ['status' => $status, 'body' => ['ok' => false, 'error' => $error]];
     $base = getenv('VAAK_SHADOW_HTTP');
     $base = is_string($base) && trim($base) !== '' ? rtrim(trim($base), '/') : 'http://127.0.0.1:8787';
     $host = parse_url($base, PHP_URL_HOST);
@@ -393,13 +405,12 @@ function ap_nostr_action(string $action, int $ownerUserId, bool $isAdmin, array 
     if ($ch === false) {
         return $fail(503, 'The Nostr worker is not reachable.');
     }
-    // Follow edits read the current list from relays before answering.
     curl_setopt_array($ch, [
         CURLOPT_POST => true,
         CURLOPT_POSTFIELDS => $json,
         CURLOPT_RETURNTRANSFER => true,
         CURLOPT_CONNECTTIMEOUT_MS => 250,
-        CURLOPT_TIMEOUT_MS => 30000,
+        CURLOPT_TIMEOUT_MS => $timeoutMs,
         CURLOPT_FOLLOWLOCATION => false,
         CURLOPT_HTTPHEADER => array_merge(['Content-Type: application/json', 'Accept: application/json'], ap_shadow_http_auth_headers()),
     ]);
@@ -411,4 +422,114 @@ function ap_nostr_action(string $action, int $ownerUserId, bool $isAdmin, array 
         return $fail(502, 'The Nostr worker did not answer. Try again in a minute.');
     }
     return ['status' => $code === 200 ? 200 : max(400, $code), 'body' => $body];
+}
+
+/**
+ * Stored Nostr notes as Mastodon-shaped statuses (the worker paints them the
+ * same way Home does), keyed by hex id. Missing or unreachable: left out.
+ * Cached for the request, so a Bookmarks page asks once per note.
+ *
+ * @param list<string> $ids
+ * @return array<string, array<string,mixed>>
+ */
+function ap_nostr_statuses(array $ids): array
+{
+    static $cache = [];
+    $want = [];
+    foreach ($ids as $id) {
+        $id = strtolower(trim((string) $id));
+        if (preg_match('/^[0-9a-f]{64}$/', $id) && !array_key_exists($id, $cache)) {
+            $want[$id] = true;
+        }
+    }
+    if ($want !== []) {
+        $res = ap_nostr_worker_call('/shadow/nostr-statuses', ['ids' => array_keys($want)], 3000);
+        $found = is_array($res['body']['statuses'] ?? null) ? $res['body']['statuses'] : [];
+        foreach (array_keys($want) as $id) {
+            $cache[$id] = is_array($found[$id] ?? null) ? $found[$id] : null;
+        }
+    }
+    $out = [];
+    foreach ($ids as $id) {
+        $id = strtolower(trim((string) $id));
+        if (is_array($cache[$id] ?? null)) {
+            $out[$id] = $cache[$id];
+        }
+    }
+    return $out;
+}
+
+/**
+ * Card HTML for one Nostr status, painted by the worker like Home paints it
+ * (signed actions, VAAK bookmark). '' when the worker can't be reached.
+ */
+function ap_nostr_card_html(array $status, int $ownerUserId, string $view): string
+{
+    return ap_nostr_cards_html([$status], $ownerUserId, $view)[0];
+}
+
+/**
+ * Worker-painted cards for Nostr statuses, one HTML string per status in
+ * order ('' where none could be painted).
+ * @param list<array<string,mixed>> $statuses
+ * @return list<string>
+ */
+function ap_nostr_cards_html(array $statuses, int $ownerUserId, string $view): array
+{
+    $out = array_fill(0, count($statuses), '');
+    $send = [];
+    foreach (array_values($statuses) as $i => $status) {
+        if (is_array($status) && str_starts_with((string) ($status['id'] ?? ''), 'nostr:')) {
+            $send[$i] = $status;
+        }
+    }
+    if ($ownerUserId < 1 || $send === []) {
+        return $out;
+    }
+    foreach (array_chunk($send, 100, true) as $chunk) {
+        $res = ap_nostr_worker_call('/shadow/nostr-card', ['owner_id' => $ownerUserId, 'from' => $view, 'statuses' => array_values($chunk)], 3000);
+        $htmls = $res['body']['htmls'] ?? null;
+        if (empty($res['body']['ok']) || !is_array($htmls) || count($htmls) !== count($chunk)) {
+            continue;
+        }
+        foreach (array_keys($chunk) as $n => $i) {
+            $out[$i] = is_string($htmls[$n] ?? null) ? $htmls[$n] : '';
+        }
+    }
+    return $out;
+}
+
+/** Favourites > Nostr shows for users who may use Nostr and linked an npub. */
+function ap_nostr_favourites_tab_visible(int $ownerUserId, bool $isAdmin): bool
+{
+    return $ownerUserId > 0 && ap_nostr_form_visible($isAdmin) && ap_nostr_table_ready()
+        && ap_nostr_link_for_user($ownerUserId) !== null;
+}
+
+/**
+ * Favourites > Nostr fragment: the notes the owner liked, painted by the
+ * worker. Rows count toward the offset even when their note is gone.
+ * @return array{html:string,has_more:bool}
+ */
+function ap_nostr_favourites_fragment(int $ownerUserId, int $offset, int $limit): array
+{
+    $offset = max(0, $offset);
+    $limit = max(1, min(40, $limit));
+    $res = ap_nostr_worker_call('/shadow/nostr-likes', ['owner_id' => $ownerUserId, 'offset' => $offset, 'limit' => $limit], 5000);
+    $ok = !empty($res['body']['ok']) && is_array($res['body']['htmls'] ?? null);
+    $htmls = $ok ? array_values(array_filter($res['body']['htmls'], 'is_string')) : [];
+    $hasMore = $ok && !empty($res['body']['has_more']);
+    $html = '<div data-fedi-favourites-fragment data-ajax="favourites_nostr" data-end-label="End of Nostr favourites"'
+        . ' data-offset="' . ($offset + ($hasMore ? $limit : count($htmls))) . '" data-limit="' . $limit
+        . '" data-has-more="' . ($hasMore ? '1' : '0') . '">';
+    if (!$ok && $offset === 0) {
+        $html .= '<div class="empty">Nostr favourites couldn’t load. Try again shortly.</div>';
+    } elseif ($htmls === [] && $offset === 0) {
+        $html .= '<div class="empty">No Nostr favourites yet. Notes you like on Home show up here.</div>';
+    } else {
+        $html .= implode('', $htmls);
+    }
+    $html .= '<div data-fedi-favourites-sentinel class="meta" style="padding:1rem 0 2rem;text-align:center">'
+        . ($hasMore ? 'Scroll for more…' : '') . '</div></div>';
+    return ['html' => $html, 'has_more' => $hasMore];
 }
