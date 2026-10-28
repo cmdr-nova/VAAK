@@ -142,6 +142,7 @@ php_tests=(
   api/bin/shadow-http-token-smoke.php
   api/bin/trends-response-cache-smoke.php
   api/bin/trending-open-ref-smoke.php
+  api/bin/trend-sparkline-smoke.php
   api/bin/timeline-newer-counter-smoke.php
   api/bin/timeline-cursor-smoke.php
   api/bin/timeline-quote-boost-smoke.php
