@@ -55,7 +55,7 @@ impl Event {
         let pk = hex::decode(&self.pubkey).map_err(|_| "bad pubkey hex")?;
         let sig = hex::decode(&self.sig).map_err(|_| "bad sig hex")?;
         let id = hex::decode(&self.id).map_err(|_| "bad id hex")?;
-        let key = k256::schnorr::VerifyingKey::from_bytes(&pk).map_err(|_| "pubkey not on curve")?;
+        let key = k256::schnorr::VerifyingKey::from_slice(&pk).map_err(|_| "pubkey not on curve")?;
         let sig = k256::schnorr::Signature::try_from(sig.as_slice()).map_err(|_| "bad signature")?;
         key.verify_raw(&id, &sig).map_err(|_| "signature does not verify")
     }
@@ -183,7 +183,7 @@ pub(crate) mod tests {
 
     /// Build and sign an event with a test key (BIP-340, zero aux rand).
     pub(crate) fn signed(seed: u8, created_at: i64, kind: i64, tags: Vec<Vec<String>>, content: &str) -> Event {
-        let sk = SigningKey::from_bytes(&[seed; 32]).expect("test key");
+        let sk = SigningKey::from_slice(&[seed; 32]).expect("test key");
         let mut ev = Event {
             id: String::new(),
             pubkey: hex::encode(sk.verifying_key().to_bytes()),
