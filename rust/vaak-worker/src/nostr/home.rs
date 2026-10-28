@@ -38,6 +38,9 @@ struct Candidate {
     /// Kind 6 only: the reposted note's author and text, when stored.
     repost_of: Option<(String, String)>,
     is_repost: bool,
+    /// The NIP-48 `proxy` tag's ActivityPub URL, when the note is a copy of
+    /// a fediverse post (VAAK's composer crosspost, Mostr bridges).
+    proxied_from: Option<String>,
 }
 
 impl Candidate {
@@ -67,6 +70,14 @@ fn pick(candidates: Vec<Candidate>, hidden: &HashSet<String>, muted: impl Fn(&st
         out.push(NostrKey { id: c.id, sort: c.created_at, author, text, note });
     }
     out
+}
+
+/// A Nostr copy of a fediverse post by the owner or someone they follow on
+/// the fediverse: the original already reaches Home, so the copy would show
+/// the same post twice. `covered` holds actor ids without a trailing slash.
+fn proxied_from_covered(url: Option<&str>, covered: &HashSet<String>) -> bool {
+    let Some(url) = url else { return false };
+    covered.iter().any(|actor| url.len() > actor.len() + 1 && url.starts_with(actor.as_str()) && url.as_bytes()[actor.len()] == b'/')
 }
 
 /// A reply stays when everyone it answers is followed (or the author
@@ -128,7 +139,9 @@ async fn select_keys<F: Fn(&str) -> bool + Sync>(
     let rows = db
         .query(
             "SELECT e.id, e.pubkey, e.created_at, e.is_reply, e.reply_pubkeys, e.reply_to, left(e.content, 4000),
-                    e.kind, t.pubkey, left(t.content, 4000)
+                    e.kind, t.pubkey, left(t.content, 4000),
+                    (SELECT p->>1 FROM jsonb_array_elements(e.tags) p
+                     WHERE e.kind = 1 AND p->>0 = 'proxy' AND p->>2 = 'activitypub' LIMIT 1)
              FROM nostr_events e
              LEFT JOIN nostr_events t ON e.kind = 6 AND t.id = e.reply_to AND t.kind = 1
              WHERE e.pubkey IN (SELECT pubkey FROM nostr_follows WHERE owner_user_id = $1)
@@ -154,6 +167,7 @@ async fn select_keys<F: Fn(&str) -> bool + Sync>(
                 content: r.get(6),
                 repost_of: target.map(|pk| (pk, r.get::<_, Option<String>>(9).unwrap_or_default())),
                 is_repost,
+                proxied_from: r.get(10),
             }
         })
         .collect();
@@ -172,10 +186,28 @@ async fn select_keys<F: Fn(&str) -> bool + Sync>(
             .map(|r| (r.get(0), r.get(1)))
             .collect()
     };
+    let covered: HashSet<String> = if candidates.iter().any(|c| c.proxied_from.is_some()) {
+        db.query(
+            "SELECT rtrim(u.actor_id, '/') FROM ap_users u WHERE u.id::bigint = $1
+             UNION SELECT rtrim(f.actor_id, '/') FROM following f JOIN ap_users u
+               ON rtrim(f.owner_actor_id, '/') = rtrim(u.actor_id, '/')
+             WHERE u.id::bigint = $1 AND COALESCE(f.follow_state, '') NOT IN ('pending', 'rejected')",
+            &[&owner],
+        )
+        .await
+        .context("fediverse follows for nostr dedupe")?
+        .iter()
+        .filter_map(|r| r.get::<_, Option<String>>(0))
+        .filter(|a| !a.is_empty())
+        .collect()
+    } else {
+        HashSet::new()
+    };
     let hidden = super::moderation::hidden_keys(db, owner).await;
     let in_graph: Vec<Candidate> = candidates
         .into_iter()
         .filter(|c| reply_in_graph(c, &follows, parent_authors.get(&c.reply_to)))
+        .filter(|c| !proxied_from_covered(c.proxied_from.as_deref(), &covered))
         .collect();
     Ok(pick(in_graph, &hidden, muted))
 }
@@ -289,11 +321,25 @@ mod tests {
             content: String::new(),
             repost_of: None,
             is_repost: false,
+            proxied_from: None,
         }
     }
 
     fn key(id: &str, sort: i64) -> NostrKey {
         NostrKey { id: id.into(), sort, author: String::new(), text: String::new(), note: id.into() }
+    }
+
+    #[test]
+    fn crossposts_of_followed_fediverse_posts_are_skipped() {
+        let covered: HashSet<String> =
+            ["https://mkultra.monster/users/cmdr_nova".to_string(), "https://m.example/users/a".to_string()].into();
+        let skip = |u: &str| proxied_from_covered(Some(u), &covered);
+        assert!(skip("https://mkultra.monster/users/cmdr_nova/notes/abc"));
+        assert!(skip("https://m.example/users/a/statuses/1"));
+        assert!(!skip("https://mkultra.monster/users/cmdr_nova_two/notes/abc"), "a lookalike actor is not covered");
+        assert!(!skip("https://mkultra.monster/users/shana_flux/notes/1"), "unfollowed accounts still show");
+        assert!(!skip("https://mkultra.monster/users/cmdr_nova/"), "the actor itself is not a post");
+        assert!(!proxied_from_covered(None, &covered));
     }
 
     #[test]
