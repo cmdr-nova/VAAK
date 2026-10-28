@@ -24,7 +24,12 @@ impl SelectedProfilePage {
     }
 }
 #[derive(Clone,PartialEq)]
-pub(crate) struct SourceLedger {table:&'static str,rows:Vec<Value>,actor_key:String,source_actor:String,ordinals:Option<Vec<usize>>,secondary:Option<SecondaryLedger>}
+pub(crate) struct SourceLedger {table:&'static str,rows:Vec<Value>,actor_key:String,source_actor:String,ordinals:Option<Vec<usize>>,secondary:Option<SecondaryLedger>,digest:LedgerDigest}
+/// Row digests from the first exact check, shared by clones of one page.
+/// Never part of ledger equality.
+#[derive(Clone,Default)]
+struct LedgerDigest(std::sync::Arc<std::sync::OnceLock<Vec<String>>>);
+impl PartialEq for LedgerDigest{fn eq(&self,_:&Self)->bool{true}}
 #[derive(Clone,PartialEq)]
 struct SecondaryLedger {kind:&'static str,owner:Option<Value>,selected:Vec<Value>,preload:Vec<Value>,missing:Vec<Value>}
 async fn secondary_owner(db:&Client,key:&str,actor:&str)->Result<Option<Value>>{Ok(db.query_opt("SELECT to_jsonb(u) FROM ap_users u WHERE lower(actor_key)=$1 OR actor_id=$2 OR actor_id=$3 LIMIT 1",&[&key,&actor,&format!("{actor}/")]).await?.map(|row|row.get(0)))}
@@ -44,13 +49,36 @@ impl SourceLedger {
     pub(crate) fn require_target(&self,key:&str,actor:&str)->Result<()>{if self.actor_key!=key||self.source_actor!=actor{bail!("PHP fallback: profile selection target binding differs")}Ok(())}
     pub(crate) async fn require_current(&self,db:&Client)->Result<()> {
         crate::profile_bridge::count_stage(crate::profile_bridge::StageCount::LedgerCheck);
+        crate::profile_bridge::timed(crate::profile_bridge::Stage::Ledger,self.require_current_inner(db)).await
+    }
+    async fn require_current_inner(&self,db:&Client)->Result<()> {
         if let Some(secondary)=&self.secondary{
          let owner=secondary_owner(db,&self.actor_key,&self.source_actor).await?;if owner!=secondary.owner{bail!("PHP fallback: secondary profile target changed")}
          let owner=owner.as_ref().and_then(|row|row["id"].as_i64()).unwrap_or(0);let(selected,preload,missing)=secondary_rows(db,&self.actor_key,owner,secondary.kind).await?;
          if selected!=secondary.selected||preload!=secondary.preload||missing!=secondary.missing{bail!("PHP fallback: secondary profile selection changed before publication")}
         }
-        let current:Vec<Value>=if self.table=="outbox_notes"{let ids=self.rows.iter().map(|row|row["id"].as_str().context("selected outbox identity is not a string").map(str::to_owned)).collect::<Result<Vec<_>>>()?;db.query("SELECT to_jsonb(n) FROM outbox_notes n WHERE id=ANY($1)",&[&ids]).await?.into_iter().map(|row|row.get(0)).collect()}else{let field=if self.table=="masto_statuses"{"local_id"}else{"id"};let ids=self.rows.iter().map(|row|row[field].as_i64().context("selected integral source identity missing")).collect::<Result<Vec<_>>>()?;let sql=if self.table=="masto_statuses"{"SELECT to_jsonb(s) FROM masto_statuses s WHERE local_id=ANY($1::bigint[])"}else{"SELECT to_jsonb(e) FROM events e WHERE id=ANY($1::bigint[])"};db.query(sql,&[&ids]).await?.into_iter().map(|row|row.get(0)).collect()};
+        // Rechecks compare Postgres-side row digests first: a page asks this
+        // ledger many times per request and full rows carry raw_create_json.
+        // Any digest change falls through to the exact row comparison below.
+        let text_ids;let int_ids;
+        let(sql,digest_sql,ids):(&str,&str,&(dyn tokio_postgres::types::ToSql+Sync))=if self.table=="outbox_notes"{
+         text_ids=self.rows.iter().map(|row|row["id"].as_str().context("selected outbox identity is not a string").map(str::to_owned)).collect::<Result<Vec<_>>>()?;
+         ("SELECT to_jsonb(n),md5(to_jsonb(n)::text) FROM outbox_notes n WHERE id=ANY($1)","SELECT md5(to_jsonb(n)::text) FROM outbox_notes n WHERE id=ANY($1)",&text_ids)
+        }else{
+         let field=if self.table=="masto_statuses"{"local_id"}else{"id"};
+         int_ids=self.rows.iter().map(|row|row[field].as_i64().context("selected integral source identity missing")).collect::<Result<Vec<_>>>()?;
+         if self.table=="masto_statuses"{("SELECT to_jsonb(s),md5(to_jsonb(s)::text) FROM masto_statuses s WHERE local_id=ANY($1::bigint[])","SELECT md5(to_jsonb(s)::text) FROM masto_statuses s WHERE local_id=ANY($1::bigint[])",&int_ids)}
+         else{("SELECT to_jsonb(e),md5(to_jsonb(e)::text) FROM events e WHERE id=ANY($1::bigint[])","SELECT md5(to_jsonb(e)::text) FROM events e WHERE id=ANY($1::bigint[])",&int_ids)}
+        };
+        if let Some(known)=self.digest.0.get(){
+         let mut now:Vec<String>=db.query(digest_sql,&[ids]).await?.into_iter().map(|row|row.get(0)).collect();now.sort();
+         if &now==known{return Ok(())}
+        }
+        let rows=db.query(sql,&[ids]).await?;
+        let mut digests:Vec<String>=rows.iter().map(|row|row.get(1)).collect();digests.sort();
+        let current:Vec<Value>=rows.into_iter().map(|row|row.get(0)).collect();
         for expected in &self.rows{if !current.iter().any(|row|row==expected){bail!("PHP fallback: selected profile ledger changed before publication")}}
+        let _=self.digest.0.set(digests);
         Ok(())
     }
 }
@@ -95,7 +123,7 @@ pub(crate) async fn select(db:&Client,key:&str,actor:&str,tab:&str,limit:i64,off
         db.query(&format!("SELECT to_jsonb(n) FROM outbox_notes n WHERE id LIKE $1 AND COALESCE(visibility,'public')='public' AND {predicate} ORDER BY published DESC LIMIT $2 OFFSET $3"),&[&prefix,&(limit+1),&offset]).await?
     }.into_iter().map(|row|row.get(0)).collect();
     let more=rows.len()>limit as usize;rows.truncate(limit as usize);
-    let page=crate::profile_context::ProfilePage::from_current_ledger(offset,limit,rows.len(),more,SourceLedger{table,rows:rows.clone(),actor_key:key.into(),source_actor:selected_actor.clone(),ordinals:None,secondary:None})?;
+    let page=crate::profile_context::ProfilePage::from_current_ledger(offset,limit,rows.len(),more,SourceLedger{table,rows:rows.clone(),actor_key:key.into(),source_actor:selected_actor.clone(),ordinals:None,secondary:None,digest:Default::default()})?;
     Ok(SelectedProfilePage{ordinals:(0..rows.len()).collect(),rows,page,actor_key:key.into(),source_actor:selected_actor,tab:tab.into()})
 }
 /// Secondary membership does not grant access: pins retain private/orphan
@@ -108,13 +136,31 @@ pub(crate) async fn select_secondary(db:&Client,key:&str,actor:&str,kind:&'stati
   let mut by_note=std::collections::HashMap::new();for row in preload.iter().chain(&missing){if let Some(id)=row["id"].as_str(){if !id.is_empty(){by_note.insert(id.trim_end_matches('/'),row.clone());}}}
   let mut rows=Vec::new();let mut ordinals=Vec::new();for(index,ask)in selected.iter().enumerate(){if let Some(id)=ask["answer_note_id"].as_str(){if let Some(note)=by_note.get(id.trim_end_matches('/')){rows.push(note.clone());ordinals.push(index);}}}(rows,ordinals)
  };
- let ledger=SourceLedger{table:if kind=="pinned"{"masto_statuses"}else{"outbox_notes"},rows:rows.clone(),actor_key:key.into(),source_actor:actor.into(),ordinals:Some(ordinals.clone()),secondary:Some(SecondaryLedger{kind,owner,selected,preload,missing})};
+ let ledger=SourceLedger{table:if kind=="pinned"{"masto_statuses"}else{"outbox_notes"},rows:rows.clone(),actor_key:key.into(),source_actor:actor.into(),ordinals:Some(ordinals.clone()),secondary:Some(SecondaryLedger{kind,owner,selected,preload,missing}),digest:Default::default()};
  let page=crate::profile_context::ProfilePage::from_secondary_ledger(count,ledger)?;page.require_current_ledger(db).await?;Ok(SelectedProfilePage{rows,page,actor_key:key.into(),source_actor:actor.into(),tab:kind.into(),ordinals})
 }
 
 #[cfg(test)]
 mod tests {
  use super::*;
+ #[tokio::test]
+ #[ignore = "requires isolated local PostgreSQL fixture"]
+ async fn ledger_digest_recheck_still_sees_changes()->Result<()>{
+  let url=std::env::var("LEDGER_TEST_DATABASE_URL")?;
+  let(db,connection)=tokio_postgres::connect(&url,tokio_postgres::NoTls).await?;let task=tokio::spawn(connection);
+  let schema=format!("ledger_digest_{}",std::process::id());
+  db.batch_execute(&format!("CREATE SCHEMA {schema};SET search_path TO {schema};CREATE TABLE outbox_notes(id TEXT PRIMARY KEY,content TEXT,raw_create_json TEXT);INSERT INTO outbox_notes VALUES ('a','x','{{}}'),('b','y','{{\"k\":1}}')")).await?;
+  let rows:Vec<Value>=db.query("SELECT to_jsonb(n) FROM outbox_notes n ORDER BY id",&[]).await?.into_iter().map(|row|row.get(0)).collect();
+  let ledger=SourceLedger{table:"outbox_notes",rows,actor_key:"k".into(),source_actor:"a".into(),ordinals:None,secondary:None,digest:Default::default()};
+  let clone=ledger.clone();
+  ledger.require_current(&db).await?;assert!(clone.digest.0.get().is_some(),"clones share the first exact check");
+  clone.require_current(&db).await?;
+  db.batch_execute("UPDATE outbox_notes SET content='changed' WHERE id='b'").await?;
+  assert!(clone.require_current(&db).await.is_err(),"a changed row must still fail the recheck");
+  db.batch_execute("UPDATE outbox_notes SET content='y' WHERE id='b'").await?;
+  ledger.require_current(&db).await?;
+  db.batch_execute(&format!("DROP SCHEMA {schema} CASCADE")).await?;drop(db);let _=task.await;Ok(())
+ }
  #[test]
  fn profile_end_marker_follows_has_more_and_the_tab_total() {
   assert!(profile_page_has_more(true, 12, 12, 10));
