@@ -4719,7 +4719,7 @@ pub async fn warm_view(
     boost_ids.sort();
     boost_ids.dedup();
 
-    let mut hidden = crate::hidden::load_hidden_sets(&db, owner_user_id).await?;
+    let mut hidden = crate::hidden::load_timeline_hidden_sets(&db, owner_user_id).await?;
     crate::hidden::load_ordinary_owned_notes(&db, owner_user_id, &outbox_ids, &mut hidden).await?;
     let owner_username = load_owner_username(&db, owner_user_id).await?;
     let mut rss_map = fetch_rss_map(&db, &rss_ids, owner_user_id).await?;
@@ -5480,7 +5480,7 @@ pub(crate) async fn statuses_for_older_hits(
         }
     }
     let local_profiles = fetch_local_profiles_map(db, &local_keys).await.unwrap_or_default();
-    let hidden = crate::hidden::load_hidden_sets(db, owner_user_id)
+    let hidden = crate::hidden::load_timeline_hidden_sets(db, owner_user_id)
         .await
         .unwrap_or_default();
     use crate::timeline_cursor::CursorRow;

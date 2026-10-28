@@ -544,6 +544,51 @@ pub async fn load_hidden_sets(db: &Client, owner_user_id: i64) -> Result<HiddenS
     Ok(sets)
 }
 
+/// Home, Local, Federated and profile timelines also obey the owner's
+/// `bsky_hide_dids` rows: Bluesky blocks, mutes, and subscribed moderation
+/// lists (listblock, listmute). PHP ap_row_is_hidden reads the same set via
+/// ap_bsky_hide_did_set. Mutes join `muted_actors` so a directly opened
+/// profile keeps its root author, as with VAAK mutes; everything else is a
+/// block. A failed read keeps the ordinary sets.
+pub async fn load_timeline_hidden_sets(db: &Client, owner_user_id: i64) -> Result<HiddenSets> {
+    let mut sets = load_hidden_sets(db, owner_user_id).await?;
+    if owner_user_id < 1 {
+        return Ok(sets);
+    }
+    match db.query(BSKY_HIDE_REASONS_SQL, &[&owner_user_id]).await {
+        Ok(rows) => {
+            let pairs: Vec<(String, String)> = rows
+                .iter()
+                .map(|row| {
+                    let did: Option<String> = row.get(0);
+                    let reason: Option<String> = row.get(1);
+                    (did.unwrap_or_default(), reason.unwrap_or_default())
+                })
+                .collect();
+            apply_bsky_hide_rows(&mut sets, &pairs);
+        }
+        Err(error) => tracing::warn!(%error, "timeline bsky hide set skipped"),
+    }
+    Ok(sets)
+}
+
+pub const BSKY_HIDE_REASONS_SQL: &str =
+    "SELECT DISTINCT did, reason FROM bsky_hide_dids WHERE owner_user_id::bigint = $1";
+
+fn apply_bsky_hide_rows(sets: &mut HiddenSets, rows: &[(String, String)]) {
+    for (did, reason) in rows {
+        let did = did.trim();
+        if !did.starts_with("did:") {
+            continue;
+        }
+        if matches!(reason.trim(), "mute" | "listmute") {
+            insert_actor_aliases(&mut sets.muted_actors, did);
+        } else {
+            insert_actor_aliases(&mut sets.user_blocked_actors, did);
+        }
+    }
+}
+
 /// Bluesky identities named by moderation rows: (DIDs, lowercased handles).
 fn bsky_moderation_refs(sets: &HiddenSets) -> (Vec<String>, Vec<String>) {
     let mut dids = HashSet::new();
@@ -1253,6 +1298,41 @@ fn is_bsky_handle(handle: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bsky_list_rows_hide_timeline_posts_boosts_and_quotes() {
+        let mut sets = HiddenSets::default();
+        apply_bsky_hide_rows(&mut sets, &[
+            ("did:plc:listblock".into(), "listblock".into()),
+            ("did:plc:block".into(), "block".into()),
+            ("did:plc:listmute".into(), "listmute".into()),
+            ("not-a-did".into(), "listblock".into()),
+        ]);
+        // Rust Home warm checks the DID and its profile URL.
+        assert!(sets.is_hidden("did:plc:listblock"));
+        assert!(sets.is_hidden("https://bsky.app/profile/did:plc:listblock"));
+        assert!(sets.is_hidden("did:plc:block"));
+        assert!(sets.is_hidden("did:plc:listmute"));
+        assert!(!sets.is_hidden("did:plc:friend"));
+        assert!(!sets.is_hidden("not-a-did"));
+        let post = |did: &str| serde_json::json!({
+            "uri": format!("at://{did}/app.bsky.feed.post/1"),
+            "account": {"uri": "https://bsky.app/profile/someone.bsky.social"},
+            "content": "hi",
+        });
+        let friend = post("did:plc:friend");
+        assert!(!status_hidden(&friend, &sets));
+        assert!(status_hidden(&post("did:plc:listblock"), &sets));
+        let mut boost = friend.clone();
+        boost["reblog"] = post("did:plc:listblock");
+        assert!(ordinary_status_hidden(&boost, &sets));
+        let mut quote = friend.clone();
+        quote["quote"] = serde_json::json!({"quoted_status": post("did:plc:listmute")});
+        assert!(ordinary_status_hidden(&quote, &sets));
+        // A muted author's own profile still shows; a blocked one does not.
+        assert!(!ordinary_status_hidden_on_profile(&post("did:plc:listmute"), &sets));
+        assert!(ordinary_status_hidden_on_profile(&post("did:plc:listblock"), &sets));
+    }
 
     #[test]
     fn bsky_did_moderation_hides_handle_keyed_notifiers_and_back() {

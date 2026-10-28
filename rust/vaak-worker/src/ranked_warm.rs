@@ -2957,7 +2957,7 @@ pub async fn warm_home_native(cfg: &Config, owner_user_id: i64) -> Result<String
     let downranking_on = load_downranking_enabled(&db, &actor_key).await?;
     let following = load_following_actor_ids(&db, &actor_id).await?;
     let logical = cache_key_home(owner_user_id, algorithm_on, &following);
-    let hidden = hidden::load_hidden_sets(&db, owner_user_id).await?;
+    let hidden = hidden::load_timeline_hidden_sets(&db, owner_user_id).await?;
     let ap_following = ap_following_for_events(&following);
     let followed_tags = load_followed_tags(&db, owner_user_id).await;
 
@@ -3229,7 +3229,7 @@ pub async fn warm_feed_native(cfg: &Config, owner_user_id: i64) -> Result<String
     let (actor_id, _) = load_owner(&db, owner_user_id).await?;
     let following = load_following_actor_ids(&db, &actor_id).await?;
     let logical = cache_key_feed(owner_user_id, &following);
-    let hidden = hidden::load_hidden_sets(&db, owner_user_id).await?;
+    let hidden = hidden::load_timeline_hidden_sets(&db, owner_user_id).await?;
     let timeline = fetch_federated_events(&db, &hidden).await?;
     let mut ranked = rank_from_timeline(timeline);
     // PHP Federated collapsed native + Bridgy Fed copies of one post.

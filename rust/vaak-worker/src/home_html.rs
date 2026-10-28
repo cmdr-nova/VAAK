@@ -328,7 +328,7 @@ async fn tl_html_older(
     } else {
         Vec::new()
     };
-    let hidden = crate::hidden::load_hidden_sets(&db, owner_user_id)
+    let hidden = crate::hidden::load_timeline_hidden_sets(&db, owner_user_id)
         .await
         .unwrap_or_default();
     let fetch_limit = (limit.saturating_mul(3).max(40)) as i64;
