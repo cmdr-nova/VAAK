@@ -4683,6 +4683,7 @@ pub async fn warm_view(
 
     let mut rss_ids = Vec::new();
     let mut bsky_uris = Vec::new();
+    let mut nostr_ids = Vec::new();
     let mut event_ids = Vec::new();
     let mut outbox_ids = Vec::new();
     let mut boost_ids = Vec::new();
@@ -4696,6 +4697,7 @@ pub async fn warm_view(
                 }
             }
             ("home", "bsky") => bsky_uris.push(e.id.clone()),
+            ("home", "nostr") => nostr_ids.push(e.id.clone()),
             ("home" | "local" | "feed", "event") => {
                 if let Ok(id) = e.id.parse::<i64>() {
                     if id > 0 {
@@ -4712,6 +4714,8 @@ pub async fn warm_view(
     rss_ids.dedup();
     bsky_uris.sort();
     bsky_uris.dedup();
+    nostr_ids.sort();
+    nostr_ids.dedup();
     event_ids.sort_unstable();
     event_ids.dedup();
     outbox_ids.sort();
@@ -4724,6 +4728,10 @@ pub async fn warm_view(
     let owner_username = load_owner_username(&db, owner_user_id).await?;
     let mut rss_map = fetch_rss_map(&db, &rss_ids, owner_user_id).await?;
     let bsky_map = fetch_bsky_map(&db, &bsky_uris).await?;
+    let nostr_map = crate::nostr::home::fetch_rows(&db, &nostr_ids).await.unwrap_or_else(|e| {
+        tracing::warn!(error = %format!("{e:#}"), "nostr hydrate skipped");
+        HashMap::new()
+    });
     // Reply cards need the parent's author label even when the parent itself
     // is not on this timeline page. Hydrate the already-cached parent records
     // in one bounded query (never a network fetch).
@@ -4856,6 +4864,7 @@ pub async fn warm_view(
                 let id = e.id.parse::<i64>().unwrap_or(0);
                 rss_map.get(&id).map(materialize_rss)
             }
+            ("home", "nostr") => nostr_map.get(&e.id).map(crate::nostr::render::materialize),
             ("home", "bsky") => bsky_map.get(&e.id).map(|row| {
                 let mut st = materialize_bsky(row);
                 if let Some(parent_uri) = st.get("vaak_in_reply_to_url").and_then(|v| v.as_str()).map(str::to_owned) {

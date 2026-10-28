@@ -3113,6 +3113,17 @@ pub async fn warm_home_native(cfg: &Config, owner_user_id: i64) -> Result<String
     bsky.sort_by(|a, b| b.sort.cmp(&a.sort).then(b.indexed_at.cmp(&a.indexed_at)));
     collapse_repeated_external_posts(&mut bsky);
     ranked = merge_bsky_ranked(ranked, &bsky, &hidden);
+    // Opt-in Nostr follows (Settings > Profile npub link). Read-only notes,
+    // placed by post time like unweighted Bluesky posts.
+    let muted_phrases = load_muted_phrases(&db, owner_user_id).await;
+    match crate::nostr::home::fetch_keys(&db, owner_user_id, |text: &str| text_matches_muted(text, &muted_phrases)).await {
+        Ok(keys) => ranked = crate::nostr::home::merge_ranked(ranked, &keys),
+        Err(e) => tracing::warn!(
+            owner = owner_user_id,
+            error = %format!("{e:#}"),
+            "native home nostr merge skipped"
+        ),
+    }
     if let Err(e) = collapse_bridgy_twins(&db, &mut ranked).await {
         tracing::warn!(
             owner = owner_user_id,
@@ -3364,6 +3375,9 @@ fn view_input_tables(view: &str) -> &'static [&'static str] {
             "bsky_sessions",
             "rss_items",
             "rss_feeds",
+            "nostr_links",
+            "nostr_follows",
+            "nostr_events",
             "ap_home_downrank_terms",
             "ap_home_suppression",
             "masto_statuses",

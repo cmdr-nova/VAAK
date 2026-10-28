@@ -1,0 +1,29 @@
+# Nostr read-only sync: linked npubs' follow lists, followee profiles and
+# write relays, then recent kind 1 notes for Home. Prunes notes older than
+# VAAK_NOSTR_RETENTION_DAYS (default 30). VAAK_NOSTR=0 makes it a no-op.
+#
+#   cp deploy/vaak-nostr-sync.{service,timer} /etc/systemd/system/
+#   systemctl daemon-reload
+#   systemctl enable --now vaak-nostr-sync.timer
+#
+# Read the latest runs:
+#   journalctl -u vaak-nostr-sync.service -n 20 --no-pager
+
+[Unit]
+Description=VAAK Nostr follow and note sync
+After=postgresql.service network-online.target
+Wants=postgresql.service network-online.target
+ConditionPathExists=/usr/local/bin/vaak-worker
+
+[Service]
+Type=oneshot
+User=www-data
+Group=www-data
+Nice=15
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+Environment=VAAK_ENV_FILE=/etc/mkultra/vaak.env
+ExecStart=/usr/local/bin/vaak-worker nostr-sync --budget-secs 100
+TimeoutStartSec=150
+NoNewPrivileges=true
+PrivateTmp=true

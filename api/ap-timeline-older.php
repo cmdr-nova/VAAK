@@ -31,6 +31,10 @@ function admin_tl_cursor_token_from_ranked(array $ranked, int $index): string
     if ($kind === '' || $id === '') {
         return $wildcard();
     }
+    // Nostr keys carry the note's own created_at as sort; no row lookup needed.
+    if ($kind === 'nostr') {
+        return $sort > 0 ? vaak_tl_cursor_pack(['at' => gmdate('c', $sort), 'source' => 'nostr', 'id' => $id]) : '';
+    }
     try {
         $db = ap_db();
         if ($kind === 'event') {
@@ -146,6 +150,7 @@ function admin_tl_ranked_index_of_cursor(array $ranked, array $cursor): int
         'boost' => 'boost',
         'bsky' => 'bsky',
         'rss' => 'rss',
+        'nostr' => 'nostr',
         default => '',
     };
     if ($kind === '') {

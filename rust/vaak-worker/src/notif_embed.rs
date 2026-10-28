@@ -2822,7 +2822,18 @@ fn paint_lean_timeline_actions(status: &Value, from: &str, viewer_actor: &str) -
 
     let mut actions = String::new();
 
-    if rss {
+    if crate::nostr::render::is_nostr_status(status) {
+        // Read-only Nostr note: VAAK holds no key, so no reply/boost/like.
+        let open = status.get("url").and_then(|v| v.as_str()).unwrap_or("");
+        if open.starts_with("https://") {
+            actions.push_str(&format!(
+                "<details class=\"post-action-menu\"><summary class=\"icon-btn\" title=\"More actions\" aria-label=\"More actions\">⋯</summary>\
+                 <div class=\"post-action-menu__body\"><a class=\"menu-action\" href=\"{0}\" target=\"_blank\" rel=\"noopener noreferrer\">Open on Nostr</a>\
+                 <button type=\"button\" class=\"menu-action\" data-copy-value=\"{0}\" title=\"Copy link to post\">Copy link</button></div></details>",
+                esc(open)
+            ));
+        }
+    } else if rss {
         let rss_item = status
             .get("vaak_rss_item_id")
             .and_then(|v| v.as_i64())
@@ -4145,8 +4156,18 @@ pub fn paint_lean_embed_from(
             )
         };
         // Network source tags (Bluesky / RSS) omitted — they only crowded the header.
+        let nostr_url = status
+            .get("url")
+            .and_then(|v| v.as_str())
+            .filter(|u| u.starts_with("https://") && crate::nostr::render::is_nostr_status(status));
         let when_html = if when.is_empty() {
             String::new()
+        } else if let Some(open) = nostr_url {
+            format!(
+                "<a class=\"meta tweet-time\" href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\" title=\"Open on Nostr\"> · {}</a>",
+                esc(open),
+                esc(&when)
+            )
         } else if !uri.is_empty() {
             let status_href = crate::library::actions::in_app_status_href(&status_open_ref(status, uri), from_q);
             format!(
