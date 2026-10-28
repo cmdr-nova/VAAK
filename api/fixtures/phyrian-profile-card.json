@@ -1,0 +1,717 @@
+{
+    "origin_owner_user_id": 1,
+    "cards": [
+        {
+            "id": "no_owner_self",
+            "owner": 0,
+            "is_self": true,
+            "bridge": null,
+            "row": null,
+            "html": "<section class=\"phyrian-profile-card\" data-phyrian-card=\"unmarked\" aria-label=\"Phyrian Strains\" style=\"display:flex;flex-wrap:wrap;align-items:center;gap:.35rem .85rem;width:100%;box-sizing:border-box;margin:.85rem 0 0;padding:.5rem .7rem;border-radius:12px;border:1px solid color-mix(in srgb, #5ee7ff 28%, var(--border));background:linear-gradient(160deg, rgba(94,231,255,.05), transparent 55%), var(--panel);color:var(--muted);font-size:.85rem;line-height:1.35;overflow-wrap:anywhere\"><span class=\"phyrian-profile-card-title\" style=\"color:var(--text);font-weight:650;letter-spacing:.04em;text-transform:uppercase;font-size:.72rem\">Phyrian Strains</span><span class=\"phyrian-badge phyrian-badge--unknown\">Unmarked</span><span>Not imprinted yet.</span><span>Start playing to receive a strain.</span><a href=\"?view=phyrian\" style=\"margin-left:auto;color:var(--primary);text-decoration:none\">Start playing</a></section>\n"
+        },
+        {
+            "id": "no_owner_other",
+            "owner": 0,
+            "is_self": false,
+            "bridge": null,
+            "row": null,
+            "html": "<section class=\"phyrian-profile-card\" data-phyrian-card=\"unmarked\" aria-label=\"Phyrian Strains\" style=\"display:flex;flex-wrap:wrap;align-items:center;gap:.35rem .85rem;width:100%;box-sizing:border-box;margin:.85rem 0 0;padding:.5rem .7rem;border-radius:12px;border:1px solid color-mix(in srgb, #5ee7ff 28%, var(--border));background:linear-gradient(160deg, rgba(94,231,255,.05), transparent 55%), var(--panel);color:var(--muted);font-size:.85rem;line-height:1.35;overflow-wrap:anywhere\"><span class=\"phyrian-profile-card-title\" style=\"color:var(--text);font-weight:650;letter-spacing:.04em;text-transform:uppercase;font-size:.72rem\">Phyrian Strains</span><span class=\"phyrian-badge phyrian-badge--unknown\">Unmarked</span><span>Not imprinted yet.</span></section>\n"
+        },
+        {
+            "id": "no_row_self",
+            "owner": 5,
+            "is_self": true,
+            "bridge": null,
+            "row": null,
+            "html": "<section class=\"phyrian-profile-card\" data-phyrian-card=\"unmarked\" aria-label=\"Phyrian Strains\" style=\"display:flex;flex-wrap:wrap;align-items:center;gap:.35rem .85rem;width:100%;box-sizing:border-box;margin:.85rem 0 0;padding:.5rem .7rem;border-radius:12px;border:1px solid color-mix(in srgb, #5ee7ff 28%, var(--border));background:linear-gradient(160deg, rgba(94,231,255,.05), transparent 55%), var(--panel);color:var(--muted);font-size:.85rem;line-height:1.35;overflow-wrap:anywhere\"><span class=\"phyrian-profile-card-title\" style=\"color:var(--text);font-weight:650;letter-spacing:.04em;text-transform:uppercase;font-size:.72rem\">Phyrian Strains</span><span class=\"phyrian-badge phyrian-badge--unknown\">Unmarked</span><span>Not imprinted yet.</span><span>Start playing to receive a strain.</span><a href=\"?view=phyrian\" style=\"margin-left:auto;color:var(--primary);text-decoration:none\">Start playing</a></section>\n"
+        },
+        {
+            "id": "no_row_other_linked",
+            "owner": 5,
+            "is_self": false,
+            "bridge": {
+                "owner_user_id": 5,
+                "status": "verified",
+                "avatar_name": "Ada Resident",
+                "strain_snapshot": "Rose Static"
+            },
+            "row": null,
+            "html": "<section class=\"phyrian-profile-card\" data-phyrian-card=\"unmarked\" aria-label=\"Phyrian Strains\" style=\"display:flex;flex-wrap:wrap;align-items:center;gap:.35rem .85rem;width:100%;box-sizing:border-box;margin:.85rem 0 0;padding:.5rem .7rem;border-radius:12px;border:1px solid color-mix(in srgb, #5ee7ff 28%, var(--border));background:linear-gradient(160deg, rgba(94,231,255,.05), transparent 55%), var(--panel);color:var(--muted);font-size:.85rem;line-height:1.35;overflow-wrap:anywhere\"><span class=\"phyrian-profile-card-title\" style=\"color:var(--text);font-weight:650;letter-spacing:.04em;text-transform:uppercase;font-size:.72rem\">Phyrian Strains</span><span class=\"phyrian-badge phyrian-badge--unknown\">Unmarked</span><span>Not imprinted yet.</span><span>OpenSim linked as <b>Ada Resident</b></span></section>\n"
+        },
+        {
+            "id": "unmarked_self",
+            "owner": 5,
+            "is_self": true,
+            "bridge": null,
+            "row": {
+                "status": "unknown",
+                "strain": "",
+                "resonance": 0,
+                "level": 1,
+                "generation": 1,
+                "banked_resonance": 0,
+                "resonance_exchanges": 0,
+                "inductions_given": 0,
+                "lineage_depth": null,
+                "daily_resonance_decay": 5
+            },
+            "html": "<section class=\"phyrian-profile-card\" data-phyrian-card=\"unmarked\" aria-label=\"Phyrian Strains\" style=\"display:flex;flex-wrap:wrap;align-items:center;gap:.35rem .85rem;width:100%;box-sizing:border-box;margin:.85rem 0 0;padding:.5rem .7rem;border-radius:12px;border:1px solid color-mix(in srgb, #5ee7ff 28%, var(--border));background:linear-gradient(160deg, rgba(94,231,255,.05), transparent 55%), var(--panel);color:var(--muted);font-size:.85rem;line-height:1.35;overflow-wrap:anywhere\"><span class=\"phyrian-profile-card-title\" style=\"color:var(--text);font-weight:650;letter-spacing:.04em;text-transform:uppercase;font-size:.72rem\">Phyrian Strains</span><span class=\"phyrian-badge phyrian-badge--unknown\">Unmarked</span><span>Not imprinted yet.</span><span>Start playing to receive a strain.</span><span>Level <b>1</b></span><span>Resonance <b>0</b>/100</span><a href=\"?view=phyrian\" style=\"margin-left:auto;color:var(--primary);text-decoration:none\">Start playing</a></section>\n"
+        },
+        {
+            "id": "unmarked_other",
+            "owner": 5,
+            "is_self": false,
+            "bridge": null,
+            "row": {
+                "status": "unknown",
+                "strain": null,
+                "resonance": 12,
+                "level": 3,
+                "generation": 2,
+                "banked_resonance": 0,
+                "resonance_exchanges": 0,
+                "inductions_given": 0,
+                "lineage_depth": null,
+                "daily_resonance_decay": 5
+            },
+            "html": "<section class=\"phyrian-profile-card\" data-phyrian-card=\"unmarked\" aria-label=\"Phyrian Strains\" style=\"display:flex;flex-wrap:wrap;align-items:center;gap:.35rem .85rem;width:100%;box-sizing:border-box;margin:.85rem 0 0;padding:.5rem .7rem;border-radius:12px;border:1px solid color-mix(in srgb, #5ee7ff 28%, var(--border));background:linear-gradient(160deg, rgba(94,231,255,.05), transparent 55%), var(--panel);color:var(--muted);font-size:.85rem;line-height:1.35;overflow-wrap:anywhere\"><span class=\"phyrian-profile-card-title\" style=\"color:var(--text);font-weight:650;letter-spacing:.04em;text-transform:uppercase;font-size:.72rem\">Phyrian Strains</span><span class=\"phyrian-badge phyrian-badge--unknown\">Unmarked</span><span>Not imprinted yet.</span><span>Level <b>3</b></span><span>Resonance <b>12</b>/100</span></section>\n"
+        },
+        {
+            "id": "imprinted_blank_strain",
+            "owner": 5,
+            "is_self": false,
+            "bridge": null,
+            "row": {
+                "strain": "   ",
+                "status": "imprinted",
+                "resonance": 60,
+                "generation": 2,
+                "level": 20,
+                "banked_resonance": 0,
+                "resonance_exchanges": 0,
+                "inductions_given": 0,
+                "lineage_depth": null,
+                "daily_resonance_decay": 5
+            },
+            "html": "<section class=\"phyrian-profile-card\" data-phyrian-card=\"unmarked\" aria-label=\"Phyrian Strains\" style=\"display:flex;flex-wrap:wrap;align-items:center;gap:.35rem .85rem;width:100%;box-sizing:border-box;margin:.85rem 0 0;padding:.5rem .7rem;border-radius:12px;border:1px solid color-mix(in srgb, #5ee7ff 28%, var(--border));background:linear-gradient(160deg, rgba(94,231,255,.05), transparent 55%), var(--panel);color:var(--muted);font-size:.85rem;line-height:1.35;overflow-wrap:anywhere\"><span class=\"phyrian-profile-card-title\" style=\"color:var(--text);font-weight:650;letter-spacing:.04em;text-transform:uppercase;font-size:.72rem\">Phyrian Strains</span><span class=\"phyrian-badge phyrian-badge--unknown\">Unmarked</span><span>Not imprinted yet.</span><span>Level <b>20</b></span><span>Resonance <b>60</b>/100</span></section>\n"
+        },
+        {
+            "id": "imprinted_padded_status",
+            "owner": 5,
+            "is_self": false,
+            "bridge": null,
+            "row": {
+                "status": " imprinted ",
+                "strain": " Grey Bloom ",
+                "resonance": 60,
+                "generation": 2,
+                "level": 20,
+                "banked_resonance": 0,
+                "resonance_exchanges": 0,
+                "inductions_given": 0,
+                "lineage_depth": null,
+                "daily_resonance_decay": 5
+            },
+            "html": "<section class=\"phyrian-profile-card\" data-phyrian-card=\"imprinted\" aria-label=\"Phyrian Strains\" style=\"display:flex;flex-wrap:wrap;align-items:center;gap:.35rem .85rem;width:100%;box-sizing:border-box;margin:.85rem 0 0;padding:.5rem .7rem;border-radius:12px;border:1px solid color-mix(in srgb, #5ee7ff 28%, var(--border));background:linear-gradient(160deg, rgba(94,231,255,.05), transparent 55%), var(--panel);color:var(--muted);font-size:.85rem;line-height:1.35;overflow-wrap:anywhere\"><span class=\"phyrian-profile-card-title\" style=\"color:var(--text);font-weight:650;letter-spacing:.04em;text-transform:uppercase;font-size:.72rem\">Phyrian Strains</span><span class=\"phyrian-badge\">Imprinted</span><span class=\"who\">Grey Bloom</span><span>Stable</span><span>Gen <b>2</b></span><span>Level <b>20</b>/80</span><span>Rank <b>Colony Node</b></span><span>Resonance <b>60</b>/100</span><span>Decay <b>−5</b>/day</span><a href=\"?view=phyrian&amp;page=dossier&amp;owner=5\" style=\"margin-left:auto;color:var(--primary);text-decoration:none\">Readout</a></section>\n"
+        },
+        {
+            "id": "imprinted_self",
+            "owner": 5,
+            "is_self": true,
+            "bridge": null,
+            "row": {
+                "status": "imprinted",
+                "strain": "Rose Static",
+                "resonance": 60,
+                "generation": 2,
+                "level": 20,
+                "banked_resonance": 0,
+                "resonance_exchanges": 0,
+                "inductions_given": 0,
+                "lineage_depth": null,
+                "daily_resonance_decay": 5
+            },
+            "html": "<section class=\"phyrian-profile-card\" data-phyrian-card=\"imprinted\" aria-label=\"Phyrian Strains\" style=\"display:flex;flex-wrap:wrap;align-items:center;gap:.35rem .85rem;width:100%;box-sizing:border-box;margin:.85rem 0 0;padding:.5rem .7rem;border-radius:12px;border:1px solid color-mix(in srgb, #5ee7ff 28%, var(--border));background:linear-gradient(160deg, rgba(94,231,255,.05), transparent 55%), var(--panel);color:var(--muted);font-size:.85rem;line-height:1.35;overflow-wrap:anywhere\"><span class=\"phyrian-profile-card-title\" style=\"color:var(--text);font-weight:650;letter-spacing:.04em;text-transform:uppercase;font-size:.72rem\">Phyrian Strains</span><span class=\"phyrian-badge\">Imprinted</span><span class=\"who\">Rose Static</span><span>Stable</span><span>Gen <b>2</b></span><span>Level <b>20</b>/80</span><span>Rank <b>Colony Node</b></span><span>Resonance <b>60</b>/100</span><span>Decay <b>−5</b>/day</span><a href=\"?view=phyrian\" style=\"margin-left:auto;color:var(--primary);text-decoration:none\">Open game</a></section>\n"
+        },
+        {
+            "id": "newly_marked_stable",
+            "owner": 7,
+            "is_self": false,
+            "bridge": null,
+            "row": {
+                "level": 19,
+                "resonance": 50,
+                "status": "imprinted",
+                "strain": "Rose Static",
+                "generation": 2,
+                "banked_resonance": 0,
+                "resonance_exchanges": 0,
+                "inductions_given": 0,
+                "lineage_depth": null,
+                "daily_resonance_decay": 5
+            },
+            "html": "<section class=\"phyrian-profile-card\" data-phyrian-card=\"imprinted\" aria-label=\"Phyrian Strains\" style=\"display:flex;flex-wrap:wrap;align-items:center;gap:.35rem .85rem;width:100%;box-sizing:border-box;margin:.85rem 0 0;padding:.5rem .7rem;border-radius:12px;border:1px solid color-mix(in srgb, #5ee7ff 28%, var(--border));background:linear-gradient(160deg, rgba(94,231,255,.05), transparent 55%), var(--panel);color:var(--muted);font-size:.85rem;line-height:1.35;overflow-wrap:anywhere\"><span class=\"phyrian-profile-card-title\" style=\"color:var(--text);font-weight:650;letter-spacing:.04em;text-transform:uppercase;font-size:.72rem\">Phyrian Strains</span><span class=\"phyrian-badge\">Imprinted</span><span class=\"who\">Rose Static</span><span>Stable</span><span>Gen <b>2</b></span><span>Level <b>19</b>/80</span><span>Rank <b>Newly Marked</b></span><span>Resonance <b>50</b>/100</span><span>Decay <b>−5</b>/day</span><a href=\"?view=phyrian&amp;page=dossier&amp;owner=7\" style=\"margin-left:auto;color:var(--primary);text-decoration:none\">Readout</a></section>\n"
+        },
+        {
+            "id": "colony_node_fading",
+            "owner": 7,
+            "is_self": false,
+            "bridge": null,
+            "row": {
+                "level": 39,
+                "resonance": 49,
+                "generation": 4,
+                "status": "imprinted",
+                "strain": "Rose Static",
+                "banked_resonance": 0,
+                "resonance_exchanges": 0,
+                "inductions_given": 0,
+                "lineage_depth": null,
+                "daily_resonance_decay": 5
+            },
+            "html": "<section class=\"phyrian-profile-card\" data-phyrian-card=\"imprinted\" aria-label=\"Phyrian Strains\" style=\"display:flex;flex-wrap:wrap;align-items:center;gap:.35rem .85rem;width:100%;box-sizing:border-box;margin:.85rem 0 0;padding:.5rem .7rem;border-radius:12px;border:1px solid color-mix(in srgb, #5ee7ff 28%, var(--border));background:linear-gradient(160deg, rgba(94,231,255,.05), transparent 55%), var(--panel);color:var(--muted);font-size:.85rem;line-height:1.35;overflow-wrap:anywhere\"><span class=\"phyrian-profile-card-title\" style=\"color:var(--text);font-weight:650;letter-spacing:.04em;text-transform:uppercase;font-size:.72rem\">Phyrian Strains</span><span class=\"phyrian-badge\">Imprinted</span><span class=\"who\">Rose Static</span><span>Fading</span><span>Gen <b>4</b></span><span>Level <b>39</b>/80</span><span>Rank <b>Colony Node</b></span><span>Resonance <b>49</b>/100</span><span>Decay <b>−5</b>/day</span><a href=\"?view=phyrian&amp;page=dossier&amp;owner=7\" style=\"margin-left:auto;color:var(--primary);text-decoration:none\">Readout</a></section>\n"
+        },
+        {
+            "id": "marked_host_critical",
+            "owner": 7,
+            "is_self": false,
+            "bridge": null,
+            "row": {
+                "level": 40,
+                "resonance": 24,
+                "banked_resonance": 8,
+                "status": "imprinted",
+                "strain": "Rose Static",
+                "generation": 2,
+                "resonance_exchanges": 0,
+                "inductions_given": 0,
+                "lineage_depth": null,
+                "daily_resonance_decay": 5
+            },
+            "html": "<section class=\"phyrian-profile-card\" data-phyrian-card=\"imprinted\" aria-label=\"Phyrian Strains\" style=\"display:flex;flex-wrap:wrap;align-items:center;gap:.35rem .85rem;width:100%;box-sizing:border-box;margin:.85rem 0 0;padding:.5rem .7rem;border-radius:12px;border:1px solid color-mix(in srgb, #5ee7ff 28%, var(--border));background:linear-gradient(160deg, rgba(94,231,255,.05), transparent 55%), var(--panel);color:var(--muted);font-size:.85rem;line-height:1.35;overflow-wrap:anywhere\"><span class=\"phyrian-profile-card-title\" style=\"color:var(--text);font-weight:650;letter-spacing:.04em;text-transform:uppercase;font-size:.72rem\">Phyrian Strains</span><span class=\"phyrian-badge\">Imprinted</span><span class=\"who\">Rose Static</span><span>Critical</span><span>Gen <b>2</b></span><span>Level <b>40</b>/80</span><span>Rank <b>Marked Host</b></span><span>Resonance <b>24</b>/100</span><span>Banked <b>8</b></span><span>Decay <b>−5</b>/day</span><a href=\"?view=phyrian&amp;page=dossier&amp;owner=7\" style=\"margin-left:auto;color:var(--primary);text-decoration:none\">Readout</a></section>\n"
+        },
+        {
+            "id": "marked_host_edge",
+            "owner": 7,
+            "is_self": false,
+            "bridge": null,
+            "row": {
+                "level": 59,
+                "resonance": 25,
+                "resonance_exchanges": 3,
+                "status": "imprinted",
+                "strain": "Rose Static",
+                "generation": 2,
+                "banked_resonance": 0,
+                "inductions_given": 0,
+                "lineage_depth": null,
+                "daily_resonance_decay": 5
+            },
+            "html": "<section class=\"phyrian-profile-card\" data-phyrian-card=\"imprinted\" aria-label=\"Phyrian Strains\" style=\"display:flex;flex-wrap:wrap;align-items:center;gap:.35rem .85rem;width:100%;box-sizing:border-box;margin:.85rem 0 0;padding:.5rem .7rem;border-radius:12px;border:1px solid color-mix(in srgb, #5ee7ff 28%, var(--border));background:linear-gradient(160deg, rgba(94,231,255,.05), transparent 55%), var(--panel);color:var(--muted);font-size:.85rem;line-height:1.35;overflow-wrap:anywhere\"><span class=\"phyrian-profile-card-title\" style=\"color:var(--text);font-weight:650;letter-spacing:.04em;text-transform:uppercase;font-size:.72rem\">Phyrian Strains</span><span class=\"phyrian-badge\">Imprinted</span><span class=\"who\">Rose Static</span><span>Fading</span><span>Gen <b>2</b></span><span>Level <b>59</b>/80</span><span>Rank <b>Marked Host</b></span><span>Resonance <b>25</b>/100</span><span>Decay <b>−5</b>/day</span><span>Exchanges <b>3</b></span><a href=\"?view=phyrian&amp;page=dossier&amp;owner=7\" style=\"margin-left:auto;color:var(--primary);text-decoration:none\">Readout</a></section>\n"
+        },
+        {
+            "id": "deep_signal_dormant",
+            "owner": 7,
+            "is_self": false,
+            "bridge": null,
+            "row": {
+                "level": 60,
+                "resonance": 0,
+                "inductions_given": 2,
+                "status": "imprinted",
+                "strain": "Rose Static",
+                "generation": 2,
+                "banked_resonance": 0,
+                "resonance_exchanges": 0,
+                "lineage_depth": null,
+                "daily_resonance_decay": 5
+            },
+            "html": "<section class=\"phyrian-profile-card\" data-phyrian-card=\"imprinted\" aria-label=\"Phyrian Strains\" style=\"display:flex;flex-wrap:wrap;align-items:center;gap:.35rem .85rem;width:100%;box-sizing:border-box;margin:.85rem 0 0;padding:.5rem .7rem;border-radius:12px;border:1px solid color-mix(in srgb, #5ee7ff 28%, var(--border));background:linear-gradient(160deg, rgba(94,231,255,.05), transparent 55%), var(--panel);color:var(--muted);font-size:.85rem;line-height:1.35;overflow-wrap:anywhere\"><span class=\"phyrian-profile-card-title\" style=\"color:var(--text);font-weight:650;letter-spacing:.04em;text-transform:uppercase;font-size:.72rem\">Phyrian Strains</span><span class=\"phyrian-badge\">Imprinted</span><span class=\"who\">Rose Static</span><span>Dormant</span><span>Gen <b>2</b></span><span>Level <b>60</b>/80</span><span>Rank <b>Deep Signal</b></span><span>Resonance <b>0</b>/100</span><span>Decay <b>−5</b>/day</span><span>Inductions <b>2</b></span><a href=\"?view=phyrian&amp;page=dossier&amp;owner=7\" style=\"margin-left:auto;color:var(--primary);text-decoration:none\">Readout</a></section>\n"
+        },
+        {
+            "id": "max_level_negative_resonance",
+            "owner": 7,
+            "is_self": false,
+            "bridge": null,
+            "row": {
+                "level": 80,
+                "resonance": -3,
+                "generation": 10,
+                "banked_resonance": 300,
+                "status": "imprinted",
+                "strain": "Rose Static",
+                "resonance_exchanges": 0,
+                "inductions_given": 0,
+                "lineage_depth": null,
+                "daily_resonance_decay": 5
+            },
+            "html": "<section class=\"phyrian-profile-card\" data-phyrian-card=\"imprinted\" aria-label=\"Phyrian Strains\" style=\"display:flex;flex-wrap:wrap;align-items:center;gap:.35rem .85rem;width:100%;box-sizing:border-box;margin:.85rem 0 0;padding:.5rem .7rem;border-radius:12px;border:1px solid color-mix(in srgb, #5ee7ff 28%, var(--border));background:linear-gradient(160deg, rgba(94,231,255,.05), transparent 55%), var(--panel);color:var(--muted);font-size:.85rem;line-height:1.35;overflow-wrap:anywhere\"><span class=\"phyrian-profile-card-title\" style=\"color:var(--text);font-weight:650;letter-spacing:.04em;text-transform:uppercase;font-size:.72rem\">Phyrian Strains</span><span class=\"phyrian-badge\">Imprinted</span><span class=\"who\">Rose Static</span><span>Dormant</span><span>Gen <b>10</b></span><span>Level <b>80</b>/80</span><span>Rank <b>Deep Signal</b></span><span>Resonance <b>-3</b>/100</span><span>Banked <b>300</b></span><span>Decay <b>−5</b>/day</span><a href=\"?view=phyrian&amp;page=dossier&amp;owner=7\" style=\"margin-left:auto;color:var(--primary);text-decoration:none\">Readout</a></section>\n"
+        },
+        {
+            "id": "lineage_zero",
+            "owner": 7,
+            "is_self": false,
+            "bridge": null,
+            "row": {
+                "lineage_depth": 0,
+                "status": "imprinted",
+                "strain": "Rose Static",
+                "resonance": 60,
+                "generation": 2,
+                "level": 20,
+                "banked_resonance": 0,
+                "resonance_exchanges": 0,
+                "inductions_given": 0,
+                "daily_resonance_decay": 5
+            },
+            "html": "<section class=\"phyrian-profile-card\" data-phyrian-card=\"imprinted\" aria-label=\"Phyrian Strains\" style=\"display:flex;flex-wrap:wrap;align-items:center;gap:.35rem .85rem;width:100%;box-sizing:border-box;margin:.85rem 0 0;padding:.5rem .7rem;border-radius:12px;border:1px solid color-mix(in srgb, #5ee7ff 28%, var(--border));background:linear-gradient(160deg, rgba(94,231,255,.05), transparent 55%), var(--panel);color:var(--muted);font-size:.85rem;line-height:1.35;overflow-wrap:anywhere\"><span class=\"phyrian-profile-card-title\" style=\"color:var(--text);font-weight:650;letter-spacing:.04em;text-transform:uppercase;font-size:.72rem\">Phyrian Strains</span><span class=\"phyrian-badge\">Imprinted</span><span class=\"who\">Rose Static</span><span>Stable</span><span>Gen <b>2</b></span><span>Level <b>20</b>/80</span><span>Rank <b>Colony Node</b></span><span>Resonance <b>60</b>/100</span><span>Decay <b>−5</b>/day</span><a href=\"?view=phyrian&amp;page=dossier&amp;owner=7\" style=\"margin-left:auto;color:var(--primary);text-decoration:none\">Readout</a></section>\n"
+        },
+        {
+            "id": "lineage_number",
+            "owner": 7,
+            "is_self": false,
+            "bridge": null,
+            "row": {
+                "lineage_depth": 4,
+                "resonance_exchanges": 1,
+                "inductions_given": 1,
+                "banked_resonance": 1,
+                "status": "imprinted",
+                "strain": "Rose Static",
+                "resonance": 60,
+                "generation": 2,
+                "level": 20,
+                "daily_resonance_decay": 5
+            },
+            "html": "<section class=\"phyrian-profile-card\" data-phyrian-card=\"imprinted\" aria-label=\"Phyrian Strains\" style=\"display:flex;flex-wrap:wrap;align-items:center;gap:.35rem .85rem;width:100%;box-sizing:border-box;margin:.85rem 0 0;padding:.5rem .7rem;border-radius:12px;border:1px solid color-mix(in srgb, #5ee7ff 28%, var(--border));background:linear-gradient(160deg, rgba(94,231,255,.05), transparent 55%), var(--panel);color:var(--muted);font-size:.85rem;line-height:1.35;overflow-wrap:anywhere\"><span class=\"phyrian-profile-card-title\" style=\"color:var(--text);font-weight:650;letter-spacing:.04em;text-transform:uppercase;font-size:.72rem\">Phyrian Strains</span><span class=\"phyrian-badge\">Imprinted</span><span class=\"who\">Rose Static</span><span>Stable</span><span>Gen <b>2</b></span><span>Level <b>20</b>/80</span><span>Rank <b>Colony Node</b></span><span>Resonance <b>60</b>/100</span><span>Banked <b>1</b></span><span>Decay <b>−5</b>/day</span><span>Exchanges <b>1</b></span><span>Inductions <b>1</b></span><span>Lineage <b>4</b></span><a href=\"?view=phyrian&amp;page=dossier&amp;owner=7\" style=\"margin-left:auto;color:var(--primary);text-decoration:none\">Readout</a></section>\n"
+        },
+        {
+            "id": "lineage_blank_string",
+            "owner": 7,
+            "is_self": false,
+            "bridge": null,
+            "row": {
+                "lineage_depth": "",
+                "status": "imprinted",
+                "strain": "Rose Static",
+                "resonance": 60,
+                "generation": 2,
+                "level": 20,
+                "banked_resonance": 0,
+                "resonance_exchanges": 0,
+                "inductions_given": 0,
+                "daily_resonance_decay": 5
+            },
+            "html": "<section class=\"phyrian-profile-card\" data-phyrian-card=\"imprinted\" aria-label=\"Phyrian Strains\" style=\"display:flex;flex-wrap:wrap;align-items:center;gap:.35rem .85rem;width:100%;box-sizing:border-box;margin:.85rem 0 0;padding:.5rem .7rem;border-radius:12px;border:1px solid color-mix(in srgb, #5ee7ff 28%, var(--border));background:linear-gradient(160deg, rgba(94,231,255,.05), transparent 55%), var(--panel);color:var(--muted);font-size:.85rem;line-height:1.35;overflow-wrap:anywhere\"><span class=\"phyrian-profile-card-title\" style=\"color:var(--text);font-weight:650;letter-spacing:.04em;text-transform:uppercase;font-size:.72rem\">Phyrian Strains</span><span class=\"phyrian-badge\">Imprinted</span><span class=\"who\">Rose Static</span><span>Stable</span><span>Gen <b>2</b></span><span>Level <b>20</b>/80</span><span>Rank <b>Colony Node</b></span><span>Resonance <b>60</b>/100</span><span>Decay <b>−5</b>/day</span><a href=\"?view=phyrian&amp;page=dossier&amp;owner=7\" style=\"margin-left:auto;color:var(--primary);text-decoration:none\">Readout</a></section>\n"
+        },
+        {
+            "id": "decay_zero",
+            "owner": 7,
+            "is_self": false,
+            "bridge": null,
+            "row": {
+                "daily_resonance_decay": 0,
+                "status": "imprinted",
+                "strain": "Rose Static",
+                "resonance": 60,
+                "generation": 2,
+                "level": 20,
+                "banked_resonance": 0,
+                "resonance_exchanges": 0,
+                "inductions_given": 0,
+                "lineage_depth": null
+            },
+            "html": "<section class=\"phyrian-profile-card\" data-phyrian-card=\"imprinted\" aria-label=\"Phyrian Strains\" style=\"display:flex;flex-wrap:wrap;align-items:center;gap:.35rem .85rem;width:100%;box-sizing:border-box;margin:.85rem 0 0;padding:.5rem .7rem;border-radius:12px;border:1px solid color-mix(in srgb, #5ee7ff 28%, var(--border));background:linear-gradient(160deg, rgba(94,231,255,.05), transparent 55%), var(--panel);color:var(--muted);font-size:.85rem;line-height:1.35;overflow-wrap:anywhere\"><span class=\"phyrian-profile-card-title\" style=\"color:var(--text);font-weight:650;letter-spacing:.04em;text-transform:uppercase;font-size:.72rem\">Phyrian Strains</span><span class=\"phyrian-badge\">Imprinted</span><span class=\"who\">Rose Static</span><span>Stable</span><span>Gen <b>2</b></span><span>Level <b>20</b>/80</span><span>Rank <b>Colony Node</b></span><span>Resonance <b>60</b>/100</span><span>Decay <b>−0</b>/day</span><a href=\"?view=phyrian&amp;page=dossier&amp;owner=7\" style=\"margin-left:auto;color:var(--primary);text-decoration:none\">Readout</a></section>\n"
+        },
+        {
+            "id": "decay_missing_uses_default",
+            "owner": 7,
+            "is_self": false,
+            "bridge": null,
+            "row": {
+                "status": "imprinted",
+                "strain": "Rose Static",
+                "resonance": 60,
+                "generation": 2,
+                "level": 20,
+                "banked_resonance": 0,
+                "resonance_exchanges": 0,
+                "inductions_given": 0,
+                "lineage_depth": null
+            },
+            "html": "<section class=\"phyrian-profile-card\" data-phyrian-card=\"imprinted\" aria-label=\"Phyrian Strains\" style=\"display:flex;flex-wrap:wrap;align-items:center;gap:.35rem .85rem;width:100%;box-sizing:border-box;margin:.85rem 0 0;padding:.5rem .7rem;border-radius:12px;border:1px solid color-mix(in srgb, #5ee7ff 28%, var(--border));background:linear-gradient(160deg, rgba(94,231,255,.05), transparent 55%), var(--panel);color:var(--muted);font-size:.85rem;line-height:1.35;overflow-wrap:anywhere\"><span class=\"phyrian-profile-card-title\" style=\"color:var(--text);font-weight:650;letter-spacing:.04em;text-transform:uppercase;font-size:.72rem\">Phyrian Strains</span><span class=\"phyrian-badge\">Imprinted</span><span class=\"who\">Rose Static</span><span>Stable</span><span>Gen <b>2</b></span><span>Level <b>20</b>/80</span><span>Rank <b>Colony Node</b></span><span>Resonance <b>60</b>/100</span><span>Decay <b>−5</b>/day</span><a href=\"?view=phyrian&amp;page=dossier&amp;owner=7\" style=\"margin-left:auto;color:var(--primary);text-decoration:none\">Readout</a></section>\n"
+        },
+        {
+            "id": "driver_strings",
+            "owner": 7,
+            "is_self": false,
+            "bridge": null,
+            "row": {
+                "resonance": "41",
+                "generation": "3",
+                "level": " 22",
+                "banked_resonance": "0",
+                "lineage_depth": "2",
+                "daily_resonance_decay": "7",
+                "status": "imprinted",
+                "strain": "Rose Static",
+                "resonance_exchanges": 0,
+                "inductions_given": 0
+            },
+            "html": "<section class=\"phyrian-profile-card\" data-phyrian-card=\"imprinted\" aria-label=\"Phyrian Strains\" style=\"display:flex;flex-wrap:wrap;align-items:center;gap:.35rem .85rem;width:100%;box-sizing:border-box;margin:.85rem 0 0;padding:.5rem .7rem;border-radius:12px;border:1px solid color-mix(in srgb, #5ee7ff 28%, var(--border));background:linear-gradient(160deg, rgba(94,231,255,.05), transparent 55%), var(--panel);color:var(--muted);font-size:.85rem;line-height:1.35;overflow-wrap:anywhere\"><span class=\"phyrian-profile-card-title\" style=\"color:var(--text);font-weight:650;letter-spacing:.04em;text-transform:uppercase;font-size:.72rem\">Phyrian Strains</span><span class=\"phyrian-badge\">Imprinted</span><span class=\"who\">Rose Static</span><span>Fading</span><span>Gen <b>3</b></span><span>Level <b>22</b>/80</span><span>Rank <b>Colony Node</b></span><span>Resonance <b>41</b>/100</span><span>Decay <b>−7</b>/day</span><span>Lineage <b>2</b></span><a href=\"?view=phyrian&amp;page=dossier&amp;owner=7\" style=\"margin-left:auto;color:var(--primary);text-decoration:none\">Readout</a></section>\n"
+        },
+        {
+            "id": "nulls_use_defaults",
+            "owner": 7,
+            "is_self": false,
+            "bridge": null,
+            "row": {
+                "status": "imprinted",
+                "strain": "Ash Gene",
+                "resonance": null,
+                "generation": null,
+                "level": null
+            },
+            "html": "<section class=\"phyrian-profile-card\" data-phyrian-card=\"imprinted\" aria-label=\"Phyrian Strains\" style=\"display:flex;flex-wrap:wrap;align-items:center;gap:.35rem .85rem;width:100%;box-sizing:border-box;margin:.85rem 0 0;padding:.5rem .7rem;border-radius:12px;border:1px solid color-mix(in srgb, #5ee7ff 28%, var(--border));background:linear-gradient(160deg, rgba(94,231,255,.05), transparent 55%), var(--panel);color:var(--muted);font-size:.85rem;line-height:1.35;overflow-wrap:anywhere\"><span class=\"phyrian-profile-card-title\" style=\"color:var(--text);font-weight:650;letter-spacing:.04em;text-transform:uppercase;font-size:.72rem\">Phyrian Strains</span><span class=\"phyrian-badge\">Imprinted</span><span class=\"who\">Ash Gene</span><span>Dormant</span><span>Gen <b>1</b></span><span>Level <b>1</b>/80</span><span>Rank <b>Newly Marked</b></span><span>Resonance <b>0</b>/100</span><span>Decay <b>−5</b>/day</span><a href=\"?view=phyrian&amp;page=dossier&amp;owner=7\" style=\"margin-left:auto;color:var(--primary);text-decoration:none\">Readout</a></section>\n"
+        },
+        {
+            "id": "strain_escaped",
+            "owner": 7,
+            "is_self": false,
+            "bridge": null,
+            "row": {
+                "strain": "Cosmic <Alien> & \"Kin\" 'x'",
+                "status": "imprinted",
+                "resonance": 60,
+                "generation": 2,
+                "level": 20,
+                "banked_resonance": 0,
+                "resonance_exchanges": 0,
+                "inductions_given": 0,
+                "lineage_depth": null,
+                "daily_resonance_decay": 5
+            },
+            "html": "<section class=\"phyrian-profile-card\" data-phyrian-card=\"imprinted\" aria-label=\"Phyrian Strains\" style=\"display:flex;flex-wrap:wrap;align-items:center;gap:.35rem .85rem;width:100%;box-sizing:border-box;margin:.85rem 0 0;padding:.5rem .7rem;border-radius:12px;border:1px solid color-mix(in srgb, #5ee7ff 28%, var(--border));background:linear-gradient(160deg, rgba(94,231,255,.05), transparent 55%), var(--panel);color:var(--muted);font-size:.85rem;line-height:1.35;overflow-wrap:anywhere\"><span class=\"phyrian-profile-card-title\" style=\"color:var(--text);font-weight:650;letter-spacing:.04em;text-transform:uppercase;font-size:.72rem\">Phyrian Strains</span><span class=\"phyrian-badge\">Imprinted</span><span class=\"who\">Cosmic &lt;Alien&gt; &amp; &quot;Kin&quot; &#039;x&#039;</span><span>Stable</span><span>Gen <b>2</b></span><span>Level <b>20</b>/80</span><span>Rank <b>Colony Node</b></span><span>Resonance <b>60</b>/100</span><span>Decay <b>−5</b>/day</span><a href=\"?view=phyrian&amp;page=dossier&amp;owner=7\" style=\"margin-left:auto;color:var(--primary);text-decoration:none\">Readout</a></section>\n"
+        },
+        {
+            "id": "unicode_strain",
+            "owner": 7,
+            "is_self": true,
+            "bridge": null,
+            "row": {
+                "strain": "Violet Drift ニュース ü",
+                "status": "imprinted",
+                "resonance": 60,
+                "generation": 2,
+                "level": 20,
+                "banked_resonance": 0,
+                "resonance_exchanges": 0,
+                "inductions_given": 0,
+                "lineage_depth": null,
+                "daily_resonance_decay": 5
+            },
+            "html": "<section class=\"phyrian-profile-card\" data-phyrian-card=\"imprinted\" aria-label=\"Phyrian Strains\" style=\"display:flex;flex-wrap:wrap;align-items:center;gap:.35rem .85rem;width:100%;box-sizing:border-box;margin:.85rem 0 0;padding:.5rem .7rem;border-radius:12px;border:1px solid color-mix(in srgb, #5ee7ff 28%, var(--border));background:linear-gradient(160deg, rgba(94,231,255,.05), transparent 55%), var(--panel);color:var(--muted);font-size:.85rem;line-height:1.35;overflow-wrap:anywhere\"><span class=\"phyrian-profile-card-title\" style=\"color:var(--text);font-weight:650;letter-spacing:.04em;text-transform:uppercase;font-size:.72rem\">Phyrian Strains</span><span class=\"phyrian-badge\">Imprinted</span><span class=\"who\">Violet Drift ニュース ü</span><span>Stable</span><span>Gen <b>2</b></span><span>Level <b>20</b>/80</span><span>Rank <b>Colony Node</b></span><span>Resonance <b>60</b>/100</span><span>Decay <b>−5</b>/day</span><a href=\"?view=phyrian\" style=\"margin-left:auto;color:var(--primary);text-decoration:none\">Open game</a></section>\n"
+        },
+        {
+            "id": "origin_owner",
+            "owner": 1,
+            "is_self": false,
+            "bridge": {
+                "owner_user_id": 5,
+                "status": "verified",
+                "avatar_name": "val3r1e flux",
+                "strain_snapshot": "Rose Static"
+            },
+            "row": {
+                "strain": "Phyrian",
+                "generation": 3,
+                "level": 80,
+                "resonance": 93,
+                "status": "imprinted",
+                "banked_resonance": 0,
+                "resonance_exchanges": 0,
+                "inductions_given": 0,
+                "lineage_depth": null,
+                "daily_resonance_decay": 5
+            },
+            "html": "<section class=\"phyrian-profile-card\" data-phyrian-card=\"imprinted\" aria-label=\"Phyrian Strains\" style=\"display:flex;flex-wrap:wrap;align-items:center;gap:.35rem .85rem;width:100%;box-sizing:border-box;margin:.85rem 0 0;padding:.5rem .7rem;border-radius:12px;border:1px solid color-mix(in srgb, #5ee7ff 28%, var(--border));background:linear-gradient(160deg, rgba(94,231,255,.05), transparent 55%), var(--panel);color:var(--muted);font-size:.85rem;line-height:1.35;overflow-wrap:anywhere\"><span class=\"phyrian-profile-card-title\" style=\"color:var(--text);font-weight:650;letter-spacing:.04em;text-transform:uppercase;font-size:.72rem\">Phyrian Strains</span><span class=\"phyrian-badge\">Imprinted</span><span class=\"phyrian-badge phyrian-badge--origin\">Origin</span><span class=\"who\">Phyrian</span><span>Stable</span><span>Gen <b>3</b></span><span>Level <b>80</b>/80</span><span>Rank <b>Phyrian Origin</b></span><span>Resonance <b>93</b>/100</span><span>Decay <b>−5</b>/day</span><span>OpenSim linked as <b>val3r1e flux</b></span><a href=\"?view=phyrian&amp;page=dossier&amp;owner=1\" style=\"margin-left:auto;color:var(--primary);text-decoration:none\">Readout</a></section>\n"
+        },
+        {
+            "id": "origin_self",
+            "owner": 1,
+            "is_self": true,
+            "bridge": {
+                "owner_user_id": 5,
+                "status": "verified",
+                "avatar_name": "val3r1e flux",
+                "strain_snapshot": "Rose Static"
+            },
+            "row": {
+                "strain": "Phyrian",
+                "level": 80,
+                "status": "imprinted",
+                "resonance": 60,
+                "generation": 2,
+                "banked_resonance": 0,
+                "resonance_exchanges": 0,
+                "inductions_given": 0,
+                "lineage_depth": null,
+                "daily_resonance_decay": 5
+            },
+            "html": "<section class=\"phyrian-profile-card\" data-phyrian-card=\"imprinted\" aria-label=\"Phyrian Strains\" style=\"display:flex;flex-wrap:wrap;align-items:center;gap:.35rem .85rem;width:100%;box-sizing:border-box;margin:.85rem 0 0;padding:.5rem .7rem;border-radius:12px;border:1px solid color-mix(in srgb, #5ee7ff 28%, var(--border));background:linear-gradient(160deg, rgba(94,231,255,.05), transparent 55%), var(--panel);color:var(--muted);font-size:.85rem;line-height:1.35;overflow-wrap:anywhere\"><span class=\"phyrian-profile-card-title\" style=\"color:var(--text);font-weight:650;letter-spacing:.04em;text-transform:uppercase;font-size:.72rem\">Phyrian Strains</span><span class=\"phyrian-badge\">Imprinted</span><span class=\"phyrian-badge phyrian-badge--origin\">Origin</span><span class=\"who\">Phyrian</span><span>Stable</span><span>Gen <b>2</b></span><span>Level <b>80</b>/80</span><span>Rank <b>Phyrian Origin</b></span><span>Resonance <b>60</b>/100</span><span>Decay <b>−5</b>/day</span><span>OpenSim linked as <b>val3r1e flux</b></span><a href=\"?view=phyrian\" style=\"margin-left:auto;color:var(--primary);text-decoration:none\">Open game</a></section>\n"
+        },
+        {
+            "id": "origin_unmarked",
+            "owner": 1,
+            "is_self": true,
+            "bridge": null,
+            "row": {
+                "status": "unknown",
+                "strain": "",
+                "resonance": 60,
+                "generation": 2,
+                "level": 20,
+                "banked_resonance": 0,
+                "resonance_exchanges": 0,
+                "inductions_given": 0,
+                "lineage_depth": null,
+                "daily_resonance_decay": 5
+            },
+            "html": "<section class=\"phyrian-profile-card\" data-phyrian-card=\"unmarked\" aria-label=\"Phyrian Strains\" style=\"display:flex;flex-wrap:wrap;align-items:center;gap:.35rem .85rem;width:100%;box-sizing:border-box;margin:.85rem 0 0;padding:.5rem .7rem;border-radius:12px;border:1px solid color-mix(in srgb, #5ee7ff 28%, var(--border));background:linear-gradient(160deg, rgba(94,231,255,.05), transparent 55%), var(--panel);color:var(--muted);font-size:.85rem;line-height:1.35;overflow-wrap:anywhere\"><span class=\"phyrian-profile-card-title\" style=\"color:var(--text);font-weight:650;letter-spacing:.04em;text-transform:uppercase;font-size:.72rem\">Phyrian Strains</span><span class=\"phyrian-badge phyrian-badge--unknown\">Unmarked</span><span>Not imprinted yet.</span><span>Start playing to receive a strain.</span><span>Level <b>20</b></span><span>Resonance <b>60</b>/100</span><a href=\"?view=phyrian\" style=\"margin-left:auto;color:var(--primary);text-decoration:none\">Start playing</a></section>\n"
+        },
+        {
+            "id": "linked_special_chars",
+            "owner": 7,
+            "is_self": false,
+            "bridge": {
+                "owner_user_id": 5,
+                "status": "verified",
+                "avatar_name": "  <b>\"Nova\" & 'Bee'</b>  ",
+                "strain_snapshot": "Rose Static"
+            },
+            "row": {
+                "status": "imprinted",
+                "strain": "Rose Static",
+                "resonance": 60,
+                "generation": 2,
+                "level": 20,
+                "banked_resonance": 0,
+                "resonance_exchanges": 0,
+                "inductions_given": 0,
+                "lineage_depth": null,
+                "daily_resonance_decay": 5
+            },
+            "html": "<section class=\"phyrian-profile-card\" data-phyrian-card=\"imprinted\" aria-label=\"Phyrian Strains\" style=\"display:flex;flex-wrap:wrap;align-items:center;gap:.35rem .85rem;width:100%;box-sizing:border-box;margin:.85rem 0 0;padding:.5rem .7rem;border-radius:12px;border:1px solid color-mix(in srgb, #5ee7ff 28%, var(--border));background:linear-gradient(160deg, rgba(94,231,255,.05), transparent 55%), var(--panel);color:var(--muted);font-size:.85rem;line-height:1.35;overflow-wrap:anywhere\"><span class=\"phyrian-profile-card-title\" style=\"color:var(--text);font-weight:650;letter-spacing:.04em;text-transform:uppercase;font-size:.72rem\">Phyrian Strains</span><span class=\"phyrian-badge\">Imprinted</span><span class=\"who\">Rose Static</span><span>Stable</span><span>Gen <b>2</b></span><span>Level <b>20</b>/80</span><span>Rank <b>Colony Node</b></span><span>Resonance <b>60</b>/100</span><span>Decay <b>−5</b>/day</span><span>OpenSim linked as <b>&lt;b&gt;&quot;Nova&quot; &amp; &#039;Bee&#039;&lt;/b&gt;</b></span><a href=\"?view=phyrian&amp;page=dossier&amp;owner=7\" style=\"margin-left:auto;color:var(--primary);text-decoration:none\">Readout</a></section>\n"
+        },
+        {
+            "id": "linked_blank_name",
+            "owner": 7,
+            "is_self": true,
+            "bridge": {
+                "owner_user_id": 5,
+                "status": "verified",
+                "avatar_name": "   ",
+                "strain_snapshot": "Rose Static"
+            },
+            "row": {
+                "status": "unknown",
+                "strain": "",
+                "resonance": 60,
+                "generation": 2,
+                "level": 20,
+                "banked_resonance": 0,
+                "resonance_exchanges": 0,
+                "inductions_given": 0,
+                "lineage_depth": null,
+                "daily_resonance_decay": 5
+            },
+            "html": "<section class=\"phyrian-profile-card\" data-phyrian-card=\"unmarked\" aria-label=\"Phyrian Strains\" style=\"display:flex;flex-wrap:wrap;align-items:center;gap:.35rem .85rem;width:100%;box-sizing:border-box;margin:.85rem 0 0;padding:.5rem .7rem;border-radius:12px;border:1px solid color-mix(in srgb, #5ee7ff 28%, var(--border));background:linear-gradient(160deg, rgba(94,231,255,.05), transparent 55%), var(--panel);color:var(--muted);font-size:.85rem;line-height:1.35;overflow-wrap:anywhere\"><span class=\"phyrian-profile-card-title\" style=\"color:var(--text);font-weight:650;letter-spacing:.04em;text-transform:uppercase;font-size:.72rem\">Phyrian Strains</span><span class=\"phyrian-badge phyrian-badge--unknown\">Unmarked</span><span>Not imprinted yet.</span><span>Start playing to receive a strain.</span><span>Level <b>20</b></span><span>Resonance <b>60</b>/100</span><span>OpenSim linked</span><a href=\"?view=phyrian\" style=\"margin-left:auto;color:var(--primary);text-decoration:none\">Start playing</a></section>\n"
+        },
+        {
+            "id": "linked_null_name",
+            "owner": 7,
+            "is_self": false,
+            "bridge": {
+                "owner_user_id": 5,
+                "status": "verified",
+                "avatar_name": null,
+                "strain_snapshot": "Rose Static"
+            },
+            "row": null,
+            "html": "<section class=\"phyrian-profile-card\" data-phyrian-card=\"unmarked\" aria-label=\"Phyrian Strains\" style=\"display:flex;flex-wrap:wrap;align-items:center;gap:.35rem .85rem;width:100%;box-sizing:border-box;margin:.85rem 0 0;padding:.5rem .7rem;border-radius:12px;border:1px solid color-mix(in srgb, #5ee7ff 28%, var(--border));background:linear-gradient(160deg, rgba(94,231,255,.05), transparent 55%), var(--panel);color:var(--muted);font-size:.85rem;line-height:1.35;overflow-wrap:anywhere\"><span class=\"phyrian-profile-card-title\" style=\"color:var(--text);font-weight:650;letter-spacing:.04em;text-transform:uppercase;font-size:.72rem\">Phyrian Strains</span><span class=\"phyrian-badge phyrian-badge--unknown\">Unmarked</span><span>Not imprinted yet.</span><span>OpenSim linked</span></section>\n"
+        }
+    ],
+    "cache": [
+        {
+            "id": "found_row",
+            "cached": "{\"found\":true,\"row\":{\"status\":\"imprinted\",\"strain\":\"Ash Gene\",\"resonance\":40,\"generation\":2,\"level\":9,\"banked_resonance\":0,\"resonance_exchanges\":0,\"inductions_given\":0,\"lineage_depth\":null,\"daily_resonance_decay\":5}}",
+            "hit": true,
+            "row": {
+                "status": "imprinted",
+                "strain": "Ash Gene",
+                "resonance": 40,
+                "generation": 2,
+                "level": 9,
+                "banked_resonance": 0,
+                "resonance_exchanges": 0,
+                "inductions_given": 0,
+                "lineage_depth": null,
+                "daily_resonance_decay": 5
+            }
+        },
+        {
+            "id": "found_false",
+            "cached": "{\"found\":false,\"row\":null}",
+            "hit": true,
+            "row": null
+        },
+        {
+            "id": "found_zero_with_row",
+            "cached": "{\"found\":0,\"row\":{\"status\":\"imprinted\",\"strain\":\"Ash Gene\"}}",
+            "hit": true,
+            "row": null
+        },
+        {
+            "id": "found_string_zero",
+            "cached": "{\"found\":\"0\",\"row\":{\"status\":\"imprinted\",\"strain\":\"Ash Gene\"}}",
+            "hit": true,
+            "row": null
+        },
+        {
+            "id": "found_null",
+            "cached": "{\"found\":null}",
+            "hit": true,
+            "row": null
+        },
+        {
+            "id": "found_row_string",
+            "cached": "{\"found\":true,\"row\":\"imprinted\"}",
+            "hit": true,
+            "row": null
+        },
+        {
+            "id": "found_row_list",
+            "cached": "{\"found\":1,\"row\":[]}",
+            "hit": true,
+            "row": {
+                "status": "",
+                "strain": "",
+                "resonance": 0,
+                "generation": 1,
+                "level": 1,
+                "banked_resonance": 0,
+                "resonance_exchanges": 0,
+                "inductions_given": 0,
+                "lineage_depth": null,
+                "daily_resonance_decay": 5
+            }
+        },
+        {
+            "id": "found_row_partial",
+            "cached": "{\"found\":\"yes\",\"row\":{\"status\":\"imprinted\",\"strain\":\"Grave Neon\",\"level\":\"61\"}}",
+            "hit": true,
+            "row": {
+                "status": "imprinted",
+                "strain": "Grave Neon",
+                "resonance": 0,
+                "generation": 1,
+                "level": 61,
+                "banked_resonance": 0,
+                "resonance_exchanges": 0,
+                "inductions_given": 0,
+                "lineage_depth": null,
+                "daily_resonance_decay": 5
+            }
+        },
+        {
+            "id": "no_found_key",
+            "cached": "{\"row\":{\"status\":\"imprinted\",\"strain\":\"Ash Gene\"}}",
+            "hit": false,
+            "row": null
+        },
+        {
+            "id": "list_value",
+            "cached": "[\"found\"]",
+            "hit": false,
+            "row": null
+        },
+        {
+            "id": "scalar_value",
+            "cached": "5",
+            "hit": false,
+            "row": null
+        },
+        {
+            "id": "not_json",
+            "cached": "found",
+            "hit": false,
+            "row": null
+        }
+    ],
+    "flags": [
+        {
+            "raw": null,
+            "enabled": false
+        },
+        {
+            "raw": "",
+            "enabled": false
+        },
+        {
+            "raw": "1",
+            "enabled": true
+        },
+        {
+            "raw": "true",
+            "enabled": true
+        },
+        {
+            "raw": "TRUE",
+            "enabled": true
+        },
+        {
+            "raw": "yes",
+            "enabled": true
+        },
+        {
+            "raw": "On",
+            "enabled": true
+        },
+        {
+            "raw": " on\n",
+            "enabled": true
+        },
+        {
+            "raw": "\t1 ",
+            "enabled": true
+        },
+        {
+            "raw": "0",
+            "enabled": false
+        },
+        {
+            "raw": "false",
+            "enabled": false
+        },
+        {
+            "raw": "off",
+            "enabled": false
+        },
+        {
+            "raw": "no",
+            "enabled": false
+        },
+        {
+            "raw": "enabled",
+            "enabled": false
+        },
+        {
+            "raw": "1 1",
+            "enabled": false
+        },
+        {
+            "raw": "y",
+            "enabled": false
+        }
+    ]
+}

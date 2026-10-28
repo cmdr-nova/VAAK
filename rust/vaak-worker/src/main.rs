@@ -55,6 +55,7 @@ mod profile_raw;
 mod profile_raw_facts;
 mod profile_guest_facts;
 mod phyrian;
+mod phyrian_card;
 mod ranked;
 mod ranked_warm;
 mod recommendations;

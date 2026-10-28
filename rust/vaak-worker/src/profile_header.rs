@@ -29,7 +29,7 @@ pub(crate) struct HeaderFacts{
  requested_tab:String,effective_tab:String,from:String,blog_slug:String,tab_href:String,
  following:bool,follows_you:bool,requested:bool,locked:bool,post_subscription:bool,
  moderation:ModerationContext,counts:HeaderCounts,name:String,bio:String,avatar:Option<String>,banner:Option<String>,fallback_avatar:String,
- emoji:HashMap<String,String>,fields:Vec<Value>,badges:Vec<String>,now_playing:String,sl:Option<Value>,wow:Option<Value>,bridge:Option<Value>,bsky_handle:String,
+ emoji:HashMap<String,String>,fields:Vec<Value>,badges:Vec<String>,now_playing:String,phyrian_card:String,sl:Option<Value>,wow:Option<Value>,bridge:Option<Value>,bsky_handle:String,
  pin_rows:Vec<Value>,featured_rows:Vec<Value>,blog_rows:Vec<Value>,blog_post:Option<Value>,blog_offset:i64,
  dependencies:Value,
 }
@@ -104,6 +104,20 @@ fn column_prefilter(condition:&str,columns:&HashMap<String,String>)->Option<Stri
 async fn optional_rows(db:&Client,table:&str,sql:&str,args:&[&(dyn tokio_postgres::types::ToSql+Sync)])->Result<Vec<Value>>{
  if !exists_table(db,table).await?{return Ok(vec![])}Ok(db.query(sql,args).await?.iter().map(|r|r.get(0)).collect())
 }
+/// The card row as ap_phyrian_profile_card_snapshot reads it (None: no player row).
+/// PHP's shared Redis value first, which PHP also serves for its whole TTL, so a
+/// hit may trail the row by up to 60s on both sides; a Redis error is a miss.
+/// On a miss, the primary-key read (a header dependency while the card is on)
+/// is stored back in PHP's shape. PHP migrates the table on every request, so a
+/// missing table or column here is a database PHP would paint differently.
+async fn phyrian_card_row(db:&Client,cfg:Option<&crate::config::Config>,owner:i64)->Result<Option<Value>>{
+ if owner<1{return Ok(None)}let key=crate::phyrian_card::cache_key(owner);
+ if let Some(cfg)=cfg{if let Some(hit)=cache::read_json(cfg,&key).await.map(|v|crate::phyrian_card::shared_row(&v)).transpose()?.flatten(){return Ok(hit)}}
+ let Some(columns)=table_shapes(db,&["phyrian_players"]).await?.remove(0)else{bail!("PHP fallback: phyrian_players is absent")};
+ if !crate::phyrian_card::COLUMNS.iter().all(|c|columns.contains_key(*c)){bail!("PHP fallback: phyrian_players columns are absent")}
+ let row=db.query_opt(crate::phyrian_card::PLAYER_SQL,&[&owner]).await?.map(|r|crate::phyrian_card::normalize(&r.get::<_,Value>(0))).transpose()?;
+ if let Some(cfg)=cfg{cache::write_json(cfg,&key,&crate::phyrian_card::shared_value(row.as_ref()),crate::phyrian_card::TTL).await;}Ok(row)
+}
 async fn supporter_awarded(db:&Client,key:&str)->Result<bool>{
  if !exists_table(db,"ap_supporter_codes").await?{return Ok(false)}
  Ok(db.query_one("SELECT EXISTS(SELECT 1 FROM ap_supporter_codes c JOIN ap_users u ON u.id=c.used_by WHERE u.actor_key=$1 AND u.disabled_at IS NULL AND c.used_at IS NOT NULL)",&[&key]).await?.get(0))
@@ -126,11 +140,13 @@ const DEPENDENCY_TABLES:[(&str,&str);15]=[
   ("phyrian_bridge_links","j->>'owner_user_id'=ANY($2)"),("bsky_sessions","j->>'owner_user_id'=ANY($2) OR j->>'owner_user_id' IN(SELECT id::text FROM ap_users WHERE lower(actor_key)=$3 OR lower(username)=$3)"),
   ("bsky_graph_sync","(j->>'owner_user_id'=ANY($2) OR j->>'owner_user_id' IN(SELECT id::text FROM ap_users WHERE lower(actor_key)=$3 OR lower(username)=$3)) AND j->>'kind'='meta' AND j->>'target_did'='graph_sync_v1'"),
 ];
+// Only while VAAK_PHYRIAN_PROFILE_CARD is on (the card owner is one of $2).
+const PHYRIAN_DEPENDENCY:(&str,&str)=("phyrian_players","j->>'owner_user_id'=ANY($2)");
 async fn header_dependencies(db:&Client,key:&str,actor:&str,owner:i64,viewer:&str,target:i64,blocked:bool)->Result<Value>{crate::profile_bridge::timed(crate::profile_bridge::Stage::HeaderDeps,header_dependencies_current(db,key,actor,owner,viewer,target,blocked)).await}
 async fn header_dependencies_current(db:&Client,key:&str,actor:&str,owner:i64,viewer:&str,target:i64,blocked:bool)->Result<Value>{
  let aliases=vec![actor.trim_end_matches('/').to_owned(),format!("{}/",actor.trim_end_matches('/')),viewer.trim_end_matches('/').to_owned(),format!("{}/",viewer.trim_end_matches('/'))];
  let owners=vec![owner.to_string(),target.to_string()];let mut result=serde_json::Map::new();
- let tables=DEPENDENCY_TABLES.into_iter().filter(|(table,_)|!blocked||matches!(*table,"ap_users"|"ap_user_blocks"|"ap_mutes"|"ap_deprioritized_actors")).collect::<Vec<_>>();
+ let tables=DEPENDENCY_TABLES.into_iter().filter(|(table,_)|!blocked||matches!(*table,"ap_users"|"ap_user_blocks"|"ap_mutes"|"ap_deprioritized_actors")).chain((!blocked&&crate::phyrian_card::enabled()).then_some(PHYRIAN_DEPENDENCY)).collect::<Vec<_>>();
  let shapes=table_shapes(db,&tables.iter().map(|(table,_)|*table).collect::<Vec<_>>()).await?;let mut parts=Vec::new();
  for((table,condition),shape)in tables.iter().zip(&shapes){let Some(columns)=shape else{continue};
   // Bind both arrays explicitly even where a scoped predicate needs only one.
@@ -138,7 +154,8 @@ async fn header_dependencies_current(db:&Client,key:&str,actor:&str,owner:i64,vi
   // conversion to the same two account IDs first so its existing partial
   // used_by index can avoid scanning every issued reward. Preserve the bound
   // text-array contract used by the other dependency predicates.
-  let scoped=if *table=="ap_supporter_codes"{" WHERE used_by=ANY($2::text[]::bigint[]) AND used_at IS NOT NULL".to_owned()}else{column_prefilter(condition,columns).map(|p|format!(" WHERE ({p})")).unwrap_or_default()};
+  // The player digest is a primary-key read for the same two IDs.
+  let scoped=if *table=="ap_supporter_codes"{" WHERE used_by=ANY($2::text[]::bigint[]) AND used_at IS NOT NULL".to_owned()}else if *table=="phyrian_players"&&columns.get("owner_user_id").is_some_and(|t|matches!(t.as_str(),"integer"|"bigint")){" WHERE owner_user_id=ANY($2::text[]::bigint[])".to_owned()}else{column_prefilter(condition,columns).map(|p|format!(" WHERE ({p})")).unwrap_or_default()};
   parts.push(format!("(SELECT jsonb_build_object('count',COUNT(*),'digest',md5(COALESCE(string_agg(j::text,'' ORDER BY j::text),''))) FROM (SELECT to_jsonb(t) j FROM {table} t{scoped}) q WHERE ($1::text[] IS NOT NULL AND $2::text[] IS NOT NULL AND $3::text IS NOT NULL) AND ({condition}))"));
  }
  // One statement per check: each table's digest is the same subquery as before.
@@ -206,17 +223,20 @@ async fn resolve_local(db:&Client,key:&str,actor:&str,owner:i64,owner_actor:Stri
  let link_sql=[("ap_sl_links","l",""),("ap_wow_links","l",""),("phyrian_bridge_links","l"," AND l.status='verified' AND l.unlinked_at IS NULL")].map(|(table,alias,extra)|(table,format!("SELECT to_jsonb({alias}) FROM {table} {alias} INNER JOIN ap_users u ON u.id=l.owner_user_id WHERE u.actor_key=$1 AND u.disabled_at IS NULL{extra} LIMIT 1")));
  // The ListenBrainz snapshot rides in the same pipelined batch: one indexed
  // join, stored by the cron worker. Volatile presentation, so it is not a
- // header dependency (like the counts).
- let(badges,emoji_rows,sl,wow,bridge,fallback_avatar,listen)=tokio::join!(authorized_badges(db,key,&profile["profile_badges"]),db.query("SELECT shortcode,url FROM remote_custom_emojis WHERE host='mkultra.monster'",&[]),async{optional_rows(db,link_sql[0].0,&link_sql[0].1,&[&key]).await},async{optional_rows(db,link_sql[1].0,&link_sql[1].1,&[&key]).await},async{optional_rows(db,link_sql[2].0,&link_sql[2].1,&[&key]).await},facts::avatar(db,&Value::Null,actor),async{optional_rows(db,"ap_listenbrainz_links",crate::listenbrainz::ROW_FOR_ACTOR_KEY_SQL,&[&key]).await});
+ // header dependency (like the counts). The Phyrian card row rides along too.
+ let(card_on,card_owner)=(crate::phyrian_card::enabled(),crate::phyrian_card::owner(is_own,owner,target_id));
+ let(badges,emoji_rows,sl,wow,bridge,fallback_avatar,listen,phyrian)=tokio::join!(authorized_badges(db,key,&profile["profile_badges"]),db.query("SELECT shortcode,url FROM remote_custom_emojis WHERE host='mkultra.monster'",&[]),async{optional_rows(db,link_sql[0].0,&link_sql[0].1,&[&key]).await},async{optional_rows(db,link_sql[1].0,&link_sql[1].1,&[&key]).await},async{optional_rows(db,link_sql[2].0,&link_sql[2].1,&[&key]).await},facts::avatar(db,&Value::Null,actor),async{optional_rows(db,"ap_listenbrainz_links",crate::listenbrainz::ROW_FOR_ACTOR_KEY_SQL,&[&key]).await},async{if card_on{phyrian_card_row(db,cfg,card_owner).await.map(Some)}else{Ok(None)}});
  let badges=badges?;let now_playing=crate::listenbrainz::profile_html(listen?.first().and_then(|row|crate::listenbrainz::display(row,chrono::Utc::now().timestamp())).as_ref());
  let mut emoji=HashMap::new();for row in emoji_rows?{let k:String=row.get(0);let u:String=row.get(1);if !k.is_empty()&&u.starts_with("https://"){emoji.insert(k,u);}}
  let mut links=Vec::new();for rows in[sl,wow,bridge]{links.push(rows?.into_iter().next());}
+ // ap_phyrian_profile_card_markup(true,$rpCardOwner,[is_self,opensim_linked,avatar_name]); '' while off.
+ let phyrian_card=match phyrian?{Some(row)=>crate::phyrian_card::html(row.as_ref(),card_owner,is_own,crate::phyrian_card::linked_avatar(links[2].as_ref())?.as_deref(),crate::phyrian_card::origin_owner())?,None=>String::new()};
  let tab_href=format!("/vaak/users/{}{}tab=",q(key),if from.is_empty(){"?".into()}else{format!("?from={}&",form_query(&from))});
  let combined=cache::combined(db,key,counts.followers,counts.following,warm.is_some()).await?;counts.followers=combined.followers;counts.following=combined.following;
  let locked=card::boolean(&profile,"manually_approves");let bio=crate::library::body::html_to_plain(s(&profile,"summary"));
  let fallback_avatar=fallback_avatar?;
  anyhow::ensure!(dependencies==header_dependencies(db,key,actor,owner,&owner_actor,target_id,false).await?,"header dependencies changed during enrichment");
- Ok(HeaderFacts{dependencies,actor:actor.into(),key:key.into(),profile,current_profile,owner,owner_actor,csrf:csrf.into(),guest,is_own,requested_tab,effective_tab,from,blog_slug,tab_href,following,follows_you,requested,locked,post_subscription,moderation,counts,name,bio,avatar,banner,fallback_avatar,emoji,fields,badges,now_playing,sl:links[0].take(),wow:links[1].take(),bridge:links[2].take(),bsky_handle:combined.handle,pin_rows,featured_rows,blog_rows,blog_post,blog_offset})
+ Ok(HeaderFacts{dependencies,actor:actor.into(),key:key.into(),profile,current_profile,owner,owner_actor,csrf:csrf.into(),guest,is_own,requested_tab,effective_tab,from,blog_slug,tab_href,following,follows_you,requested,locked,post_subscription,moderation,counts,name,bio,avatar,banner,fallback_avatar,emoji,fields,badges,now_playing,phyrian_card,sl:links[0].take(),wow:links[1].take(),bridge:links[2].take(),bsky_handle:combined.handle,pin_rows,featured_rows,blog_rows,blog_post,blog_offset})
 }
 pub(crate) struct BlockedHeaderFacts{actions:HeaderFacts,personal:bool,server:bool}
 impl BlockedHeaderFacts{pub(crate) async fn require_actions_current(&self,db:&Client)->Result<()>{self.actions.require_secondary_current(db).await}}
@@ -238,7 +258,7 @@ async fn resolve_blocked_local(db:&Client,key:&str,actor:&str,owner:i64,owner_ac
  // Cache-only identity; denied roots never enter profile/emoji/count/preview or warming helpers.
  let avatar=facts::avatar(db,&Value::Null,actor).await?;
  anyhow::ensure!(dependencies==header_dependencies(db,key,actor,owner,&owner_actor,card::integer(&target,"id"),true).await?,"blocked action dependencies changed during presentation");
- let actions=HeaderFacts{dependencies,actor:actor.into(),key:key.into(),profile:Value::Null,current_profile:Value::Null,owner,owner_actor,csrf:csrf.into(),guest,is_own,requested_tab:String::new(),effective_tab:String::new(),from,blog_slug:String::new(),tab_href:String::new(),following:false,follows_you:false,requested:false,locked:false,post_subscription:false,moderation,counts:HeaderCounts::default(),name:String::new(),bio:String::new(),avatar:None,banner:None,fallback_avatar:avatar,emoji:HashMap::new(),fields:vec![],badges:vec![],now_playing:String::new(),sl:None,wow:None,bridge:None,bsky_handle:String::new(),pin_rows:vec![],featured_rows:vec![],blog_rows:vec![],blog_post:None,blog_offset:0};
+ let actions=HeaderFacts{dependencies,actor:actor.into(),key:key.into(),profile:Value::Null,current_profile:Value::Null,owner,owner_actor,csrf:csrf.into(),guest,is_own,requested_tab:String::new(),effective_tab:String::new(),from,blog_slug:String::new(),tab_href:String::new(),following:false,follows_you:false,requested:false,locked:false,post_subscription:false,moderation,counts:HeaderCounts::default(),name:String::new(),bio:String::new(),avatar:None,banner:None,fallback_avatar:avatar,emoji:HashMap::new(),fields:vec![],badges:vec![],now_playing:String::new(),phyrian_card:String::new(),sl:None,wow:None,bridge:None,bsky_handle:String::new(),pin_rows:vec![],featured_rows:vec![],blog_rows:vec![],blog_post:None,blog_offset:0};
  Ok(BlockedHeaderFacts{actions,personal,server})
 }
 pub(crate) fn render_blocked(token:&crate::profile_context::AdmittedBlockedProfileHeader)->Result<String>{render_blocked_core(token.facts())}
@@ -361,7 +381,7 @@ fn render_core(f:&HeaderFacts)->Result<String>{
  if f.guest{out.push_str(&guest_follow(f));}
  out.push_str(&if f.bio.is_empty(){"<div class=\"meta\" style=\"margin-top:.75rem\">No bio set.</div>".into()}else{format!("<div class=\"body\" style=\"margin-top:.75rem;white-space:pre-wrap\">{}</div>",h(&f.bio))});out.push_str(&world_html(f));out.push_str(&fields_html(&f.fields));
  if !f.badges.is_empty(){out.push_str("<div class=\"profile-badges\" aria-label=\"Profile badges\" style=\"display:flex;flex-wrap:wrap;gap:.35rem;margin-top:.65rem\">");for key in &f.badges{if let Some((_,label,emoji))=BADGES.iter().find(|b|b.0==key){out.push_str(&format!("<span class=\"tag\" title=\"{}\">{} {}</span>",h(label),h(emoji),h(label)));}}out.push_str("</div>");}
- out.push_str(&f.now_playing);
+ out.push_str(&f.now_playing);out.push_str(&f.phyrian_card);
  let c=&f.counts;let title=if f.bsky_handle.is_empty(){""}else{" title=\"Includes ActivityPub and connected Bluesky counts\""};out.push_str(&format!("<div class=\"remote-profile-stats\" aria-label=\"Profile stats\"><div><span class=\"n\">{}</span><span class=\"l\">Posts</span></div>",c.posts));
  for(label,n,key)in[("Following",c.following,"following"),("Followers",c.followers,"followers")]{out.push_str(&format!("<a href=\"{}\"{}{title}><span class=\"n\">{n}</span><span class=\"l\">{label}</span></a>",if f.is_own{format!("?view={key}")}else{format!("/users/{}/{key}",q(&f.key))},if f.is_own{""}else{" target=\"_blank\" rel=\"noopener noreferrer\""}));}out.push_str("</div><div class=\"tweet-actions remote-profile-actions\" style=\"flex-wrap:wrap;align-items:center;gap:.45rem\">");
  if !f.guest&&!f.is_own{
@@ -402,7 +422,7 @@ mod tests{
    following:false,follows_you:false,requested:false,locked:false,post_subscription:false,
    moderation:ModerationContext{is_self:false,is_local:false,is_local_admin:false,is_wafrn:false,is_admin:false,personal_block_id:None,muted:false,deprioritized:false,global_kind:String::new(),global_id:0},
    counts:HeaderCounts::default(),name:String::new(),bio:String::new(),avatar:None,banner:None,fallback_avatar:String::new(),
-   emoji:HashMap::new(),fields:vec![],badges:vec![],now_playing:String::new(),sl:None,wow:None,bridge:None,bsky_handle:String::new(),
+   emoji:HashMap::new(),fields:vec![],badges:vec![],now_playing:String::new(),phyrian_card:String::new(),sl:None,wow:None,bridge:None,bsky_handle:String::new(),
    pin_rows:vec![],featured_rows:vec![],blog_rows:vec![],blog_post:None,blog_offset:0,dependencies:Value::Null,
   }
  }
@@ -441,6 +461,48 @@ mod tests{
   assert!(source.contains("COALESCE(visibility, 'public') = 'public' AND raw_create_json LIKE"));
   assert!(source.contains("LIMIT 40 OFFSET $2"));
   assert!(!source.contains(&format!("{} DESC LIMIT 40\"", "id")));
+ }
+ #[test]
+ fn phyrian_card_sits_between_now_playing_and_stats(){
+  let mut f=blank_facts();f.key="ada".into();f.now_playing="<div class=\"now-playing\"></div>".into();
+  f.phyrian_card=crate::phyrian_card::html(None,0,false,None,Some(1)).unwrap();let html=render_core(&f).unwrap();
+  let(np,card,stats)=(html.find("now-playing").unwrap(),html.find("<section class=\"phyrian-profile-card\"").unwrap(),html.find("<div class=\"remote-profile-stats\"").unwrap());
+  assert!(np<card&&card<stats&&html[card..stats].ends_with("</section>\n"),"card is printed after now playing, right before the stats row");
+  f.phyrian_card=String::new();assert!(!render_core(&f).unwrap().contains("phyrian-profile-card"),"switch off prints no card");
+ }
+ #[tokio::test]
+ #[ignore="requires isolated local PostgreSQL (PHYRIAN_CARD_TEST_DATABASE_URL), optionally local Redis (PHYRIAN_CARD_TEST_REDIS); sets VAAK_PHYRIAN_PROFILE_CARD"]
+ async fn phyrian_card_current_sql()->Result<()>{
+  let db=crate::db::connect(&std::env::var("PHYRIAN_CARD_TEST_DATABASE_URL")?).await?;std::env::set_var("VAAK_PHYRIAN_PROFILE_CARD","on");
+  let cfg=std::env::var("PHYRIAN_CARD_TEST_REDIS").ok().map(|r|{anyhow::ensure!(r.starts_with("redis://127.0.0.1:"),"local Redis required");Ok(crate::config::Config{database_url:String::new(),redis_url:r.clone(),redis_queue_url:r,jetstream_state:Default::default(),default_owner_id:1,bsky_public_api:String::new(),notif_cache_dir:Default::default(),phyrian_mutation_token:None,phyrian_bridge_url:String::new(),phyrian_bridge_secret:None})}).transpose()?;
+  let key=crate::phyrian_card::cache_key(5);let fallback=|r:Result<Option<Value>>|r.is_err_and(|e|e.to_string().starts_with("PHP fallback:"));
+  for width in ["INTEGER","BIGINT"]{
+   let schema=format!("phyrian_card_{}_{}",width.to_ascii_lowercase(),std::process::id());db.batch_execute(&format!("CREATE SCHEMA {schema};SET search_path={schema};CREATE TABLE ap_users(id {width} PRIMARY KEY,username TEXT,actor_key TEXT,actor_id TEXT,disabled_at TEXT,is_admin INTEGER DEFAULT 0);INSERT INTO ap_users(id,username,actor_key,actor_id)VALUES(5,'ada','ada','https://mkultra.monster/users/ada')")).await?;
+   let deps=||header_dependencies(&db,"ada","https://mkultra.monster/users/ada",0,"",5,false);
+   let result:Result<()>=async{
+    if let Some(cfg)=&cfg{let mut c=crate::redis_util::connect(&cfg.redis_url).await?;let _:()=redis::cmd("DEL").arg(&key).query_async(&mut c).await?;}
+    assert!(fallback(phyrian_card_row(&db,None,5).await),"missing table is left to PHP, which migrates it");
+    db.batch_execute(&format!("CREATE TABLE phyrian_players(owner_user_id {width} PRIMARY KEY,actor_id TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'unknown',strain TEXT,resonance INTEGER NOT NULL DEFAULT 0,generation INTEGER NOT NULL DEFAULT 1,level INTEGER NOT NULL DEFAULT 1,updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())")).await?;
+    assert!(fallback(phyrian_card_row(&db,None,5).await),"missing columns are left to PHP");
+    db.batch_execute("ALTER TABLE phyrian_players ADD COLUMN banked_resonance INTEGER NOT NULL DEFAULT 0,ADD COLUMN resonance_exchanges INTEGER NOT NULL DEFAULT 0,ADD COLUMN inductions_given INTEGER NOT NULL DEFAULT 0,ADD COLUMN lineage_depth INTEGER,ADD COLUMN daily_resonance_decay INTEGER NOT NULL DEFAULT 5").await?;
+    assert_eq!(phyrian_card_row(&db,None,5).await?,None);assert_eq!(phyrian_card_row(&db,None,0).await?,None);
+    let before=deps().await?;assert!(before["phyrian_players"].is_object());
+    db.batch_execute("INSERT INTO phyrian_players(owner_user_id,actor_id,status,strain,resonance,generation,level,lineage_depth)VALUES(5,'https://mkultra.monster/users/ada','imprinted',' Rose Static ',40,2,21,3)").await?;
+    let row=phyrian_card_row(&db,None,5).await?.context("player row")?;
+    assert_eq!(row,json!({"status":"imprinted","strain":"Rose Static","resonance":40,"generation":2,"level":21,"banked_resonance":0,"resonance_exchanges":0,"inductions_given":0,"lineage_depth":3,"daily_resonance_decay":5}));
+    let after=deps().await?;assert_ne!(before,after,"a player change invalidates the header");
+    db.batch_execute("INSERT INTO phyrian_players(owner_user_id,actor_id)VALUES(9,'other')").await?;assert_eq!(after,deps().await?,"another player's row is not a dependency");
+    assert!(header_dependencies(&db,"ada","https://mkultra.monster/users/ada",0,"",5,true).await?.get("phyrian_players").is_none(),"blocked headers never read players");
+    if let Some(cfg)=&cfg{
+     assert_eq!(phyrian_card_row(&db,Some(cfg),5).await?,Some(row.clone()));assert_eq!(cache::read_json(cfg,&key).await,Some(crate::phyrian_card::shared_value(Some(&row))),"a miss stores PHP's shape");
+     db.batch_execute("UPDATE phyrian_players SET resonance=1 WHERE owner_user_id=5").await?;assert_eq!(phyrian_card_row(&db,Some(cfg),5).await?,Some(row.clone()),"the shared value is served for its TTL, as PHP does");
+     let mut c=crate::redis_util::connect(&cfg.redis_url).await?;let ttl:i64=redis::cmd("TTL").arg(&key).query_async(&mut c).await?;assert!((1..=60).contains(&ttl));let _:()=redis::cmd("DEL").arg(&key).query_async(&mut c).await?;
+    }
+    std::env::set_var("VAAK_PHYRIAN_PROFILE_CARD","0");let off=deps().await;std::env::set_var("VAAK_PHYRIAN_PROFILE_CARD","on");assert!(off?.get("phyrian_players").is_none(),"switch off adds no dependency");
+    Ok(())
+   }.await;db.batch_execute(&format!("SET search_path=public;DROP SCHEMA {schema} CASCADE")).await?;result?;
+  }
+  std::env::remove_var("VAAK_PHYRIAN_PROFILE_CARD");Ok(())
  }
  #[test]
  fn second_life_icon_uses_shipped_svg(){

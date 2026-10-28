@@ -5,6 +5,11 @@ declare(strict_types=1);
  * Phyrian local-profile card.
  * No Postgres and no Redis server: the switch-off path must not touch either,
  * and the switch-on path reads one primary-key row from an in-memory table.
+ *
+ * The markup cases at the end live in api/fixtures/phyrian-profile-card.json,
+ * which the Rust test phyrian_card::tests::shared_fixture_matches_php replays.
+ * Regenerate after an intended markup change with:
+ *   php api/bin/phyrian-profile-card-smoke.php --write-fixture
  */
 
 $GLOBALS['phyrian_card_redis_gets'] = 0;
@@ -201,6 +206,106 @@ $game = (string) file_get_contents(dirname(__DIR__) . '/ap-phyrian.php');
 $bridge = (string) file_get_contents(dirname(__DIR__) . '/ap-phyrian-bridge.php');
 $check(!str_contains($game, 'VAAK_PHYRIAN_PROFILE_CARD'), 'game module is unchanged by the card switch');
 $check(!str_contains($bridge, 'VAAK_PHYRIAN_PROFILE_CARD'), 'OpenSim bridge is unchanged by the card switch');
+
+// Shared fixture for the Rust profile header. Each card case goes through the
+// real page entry with its row served as a shared cache hit, so it covers the
+// owner/no-owner selection, normalize and the markup. Each cache case records
+// whether a stored value is a hit (no player query) and the row it yields.
+putenv('VAAK_PHYRIAN_ORIGIN_OWNER_ID');
+putenv('VAAK_PHYRIAN_PROFILE_CARD=1');
+$player = static fn (array $over): array => $over + [
+    'status' => 'imprinted', 'strain' => 'Rose Static', 'resonance' => 60, 'generation' => 2, 'level' => 20,
+    'banked_resonance' => 0, 'resonance_exchanges' => 0, 'inductions_given' => 0, 'lineage_depth' => null, 'daily_resonance_decay' => 5,
+];
+$link = static fn (?string $name): array => ['owner_user_id' => 5, 'status' => 'verified', 'avatar_name' => $name, 'strain_snapshot' => 'Rose Static'];
+$cardCases = [
+    ['id' => 'no_owner_self', 'owner' => 0, 'is_self' => true, 'bridge' => null, 'row' => null],
+    ['id' => 'no_owner_other', 'owner' => 0, 'is_self' => false, 'bridge' => null, 'row' => null],
+    ['id' => 'no_row_self', 'owner' => 5, 'is_self' => true, 'bridge' => null, 'row' => null],
+    ['id' => 'no_row_other_linked', 'owner' => 5, 'is_self' => false, 'bridge' => $link('Ada Resident'), 'row' => null],
+    ['id' => 'unmarked_self', 'owner' => 5, 'is_self' => true, 'bridge' => null, 'row' => $player(['status' => 'unknown', 'strain' => '', 'resonance' => 0, 'level' => 1, 'generation' => 1])],
+    ['id' => 'unmarked_other', 'owner' => 5, 'is_self' => false, 'bridge' => null, 'row' => $player(['status' => 'unknown', 'strain' => null, 'resonance' => 12, 'level' => 3])],
+    ['id' => 'imprinted_blank_strain', 'owner' => 5, 'is_self' => false, 'bridge' => null, 'row' => $player(['strain' => '   '])],
+    ['id' => 'imprinted_padded_status', 'owner' => 5, 'is_self' => false, 'bridge' => null, 'row' => $player(['status' => ' imprinted ', 'strain' => ' Grey Bloom '])],
+    ['id' => 'imprinted_self', 'owner' => 5, 'is_self' => true, 'bridge' => null, 'row' => $player([])],
+    ['id' => 'newly_marked_stable', 'owner' => 7, 'is_self' => false, 'bridge' => null, 'row' => $player(['level' => 19, 'resonance' => 50])],
+    ['id' => 'colony_node_fading', 'owner' => 7, 'is_self' => false, 'bridge' => null, 'row' => $player(['level' => 39, 'resonance' => 49, 'generation' => 4])],
+    ['id' => 'marked_host_critical', 'owner' => 7, 'is_self' => false, 'bridge' => null, 'row' => $player(['level' => 40, 'resonance' => 24, 'banked_resonance' => 8])],
+    ['id' => 'marked_host_edge', 'owner' => 7, 'is_self' => false, 'bridge' => null, 'row' => $player(['level' => 59, 'resonance' => 25, 'resonance_exchanges' => 3])],
+    ['id' => 'deep_signal_dormant', 'owner' => 7, 'is_self' => false, 'bridge' => null, 'row' => $player(['level' => 60, 'resonance' => 0, 'inductions_given' => 2])],
+    ['id' => 'max_level_negative_resonance', 'owner' => 7, 'is_self' => false, 'bridge' => null, 'row' => $player(['level' => 80, 'resonance' => -3, 'generation' => 10, 'banked_resonance' => 300])],
+    ['id' => 'lineage_zero', 'owner' => 7, 'is_self' => false, 'bridge' => null, 'row' => $player(['lineage_depth' => 0])],
+    ['id' => 'lineage_number', 'owner' => 7, 'is_self' => false, 'bridge' => null, 'row' => $player(['lineage_depth' => 4, 'resonance_exchanges' => 1, 'inductions_given' => 1, 'banked_resonance' => 1])],
+    ['id' => 'lineage_blank_string', 'owner' => 7, 'is_self' => false, 'bridge' => null, 'row' => $player(['lineage_depth' => ''])],
+    ['id' => 'decay_zero', 'owner' => 7, 'is_self' => false, 'bridge' => null, 'row' => $player(['daily_resonance_decay' => 0])],
+    ['id' => 'decay_missing_uses_default', 'owner' => 7, 'is_self' => false, 'bridge' => null, 'row' => array_diff_key($player([]), ['daily_resonance_decay' => true])],
+    ['id' => 'driver_strings', 'owner' => 7, 'is_self' => false, 'bridge' => null, 'row' => $player(['resonance' => '41', 'generation' => '3', 'level' => ' 22', 'banked_resonance' => '0', 'lineage_depth' => '2', 'daily_resonance_decay' => '7'])],
+    ['id' => 'nulls_use_defaults', 'owner' => 7, 'is_self' => false, 'bridge' => null, 'row' => ['status' => 'imprinted', 'strain' => 'Ash Gene', 'resonance' => null, 'generation' => null, 'level' => null]],
+    ['id' => 'strain_escaped', 'owner' => 7, 'is_self' => false, 'bridge' => null, 'row' => $player(['strain' => 'Cosmic <Alien> & "Kin" \'x\''])],
+    ['id' => 'unicode_strain', 'owner' => 7, 'is_self' => true, 'bridge' => null, 'row' => $player(['strain' => 'Violet Drift ニュース ü'])],
+    ['id' => 'origin_owner', 'owner' => 1, 'is_self' => false, 'bridge' => $link('val3r1e flux'), 'row' => $player(['strain' => 'Phyrian', 'generation' => 3, 'level' => 80, 'resonance' => 93])],
+    ['id' => 'origin_self', 'owner' => 1, 'is_self' => true, 'bridge' => $link('val3r1e flux'), 'row' => $player(['strain' => 'Phyrian', 'level' => 80])],
+    ['id' => 'origin_unmarked', 'owner' => 1, 'is_self' => true, 'bridge' => null, 'row' => $player(['status' => 'unknown', 'strain' => ''])],
+    ['id' => 'linked_special_chars', 'owner' => 7, 'is_self' => false, 'bridge' => $link('  <b>"Nova" & \'Bee\'</b>  '), 'row' => $player([])],
+    ['id' => 'linked_blank_name', 'owner' => 7, 'is_self' => true, 'bridge' => $link('   '), 'row' => $player(['status' => 'unknown', 'strain' => ''])],
+    ['id' => 'linked_null_name', 'owner' => 7, 'is_self' => false, 'bridge' => $link(null), 'row' => null],
+];
+$fixtureCards = [];
+foreach ($cardCases as $case) {
+    ap_phyrian_profile_card_cache_reset();
+    $GLOBALS['phyrian_card_redis'] = [];
+    if ($case['owner'] > 0) {
+        $GLOBALS['phyrian_card_redis'][ap_phyrian_profile_card_cache_key($case['owner'])] = ['found' => $case['row'] !== null, 'row' => $case['row']];
+    }
+    $linked = is_array($case['bridge']);
+    $case['html'] = ap_phyrian_profile_card_markup(true, $case['owner'], [
+        'is_self' => $case['is_self'],
+        'opensim_linked' => $linked,
+        'avatar_name' => $linked ? (string) ($case['bridge']['avatar_name'] ?? '') : '',
+    ], $forbid);
+    $check(ap_phyrian_profile_card_lookup_count() === 0, 'fixture card ' . $case['id'] . ' is served from the shared value');
+    $check(str_starts_with($case['html'], '<section class="phyrian-profile-card"'), 'fixture card ' . $case['id'] . ' renders a card');
+    $fixtureCards[] = $case;
+}
+$cacheCases = [
+    ['id' => 'found_row', 'cached' => '{"found":true,"row":{"status":"imprinted","strain":"Ash Gene","resonance":40,"generation":2,"level":9,"banked_resonance":0,"resonance_exchanges":0,"inductions_given":0,"lineage_depth":null,"daily_resonance_decay":5}}'],
+    ['id' => 'found_false', 'cached' => '{"found":false,"row":null}'],
+    ['id' => 'found_zero_with_row', 'cached' => '{"found":0,"row":{"status":"imprinted","strain":"Ash Gene"}}'],
+    ['id' => 'found_string_zero', 'cached' => '{"found":"0","row":{"status":"imprinted","strain":"Ash Gene"}}'],
+    ['id' => 'found_null', 'cached' => '{"found":null}'],
+    ['id' => 'found_row_string', 'cached' => '{"found":true,"row":"imprinted"}'],
+    ['id' => 'found_row_list', 'cached' => '{"found":1,"row":[]}'],
+    ['id' => 'found_row_partial', 'cached' => '{"found":"yes","row":{"status":"imprinted","strain":"Grave Neon","level":"61"}}'],
+    ['id' => 'no_found_key', 'cached' => '{"row":{"status":"imprinted","strain":"Ash Gene"}}'],
+    ['id' => 'list_value', 'cached' => '["found"]'],
+    ['id' => 'scalar_value', 'cached' => '5'],
+    ['id' => 'not_json', 'cached' => 'found'],
+];
+$fixtureCache = [];
+foreach ($cacheCases as $case) {
+    ap_phyrian_profile_card_cache_reset();
+    $decoded = json_decode($case['cached'], true);
+    $GLOBALS['phyrian_card_redis'] = [ap_phyrian_profile_card_cache_key(999) => is_array($decoded) ? $decoded : null];
+    $snap = ap_phyrian_profile_card_snapshot(999, $db);
+    $case['hit'] = ap_phyrian_profile_card_lookup_count() === 0;
+    $case['row'] = $case['hit'] ? $snap['row'] : null;
+    $check(!empty($snap['ok']), 'fixture cache ' . $case['id'] . ' snapshot is ok');
+    $fixtureCache[] = $case;
+}
+$fixtureFlags = [];
+foreach ([null, '', '1', 'true', 'TRUE', 'yes', 'On', " on\n", "\t1 ", '0', 'false', 'off', 'no', 'enabled', '1 1', 'y'] as $raw) {
+    putenv($raw === null ? 'VAAK_PHYRIAN_PROFILE_CARD' : 'VAAK_PHYRIAN_PROFILE_CARD=' . $raw);
+    $fixtureFlags[] = ['raw' => $raw, 'enabled' => ap_phyrian_profile_card_enabled()];
+}
+putenv('VAAK_PHYRIAN_PROFILE_CARD=1');
+$fixturePath = dirname(__DIR__) . '/fixtures/phyrian-profile-card.json';
+$encoded = json_encode(['origin_owner_user_id' => 1, 'cards' => $fixtureCards, 'cache' => $fixtureCache, 'flags' => $fixtureFlags], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR) . "\n";
+if (in_array('--write-fixture', $argv ?? [], true)) {
+    file_put_contents($fixturePath, $encoded);
+    echo "wrote {$fixturePath}\n";
+    exit(0);
+}
+$check(is_file($fixturePath) && file_get_contents($fixturePath) === $encoded, 'shared fixture matches PHP output (rerun with --write-fixture after an intended change)');
 
 if ($failures !== []) {
     fwrite(STDERR, "phyrian-profile-card: FAIL\n" . implode("\n", $failures) . "\n");
