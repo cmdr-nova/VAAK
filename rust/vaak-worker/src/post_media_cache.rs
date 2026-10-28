@@ -16,7 +16,7 @@ const MAX_ENQUEUE_PER_PAGE: usize = 12;
 
 /// Skip the `last_used_at` write when the row was touched this recently.
 /// Cleanup evicts after 30 unused days, so a daily touch is plenty.
-const TOUCH_AFTER_SECS: i64 = 86_400;
+pub(crate) const TOUCH_AFTER_SECS: i64 = 86_400;
 
 /// Public R2 host from /etc/mkultra/r2.env (same key order as
 /// ap_r2_put_object). Only the host is read; credentials are ignored.

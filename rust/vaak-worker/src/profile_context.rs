@@ -617,8 +617,8 @@ async fn prepare_raw_quote(db:&Client,viewer:&crate::profile_materialize::Profil
  let admission_status=child.clone();let grant=AdmittedQuoteProjection{requested:product.requested_target().into(),status:if allowed{Some(child.clone())}else{None},owner,owner_snapshot,root_actor:root_actor.into(),page:page.clone(),parent:root.clone()};
  if allowed{
   let warm=match viewer{crate::profile_materialize::ProfileViewer::Auth(session)=>session.warm_context(),crate::profile_materialize::ProfileViewer::Guest(session)=>session.warm_context()};
-  // Each effect is followed by a recheck, which also serves as the next
-  // effect's precheck: nothing is awaited between the two.
+  // Each effect is followed by a recheck (the mapping and touch writers do
+  // their own), which also serves as the next effect's precheck.
   let effects=product.effects().to_vec();if !effects.is_empty(){grant.require_current(db,product.requested_target(),&admission_status).await?;}
   for effect in &effects{
    match effect.effect(){
@@ -627,7 +627,8 @@ async fn prepare_raw_quote(db:&Client,viewer:&crate::profile_materialize::Profil
     crate::profile_materialize::ProjectionEffect::RememberAccount{..}|crate::profile_materialize::ProjectionEffect::PostMediaTouch{..}=>{mapping_changes.push(product.apply_quote_effect(db,effect,&admission_status,&grant).await?);}
     crate::profile_materialize::ProjectionEffect::PostMediaWarm{..}=>{let warm=warm.context("PHP fallback: quoted post-media transport unavailable")?;product.apply_quote_post_media_warm(db,effect,&admission_status,&grant,warm.cfg(),warm.transport()).await?;}
    }
-   grant.require_current(db,product.requested_target(),&admission_status).await?;
+   // Mapping and media-touch writers end with their own check after a write.
+   if !matches!(effect.effect(),crate::profile_materialize::ProjectionEffect::RememberAccount{..}|crate::profile_materialize::ProjectionEffect::PostMediaTouch{..}){grant.require_current(db,product.requested_target(),&admission_status).await?;}
   }
  }
  if allowed{crate::profile_bridge::timed(crate::profile_bridge::Stage::QuoteCache,product.complete_cache(db,dns,&grant)).await?;}
