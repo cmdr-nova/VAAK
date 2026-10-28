@@ -169,6 +169,59 @@ $own = ap_masto_nostr_status_fields([], $noteUrl, '');
 $check($own['vaak_nostr_pubkey'] === '' && $own['url'] === $noteUrl, 'a liked note of yours has no author key from the row');
 $check(ap_masto_nostr_status_fields([], 'https://example.com/x', $actorUrl)['vaak_nostr_event_id'] === '', 'only njump note links decode');
 
+// Composer crosspost: which posts go to Nostr, and what the note carries.
+if (!function_exists('ap_db_owner_actor_id_for_user_id')) {
+    function ap_db_owner_actor_id_for_user_id(int $userId): string
+    {
+        return 'https://vaak.test/users/u' . $userId;
+    }
+}
+$xdb = new PDO('sqlite::memory:');
+$xdb->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+$xdb->exec('CREATE TABLE masto_statuses (local_id INTEGER PRIMARY KEY, note_id TEXT, content_text TEXT, visibility TEXT, spoiler_text TEXT, in_reply_to_local_id INTEGER)');
+$xdb->exec('CREATE TABLE masto_media (local_id INTEGER PRIMARY KEY, status_local_id INTEGER, public_url TEXT, mime TEXT, description TEXT)');
+$xdb->exec('CREATE TABLE outbox_notes (id TEXT PRIMARY KEY, in_reply_to TEXT)');
+$xdb->exec('CREATE TABLE nostr_profiles (pubkey TEXT PRIMARY KEY, name TEXT, display_name TEXT, picture TEXT)');
+$mine = 'https://vaak.test/users/u3/notes/';
+$addStatus = $xdb->prepare('INSERT INTO masto_statuses (local_id, note_id, content_text, visibility, spoiler_text, in_reply_to_local_id) VALUES (?, ?, ?, ?, ?, ?)');
+$addStatus->execute([1, $mine . '1', 'Hello #Nostr and #nostr #VAAK', 'public', 'birds', null]);
+$addStatus->execute([2, $mine . '2', 'quiet', 'unlisted', '', null]);
+$addStatus->execute([3, $mine . '3', 'reply', 'public', '', 1]);
+$addStatus->execute([4, $mine . '4', 'thread', 'public', '', null]);
+$addStatus->execute([5, $mine . '5', '', 'public', '', null]);
+$xdb->exec("INSERT INTO outbox_notes (id, in_reply_to) VALUES ('{$mine}4', 'https://elsewhere.test/notes/9')");
+$xdb->exec("INSERT INTO masto_media (local_id, status_local_id, public_url, mime, description) VALUES (1, 1, 'https://vaak.test/m/a.jpg', 'image/jpeg', ' a  bird '), (2, 1, 'http://insecure.test/b.jpg', 'image/jpeg', ''), (3, 5, 'https://vaak.test/m/c.mp4', '', '')");
+$x = ap_nostr_post_note(3, $mine . '1', $xdb);
+$check(!empty($x['ok']) && $x['content'] === "Hello #Nostr and #nostr #VAAK\n\nhttps://vaak.test/m/a.jpg", 'crosspost text ends with its https media links');
+$check(($x['tags'] ?? []) === [
+    ['t', 'nostr'], ['t', 'vaak'],
+    ['content-warning', 'birds'],
+    ['imeta', 'url https://vaak.test/m/a.jpg', 'm image/jpeg', 'alt a bird'],
+    ['proxy', $mine . '1', 'activitypub'],
+], 'crosspost tags: hashtags once, CW, imeta, proxy');
+$check(!empty(ap_nostr_post_note(3, $mine . '5', $xdb)['ok']) && ap_nostr_post_note(3, $mine . '5', $xdb)['tags'][0] === ['imeta', 'url https://vaak.test/m/c.mp4'], 'media-only post goes, imeta skips an empty mime');
+$check(str_contains((string) (ap_nostr_post_note(3, $mine . '2', $xdb)['error'] ?? ''), 'public'), 'non-public posts stay on VAAK');
+$check(str_contains((string) (ap_nostr_post_note(3, $mine . '3', $xdb)['error'] ?? ''), 'Replies'), 'replies to VAAK posts stay on VAAK');
+$check(str_contains((string) (ap_nostr_post_note(3, $mine . '4', $xdb)['error'] ?? ''), 'Replies'), 'replies to remote posts stay on VAAK');
+$check(!empty(ap_nostr_post_note(3, $mine . '99', $xdb)['retry']), 'a post still in the queue asks to retry');
+$check(empty(ap_nostr_post_note(4, $mine . '1', $xdb)['ok']) && empty(ap_nostr_post_note(4, $mine . '1', $xdb)['retry']), "someone else's post is refused");
+$check(empty(ap_nostr_post_note(3, 'https://vaak.test/users/u33/notes/1', $xdb)['ok']), 'a lookalike actor prefix is refused');
+
+// The composer's "Nostr" box needs a linked npub; its name and picture come from kind 0.
+unset($GLOBALS['ap_nostr_table_ready']);
+putenv('VAAK_NOSTR');
+$check(ap_nostr_compose_identity(3, true, $xdb) === null, 'no linked npub, no Nostr box');
+ap_nostr_save_link(3, $npub, true, $xdb);
+$id = ap_nostr_compose_identity(3, true, $xdb);
+$check(is_array($id) && $id['npub'] === $npub && $id['name'] === 'npub10elfc…zvjptg' && $id['picture'] === '', 'no profile yet: short npub, no picture');
+$xdb->prepare('INSERT INTO nostr_profiles (pubkey, name, display_name, picture) VALUES (?, ?, ?, ?)')->execute([$nip19, 'val', 'Valerie', 'https://pics.test/v.png']);
+$id = ap_nostr_compose_identity(3, true, $xdb);
+$check(($id['name'] ?? '') === 'Valerie' && ($id['picture'] ?? '') === 'https://pics.test/v.png', 'kind 0 display name and picture');
+$xdb->exec("UPDATE nostr_profiles SET display_name = '', picture = 'javascript:alert(1)'");
+$id = ap_nostr_compose_identity(3, true, $xdb);
+$check(($id['name'] ?? '') === 'val' && ($id['picture'] ?? 'x') === '', 'falls back to name; only https pictures');
+$check(ap_nostr_compose_identity(3, false, $xdb) === null, 'non-admins see no box while Nostr is admin only');
+
 if ($failures !== []) {
     fwrite(STDERR, "nostr-smoke: " . count($failures) . " of {$checks} checks failed\n - " . implode("\n - ", $failures) . "\n");
     exit(1);

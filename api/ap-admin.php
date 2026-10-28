@@ -13165,7 +13165,23 @@ function admin_render_compose_panel(bool $inline = false): void
                   . (count($prefillDraftMediaIds) < 4 ? ' — you can add more' : '');
           }
         ?></span>
-        <div style="display:flex;gap:.5rem;flex-wrap:wrap">
+        <?php
+          // Crosspost to Nostr: only for a linked npub, and never for edits.
+          // The JS hides it for replies, quotes and non-public posts.
+          $composeNostr = (!$composeIsEdit && function_exists('ap_nostr_compose_identity'))
+              ? ap_nostr_compose_identity((int) ($GLOBALS['vaak_owner_id'] ?? 0), !empty($GLOBALS['vaak_is_admin']))
+              : null;
+        ?>
+        <div style="display:flex;gap:.5rem;flex-wrap:wrap;align-items:center">
+          <?php if ($composeNostr !== null): ?>
+            <label class="composer-check compose-nostr" id="compose-nostr" title="<?= h('Also post to Nostr as ' . $composeNostr['name']) ?>" hidden>
+              <input type="checkbox" id="compose-nostr-box" value="1">
+              <span>Nostr</span>
+              <?php if ($composeNostr['picture'] !== ''): ?>
+                <img class="compose-nostr-avatar" src="<?= h($composeNostr['picture']) ?>" alt="" title="<?= h($composeNostr['name']) ?>" width="20" height="20" loading="lazy" decoding="async" referrerpolicy="no-referrer">
+              <?php endif; ?>
+            </label>
+          <?php endif; ?>
           <button class="btn btn-ghost" type="button" id="compose-draft-btn" title="Save as draft"<?= $composeIsEdit ? ' style="display:none"' : '' ?>>Save draft</button>
           <button class="btn btn-ghost" type="button" id="compose-queue-btn" title="Add to posting queue"<?= $composeIsEdit ? ' style="display:none"' : '' ?>>Add to queue</button>
           <button class="btn btn-primary" type="submit" id="compose-submit-btn"><?= h($composeSubmit) ?></button>
@@ -28698,6 +28714,12 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     .compose-emoji-picker button:focus-visible {
       background: rgba(126,224,255,.12);
       outline: none;
+    }
+    .composer-check.compose-nostr { margin: 0 .25rem 0 0; gap: .4rem; cursor: pointer; }
+    .composer-check.compose-nostr[hidden] { display: none; }
+    .compose-nostr-avatar {
+      width: 20px; height: 20px; border-radius: 50%; object-fit: cover; flex: 0 0 auto;
+      background: var(--panel-2);
     }
     .composer-check input[type="checkbox"] {
       width: 1rem;
@@ -47148,7 +47170,33 @@ $showComposeFab = empty($GLOBALS['vaak_guest_profile'])
     if (!panel) return;
     setComposePollOpen(!!panel.hidden);
   };
+  // The "Nostr" crosspost box (admin_render_compose_panel) only shows for a
+  // new public post: not for edits, replies, quotes or other visibilities.
+  function composeNostrEligible(form) {
+    if (!form || composePollIsEditOrQuote()) return false;
+    const replyTo = form.querySelector('input[name="in_reply_to"]');
+    if (replyTo && String(replyTo.value || '').trim()) return false;
+    const vis = form.querySelector('select[name="visibility"], input[name="visibility"]');
+    return !vis || String(vis.value || 'public') === 'public';
+  }
+  window.vaakComposeNostrWanted = function (form) {
+    const box = form ? form.querySelector('#compose-nostr-box') : null;
+    return !!(box && box.checked && composeNostrEligible(form));
+  };
+  window.vaakSyncComposeNostr = function () {
+    const form = (typeof activeComposeForm === 'function' && activeComposeForm())
+      || document.getElementById('compose-form');
+    const wrap = form ? form.querySelector('#compose-nostr') : null;
+    if (wrap) wrap.hidden = !composeNostrEligible(form);
+  };
+  document.addEventListener('input', (ev) => {
+    if (ev.target && ev.target.closest && ev.target.closest('#compose-form')) window.vaakSyncComposeNostr();
+  });
+  document.addEventListener('change', (ev) => {
+    if (ev.target && ev.target.closest && ev.target.closest('#compose-form')) window.vaakSyncComposeNostr();
+  });
   window.vaakSyncComposePollChrome = function () {
+    window.vaakSyncComposeNostr();
     const form = (typeof activeComposeForm === 'function' && activeComposeForm())
       || document.getElementById('compose-form');
     const toggle = form
@@ -47336,9 +47384,11 @@ $showComposeFab = empty($GLOBALS['vaak_guest_profile'])
       if (feedEl) feedEl.scrollTop = savedFeedTop;
     };
     restoreScroll();
+    if (typeof window.vaakSyncComposeNostr === 'function') window.vaakSyncComposeNostr();
     const ta = document.getElementById('compose-content');
     if (ta) {
       requestAnimationFrame(() => {
+        if (typeof window.vaakSyncComposeNostr === 'function') window.vaakSyncComposeNostr();
         restoreScroll();
         clampComposeTextarea();
         autoGrowComposeTextarea();
@@ -49162,6 +49212,15 @@ $showComposeFab = empty($GLOBALS['vaak_guest_profile'])
         }
       }
       if (mode === 'reply') playPostAudio();
+      // "Nostr" box: sign the same post as a Nostr note via the browser's
+      // signer extension. Runs in the background; the post is already in.
+      if (actionName === 'reply' && !submittedIsReply && data.kind !== 'quote' && data.note_id
+          && typeof window.vaakComposeNostrWanted === 'function' && window.vaakComposeNostrWanted(form)
+          && typeof window.vaakNostrCrosspost === 'function') {
+        window.vaakNostrCrosspost(String(data.note_id));
+      }
+      // The box starts unticked for every post.
+      form.querySelectorAll('#compose-nostr-box').forEach((box) => { box.checked = false; });
       // Posted/queued — don't re-save as draft on close
       skipDraftOnClose = true;
       // A completed post is no longer a recoverable composer draft. Remove the
@@ -50301,16 +50360,26 @@ if (VIEW === 'analytics') loadAnalytics();
     return { ok: false, error: 'VAAK did not answer. Try again.' };
   }
 
-  async function run(purpose, target, content, reason) {
+  function signerReady() {
     const signer = window.nostr;
     if (!signer || typeof signer.signEvent !== 'function' || typeof signer.getPublicKey !== 'function') {
       toast('To act on Nostr posts, install a signer extension such as nos2x or Alby, then reload this page.');
       return null;
     }
+    return signer;
+  }
+
+  async function run(purpose, target, content, reason) {
+    const signer = signerReady();
+    if (!signer) return null;
     const prepFields = { action: 'nostr_prepare', purpose: purpose, target: target };
     if (reason) prepFields.reason = reason;
     const prep = await post(prepFields);
     if (!prep.ok) { toast(prep.error || 'Could not prepare that.'); return null; }
+    return signAndPublish(signer, prep, content);
+  }
+
+  async function signAndPublish(signer, prep, content) {
     let pubkey = '';
     try { pubkey = String(await signer.getPublicKey() || '').toLowerCase(); } catch (e) {}
     if (!pubkey) { toast('Your signer extension did not share its key.'); return null; }
@@ -50332,6 +50401,24 @@ if (VIEW === 'analytics') loadAnalytics();
     if (!done.ok) { toast(done.error || 'No relay accepted it.'); return null; }
     return done;
   }
+
+  // The composer's "Nostr" box: once VAAK has accepted a public, top-level
+  // post, sign the same post as a kind 1 note. The publication queue may
+  // still be saving it, so a `retry` answer waits and asks again.
+  window.vaakNostrCrosspost = async function (noteId) {
+    const signer = signerReady();
+    if (!signer || !noteId) return null;
+    let prep = null;
+    for (let attempt = 0; attempt < 6; attempt++) {
+      if (attempt > 0) await new Promise(function (r) { setTimeout(r, 1500 * attempt); });
+      prep = await post({ action: 'nostr_prepare', purpose: 'post', target: noteId });
+      if (prep.ok || !prep.retry) break;
+    }
+    if (!prep || !prep.ok) { toast((prep && prep.error) || 'Could not prepare the Nostr copy.'); return null; }
+    const done = await signAndPublish(signer, prep, '');
+    if (done) toast('Also posted to Nostr.');
+    return done;
+  };
 
   function sameTarget(act, target) {
     const sel = '[data-nostr-act="' + act + '"][data-nostr-target="' + (window.CSS && CSS.escape ? CSS.escape(target) : target) + '"]';
