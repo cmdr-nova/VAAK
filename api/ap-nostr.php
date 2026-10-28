@@ -405,8 +405,8 @@ function ap_nostr_action(string $action, int $ownerUserId, bool $isAdmin, array 
 
 /**
  * The same post crosspost for an app with an access token instead of a
- * browser (Shana, api/bin/vaak-nostr-signer.py): `prepare` takes the id
- * POST /api/v1/statuses returned and answers the unsigned note, the app
+ * browser (Shana, ops/nostr-signer/vaak_nostr.py): `prepare` takes the id
+ * POST /api/v1/statuses returned (or the post's note URL) and answers the unsigned note, the app
  * signs it with a key that never leaves its machine, and `publish` hands it
  * back for the worker to check and relay. Blog posts stay on VAAK.
  *
@@ -428,12 +428,21 @@ function ap_nostr_api_action(string $step, array $user, array $in, ?PDO $db = nu
     if ($step !== 'prepare') {
         return ['status' => 404, 'body' => ['ok' => false, 'error' => 'Unknown Nostr step.']];
     }
-    $sid = (string) ($in['status_id'] ?? '');
-    if (!preg_match('/^\d{1,20}$/', $sid)) {
-        return ['status' => 400, 'body' => ['ok' => false, 'error' => 'status_id required.']];
+    // note_id is for posters that don't go through POST /api/v1/statuses
+    // (Shana's SSH "post" command answers the note URL, not a status id).
+    // ap_nostr_post_note still checks it is the token owner's own post.
+    $noteId = trim((string) ($in['note_id'] ?? ''));
+    if ($noteId !== '' && (!str_starts_with($noteId, 'https://') || strlen($noteId) > 300)) {
+        return ['status' => 400, 'body' => ['ok' => false, 'error' => 'note_id must be the post\'s https URL.']];
     }
-    $row = ap_masto_local_row_from_public_id((int) $sid) ?? (((int) $sid < 2000000) ? ap_masto_status_by_local_id((int) $sid) : null);
-    $noteId = is_array($row) ? (string) ($row['note_id'] ?? '') : '';
+    if ($noteId === '') {
+        $sid = (string) ($in['status_id'] ?? '');
+        if (!preg_match('/^\d{1,20}$/', $sid)) {
+            return ['status' => 400, 'body' => ['ok' => false, 'error' => 'status_id or note_id required.']];
+        }
+        $row = ap_masto_local_row_from_public_id((int) $sid) ?? (((int) $sid < 2000000) ? ap_masto_status_by_local_id((int) $sid) : null);
+        $noteId = is_array($row) ? (string) ($row['note_id'] ?? '') : '';
+    }
     if ($noteId === '') {
         return ['status' => 200, 'body' => ['ok' => false, 'error' => 'The post is still being saved.', 'retry' => true]];
     }
