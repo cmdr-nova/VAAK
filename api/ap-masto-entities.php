@@ -5647,6 +5647,39 @@ function ap_masto_mention_is_bluesky(array $row): bool
     return false;
 }
 
+/** True when a mentions row was staged from Nostr (vaak-worker nostr/notif.rs). */
+function ap_masto_mention_is_nostr(array $row): bool
+{
+    return str_starts_with((string) ($row['activity_id'] ?? ''), 'nostr:')
+        || str_starts_with((string) ($row['actor_id'] ?? ''), 'https://njump.me/')
+        || str_starts_with((string) ($row['object_id'] ?? ''), 'https://njump.me/');
+}
+
+/**
+ * The Nostr card fields on a notification status built from a Nostr
+ * mentions row, so the web card shows the signed Nostr actions. $author is
+ * the note's author key ('' when it is the owner's own note).
+ *
+ * @param array<string,mixed> $status
+ * @return array<string,mixed>
+ */
+function ap_masto_nostr_status_fields(array $status, string $noteUrl, string $author): array
+{
+    if (!function_exists('ap_nostr_bech32_decode')) {
+        require_once __DIR__ . '/ap-nostr.php';
+    }
+    $hex = static function (string $url, string $hrp): string {
+        $tail = substr(rtrim($url, '/'), strlen('https://njump.me/'));
+        $got = str_starts_with($url, 'https://njump.me/') ? ap_nostr_bech32_decode($tail) : null;
+        return is_array($got) && $got[0] === $hrp && strlen($got[1]) === 32 ? bin2hex($got[1]) : '';
+    };
+    $status['source'] = 'nostr';
+    $status['vaak_nostr_event_id'] = $hex($noteUrl, 'note');
+    $status['vaak_nostr_pubkey'] = $author !== '' ? $hex($author, 'npub') : '';
+    $status['url'] = $noteUrl;
+    return $status;
+}
+
 /**
  * Resolve a Bluesky handle/DID/profile URL to a linked VAAK owner_user_id (0 if none).
  */
@@ -5883,7 +5916,8 @@ function ap_masto_mention_notif_type(array $row): ?string
     }
 
     // Bluesky-connected ingest: map by activity_type without requiring local AP note URLs.
-    if (ap_masto_mention_is_bluesky($row)) {
+    // Nostr rows come from the owner's linked npub the same way.
+    if (ap_masto_mention_is_bluesky($row) || ap_masto_mention_is_nostr($row)) {
         if ($activity === 'like' || $objType === 'like') {
             return 'favourite';
         }
@@ -6098,7 +6132,29 @@ function ap_masto_notification_entity(array $item): ?array
     $status = null;
     $objectId = ap_masto_mention_target_object_id((string) ($row['object_id'] ?? ''));
     $isBsky = ap_masto_mention_is_bluesky($row);
-    if ($type === 'favourite' || $type === 'reblog') {
+    $isNostr = ap_masto_mention_is_nostr($row);
+    if ($isNostr) {
+        // A like/repost shows the owner's own note; anything else the notifier's.
+        $status = ap_masto_status_from_mention($row);
+        if ($type === 'favourite' || $type === 'reblog') {
+            $ownerActor = rtrim((string) ($row['owner_actor_id'] ?? ''), '/');
+            $ownerAcct = $ownerActor !== '' && function_exists('ap_masto_account_for_local_url')
+                ? ap_masto_account_for_local_url($ownerActor)
+                : null;
+            if (!is_array($ownerAcct) && function_exists('ap_masto_account')) {
+                $ownerAcct = ap_masto_account();
+            }
+            if (is_array($ownerAcct)) {
+                $status['account'] = $ownerAcct;
+            }
+            if (trim(strip_tags((string) ($status['content'] ?? ''))) === '') {
+                $status['content'] = '<p>Nostr note</p>';
+            }
+            $status = ap_masto_nostr_status_fields($status, $objectId, '');
+        } else {
+            $status = ap_masto_nostr_status_fields($status, $objectId, $actorId);
+        }
+    } elseif ($type === 'favourite' || $type === 'reblog') {
         $status = ap_masto_resolve_our_liked_status($objectId);
         // Bluesky likes/reposts: prefer the mapped VAAK post body when this was a cross-post.
         if ($status === null && $isBsky) {

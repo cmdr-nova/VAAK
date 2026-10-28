@@ -664,16 +664,27 @@ fn paint_notif_card_follows(n: &Value, viewer_actor: &str, following: &HashSet<S
         esc(av_src),
         hover
     );
+    // A Nostr notifier (nostr::notif) has no in-app profile: open njump.
+    let nostr_profile = (account_uri.starts_with("nostr:") && account_url.starts_with("https://")).then_some(account_url);
     let av_block = if !profile_href.is_empty() {
         format!(
             "<a href=\"{}\" aria-label=\"Open profile\" style=\"text-decoration:none\"{hover}>{}</a>",
             esc(&profile_href),
             av_img
         )
+    } else if let Some(href) = nostr_profile {
+        format!("<a href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\" aria-label=\"Open on Nostr\" style=\"text-decoration:none\">{av_img}</a>", esc(href))
     } else {
         av_img
     };
-    let who = if !profile_href.is_empty() {
+    let who = if let (true, Some(href)) = (profile_href.is_empty(), nostr_profile) {
+        format!(
+            "<a class=\"who\" href=\"{h}\" target=\"_blank\" rel=\"noopener noreferrer\" style=\"color:inherit;text-decoration:none\">{d}</a><span class=\"meta\"> @{a}</span>",
+            h = esc(href),
+            d = esc(display),
+            a = esc(acct)
+        )
+    } else if !profile_href.is_empty() {
         format!(
             "<a class=\"who\" href=\"{h}\" style=\"color:inherit;text-decoration:none\"{hover}>{d}</a><a class=\"meta\" href=\"{h}\" style=\"color:var(--muted);text-decoration:none\"{hover}> @{a}</a>",
             h = esc(&profile_href),
@@ -1043,6 +1054,9 @@ pub async fn mentions_html_fill(
     // A pending first-All Phyrian offer still needs the actual PHP producer.
     if pending { return Ok(None); }
     crate::audience::filter_notifications(&policy_db, owner_user_id, &mut report.items).await?;
+    // The warm head is PHP-built; Nostr cards get the stored note (links,
+    // media, quotes) and the notifier's Nostr profile here.
+    crate::nostr::notif::dress_entities(&policy_db, owner_user_id, &mut report.items).await;
 
     // Replies and quote-boosts need the signed-in actor or the ⋯ menu is omitted.
     let viewer_actor = active_viewer_actor(&policy_db, owner_user_id).await?;
@@ -1069,6 +1083,7 @@ pub async fn mentions_html_fill(
             &mut nested,
         )
         .await;
+        crate::nostr::act::stamp_viewer_flags(&policy_db, owner_user_id, &mut nested).await;
         let _ = crate::home_hydrate_ranked::attach_bsky_link_facets(&policy_db, &mut nested).await;
         let _ = crate::home_hydrate_ranked::attach_ask_identities(&policy_db, &mut nested).await;
         let _ = crate::status_emoji::attach_custom_emojis(&policy_db, &mut nested).await;

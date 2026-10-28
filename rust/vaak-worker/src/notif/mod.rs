@@ -463,6 +463,11 @@ pub(crate) fn quote_of_ours(activity: &str, obj: &str, object_id: &str, content:
 /// Thin port of PHP `ap_masto_mention_notif_type` — returns Some(kind) when the
 /// row should count toward the badge. `update` returns None so the caller can
 /// run the favourites lookup.
+/// A mentions row staged by `nostr::notif` (PHP `ap_masto_mention_is_nostr`).
+pub(crate) fn is_nostr(activity_id: &str, actor_id: &str, object_id: &str) -> bool {
+    activity_id.starts_with("nostr:") || actor_id.starts_with("https://njump.me/") || object_id.starts_with("https://njump.me/")
+}
+
 pub(crate) fn mention_notif_type(
     activity_type: &str,
     obj_type: &str,
@@ -491,7 +496,9 @@ pub(crate) fn mention_notif_type(
         || object_id.starts_with("https://bsky.app/")
         || object_id.starts_with("bsky:");
 
-    if is_bsky {
+    // Nostr rows (nostr::notif) are typed the same way: they come from the
+    // user's own linked key, never addressed to a VAAK note URL.
+    if is_bsky || is_nostr(activity_id, actor, object_id) {
         if activity == "like" || obj == "like" {
             return Some("favourite");
         }

@@ -49,6 +49,7 @@ reference_load($api . '/ap-masto-entities.php', [
     'ap_masto_format_time',
     'ap_masto_mention_target_object_id',
     'ap_masto_mention_is_bluesky',
+    'ap_masto_mention_is_nostr',
     'ap_masto_mention_is_quote_of_ours',
     'ap_masto_mention_notif_type',
     'ap_masto_remote_account_acct_key',
@@ -754,6 +755,9 @@ $classifyRows = [
     ['name' => 'reply_to_note', 'activity_type' => 'Create', 'type' => 'Note', 'object_id' => 'https://example.social/users/shana_flux/statuses/9', 'actor_id' => $shana, 'content' => 'no handle in the body', 'in_reply_to' => $parentNote, 'owner_actor_id' => $nova, 'activity_id' => ''],
     ['name' => 'update', 'activity_type' => 'Update', 'type' => 'Note', 'object_id' => 'https://example.social/users/shana_flux/statuses/9', 'actor_id' => $shana, 'content' => 'edited', 'in_reply_to' => '', 'owner_actor_id' => $nova, 'activity_id' => ''],
     ['name' => 'person', 'activity_type' => 'Create', 'type' => 'Person', 'object_id' => 'https://example.social/users/shana_flux', 'actor_id' => $shana, 'content' => '', 'in_reply_to' => '', 'owner_actor_id' => $nova, 'activity_id' => ''],
+    ['name' => 'nostr_reply', 'activity_type' => 'Create', 'type' => 'Note', 'object_id' => 'https://njump.me/note1abc', 'actor_id' => 'https://njump.me/npub1abc', 'content' => 'no handle', 'in_reply_to' => 'https://njump.me/note1parent', 'owner_actor_id' => $nova, 'activity_id' => 'nostr:aaaa'],
+    ['name' => 'nostr_like', 'activity_type' => 'Like', 'type' => 'Like', 'object_id' => 'https://njump.me/note1mine#like-0123456789ab', 'actor_id' => 'https://njump.me/npub1abc', 'content' => 'my note', 'in_reply_to' => '', 'owner_actor_id' => $nova, 'activity_id' => 'nostr:bbbb'],
+    ['name' => 'nostr_repost', 'activity_type' => 'Announce', 'type' => 'Announce', 'object_id' => 'https://njump.me/note1mine#reblog-0123456789ab', 'actor_id' => 'https://njump.me/npub1abc', 'content' => 'my note', 'in_reply_to' => '', 'owner_actor_id' => $nova, 'activity_id' => 'nostr:cccc'],
     ['name' => 'bite', 'activity_type' => 'Bite', 'type' => 'Bite', 'object_id' => $ourNote, 'actor_id' => $shana, 'content' => '', 'in_reply_to' => '', 'owner_actor_id' => $nova, 'activity_id' => ''],
 ];
 $classify = [];

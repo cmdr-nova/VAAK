@@ -1059,6 +1059,13 @@ fn mention_status(item: &NotifInput, facts: &PageFacts, owner: &OwnerView) -> Va
     });
     flags(&mut status, facts);
     let _ = parent;
+    if notif::is_nostr(&item.activity_id, &item.actor_id, &item.object_id) {
+        // Nostr actions on the card (signed in the browser); dressed with the
+        // stored note by nostr::notif::dress_entities.
+        status["source"] = json!("nostr");
+        status["vaak_nostr_event_id"] = json!(crate::nostr::notif::note_key(&url).unwrap_or_default());
+        status["vaak_nostr_pubkey"] = json!(crate::nostr::notif::actor_key(&item.actor_id).unwrap_or_default());
+    }
     status
 }
 
@@ -1103,6 +1110,16 @@ fn liked_status(item: &NotifInput, facts: &PageFacts, owner: &OwnerView) -> Opti
                 }
             }
         }
+    }
+    if notif::is_nostr(&item.activity_id, &item.actor_id, &item.object_id) {
+        // A like or repost of the owner's own Nostr note.
+        let mut status = mention_status(item, facts, owner);
+        status["account"] = json!(local_account(&item.owner_actor, facts, owner));
+        status["vaak_nostr_pubkey"] = json!("");
+        if notification_clean_text(&json_string(&status, "content")).is_empty() {
+            status["content"] = json!("<p>Nostr note</p>");
+        }
+        return Some(status);
     }
     if item.is_bsky {
         if let Some(note) = mapped_note(&target, facts) {
@@ -1310,6 +1327,7 @@ fn muted_entity(entity: &Value, phrases: &[String]) -> bool {
 pub async fn entities_for_page(db: &Client, owner: &OwnerView, items: &[NotifInput], muted: &[String]) -> Result<Vec<Value>> {
     let facts = load_facts(db, owner, items).await;
     let mut built = build_notifications(items, &facts, owner);
+    crate::nostr::notif::dress_entities(db, owner.user_id, &mut built).await;
     if !built.is_empty() {
         let missing = notif::missing_local_notes_in_items(db, &built).await;
         built.retain(|entity| !notif::item_targets_missing_local(entity, &missing) && !muted_entity(entity, muted));

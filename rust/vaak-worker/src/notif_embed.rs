@@ -2176,6 +2176,13 @@ fn paint_reply_context(status: &Value, from: &str) -> String {
     if !parent.starts_with("https://") {
         return String::new();
     }
+    // Nostr notes have no in-app status view; open the parent on njump.
+    if parent.starts_with("https://njump.me/") {
+        return format!(
+            "<div class=\"meta reply-context\" style=\"margin:.35rem 0 .5rem\">↩ in reply to <a href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\">a Nostr note</a></div>",
+            esc(&parent)
+        );
+    }
     let cached_parent_label = status
         .get("vaak_reply_parent_handle")
         .and_then(|v| v.as_str())

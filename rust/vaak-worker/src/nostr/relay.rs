@@ -148,6 +148,8 @@ pub struct Query {
     pub kinds: Vec<i64>,
     /// Set for an id lookup: only these events are kept, whoever wrote them.
     pub ids: Vec<String>,
+    /// Set for a `#p` lookup: events from anyone that tag this key.
+    pub tagged: String,
 }
 
 impl Query {
@@ -156,16 +158,26 @@ impl Query {
         if let Some(since) = since {
             filter["since"] = json!(since);
         }
-        Self { filter, authors, kinds, ids: Vec::new() }
+        Self { filter, authors, kinds, ids: Vec::new(), tagged: String::new() }
+    }
+
+    /// Events of `kinds` from anyone that tag `pubkey` (notifications).
+    pub fn tagging(pubkey: &str, kinds: Vec<i64>, since: i64, limit: i64) -> Self {
+        let filter = json!({"#p": [pubkey], "kinds": kinds, "since": since, "limit": limit});
+        Self { filter, authors: Vec::new(), kinds, ids: Vec::new(), tagged: pubkey.to_string() }
     }
 
     /// Fetch these events by id (reposted notes VAAK hasn't stored).
     pub fn by_ids(ids: Vec<String>, kinds: Vec<i64>) -> Self {
         let filter = json!({"ids": ids, "kinds": kinds, "limit": ids.len().max(1)});
-        Self { filter, authors: Vec::new(), kinds, ids }
+        Self { filter, authors: Vec::new(), kinds, ids, tagged: String::new() }
     }
 
     fn wants(&self, ev: &Event) -> bool {
+        if !self.tagged.is_empty() {
+            return self.kinds.contains(&ev.kind)
+                && ev.tags.iter().any(|t| t.first().map(String::as_str) == Some("p") && t.get(1) == Some(&self.tagged));
+        }
         if !self.ids.is_empty() {
             return self.ids.iter().any(|id| id == &ev.id) && self.kinds.contains(&ev.kind);
         }

@@ -18,7 +18,9 @@
 //!     relays (NIP-65 outbox), since that key's last good sync (at most 48 h
 //!     back), plus the notes those reposts point at. Every event's id and
 //!     signature are checked before it is stored.
-//!  4. Clean-up: notes older than the retention window, notes and profiles
+//!  4. Notifications (`notif`): events tagging each linked key, staged and
+//!     handed to PHP's `ap_mention_store`.
+//!  5. Clean-up: notes older than the retention window, notes and profiles
 //!     nobody follows any more, follows of removed links. Notes a VAAK user
 //!     boosted, quoted, bookmarked or liked stay (and their authors' profiles),
 //!     as do notes a stored repost points at.
@@ -145,7 +147,7 @@ pub fn plan_relays(
 /// Run `queries` against several relays at once, `s.concurrency` at a
 /// time, skipping removed relays and recording each relay's outcome.
 /// Returns (relay, result) pairs; a failed relay is an Err.
-async fn fan_out(
+pub(super) async fn fan_out(
     db: &Client,
     s: &Settings,
     jobs: Vec<(String, Vec<Query>)>,
@@ -176,7 +178,7 @@ async fn fan_out(
 }
 
 /// Verified events only; one copy per id.
-fn verified(events: impl IntoIterator<Item = Event>, now: i64, rejected: &mut usize) -> Vec<Event> {
+pub(super) fn verified(events: impl IntoIterator<Item = Event>, now: i64, rejected: &mut usize) -> Vec<Event> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
     for ev in events {
@@ -202,7 +204,7 @@ fn chunk_queries(authors: &[String], kinds: &[i64], since: Option<i64>, per_auth
         .collect()
 }
 
-async fn upsert_meta(db: &Client, pubkey: &str, profile: Option<&Event>, relays: Option<&Event>, fetched_at: i64) -> Result<()> {
+pub(super) async fn upsert_meta(db: &Client, pubkey: &str, profile: Option<&Event>, relays: Option<&Event>, fetched_at: i64) -> Result<()> {
     db.execute(
         "INSERT INTO nostr_profiles (pubkey, meta_fetched_at) VALUES ($1, $2)
          ON CONFLICT (pubkey) DO UPDATE SET meta_fetched_at = EXCLUDED.meta_fetched_at",
@@ -438,19 +440,22 @@ fn meta_stamp(found: bool, now: i64) -> i64 {
 
 async fn sync_followee_meta(db: &Client, s: &Settings, now: i64, deadline: Instant) -> Result<usize> {
     let stale = now - META_REFRESH_SECS;
+    // People who notified someone stay fresh too, once that table exists.
+    let notifiers = if super::notif::ready(db).await { "UNION SELECT n.actor FROM nostr_notifs n" } else { "" };
     let rows = db
         .query(
-            "WITH wanted AS (
+            &format!("WITH wanted AS (
                SELECT f.pubkey FROM nostr_follows f
                JOIN nostr_links l ON l.owner_user_id = f.owner_user_id AND l.show_in_home
                UNION
                SELECT t.pubkey FROM nostr_events r JOIN nostr_events t ON t.id = r.reply_to AND t.kind = 1 WHERE r.kind = 6
+               {notifiers}
              )
              SELECT w.pubkey FROM wanted w
              LEFT JOIN nostr_profiles p ON p.pubkey = w.pubkey
              WHERE p.pubkey IS NULL OR p.meta_fetched_at < $1
              ORDER BY COALESCE(p.meta_fetched_at, 0), w.pubkey
-             LIMIT $2",
+             LIMIT $2"),
             &[&stale, &META_AUTHORS_PER_RUN],
         )
         .await
@@ -739,7 +744,15 @@ async fn shares_ready(db: &Client) -> bool {
 async fn cleanup(db: &Client, s: &Settings, now: i64) -> Result<u64> {
     let cutoff = now - s.retention_days * 86_400;
     // Until the nostr_shares migration has run nothing can be shared yet.
-    let keep = if shares_ready(db).await { format!(" AND NOT ({KEPT_NOTE_SQL})") } else { String::new() };
+    let mut kept: Vec<&str> = Vec::new();
+    if shares_ready(db).await {
+        kept.push(KEPT_NOTE_SQL);
+    }
+    let notifs = super::notif::ready(db).await;
+    if notifs {
+        kept.push(super::notif::KEPT_SQL);
+    }
+    let keep = if kept.is_empty() { String::new() } else { format!(" AND NOT ({})", kept.join(" OR ")) };
     let mut n = db.execute(&format!("DELETE FROM nostr_events e WHERE e.created_at < $1{keep}"), &[&cutoff]).await?;
     n += db
         .execute("DELETE FROM nostr_follows f WHERE NOT EXISTS (SELECT 1 FROM nostr_links l WHERE l.owner_user_id = f.owner_user_id)", &[])
@@ -768,11 +781,15 @@ async fn cleanup(db: &Client, s: &Settings, now: i64) -> Result<u64> {
         )
         .await
         .unwrap_or(0);
+    n += super::notif::cleanup(db, cutoff).await;
+    let notifiers = if notifs { " AND NOT EXISTS (SELECT 1 FROM nostr_notifs n WHERE n.actor = p.pubkey)" } else { "" };
     n += db
         .execute(
-            "DELETE FROM nostr_profiles p WHERE NOT EXISTS (SELECT 1 FROM nostr_follows f WHERE f.pubkey = p.pubkey)
-               AND NOT EXISTS (SELECT 1 FROM nostr_links l WHERE l.pubkey = p.pubkey)
-               AND NOT EXISTS (SELECT 1 FROM nostr_events e WHERE e.pubkey = p.pubkey)",
+            &format!(
+                "DELETE FROM nostr_profiles p WHERE NOT EXISTS (SELECT 1 FROM nostr_follows f WHERE f.pubkey = p.pubkey)
+                   AND NOT EXISTS (SELECT 1 FROM nostr_links l WHERE l.pubkey = p.pubkey)
+                   AND NOT EXISTS (SELECT 1 FROM nostr_events e WHERE e.pubkey = p.pubkey){notifiers}"
+            ),
             &[],
         )
         .await?;
@@ -796,6 +813,7 @@ pub async fn run_once(cfg: &Config, budget_secs: u64) -> Result<String> {
     sync_links(&mut db, &s, now, deadline, &mut log).await?;
     let meta = sync_followee_meta(&db, &s, now, deadline).await?;
     let notes = sync_notes(&mut db, &s, now, deadline).await?;
+    let notifs = super::notif::sync(&mut db, &s, now, deadline).await?;
     db.execute(
         "UPDATE nostr_links SET synced_at = $1 WHERE show_in_home AND follow_list_at > 0",
         &[&now],
@@ -804,13 +822,16 @@ pub async fn run_once(cfg: &Config, budget_secs: u64) -> Result<String> {
     let cleaned = cleanup(&db, &s, now).await?;
     relay_book::prune(&db, now).await?;
     Ok(format!(
-        "nostr-sync {}meta={meta} authors={} relays={}/{} stored={} rejected={} cleaned={cleaned} ms={}",
+        "nostr-sync {}meta={meta} authors={} relays={}/{} stored={} rejected={} notifs={}/{} ingest={} cleaned={cleaned} ms={}",
         if log.is_empty() { String::new() } else { format!("{} ", log.join(" ")) },
         notes.authors,
         notes.relays_ok,
         notes.relays,
         notes.stored,
         notes.rejected,
+        notifs.staged,
+        notifs.owners,
+        if notifs.ingest.is_empty() { "-" } else { notifs.ingest.as_str() },
         started.elapsed().as_millis()
     ))
 }
