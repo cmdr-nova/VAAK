@@ -332,7 +332,7 @@ pub(crate) fn fields_html(fields:&[Value])->String{
   if name.is_empty()||card::php_trim(&field_tag_re().replace_all(raw,"")).is_empty(){continue;}
   let value=field_html(&crate::home_hydrate_ranked::html_entity_decode(raw));if value.is_empty(){continue;}
   let verified=if card::boolean(field,"verified_at"){s(field,"verified_at")}else{""};
-  rows.push_str(&format!("<div class=\"remote-profile-field\"><span class=\"meta\" style=\"display:block;font-size:.75rem;margin:0 0 .15rem\">{}{} </span><div style=\"overflow:hidden;text-overflow:ellipsis;white-space:nowrap\">{value}</div></div>",h(name),if verified.is_empty(){String::new()}else{format!(" <span class=\"field-verified\" title=\"Verified via rel=me · {}\" aria-label=\"Verified\">✓</span>",h(verified))}));
+  rows.push_str(&format!("<div class=\"remote-profile-field\"><span class=\"meta\" style=\"display:block;font-size:.75rem;margin:0 0 .15rem\">{}{}</span><div style=\"overflow:hidden;text-overflow:ellipsis;white-space:nowrap\">{value}</div></div>",h(name),if verified.is_empty(){String::new()}else{format!(" <span class=\"field-verified\" title=\"Verified via rel=me · {}\" aria-label=\"Verified\">✓</span>",h(verified))}));
  }if rows.is_empty(){String::new()}else{format!("<div class=\"remote-profile-fields\" aria-label=\"Profile fields\">{rows}</div>")}
 }
 pub(crate) fn parity_markdown(raw: &str) -> String { secondary::markdown(raw) }
