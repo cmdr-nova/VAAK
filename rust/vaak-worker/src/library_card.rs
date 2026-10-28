@@ -109,6 +109,10 @@ pub(crate) fn linked_body_html(text:&str,status:&Value,facts:&CardFacts)->Result
 pub(crate) fn linked_body_presentation(text:&str,status:&Value,view:&str,owner_actor:&str,emoji_map:&std::collections::HashMap<String,String>)->Result<String>{
     Ok(super::body::facets(&super::body::emojis(&body_text(text,view,status.get("mentions").and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[]),owner_actor)?,emoji_map,false),status))
 }
+/// admin_linkify_body_html(..., [], actor) after its own mention discovery.
+pub(crate) fn linked_discovered_presentation(body:&super::body::DiscoveredBody,status:&Value,view:&str,emoji_map:&std::collections::HashMap<String,String>)->Result<String>{
+    Ok(super::body::facets(&super::body::emojis(&super::body::linked_discovered(body,view)?,emoji_map,false),status))
+}
 pub(crate) fn account_actor_ref(account:&Value)->String {
     let uri=string(account,"uri").trim_end_matches('/');let url=string(account,"url").trim_end_matches('/');
     if uri.starts_with("https://")&&!static_regex!(r"/@[^/]+$").is_match(uri){return uri.into();}

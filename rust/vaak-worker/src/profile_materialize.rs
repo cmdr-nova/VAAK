@@ -1008,6 +1008,7 @@ pub(crate) use search::{SearchHit,SearchProjector,post_media_resolve};
 
 #[path="profile_materialize_entities.rs"]
 mod entities;
+pub(crate) use entities::{raw_body_mentions,RawBodyMentionProof};
 
 /// Shared status presentation for notification pages. Callers pass text and
 /// mention rows they already loaded; this does not query or fetch.

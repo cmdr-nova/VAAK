@@ -71,8 +71,10 @@ impl Projector<'_> {
  }
  async fn bare_mention(&mut self,user:&str)->Result<Option<Value>>{
   let needle=crate::library::card::php_trim(user).to_ascii_lowercase();if let Some(cached)=self.bare_memo.get(&needle){return Ok(cached.clone())}if needle=="cmdr_nova"{let value=Some(self.mention_from_actor("https://mkultra.monster/users/cmdr_nova").await?);self.bare_memo.insert(needle,value.clone());return Ok(value)}
-  let rows=self.rows("SELECT to_jsonb(a) FROM remote_actors a WHERE lower(username)=$1::jsonb->>'username' ORDER BY updated_at DESC LIMIT 3",json!({"username":needle})).await?;
-  let value=if let Some(row)=rows.first(){Some(self.mention_from_actor(s(row,"actor_id")).await?)}else{None};self.bare_memo.insert(needle,value.clone());Ok(value)
+  let rows=self.rows(BARE_ACTORS,json!({"username":needle})).await?;
+  // ap_masto_resolve_bare_username then tries ap_local_user_by_username.
+  let local=if rows.is_empty()&&re!(r"^[A-Za-z0-9_]{2,32}$").is_match(crate::library::card::php_trim(user))&&re!(r"^[a-z][a-z0-9_]{1,29}$").is_match(&needle){self.rows(LOCAL_USER,json!({"username":needle})).await?.first().map(|r|s(r,"actor_id").to_owned()).filter(|a|!a.is_empty())}else{None};
+  let value=if let Some(row)=rows.first(){Some(self.mention_from_actor(s(row,"actor_id")).await?)}else if let Some(actor)=local{Some(self.mention_from_actor(&actor).await?)}else{None};self.bare_memo.insert(needle,value.clone());Ok(value)
  }
  pub(super) async fn canonical_pack(&mut self,raw:&str)->Result<Value>{self.canonical_pack_with_actors(raw,&[]).await}
  pub(super) async fn canonical_pack_with_actors(&mut self,raw:&str,extra:&[String])->Result<Value>{
@@ -89,16 +91,79 @@ impl Projector<'_> {
   let mut replacements=vec![];for(start,end,prefix,token)in tokens{if self.bare_mention(&token).await?.is_some(){continue}let offsets=token.char_indices().map(|(i,_)|i).chain(std::iter::once(token.len())).collect::<Vec<_>>();for n in (2..offsets.len()-1).rev(){let split=offsets[n];if self.bare_mention(&token[..split]).await?.is_some(){replacements.push((start,end,format!("{prefix}@{} {}",&token[..split],&token[split..])));break}}}for(start,end,value)in replacements.into_iter().rev(){text.replace_range(start..end,&value)}
   for c in re!(r"(^|[^A-Za-z0-9_])@([A-Za-z0-9_]+)@([a-z0-9.-]+\.[a-z]{2,})").captures_iter(&text){let acct=format!("{}@{}",&c[2],c[3].to_ascii_lowercase());if mentions.iter().any(|m|s(m,"acct").eq_ignore_ascii_case(&acct)){continue}let mut m=self.mention_from_actor(&format!("https://{}/users/{}",c[3].to_ascii_lowercase(),encode(&c[2]))).await?;m["acct"]=json!(acct);m["username"]=json!(&c[2]);mentions.push(m)}
   for c in re!(r"(^|[^A-Za-z0-9_@])@([A-Za-z0-9][A-Za-z0-9.-]*\.[A-Za-z]{2,})").captures_iter(&text){if text[c.get(0).unwrap().end()..].chars().next().is_some_and(|ch|ch.is_ascii_alphanumeric()||".@".contains(ch)){continue}let handle=c[2].to_ascii_lowercase();if mentions.iter().any(|m|s(m,"username").eq_ignore_ascii_case(&handle)||s(m,"acct").eq_ignore_ascii_case(&handle)){continue}if handle.ends_with(".brid.gy"){continue}
-   let mut rows=self.rows("SELECT to_jsonb(a) FROM remote_actors a WHERE lower(username)=$1::jsonb->>'username' AND(host LIKE '%.brid.gy' OR host='brid.gy' OR actor_id LIKE 'https://bsky.brid.gy/%') ORDER BY updated_at DESC LIMIT 1",json!({"username":handle})).await?;
-   if rows.is_empty(){rows=self.rows("SELECT to_jsonb(a) FROM remote_actors a WHERE lower(username)=$1::jsonb->>'username' ORDER BY updated_at DESC LIMIT 1",json!({"username":handle})).await?}if let Some(row)=rows.first(){let actor=s(row,"actor_id").trim_end_matches('/');if actor.starts_with("https://"){mentions.push(self.mention_from_actor(actor).await?)}}
+   let mut rows=self.rows(BRIDGY_HANDLE,json!({"username":handle})).await?;
+   if rows.is_empty(){rows=self.rows(ANY_HANDLE,json!({"username":handle})).await?}if let Some(row)=rows.first(){let actor=s(row,"actor_id").trim_end_matches('/');if actor.starts_with("https://"){mentions.push(self.mention_from_actor(actor).await?)}}
   }
   for c in re!(r"(^|[^A-Za-z0-9_@])@([A-Za-z0-9_]{2,32})").captures_iter(&text){let end=c.get(0).unwrap().end();if text[end..].chars().next().is_some_and(|ch|ch.is_ascii_alphanumeric()||"_@".contains(ch)){continue}let user=&c[2];if mentions.iter().any(|m|s(m,"username").eq_ignore_ascii_case(user)){continue}if let Some(m)=self.bare_mention(user).await?{if let Some(old)=mentions.iter_mut().find(|old|s(old,"acct").eq_ignore_ascii_case(s(&m,"acct"))){*old=m}else{mentions.push(m)}}}
   render_pack(&text,&mentions)
  }
 }
+const BARE_ACTORS:&str="SELECT to_jsonb(a) FROM remote_actors a WHERE lower(username)=$1::jsonb->>'username' ORDER BY updated_at DESC LIMIT 3";
+const LOCAL_USER:&str="SELECT jsonb_build_object('actor_id',u.actor_id) FROM ap_users u WHERE lower(u.username)=$1::jsonb->>'username' AND u.disabled_at IS NULL LIMIT 1";
+const BRIDGY_HANDLE:&str="SELECT to_jsonb(a) FROM remote_actors a WHERE lower(username)=$1::jsonb->>'username' AND(host LIKE '%.brid.gy' OR host='brid.gy' OR actor_id LIKE 'https://bsky.brid.gy/%') ORDER BY updated_at DESC LIMIT 1";
+const ANY_HANDLE:&str="SELECT to_jsonb(a) FROM remote_actors a WHERE lower(username)=$1::jsonb->>'username' ORDER BY updated_at DESC LIMIT 1";
+impl crate::library::body::BodyMentionResolver for Projector<'_>{
+ async fn remote_username_actor(&mut self,needle:&str)->Result<Option<String>>{Ok(self.rows(BARE_ACTORS,json!({"username":needle})).await?.first().map(|r|s(r,"actor_id").to_owned()))}
+ async fn local_username_actor(&mut self,needle:&str)->Result<Option<String>>{Ok(self.rows(LOCAL_USER,json!({"username":needle})).await?.first().map(|r|s(r,"actor_id").to_owned()))}
+ async fn bridgy_handle_actor(&mut self,handle:&str)->Result<Option<String>>{Ok(self.rows(BRIDGY_HANDLE,json!({"username":handle})).await?.first().map(|r|s(r,"actor_id").to_owned()))}
+ async fn any_handle_actor(&mut self,handle:&str)->Result<Option<String>>{Ok(self.rows(ANY_HANDLE,json!({"username":handle})).await?.first().map(|r|s(r,"actor_id").to_owned()))}
+ async fn mention(&mut self,actor:&str)->Result<crate::library::body::BodyMention>{let m=self.mention_from_actor(actor).await?;Ok(crate::library::body::BodyMention{acct:s(&m,"acct").into(),username:s(&m,"username").into(),url:s(&m,"url").into()})}
+}
+/// Every actor-cache snapshot the discovery read, rechecked like the other
+/// projector dependencies before raw cards are published.
+#[derive(Clone)]
+pub(crate) struct RawBodyMentionProof(Vec<Dependency>);
+impl RawBodyMentionProof{pub(crate) async fn require_current(&self,db:&Client)->Result<()>{require_dependencies(db,&self.0,"PHP fallback: raw body mention cache changed before publication").await}}
+/// admin_linkify_body_html's own discovery for a raw outbox body. Read-only:
+/// the account helper's warm/remember effects are cache upkeep, not painted.
+pub(crate) async fn raw_body_mentions(db:&Client,owner:i64,plain:&str,owner_actor:&str,self_key:&str,self_actor:&str)->Result<(crate::library::body::DiscoveredBody,RawBodyMentionProof)>{
+ let mut projector=Projector{db,php_web_urls:false,owner,dependencies:Vec::new(),static_counts:Vec::new(),effects:Vec::new(),source_index:0,account_memo:Default::default(),bare_memo:Default::default(),cache:Vec::new(),graphs:Vec::new(),path:Vec::new()};
+ let body=crate::library::body::discover_mentions(plain,owner_actor,self_key,self_actor,&mut projector).await?;
+ if !projector.cache.is_empty()||!projector.graphs.is_empty(){bail!("PHP fallback: raw body mention discovery deferred projection")}
+ Ok((body,RawBodyMentionProof(projector.dependencies)))
+}
 #[cfg(test)]
 mod tests{
  use super::*;
+ use crate::library::body::{BodyMention,BodyMentionResolver};
+ /// Projector SQL, with the account helper answering the looked-up actor.
+ struct SqlOnly<'a,'b>(&'b mut Projector<'a>);
+ impl BodyMentionResolver for SqlOnly<'_,'_>{
+  async fn remote_username_actor(&mut self,needle:&str)->Result<Option<String>>{self.0.remote_username_actor(needle).await}
+  async fn local_username_actor(&mut self,needle:&str)->Result<Option<String>>{self.0.local_username_actor(needle).await}
+  async fn bridgy_handle_actor(&mut self,handle:&str)->Result<Option<String>>{self.0.bridgy_handle_actor(handle).await}
+  async fn any_handle_actor(&mut self,handle:&str)->Result<Option<String>>{self.0.any_handle_actor(handle).await}
+  async fn mention(&mut self,actor:&str)->Result<BodyMention>{Ok(BodyMention{acct:"x".into(),username:"x".into(),url:actor.into()})}
+ }
+ #[tokio::test]
+ #[ignore="opt-in disposable PostgreSQL actual PHP raw body mention SQL differential"]
+ async fn actual_php_raw_mention_lookups_postgres(){
+  let connection=std::env::var("LIBRARY_FIXTURE_DB").expect("disposable PG");assert!(connection.contains("/tmp/"));
+  let bin=std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../api/bin");
+  let fixture=std::process::Command::new(bin.join("php-policy-test")).arg(bin.join("profile-raw-mention-reference.php")).output().unwrap();assert!(fixture.status.success(),"{}",String::from_utf8_lossy(&fixture.stderr));
+  let fixture:Value=serde_json::from_slice(&fixture.stdout).unwrap();let fixture=&fixture["fixture"];
+  let db=crate::db::connect(&connection).await.unwrap();let schema=format!("raw_mentions_{}",std::process::id());
+  db.batch_execute(&format!("CREATE SCHEMA {schema};SET search_path TO {schema};CREATE TABLE remote_actors(actor_id TEXT PRIMARY KEY,username TEXT,display_name TEXT,host TEXT,icon_source_url TEXT,image_source_url TEXT,updated_at TEXT NOT NULL,summary TEXT,profile_json TEXT);CREATE TABLE ap_users(id BIGINT PRIMARY KEY,username TEXT NOT NULL UNIQUE,actor_key TEXT,actor_id TEXT NOT NULL UNIQUE,disabled_at TEXT)")).await.unwrap();
+  for row in fixture["remote_actors"].as_array().unwrap(){db.execute("INSERT INTO remote_actors(actor_id,username,host,updated_at) SELECT $1::jsonb->>'actor_id',$1::jsonb->>'username',$1::jsonb->>'host',$1::jsonb->>'updated_at'",&[row]).await.unwrap();}
+  for row in fixture["ap_users"].as_array().unwrap(){db.execute("INSERT INTO ap_users(id,username,actor_id,disabled_at) SELECT ($1::jsonb->>'id')::bigint,$1::jsonb->>'username',$1::jsonb->>'actor_id',$1::jsonb->>'disabled_at'",&[row]).await.unwrap();}
+  let names=["alice.bsky.social","ALICE.bsky.social","custom.example","Gargron","gargron","dup","DUP","luna","Luna","ghost","fixture","nobody","cmdr_nova","eliza","x.bsky.social","foo.brid.gy","bob","l"];
+  let config:tokio_postgres::Config=connection.parse().unwrap();
+  let host=config.get_hosts().iter().find_map(|h|match h{tokio_postgres::config::Host::Unix(path)=>Some(path.to_string_lossy().into_owned()),_=>None}).expect("unix socket fixture");
+  let dsn=format!("pgsql:host={host};dbname={};user={};options=--search_path={schema}",config.get_dbname().unwrap_or("postgres"),config.get_user().unwrap_or("postgres"));
+  let mut php=std::process::Command::new(bin.join("php-policy-test")).arg(bin.join("profile-raw-mention-reference.php")).arg(&dsn).stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
+  {use std::io::Write;php.stdin.take().unwrap().write_all(&serde_json::to_vec(&names).unwrap()).unwrap();}
+  let php=php.wait_with_output().unwrap();assert!(php.status.success(),"{}",String::from_utf8_lossy(&php.stderr));
+  let expected:Vec<Value>=serde_json::from_slice(&php.stdout).unwrap();
+  let mut projector=Projector{db:&db,php_web_urls:false,owner:0,dependencies:Vec::new(),static_counts:Vec::new(),effects:Vec::new(),source_index:0,account_memo:Default::default(),bare_memo:Default::default(),cache:Vec::new(),graphs:Vec::new(),path:Vec::new()};
+  for(name,php)in names.iter().zip(&expected){
+   let(bsky,bare)=crate::library::body::lookups_for_test(&mut SqlOnly(&mut projector),name).await.unwrap();
+   assert_eq!(json!({"name":name,"bsky":bsky,"bare":bare}),*php,"actual PHP raw mention lookup {name}");
+  }
+  let proof=RawBodyMentionProof(projector.dependencies);proof.require_current(&db).await.unwrap();
+  db.execute("UPDATE remote_actors SET updated_at='2027-01-01T00:00:00Z' WHERE actor_id='https://a.example/users/dup'",&[]).await.unwrap();
+  assert!(proof.require_current(&db).await.is_err(),"a changed cached actor must reject the admitted discovery");
+  db.batch_execute(&format!("SET search_path TO public;DROP SCHEMA {schema} CASCADE")).await.unwrap();
+ }
  #[test]fn actual_canonical_entity_helpers(){let reference:Value=serde_json::from_slice(&std::fs::read("/tmp/vaak-profile-entity-helper-reference.json").unwrap()).unwrap();let cases=reference["captures"].as_array().unwrap();assert_eq!(cases.len(),28);let mut counts=std::collections::HashMap::<String,usize>::new();for row in cases{*counts.entry(s(row,"helper").into()).or_default()+=1;let output=match s(row,"helper"){"plain_pack"=>plain_pack(s(row,"input")).unwrap(),"escaped_tags"=>{let(html,tags)=escaped_tags(s(row,"input"));json!([html,tags])},"html_tags"=>{let(html,tags)=html_tags(s(row,"input"));json!({"html":html,"tags":tags})},_=>panic!("unknown actual entity helper")};assert_eq!(output,row["expected"],"{} {:?}",row["helper"],row["input"]);}assert_eq!(counts.get("plain_pack"),Some(&11));assert_eq!(counts.get("escaped_tags"),Some(&11));assert_eq!(counts.get("html_tags"),Some(&6));}
  #[test]
  fn digit_only_hashtags_stay_plain_text() {

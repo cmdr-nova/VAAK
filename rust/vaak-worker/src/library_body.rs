@@ -10,7 +10,7 @@ macro_rules! static_regex { ($pattern:literal) => {{
  })
  }}; }
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use super::actions::{esc, query};
 
 /// Exact shared painter Ask-body precedence (ap-admin.php:17681-17726).
@@ -364,6 +364,245 @@ fn is_status_url(url: &str) -> bool {
     canonical||static_regex!(r"(?i)^https://(?:bsky\.app/profile/[^/]+/post/|[^/]+/(?:users|@)[^/]+/(?:statuses|posts)/[0-9]+|[^/]+/ap/(?:users|actor)s?/[^/]+/statuses/)").is_match(url)
 }
 
+// admin_linkify_body_html (ap-admin.php:16200) with its own mention discovery.
+// Raw outbox cards pass no declared mentions, so PHP discovers @user@host,
+// dotted handles and bare @user itself. Discovery reads the actor cache
+// through an injected resolver during admission; painting stays pure.
+
+/// One `$byAcct` entry, kept in PHP insertion order.
+#[derive(Clone,Debug,PartialEq)]
+pub(crate) struct BodyMention{pub(crate) acct:String,pub(crate) username:String,pub(crate) url:String}
+/// Row lookups of ap_masto_resolve_bare_username, ap_local_user_by_username and
+/// ap_masto_resolve_bsky_handle_actor (first actor_id column, as stored), plus
+/// ap_masto_mention_from_actor. The PHP gates around them stay in the driver.
+pub(crate) trait BodyMentionResolver{
+ async fn remote_username_actor(&mut self,needle:&str)->Result<Option<String>>;
+ async fn local_username_actor(&mut self,needle:&str)->Result<Option<String>>;
+ async fn bridgy_handle_actor(&mut self,handle:&str)->Result<Option<String>>;
+ async fn any_handle_actor(&mut self,handle:&str)->Result<Option<String>>;
+ async fn mention(&mut self,actor:&str)->Result<BodyMention>;
+}
+/// Discovered linkify input. Only `discover_mentions` constructs it.
+#[derive(Clone,Debug)]
+pub(crate) struct DiscoveredBody{source:String,text:String,code:Vec<(String,String)>,mentions:Vec<BodyMention>,self_actor:String}
+impl DiscoveredBody{
+ pub(crate) fn source(&self)->&str{&self.source}
+ #[cfg(test)] pub(crate) fn mentions(&self)->&[BodyMention]{&self.mentions}
+}
+/// The html_entity_decode boundary admission and painter both use to pick
+/// this path; other text keeps the canonical declared-mention painter.
+pub(crate) fn needs_discovery(plain:&str)->bool{crate::home_hydrate_ranked::html_entity_decode(super::card::php_trim(plain)).contains('@')}
+/// PCRE UCP `\w`.
+fn php_word(c:char)->bool{c=='_'||{let mut b=[0;4];static_regex!(r"^[\p{L}\p{N}]$").is_match(c.encode_utf8(&mut b))}}
+fn ascii_word(c:char)->bool{c.is_ascii_alphanumeric()||c=='_'}
+fn char_at(text:&str,at:usize)->Option<char>{text.get(at..).and_then(|rest|rest.chars().next())}
+/// preg scan of `(^|[^class])BODY`: '^' first, then one prefix character,
+/// otherwise advance one character; a match resumes at its end. Returns
+/// (match start, body start, body end).
+fn php_prefixed(text:&str,prefix:impl Fn(char)->bool,body:impl Fn(usize)->Option<usize>)->Vec<(usize,usize,usize)>{
+ let mut out=Vec::new();let mut p=0;
+ if let Some(end)=body(0){out.push((0,0,end));p=end;}
+ while let Some(c)=char_at(text,p){
+  if prefix(c){if let Some(end)=body(p+c.len_utf8()){out.push((p,p+c.len_utf8(),end));p=end;continue;}}
+  p+=c.len_utf8();
+ }
+ out
+}
+fn ascii_run(text:&str,at:usize,ok:impl Fn(u8)->bool)->usize{text.as_bytes().get(at..).map(|b|b.iter().take_while(|c|ok(**c)).count()).unwrap_or(0)}
+/// `@([A-Za-z0-9_]+)@([a-z0-9.-]+\.[a-z]{2,})`: greedy host, latest dot first.
+fn body_user_host(text:&str,q:usize)->Option<usize>{
+ if char_at(text,q)!=Some('@'){return None}
+ let user=ascii_run(text,q+1,|c|c.is_ascii_alphanumeric()||c==b'_');if user==0||char_at(text,q+1+user)!=Some('@'){return None}
+ let start=q+2+user;let run=ascii_run(text,start,|c|c.is_ascii_lowercase()||c.is_ascii_digit()||c==b'.'||c==b'-');
+ (start+1..start+run).rev().filter(|d|text.as_bytes()[*d]==b'.').find_map(|d|{let tld=ascii_run(text,d+1,|c|c.is_ascii_lowercase());(tld>=2).then_some(d+1+tld)})
+}
+/// `@([A-Za-z0-9][A-Za-z0-9.-]*\.[A-Za-z]{2,})(?![A-Za-z0-9.@])`.
+fn body_dotted(text:&str,q:usize)->Option<usize>{
+ if char_at(text,q)!=Some('@')||!char_at(text,q+1).is_some_and(|c|c.is_ascii_alphanumeric()){return None}
+ let start=q+2;let run=ascii_run(text,start,|c|c.is_ascii_alphanumeric()||c==b'.'||c==b'-');
+ (start..start+run).rev().filter(|d|text.as_bytes()[*d]==b'.').find_map(|d|{let tld=ascii_run(text,d+1,|c|c.is_ascii_alphabetic());(tld>=2&&!char_at(text,d+1+tld).is_some_and(|c|c.is_ascii_alphanumeric()||c=='.'||c=='@')).then_some(d+1+tld)})
+}
+/// `@([A-Za-z0-9_]{2,32})(?![A-Za-z0-9_@.])`.
+fn body_bare(text:&str,q:usize)->Option<usize>{
+ if char_at(text,q)!=Some('@'){return None}
+ let run=ascii_run(text,q+1,|c|c.is_ascii_alphanumeric()||c==b'_');
+ ((2..=32).contains(&run)&&!matches!(char_at(text,q+1+run),Some('@'|'.'))).then_some(q+1+run)
+}
+/// ap_masto_unglue_bare_handles token `@([A-Za-z][\w]{1,40})(?![@\w.])`.
+fn body_unglue(text:&str,q:usize)->Option<usize>{
+ if char_at(text,q)!=Some('@')||!char_at(text,q+1).is_some_and(|c|c.is_ascii_alphabetic()){return None}
+ let (mut end,mut count)=(q+2,0);while let Some(c)=char_at(text,end).filter(|c|php_word(*c)){end+=c.len_utf8();count+=1;}
+ ((1..=40).contains(&count)&&!matches!(char_at(text,end),Some('@'|'.'))).then_some(end)
+}
+/// `(?<!BEHIND)PATTERN` replacement; candidates come from the original subject.
+fn php_lookbehind_replace(text:&str,behind:impl Fn(char)->bool,pattern:&regex::Regex,replace:impl Fn(&str)->String)->String{
+ let mut out=String::new();let mut copied=0;let mut p=0;
+ // A rejected candidate retries one character later, inside its own span.
+ while let Some(found)=pattern.find_at(text,p){
+  let start=found.start();
+  if text[..start].chars().next_back().is_some_and(&behind){p=start+char_at(text,start).map_or(1,char::len_utf8);continue}
+  out.push_str(&text[copied..start]);out.push_str(&replace(found.as_str()));copied=found.end();p=copied;
+ }
+ out.push_str(&text[copied..]);out
+}
+const CMDR_NOVA:&str="https://mkultra.monster/users/cmdr_nova";
+async fn mention_from_actor<R:BodyMentionResolver>(resolver:&mut R,actor:&str)->Result<BodyMention>{
+ let actor=super::card::php_trim(actor).trim_end_matches('/');
+ if actor==CMDR_NOVA||actor.starts_with("https://mkultra.monster/users/cmdr_nova/"){return Ok(BodyMention{acct:"cmdr_nova".into(),username:"cmdr_nova".into(),url:CMDR_NOVA.into()})}
+ resolver.mention(actor).await
+}
+/// ap_masto_resolve_bare_username with its request-static memo.
+async fn resolve_bare<R:BodyMentionResolver>(resolver:&mut R,memo:&mut std::collections::HashMap<String,Option<BodyMention>>,username:&str)->Result<Option<BodyMention>>{
+ let username=super::card::php_trim(username);if username.is_empty(){return Ok(None)}
+ let needle=username.to_ascii_lowercase();if let Some(value)=memo.get(&needle){return Ok(value.clone())}
+ let value=if needle=="cmdr_nova"{Some(mention_from_actor(resolver,CMDR_NOVA).await?)}
+ else if let Some(actor)=resolver.remote_username_actor(&needle).await?{Some(mention_from_actor(resolver,&actor).await?)}
+ else if static_regex!(r"^[A-Za-z0-9_]{2,32}$").is_match(username)&&static_regex!(r"^[a-z][a-z0-9_]{1,29}$").is_match(&needle){
+  match resolver.local_username_actor(&needle).await?.filter(|actor|!actor.is_empty()){Some(actor)=>Some(mention_from_actor(resolver,&actor).await?),None=>None}
+ }else{None};
+ memo.insert(needle,value.clone());Ok(value)
+}
+/// ap_masto_resolve_bsky_handle_actor; `?:` turns NULL (and "0") into ''.
+async fn resolve_bsky<R:BodyMentionResolver>(resolver:&mut R,handle:&str)->Result<Option<String>>{
+ let handle=super::card::php_trim(handle).trim_start_matches('@').to_ascii_lowercase();
+ if handle.is_empty()||!handle.contains('.')||handle.ends_with(".brid.gy"){return Ok(None)}
+ let found=|actor:Option<String>|actor.filter(|a|a!="0").map(|a|a.trim_end_matches('/').to_owned()).filter(|a|a.starts_with("https://"));
+ if let Some(actor)=found(resolver.bridgy_handle_actor(&handle).await?){return Ok(Some(actor))}
+ Ok(found(resolver.any_handle_actor(&handle).await?))
+}
+/// The two cache lookups alone, for the SQL differential.
+#[cfg(test)]
+pub(crate) async fn lookups_for_test<R:BodyMentionResolver>(resolver:&mut R,name:&str)->Result<(Option<String>,Option<String>)>{
+ let mut memo=std::collections::HashMap::new();Ok((resolve_bsky(resolver,name).await?,resolve_bare(resolver,&mut memo,name).await?.map(|m|m.url)))
+}
+fn by_acct_set(list:&mut Vec<(String,BodyMention)>,key:String,value:BodyMention){if let Some(old)=list.iter_mut().find(|(k,_)|*k==key){old.1=value}else{list.push((key,value))}}
+/// Preprocessing and discovery half of admin_linkify_body_html. `self_key` and
+/// `self_actor` are vaak_actor_key()/vaak_actor_id() of the rendering request.
+pub(crate) async fn discover_mentions<R:BodyMentionResolver>(plain:&str,owner_actor:&str,self_key:&str,self_actor:&str,resolver:&mut R)->Result<DiscoveredBody>{
+ let self_actor=self_actor.trim_end_matches('/').to_owned();
+ let mut text=crate::home_hydrate_ranked::html_entity_decode(super::card::php_trim(plain));
+ let mut code=Vec::new();
+ if text.is_empty(){return Ok(DiscoveredBody{source:plain.into(),text,code,mentions:vec![],self_actor})}
+ text=static_regex!(r"`([^`\r\n]+)`").replace_all(&text,|cap:&regex::Captures|{
+  if super::card::php_trim(&cap[1]).is_empty(){return cap[0].to_owned();}
+  let key=format!("\u{1}C{}\u{1}",code.len());code.push((key.clone(),format!("<code>{}</code>",esc(&cap[1]))));key
+ }).into_owned();
+ text=php_lookbehind_replace(&text,|c|php_word(c)||matches!(c,'.'|'/'|':'|'@'),static_regex!(r"(?i)www\.[^\s<]+"),|tok|format!("https://{tok}"));
+ // ap_normalize_bridgy_plain_mentions also folds @handle@bsky.app.
+ text=static_regex!(r"@([A-Za-z0-9][A-Za-z0-9.-]*\.[A-Za-z]{2,})@(?:bsky\.brid\.gy|bsky\.app)\b").replace_all(&text,"@$1").into_owned();
+ text=repair_at_tags(&text);text=unglue_mentions(&text,&[]);text=expand_url_mentions(&text);
+ text=unglue_hashtags(&text);text=unglue_host_mentions(&text,owner_actor,&[]);
+ let mut memo=std::collections::HashMap::new();
+ // ap_masto_unglue_bare_handles: callbacks see the original subject.
+ let tokens=php_prefixed(&text,|c|!(php_word(c)||c=='@'),|q|body_unglue(&text,q));
+ let mut split=String::new();let mut copied=0;
+ for(_,q,end)in tokens{
+  let token=&text[q+1..end];
+  if resolve_bare(resolver,&mut memo,token).await?.is_some(){continue}
+  let offsets=token.char_indices().map(|(i,_)|i).collect::<Vec<_>>();
+  for n in (2..offsets.len()).rev(){
+   let(prefix,rest)=token.split_at(offsets[n]);
+   if !rest.chars().next().is_some_and(|c|c!='_'&&php_word(c))||rest.contains(['@','.','_'])||prefix.ends_with('_'){continue}
+   if resolve_bare(resolver,&mut memo,prefix).await?.is_some(){split.push_str(&text[copied..q]);split.push_str(&format!("@{prefix} {rest}"));copied=end;break}
+  }
+ }
+ split.push_str(&text[copied..]);text=split;
+ let mut by_acct:Vec<(String,BodyMention)>=Vec::new();
+ for(_,q,end)in php_prefixed(&text,|c|!ascii_word(c),|q|body_user_host(&text,q)){
+  let(user,host)=text[q+1..end].split_once('@').context("discovered user@host shape")?;let host=host.to_ascii_lowercase();
+  let full=format!("{user}@{host}");let key=full.to_ascii_lowercase();
+  if by_acct.iter().any(|(k,_)|*k==key){continue}
+  if (host=="bsky.brid.gy"||host.ends_with(".brid.gy"))&&user.contains('.'){continue}
+  let resolved=mention_from_actor(resolver,&format!("https://{host}/users/{}",query(user))).await?;
+  by_acct_set(&mut by_acct,key,BodyMention{acct:full,username:resolved.username,url:resolved.url});
+ }
+ for(_,q,end)in php_prefixed(&text,|c|!(ascii_word(c)||c=='@'),|q|body_dotted(&text,q)){
+  let handle=text[q+1..end].to_ascii_lowercase();
+  if by_acct.iter().any(|(k,m)|*k==handle||m.username.to_ascii_lowercase()==handle||m.acct.to_ascii_lowercase()==handle){continue}
+  let value=match resolve_bsky(resolver,&handle).await?{
+   Some(actor)=>mention_from_actor(resolver,&actor).await?,
+   None=>BodyMention{acct:handle.clone(),username:handle.clone(),url:format!("https://bsky.app/profile/{}",query(&handle))},
+  };
+  by_acct_set(&mut by_acct,handle,value);
+ }
+ let self_key=self_key.to_ascii_lowercase();
+ for(_,q,end)in php_prefixed(&text,|c|!(ascii_word(c)||c=='@'),|q|body_bare(&text,q)){
+  let user=&text[q+1..end];let key=user.to_ascii_lowercase();
+  if by_acct.iter().any(|(_,m)|m.username.to_ascii_lowercase()==key){continue}
+  if key==self_key||(self_key=="cmdr_nova"&&key=="cmdr-nova"){by_acct_set(&mut by_acct,self_key.clone(),BodyMention{acct:self_key.clone(),username:self_key.clone(),url:self_actor.clone()});continue}
+  if let Some(resolved)=resolve_bare(resolver,&mut memo,user).await?.filter(|m|!m.url.is_empty()&&m.url!="0"){by_acct_set(&mut by_acct,resolved.acct.to_ascii_lowercase(),resolved);continue}
+  by_acct_set(&mut by_acct,format!("__bare:{key}"),BodyMention{acct:user.into(),username:user.into(),url:format!("search://{user}")});
+ }
+ Ok(DiscoveredBody{source:plain.into(),text,code,mentions:by_acct.into_iter().map(|(_,m)|m).collect(),self_actor})
+}
+/// PHP urlencode, as http_build_query writes values.
+fn form_urlencode(value:&str)->String{let mut out=String::new();for b in value.bytes(){if b.is_ascii_alphanumeric()||b"-_.".contains(&b){out.push(b as char)}else if b==b' '{out.push('+')}else{out.push_str(&format!("%{b:02X}"))}}out}
+/// The `$profileHref` closure: search, own outbox, then admin_profile_app_href.
+fn discovered_profile_href(url:&str,view:&str,self_actor:&str)->String{
+ if let Some(user)=url.strip_prefix("search://"){return format!("?view=search&q={}&type=accounts&resolve=1",query(&format!("@{user}")))}
+ let own=url.trim_end_matches('/');if !own.is_empty()&&(own==self_actor||own.starts_with(&format!("{self_actor}/"))){return "?view=outbox".into()}
+ let actor=super::card::php_trim(url).trim_end_matches('/');if actor.is_empty(){return "/vaak/?view=home".into()}
+ if let Some(cap)=static_regex!(r"^https://mkultra\.monster/users/([A-Za-z0-9_]+)$").captures(actor){
+  let path=format!("/vaak/users/{}",query(&cap[1].to_ascii_lowercase()));
+  return if view!="home"{format!("{path}?from={}",form_urlencode(view))}else{path}
+ }
+ format!("/vaak/?view=remote_profile&actor={}&from={}",form_urlencode(actor),form_urlencode(view))
+}
+/// Pure painting half of admin_linkify_body_html for a discovered list.
+/// Unmatched `@` tokens stay escaped text, exactly as PHP leaves them.
+pub(crate) fn linked_discovered(body:&DiscoveredBody,view:&str)->Result<String>{
+ if body.text.is_empty(){return Ok(String::new())}
+ let view={let view=view.chars().filter(|c|c.is_ascii_lowercase()||*c=='_').collect::<String>();if view.is_empty(){"home".to_owned()}else{view}};
+ let plain=php_lookbehind_replace(&body.text,|c|php_word(c)||matches!(c,'.'|'/'|':'|'@'|'%'|'-'),static_regex!(r#"(?i)(?:[a-z0-9-]+\.)+[a-z]{2,}/[^\s<>"']+"#),|tok|if tok.contains("...")||tok.contains('…')||tok.contains(".."){tok.to_owned()}else{format!("https://{tok}")});
+ let mut hold:Vec<(String,String,bool)>=Vec::new();
+ let protected=static_regex!(r"(?i)https?://[^\s<]+").replace_all(&plain,|cap:&regex::Captures|{
+  let raw=&cap[0];let core=raw.trim_end_matches(['.',',',';',':','!','?',')',']']);
+  let(raw,trail)=if core.len()<raw.len()&&!core.is_empty()&&!core.ends_with('/'){(core,&raw[core.len()..])}else{(raw,"")};
+  let key=format!("\u{1}U{}\u{1}",hold.len());hold.push((key.clone(),raw.to_owned(),true));format!("{key}{trail}")
+ }).into_owned();
+ let mut escaped=esc(&protected);
+ if !body.mentions.is_empty(){
+  let mut list=body.mentions.clone();list.sort_by_key(|m|std::cmp::Reverse(m.acct.len()));
+  let local_actor=static_regex!(r"(?i)^https://mkultra\.monster/users/[A-Za-z0-9_]+$");
+  for m in list.iter().filter(|m|m.acct.contains('@')){
+   let href=esc(&discovered_profile_href(&m.url,&view,&body.self_actor));
+   let local=local_actor.is_match(&m.url);
+   let label=if local{if m.username.is_empty(){m.acct.split('@').next().unwrap_or("").to_owned()}else{m.username.clone()}}else{m.acct.clone()};
+   escaped=escaped.replace(&format!("@{}",esc(&m.acct)),&format!("<a class=\"mention\" href=\"{href}\">@{}</a>",esc(&label)));
+  }
+  escaped=static_regex!(r#"(?s)<a class="mention"[^>]*>.*?</a>"#).replace_all(&escaped,|cap:&regex::Captures|{let key=format!("\u{1}M{}\u{1}",hold.len());hold.push((key.clone(),cap[0].to_owned(),false));key}).into_owned();
+  let mut by_user:Vec<(String,Option<&BodyMention>)>=Vec::new();
+  for m in &list{
+   let key=m.username.to_ascii_lowercase();
+   match by_user.iter_mut().find(|(u,_)|*u==key){
+    None=>by_user.push((key,Some(m))),
+    Some((_,slot))=>if let Some(previous)=*slot{if previous.acct.contains('@')&&!m.acct.contains('@'){*slot=Some(m)}else if previous.url!=m.url{*slot=None}},
+   }
+  }
+  for m in by_user.into_iter().filter_map(|(_,m)|m){
+   let uname=esc(&m.username);
+   let link=format!("<a class=\"mention\" href=\"{}\">@{uname}</a>",esc(&discovered_profile_href(&m.url,&view,&body.self_actor)));
+   let needle=format!("@{uname}");let mut out=String::new();let mut copied=0;
+   let hits=php_prefixed(&escaped,|c|!(ascii_word(c)||c=='/'),|q|escaped.get(q..).filter(|rest|rest.starts_with(&needle)).map(|_|q+needle.len()).filter(|end|!char_at(&escaped,*end).is_some_and(|c|ascii_word(c)||c=='.'||c=='@')));
+   // preg_replace would read `$n` / `\n` references inside this replacement.
+   if !hits.is_empty()&&link.contains(['$','\\']){bail!("PHP fallback: discovered mention replacement has preg references")}
+   for(_,q,end)in hits{out.push_str(&escaped[copied..q]);out.push_str(&link);copied=end;}
+   out.push_str(&escaped[copied..]);escaped=out;
+  }
+ }
+ escaped=static_regex!(r"(^|[^A-Za-z0-9_&/%])#([\p{L}\p{N}_]{1,100})").replace_all(&escaped,|cap:&regex::Captures|{
+  let href=format!("?view=search&q={}&type=statuses",query(&format!("#{}",&cap[2])));
+  let key=format!("\u{1}H{}\u{1}",hold.len());hold.push((key.clone(),format!("<a class=\"hashtag\" href=\"{}\">#{}</a>",esc(&href),esc(&cap[2])),false));format!("{}{key}",&cap[1])
+ }).into_owned();
+ let mut keys=hold.iter().collect::<Vec<_>>();keys.sort_by_key(|(key,..)|std::cmp::Reverse(key.len()));
+ for(key,value,url)in keys{
+  let value=if *url{if is_status_url(value){format!("<a class=\"status-link\" href=\"{}\">{}</a>",esc(&super::actions::in_app_status_href(value,&view)),esc(value))}else{format!("<a class=\"ext-link\" href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\">{}</a>",esc(value),esc(value))}}else{value.clone()};
+  escaped=escaped.replace(key.as_str(),&value);
+ }
+ for(key,value)in &body.code{escaped=escaped.replace(key.as_str(),value);}
+ Ok(escaped)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -408,5 +647,42 @@ mod tests {
         for fixture in reference["raw_quotes"].as_array().unwrap(){let input=fixture["input"].as_str().unwrap();assert_eq!(looks_like_as2(input),fixture["looks"].as_bool().unwrap(),"actual AS2 recognition");assert_eq!(scrub_as2(input),fixture["scrub"].as_str().unwrap(),"actual AS2 scrub");assert_eq!(strip_raw_quotes(input,fixture["quoted"].as_str()),fixture["plain"].as_str().unwrap(),"actual raw quote strip");}
         assert_eq!(count, 8);
         assert!(linked_text("@uncachedperson", "bookmarks").is_err());
+    }
+    /// The PHP fixture's rows, read with the same SQL semantics in memory.
+    pub(crate) struct FixtureResolver(pub(crate) serde_json::Value);
+    impl FixtureResolver {
+        fn first(&self,table:&str,keep:impl Fn(&serde_json::Value)->bool,latest:bool)->Option<String>{
+            let mut rows=self.0[table].as_array().unwrap().iter().filter(|row|keep(row)).collect::<Vec<_>>();
+            if latest{rows.sort_by(|a,b|b["updated_at"].as_str().cmp(&a["updated_at"].as_str()));}
+            rows.first().map(|row|row["actor_id"].as_str().unwrap_or("").to_owned())
+        }
+    }
+    impl BodyMentionResolver for FixtureResolver {
+        async fn remote_username_actor(&mut self,needle:&str)->Result<Option<String>>{Ok(self.first("remote_actors",|r|r["username"].as_str().map(str::to_lowercase).as_deref()==Some(needle),true))}
+        async fn local_username_actor(&mut self,needle:&str)->Result<Option<String>>{Ok(self.first("ap_users",|r|r["username"].as_str().map(str::to_lowercase).as_deref()==Some(needle)&&r["disabled_at"].is_null(),false))}
+        async fn bridgy_handle_actor(&mut self,handle:&str)->Result<Option<String>>{Ok(self.first("remote_actors",|r|{let host=r["host"].as_str().unwrap_or("");r["username"].as_str().map(str::to_lowercase).as_deref()==Some(handle)&&(host.ends_with(".brid.gy")||host=="brid.gy"||r["actor_id"].as_str().unwrap_or("").starts_with("https://bsky.brid.gy/"))},true))}
+        async fn any_handle_actor(&mut self,handle:&str)->Result<Option<String>>{Ok(self.first("remote_actors",|r|r["username"].as_str().map(str::to_lowercase).as_deref()==Some(handle),true))}
+        async fn mention(&mut self,actor:&str)->Result<BodyMention>{
+            if let Some(known)=self.0["mentions"].get(actor){return Ok(BodyMention{acct:known["acct"].as_str().unwrap().into(),username:known["username"].as_str().unwrap().into(),url:known["url"].as_str().unwrap().into()})}
+            let url=reqwest::Url::parse(actor).unwrap();let user=url.path().trim_end_matches('/').rsplit('/').next().unwrap().to_owned();
+            Ok(BodyMention{acct:format!("{user}@{}",url.host_str().unwrap()),username:user,url:actor.into()})
+        }
+    }
+    /// Actual admin_linkify_body_html own discovery (raw outbox cards) with its
+    /// real bare/Bluesky SQL helpers on fixture rows and a mapped account helper.
+    #[tokio::test]
+    async fn actual_php_raw_body_mention_discovery(){
+        let dir=std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../api/bin");
+        let output=std::process::Command::new(dir.join("php-policy-test")).arg(dir.join("profile-raw-mention-reference.php")).output().unwrap();
+        assert!(output.status.success(),"{}",String::from_utf8_lossy(&output.stderr));
+        let reference:serde_json::Value=serde_json::from_slice(&output.stdout).unwrap();
+        let cases=reference["cases"].as_array().unwrap();assert!(cases.len()>=40,"{}",cases.len());
+        for case in cases{
+            let text=case["text"].as_str().unwrap();let actor=case["self_actor"].as_str().unwrap();
+            let mut resolver=FixtureResolver(reference["fixture"].clone());
+            let body=discover_mentions(text,actor,case["self_key"].as_str().unwrap(),actor,&mut resolver).await.unwrap();
+            assert_eq!(body.source(),text);
+            assert_eq!(linked_discovered(&body,case["view"].as_str().unwrap()).unwrap(),case["html"].as_str().unwrap(),"actual PHP raw discovery {}",case["name"]);
+        }
     }
 }

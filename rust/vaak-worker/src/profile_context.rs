@@ -228,7 +228,7 @@ impl GuestProfileSession {
     pub(crate) fn source_actor(&self)->&str{&self.source_actor}
 }
 type RawSourceDependency=(Value,String,Value,Option<Value>);
-struct RawProfileProof {owner:i64,owner_snapshot:Option<Value>,key:String,actor:String,target:Value,dependencies:Vec<RawSourceDependency>,quotes:Vec<(crate::profile_materialize::ProjectedQuoteTarget,bool)>,mapping_changes:Vec<crate::profile_materialize::AccountMappingChanges>}
+struct RawProfileProof {owner:i64,owner_snapshot:Option<Value>,key:String,actor:String,target:Value,dependencies:Vec<RawSourceDependency>,quotes:Vec<(crate::profile_materialize::ProjectedQuoteTarget,bool)>,mapping_changes:Vec<crate::profile_materialize::AccountMappingChanges>,mentions:Vec<crate::profile_materialize::RawBodyMentionProof>}
 impl RawProfileProof {
  async fn require_current(&self,db:&Client,page:&ProfilePage)->Result<()>{
   require_projection_identity(db,self.owner,&self.owner_snapshot,&self.actor,page).await?;
@@ -242,6 +242,7 @@ impl RawProfileProof {
    for(row,(_,_,profile,masto))in rows.iter().zip(&self.dependencies){if row.get::<_,Option<Value>>(0).as_ref()!=Some(profile)||&row.get::<_,Option<Value>>(1)!=masto{bail!("raw prepared prefix current presentation changed after later source preparation")}}
   }
   for(product,painted)in &self.quotes{product.require_current(db).await?;if *painted{if let Some(status)=product.status(){require_current_profile_card(db,self.owner,status).await?;}}}
+  for mentions in &self.mentions{mentions.require_current(db).await?;}
   Ok(())
  }
 }
@@ -259,6 +260,7 @@ async fn require_raw_profile_prefix(db:&Client,owner:i64,page:&ProfilePage,proof
   if rows.len()!=dependencies.len(){bail!("raw final prefix source cardinality changed")}
   for(row,(_,_,profile,masto))in rows.iter().zip(dependencies){if row.get::<_,Option<Value>>(0).as_ref()!=Some(profile)||row.get::<_,Option<Value>>(1)!=*masto{bail!("raw final prefix presentation changed")}}
  }
+ for proof in proofs{for mentions in &proof.mentions{mentions.require_current(db).await?;}}
  let mut children=Vec::new();for proof in proofs{for(product,painted)in &proof.quotes{product.require_current(db).await?;if *painted{if let Some(status)=product.status(){children.push(status);}}}}
  require_current_profile_cards(db,owner,&children).await
 }
@@ -336,11 +338,11 @@ pub(crate) async fn admit_guest_raw_with_dns(db:&Client,session:&GuestProfileSes
     crate::profile_bridge::ensure_budget()?;
     let (rows,media,bsky,memo)=load_guest_raw_page(db,selected_rows).await?;
     if let Some(warm)=session.warm_context(){for row in &rows{if warm.cached_avatar(&row.actor).is_none(){let icon=row.profile.get("icon_url").and_then(Value::as_str).unwrap_or("");let url=if reqwest::Url::parse(icon).ok().is_some_and(|url|url.scheme()=="https"){icon.to_owned()}else{"https://mkultra.monster/img/avatar/local-default.webp".into()};warm.cache_avatar(&row.actor,&url);}}}
-    let mut cards=Vec::new();let mut dependencies=Vec::new();let mut quote_products:Vec<(crate::profile_materialize::ProjectedQuoteTarget,bool)>=Vec::new();let mut mapping_changes=Vec::new();
+    let mut cards=Vec::new();let mut dependencies=Vec::new();let mut quote_products:Vec<(crate::profile_materialize::ProjectedQuoteTarget,bool)>=Vec::new();let mut mapping_changes=Vec::new();let mut mention_proofs=Vec::new();
     for row in rows{
         crate::profile_bridge::ensure_budget()?;
         let RawPageRow{index,raw,note:_,key,actor,profile,masto,digest,status,plain,quote:quote_intent}=row;
-        let stage=std::sync::Arc::new(RawStageGrant{proof:RawProfileProof{owner:0,owner_snapshot:None,key:session.actor_key.clone(),actor:session.canonical_actor.clone(),target:target.clone(),dependencies:vec![(status.clone(),key.clone(),profile.clone(),masto.clone())],quotes:vec![],mapping_changes:vec![]},page:page.clone()});
+        let stage=std::sync::Arc::new(RawStageGrant{proof:RawProfileProof{owner:0,owner_snapshot:None,key:session.actor_key.clone(),actor:session.canonical_actor.clone(),target:target.clone(),dependencies:vec![(status.clone(),key.clone(),profile.clone(),masto.clone())],quotes:vec![],mapping_changes:vec![],mentions:vec![]},page:page.clone()});
         let scoped_warm=session.warm_context().map(|context|context.bound(stage.clone()));let mut scoped_session=session.clone();if let Some(context)=&scoped_warm{scoped_session=scoped_session.with_warm_context(context.clone());}
         let mut facts=crate::profile_guest_facts::resolve_public_raw(db,&status,session.lazy_media,Some(&plain),scoped_warm.as_deref(),Some(&memo)).await?;
         facts.current_action_counts=None;
@@ -351,16 +353,18 @@ pub(crate) async fn admit_guest_raw_with_dns(db:&Client,session:&GuestProfileSes
             let attachments=object.get("attachment").map(|item|if let Some(items)=item.as_array(){items.clone()}else{vec![item.clone()]}).unwrap_or_default();
             attachments.iter().any(|item|item.get("url").and_then(Value::as_str).or_else(||item.get("url").and_then(|url|url.get("href")).and_then(Value::as_str))==Some(url.as_str()))
         }).map(|(url,preview)|(url.clone(),preview.clone())).collect();
-        let mut raw_facts=crate::profile_raw::RawProfileFacts{card:facts,actor_key:key.clone(),actor:actor.clone(),display_name:profile.get("name").and_then(Value::as_str).unwrap_or(&key).into(),note_dom_id:digest,masto_row:masto.clone(),status_id:String::new(),own_note:false,guest:true,quote_html:String::new(),link_card:None,media_preview_by_url:previews};
+        let mut raw_facts=crate::profile_raw::RawProfileFacts{card:facts,actor_key:key.clone(),actor:actor.clone(),display_name:profile.get("name").and_then(Value::as_str).unwrap_or(&key).into(),note_dom_id:digest,masto_row:masto.clone(),status_id:String::new(),own_note:false,guest:true,quote_html:String::new(),link_card:None,media_preview_by_url:previews,body_mentions:None};
         if let Some(intent)=quote_intent.as_ref(){let(html,product,changes)=prepare_raw_quote(db,&crate::profile_materialize::ProfileViewer::Guest(&scoped_session),&page,index,&raw,&status,intent,&raw_facts.card,dns,Some(&bsky)).await?;for change in &changes{for(previous,_)in &mut quote_products{previous.reconcile_account_changes(change)?;}}mapping_changes.extend(changes);let painted=!html.is_empty()&&product.status().is_some();raw_facts.quote_html=html;quote_products.push((product,painted));}
         if crate::profile_raw::root_preview_allowed(&raw,&raw_facts){raw_facts.link_card=crate::direct_preview::resolve_cache_only_guarded(db,dns,&crate::profile_raw::current_plain(&raw,&raw_facts),raw_facts.card.now,Some(stage.as_ref())).await?;}
+        // The public PHP profile renders with vaak_actor_key() '__guest__' and an empty vaak_actor_id().
+        let body=crate::profile_raw::current_plain(&raw,&raw_facts);if crate::library::body::needs_discovery(&body){let(found,proof)=crate::profile_materialize::raw_body_mentions(db,0,&body,&raw_facts.card.owner_actor,"__guest__","").await?;raw_facts.body_mentions=Some(found);mention_proofs.push(proof);}
         dependencies.push((status,key,profile,masto));cards.push((index,AdmittedRawProfileStatus{status:raw,facts:raw_facts}));
     }
     page.require_current_ledger(db).await?;
     if root_content_blocked_for(db,0,&session.canonical_actor).await?{bail!("PHP fallback: raw guest root changed before publication")}
     let final_target=db.query_opt("SELECT to_jsonb(p) FROM actor_profile p WHERE actor_key=$1",&[&session.actor_key]).await?.map(|row|row.get::<_,Value>(0));
     if final_target.as_ref()!=Some(&target){bail!("PHP fallback: raw target identity changed before publication")}
-    let proof=RawProfileProof{owner:0,owner_snapshot:None,key:session.actor_key.clone(),actor:session.canonical_actor.clone(),target,dependencies,quotes:quote_products,mapping_changes};let batch=GuestRawProfileCards{page,cards,proof};batch.require_current(db).await?;Ok(batch)
+    let proof=RawProfileProof{owner:0,owner_snapshot:None,key:session.actor_key.clone(),actor:session.canonical_actor.clone(),target,dependencies,quotes:quote_products,mapping_changes,mentions:mention_proofs};let batch=GuestRawProfileCards{page,cards,proof};batch.require_current(db).await?;Ok(batch)
 }
 /// Match the actual summary split boundary; ordinary QTIP/inline QT text is
 /// not a quoted source. Structured target resolution remains a separate step.
@@ -665,11 +669,14 @@ pub(crate) async fn admit_authenticated_raw_with_dns(db:&Client,session:&Authent
     let (selected_rows,page)=selection.into_indexed_parts();page.require_current_ledger(db).await?;page.require_target(&session.actor_key,&session.source_actor)?;
     let owner=db.query_opt("SELECT actor_id,actor_key FROM ap_users WHERE id=$1::bigint AND disabled_at IS NULL",&[&session.owner]).await?.context("inactive raw profile owner")?;
     let owner_actor:String=owner.get(0);let owner_key:String=owner.get(1);
+    // vaak_actor_key()/vaak_actor_id() of the signed-in PHP request.
+    let self_key=owner_key.to_ascii_lowercase().chars().filter(|c|c.is_ascii_lowercase()||c.is_ascii_digit()||*c=='_').collect::<String>();
+    let self_actor=Some(owner_actor.trim_end_matches('/')).filter(|actor|actor.starts_with("https://")).unwrap_or("").to_owned();
     let owner_snapshot=db.query_opt("SELECT to_jsonb(u) FROM ap_users u WHERE id=$1::bigint AND disabled_at IS NULL",&[&session.owner]).await?.map(|row|row.get::<_,Value>(0)).context("inactive raw profile owner snapshot")?;
     if root_content_blocked_for(db,session.owner,&session.canonical_actor).await?{bail!("PHP fallback: authenticated raw profile root blocked")}
     let target=db.query_opt("SELECT to_jsonb(p) FROM actor_profile p WHERE actor_key=$1",&[&session.actor_key]).await?.map(|row|row.get::<_,Value>(0)).context("PHP fallback: raw profile target unavailable")?;
     reject_unsupported_profile_quotes(&selected_rows.iter().map(|(_,row)|row.clone()).collect::<Vec<_>>())?;
-    let mut cards=Vec::new();let mut dependencies=Vec::new();let mut quote_products:Vec<(crate::profile_materialize::ProjectedQuoteTarget,bool)>=Vec::new();let mut mapping_changes=Vec::new();
+    let mut cards=Vec::new();let mut dependencies=Vec::new();let mut quote_products:Vec<(crate::profile_materialize::ProjectedQuoteTarget,bool)>=Vec::new();let mut mapping_changes=Vec::new();let mut mention_proofs=Vec::new();
     for (index,raw) in selected_rows{
         crate::profile_bridge::ensure_budget()?;
         let note=raw.get("id").and_then(Value::as_str).context("raw profile source is not an outbox note")?;
@@ -684,11 +691,12 @@ pub(crate) async fn admit_authenticated_raw_with_dns(db:&Client,session:&Authent
         let object=decoded.get("object").unwrap_or(&decoded);
         let quote_intent=raw_quote_intent(object,&plain)?;
         let masto=db.query_opt("SELECT to_jsonb(s) FROM masto_statuses s WHERE note_id IN ($1,$2) LIMIT 1",&[&note,&format!("{}/",note.trim_end_matches('/'))]).await?.map(|row|row.get::<_,Value>(0));
-        let stage=std::sync::Arc::new(RawStageGrant{proof:RawProfileProof{owner:session.owner,owner_snapshot:Some(owner_snapshot.clone()),key:session.actor_key.clone(),actor:session.canonical_actor.clone(),target:target.clone(),dependencies:vec![(status.clone(),key.clone(),profile.clone(),masto.clone())],quotes:vec![],mapping_changes:vec![]},page:page.clone()});
+        let stage=std::sync::Arc::new(RawStageGrant{proof:RawProfileProof{owner:session.owner,owner_snapshot:Some(owner_snapshot.clone()),key:session.actor_key.clone(),actor:session.canonical_actor.clone(),target:target.clone(),dependencies:vec![(status.clone(),key.clone(),profile.clone(),masto.clone())],quotes:vec![],mapping_changes:vec![],mentions:vec![]},page:page.clone()});
         crate::profile_bridge::ensure_budget()?;let mut scoped_session=session.clone();if let Some(context)=session.warm_context(){scoped_session=scoped_session.with_warm_context(context.bound(stage.clone()));}
         let mut raw_facts=crate::profile_raw_facts::resolve_authenticated(db,&scoped_session,&raw,&actor,&key,&profile).await?;
         if let Some(intent)=quote_intent.as_ref(){let(html,product,changes)=prepare_raw_quote(db,&crate::profile_materialize::ProfileViewer::Auth(&scoped_session),&page,index,&raw,&status,intent,&raw_facts.card,dns,None).await?;for change in &changes{for(previous,_)in &mut quote_products{previous.reconcile_account_changes(change)?;}}mapping_changes.extend(changes);let painted=!html.is_empty()&&product.status().is_some();raw_facts.quote_html=html;quote_products.push((product,painted));}
         if crate::profile_raw::root_preview_allowed(&raw,&raw_facts){raw_facts.link_card=crate::direct_preview::resolve_cache_only_guarded(db,dns,&crate::profile_raw::current_plain(&raw,&raw_facts),raw_facts.card.now,Some(stage.as_ref())).await?;}
+        let body=crate::profile_raw::current_plain(&raw,&raw_facts);if crate::library::body::needs_discovery(&body){let(found,proof)=crate::profile_materialize::raw_body_mentions(db,session.owner,&body,&raw_facts.card.owner_actor,&self_key,&self_actor).await?;raw_facts.body_mentions=Some(found);mention_proofs.push(proof);}
         dependencies.push((status,key,profile,masto));cards.push((index,AdmittedRawProfileStatus{status:raw,facts:raw_facts}));
     }
     page.require_current_ledger(db).await?;
@@ -697,7 +705,7 @@ pub(crate) async fn admit_authenticated_raw_with_dns(db:&Client,session:&Authent
     if final_target.as_ref()!=Some(&target){bail!("PHP fallback: raw target identity changed before publication")}
     let final_owner=db.query_opt("SELECT actor_id,actor_key FROM ap_users WHERE id=$1::bigint AND disabled_at IS NULL",&[&session.owner]).await?.context("inactive raw profile owner before publication")?;
     if final_owner.get::<_,String>(0)!=owner_actor||final_owner.get::<_,String>(1)!=owner_key{bail!("raw profile owner changed before publication")}
-    let proof=RawProfileProof{owner:session.owner,owner_snapshot:Some(owner_snapshot),key:session.actor_key.clone(),actor:session.canonical_actor.clone(),target,dependencies,quotes:quote_products,mapping_changes};let batch=AuthenticatedRawProfileCards{page,cards,proof};batch.require_current(db).await?;Ok(batch)
+    let proof=RawProfileProof{owner:session.owner,owner_snapshot:Some(owner_snapshot),key:session.actor_key.clone(),actor:session.canonical_actor.clone(),target,dependencies,quotes:quote_products,mapping_changes,mentions:mention_proofs};let batch=AuthenticatedRawProfileCards{page,cards,proof};batch.require_current(db).await?;Ok(batch)
 }
 pub(crate) struct GuestProfileCards {page:ProfilePage,cards:Vec<(usize,AdmittedGuestProfileStatus)>,remaining_preview_budget:i64,quote_state:Option<crate::profile_quote_state::QuotePreviewState>}
 impl GuestProfileCards {

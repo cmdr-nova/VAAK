@@ -31,6 +31,8 @@ pub(crate) struct RawProfileFacts {
     pub(crate) quote_html: String,
     pub(crate) link_card: Option<Value>,
     pub(crate) media_preview_by_url: std::collections::HashMap<String,String>,
+ // admin_linkify_body_html's own mention discovery, read during admission.
+ pub(crate) body_mentions: Option<body::DiscoveredBody>,
 }
 /// Cache/source-resolved quote options, corresponding to the actual raw
 /// painter's admin_quote_opts_from_status / admin_quote_opts_from_bsky / stub.
@@ -179,7 +181,13 @@ fn render_core(n:&Value,f:&RawProfileFacts)->Result<String>{
  let mut inner=String::new();
  if !plain.is_empty()&&!matches!(plain.as_str(),"(quote)"|"(media)"|"(poll)"|"(attachment)"|"(boost)"){
   let status=json!({"account":{"uri":actor},"mentions":[]});
-  inner.push_str(&format!("<div class=\"body feed-body\" style=\"white-space:pre-wrap\">{}</div>",card::linked_body_presentation(&plain,&status,view,&facts.owner_actor,&emoji)?));
+  // PHP passes no mentions here and discovers them itself; the admitted
+  // discovery must belong to this exact current body.
+  let linked=if body::needs_discovery(&plain){
+   let found=f.body_mentions.as_ref().filter(|found|found.source()==plain).ok_or_else(||anyhow::anyhow!("PHP fallback: raw body mention discovery absent"))?;
+   card::linked_discovered_presentation(found,&status,view,&emoji)?
+  }else{card::linked_body_presentation(&plain,&status,view,&facts.owner_actor,&emoji)?};
+  inner.push_str(&format!("<div class=\"body feed-body\" style=\"white-space:pre-wrap\">{linked}</div>"));
  }
  let media=raw_media(obj,f);
  let media_html=card::media_row(&media,facts.lazy_media);
@@ -248,7 +256,7 @@ pub(crate) fn prewarm_static_regexes(){
  let quote=RawQuoteFacts{acct:"@luna.example".into(),text:"Quoted line".into(),url:"at://did:plc:abc/app.bsky.feed.post/xyz".into(),media:vec![json!({"url":"https://cdn.example/original/clip.mp4","mediaType":"video/mp4","preview_url":"https://cdn.example/thumb.jpg"})],card:None,mentions:Vec::new(),spoiler:String::new(),sensitive:false,is_rss:false,article_url:String::new(),open_label:"Open original".into(),open_external:true};
  let quote_html=render_quote(&quote,&card).unwrap_or_default();
  let raw=json!({"id":"https://mkultra.monster/users/fixture/notes/prewarm","published":"2026-10-01T00:00:00Z","visibility":"public","content":"<p>prewarm</p>","in_reply_to":"https://mkultra.monster/users/fixture/notes/parent","raw_create_json":serde_json::to_string(&json!({"object":{"vaakOrigin":"bluesky","summary":"<p>cw</p>","blueskyUri":"https://bsky.app/profile/name.example/post/abc","attachment":[{"type":"Video","mediaType":"video/mp4","url":"https://cdn.example/original/clip.mp4"}],"oneOf":[{"name":"Yes"},{"name":"No"}]}})).unwrap_or_default()});
- let profile=RawProfileFacts{card,actor_key:"fixture".into(),actor:"https://mkultra.monster/users/fixture".into(),display_name:"Fixture".into(),note_dom_id:"0123456789abcdef0123456789abcdef".into(),masto_row:Some(json!({"edited_at":"2026-10-02T00:00:00Z","spoiler_text":"","sensitive":false,"visibility":"public","content_text":"prewarm"})),status_id:String::new(),own_note:false,guest:true,quote_html,link_card:None,media_preview_by_url:Default::default()};
+ let profile=RawProfileFacts{card,actor_key:"fixture".into(),actor:"https://mkultra.monster/users/fixture".into(),display_name:"Fixture".into(),note_dom_id:"0123456789abcdef0123456789abcdef".into(),masto_row:Some(json!({"edited_at":"2026-10-02T00:00:00Z","spoiler_text":"","sensitive":false,"visibility":"public","content_text":"prewarm"})),status_id:String::new(),own_note:false,guest:true,quote_html,link_card:None,media_preview_by_url:Default::default(),body_mentions:None};
  let _=render_core(&raw,&profile);
 }
 
@@ -268,6 +276,32 @@ mod tests{
    assert_eq!(render_quote(&q,&facts).unwrap(),string(case,"html"),"actual PHP raw quote {}",string(case,"case"));
   }
  }
+ /// An empty actor cache: every lookup misses, as for a cold Bluesky backfill.
+ struct ColdCache;
+ impl body::BodyMentionResolver for ColdCache{
+  async fn remote_username_actor(&mut self,_:&str)->Result<Option<String>>{Ok(None)}
+  async fn local_username_actor(&mut self,_:&str)->Result<Option<String>>{Ok(None)}
+  async fn bridgy_handle_actor(&mut self,_:&str)->Result<Option<String>>{Ok(None)}
+  async fn any_handle_actor(&mut self,_:&str)->Result<Option<String>>{Ok(None)}
+  async fn mention(&mut self,actor:&str)->Result<body::BodyMention>{Ok(body::BodyMention{acct:"user@host.example".into(),username:"user".into(),url:actor.into()})}
+ }
+ /// The production fallback: backfilled bodies carry handles PHP discovers
+ /// itself. Admitted discovery paints them; absent or stale discovery bails.
+ #[tokio::test]
+ async fn raw_body_mentions_use_admitted_discovery(){
+  let text="hi @alice.bsky.social, @user@host.example and @nobody (a@b.com)";
+  let raw=json!({"id":"https://mkultra.monster/users/luna_naloc/notes/mirrored","published":"2026-10-01T00:00:00Z","visibility":"public","content":"<p>x</p>","raw_create_json":serde_json::to_string(&json!({"object":{"vaakOrigin":"bluesky","blueskyUri":"at://did:plc:abc/app.bsky.feed.post/xyz"}})).unwrap()});
+  let mut card=presentation_facts();card.owner_id=0;card.csrf.clear();card.owner_actor.clear();
+  let mut profile=RawProfileFacts{card,actor_key:"luna_naloc".into(),actor:"https://mkultra.monster/users/luna_naloc".into(),display_name:"Luna".into(),note_dom_id:"0123456789abcdef0123456789abcdef".into(),masto_row:Some(json!({"spoiler_text":"","sensitive":false,"visibility":"public","content_text":text})),status_id:String::new(),own_note:false,guest:true,quote_html:String::new(),link_card:None,media_preview_by_url:Default::default(),body_mentions:None};
+  assert!(render_core(&raw,&profile).unwrap_err().to_string().starts_with("PHP fallback:"));
+  let stale=body::discover_mentions("other @nobody","","__guest__","",&mut ColdCache).await.unwrap();profile.body_mentions=Some(stale);
+  assert!(render_core(&raw,&profile).unwrap_err().to_string().starts_with("PHP fallback:"));
+  let found=body::discover_mentions(&current_plain(&raw,&profile),"","__guest__","",&mut ColdCache).await.unwrap();
+  let expected=body::linked_discovered(&found,"remote_profile").unwrap();profile.body_mentions=Some(found);
+  let html=render_core(&raw,&profile).unwrap();
+  assert!(html.contains(&format!("<div class=\"body feed-body\" style=\"white-space:pre-wrap\">{expected}</div>")),"{html}");
+  for anchor in ["href=\"/vaak/?view=remote_profile&amp;actor=https%3A%2F%2Fbsky.app%2Fprofile%2Falice.bsky.social&amp;from=remote_profile\">@alice.bsky.social</a>","href=\"/vaak/?view=remote_profile&amp;actor=https%3A%2F%2Fhost.example%2Fusers%2Fuser&amp;from=remote_profile\">@user@host.example</a>","href=\"?view=search&amp;q=%40nobody&amp;type=accounts&amp;resolve=1\">@nobody</a>","(a@b.com)"]{assert!(expected.contains(anchor),"{expected}");}
+ }
  /// Pure painter guard for a 50-card guest page. The old per-card regex compile
  /// made this about 1.3s. CI debug runners share the machine with the rest of
  /// the suite, so a single wall-clock sample is not the gate: after a warmup
@@ -284,7 +318,7 @@ mod tests{
   assert!(text_at<media_at,"quoted media belongs inside the quote card below the quoted text");
   let attachments=(1..=4).map(|n|json!({"type":"Image","mediaType":"image/jpeg","url":format!("https://cdn.test/{n}.jpg")})).collect::<Vec<_>>();
   let raw=json!({"id":"https://mkultra.monster/users/luna_naloc/notes/mirrored","published":"2026-10-01T00:00:00Z","visibility":"public","content":"<p>Mirrored post with a quote</p>","in_reply_to":"https://mkultra.monster/users/luna_naloc/notes/parent","raw_create_json":serde_json::to_string(&json!({"object":{"vaakOrigin":"bluesky","blueskyUri":"at://did:plc:abc/app.bsky.feed.post/xyz","attachment":attachments,"oneOf":[{"name":"Yes"},{"name":"No"}]}})).unwrap()});
-  let profile=RawProfileFacts{card,actor_key:"luna_naloc".into(),actor:"https://mkultra.monster/users/luna_naloc".into(),display_name:"Luna".into(),note_dom_id:"0123456789abcdef0123456789abcdef".into(),masto_row:Some(json!({"edited_at":"2026-10-02T00:00:00Z","spoiler_text":"","sensitive":false,"visibility":"public","content_text":"Mirrored post with a quote"})),status_id:String::new(),own_note:false,guest:true,quote_html,link_card:None,media_preview_by_url:Default::default()};
+  let profile=RawProfileFacts{card,actor_key:"luna_naloc".into(),actor:"https://mkultra.monster/users/luna_naloc".into(),display_name:"Luna".into(),note_dom_id:"0123456789abcdef0123456789abcdef".into(),masto_row:Some(json!({"edited_at":"2026-10-02T00:00:00Z","spoiler_text":"","sensitive":false,"visibility":"public","content_text":"Mirrored post with a quote"})),status_id:String::new(),own_note:false,guest:true,quote_html,link_card:None,media_preview_by_url:Default::default(),body_mentions:None};
   let _warmup=render_core(&raw,&profile).unwrap();
   let compiles_before=crate::library::static_regex_compiles();
   assert!(compiles_before>0,"warmup paint did not compile the static painter regexes");
@@ -348,7 +382,7 @@ mod tests{
    let optional=|key:&str|f.get(key).filter(|v|v.is_object()).cloned();
    let mut facts=RawProfileFacts{card:CardFacts{
     bsky:None,owner_id:card::integer(f,"owner_id"),owner_actor:string(f,"owner_actor").into(),return_view:string(f,"return_view").into(),auto_unblur_sensitive:card::boolean(f,"auto_unblur_sensitive"),resolved_avatar:string(f,"resolved_avatar").into(),csrf:string(f,"csrf").into(),favourited:card::boolean(f,"favourited"),bookmarked:card::boolean(f,"bookmarked"),boosted:card::boolean(f,"boosted"),own,current_action_counts:None,rss_row:None,rss_quote_row:None,rss_quoted:false,emoji_by_actor:emoji,reply_mentions:vec![],moderation,poll_row:optional("poll_row"),ask_row:optional("ask_row"),now:chrono::DateTime::from_timestamp(card::integer(f,"rendered_at"),0).unwrap(),lazy_media:card::boolean(f,"lazy_media")},
-    actor_key:string(f,"actor_key").into(),actor:string(f,"actor").into(),display_name:string(f,"display_name").into(),note_dom_id:string(f,"note_dom_id").into(),masto_row:optional("masto_row"),status_id:string(f,"status_id").into(),own_note:card::boolean(f,"own_note"),guest:card::boolean(f,"guest"),quote_html:string(f,"quote_html").into(),link_card:optional("link_card"),media_preview_by_url:map("media_preview_by_url")};
+    actor_key:string(f,"actor_key").into(),actor:string(f,"actor").into(),display_name:string(f,"display_name").into(),note_dom_id:string(f,"note_dom_id").into(),masto_row:optional("masto_row"),status_id:string(f,"status_id").into(),own_note:card::boolean(f,"own_note"),guest:card::boolean(f,"guest"),quote_html:string(f,"quote_html").into(),link_card:optional("link_card"),media_preview_by_url:map("media_preview_by_url"),body_mentions:None};
    // Prepared quote chrome must be produced by the native quote path in a
    // later integrated replay. A PHP expected subtree is never fed to Rust.
    assert!(facts.quote_html.is_empty(),"quote cases need integrated native quote facts, not expected HTML injection");
