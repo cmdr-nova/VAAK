@@ -14963,6 +14963,31 @@ function ap_masto_trend_status_seen_uris(array $rows): array
     return $seen;
 }
 
+/**
+ * Order trending posts from both networks by one popularity score:
+ * likes + 2 × (boosts + replies + quotes), decayed by post age so a
+ * week-old viral post doesn't own the list. Stable for equal scores.
+ *
+ * @param list<array<string,mixed>> $items
+ * @return list<array<string,mixed>>
+ */
+function ap_masto_trend_statuses_rank_mixed(array $items, ?int $now = null): array
+{
+    $now ??= time();
+    $scored = [];
+    foreach (array_values($items) as $i => $st) {
+        $eng = max(0, (int) ($st['favourites_count'] ?? 0))
+            + 2 * (max(0, (int) ($st['reblogs_count'] ?? 0))
+                + max(0, (int) ($st['replies_count'] ?? 0))
+                + max(0, (int) ($st['quotes_count'] ?? 0)));
+        $ts = strtotime((string) ($st['created_at'] ?? '')) ?: $now;
+        $ageHours = max(0.0, ($now - $ts) / 3600.0);
+        $scored[] = [($eng + 1) / (($ageHours + 2) ** 0.8), $i, $st];
+    }
+    usort($scored, static fn(array $a, array $b): int => [$b[0], $a[1]] <=> [$a[0], $b[1]]);
+    return array_column($scored, 2);
+}
+
 function ap_masto_trends_statuses(int $limit = 10): array
 {
     $limit = max(1, min(20, $limit));
@@ -15070,8 +15095,8 @@ function ap_masto_trends_statuses(int $limit = 10): array
         return true;
     };
 
-    // Leave room so cached Bluesky posts can appear in Explore (~30%).
-    $fediCap = 14;
+    // Each network gets up to 20 candidates; one shared score picks the winners below.
+    $fediCap = 20;
     foreach (array_chunk(array_keys($scored),32) as $oids) {
         if (count($out) >= $fediCap) break;
         try {
@@ -15128,12 +15153,12 @@ function ap_masto_trends_statuses(int $limit = 10): array
         );
         $st->execute([$since]);
         $bskyAdded = 0;
-        $bskyCap = 6;
+        $bskyCap = 20;
         foreach(array_chunk($st->fetchAll()?:[],32) as $batch) {
-            if($bskyAdded>=$bskyCap||count($out)>=20)break;
+            if($bskyAdded>=$bskyCap)break;
             $entries=[];foreach($batch as $row)$entries[]=['source'=>'bsky','row'=>$row];
             foreach(ap_masto_trend_status_candidate_batch($entries,ap_masto_trend_status_seen_uris($out)) as $status) {
-                if($bskyAdded>=$bskyCap||count($out)>=20)break;
+                if($bskyAdded>=$bskyCap)break;
                 if($takeStatus($status,$status['_vaak_trend_source']['row'],'bsky'))$bskyAdded++;
             }
         }
@@ -15141,29 +15166,8 @@ function ap_masto_trends_statuses(int $limit = 10): array
         // Optional Bluesky cache must never affect Fediverse trends.
     }
 
-    // Interleave Bluesky into the returned window (they were appended after
-    // fedi and used to get sliced off when limit < count($out)).
-    $fediOnly = [];
-    $bskyOnly = [];
-    foreach ($out as $st) {
-        if (($st['source'] ?? '') === 'bluesky') {
-            $bskyOnly[] = $st;
-        } else {
-            $fediOnly[] = $st;
-        }
-    }
-    $mixed = [];
-    $bi = 0;
-    foreach ($fediOnly as $i => $st) {
-        $mixed[] = $st;
-        if ($bi < count($bskyOnly) && ($i % 3 === 2)) {
-            $mixed[] = $bskyOnly[$bi++];
-        }
-    }
-    while ($bi < count($bskyOnly)) {
-        $mixed[] = $bskyOnly[$bi++];
-    }
-    $out = $mixed;
+    // One ranking across both networks: no fixed fediverse/Bluesky quota.
+    $out = ap_masto_trend_statuses_rank_mixed($out);
 
     ap_masto_trends_cache_set('statuses', array_slice($out, 0, 20));
     return ap_masto_trend_status_public_items(array_slice($out, 0, $limit));
