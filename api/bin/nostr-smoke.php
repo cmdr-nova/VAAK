@@ -120,6 +120,21 @@ $check(str_contains($frag['html'], 'couldn’t load') && !$frag['has_more'] && s
 $check(ap_nostr_cards_html([['id' => 'rss:1'], ['id' => 'nostr:' . $hex]], 1, 'bookmarks') === ['', ''], 'cards keep their slots when nothing paints');
 putenv('VAAK_SHADOW_HTTP');
 
+// Admin > Relays > Nostr: relay addresses follow the worker's rules.
+foreach ([
+    'WSS://Relay.Example.com/' => 'wss://relay.example.com',
+    'wss://relay.example.com:443/inbox/' => 'wss://relay.example.com/inbox',
+    ' wss://nos.lol ' => 'wss://nos.lol',
+] as $in => $want) {
+    $check(ap_nostr_normalize_relay_url($in) === $want, 'relay url normalizes: ' . $in);
+}
+foreach (['https://relay.example.com', 'ws://relay.example.com', 'wss://127.0.0.1', 'wss://localhost', 'wss://box.local',
+    'wss://relay.example.com:8443', 'wss://relay.example.com/?x=1', 'wss://user@relay.example.com', 'wss://relay.example.com/../x', 'wss://nodot'] as $bad) {
+    $check(ap_nostr_normalize_relay_url($bad) === null, 'relay url refused: ' . $bad);
+}
+$check(!ap_nostr_relay_admin_action('nostr_relay_add', ['relay_url' => 'wss://10.0.0.1'])['ok'], 'admin add refuses a private relay');
+$check(ap_nostr_relay_age(0, 100) === 'never' && ap_nostr_relay_age(9400, 10000) === '10 min ago', 'relay ages read naturally');
+
 if ($failures !== []) {
     fwrite(STDERR, "nostr-smoke: " . count($failures) . " of {$checks} checks failed\n - " . implode("\n - ", $failures) . "\n");
     exit(1);

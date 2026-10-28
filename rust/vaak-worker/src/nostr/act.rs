@@ -276,7 +276,8 @@ pub async fn prepare(cfg: &Config, owner: i64, purpose: &str, target: &str) -> R
     if !event::is_hex64(&target) {
         return refuse("That isn't a Nostr note or person.");
     }
-    let s = super::sync::Settings::from_env(30);
+    let mut s = super::sync::Settings::from_env(30);
+    super::relay_book::apply(&db, &mut s, chrono::Utc::now().timestamp()).await?;
     let mut pending = match purpose {
         "like" | "reply" | "repost" | "quote" => {
             let Some(row) = db
@@ -404,7 +405,7 @@ pub async fn prepare(cfg: &Config, owner: i64, purpose: &str, target: &str) -> R
                 return refuse("That's you.");
             }
             let mine = write_relays_of(&db, std::slice::from_ref(&me)).await;
-            let read_from = merge_relays(&[&mine, &s.index_relays]);
+            let read_from = super::relay_book::without_skipped(merge_relays(&[&mine, &s.index_relays]), &s.skip);
             let (base, answered) = newest_contacts(&me, &read_from).await;
             let Some(base) = base else {
                 return refuse(if answered == 0 {
@@ -433,6 +434,8 @@ pub async fn prepare(cfg: &Config, owner: i64, purpose: &str, target: &str) -> R
         }
         _ => return refuse("Unknown Nostr action."),
     };
+    // Relays an admin removed are never published to.
+    pending.relays = super::relay_book::without_skipped(std::mem::take(&mut pending.relays), &s.skip);
     if pending.relays.is_empty() {
         pending.relays = s.fallback_relays.clone();
     }

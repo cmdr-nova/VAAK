@@ -533,3 +533,218 @@ function ap_nostr_favourites_fragment(int $ownerUserId, int $offset, int $limit)
         . ($hasMore ? 'Scroll for more…' : '') . '</div></div>';
     return ['html' => $html, 'has_more' => $hasMore];
 }
+
+/** Same rules as the worker's normalize_relay_url (nostr/relay.rs): wss only, no ports but 443, no private names. */
+function ap_nostr_normalize_relay_url(string $raw): ?string
+{
+    $raw = trim($raw);
+    if (strlen($raw) > 200 || strncasecmp($raw, 'wss://', 6) !== 0) {
+        return null;
+    }
+    $rest = substr($raw, 6);
+    if (preg_match('/[?#@\\\\\s]/', $rest)) {
+        return null;
+    }
+    $slash = strpos($rest, '/');
+    $authority = $slash === false ? $rest : substr($rest, 0, $slash);
+    $path = $slash === false ? '' : substr($rest, $slash);
+    $colon = strrpos($authority, ':');
+    if ($colon !== false) {
+        if (substr($authority, $colon + 1) !== '443') {
+            return null;
+        }
+        $authority = substr($authority, 0, $colon);
+    }
+    $host = strtolower(rtrim($authority, '.'));
+    if ($host === '' || strlen($host) > 120 || !str_contains($host, '.') || in_array($host[0], ['.', '-'], true)
+        || !preg_match('/^[a-z0-9.-]+$/', $host) || preg_match('/^[0-9.]+$/', $host)
+        || $host === 'localhost' || preg_match('/\.(localhost|local|internal)$/', $host)) {
+        return null;
+    }
+    $path = rtrim($path, '/');
+    if (!preg_match('#^[A-Za-z0-9/_.~-]*$#', $path) || str_contains($path, '..')) {
+        return null;
+    }
+    return 'wss://' . $host . $path;
+}
+
+function ap_nostr_relays_ready(?PDO $db = null): bool
+{
+    try {
+        $db ??= ap_db();
+        $name = $db->query("SELECT to_regclass('public.nostr_relays')")->fetchColumn();
+        return is_string($name) && $name !== '';
+    } catch (Throwable $e) {
+        return false;
+    }
+}
+
+/** @return list<array<string,mixed>> configured relays first, then ones followed authors list, then removed ones */
+function ap_nostr_relays_list(?PDO $db = null): array
+{
+    try {
+        $db ??= ap_db();
+        $st = $db->query('SELECT url, is_index, is_fallback, added_at, removed_at, checked_at, ok, last_ok_at, last_error, fail_streak
+            FROM nostr_relays
+            ORDER BY (removed_at IS NOT NULL), (NOT is_index AND NOT is_fallback), ok IS TRUE, url
+            LIMIT 500');
+        return $st->fetchAll(PDO::FETCH_ASSOC) ?: [];
+    } catch (Throwable $e) {
+        return [];
+    }
+}
+
+/**
+ * Admin > Relays > Nostr actions. The worker reads the table on its next
+ * sync; removed relays are never contacted again until restored.
+ * @return array{ok:bool,notice?:string,error?:string}
+ */
+function ap_nostr_relay_admin_action(string $action, array $post, ?PDO $db = null): array
+{
+    $url = ap_nostr_normalize_relay_url((string) ($post['relay_url'] ?? ''));
+    if ($action !== 'nostr_relay_check_all' && $url === null) {
+        return ['ok' => false, 'error' => 'That isn\'t a public wss:// relay address.'];
+    }
+    try {
+        $db ??= ap_db();
+        if (!ap_nostr_relays_ready($db)) {
+            return ['ok' => false, 'error' => 'The Nostr relay table isn\'t set up yet. Deploy the latest release first.'];
+        }
+        $now = time();
+        switch ($action) {
+            case 'nostr_relay_add':
+                $role = (string) ($post['role'] ?? 'both');
+                $index = in_array($role, ['index', 'both'], true);
+                $fallback = in_array($role, ['fallback', 'both'], true);
+                $db->prepare('INSERT INTO nostr_relays (url, is_index, is_fallback, added_at) VALUES (?, ?, ?, ?)
+                    ON CONFLICT (url) DO UPDATE SET is_index = EXCLUDED.is_index, is_fallback = EXCLUDED.is_fallback, removed_at = NULL')
+                    ->execute([$url, $index ? 'true' : 'false', $fallback ? 'true' : 'false', $now]);
+                $check = ap_nostr_relay_check([$url]);
+                return ['ok' => true, 'notice' => 'Added ' . $url . '. ' . $check];
+            case 'nostr_relay_remove':
+                $db->prepare('UPDATE nostr_relays SET removed_at = ? WHERE url = ?')->execute([$now, $url]);
+                return ['ok' => true, 'notice' => 'Removed ' . $url . '. VAAK won\'t connect to it again.'];
+            case 'nostr_relay_restore':
+                $db->prepare('UPDATE nostr_relays SET removed_at = NULL WHERE url = ?')->execute([$url]);
+                return ['ok' => true, 'notice' => 'Restored ' . $url . '.'];
+            case 'nostr_relay_check':
+                return ['ok' => true, 'notice' => ap_nostr_relay_check([$url])];
+            case 'nostr_relay_check_all':
+                $urls = $db->query('SELECT url FROM nostr_relays WHERE removed_at IS NULL AND (is_index OR is_fallback) ORDER BY url LIMIT 60')
+                    ->fetchAll(PDO::FETCH_COLUMN) ?: [];
+                return $urls === [] ? ['ok' => false, 'error' => 'No relays to check yet.'] : ['ok' => true, 'notice' => ap_nostr_relay_check($urls)];
+        }
+    } catch (Throwable $e) {
+        return ['ok' => false, 'error' => 'Could not update Nostr relays.'];
+    }
+    return ['ok' => false, 'error' => 'Unknown relay action.'];
+}
+
+/** Probe relays through the worker (it records the result); a one-line summary. */
+function ap_nostr_relay_check(array $urls): string
+{
+    $res = ap_nostr_worker_call('/shadow/nostr-relay-check', ['urls' => array_values($urls)], 15000);
+    $results = $res['body']['results'] ?? null;
+    if (empty($res['body']['ok']) || !is_array($results)) {
+        return 'The relay check couldn\'t run right now.';
+    }
+    if (count($results) === 1) {
+        $r = $results[0];
+        return !empty($r['ok']) ? 'It answered.' : 'It did not answer: ' . mb_substr((string) ($r['error'] ?? ''), 0, 160);
+    }
+    $up = count(array_filter($results, static fn ($r): bool => !empty($r['ok'])));
+    return $up . ' of ' . count($results) . ' relays answered.';
+}
+
+function ap_nostr_relay_age(int $at, int $now): string
+{
+    if ($at <= 0) {
+        return 'never';
+    }
+    $d = max(0, $now - $at);
+    return match (true) {
+        $d < 90 => 'just now',
+        $d < 5400 => (int) round($d / 60) . ' min ago',
+        $d < 129600 => (int) round($d / 3600) . ' h ago',
+        default => (int) round($d / 86400) . ' d ago',
+    };
+}
+
+/** Admin > Relays > Nostr body. */
+function ap_nostr_relays_tab_html(string $csrf, ?PDO $db = null): string
+{
+    $e = static fn (mixed $s): string => htmlspecialchars((string) $s, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+    $action = '?view=relays&amp;network=nostr';
+    $hidden = '<input type="hidden" name="csrf" value="' . $e($csrf) . '">';
+    $btn = static function (string $act, string $url, string $label, string $class = 'btn-ghost', string $confirm = '') use ($e, $action, $hidden): string {
+        return '<form method="post" action="' . $action . '" style="display:inline"'
+            . ($confirm !== '' ? ' onsubmit="return confirm(\'' . $e($confirm) . '\');"' : '') . '>'
+            . '<input type="hidden" name="action" value="' . $e($act) . '"><input type="hidden" name="relay_url" value="' . $e($url) . '">' . $hidden
+            . '<button class="btn ' . $class . '" type="submit" style="padding:.25rem .7rem;font-size:.8rem">' . $e($label) . '</button></form>';
+    };
+    $h = '<div class="tweet" style="margin-bottom:1rem"><div class="who">Nostr relays</div>'
+        . '<div class="body meta" style="margin-top:.45rem">VAAK reads profiles and follow lists from <b>index</b> relays, and notes from each author\'s own relays, '
+        . 'using <b>fallback</b> relays when an author lists none (likes, replies and boosts are published there too). '
+        . 'The dot shows whether the relay answered the last time VAAK asked. Removing a relay stops VAAK from ever connecting to it, '
+        . 'even when an author lists it.</div></div>';
+    if (!ap_nostr_relays_ready($db)) {
+        return $h . '<div class="empty">The Nostr relay table isn\'t set up yet. Deploy the latest release first.</div>';
+    }
+    $h .= '<form class="composer" method="post" action="' . $action . '" style="margin-bottom:1rem">'
+        . '<input type="hidden" name="action" value="nostr_relay_add">' . $hidden
+        . '<input type="text" name="relay_url" required placeholder="wss://relay.example" autocomplete="off" spellcheck="false">'
+        . '<div class="composer-actions"><select name="role" aria-label="Use as">'
+        . '<option value="both">Index and fallback</option><option value="index">Index only</option><option value="fallback">Fallback only</option></select>'
+        . '<button class="btn btn-primary" type="submit">Add relay</button></div></form>';
+    $rows = ap_nostr_relays_list($db);
+    if ($rows === []) {
+        return $h . '<div class="empty">No relays recorded yet. They show up after the next Nostr sync.</div>';
+    }
+    $h .= '<div style="margin:0 0 1rem">' . $btn('nostr_relay_check_all', '', 'Check all index and fallback relays') . '</div>';
+    $now = time();
+    $section = '';
+    foreach ($rows as $r) {
+        $removed = $r['removed_at'] !== null;
+        $index = in_array($r['is_index'], [true, 't', '1', 1], true);
+        $fallback = in_array($r['is_fallback'], [true, 't', '1', 1], true);
+        $group = $removed ? 'Removed' : (($index || $fallback) ? 'In use' : 'Listed by people you follow');
+        if ($group !== $section) {
+            $section = $group;
+            $h .= '<h3 style="font-size:.95rem;color:var(--muted);margin:1.2rem 0 .5rem">' . $e($group) . '</h3>';
+        }
+        $checked = (int) $r['checked_at'];
+        $ok = $r['ok'] === null ? null : in_array($r['ok'], [true, 't', '1', 1], true);
+        [$color, $state] = $removed ? ['#6b7280', 'removed'] : ($checked === 0 || $ok === null ? ['#6b7280', 'not checked yet'] : ($ok ? ['#22c55e', 'answering'] : ['#ef4444', 'not answering']));
+        $url = (string) $r['url'];
+        $h .= '<article class="tweet nostr-relay" data-relay-url="' . $e($url) . '"><div class="who">'
+            . '<span class="nostr-relay-dot" role="img" aria-label="' . $e($state) . '" title="' . $e($state) . '" style="display:inline-block;width:.7rem;height:.7rem;border-radius:50%;background:' . $color . ';margin-right:.45rem;vertical-align:middle"></span>'
+            . $e($url);
+        if ($index) {
+            $h .= ' <span class="tag" style="margin-left:.35rem">index</span>';
+        }
+        if ($fallback) {
+            $h .= ' <span class="tag" style="margin-left:.35rem">fallback</span>';
+        }
+        $h .= '</div><div class="body meta" style="margin-top:.35rem">';
+        if ($removed) {
+            $h .= 'removed ' . $e(ap_nostr_relay_age((int) $r['removed_at'], $now));
+        } else {
+            $h .= 'checked ' . $e(ap_nostr_relay_age($checked, $now)) . ' · last answered ' . $e(ap_nostr_relay_age((int) $r['last_ok_at'], $now));
+            if ($ok === false) {
+                $h .= ' · failed ' . (int) $r['fail_streak'] . 'x in a row';
+                if ((string) $r['last_error'] !== '') {
+                    $h .= '<br><code style="font-size:.75rem;word-break:break-all">' . $e(mb_substr((string) $r['last_error'], 0, 300)) . '</code>';
+                }
+            }
+        }
+        $h .= '</div><div class="tweet-actions">';
+        if ($removed) {
+            $h .= $btn('nostr_relay_restore', $url, 'Restore');
+        } else {
+            $h .= $btn('nostr_relay_check', $url, 'Check now') . ' '
+                . $btn('nostr_relay_remove', $url, 'Remove', 'btn-ghost', 'Remove this Nostr relay? VAAK will stop connecting to it.');
+        }
+        $h .= '</div></article>';
+    }
+    return $h;
+}

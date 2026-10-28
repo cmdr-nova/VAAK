@@ -30,6 +30,7 @@ use tokio_postgres::Client;
 
 use super::event::{self, Event};
 use super::relay::{self, Query};
+use super::relay_book;
 use crate::config::Config;
 
 const LINK_REFRESH_SECS: i64 = 3600;
@@ -56,6 +57,8 @@ pub struct Settings {
     pub max_relays: usize,
     pub concurrency: usize,
     pub budget: Duration,
+    /// Relays an admin removed (`nostr_relays.removed_at`); never contacted.
+    pub skip: HashSet<String>,
 }
 
 fn relay_list_env(name: &str, default: &str) -> Vec<String> {
@@ -81,6 +84,7 @@ impl Settings {
             max_relays: num("VAAK_NOSTR_MAX_RELAYS", 24, 1, 60) as usize,
             concurrency: num("VAAK_NOSTR_RELAY_CONCURRENCY", 6, 1, 16) as usize,
             budget: Duration::from_secs(budget_secs.clamp(10, 600)),
+            skip: HashSet::new(),
         }
     }
 }
@@ -134,14 +138,17 @@ pub fn plan_relays(
     plan
 }
 
-/// Run `queries` against several relays at once, `concurrency` at a time.
+/// Run `queries` against several relays at once, `s.concurrency` at a
+/// time, skipping removed relays and recording each relay's outcome.
 /// Returns (relay, result) pairs; a failed relay is an Err.
 async fn fan_out(
+    db: &Client,
+    s: &Settings,
     jobs: Vec<(String, Vec<Query>)>,
-    concurrency: usize,
     run_deadline: Instant,
 ) -> Vec<(String, Result<relay::FetchResult>)> {
-    futures_util::stream::iter(jobs.into_iter().map(|(url, queries)| async move {
+    let jobs: Vec<(String, Vec<Query>)> = jobs.into_iter().filter(|(url, _)| !s.skip.contains(url)).collect();
+    let results: Vec<(String, Result<relay::FetchResult>)> = futures_util::stream::iter(jobs.into_iter().map(|(url, queries)| async move {
         let deadline = (Instant::now() + RELAY_TIMEOUT).min(run_deadline);
         let res = relay::fetch(&url, &queries, deadline).await;
         match &res {
@@ -156,9 +163,12 @@ async fn fan_out(
         }
         (url, res)
     }))
-    .buffer_unordered(concurrency.max(1))
+    .buffer_unordered(s.concurrency.max(1))
     .collect()
-    .await
+    .await;
+    let outcomes: Vec<relay_book::Outcome> = results.iter().map(|(url, res)| relay_book::outcome(url, res)).collect();
+    relay_book::record(db, &outcomes, chrono::Utc::now().timestamp()).await;
+    results
 }
 
 /// Verified events only; one copy per id.
@@ -253,7 +263,7 @@ async fn sync_links(db: &mut Client, s: &Settings, now: i64, deadline: Instant, 
     for row in known {
         let list: Value = row.get(0);
         for r in list.as_array().into_iter().flatten().filter_map(Value::as_str).filter_map(relay::normalize_relay_url) {
-            if !relays.contains(&r) {
+            if !relays.contains(&r) && !s.skip.contains(&r) {
                 relays.push(r);
             }
         }
@@ -264,7 +274,7 @@ async fn sync_links(db: &mut Client, s: &Settings, now: i64, deadline: Instant, 
     let jobs = relays.into_iter().map(|r| (r, queries.clone())).collect();
     let mut all = Vec::new();
     let mut answered = 0usize;
-    for (_, res) in fan_out(jobs, s.concurrency, deadline).await {
+    for (_, res) in fan_out(db, s, jobs, deadline).await {
         if let Ok(res) = res {
             answered += usize::from(res.completed > 0);
             all.extend(res.events);
@@ -394,7 +404,7 @@ async fn sync_followee_meta(db: &Client, s: &Settings, now: i64, deadline: Insta
     let queries = chunk_queries(&keys, &[0, 10002], None, 3);
     let jobs = s.index_relays.iter().map(|r| (r.clone(), queries.clone())).collect();
     let mut all = Vec::new();
-    for (_, res) in fan_out(jobs, s.concurrency, deadline).await {
+    for (_, res) in fan_out(db, s, jobs, deadline).await {
         if let Ok(res) = res {
             all.extend(res.events);
         }
@@ -413,7 +423,7 @@ async fn sync_followee_meta(db: &Client, s: &Settings, now: i64, deadline: Insta
             .map(|(url, ks)| (url.clone(), chunk_queries(ks, &[0, 10002], None, 3)))
             .collect();
         let mut more = Vec::new();
-        for (_, res) in fan_out(jobs, s.concurrency, deadline).await {
+        for (_, res) in fan_out(db, s, jobs, deadline).await {
             if let Ok(res) = res {
                 more.extend(res.events);
             }
@@ -462,7 +472,15 @@ async fn sync_notes(db: &mut Client, s: &Settings, now: i64, deadline: Instant) 
             continue;
         }
         let list: Value = row.get(1);
-        let relays = list.as_array().into_iter().flatten().filter_map(Value::as_str).filter_map(relay::normalize_relay_url).collect();
+        // A removed relay is dropped here, so its authors fall back instead.
+        let relays = list
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .filter_map(relay::normalize_relay_url)
+            .filter(|r| !s.skip.contains(r))
+            .collect();
         synced_at.insert(key.clone(), row.get(2));
         authors.push((key, relays));
     }
@@ -487,7 +505,7 @@ async fn sync_notes(db: &mut Client, s: &Settings, now: i64, deadline: Instant) 
         .collect();
     let mut events = Vec::new();
     let mut good_authors: HashSet<String> = HashSet::new();
-    for (url, res) in fan_out(jobs, s.concurrency, deadline).await {
+    for (url, res) in fan_out(db, s, jobs, deadline).await {
         match res {
             Ok(res) => {
                 if res.completed > 0 {
@@ -600,13 +618,14 @@ pub async fn run_once(cfg: &Config, budget_secs: u64) -> Result<String> {
         return Ok("nostr-sync skipped=disabled".into());
     }
     let started = Instant::now();
-    let s = Settings::from_env(budget_secs);
+    let mut s = Settings::from_env(budget_secs);
     let deadline = started + s.budget;
     let mut db = crate::db::connect(&cfg.database_url).await?;
     if !tables_ready(&db).await {
         return Ok("nostr-sync skipped=no-tables".into());
     }
     let now = chrono::Utc::now().timestamp();
+    relay_book::apply(&db, &mut s, now).await?;
     let mut log = Vec::new();
     sync_links(&mut db, &s, now, deadline, &mut log).await?;
     let meta = sync_followee_meta(&db, &s, now, deadline).await?;
@@ -617,6 +636,7 @@ pub async fn run_once(cfg: &Config, budget_secs: u64) -> Result<String> {
     )
     .await?;
     let cleaned = cleanup(&db, &s, now).await?;
+    relay_book::prune(&db, now).await?;
     Ok(format!(
         "nostr-sync {}meta={meta} authors={} relays={}/{} stored={} rejected={} cleaned={cleaned} ms={}",
         if log.is_empty() { String::new() } else { format!("{} ", log.join(" ")) },

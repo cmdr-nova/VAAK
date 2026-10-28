@@ -118,6 +118,7 @@ function vaak_migrate_deploy_sql_files(string $apiRoot): array
         '20261028_nostr_postgres.sql',
         '20261028_nostr_actions_postgres.sql',
         '20261028_nostr_shares_postgres.sql',
+        '20261028_nostr_relays_postgres.sql',
     ];
     $files = [];
     $migrations = $root . DIRECTORY_SEPARATOR . 'migrations' . DIRECTORY_SEPARATOR;
