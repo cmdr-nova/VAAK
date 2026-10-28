@@ -49,6 +49,20 @@ fn groups_likes_on_same_status() {
 }
 
 #[test]
+fn groups_nostr_likes_on_same_note() {
+    let note = "https://njump.me/note1abc";
+    let rows = vec![
+        fav("20", "a", "nostr:npub1aaa", note),
+        fav("21", "b", "nostr:npub1bbb", note),
+        fav("22", "c", "nostr:npub1ccc", "https://njump.me/note1other"),
+    ];
+    let grouped = group_notification_rows(&rows);
+    assert_eq!(grouped.len(), 2);
+    assert_eq!((grouped[0].count, grouped[0].accounts.len()), (2, 2));
+    assert!(paint_grouped_card(&grouped[0], "").contains("2 people liked your post"));
+}
+
+#[test]
 fn does_not_group_mentions() {
     let rows = vec![json!({
         "id": "1",
