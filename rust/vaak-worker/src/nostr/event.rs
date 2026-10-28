@@ -1,7 +1,7 @@
 //! NIP-01 events: id and BIP-340 signature checks, plus the few kinds the
 //! sync reads (0 profile, 1 note, 3 follow list, 10002 relay list).
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
@@ -13,7 +13,7 @@ pub const MAX_FOLLOWS: usize = 5000;
 /// Write relays kept per author (NIP-65 asks for 2 to 4).
 pub const MAX_WRITE_RELAYS: usize = 4;
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Event {
     pub id: String,
     pub pubkey: String,

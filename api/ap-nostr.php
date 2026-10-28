@@ -1,15 +1,18 @@
 <?php
 /**
- * Opt-in, read-only Nostr follows in Home.
+ * Opt-in Nostr follows in Home.
  *
  * A user pastes their npub in Settings > Profile. That is a public key: VAAK
  * never asks for or stores a Nostr private key, so it cannot publish anything
- * as the user or change their Nostr profile. `vaak-worker nostr-sync`
+ * as the user by itself. Likes, replies and follows from Home cards are signed
+ * in the browser by the user's signer extension (NIP-07) and only relayed by
+ * the worker (ap_nostr_action below, nostr/act.rs). `vaak-worker nostr-sync`
  * (rust/vaak-worker/src/nostr, deploy/vaak-nostr-sync.timer) reads the user's
  * follow list and their follows' recent notes from public relays, and Home
  * mixes those notes in.
  *
- * The tables come from api/migrations/20261028_nostr_postgres.sql (applied by
+ * The tables come from api/migrations/20261028_nostr_postgres.sql and
+ * 20261028_nostr_actions_postgres.sql (applied by
  * deploy/remote/migrate.php). Until they exist every helper here returns
  * nothing and Settings hides the form.
  *
@@ -334,4 +337,78 @@ function ap_nostr_status_line(?array $link, int $now): string
         $line .= ' Last problem: ' . $error . '.';
     }
     return $line;
+}
+
+/**
+ * Like, reply or follow from a Home card. The browser's signer extension
+ * (NIP-07) signs; the worker (`/shadow/nostr-prepare`, `/shadow/nostr-publish`
+ * in nostr/act.rs) builds the event, checks the signed copy and relays it.
+ * VAAK never sees a private key.
+ *
+ * @param array<string,mixed> $post
+ * @return array{status:int, body:array<string,mixed>}
+ */
+function ap_nostr_action(string $action, int $ownerUserId, bool $isAdmin, array $post): array
+{
+    $fail = static fn (int $status, string $error): array => ['status' => $status, 'body' => ['ok' => false, 'error' => $error]];
+    if (!ap_nostr_form_visible($isAdmin)) {
+        return $fail(403, 'Nostr is not open on this server yet.');
+    }
+    if ($ownerUserId < 1) {
+        return $fail(401, 'Sign in first.');
+    }
+    if ($action === 'nostr_prepare') {
+        $purpose = (string) ($post['purpose'] ?? '');
+        $target = strtolower(trim((string) ($post['target'] ?? '')));
+        if (!in_array($purpose, ['like', 'reply', 'follow', 'unfollow'], true) || !preg_match('/^[0-9a-f]{64}$/', $target)) {
+            return $fail(400, 'Unknown Nostr action.');
+        }
+        $path = '/shadow/nostr-prepare';
+        $payload = ['owner_id' => $ownerUserId, 'purpose' => $purpose, 'target' => $target];
+    } elseif ($action === 'nostr_publish') {
+        $nonce = (string) ($post['nonce'] ?? '');
+        $event = json_decode((string) ($post['event'] ?? ''), true);
+        if (!preg_match('/^[0-9a-f]{32}$/', $nonce) || !is_array($event)) {
+            return $fail(400, 'Your signer didn\'t return a signed event.');
+        }
+        $path = '/shadow/nostr-publish';
+        $payload = ['owner_id' => $ownerUserId, 'nonce' => $nonce, 'event' => $event];
+    } else {
+        return $fail(400, 'Unknown Nostr action.');
+    }
+    $base = getenv('VAAK_SHADOW_HTTP');
+    $base = is_string($base) && trim($base) !== '' ? rtrim(trim($base), '/') : 'http://127.0.0.1:8787';
+    $host = parse_url($base, PHP_URL_HOST);
+    if (!is_string($host) || !in_array(strtolower($host), ['127.0.0.1', 'localhost', '::1'], true) || !function_exists('curl_init')) {
+        return $fail(503, 'The Nostr worker is not reachable.');
+    }
+    if (!function_exists('ap_shadow_http_auth_headers')) {
+        require_once __DIR__ . '/ap-shadow-http.php';
+    }
+    $json = json_encode($payload, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+    if (!is_string($json) || strlen($json) > 1048576) {
+        return $fail(413, 'That is too large to send.');
+    }
+    $ch = curl_init($base . $path);
+    if ($ch === false) {
+        return $fail(503, 'The Nostr worker is not reachable.');
+    }
+    // Follow edits read the current list from relays before answering.
+    curl_setopt_array($ch, [
+        CURLOPT_POST => true,
+        CURLOPT_POSTFIELDS => $json,
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_CONNECTTIMEOUT_MS => 250,
+        CURLOPT_TIMEOUT_MS => 30000,
+        CURLOPT_FOLLOWLOCATION => false,
+        CURLOPT_HTTPHEADER => array_merge(['Content-Type: application/json', 'Accept: application/json'], ap_shadow_http_auth_headers()),
+    ]);
+    $raw = curl_exec($ch);
+    $code = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+    curl_close($ch);
+    $body = is_string($raw) ? json_decode($raw, true) : null;
+    if (!is_array($body) || !array_key_exists('ok', $body)) {
+        return $fail(502, 'The Nostr worker did not answer. Try again in a minute.');
+    }
+    return ['status' => $code === 200 ? 200 : max(400, $code), 'body' => $body];
 }

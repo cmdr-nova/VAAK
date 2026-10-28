@@ -88,6 +88,20 @@ $check(is_array($cursor) && $cursor['source'] === 'nostr' && $cursor['id'] === '
 $check(is_array($cursor) && admin_tl_ranked_index_of_cursor($ranked, $cursor) === 1, 'nostr cursor finds its ranked index');
 $check(admin_tl_cursor_token_from_ranked([['k' => 'nostr', 'id' => 'cc33', 'sort' => 0]], 0) === '', 'nostr row without sort gives no cursor');
 
+// Home card actions: the PHP side only validates and forwards; anything
+// malformed is refused before the worker is asked.
+$hex = str_repeat('ab', 32);
+putenv('VAAK_NOSTR=0');
+$check(ap_nostr_action('nostr_prepare', 1, true, ['purpose' => 'like', 'target' => $hex])['status'] === 403, 'kill switch refuses actions');
+putenv('VAAK_NOSTR');
+$check(ap_nostr_action('nostr_prepare', 1, false, ['purpose' => 'like', 'target' => $hex])['status'] === 403, 'admin-only rollout refuses other users');
+$check(ap_nostr_action('nostr_prepare', 0, true, ['purpose' => 'like', 'target' => $hex])['status'] === 401, 'no user, no action');
+$check(ap_nostr_action('nostr_prepare', 1, true, ['purpose' => 'boost_everything', 'target' => $hex])['status'] === 400, 'unknown purpose refused');
+$check(ap_nostr_action('nostr_prepare', 1, true, ['purpose' => 'like', 'target' => 'note1abc'])['status'] === 400, 'non-hex target refused');
+$check(ap_nostr_action('nostr_publish', 1, true, ['nonce' => 'xyz', 'event' => '{}'])['status'] === 400, 'bad nonce refused');
+$check(ap_nostr_action('nostr_publish', 1, true, ['nonce' => str_repeat('a', 32), 'event' => 'not json'])['status'] === 400, 'non-JSON event refused');
+$check(ap_nostr_action('nostr_sign_anything', 1, true, [])['status'] === 400, 'unknown action refused');
+
 if ($failures !== []) {
     fwrite(STDERR, "nostr-smoke: " . count($failures) . " of {$checks} checks failed\n - " . implode("\n - ", $failures) . "\n");
     exit(1);

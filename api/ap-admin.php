@@ -1058,6 +1058,20 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
         $error = $csrfError;
         $action = '';
     }
+    // Nostr like/reply/follow from Home cards: JSON in and out, signed by the
+    // browser's signer extension (ap_nostr_action, nostr/act.rs).
+    if ($action === 'nostr_prepare' || $action === 'nostr_publish') {
+        require_once __DIR__ . '/ap-nostr.php';
+        $nostrReply = ap_nostr_action($action, (int) admin_owner_user_id(), !empty($vaakIsAdmin), $_POST);
+        if (function_exists('ap_auth_session_write_close')) {
+            ap_auth_session_write_close();
+        }
+        header('Content-Type: application/json; charset=utf-8');
+        header('Cache-Control: no-store');
+        http_response_code($nostrReply['status']);
+        echo json_encode($nostrReply['body'], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+        exit;
+    }
     // Server-wide / operator-only mutations (UI views are gated; POSTs must be too)
 $vaakAdminOnlyActions = [
         'set_app_password', 'purge_oauth_tokens',
@@ -30543,6 +30557,21 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       display: flex; flex-direction: column; gap: .85rem; margin: .85rem 0 .25rem;
     }
     .profile-form .profile-linked-account .meta { margin: 0; }
+    form.nostr-reply { display: flex; flex-direction: column; gap: .5rem; margin: .6rem 0 .2rem; }
+    form.nostr-reply textarea {
+      width: 100%; box-sizing: border-box; resize: vertical; min-height: 4.5rem;
+      padding: .55rem .65rem; border-radius: 8px; border: 1px solid var(--border);
+      background: var(--panel-2); color: var(--text); font: inherit;
+    }
+    form.nostr-reply .nostr-reply-row { display: flex; gap: .5rem; justify-content: flex-end; }
+    .nostr-reply-done { margin: .5rem 0 .2rem; }
+    .nostr-toast {
+      position: fixed; left: 50%; bottom: calc(1.25rem + env(safe-area-inset-bottom, 0px)); transform: translateX(-50%);
+      z-index: 13000; max-width: min(92vw, 30rem); padding: .65rem .9rem; border-radius: 10px;
+      background: #151515; color: var(--text); border: 1px solid var(--border); box-shadow: 0 8px 24px rgba(0,0,0,.45);
+      font-size: .9rem; line-height: 1.35;
+    }
+    .nostr-toast[hidden] { display: none; }
     .profile-preview {
       display: flex; gap: 1rem; align-items: center; margin-bottom: 1rem;
       padding: .85rem; border-radius: 12px; background: var(--panel-2); border: 1px solid var(--border);
@@ -33530,7 +33559,8 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
               <button class="btn btn-primary" type="submit" form="nostr-link-form">Save</button>
             </div>
             <label class="meta" style="font-weight:400"><input type="checkbox" form="nostr-link-form" name="nostr_show_in_home" value="1"<?= $nostrShow ? ' checked' : '' ?>> Show posts from people I follow on Nostr in Home</label>
-            <div class="meta">Read-only: VAAK only needs your public npub, never your nsec, and never posts or changes anything on Nostr. Leave it empty to unlink.<?php if ($nostrStatus !== ''): ?> <?= h($nostrStatus) ?><?php endif; ?></div>
+            <div class="meta">VAAK only needs your public npub. Never paste your nsec anywhere on VAAK. Leave it empty to unlink.<?php if ($nostrStatus !== ''): ?> <?= h($nostrStatus) ?><?php endif; ?></div>
+            <div class="meta">To like, reply and follow on Nostr from Home, install a Nostr signer extension in your browser, such as <a href="https://github.com/fiatjaf/nos2x" target="_blank" rel="noopener noreferrer">nos2x</a> or <a href="https://getalby.com/" target="_blank" rel="noopener noreferrer">Alby</a> (on iPhone, Nostore for Safari), and add your key there. The extension signs each action and can ask you first; VAAK never sees your key. It must hold the same key as the npub above.</div>
           </div>
           <?php endif; ?>
         </div>
@@ -50063,6 +50093,178 @@ if (VIEW === 'analytics') loadAnalytics();
     } else {
       const input = button.parentElement && button.parentElement.querySelector('input[readonly]');
       if (input) { input.select(); document.execCommand('copy'); done(); }
+    }
+  });
+})();
+</script>
+<script>
+// Nostr like / reply / follow on Home cards. The browser's signer extension
+// (NIP-07: nos2x, Alby, Nostore…) signs; VAAK never sees the private key.
+// The worker builds each event (nostr_prepare) and only relays the exact
+// copy the extension signed (nostr_publish). See api/ap-nostr.php.
+(function () {
+  if (document.documentElement.dataset.nostrActionsBound === '1') return;
+  document.documentElement.dataset.nostrActionsBound = '1';
+
+  function toast(text) {
+    let el = document.getElementById('nostr-toast');
+    if (!el) {
+      el = document.createElement('div');
+      el.id = 'nostr-toast';
+      el.className = 'nostr-toast';
+      el.setAttribute('role', 'status');
+      el.setAttribute('aria-live', 'polite');
+      document.body.appendChild(el);
+    }
+    el.textContent = text;
+    el.hidden = false;
+    clearTimeout(el._vaakTimer);
+    el._vaakTimer = setTimeout(function () { el.hidden = true; }, 6000);
+  }
+
+  async function post(fields) {
+    const body = new URLSearchParams(fields);
+    body.set('ajax', '1');
+    if (window.VAAK_CSRF) body.set('csrf', window.VAAK_CSRF);
+    try {
+      const res = await fetch('?view=home&ajax=1', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Accept': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
+        body: body
+      });
+      const data = await res.json();
+      if (data && typeof data === 'object') return data;
+    } catch (e) {}
+    return { ok: false, error: 'VAAK did not answer. Try again.' };
+  }
+
+  async function run(purpose, target, content) {
+    const signer = window.nostr;
+    if (!signer || typeof signer.signEvent !== 'function' || typeof signer.getPublicKey !== 'function') {
+      toast('To like, reply or follow on Nostr, install a signer extension such as nos2x or Alby, then reload this page.');
+      return null;
+    }
+    const prep = await post({ action: 'nostr_prepare', purpose: purpose, target: target });
+    if (!prep.ok) { toast(prep.error || 'Could not prepare that.'); return null; }
+    let pubkey = '';
+    try { pubkey = String(await signer.getPublicKey() || '').toLowerCase(); } catch (e) {}
+    if (!pubkey) { toast('Your signer extension did not share its key.'); return null; }
+    if (pubkey !== prep.pubkey) {
+      toast('Your signer extension uses a different key than the npub linked in Settings > Profile.');
+      return null;
+    }
+    const unsigned = {
+      kind: prep.template.kind,
+      created_at: Math.floor(Date.now() / 1000),
+      tags: prep.template.tags,
+      content: prep.needs_content ? content : prep.template.content
+    };
+    let signed = null;
+    try { signed = await signer.signEvent(unsigned); } catch (e) {}
+    if (!signed || typeof signed !== 'object') { toast('Signing was cancelled.'); return null; }
+    const done = await post({ action: 'nostr_publish', nonce: prep.nonce, event: JSON.stringify(signed) });
+    if (!done.ok) { toast(done.error || 'No relay accepted it.'); return null; }
+    return done;
+  }
+
+  function sameTarget(act, target) {
+    const sel = '[data-nostr-act="' + act + '"][data-nostr-target="' + (window.CSS && CSS.escape ? CSS.escape(target) : target) + '"]';
+    return Array.prototype.slice.call(document.querySelectorAll(sel));
+  }
+
+  function setLiked(target, on) {
+    sameTarget('like', target).forEach(function (btn) {
+      btn.classList.toggle('on', on);
+      btn.setAttribute('aria-pressed', on ? 'true' : 'false');
+      const label = on ? 'Unlike on Nostr' : 'Like on Nostr';
+      btn.title = label;
+      btn.setAttribute('aria-label', label);
+      const icon = document.createElement('i');
+      icon.className = (on ? 'ph-fill' : 'ph') + ' ph-heart';
+      icon.setAttribute('aria-hidden', 'true');
+      btn.replaceChildren(icon);
+    });
+  }
+
+  function setFollowing(target, on) {
+    sameTarget('follow', target).concat(sameTarget('unfollow', target)).forEach(function (btn) {
+      btn.setAttribute('data-nostr-act', on ? 'unfollow' : 'follow');
+      btn.textContent = on ? 'Unfollow on Nostr' : 'Follow on Nostr';
+    });
+  }
+
+  function openReply(btn, target) {
+    const card = btn.closest('article');
+    if (!card) return;
+    const open = card.querySelector('form.nostr-reply');
+    if (open) { open.remove(); return; }
+    const form = document.createElement('form');
+    form.className = 'nostr-reply';
+    const box = document.createElement('textarea');
+    box.rows = 3;
+    box.maxLength = 8000;
+    box.placeholder = 'Reply on Nostr…';
+    box.setAttribute('aria-label', 'Reply on Nostr');
+    const row = document.createElement('div');
+    row.className = 'nostr-reply-row';
+    const send = document.createElement('button');
+    send.type = 'submit';
+    send.className = 'btn btn-primary';
+    send.textContent = 'Reply';
+    const cancel = document.createElement('button');
+    cancel.type = 'button';
+    cancel.className = 'btn btn-ghost';
+    cancel.textContent = 'Cancel';
+    cancel.addEventListener('click', function () { form.remove(); });
+    row.append(send, cancel);
+    form.append(box, row);
+    form.addEventListener('submit', async function (event) {
+      event.preventDefault();
+      const text = box.value.trim();
+      if (!text) { box.focus(); return; }
+      send.disabled = true;
+      const res = await run('reply', target, text);
+      send.disabled = false;
+      if (!res) return;
+      const note = document.createElement('div');
+      note.className = 'meta nostr-reply-done';
+      note.append('Replied on Nostr. ');
+      if (res.note) {
+        const link = document.createElement('a');
+        link.href = 'https://njump.me/' + encodeURIComponent(res.note);
+        link.target = '_blank';
+        link.rel = 'noopener noreferrer';
+        link.textContent = 'Open it';
+        note.append(link);
+      }
+      form.replaceWith(note);
+    });
+    card.appendChild(form);
+    box.focus();
+  }
+
+  document.addEventListener('click', async function (event) {
+    const btn = event.target.closest('[data-nostr-act]');
+    if (!btn) return;
+    event.preventDefault();
+    const act = btn.getAttribute('data-nostr-act') || '';
+    const target = (btn.getAttribute('data-nostr-target') || '').toLowerCase();
+    if (!/^[0-9a-f]{64}$/.test(target)) return;
+    if (act === 'reply') { openReply(btn, target); return; }
+    if (btn.dataset.nostrBusy === '1') return;
+    btn.dataset.nostrBusy = '1';
+    try {
+      const res = await run(act, target, '');
+      if (!res) return;
+      if (res.purpose === 'like' || res.purpose === 'unlike') {
+        setLiked(target, res.purpose === 'like');
+      } else if (res.purpose === 'follow' || res.purpose === 'unfollow') {
+        setFollowing(target, res.purpose === 'follow');
+        toast(res.purpose === 'follow' ? 'Followed on Nostr.' : 'Unfollowed on Nostr. Their posts leave Home on the next refresh.');
+      }
+    } finally {
+      btn.dataset.nostrBusy = '';
     }
   });
 })();

@@ -205,6 +205,64 @@ pub async fn fetch(url: &str, queries: &[Query], deadline: Instant) -> Result<Fe
     run_queries(ws, queries, deadline).await
 }
 
+/// Send one signed event and wait for the relay's `OK`. Returns whether the
+/// relay accepted it and its message (NIP-01; "duplicate:" counts as
+/// accepted). A relay that wants NIP-42 auth first answers false.
+pub async fn publish(url: &str, event: &Event, deadline: Instant) -> Result<(bool, String)> {
+    let url = normalize_relay_url(url).ok_or_else(|| anyhow!("unusable relay url"))?;
+    if let Some(base) = test_relay_base() {
+        let target = format!("{base}/{}", url.trim_start_matches("wss://"));
+        let tcp = TcpStream::connect(base.trim_start_matches("ws://").split('/').next().unwrap_or("")).await?;
+        let (ws, _) = tokio_tungstenite::client_async_with_config(handshake_request(&target)?, tcp, Some(ws_config())).await?;
+        return send_event(ws, event, deadline).await;
+    }
+    let host = host_of(&url).to_string();
+    let tcp = timeout_at(deadline, guarded_tcp(&host)).await.map_err(|_| anyhow!("deadline"))??;
+    let name = rustls::pki_types::ServerName::try_from(host.clone()).map_err(|_| anyhow!("bad tls name"))?;
+    let tls = timeout_at(deadline, tokio_rustls::TlsConnector::from(tls_config()).connect(name, tcp))
+        .await
+        .map_err(|_| anyhow!("tls timeout"))?
+        .context("tls")?;
+    let (ws, _) = timeout_at(deadline, tokio_tungstenite::client_async_with_config(handshake_request(&url)?, tls, Some(ws_config())))
+        .await
+        .map_err(|_| anyhow!("websocket timeout"))?
+        .context("websocket")?;
+    send_event(ws, event, deadline).await
+}
+
+async fn send_event<S>(mut ws: tokio_tungstenite::WebSocketStream<S>, event: &Event, deadline: Instant) -> Result<(bool, String)>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    ws.send(Message::text(json!(["EVENT", event]).to_string())).await?;
+    loop {
+        let msg = match timeout_at(deadline, ws.next()).await {
+            Ok(Some(Ok(msg))) => msg,
+            Ok(Some(Err(e))) => return Err(e.into()),
+            Ok(None) => bail!("closed before OK"),
+            Err(_) => bail!("no OK before deadline"),
+        };
+        let text = match msg {
+            Message::Text(t) => t.to_string(),
+            Message::Ping(p) => {
+                ws.send(Message::Pong(p)).await?;
+                continue;
+            }
+            Message::Close(_) => bail!("closed before OK"),
+            _ => continue,
+        };
+        let Ok(Value::Array(parts)) = serde_json::from_str::<Value>(&text) else {
+            continue;
+        };
+        if parts.first().and_then(Value::as_str) == Some("OK") && parts.get(1).and_then(Value::as_str) == Some(event.id.as_str()) {
+            let accepted = parts.get(2).and_then(Value::as_bool).unwrap_or(false);
+            let message: String = parts.get(3).and_then(Value::as_str).unwrap_or("").chars().take(160).collect();
+            let _ = ws.close(None).await;
+            return Ok((accepted || message.starts_with("duplicate:"), message));
+        }
+    }
+}
+
 async fn run_queries<S>(
     mut ws: tokio_tungstenite::WebSocketStream<S>,
     queries: &[Query],

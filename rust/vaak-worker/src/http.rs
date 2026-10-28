@@ -178,6 +178,10 @@ pub async fn serve(cfg: Config, bind: SocketAddr) -> Result<()> {
         .route("/shadow/local-since-html", get(shadow_local_since_html))
         .route("/shadow/feed-since-html", get(shadow_feed_since_html))
         .route("/api/v1/notifications", get(shadow_notifications_masto))
+        // Nostr like/reply/follow: build the unsigned event, then relay the
+        // copy the viewer's signer extension signed (nostr::act).
+        .route("/shadow/nostr-prepare", post(shadow_nostr_prepare))
+        .route("/shadow/nostr-publish", post(shadow_nostr_publish))
         .route_layer(axum::middleware::from_fn_with_state(shadow_token, crate::shadow_auth::require));
     let mut app = Router::new()
         .route("/healthz", get(healthz))
@@ -251,7 +255,9 @@ async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
             "/shadow/home-since-html",
             "/shadow/local-since-html",
             "/shadow/feed-since-html",
-            "/api/v1/notifications"
+            "/api/v1/notifications",
+            "/shadow/nostr-prepare (POST)",
+            "/shadow/nostr-publish (POST)"
         ],
     }))
 }
@@ -652,6 +658,48 @@ async fn shadow_tl_html(
 }
 
 /// Home fill HTML (0.7.4). Offset pages (0.7.9).
+#[derive(serde::Deserialize)]
+struct NostrPrepareBody {
+    owner_id: i64,
+    purpose: String,
+    target: String,
+}
+
+#[derive(serde::Deserialize)]
+struct NostrPublishBody {
+    owner_id: i64,
+    nonce: String,
+    event: serde_json::Value,
+}
+
+fn nostr_reply(res: anyhow::Result<serde_json::Value>) -> axum::response::Response {
+    match res {
+        Ok(body) => Json(body).into_response(),
+        Err(e) => {
+            tracing::warn!(error = %format!("{e:#}"), "nostr action failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"ok": false, "error": "VAAK couldn't finish that Nostr action. Try again."})),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn shadow_nostr_prepare(State(state): State<AppState>, Json(body): Json<NostrPrepareBody>) -> axum::response::Response {
+    if body.owner_id < 1 {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"ok": false, "error": "owner required"}))).into_response();
+    }
+    nostr_reply(crate::nostr::act::prepare(&state.cfg, body.owner_id, &body.purpose, &body.target).await)
+}
+
+async fn shadow_nostr_publish(State(state): State<AppState>, Json(body): Json<NostrPublishBody>) -> axum::response::Response {
+    if body.owner_id < 1 {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"ok": false, "error": "owner required"}))).into_response();
+    }
+    nostr_reply(crate::nostr::act::publish(&state.cfg, body.owner_id, &body.nonce, &body.event).await)
+}
+
 async fn shadow_home_html(
     State(state): State<AppState>,
     Query(q): Query<OwnerQuery>,

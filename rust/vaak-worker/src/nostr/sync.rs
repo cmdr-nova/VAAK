@@ -187,11 +187,11 @@ fn chunk_queries(authors: &[String], kinds: &[i64], since: Option<i64>, per_auth
         .collect()
 }
 
-async fn upsert_meta(db: &Client, pubkey: &str, profile: Option<&Event>, relays: Option<&Event>, now: i64) -> Result<()> {
+async fn upsert_meta(db: &Client, pubkey: &str, profile: Option<&Event>, relays: Option<&Event>, fetched_at: i64) -> Result<()> {
     db.execute(
         "INSERT INTO nostr_profiles (pubkey, meta_fetched_at) VALUES ($1, $2)
          ON CONFLICT (pubkey) DO UPDATE SET meta_fetched_at = EXCLUDED.meta_fetched_at",
-        &[&pubkey, &now],
+        &[&pubkey, &fetched_at],
     )
     .await
     .context("nostr profile touch")?;
@@ -322,14 +322,65 @@ async fn sync_links(db: &mut Client, s: &Settings, now: i64, deadline: Instant, 
     Ok(())
 }
 
+/// Keys whose kind 0 never turned up are asked again after this long
+/// instead of waiting a whole day.
+const META_MISS_RETRY_SECS: i64 = 2 * 3600;
+/// Most relays a missing profile is chased on (its own write relays and the
+/// relays its notes came from).
+const META_CHASE_RELAYS: usize = 8;
+
+/// Each key's own relays: its NIP-65 write relays plus the relays VAAK
+/// stored its notes from, most notes first.
+async fn own_relays(db: &Client, keys: &[String]) -> Result<Vec<(String, Vec<String>)>> {
+    let rows = db
+        .query(
+            "SELECT k.pubkey,
+                    COALESCE((SELECT write_relays FROM nostr_profiles p WHERE p.pubkey = k.pubkey), '[]'::jsonb),
+                    COALESCE((SELECT array_agg(relay ORDER BY n DESC) FROM (
+                        SELECT relay, COUNT(*) AS n FROM nostr_events e
+                        WHERE e.pubkey = k.pubkey AND e.relay <> '' GROUP BY relay) r), '{}')
+             FROM unnest($1::text[]) AS k(pubkey)",
+            &[&keys],
+        )
+        .await
+        .context("nostr own relays")?;
+    Ok(rows
+        .iter()
+        .map(|r| {
+            let listed: Value = r.get(1);
+            let seen: Vec<String> = r.get(2);
+            let mut relays: Vec<String> = Vec::new();
+            let urls = listed.as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_string).chain(seen);
+            for url in urls.filter_map(|u| relay::normalize_relay_url(&u)) {
+                if !relays.contains(&url) {
+                    relays.push(url);
+                }
+            }
+            (r.get(0), relays)
+        })
+        .collect())
+}
+
+/// When a key is next due: tomorrow if its profile was found, sooner if not
+/// (a relay timing out or a profile kept off the index relays).
+fn meta_stamp(found: bool, now: i64) -> i64 {
+    if found {
+        now
+    } else {
+        now - META_REFRESH_SECS + META_MISS_RETRY_SECS
+    }
+}
+
 async fn sync_followee_meta(db: &Client, s: &Settings, now: i64, deadline: Instant) -> Result<usize> {
     let stale = now - META_REFRESH_SECS;
     let rows = db
         .query(
-            "SELECT DISTINCT f.pubkey FROM nostr_follows f
+            "SELECT f.pubkey FROM nostr_follows f
              JOIN nostr_links l ON l.owner_user_id = f.owner_user_id AND l.show_in_home
              LEFT JOIN nostr_profiles p ON p.pubkey = f.pubkey
              WHERE p.pubkey IS NULL OR p.meta_fetched_at < $1
+             GROUP BY f.pubkey
+             ORDER BY MIN(COALESCE(p.meta_fetched_at, 0)), f.pubkey
              LIMIT $2",
             &[&stale, &META_AUTHORS_PER_RUN],
         )
@@ -340,7 +391,7 @@ async fn sync_followee_meta(db: &Client, s: &Settings, now: i64, deadline: Insta
         return Ok(0);
     }
     let queries = chunk_queries(&keys, &[0, 10002], None, 3);
-    let jobs = s.index_relays.iter().take(3).map(|r| (r.clone(), queries.clone())).collect();
+    let jobs = s.index_relays.iter().map(|r| (r.clone(), queries.clone())).collect();
     let mut all = Vec::new();
     for (_, res) in fan_out(jobs, s.concurrency, deadline).await {
         if let Ok(res) = res {
@@ -348,9 +399,36 @@ async fn sync_followee_meta(db: &Client, s: &Settings, now: i64, deadline: Insta
         }
     }
     let mut rejected = 0usize;
-    let newest = relay::newest_by_author_kind(verified(all, now, &mut rejected));
+    let mut newest = relay::newest_by_author_kind(verified(all, now, &mut rejected));
+
+    // Profiles the index relays do not carry: ask each key's own relays.
+    let missing: Vec<String> = keys.iter().filter(|k| !newest.contains_key(&((*k).clone(), 0))).cloned().collect();
+    if !missing.is_empty() && Instant::now() < deadline {
+        let own = own_relays(db, &missing).await?;
+        let plan = plan_relays(&own, &[], META_CHASE_RELAYS, 2);
+        let jobs = plan
+            .iter()
+            .filter(|(url, _)| !s.index_relays.contains(url))
+            .map(|(url, ks)| (url.clone(), chunk_queries(ks, &[0, 10002], None, 3)))
+            .collect();
+        let mut more = Vec::new();
+        for (_, res) in fan_out(jobs, s.concurrency, deadline).await {
+            if let Ok(res) = res {
+                more.extend(res.events);
+            }
+        }
+        for (key, ev) in relay::newest_by_author_kind(verified(more, now, &mut rejected)) {
+            match newest.get(&key) {
+                Some(have) if have.created_at >= ev.created_at => {}
+                _ => {
+                    newest.insert(key, ev);
+                }
+            }
+        }
+    }
     for key in &keys {
-        upsert_meta(db, key, newest.get(&(key.clone(), 0)), newest.get(&(key.clone(), 10002)), now).await?;
+        let profile = newest.get(&(key.clone(), 0));
+        upsert_meta(db, key, profile, newest.get(&(key.clone(), 10002)), meta_stamp(profile.is_some(), now)).await?;
     }
     Ok(keys.len())
 }
@@ -466,6 +544,15 @@ async fn cleanup(db: &Client, s: &Settings, now: i64) -> Result<u64> {
     n += db
         .execute("DELETE FROM nostr_events e WHERE NOT EXISTS (SELECT 1 FROM nostr_follows f WHERE f.pubkey = e.pubkey)", &[])
         .await?;
+    // Added by a later migration; skip quietly until it has run.
+    n += db
+        .execute(
+            "DELETE FROM nostr_reactions r WHERE r.created_at < $1
+               OR NOT EXISTS (SELECT 1 FROM nostr_links l WHERE l.owner_user_id = r.owner_user_id)",
+            &[&cutoff],
+        )
+        .await
+        .unwrap_or(0);
     n += db
         .execute(
             "DELETE FROM nostr_profiles p WHERE NOT EXISTS (SELECT 1 FROM nostr_follows f WHERE f.pubkey = p.pubkey)
@@ -550,6 +637,14 @@ mod tests {
         let out = verified(vec![good.clone(), good.clone(), forged, future], now, &mut rejected);
         assert_eq!(out, vec![good]);
         assert_eq!(rejected, 2);
+    }
+
+    #[test]
+    fn a_missing_profile_is_retried_within_hours() {
+        let now = 1_800_000_000;
+        assert_eq!(meta_stamp(true, now), now);
+        let due = meta_stamp(false, now) + META_REFRESH_SECS;
+        assert_eq!(due - now, META_MISS_RETRY_SECS);
     }
 
     #[test]
