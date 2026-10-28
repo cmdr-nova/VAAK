@@ -80,7 +80,7 @@ impl CanonicalProjection {
             for task in &self.graphs{for kind in ["followers","following"]{
                 let(key,value,write,dependency)=graphs.load(db,kind,&task.actor,grant.as_ref()).await?;
                 if let Some(dependency)=dependency{self.ledger.dependencies.push(dependency)}
-                let count=graph_array_count(&value);graphs.retain(key,value,write).await;grant.require_current(db).await?;
+                let count=graph_array_count(&value);if graphs.writes(write){grant.require_current(db).await?;}graphs.retain(key,value,write).await;grant.require_current(db).await?;
                 apply_graph_count(status,&task.actor,kind,count);
             }}
             for task in &self.cache{

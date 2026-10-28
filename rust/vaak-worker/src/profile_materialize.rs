@@ -57,7 +57,10 @@ impl FollowGraphPresentation {
     async fn load(&self,db:&Client,kind:&str,actor:&str,guard:&dyn crate::profile_enrichment::CurrentEnrichmentGrant)->Result<(String,Value,bool,Option<Dependency>)>{
         let key=Self::cache_key(kind,actor);
         if let Some(value)=self.cached(kind,actor){return Ok((key,value,false,None))}
-        if let Some(cfg)=&self.cfg{guard.require_current(db).await?;let cached=crate::profile_header::cache::read_json(cfg,&key).await;guard.require_current(db).await?;if let Some(value)=cached.filter(|v|v.is_array()||v.is_object()){return Ok((key,value,false,None))}}
+        // Both lookups below only read. Callers check authority before the
+        // cache write in retain and once after their graph loop.
+        let _=guard;
+        if let Some(cfg)=&self.cfg{let cached=crate::profile_header::cache::read_json(cfg,&key).await;if let Some(value)=cached.filter(|v|v.is_array()||v.is_object()){return Ok((key,value,false,None))}}
         // The card shows a count. COUNT(*) is the same number as the full list
         // and stays a current snapshot, without re-reading every follow row.
         let sql=match kind{
@@ -65,10 +68,12 @@ impl FollowGraphPresentation {
             "following"=>"SELECT jsonb_build_object('c', COUNT(*)) FROM following f WHERE owner_actor_id IN($1::jsonb->>'actor',($1::jsonb->>'actor')||'/')",
             _=>bail!("invalid private graph list kind")
         };
-        let parameters=json!({"actor":actor.trim_end_matches('/')});guard.require_current(db).await?;let rows=Dependency::read(db,sql,&parameters).await?;guard.require_current(db).await?;
+        let parameters=json!({"actor":actor.trim_end_matches('/')});let rows=Dependency::read(db,sql,&parameters).await?;
         let value=rows.first().cloned().unwrap_or(json!({"c":0}));
         Ok((key,value,true,Some(Dependency::new(sql,parameters,rows))))
     }
+    /// True when retain would write the shared cache, which is an effect.
+    pub(crate) fn writes(&self,write:bool)->bool{write&&self.cfg.is_some()}
     async fn retain(&mut self,key:String,value:Value,write:bool){
         if write{if let Some(cfg)=&self.cfg{
             let ttl=std::env::var("VAAK_REDIS_RELSET_TTL").ok().and_then(|v|{let v=crate::library::card::php_trim(&v);if !v.is_empty()&&v.bytes().all(|b|b.is_ascii_digit()){Some(v.parse::<u64>().unwrap_or(u64::MAX))}else{None}}).unwrap_or(300).clamp(60,900);
@@ -403,14 +408,15 @@ impl ProjectedQuoteTarget {
         if let Some(status)=self.status.as_mut(){
             // A recheck that ends one step also opens the next one: nothing is
             // awaited between them, so the next step does not repeat it.
-            if !self.graphs.is_empty(){grant.require_current(db,&self.requested,&admission_status).await?;}
+            // Graph counts only read, except the shared cache write, which
+            // gets its own check; one check after all tasks covers the reads.
             for task in &self.graphs{
                 for kind in ["followers","following"]{
                     let(key,value,write,dependency)=graphs.load(db,kind,&task.actor,&guard).await?;
-                    grant.require_current(db,&self.requested,&admission_status).await?;
                     if let Some(dependency)=dependency{self.ledger.dependencies.push(dependency)}
-                    let count=graph_array_count(&value);graphs.retain(key,value,write).await;
-                    grant.require_current(db,&self.requested,&admission_status).await?;
+                    let count=graph_array_count(&value);
+                    if graphs.writes(write){grant.require_current(db,&self.requested,&admission_status).await?;}
+                    graphs.retain(key,value,write).await;
                     apply_graph_count(status,&task.actor,kind,count);
                 }
             }
@@ -427,7 +433,7 @@ impl ProjectedQuoteTarget {
                 self.ledger.dependencies.push(Dependency::new(sql,key,rows));let mut node=&mut *status;for part in &task.path{node=node.get_mut(part).context("quote preview lost current source path")?;}node["card"]=card.as_ref().map(masto_preview_card).unwrap_or(Value::Null);
             }
         }
-        if !self.cache.is_empty(){grant.require_current(db,&self.requested,&admission_status).await?;}
+        if !self.graphs.is_empty()||!self.cache.is_empty(){grant.require_current(db,&self.requested,&admission_status).await?;}
         self.cache_complete=true;self.require_current(db).await
     }
     pub(crate) fn into_parts(self)->Result<(String,Option<Value>,ProjectionLedger,Vec<DeferredProjectionEffect>)>{
