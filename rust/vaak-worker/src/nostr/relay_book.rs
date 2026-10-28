@@ -29,17 +29,16 @@ pub async fn apply(db: &Client, s: &mut Settings, now: i64) -> Result<()> {
     if !ready(db).await {
         return Ok(());
     }
-    for (list, index) in [(&s.index_relays, true), (&s.fallback_relays, false)] {
-        for url in list.iter() {
-            db.execute(
-                "INSERT INTO nostr_relays (url, is_index, is_fallback, added_at) VALUES ($1, $2, NOT $2, $3)
-                 ON CONFLICT (url) DO NOTHING",
-                &[url, &index, &now],
-            )
-            .await
-            .context("seed nostr relay")?;
-        }
+    for (url, index, fallback) in seed_rows(&s.index_relays, &s.fallback_relays) {
+        db.execute(
+            "INSERT INTO nostr_relays (url, is_index, is_fallback, added_at) VALUES ($1, $2, $3, $4)
+             ON CONFLICT (url) DO NOTHING",
+            &[&url, &index, &fallback, &now],
+        )
+        .await
+        .context("seed nostr relay")?;
     }
+    let (env_index, env_fallback) = (s.index_relays.clone(), s.fallback_relays.clone());
     let rows = db
         .query("SELECT url, is_index, is_fallback, removed_at IS NOT NULL FROM nostr_relays ORDER BY added_at, url", &[])
         .await
@@ -60,7 +59,29 @@ pub async fn apply(db: &Client, s: &mut Settings, now: i64) -> Result<()> {
             s.fallback_relays.push(url);
         }
     }
+    // A table with no index or no fallback relay left (older seeds marked
+    // relays in both env lists as index only) would leave keys without a
+    // relay list nowhere to read or publish: use the env list, minus
+    // removed relays, until an admin flags some in Admin > Relays > Nostr.
+    if s.index_relays.is_empty() {
+        s.index_relays = without_skipped(env_index, &s.skip);
+    }
+    if s.fallback_relays.is_empty() {
+        tracing::warn!("no fallback relays in nostr_relays; using VAAK_NOSTR_FALLBACK_RELAYS");
+        s.fallback_relays = without_skipped(env_fallback, &s.skip);
+    }
     Ok(())
+}
+
+/// The env relays with their roles: a relay in both lists is both.
+fn seed_rows(index: &[String], fallback: &[String]) -> Vec<(String, bool, bool)> {
+    let mut rows: Vec<(String, bool, bool)> = Vec::new();
+    for url in index.iter().chain(fallback) {
+        if !rows.iter().any(|(u, _, _)| u == url) {
+            rows.push((url.clone(), index.contains(url), fallback.contains(url)));
+        }
+    }
+    rows
 }
 
 /// What one relay did when asked.
@@ -155,6 +176,20 @@ mod tests {
         let skip: HashSet<String> = ["wss://dead.example".to_string()].into();
         let list = vec!["wss://a.example".to_string(), "wss://dead.example".to_string(), "wss://b.example".to_string()];
         assert_eq!(without_skipped(list, &skip), vec!["wss://a.example", "wss://b.example"]);
+    }
+
+    #[test]
+    fn relays_in_both_env_lists_seed_as_both() {
+        let index = vec!["wss://idx.example".to_string(), "wss://both.example".to_string()];
+        let fallback = vec!["wss://both.example".to_string(), "wss://fb.example".to_string()];
+        assert_eq!(
+            seed_rows(&index, &fallback),
+            vec![
+                ("wss://idx.example".to_string(), true, false),
+                ("wss://both.example".to_string(), true, true),
+                ("wss://fb.example".to_string(), false, true),
+            ]
+        );
     }
 
     #[test]
