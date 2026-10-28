@@ -403,7 +403,7 @@ impl ProjectedQuoteTarget {
         if let Some(status)=self.status.as_mut(){
             // A recheck that ends one step also opens the next one: nothing is
             // awaited between them, so the next step does not repeat it.
-            if !self.graphs.is_empty()||!self.cache.is_empty(){grant.require_current(db,&self.requested,&admission_status).await?;}
+            if !self.graphs.is_empty(){grant.require_current(db,&self.requested,&admission_status).await?;}
             for task in &self.graphs{
                 for kind in ["followers","following"]{
                     let(key,value,write,dependency)=graphs.load(db,kind,&task.actor,&guard).await?;
@@ -414,19 +414,20 @@ impl ProjectedQuoteTarget {
                     apply_graph_count(status,&task.actor,kind,count);
                 }
             }
-            for(n,task)in self.cache.iter().enumerate(){
-                // Each task ends with awaited reads after its last recheck.
-                if n>0{grant.require_current(db,&self.requested,&admission_status).await?;}
+            for task in &self.cache{
+                // Cache tasks only read. The guarded resolve checks before its
+                // DNS lookup and once after its reads; the warm below is the
+                // one outward effect and gets its own check.
                 let Some(url)=crate::direct_preview::extract_url(&task.text)?else{continue};let key=json!({"url":crate::direct_preview::normalize(&url)?});
                 let sql="SELECT to_jsonb(c) FROM link_preview_cards c WHERE url=$1::jsonb->>'url' LIMIT 1";
-                let rows=Dependency::read(db,sql,&key).await?;grant.require_current(db,&self.requested,&admission_status).await?;
+                let rows=Dependency::read(db,sql,&key).await?;
                 let card=crate::direct_preview::resolve_cache_only_guarded(db,dns,&task.text,chrono::Utc::now(),Some(&guard)).await?;
-                grant.require_current(db,&self.requested,&admission_status).await?;
                 if Dependency::read(db,sql,&key).await?!=rows{bail!("PHP fallback: quote projection cache changed during DNS eligibility")}
-                if task.require_hit&&card.is_none(){let preview=preview.context("PHP fallback: cold remote quote link preview warm capability absent")?;let bridge=CompletionQuoteGrant{db,grant:&guard};preview.warm_text(&task.text,&bridge).await?;}
+                if task.require_hit&&card.is_none(){grant.require_current(db,&self.requested,&admission_status).await?;let preview=preview.context("PHP fallback: cold remote quote link preview warm capability absent")?;let bridge=CompletionQuoteGrant{db,grant:&guard};preview.warm_text(&task.text,&bridge).await?;}
                 self.ledger.dependencies.push(Dependency::new(sql,key,rows));let mut node=&mut *status;for part in &task.path{node=node.get_mut(part).context("quote preview lost current source path")?;}node["card"]=card.as_ref().map(masto_preview_card).unwrap_or(Value::Null);
             }
         }
+        if !self.cache.is_empty(){grant.require_current(db,&self.requested,&admission_status).await?;}
         self.cache_complete=true;self.require_current(db).await
     }
     pub(crate) fn into_parts(self)->Result<(String,Option<Value>,ProjectionLedger,Vec<DeferredProjectionEffect>)>{
