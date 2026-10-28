@@ -5446,6 +5446,7 @@ pub(crate) async fn statuses_for_older_hits(
     let mut outbox_ids = Vec::new();
     let mut boost_ids = Vec::new();
     let mut bsky_uris = Vec::new();
+    let mut nostr_ids = Vec::new();
     for hit in hits {
         if !hit.keep {
             continue;
@@ -5461,9 +5462,11 @@ pub(crate) async fn statuses_for_older_hits(
             "outbox" => outbox_ids.push(hit.lookup.clone()),
             "boost" => boost_ids.push(hit.lookup.clone()),
             "bsky" => bsky_uris.push(hit.lookup.clone()),
+            "nostr" => nostr_ids.push(hit.lookup.clone()),
             _ => {}
         }
     }
+    let nostr_map = crate::nostr::home::fetch_rows(db, &nostr_ids).await.unwrap_or_default();
     let events_map = fetch_events_map(db, &event_ids).await.unwrap_or_default();
     let mut actor_ids = Vec::new();
     let mut create_objects = Vec::new();
@@ -5537,6 +5540,7 @@ pub(crate) async fn statuses_for_older_hits(
                 materialize_boost(rb, create, None, &actors_map, &local_profiles, owner_user_id)
             }),
             "bsky" => bsky_map.get(&hit.lookup).map(materialize_bsky),
+            "nostr" => nostr_map.get(&hit.lookup).map(crate::nostr::render::materialize),
             _ => None,
         };
         let Some(mut st) = built else { continue };
