@@ -58,6 +58,41 @@ function ap_rss_migrate(): void
             throw $e;
         }
     }
+    if ($db->getAttribute(PDO::ATTR_DRIVER_NAME) === 'pgsql') try {
+        // Playable media (Reddit video, gifs, galleries) and the source's own
+        // NSFW/spoiler flags. Readers go through to_jsonb(i) or i.* so an
+        // older table without these columns still paints.
+        $db->exec("ALTER TABLE rss_items ADD COLUMN IF NOT EXISTS media_json TEXT NOT NULL DEFAULT ''");
+        $db->exec('ALTER TABLE rss_items ADD COLUMN IF NOT EXISTS sensitive BOOLEAN NOT NULL DEFAULT FALSE');
+        $db->exec("ALTER TABLE rss_items ADD COLUMN IF NOT EXISTS spoiler_text TEXT NOT NULL DEFAULT ''");
+    } catch (Throwable $e) {
+        // A table owned by another role refuses ALTER; items then stay image/link only.
+        if (stripos($e->getMessage(), 'permission denied') === false
+            && stripos($e->getMessage(), 'must be owner') === false) {
+            throw $e;
+        }
+    }
+}
+
+/** True once rss_items carries media_json/sensitive/spoiler_text (ops may own the table). */
+function ap_rss_items_have_media_columns(): bool
+{
+    static $have = null;
+    if ($have !== null) {
+        return $have;
+    }
+    ap_rss_migrate();
+    try {
+        $st = ap_db()->query(
+            "SELECT COUNT(*) FROM information_schema.columns
+             WHERE table_schema = current_schema() AND table_name = 'rss_items'
+               AND column_name IN ('media_json', 'sensitive', 'spoiler_text')"
+        );
+        $have = (int) $st->fetchColumn() === 3;
+    } catch (Throwable $e) {
+        $have = false;
+    }
+    return $have;
 }
 
 /** @return list<array<string,mixed>> */
@@ -870,7 +905,7 @@ function ap_rss_refresh_feed(int $feedId, ?int $ownerUserId = null, bool $force 
 }
 
 /**
- * @param list<array{guid:string,url:string,title:string,summary_text:string,image_url:string,published_at:?string,video?:bool}> $items
+ * @param list<array{guid:string,url:string,title:string,summary_text:string,image_url:string,published_at:?string,video?:bool,media?:list<array<string,string>>,sensitive?:bool,spoiler_text?:string}> $items
  */
 function ap_rss_upsert_items(int $feedId, array $items): int
 {
@@ -878,8 +913,26 @@ function ap_rss_upsert_items(int $feedId, array $items): int
     $before = ap_db()->prepare('SELECT COUNT(*) FROM rss_items WHERE feed_id = ?');
     $before->execute([$feedId]);
     $countBefore = (int) $before->fetchColumn();
-    $st = ap_db()->prepare(
-        'INSERT INTO rss_items (feed_id, guid, url, title, summary_text, image_url, published_at, ingested_at)
+    $mediaCols = ap_rss_items_have_media_columns();
+    // Media and flags are rewritten on every poll so a re-ingest heals rows
+    // stored before playable media existed (or after a source fixes a flag).
+    $st = ap_db()->prepare($mediaCols
+        ? 'INSERT INTO rss_items (feed_id, guid, url, title, summary_text, image_url, published_at, media_json, sensitive, spoiler_text, ingested_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())
+         ON CONFLICT (feed_id, guid) DO UPDATE SET
+           media_json = EXCLUDED.media_json,
+           sensitive = EXCLUDED.sensitive,
+           spoiler_text = EXCLUDED.spoiler_text,
+           url = EXCLUDED.url,
+           title = EXCLUDED.title,
+           summary_text = CASE WHEN EXCLUDED.summary_text <> \'\' THEN EXCLUDED.summary_text ELSE rss_items.summary_text END,
+           image_url = CASE
+             WHEN EXCLUDED.image_url <> \'\' THEN EXCLUDED.image_url
+             WHEN rss_items.image_url ILIKE \'%://external-preview.redd.it/%\' THEN \'\'
+             ELSE rss_items.image_url
+           END,
+           published_at = COALESCE(EXCLUDED.published_at, rss_items.published_at)'
+        : 'INSERT INTO rss_items (feed_id, guid, url, title, summary_text, image_url, published_at, ingested_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, NOW())
          ON CONFLICT (feed_id, guid) DO UPDATE SET
            url = EXCLUDED.url,
@@ -903,7 +956,8 @@ function ap_rss_upsert_items(int $feedId, array $items): int
             continue;
         }
         $guid = mb_substr($guid, 0, 800);
-        if (!empty($it['video'])) {
+        $media = $mediaCols ? ap_rss_clean_item_media($it['media'] ?? []) : [];
+        if (!empty($it['video']) && $media === []) {
             $del->execute([$feedId, $guid]);
             continue;
         }
@@ -912,7 +966,7 @@ function ap_rss_upsert_items(int $feedId, array $items): int
         if (ap_rss_image_host_unusable($image)) {
             $image = '';
         }
-        $st->execute([
+        $row = [
             $feedId,
             $guid,
             mb_substr((string) ($it['url'] ?? ''), 0, 2000),
@@ -920,7 +974,13 @@ function ap_rss_upsert_items(int $feedId, array $items): int
             mb_substr((string) ($it['summary_text'] ?? ''), 0, 4000),
             $image,
             is_string($pub) && $pub !== '' ? $pub : null,
-        ]);
+        ];
+        if ($mediaCols) {
+            $row[] = $media === [] ? '' : json_encode($media, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+            $row[] = !empty($it['sensitive']) ? 'true' : 'false';
+            $row[] = mb_substr(trim((string) ($it['spoiler_text'] ?? '')), 0, 200);
+        }
+        $st->execute($row);
     }
     $before->execute([$feedId]);
     $added = max(0, (int) $before->fetchColumn() - $countBefore);
@@ -1079,9 +1139,22 @@ function ap_rss_item_to_masto_status(array $row): array
         : '';
 
     $media = [];
-    $mediaForward = function_exists('ap_rss_item_is_media_forward')
+    $stored = ap_rss_clean_item_media(json_decode((string) ($row['media_json'] ?? ''), true));
+    foreach ($stored as $i => $m) {
+        $media[] = [
+            'id' => $statusId . '-m' . $i,
+            'type' => $m['type'],
+            'url' => $m['url'],
+            'preview_url' => $m['preview_url'] !== '' ? $m['preview_url'] : ($m['type'] === 'image' ? $m['url'] : null),
+            'remote_url' => $m['url'],
+            'mediaType' => $m['type'] === 'image' ? 'image/*' : (preg_match('/\.m3u8(?:$|[?#])/i', $m['url']) ? 'application/vnd.apple.mpegurl' : 'video/mp4'),
+            'description' => null,
+            'blurhash' => null,
+        ];
+    }
+    $mediaForward = $media === [] && function_exists('ap_rss_item_is_media_forward')
         ? ap_rss_item_is_media_forward((string) ($row['summary_text'] ?? ''), $image, $url)
-        : ($image !== '' && $summary === '');
+        : ($media === [] && $image !== '' && $summary === '');
     if ($mediaForward && $image !== '' && preg_match('#^https://#i', $image)) {
         $media[] = [
             'id' => $statusId . '-img',
@@ -1139,8 +1212,9 @@ function ap_rss_item_to_masto_status(array $row): array
         'created_at' => $created,
         'in_reply_to_id' => null,
         'in_reply_to_account_id' => null,
-        'sensitive' => false,
-        'spoiler_text' => '',
+        // Source NSFW/spoiler flags go through VAAK's own sensitive-media gate.
+        'sensitive' => !empty($row['sensitive']) && $row['sensitive'] !== 'f',
+        'spoiler_text' => trim((string) ($row['spoiler_text'] ?? '')),
         'visibility' => 'public',
         'language' => null,
         'uri' => $url !== '' ? $url : $statusId,
@@ -1853,46 +1927,80 @@ function ap_rss_reddit_json_url(string $feedUrl, bool $oauth = false): ?string
 }
 
 /**
- * Reddit app credentials: process env first, then /etc/mkultra/vaak.env, so
- * the cron poller and the FPM pool both see them without per-entry env lines.
+ * Reddit settings: process env first, then /etc/mkultra/vaak.env, so the cron
+ * poller and the FPM pool both see them without per-entry env lines.
  *
- * @return array{0:string,1:string} [client id, client secret]
+ * @param list<string> $keys
+ * @return list<string> values in $keys order ('' when unset)
  */
-function ap_rss_reddit_credentials(?string $envFile = null): array
+function ap_rss_reddit_env(array $keys, ?string $envFile = null): array
 {
-    $id = trim((string) (getenv('AP_REDDIT_CLIENT_ID') ?: ''));
-    $secret = trim((string) (getenv('AP_REDDIT_CLIENT_SECRET') ?: ''));
+    $vals = [];
+    foreach ($keys as $k) {
+        $vals[$k] = trim((string) (getenv($k) ?: ''));
+    }
     $envFile ??= '/etc/mkultra/vaak.env';
-    if (($id === '' || $secret === '') && is_readable($envFile)) {
+    if (in_array('', $vals, true) && is_readable($envFile)) {
         foreach (file($envFile, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) ?: [] as $line) {
             $line = trim($line);
             if ($line === '' || str_starts_with($line, '#') || !str_contains($line, '=')) {
                 continue;
             }
             [$k, $v] = array_map('trim', explode('=', $line, 2));
-            $v = trim($v, " \t\"'");
-            if ($k === 'AP_REDDIT_CLIENT_ID' && $id === '') {
-                $id = $v;
-            } elseif ($k === 'AP_REDDIT_CLIENT_SECRET' && $secret === '') {
-                $secret = $v;
+            if (array_key_exists($k, $vals) && $vals[$k] === '') {
+                $vals[$k] = trim($v, " \t\"'");
             }
         }
     }
+    return array_values($vals);
+}
+
+/**
+ * Reddit app credentials (AP_REDDIT_CLIENT_ID / AP_REDDIT_CLIENT_SECRET).
+ *
+ * @return array{0:string,1:string} [client id, client secret]
+ */
+function ap_rss_reddit_credentials(?string $envFile = null): array
+{
+    [$id, $secret] = ap_rss_reddit_env(['AP_REDDIT_CLIENT_ID', 'AP_REDDIT_CLIENT_SECRET'], $envFile);
     return [$id, $secret];
 }
 
-/** App-only OAuth bearer token, cached on disk until shortly before expiry. '' when not configured or on failure. */
+/**
+ * Optional Reddit account login (AP_REDDIT_USERNAME / AP_REDDIT_PASSWORD) for
+ * a "script" app the account owns. App-only tokens carry no account, so
+ * Reddit serves NSFW posts to them without their media; a token for an account
+ * with "Show mature content" on gets the full post. VAAK then applies its own
+ * sensitive-media gate.
+ *
+ * @return array{0:string,1:string} [username, password]
+ */
+function ap_rss_reddit_login(?string $envFile = null): array
+{
+    [$user, $pass] = ap_rss_reddit_env(['AP_REDDIT_USERNAME', 'AP_REDDIT_PASSWORD'], $envFile);
+    return [$user, $pass];
+}
+
+/**
+ * OAuth bearer token, cached on disk until shortly before expiry. Account
+ * (password grant) when a login is configured, else app-only. '' when not
+ * configured or on failure.
+ */
 function ap_rss_reddit_oauth_token(): string
 {
     [$id, $secret] = ap_rss_reddit_credentials();
     if ($id === '' || $secret === '') {
         return '';
     }
+    [$user, $pass] = ap_rss_reddit_login();
+    $grant = ($user !== '' && $pass !== '')
+        ? http_build_query(['grant_type' => 'password', 'username' => $user, 'password' => $pass])
+        : 'grant_type=client_credentials';
     static $mem = ['token' => '', 'until' => 0];
     if ($mem['token'] !== '' && $mem['until'] > time()) {
         return $mem['token'];
     }
-    $cache = sys_get_temp_dir() . '/vaak-reddit-token-' . substr(hash('sha256', $id), 0, 16) . '.json';
+    $cache = sys_get_temp_dir() . '/vaak-reddit-token-' . substr(hash('sha256', $id . '|' . $user), 0, 16) . '.json';
     $cached = is_file($cache) ? json_decode((string) @file_get_contents($cache), true) : null;
     if (is_array($cached) && is_string($cached['token'] ?? null) && (int) ($cached['until'] ?? 0) > time()) {
         $mem = ['token' => $cached['token'], 'until' => (int) $cached['until']];
@@ -1906,7 +2014,7 @@ function ap_rss_reddit_oauth_token(): string
         CURLOPT_TIMEOUT => 15,
         CURLOPT_PROTOCOLS => CURLPROTO_HTTPS,
         CURLOPT_POST => true,
-        CURLOPT_POSTFIELDS => 'grant_type=client_credentials',
+        CURLOPT_POSTFIELDS => $grant,
         CURLOPT_USERPWD => $id . ':' . $secret,
         CURLOPT_HTTPHEADER => ['User-Agent: ' . ap_rss_user_agent()],
     ]);
@@ -2030,38 +2138,157 @@ function ap_rss_reddit_item(array $child): ?array
             'video' => false,
         ];
     }
+    // Crossposts carry their media on the original post.
+    $parent = is_array($d['crosspost_parent_list'][0] ?? null) ? $d['crosspost_parent_list'][0] : null;
     $link = (string) ($d['url_overridden_by_dest'] ?? ($d['url'] ?? ''));
-    // Same rule as the Atom path: Reddit-hosted video drops the item; a YouTube link post stays.
-    $video = !empty($d['is_video']) || (bool) preg_match('#//v\.redd\.it/#i', $link);
+    $video = !empty($d['is_video']) || (bool) preg_match('#//v\.redd\.it/#i', $link)
+        || ($parent !== null && !empty($parent['is_video']));
     $candidates = [];
-    if (preg_match('#^https://(?:i\.redd\.it|i\.imgur\.com)/#i', $link)
-        || preg_match('/\.(jpe?g|png|webp|gif)(?:$|[?#])/i', $link)) {
-        $candidates[] = $link;
-    }
-    $gallery = $d['gallery_data']['items'][0]['media_id'] ?? null;
-    if (is_string($gallery)) {
-        $src = $d['media_metadata'][$gallery]['s']['u'] ?? null;
-        if (is_string($src)) {
-            $candidates[] = $src;
+    foreach ($parent !== null ? [$d, $parent] : [$d] as $src) {
+        $srcLink = (string) ($src['url_overridden_by_dest'] ?? ($src['url'] ?? ''));
+        // imgur serves a still for every .gifv id; the mp4 goes to media.
+        $srcLink = (string) preg_replace('~^(https://i\.imgur\.com/[A-Za-z0-9]+)\.gifv(?=$|[?#])~i', '$1.jpg', $srcLink);
+        if (preg_match('#^https://(?:i\.redd\.it|i\.imgur\.com)/#i', $srcLink)
+            || preg_match('/\.(jpe?g|png|webp|gif)(?:$|[?#])/i', $srcLink)) {
+            $candidates[] = $srcLink;
+        }
+        $gallery = $src['gallery_data']['items'][0]['media_id'] ?? null;
+        if (is_string($gallery)) {
+            $gsrc = $src['media_metadata'][$gallery]['s']['u'] ?? null;
+            if (is_string($gsrc)) {
+                $candidates[] = $gsrc;
+            }
+        }
+        $preview = $src['preview']['images'][0]['source']['url'] ?? null;
+        if (is_string($preview)) {
+            $candidates[] = $preview;
+        }
+        // redgifs/gfycat-style embeds expose a still through oEmbed.
+        $oembedThumb = $src['secure_media']['oembed']['thumbnail_url'] ?? ($src['media']['oembed']['thumbnail_url'] ?? null);
+        if (is_string($oembedThumb)) {
+            $candidates[] = $oembedThumb;
+        }
+        $thumb = (string) ($src['thumbnail'] ?? '');
+        if (preg_match('#^https://#i', $thumb)) {
+            $candidates[] = $thumb;
         }
     }
-    $preview = $d['preview']['images'][0]['source']['url'] ?? null;
-    if (is_string($preview)) {
-        $candidates[] = $preview;
+    $image = ap_rss_pick_best_image($candidates);
+    $media = ap_rss_reddit_media($d, $image);
+    if ($media === [] && $parent !== null) {
+        $media = ap_rss_reddit_media($parent, $image);
     }
-    $thumb = (string) ($d['thumbnail'] ?? '');
-    if (preg_match('#^https://#i', $thumb)) {
-        $candidates[] = $thumb;
-    }
+    $nsfw = !empty($d['over_18']) || ($parent !== null && !empty($parent['over_18']));
+    $spoiler = !empty($d['spoiler']) || ($parent !== null && !empty($parent['spoiler']));
     return [
         'guid' => $guid,
         'url' => $itemUrl,
         'title' => (string) ($d['title'] ?? ''),
         'summary_text' => ap_rss_summary_from_html((string) ($d['selftext_html'] ?? ''), $itemUrl),
-        'image_url' => $video ? '' : ap_rss_pick_best_image($candidates),
+        // Video with no playable source keeps the old rule: dropped at upsert.
+        'image_url' => $video && $media === [] ? '' : $image,
         'published_at' => $published,
         'video' => $video,
+        'media' => $media,
+        'sensitive' => $nsfw,
+        'spoiler_text' => $spoiler ? 'Spoiler' : '',
     ];
+}
+
+/**
+ * Playable media for one Reddit post: galleries, Reddit-hosted video, gif-like
+ * posts Reddit transcodes (reddit_video_preview), imgur .gifv and direct mp4.
+ * Plain single-image posts return [] and keep the image_url path.
+ *
+ * @param array<string,mixed> $d listing child data
+ * @return list<array{type:string,url:string,preview_url:string}>
+ */
+function ap_rss_reddit_media(array $d, string $poster = ''): array
+{
+    $poster = $poster !== '' ? ap_rss_upgrade_image_url($poster) : '';
+    $out = [];
+    $items = $d['gallery_data']['items'] ?? null;
+    $meta = $d['media_metadata'] ?? null;
+    if (is_array($items) && is_array($meta)) {
+        foreach ($items as $gi) {
+            $m = is_array($gi) && is_string($gi['media_id'] ?? null) ? ($meta[$gi['media_id']] ?? null) : null;
+            if (!is_array($m) || (($m['status'] ?? 'valid') !== 'valid')) {
+                continue;
+            }
+            $s = is_array($m['s'] ?? null) ? $m['s'] : [];
+            if (($m['e'] ?? '') === 'AnimatedImage' && is_string($s['mp4'] ?? null)) {
+                $out[] = ['type' => 'gifv', 'url' => $s['mp4'], 'preview_url' => ''];
+            } elseif (is_string($s['u'] ?? null) || is_string($s['gif'] ?? null)) {
+                $u = ap_rss_upgrade_image_url((string) ($s['u'] ?? $s['gif']));
+                if ($u !== '') {
+                    $out[] = ['type' => 'image', 'url' => $u, 'preview_url' => $u];
+                }
+            }
+            if (count($out) >= 4) {
+                break;
+            }
+        }
+        if ($out !== []) {
+            return ap_rss_clean_item_media($out);
+        }
+    }
+    $rv = $d['secure_media']['reddit_video'] ?? ($d['media']['reddit_video'] ?? ($d['preview']['reddit_video_preview'] ?? null));
+    if (is_array($rv)) {
+        $fallback = (string) ($rv['fallback_url'] ?? '');
+        $hls = (string) ($rv['hls_url'] ?? '');
+        if (!empty($rv['is_gif']) && $fallback !== '') {
+            // Silent loops: the progressive mp4 needs no HLS player.
+            $out[] = ['type' => 'gifv', 'url' => $fallback, 'preview_url' => $poster];
+        } elseif ($hls !== '') {
+            // The DASH fallback mp4 is video-only; the HLS playlist carries audio.
+            $out[] = ['type' => 'video', 'url' => $hls, 'preview_url' => $poster];
+        } elseif ($fallback !== '') {
+            $out[] = ['type' => 'video', 'url' => $fallback, 'preview_url' => $poster];
+        }
+        return ap_rss_clean_item_media($out);
+    }
+    $link = (string) ($d['url_overridden_by_dest'] ?? ($d['url'] ?? ''));
+    if (preg_match('~^https://i\.imgur\.com/([A-Za-z0-9]+)\.gifv(?:$|[?#])~i', $link, $m)) {
+        $out[] = ['type' => 'gifv', 'url' => 'https://i.imgur.com/' . $m[1] . '.mp4', 'preview_url' => $poster];
+    } elseif (preg_match('/\.mp4(?:$|[?#])/i', $link)) {
+        $out[] = ['type' => 'video', 'url' => $link, 'preview_url' => $poster];
+    }
+    return ap_rss_clean_item_media($out);
+}
+
+/**
+ * Normalize stored item media: https only, known types, deduped, at most 4.
+ *
+ * @param mixed $media
+ * @return list<array{type:string,url:string,preview_url:string}>
+ */
+function ap_rss_clean_item_media($media): array
+{
+    if (!is_array($media)) {
+        return [];
+    }
+    $out = [];
+    $seen = [];
+    foreach ($media as $m) {
+        if (!is_array($m)) {
+            continue;
+        }
+        $type = strtolower(trim((string) ($m['type'] ?? '')));
+        $url = trim(html_entity_decode((string) ($m['url'] ?? ''), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+        if (!in_array($type, ['image', 'video', 'gifv'], true) || !preg_match('#^https://#i', $url) || isset($seen[$url])) {
+            continue;
+        }
+        $preview = trim(html_entity_decode((string) ($m['preview_url'] ?? ''), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+        if (!preg_match('#^https://#i', $preview) || ap_rss_image_host_unusable($preview)) {
+            $preview = '';
+        }
+        $seen[$url] = true;
+        $out[] = ['type' => $type, 'url' => mb_substr($url, 0, 2000), 'preview_url' => mb_substr($preview, 0, 2000)];
+        if (count($out) >= 4) {
+            break;
+        }
+    }
+    return $out;
 }
 
 function ap_rss_parse_feed(string $xml, string $feedUrl): ?array

@@ -3,7 +3,7 @@
 declare(strict_types=1);
 require __DIR__.'/library-privacy-admission-smoke.php';
 $GLOBALS['db_failure']=false;
-foreach (['ap_rss_local_status_id','ap_rss_item_to_masto_status'] as $fn) if (!function_exists($fn)) reference_load($api.'/ap-rss.php',[$fn]);
+foreach (['ap_rss_local_status_id','ap_rss_item_to_masto_status','ap_rss_clean_item_media','ap_rss_image_host_unusable'] as $fn) if (!function_exists($fn)) reference_load($api.'/ap-rss.php',[$fn]);
 $db->exec("DELETE FROM rss_items;DELETE FROM rss_feeds;DELETE FROM fixture_words;INSERT INTO rss_feeds VALUES(1,201,'Private feed','','https://feed.test','https://feed.test/rss');");
 $columns=$db->query('PRAGMA table_info(rss_items)')->fetchAll(PDO::FETCH_COLUMN,1);
 foreach (['url','summary_text','image_url','published_at','mirror_note_id'] as $column) if (!in_array($column,$columns,true)) $db->exec("ALTER TABLE rss_items ADD $column TEXT");
