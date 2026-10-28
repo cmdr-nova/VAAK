@@ -41,6 +41,27 @@ fn image_url(text:&str)->String{
         image=image.replace("?&","?");image=regex::Regex::new("&&+").unwrap().replace_all(&image,"&").into_owned();return image.trim_end_matches(['?','&']).into();
     }image
 }
+/// Playable media stored by the poller in `rss_items.media_json` (Reddit
+/// video, gifs, galleries), as Mastodon attachments. Mirrors PHP
+/// `ap_rss_clean_item_media` + `ap_rss_item_to_masto_status`.
+pub(crate) fn stored_media(status_id:&str,raw:&str)->Vec<Value>{
+    let Ok(Value::Array(items))=serde_json::from_str::<Value>(raw)else{return Vec::new();};
+    let mut out=Vec::new();let mut seen=std::collections::HashSet::new();
+    for item in &items{
+        let kind=s(item,"type").trim().to_ascii_lowercase();let url=crate::html_entities::decode(s(item,"url")).trim().to_owned();
+        if !matches!(kind.as_str(),"image"|"video"|"gifv")||!url.to_ascii_lowercase().starts_with("https://")||!seen.insert(url.clone()){continue;}
+        let preview=crate::html_entities::decode(s(item,"preview_url")).trim().to_owned();
+        let preview=if preview.to_ascii_lowercase().starts_with("https://")&&reqwest::Url::parse(&preview).ok().and_then(|u|u.host_str().map(str::to_owned)).as_deref()!=Some("external-preview.redd.it"){preview}else{String::new()};
+        let hls=url.split(['?','#']).next().unwrap_or(&url).to_ascii_lowercase().ends_with(".m3u8");
+        let mime=if kind=="image"{"image/*"}else if hls{"application/vnd.apple.mpegurl"}else{"video/mp4"};
+        let preview=if !preview.is_empty(){json!(preview)}else if kind=="image"{json!(url)}else{Value::Null};
+        out.push(json!({"id":format!("{status_id}-m{}",out.len()),"type":kind,"url":url,"preview_url":preview,"remote_url":url,"mediaType":mime,"description":null,"blurhash":null}));
+        if out.len()>=4{break;}
+    }
+    out
+}
+/// Postgres booleans arrive through `to_jsonb` as JSON bools.
+pub(crate) fn flag(row:&Value,key:&str)->bool{row.get(key).map(|v|v.as_bool().unwrap_or_else(||matches!(v.as_str(),Some("t"|"true"|"1"))))==Some(true)}
 pub(crate) fn normalize(row:&Value,owner:i64)->Result<Value>{
     if owner<1||n(row,"owner_user_id")!=owner||n(row,"id")<1||n(row,"feed_id")<1{bail!("RSS source requires a fresh current-owner subscription row");}
     let id=n(row,"id");let feed=n(row,"feed_id");let sid=format!("rss:{id}");let title=super::card::php_trim(s(row,"title"));let summary=clean_summary(s(row,"summary_text"));let url=s(row,"url").trim();let image=image_url(s(row,"image_url"));let feed_title=clean_feed_title(s(row,"feed_title"));
@@ -54,9 +75,10 @@ pub(crate) fn normalize(row:&Value,owner:i64)->Result<Value>{
     let favicon=if !host.is_empty(){format!("https://icons.duckduckgo.com/ip3/{}.ico",host.strip_prefix("www.").unwrap_or(&host))}else{String::new()};
     let avatar=if !favicon.is_empty(){favicon}else if s(row,"feed_favicon").starts_with("http://")||s(row,"feed_favicon").starts_with("https://"){s(row,"feed_favicon").into()}else{"https://mkultra.monster/img/avatar/default.jpg".into()};
     let acct=feed_title.to_lowercase().chars().filter(|ch|ch.is_ascii_alphanumeric()||"._-".contains(*ch)).take(30).collect::<String>();let acct=if acct.is_empty(){"rss".into()}else{acct};
-    let media=if media_forward{vec![json!({"id":format!("{sid}-img"),"type":"image","url":image,"preview_url":image,"remote_url":image,"mediaType":"image/*","description":null,"blurhash":null})]}else{Vec::new()};
+    let stored=stored_media(&sid,s(row,"media_json"));
+    let media=if !stored.is_empty(){stored}else if media_forward{vec![json!({"id":format!("{sid}-img"),"type":"image","url":image,"preview_url":image,"remote_url":image,"mediaType":"image/*","description":null,"blurhash":null})]}else{Vec::new()};
     let card=if !url.is_empty()&&media.is_empty()&&matches!(reqwest::Url::parse(url).ok().map(|url|url.scheme().to_owned()).as_deref(),Some("http"|"https")){json!({"url":url,"title":if title.is_empty(){if host.is_empty(){url}else{&host}}else{title},"description":summary,"type":"link","author_name":feed_title,"author_url":"","provider_name":host,"provider_url":if host.is_empty(){String::new()}else{format!("https://{host}/")},"html":"","width":0,"height":0,"image":if image.is_empty(){Value::Null}else{json!(image)},"embed_url":"","blurhash":null})}else{Value::Null};
-    Ok(json!({"id":sid,"uri":if url.is_empty(){&sid}else{url},"url":if url.is_empty(){&sid}else{url},"created_at":created,"content":content,"sensitive":false,"spoiler_text":"","visibility":"public","source":"rss","vaak_rss_item_id":id,"vaak_rss_feed_id":feed,"media_attachments":media,"card":card,"account":{"id":format!("rss-feed:{feed}"),"username":acct,"acct":feed_title,"display_name":feed_title,"url":row.get("feed_site_url").unwrap_or(&json!(s(row,"feed_url"))),"uri":s(row,"feed_url"),"avatar":avatar,"avatar_static":avatar}}))
+    Ok(json!({"id":sid,"uri":if url.is_empty(){&sid}else{url},"url":if url.is_empty(){&sid}else{url},"created_at":created,"content":content,"sensitive":flag(row,"sensitive"),"spoiler_text":s(row,"spoiler_text").trim(),"visibility":"public","source":"rss","vaak_rss_item_id":id,"vaak_rss_feed_id":feed,"media_attachments":media,"card":card,"account":{"id":format!("rss-feed:{feed}"),"username":acct,"acct":feed_title,"display_name":feed_title,"url":row.get("feed_site_url").unwrap_or(&json!(s(row,"feed_url"))),"uri":s(row,"feed_url"),"avatar":avatar,"avatar_static":avatar}}))
 }
 fn hidden(name:&str,value:&str)->String{format!("<input type=\"hidden\" name=\"{name}\" value=\"{}\">",esc(value))}
 pub(super) fn actions(status:&Value,facts:&CardFacts)->Result<String>{
@@ -79,6 +101,17 @@ pub(super) fn actions(status:&Value,facts:&CardFacts)->Result<String>{
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn stored_reddit_media_and_flags_reach_library_cards() {
+        let row=json!({"id":5,"feed_id":2,"owner_user_id":1,"url":"https://www.reddit.com/r/x/comments/g/","title":"Many","summary_text":"","image_url":"https://i.redd.it/a.jpg","feed_title":"r/x","feed_url":"https://www.reddit.com/r/x/.rss",
+            "media_json":r#"[{"type":"image","url":"https://i.redd.it/a.jpg","preview_url":""},{"type":"gifv","url":"https://preview.redd.it/c.gif?format=mp4&s=x","preview_url":"https://external-preview.redd.it/p.jpg"}]"#,"sensitive":true,"spoiler_text":"Spoiler"});
+        let st=normalize(&row,1).unwrap();
+        assert_eq!(st["sensitive"],json!(true));assert_eq!(st["spoiler_text"],"Spoiler");assert!(st["card"].is_null());
+        let media=st["media_attachments"].as_array().unwrap();assert_eq!(media.len(),2);
+        assert_eq!(media[0]["preview_url"],"https://i.redd.it/a.jpg");assert_eq!(media[1]["type"],"gifv");assert!(media[1]["preview_url"].is_null());
+        let old=json!({"id":5,"feed_id":2,"owner_user_id":1,"url":"https://example.com/a","title":"A","summary_text":"Body","image_url":"","feed_title":"Blog","feed_url":"https://example.com/feed"});
+        let st=normalize(&old,1).unwrap();assert_eq!(st["sensitive"],json!(false));assert_eq!(st["media_attachments"],json!([]));
+    }
     #[test]
     fn actual_php_rss_projection_and_unicode_width_match() {
         let file=std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../api/bin/migration-library-component-capture.php");

@@ -41,7 +41,7 @@ $listing = json_encode(['kind' => 'Listing', 'data' => ['children' => [
         'url' => 'https://www.reddit.com/r/pics/comments/txt1/hello/', 'created_utc' => 1761550100, 'thumbnail' => 'self',
         'selftext_html' => '<!-- SC_OFF --><div class="md"><p>Body &amp; soul</p></div><!-- SC_ON -->',
     ]],
-    // Reddit-hosted video: dropped like the Atom path.
+    // Reddit-hosted video with no playable source: still dropped at upsert.
     ['kind' => 't3', 'data' => [
         'name' => 't3_vid1', 'permalink' => '/r/pics/comments/vid1/v/', 'title' => 'Video',
         'url' => 'https://v.redd.it/xyz', 'is_video' => true, 'created_utc' => 1761550200,
@@ -68,15 +68,87 @@ $byGuid = [];
 foreach ($parsed['items'] as $it) {
     $byGuid[$it['guid']] = $it;
 }
-reddit_check(count($byGuid) === 5 && !isset($byGuid['x']), 'only t3/t1 children');
+reddit_check(count($byGuid) === 5 && empty($byGuid['t3_img1']['sensitive']) && !isset($byGuid['x']), 'only t3/t1 children');
 reddit_check($byGuid['t3_img1']['image_url'] === 'https://i.redd.it/abc123.jpg', 'image post image');
 reddit_check($byGuid['t3_img1']['url'] === 'https://www.reddit.com/r/pics/comments/img1/a_cat/', 'permalink url');
 reddit_check($byGuid['t3_img1']['published_at'] === gmdate('c', 1761550000), 'published_at');
 reddit_check($byGuid['t3_img1']['summary_text'] === '', 'image post has no summary');
 reddit_check($byGuid['t3_txt1']['summary_text'] === 'Body & soul' && $byGuid['t3_txt1']['image_url'] === '', 'selftext summary');
-reddit_check($byGuid['t3_vid1']['video'] === true && $byGuid['t3_vid1']['image_url'] === '', 'video flagged');
+reddit_check($byGuid['t3_vid1']['video'] === true && $byGuid['t3_vid1']['image_url'] === '' && $byGuid['t3_vid1']['media'] === [], 'unplayable video flagged');
+reddit_check($byGuid['t3_img1']['media'] === [], 'single image keeps the image_url path');
 reddit_check($byGuid['t3_gal1']['image_url'] === 'https://i.redd.it/m1.png', 'gallery first image upgraded');
 reddit_check($byGuid['t3_ext1']['image_url'] === '', 'external-preview dropped');
+
+// Playable media and NSFW flags.
+$media = json_encode(['kind' => 'Listing', 'data' => ['children' => [
+    // NSFW Reddit video: HLS (with audio) plus a poster, flagged sensitive.
+    ['kind' => 't3', 'data' => [
+        'name' => 't3_v2', 'permalink' => '/r/x/comments/v2/v/', 'title' => 'Clip', 'over_18' => true,
+        'url' => 'https://v.redd.it/v2id', 'is_video' => true, 'created_utc' => 1761550600, 'thumbnail' => 'nsfw',
+        'secure_media' => ['reddit_video' => ['fallback_url' => 'https://v.redd.it/v2id/DASH_720.mp4?source=fallback',
+            'hls_url' => 'https://v.redd.it/v2id/HLSPlaylist.m3u8?a=1&f=sd', 'is_gif' => false]],
+        'preview' => ['images' => [['source' => ['url' => 'https://preview.redd.it/v2poster.jpg?width=1280&format=pjpg']]]],
+    ]],
+    // Gif-like video (no audio): progressive mp4 as gifv.
+    ['kind' => 't3', 'data' => [
+        'name' => 't3_g2', 'permalink' => '/r/x/comments/g2/g/', 'title' => 'Loop', 'spoiler' => true,
+        'url' => 'https://v.redd.it/g2id', 'is_video' => true, 'created_utc' => 1761550700,
+        'media' => ['reddit_video' => ['fallback_url' => 'https://v.redd.it/g2id/DASH_480.mp4', 'hls_url' => 'https://v.redd.it/g2id/HLSPlaylist.m3u8', 'is_gif' => true]],
+    ]],
+    // redgifs-style link: Reddit's transcoded preview mp4 plays, oEmbed still is the poster.
+    ['kind' => 't3', 'data' => [
+        'name' => 't3_rg', 'permalink' => '/r/x/comments/rg/r/', 'title' => 'Ext gif', 'over_18' => true,
+        'url' => 'https://www.redgifs.com/watch/abc', 'created_utc' => 1761550800,
+        'preview' => ['reddit_video_preview' => ['fallback_url' => 'https://v.redd.it/rgid/DASH_360.mp4', 'is_gif' => true],
+            'images' => [['source' => ['url' => 'https://external-preview.redd.it/rg.jpg?s=1']]]],
+        'secure_media' => ['oembed' => ['thumbnail_url' => 'https://thumbs44.redgifs.com/Abc-poster.jpg']],
+    ]],
+    // imgur .gifv becomes its mp4.
+    ['kind' => 't3', 'data' => [
+        'name' => 't3_ig', 'permalink' => '/r/x/comments/ig/i/', 'title' => 'Imgur',
+        'url' => 'https://i.imgur.com/AbC12.gifv', 'created_utc' => 1761550900,
+    ]],
+    // Multi-image gallery with an animated item and a failed one.
+    ['kind' => 't3', 'data' => [
+        'name' => 't3_gm', 'permalink' => '/r/x/comments/gm/g/', 'title' => 'Many', 'over_18' => true,
+        'url' => 'https://www.reddit.com/gallery/gm', 'created_utc' => 1761551000,
+        'gallery_data' => ['items' => [['media_id' => 'a'], ['media_id' => 'b'], ['media_id' => 'c']]],
+        'media_metadata' => [
+            'a' => ['status' => 'valid', 'e' => 'Image', 's' => ['u' => 'https://preview.redd.it/a.jpg?width=900&format=pjpg']],
+            'b' => ['status' => 'failed'],
+            'c' => ['status' => 'valid', 'e' => 'AnimatedImage', 's' => ['gif' => 'https://i.redd.it/c.gif', 'mp4' => 'https://preview.redd.it/c.gif?format=mp4&s=x']],
+        ],
+    ]],
+    // Crosspost: media lives on the parent.
+    ['kind' => 't3', 'data' => [
+        'name' => 't3_xp', 'permalink' => '/r/x/comments/xp/x/', 'title' => 'Crosspost',
+        'url' => '/r/y/comments/orig/', 'created_utc' => 1761551100,
+        'crosspost_parent_list' => [['over_18' => true, 'is_video' => true, 'url' => 'https://v.redd.it/orig',
+            'secure_media' => ['reddit_video' => ['hls_url' => 'https://v.redd.it/orig/HLSPlaylist.m3u8']]]],
+    ]],
+]]]);
+$mp = [];
+foreach (ap_rss_parse_reddit_json((string) $media, 'https://www.reddit.com/r/x/.rss')['items'] as $it) {
+    $mp[$it['guid']] = $it;
+}
+reddit_check($mp['t3_v2']['media'] === [['type' => 'video', 'url' => 'https://v.redd.it/v2id/HLSPlaylist.m3u8?a=1&f=sd', 'preview_url' => 'https://i.redd.it/v2poster.jpg']], 'reddit video uses HLS + poster');
+reddit_check($mp['t3_v2']['sensitive'] === true && $mp['t3_v2']['spoiler_text'] === '', 'over_18 is sensitive');
+reddit_check($mp['t3_g2']['media'][0]['type'] === 'gifv' && $mp['t3_g2']['media'][0]['url'] === 'https://v.redd.it/g2id/DASH_480.mp4', 'gif video is a gifv mp4');
+reddit_check($mp['t3_g2']['spoiler_text'] === 'Spoiler' && $mp['t3_g2']['sensitive'] === false, 'spoiler flag');
+reddit_check($mp['t3_rg']['media'] === [['type' => 'gifv', 'url' => 'https://v.redd.it/rgid/DASH_360.mp4', 'preview_url' => 'https://thumbs44.redgifs.com/Abc-poster.jpg']], 'redgifs preview mp4');
+reddit_check($mp['t3_ig']['media'] === [['type' => 'gifv', 'url' => 'https://i.imgur.com/AbC12.mp4', 'preview_url' => 'https://i.imgur.com/AbC12.jpg']] && $mp['t3_ig']['image_url'] === 'https://i.imgur.com/AbC12.jpg', 'imgur gifv');
+reddit_check(array_column($mp['t3_gm']['media'], 'type') === ['image', 'gifv'] && $mp['t3_gm']['media'][0]['url'] === 'https://i.redd.it/a.jpg', 'gallery keeps valid items in order');
+reddit_check($mp['t3_xp']['media'][0]['url'] === 'https://v.redd.it/orig/HLSPlaylist.m3u8' && $mp['t3_xp']['sensitive'] === true && $mp['t3_xp']['video'] === true, 'crosspost parent media + flag');
+reddit_check(ap_rss_clean_item_media([['type' => 'video', 'url' => 'http://x/a.mp4'], ['type' => 'exe', 'url' => 'https://x/a'], ['type' => 'image', 'url' => 'https://x/b.jpg', 'preview_url' => 'https://external-preview.redd.it/p.jpg'], ['type' => 'image', 'url' => 'https://x/b.jpg']]) === [['type' => 'image', 'url' => 'https://x/b.jpg', 'preview_url' => '']], 'clean media');
+
+// Stored media + flags reach the status (PHP painter path).
+$st = ap_rss_item_to_masto_status(['id' => 7, 'feed_id' => 1, 'url' => 'https://www.reddit.com/r/x/comments/v2/v/', 'title' => 'Clip', 'summary_text' => 'some selftext that is long enough to not be media forward at all, really',
+    'image_url' => 'https://i.redd.it/v2poster.jpg', 'feed_title' => 'r/x', 'published_at' => '2026-10-28T00:00:00Z',
+    'media_json' => json_encode($mp['t3_v2']['media']), 'sensitive' => true, 'spoiler_text' => '']);
+reddit_check($st['sensitive'] === true && count($st['media_attachments']) === 1 && $st['card'] === null, 'status carries video and sensitive');
+reddit_check($st['media_attachments'][0]['type'] === 'video' && $st['media_attachments'][0]['mediaType'] === 'application/vnd.apple.mpegurl' && $st['media_attachments'][0]['preview_url'] === 'https://i.redd.it/v2poster.jpg', 'video attachment shape');
+$plain = ap_rss_item_to_masto_status(['id' => 8, 'feed_id' => 1, 'url' => 'https://example.com/a', 'title' => 'A', 'summary_text' => 'Body', 'image_url' => '', 'feed_title' => 'Blog']);
+reddit_check($plain['sensitive'] === false && $plain['spoiler_text'] === '' && $plain['media_attachments'] === [], 'old rows unchanged');
 
 // A user overview mixes posts and comments; a thread is a [post, comments] pair.
 $user = json_encode(['kind' => 'Listing', 'data' => ['children' => [
@@ -102,6 +174,9 @@ putenv('AP_REDDIT_CLIENT_ID=envid');
 reddit_check(ap_rss_reddit_credentials($envFile) === ['envid', 'filesecret'], 'process env wins');
 putenv('AP_REDDIT_CLIENT_ID');
 reddit_check(ap_rss_reddit_credentials($envFile . '.missing') === ['', ''], 'unconfigured');
+file_put_contents($envFile, "AP_REDDIT_USERNAME=nova\nAP_REDDIT_PASSWORD='p=w'\n");
+reddit_check(ap_rss_reddit_login($envFile) === ['nova', 'p=w'], 'account login from vaak.env');
+reddit_check(ap_rss_reddit_login($envFile . '.missing') === ['', ''], 'no account login');
 unlink($envFile);
 
 echo "reddit json feed smoke: {$checks} checks passed\n";

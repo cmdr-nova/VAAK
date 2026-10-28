@@ -956,6 +956,10 @@ struct RssRow {
     feed_favicon: String,
     feed_site_url: String,
     feed_url: String,
+    /// `rss_items.media_json` (Reddit video/gif/gallery); '' on older schemas.
+    media_json: String,
+    sensitive: bool,
+    spoiler_text: String,
 }
 
 #[derive(Clone)]
@@ -1197,8 +1201,8 @@ fn materialize_rss(row: &RssRow) -> Value {
     let content = plain_to_html(&plain);
     let image = upgrade_rss_image(&row.image_url);
     let url = row.url.trim();
-    let media_forward = !image.is_empty() && summary.is_empty();
-    let mut media = Vec::new();
+    let mut media = crate::library::rss::stored_media(&status_id, &row.media_json);
+    let media_forward = media.is_empty() && !image.is_empty() && summary.is_empty();
     if media_forward {
         media.push(json!({
             "id": format!("{status_id}-img"),
@@ -1273,6 +1277,9 @@ fn materialize_rss(row: &RssRow) -> Value {
         media,
         card,
     );
+    // Source NSFW/spoiler flags go through VAAK's own sensitive-media gate.
+    st["sensitive"] = json!(row.sensitive);
+    st["spoiler_text"] = json!(row.spoiler_text.trim());
     st["application"] = json!({"name": "RSS", "website": Value::Null});
     st["tags"] = json!([{"name": "RSS", "url": ""}]);
     st["vaak_rss_item_id"] = json!(row.id);
@@ -2562,7 +2569,11 @@ async fn fetch_rss_map(db: &Client, ids: &[i64], owner: i64) -> Result<HashMap<i
                     COALESCE(i.summary_text,''), COALESCE(i.image_url,''),
                     COALESCE(i.published_at::text, i.ingested_at::text, ''),
                     COALESCE(f.title,''), COALESCE(f.favicon_url,''),
-                    COALESCE(f.site_url,''), COALESCE(f.feed_url,'')
+                    COALESCE(f.site_url,''), COALESCE(f.feed_url,''),
+                    -- to_jsonb keeps this working before the media columns exist.
+                    COALESCE(to_jsonb(i)->>'media_json',''),
+                    COALESCE((to_jsonb(i)->>'sensitive')::boolean, FALSE),
+                    COALESCE(to_jsonb(i)->>'spoiler_text','')
              FROM rss_items i
              JOIN rss_feeds f ON f.id = i.feed_id
              WHERE i.id = ANY($1) AND f.owner_user_id = $2",
@@ -2586,6 +2597,9 @@ async fn fetch_rss_map(db: &Client, ids: &[i64], owner: i64) -> Result<HashMap<i
                 feed_favicon: row.get(8),
                 feed_site_url: row.get(9),
                 feed_url: row.get(10),
+                media_json: row.get(11),
+                sensitive: row.get(12),
+                spoiler_text: row.get(13),
             },
         );
     }
@@ -5704,6 +5718,54 @@ mod tests {
         assert_eq!(out2, "2026-10-05T06:43:15.000Z");
         let out3 = format_time("2026-10-05T08:43:15.000Z");
         assert_eq!(out3, "2026-10-05T08:43:15.000Z");
+    }
+
+    fn reddit_rss_row(media_json: &str, sensitive: bool, spoiler: &str) -> RssRow {
+        RssRow {
+            id: 9,
+            feed_id: 21,
+            url: "https://www.reddit.com/r/x/comments/v2/clip/".into(),
+            title: "Clip".into(),
+            summary_text: String::new(),
+            image_url: "https://i.redd.it/poster.jpg".into(),
+            published_at: "2026-10-28T00:00:00+00:00".into(),
+            feed_title: "r/x".into(),
+            feed_favicon: String::new(),
+            feed_site_url: "https://www.reddit.com/r/x/".into(),
+            feed_url: "https://www.reddit.com/r/x/.rss".into(),
+            media_json: media_json.into(),
+            sensitive,
+            spoiler_text: spoiler.into(),
+        }
+    }
+
+    #[test]
+    fn rss_stored_video_paints_behind_sensitive_gate() {
+        let row = reddit_rss_row(
+            r#"[{"type":"video","url":"https://v.redd.it/v2/HLSPlaylist.m3u8?a=1","preview_url":"https://i.redd.it/poster.jpg"},{"type":"gifv","url":"http://insecure/x.mp4"}]"#,
+            true,
+            "",
+        );
+        let st = materialize_rss(&row);
+        assert_eq!(st["sensitive"], json!(true));
+        assert!(st["card"].is_null());
+        let media = st["media_attachments"].as_array().unwrap();
+        assert_eq!(media.len(), 1, "non-https media dropped");
+        assert_eq!(media[0]["type"], "video");
+        assert_eq!(media[0]["mediaType"], "application/vnd.apple.mpegurl");
+        let html = crate::notif_embed::paint_lean_feed_card(&st);
+        assert!(html.contains("cw-gate"), "{html}");
+        assert!(html.contains("data-hls-src=\"https://v.redd.it/v2/HLSPlaylist.m3u8?a=1\""), "{html}");
+    }
+
+    #[test]
+    fn rss_without_stored_media_keeps_image_path() {
+        let st = materialize_rss(&reddit_rss_row("", false, ""));
+        assert_eq!(st["sensitive"], json!(false));
+        assert_eq!(st["spoiler_text"], "");
+        assert_eq!(st["media_attachments"][0]["url"], "https://i.redd.it/poster.jpg");
+        let spoiler = materialize_rss(&reddit_rss_row("", false, "Spoiler"));
+        assert_eq!(spoiler["spoiler_text"], "Spoiler");
     }
 
     #[test]
