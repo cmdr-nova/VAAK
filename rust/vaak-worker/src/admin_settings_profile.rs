@@ -147,6 +147,8 @@ pub(super) fn paint(c:Collected,r:&Request)->Result<(String,usize,Value)>{
   h.push_str(&format!(r#"<label class="profile-policy-row">{label} <select name="{k}"> <option value="anyone" {}>Anyone</option> <option value="followers" {}>Followers</option> <option value="nobody" {}>Nobody</option> </select> </label> "#,selected(v=="anyone"),selected(!missing&&v=="followers"),selected(!missing&&v=="nobody")));
  }
  h.push_str(r#"<div class="meta profile-policy-note">These defaults are published with your posts and are enforced for incoming quote requests. You can still choose a post's visibility when composing.</div> </div> "#);
+ // PHP fills this with the ListenBrainz and Nostr link fields (their own forms).
+ h.push_str("<!--vaak:linked-accounts--> ");
  h.push_str(&format!(r#"<div class="profile-policy-block" style="margin-top:.85rem"> <label class="profile-policy-row"><span><input type="checkbox" name="hide_profile_replies" value="1" {}> Hide replies from my profile</span></label> <label class="profile-policy-row"><span><input type="checkbox" name="hide_profile_boosts" value="1" {}> Hide boosts from my profile</span></label> <div class="meta profile-policy-note">This only changes your public profile. Replies and boosts remain available in VAAK timelines and ActivityPub.</div> </div> "#,checked(boolean(p,"hide_profile_replies")),checked(boolean(p,"hide_profile_boosts"))));
  let default_on=|k:&str|p.get(k).is_none()||boolean(p,k);
  let on=|k:&str|checked(boolean(p,k));

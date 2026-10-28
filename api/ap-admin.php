@@ -30539,6 +30539,10 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     }
     .profile-form .profile-policy-block label.profile-policy-row select { max-width: 16rem; }
     .profile-form .profile-policy-block .profile-policy-note { margin: 0; }
+    .profile-form .profile-linked-accounts {
+      display: flex; flex-direction: column; gap: .85rem; margin: .85rem 0 .25rem;
+    }
+    .profile-form .profile-linked-account .meta { margin: 0; }
     .profile-preview {
       display: flex; gap: 1rem; align-items: center; margin-bottom: 1rem;
       padding: .85rem; border-radius: 12px; background: var(--panel-2); border: 1px solid var(--border);
@@ -33494,42 +33498,63 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
         </form>
         <?php endif; ?>
         <?php
+          // ListenBrainz and Nostr have their own Save buttons but sit inside the
+          // profile form, below Who can reply/quote. Forms cannot nest, so each
+          // keeps an empty form out here and its fields join it via form="…".
           require_once __DIR__ . '/ap-listenbrainz.php';
           $lbLink = ap_listenbrainz_link_for_user((int) $vaakOwnerId);
           $lbName = is_array($lbLink) ? (string) ($lbLink['lb_username'] ?? '') : '';
           $lbError = is_array($lbLink) ? trim((string) ($lbLink['last_error'] ?? '')) : '';
+          require_once __DIR__ . '/ap-nostr.php';
+          $nostrFormOn = ap_nostr_form_visible(!empty($vaakIsAdmin)) && ap_nostr_table_ready();
+          $nostrLink = $nostrFormOn ? ap_nostr_link_for_user((int) $vaakOwnerId) : null;
+          $nostrHex = is_array($nostrLink) ? (string) ($nostrLink['pubkey'] ?? '') : '';
+          $nostrShow = !is_array($nostrLink) || !empty($nostrLink['show_in_home']);
+          $nostrStatus = $nostrFormOn ? ap_nostr_status_line($nostrLink, time()) : '';
+          ob_start();
         ?>
-        <form method="post" action="?view=profile" class="composer listenbrainz-form">
+        <div class="profile-linked-accounts listenbrainz-form">
+          <div class="profile-linked-account">
+            <label for="listenbrainz-username">ListenBrainz username</label>
+            <div class="supporter-reward-row">
+              <input id="listenbrainz-username" form="listenbrainz-link-form" name="listenbrainz_username" autocomplete="off" maxlength="120" value="<?= h($lbName) ?>" placeholder="your ListenBrainz name">
+              <button class="btn btn-primary" type="submit" form="listenbrainz-link-form">Save</button>
+            </div>
+            <div class="meta">Shows what you're listening to (or your last played track) on your profile. Leave it empty to turn it off. Updates about once a minute.<?php if ($lbName !== '' && $lbError !== ''): ?> Last check: <?= h($lbError) ?>.<?php endif; ?></div>
+          </div>
+          <?php if ($nostrFormOn): ?>
+          <div class="profile-linked-account nostr-link-form">
+            <label for="nostr-npub">Nostr npub</label>
+            <div class="supporter-reward-row">
+              <input id="nostr-npub" form="nostr-link-form" name="nostr_npub" autocomplete="off" spellcheck="false" maxlength="400" value="<?= h($nostrHex !== '' ? ap_nostr_npub($nostrHex) : '') ?>" placeholder="npub1…">
+              <button class="btn btn-primary" type="submit" form="nostr-link-form">Save</button>
+            </div>
+            <label class="meta" style="font-weight:400"><input type="checkbox" form="nostr-link-form" name="nostr_show_in_home" value="1"<?= $nostrShow ? ' checked' : '' ?>> Show posts from people I follow on Nostr in Home</label>
+            <div class="meta">Read-only: VAAK only needs your public npub, never your nsec, and never posts or changes anything on Nostr. Leave it empty to unlink.<?php if ($nostrStatus !== ''): ?> <?= h($nostrStatus) ?><?php endif; ?></div>
+          </div>
+          <?php endif; ?>
+        </div>
+        <?php $linkedAccountsHtml = (string) ob_get_clean(); ?>
+        <form id="listenbrainz-link-form" method="post" action="?view=profile" hidden>
           <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
           <input type="hidden" name="action" value="save_listenbrainz">
-          <label for="listenbrainz-username">ListenBrainz username</label>
-          <div class="supporter-reward-row">
-            <input id="listenbrainz-username" name="listenbrainz_username" autocomplete="off" maxlength="120" value="<?= h($lbName) ?>" placeholder="your ListenBrainz name">
-            <button class="btn btn-primary" type="submit">Save</button>
-          </div>
-          <div class="meta">Shows what you're listening to (or your last played track) on your profile. Leave it empty to turn it off. Updates about once a minute.<?php if ($lbName !== '' && $lbError !== ''): ?> Last check: <?= h($lbError) ?>.<?php endif; ?></div>
         </form>
-        <?php
-          require_once __DIR__ . '/ap-nostr.php';
-          if (ap_nostr_form_visible(!empty($vaakIsAdmin)) && ap_nostr_table_ready()):
-            $nostrLink = ap_nostr_link_for_user((int) $vaakOwnerId);
-            $nostrHex = is_array($nostrLink) ? (string) ($nostrLink['pubkey'] ?? '') : '';
-            $nostrShow = !is_array($nostrLink) || !empty($nostrLink['show_in_home']);
-            $nostrStatus = ap_nostr_status_line($nostrLink, time());
-        ?>
-        <form method="post" action="?view=profile" class="composer listenbrainz-form nostr-link-form">
+        <?php if ($nostrFormOn): ?>
+        <form id="nostr-link-form" method="post" action="?view=profile" hidden>
           <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
           <input type="hidden" name="action" value="save_nostr">
-          <label for="nostr-npub">Nostr npub</label>
-          <div class="supporter-reward-row">
-            <input id="nostr-npub" name="nostr_npub" autocomplete="off" spellcheck="false" maxlength="400" value="<?= h($nostrHex !== '' ? ap_nostr_npub($nostrHex) : '') ?>" placeholder="npub1…">
-            <button class="btn btn-primary" type="submit">Save</button>
-          </div>
-          <label class="meta" style="font-weight:400"><input type="checkbox" name="nostr_show_in_home" value="1"<?= $nostrShow ? ' checked' : '' ?>> Show posts from people I follow on Nostr in Home</label>
-          <div class="meta">Read-only: VAAK only needs your public npub, never your nsec, and never posts or changes anything on Nostr. Leave it empty to unlink.<?php if ($nostrStatus !== ''): ?> <?= h($nostrStatus) ?><?php endif; ?></div>
         </form>
         <?php endif; ?>
-        <?php if (($settingsNativeProfile = ap_settings_native_body('settings_profile', !empty($vaakIsAdmin))) !== null): ?><?= $settingsNativeProfile ?><?php else: ?>
+        <?php
+          $settingsNativeProfile = ap_settings_native_body('settings_profile', !empty($vaakIsAdmin));
+          if ($settingsNativeProfile !== null) {
+              // An older worker without the slot still gets the boxes, above the form.
+              $settingsNativeProfile = str_contains($settingsNativeProfile, '<!--vaak:linked-accounts-->')
+                  ? str_replace('<!--vaak:linked-accounts-->', $linkedAccountsHtml, $settingsNativeProfile)
+                  : '<div class="composer">' . $linkedAccountsHtml . '</div>' . $settingsNativeProfile;
+          }
+        ?>
+        <?php if ($settingsNativeProfile !== null): ?><?= $settingsNativeProfile ?><?php else: ?>
         <form class="composer profile-form" method="post" action="?view=profile" enctype="multipart/form-data">
           <input type="hidden" name="action" value="save_profile">
           <div class="profile-preview">
@@ -33687,6 +33712,7 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
             </label>
             <div class="meta profile-policy-note">These defaults are published with your posts and are enforced for incoming quote requests. You can still choose a post's visibility when composing.</div>
           </div>
+          <?= $linkedAccountsHtml ?? '<!--vaak:linked-accounts-->' ?>
 
           <div class="profile-policy-block" style="margin-top:.85rem">
             <label class="profile-policy-row"><span><input type="checkbox" name="hide_profile_replies" value="1" <?= !empty($profile['hide_profile_replies']) ? 'checked' : '' ?>> Hide replies from my profile</span></label>
