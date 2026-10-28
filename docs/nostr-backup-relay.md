@@ -63,7 +63,7 @@ line and Caddy route are pasted by hand, like the other units.
    ```
    @nostr_relay path /nostr
    handle @nostr_relay {
-       reverse_proxy 127.0.0.1:8795
+       reverse_proxy 127.0.0.1:8797
    }
    ```
 
