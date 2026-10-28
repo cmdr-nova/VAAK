@@ -1,0 +1,11 @@
+[Unit]
+Description=Run the VAAK Nostr sync every few minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=3min
+RandomizedDelaySec=20s
+Unit=vaak-nostr-sync.service
+
+[Install]
+WantedBy=timers.target

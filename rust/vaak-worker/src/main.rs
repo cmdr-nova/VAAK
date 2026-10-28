@@ -75,6 +75,7 @@ mod settings;
 mod shadow_auth;
 mod library;
 mod listenbrainz;
+mod nostr;
 mod ml_ranker;
 mod integrations;
 mod private_surfaces;
@@ -287,6 +288,14 @@ enum Command {
     Serve {
         #[arg(long, default_value = "127.0.0.1:8787")]
         bind: String,
+    },
+    /// Read-only Nostr sync for users who linked an npub: follow lists,
+    /// follows' profiles and relays, recent notes, and the retention sweep.
+    /// Run by deploy/vaak-nostr-sync.timer. VAAK_NOSTR=0 turns it off.
+    NostrSync {
+        /// Hard limit for one run, in seconds.
+        #[arg(long, default_value_t = 100)]
+        budget_secs: u64,
     },
     /// Print the cleanup retention plan. PHP still owns deletes.
     CleanupShadow {
@@ -559,6 +568,9 @@ async fn worker_main() -> Result<()> {
         Command::Serve { bind } => {
             let addr: SocketAddr = bind.parse()?;
             http::serve(cfg, addr).await?;
+        }
+        Command::NostrSync { budget_secs } => {
+            println!("{}", nostr::sync::run_once(&cfg, budget_secs).await?);
         }
         Command::CleanupShadow { execute } => {
             match cleanup::shadow_report(execute) {

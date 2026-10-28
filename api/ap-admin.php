@@ -2414,6 +2414,25 @@ $vaakAdminOnlyActions = [
             $error = (string) ($lbSaved['error'] ?? 'Could not save your ListenBrainz username.');
         }
         $view = 'profile';
+    } elseif ($action === 'save_nostr') {
+        require_once __DIR__ . '/ap-nostr.php';
+        if (!ap_nostr_form_visible(!empty($vaakIsAdmin))) {
+            $error = 'Nostr in Home is not open on this server yet.';
+        } else {
+            $nostrSaved = ap_nostr_save_link(
+                admin_owner_user_id(),
+                (string) ($_POST['nostr_npub'] ?? ''),
+                !empty($_POST['nostr_show_in_home'])
+            );
+            if (!empty($nostrSaved['ok'])) {
+                $notice = ($nostrSaved['pubkey'] ?? '') === ''
+                    ? 'Nostr is unlinked. Its posts leave your Home within a few minutes.'
+                    : 'Nostr npub saved. Posts from people you follow there show up in Home within a few minutes.';
+            } else {
+                $error = (string) ($nostrSaved['error'] ?? 'Could not save your npub.');
+            }
+        }
+        $view = 'profile';
     } elseif ($action === 'save_profile') {
         $fieldNames = $_POST['field_name'] ?? [];
         $fieldValues = $_POST['field_value'] ?? [];
@@ -33490,6 +33509,26 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
           </div>
           <div class="meta">Shows what you're listening to (or your last played track) on your profile. Leave it empty to turn it off. Updates about once a minute.<?php if ($lbName !== '' && $lbError !== ''): ?> Last check: <?= h($lbError) ?>.<?php endif; ?></div>
         </form>
+        <?php
+          require_once __DIR__ . '/ap-nostr.php';
+          if (ap_nostr_form_visible(!empty($vaakIsAdmin)) && ap_nostr_table_ready()):
+            $nostrLink = ap_nostr_link_for_user((int) $vaakOwnerId);
+            $nostrHex = is_array($nostrLink) ? (string) ($nostrLink['pubkey'] ?? '') : '';
+            $nostrShow = !is_array($nostrLink) || !empty($nostrLink['show_in_home']);
+            $nostrStatus = ap_nostr_status_line($nostrLink, time());
+        ?>
+        <form method="post" action="?view=profile" class="composer listenbrainz-form nostr-link-form">
+          <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
+          <input type="hidden" name="action" value="save_nostr">
+          <label for="nostr-npub">Nostr npub</label>
+          <div class="supporter-reward-row">
+            <input id="nostr-npub" name="nostr_npub" autocomplete="off" spellcheck="false" maxlength="400" value="<?= h($nostrHex !== '' ? ap_nostr_npub($nostrHex) : '') ?>" placeholder="npub1…">
+            <button class="btn btn-primary" type="submit">Save</button>
+          </div>
+          <label class="meta" style="font-weight:400"><input type="checkbox" name="nostr_show_in_home" value="1"<?= $nostrShow ? ' checked' : '' ?>> Show posts from people I follow on Nostr in Home</label>
+          <div class="meta">Read-only: VAAK only needs your public npub, never your nsec, and never posts or changes anything on Nostr. Leave it empty to unlink.<?php if ($nostrStatus !== ''): ?> <?= h($nostrStatus) ?><?php endif; ?></div>
+        </form>
+        <?php endif; ?>
         <?php if (($settingsNativeProfile = ap_settings_native_body('settings_profile', !empty($vaakIsAdmin))) !== null): ?><?= $settingsNativeProfile ?><?php else: ?>
         <form class="composer profile-form" method="post" action="?view=profile" enctype="multipart/form-data">
           <input type="hidden" name="action" value="save_profile">

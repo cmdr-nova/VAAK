@@ -71,6 +71,7 @@ php_tests=(
   api/bin/follow-fallback-smoke.php
   api/bin/fanout-dead-host-smoke.php
   api/bin/listenbrainz-smoke.php
+  api/bin/nostr-smoke.php
   api/bin/home-bsky-index-smoke.php
   api/bin/home-signal-batch-smoke.php
   api/bin/inbox-signature-smoke.php
