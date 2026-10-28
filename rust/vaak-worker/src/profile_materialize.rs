@@ -401,9 +401,11 @@ impl ProjectedQuoteTarget {
         let bound_dependencies=self.ledger.dependencies.clone();let bound_static=self.ledger.static_counts.clone();
         let guard=CompletionGrant{audience:CompletionAudience::Quote(grant,&self.requested),status:&admission_status,page:None,dependencies:&bound_dependencies,static_counts:&bound_static};
         if let Some(status)=self.status.as_mut(){
+            // A recheck that ends one step also opens the next one: nothing is
+            // awaited between them, so the next step does not repeat it.
+            if !self.graphs.is_empty()||!self.cache.is_empty(){grant.require_current(db,&self.requested,&admission_status).await?;}
             for task in &self.graphs{
                 for kind in ["followers","following"]{
-                    grant.require_current(db,&self.requested,&admission_status).await?;
                     let(key,value,write,dependency)=graphs.load(db,kind,&task.actor,&guard).await?;
                     grant.require_current(db,&self.requested,&admission_status).await?;
                     if let Some(dependency)=dependency{self.ledger.dependencies.push(dependency)}
@@ -412,8 +414,9 @@ impl ProjectedQuoteTarget {
                     apply_graph_count(status,&task.actor,kind,count);
                 }
             }
-            for task in &self.cache{
-                grant.require_current(db,&self.requested,&admission_status).await?;
+            for(n,task)in self.cache.iter().enumerate(){
+                // Each task ends with awaited reads after its last recheck.
+                if n>0{grant.require_current(db,&self.requested,&admission_status).await?;}
                 let Some(url)=crate::direct_preview::extract_url(&task.text)?else{continue};let key=json!({"url":crate::direct_preview::normalize(&url)?});
                 let sql="SELECT to_jsonb(c) FROM link_preview_cards c WHERE url=$1::jsonb->>'url' LIMIT 1";
                 let rows=Dependency::read(db,sql,&key).await?;grant.require_current(db,&self.requested,&admission_status).await?;

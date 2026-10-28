@@ -395,6 +395,10 @@ pub(crate) struct AdmittedQuoteProjection {requested:String,status:Option<Value>
 impl AdmittedQuoteProjection {
  pub(crate) fn permits(&self,target:&str,status:&Value)->bool{self.requested==target&&self.status.as_ref()==Some(status)}
  pub(crate) async fn require_current(&self,db:&Client,target:&str,status:&Value)->Result<()>{
+  crate::profile_bridge::count_stage(crate::profile_bridge::StageCount::QuoteRecheck);
+  crate::profile_bridge::timed(crate::profile_bridge::Stage::QuoteRecheck,self.require_current_inner(db,target,status)).await
+ }
+ async fn require_current_inner(&self,db:&Client,target:&str,status:&Value)->Result<()>{
   if !self.permits(target,status){bail!("PHP fallback: quote cache capability does not match current target")}
   require_projection_identity(db,self.owner,&self.owner_snapshot,&self.root_actor,&self.page).await?;
   let mut parent=vec![self.parent.clone()];crate::audience::filter_profile_statuses(db,self.owner,crate::audience::Surface::Direct,&mut parent).await?;
@@ -599,7 +603,7 @@ async fn prepare_raw_quote(db:&Client,viewer:&crate::profile_materialize::Profil
   let html=crate::profile_raw::render_quote(&quote,facts)?;
   return Ok((html,crate::profile_materialize::ProjectedQuoteTarget::absent(intent.url.clone()),Vec::new()));
  }
- let mut product=crate::profile_materialize::materialize_quote_target(db,viewer,target).await?;let mut mapping_changes=Vec::new();
+ let mut product=crate::profile_bridge::timed(crate::profile_bridge::Stage::QuoteMaterialize,crate::profile_materialize::materialize_quote_target(db,viewer,target)).await?;let mut mapping_changes=Vec::new();
  product.require_current(db).await?;
  let Some(child)=product.status().cloned()else{
   let quote=external_quote_facts(db,intent,bsky).await?;
@@ -613,8 +617,10 @@ async fn prepare_raw_quote(db:&Client,viewer:&crate::profile_materialize::Profil
  let admission_status=child.clone();let grant=AdmittedQuoteProjection{requested:product.requested_target().into(),status:if allowed{Some(child.clone())}else{None},owner,owner_snapshot,root_actor:root_actor.into(),page:page.clone(),parent:root.clone()};
  if allowed{
   let warm=match viewer{crate::profile_materialize::ProfileViewer::Auth(session)=>session.warm_context(),crate::profile_materialize::ProfileViewer::Guest(session)=>session.warm_context()};
-  let effects=product.effects().to_vec();for effect in &effects{
-   grant.require_current(db,product.requested_target(),&admission_status).await?;
+  // Each effect is followed by a recheck, which also serves as the next
+  // effect's precheck: nothing is awaited between the two.
+  let effects=product.effects().to_vec();if !effects.is_empty(){grant.require_current(db,product.requested_target(),&admission_status).await?;}
+  for effect in &effects{
    match effect.effect(){
     crate::profile_materialize::ProjectionEffect::ActorWarm(actor)=>{let current=product.effect_current_grant(&admission_status,&grant);warm.context("PHP fallback: quoted actor effect transport unavailable")?.actor_with_grant(db,actor,&current).await?;},
     crate::profile_materialize::ProjectionEffect::MediaWarm(actor)=>{let current=product.effect_current_grant(&admission_status,&grant);warm.context("PHP fallback: quoted media effect transport unavailable")?.media_with_grant(db,actor,&current).await?;},
@@ -624,7 +630,7 @@ async fn prepare_raw_quote(db:&Client,viewer:&crate::profile_materialize::Profil
    grant.require_current(db,product.requested_target(),&admission_status).await?;
   }
  }
- if allowed{product.complete_cache(db,dns,&grant).await?;}
+ if allowed{crate::profile_bridge::timed(crate::profile_bridge::Stage::QuoteCache,product.complete_cache(db,dns,&grant)).await?;}
  let html=if allowed{crate::profile_raw::render_quote(&raw_quote_facts(product.status().unwrap(),target),facts)?}else{String::new()};
  product.require_current(db).await?;page.require_current_ledger(db).await?;
  Ok((html,product,mapping_changes))
