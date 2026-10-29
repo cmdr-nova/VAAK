@@ -94,6 +94,7 @@ mod search_components;
 mod cleanup;
 mod fanout_host;
 mod follow_fallback;
+mod inbox_accept;
 mod inbox_origin;
 mod inbox_sig_shadow;
 mod parity_replay;

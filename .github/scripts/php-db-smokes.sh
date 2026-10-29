@@ -49,15 +49,19 @@ redis_hostport="${redis_hostport%%/*}"
 
 worker_pid=""
 profile_pid=""
+inbox_pid=""
+stub_pid=""
 cleanup() {
   if [[ -n "$worker_pid" ]]; then
     kill "$worker_pid" 2>/dev/null || true
     wait "$worker_pid" 2>/dev/null || true
   fi
-  if [[ -n "$profile_pid" ]]; then
-    kill "$profile_pid" 2>/dev/null || true
-    wait "$profile_pid" 2>/dev/null || true
-  fi
+  for pid in "$profile_pid" "$inbox_pid" "$stub_pid"; do
+    if [[ -n "$pid" ]]; then
+      kill "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+    fi
+  done
   rm -rf "$work"
 }
 trap cleanup EXIT
@@ -168,4 +172,30 @@ VAAK_PROFILE_PARITY_RUST_URL="$profile_url" VAAK_PROFILE_COMPLETE_SECRET="$profi
   VAAK_PROFILE_COMPLETE_BUDGET_MS="$profile_budget_ms" \
   run "$runner" api/bin/profile-complete-parity-smoke.php
 
-echo "db smokes: 13 passed"
+# Rust inbox front door (cutover F2): its own worker with the switch on, and
+# a php -S stand-in for the PHP inbox it forwards to.
+stub_port="${VAAK_CI_INBOX_STUB_PORT:-18799}"
+php -S "127.0.0.1:${stub_port}" api/bin/inbox-forward-stub-fixture.php >"${work}/stub.log" 2>&1 &
+stub_pid=$!
+inbox_port="${VAAK_CI_INBOX_PORT:-18798}"
+VAAK_ENV_FILE=/nonexistent VAAK_PHYRIAN_BRIDGE_ENV_FILE=/nonexistent \
+  VAAK_INBOX_RUST_ACCEPT=1 VAAK_INBOX_PHP_URL="http://127.0.0.1:${stub_port}" \
+  VAAK_DATABASE_URL="postgresql://${PGUSER}@${PGHOST}:${PGPORT}/${db}" \
+  VAAK_REDIS_URL="redis://${redis_hostport}/0" VAAK_REDIS_QUEUE_URL="redis://${redis_hostport}/1" \
+  VAAK_JETSTREAM_STATE="${work}/worker/jetstream-inbox" VAAK_NOTIF_CACHE_DIR="${work}/worker" \
+  RUST_LOG=warn "$worker_bin" serve --bind "127.0.0.1:${inbox_port}" &
+inbox_pid=$!
+inbox_url="http://127.0.0.1:${inbox_port}"
+for _ in $(seq 1 60); do
+  if php -r 'exit(@file_get_contents($argv[1]) === false ? 1 : 0);' "${inbox_url}/healthz"; then
+    break
+  fi
+  if ! kill -0 "$inbox_pid" 2>/dev/null; then
+    echo "inbox vaak-worker exited" >&2
+    exit 1
+  fi
+  sleep 1
+done
+VAAK_INBOX_RUST_URL="$inbox_url" run "$runner" api/bin/inbox-rust-accept-smoke.php
+
+echo "db smokes: 14 passed"

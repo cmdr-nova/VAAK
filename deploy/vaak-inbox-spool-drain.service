@@ -1,0 +1,18 @@
+[Unit]
+Description=VAAK inbox spool drain (deliveries the Rust inbox accepted)
+After=postgresql.service redis-server.service
+
+[Service]
+Type=simple
+User=www-data
+WorkingDirectory=/srv/mkultra/html/api
+# Same database as PHP-FPM; the script also copies the pool's env[] lines.
+Environment=AP_DB_DSN=pgsql:dbname=novalandia
+ExecStart=/usr/bin/php /srv/mkultra/html/api/bin/inbox-spool-drain.php --budget=300
+Restart=always
+RestartSec=2
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

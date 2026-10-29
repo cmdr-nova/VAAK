@@ -15,8 +15,8 @@ use serde_json::Value;
 use crate::config::Config;
 
 #[derive(Clone)]
-struct AppState {
-    cfg: Arc<Config>,
+pub(crate) struct AppState {
+    pub(crate) cfg: Arc<Config>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -209,6 +209,11 @@ pub async fn serve(cfg: Config, bind: SocketAddr) -> Result<()> {
     if crate::admin_read::enabled(){app=app.route("/internal/settings/profile-save",post(internal_settings_profile_save).layer(axum::extract::DefaultBodyLimit::max(64*1024)).layer(axum::middleware::map_response(crate::profile_bridge::no_store)));}
     if crate::admin_read::enabled(){app=app.route("/internal/admin/action",post(internal_admin_action).layer(axum::extract::DefaultBodyLimit::max(512*1024)).layer(axum::middleware::map_response(crate::profile_bridge::no_store)));}
     if crate::admin_read::enabled(){app=app.route("/internal/settings/action",post(internal_settings_action).layer(axum::extract::DefaultBodyLimit::max(64*1024)).layer(axum::middleware::map_response(crate::profile_bridge::no_store)));}
+    // Rust cutover F2: inbox POSTs. Routed here only when Caddy sends them;
+    // with VAAK_INBOX_RUST_ACCEPT unset every request is forwarded to PHP.
+    for path in ["/inbox", "/inbox/", "/users/{key}/inbox", "/users/{key}/inbox/"] {
+        app = app.route(path, post(crate::inbox_accept::handle).layer(axum::extract::DefaultBodyLimit::max(crate::inbox_accept::MAX_BODY + 1)));
+    }
     let app=app.with_state(state);
 
     tracing::info!(%bind, "vaak-worker shadow HTTP listening");
