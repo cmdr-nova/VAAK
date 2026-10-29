@@ -2664,7 +2664,7 @@ $vaakAdminOnlyActions = [
             : ap_cmdr_publish_profile_update($vaakActorKey);
         if (!empty($fan['ok'])) {
             $notice = 'Profile Update pushed (no movedTo). Delivered to ' . (int) ($fan['delivered'] ?? 0)
-                . ' inbox(es) — followers'
+                . ' inbox(es)' . (!empty($fan['queued']) ? ', ' . (int) $fan['queued'] . ' more queued' : '') . ' — followers'
                 . ($vaakActorKey === 'cmdr_nova' ? ' + known remote shared inboxes' : '')
                 . '. Remotes that still show “moved” should clear after they process the Update or re-fetch the actor.';
         } else {
@@ -3315,7 +3315,8 @@ $vaakAdminOnlyActions = [
                         : (function_exists('ap_cmdr_publish_profile_update')
                             ? ap_cmdr_publish_profile_update(vaak_actor_key())
                             : ['delivered' => 0]);
-                    $notice = 'Alias saved. Profile Update delivered to ' . (int) ($fan['delivered'] ?? 0) . ' inboxes.';
+                    $notice = 'Alias saved. Profile Update delivered to ' . (int) ($fan['delivered'] ?? 0) . ' inboxes'
+                        . (!empty($fan['queued']) ? ', ' . (int) $fan['queued'] . ' more queued' : '') . '.';
                 } else {
                     $error = $res['error'] ?? 'Could not add alias.';
                 }
@@ -3344,14 +3345,19 @@ $vaakAdminOnlyActions = [
                 $res = ap_move_out((string) ($_POST['target'] ?? ''), (string) ($_POST['confirm'] ?? ''), vaak_actor_key());
                 if (!empty($res['ok'])) {
                     $notice = 'Move published (movedTo set). Delivered profile Update to '
-                        . (int) ($res['delivered'] ?? 0) . ' inboxes. Followers migrate on supporting servers.';
+                        . (int) ($res['delivered'] ?? 0) . ' inboxes'
+                        . (!empty($res['queued']) ? ', ' . (int) $res['queued'] . ' more queued' : '')
+                        . '. Move sent to ' . (int) ($res['move_delivered'] ?? 0) . ' inboxes'
+                        . (!empty($res['move_queued']) ? ', ' . (int) $res['move_queued'] . ' more queued' : '')
+                        . '. Followers migrate on supporting servers.';
                 } else {
                     $error = $res['error'] ?? 'Move failed.';
                 }
             } elseif ($action === 'move_clear') {
                 $res = ap_move_clear((string) ($_POST['confirm'] ?? ''), vaak_actor_key());
                 if (!empty($res['ok'])) {
-                    $notice = 'movedTo cleared. Update delivered to ' . (int) ($res['delivered'] ?? 0) . ' inboxes.';
+                    $notice = 'movedTo cleared. Update delivered to ' . (int) ($res['delivered'] ?? 0) . ' inboxes'
+                        . (!empty($res['queued']) ? ', ' . (int) $res['queued'] . ' more queued' : '') . '.';
                 } else {
                     $error = $res['error'] ?? 'Clear failed.';
                 }
@@ -3364,7 +3370,8 @@ $vaakAdminOnlyActions = [
                             ? ap_cmdr_publish_profile_update(vaak_actor_key())
                             : ['delivered' => 0]);
                     $notice = 'Prepared as migration target (alsoKnownAs). Update delivered to '
-                        . (int) ($fan['delivered'] ?? 0) . ' inboxes. On the old account, add this account as an alias / Move destination.';
+                        . (int) ($fan['delivered'] ?? 0) . ' inboxes'
+                        . (!empty($fan['queued']) ? ', ' . (int) $fan['queued'] . ' more queued' : '') . '. On the old account, add this account as an alias / Move destination.';
                 } else {
                     $error = $res['error'] ?? 'Prepare failed.';
                 }

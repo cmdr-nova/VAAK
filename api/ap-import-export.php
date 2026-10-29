@@ -1278,7 +1278,7 @@ function ap_move_cooldown_remaining_seconds(string $actorKey = 'cmdr_nova'): int
 /**
  * Move followers out: set movedTo on our actor.
  *
- * @return array{ok:bool,error?:string,delivered?:int}
+ * @return array{ok:bool,error?:string,delivered?:int,queued?:int,move_delivered?:int,move_queued?:int}
  */
 function ap_move_out(string $targetRef, string $confirmPhrase, string $actorKey = 'cmdr_nova'): array
 {
@@ -1336,26 +1336,36 @@ function ap_move_out(string $targetRef, string $confirmPhrase, string $actorKey 
     }
 
     $delivered = 0;
+    $queued = 0;
     if (function_exists('ap_publish_profile_update')) {
         $fan = ap_publish_profile_update($actorKey);
         $delivered = (int) ($fan['delivered'] ?? 0);
+        $queued = (int) ($fan['queued'] ?? 0);
     } elseif (function_exists('ap_cmdr_publish_profile_update')) {
         $fan = ap_cmdr_publish_profile_update($actorKey);
         $delivered = (int) ($fan['delivered'] ?? 0);
+        $queued = (int) ($fan['queued'] ?? 0);
     }
     // Best-effort AS2 Move activity
+    $move = [];
     if (function_exists('ap_send_move_activity')) {
-        ap_send_move_activity($target, $actorKey);
+        $move = ap_send_move_activity($target, $actorKey);
     } elseif (function_exists('ap_cmdr_send_move_activity')) {
-        ap_cmdr_send_move_activity($target, $actorKey);
+        $move = ap_cmdr_send_move_activity($target, $actorKey);
     }
-    return ['ok' => true, 'delivered' => $delivered];
+    return [
+        'ok' => true,
+        'delivered' => $delivered,
+        'queued' => $queued,
+        'move_delivered' => (int) ($move['delivered'] ?? 0),
+        'move_queued' => (int) ($move['queued'] ?? 0),
+    ];
 }
 
 /**
  * Clear movedTo (recover from tombstone). Still counts toward cooldown from moved_at.
  *
- * @return array{ok:bool,error?:string,delivered?:int}
+ * @return array{ok:bool,error?:string,delivered?:int,queued?:int}
  */
 function ap_move_clear(string $confirmPhrase, string $actorKey = 'cmdr_nova'): array
 {
@@ -1371,14 +1381,17 @@ function ap_move_clear(string $confirmPhrase, string $actorKey = 'cmdr_nova'): a
         'UPDATE ap_account_move SET cleared_at = ?, moved_to_actor_id = NULL, moved_to_acct = NULL WHERE actor_key = ?'
     )->execute([$now, $actorKey]);
     $delivered = 0;
+    $queued = 0;
     if (function_exists('ap_publish_profile_update')) {
         $fan = ap_publish_profile_update($actorKey);
         $delivered = (int) ($fan['delivered'] ?? 0);
+        $queued = (int) ($fan['queued'] ?? 0);
     } elseif (function_exists('ap_cmdr_publish_profile_update')) {
         $fan = ap_cmdr_publish_profile_update($actorKey);
         $delivered = (int) ($fan['delivered'] ?? 0);
+        $queued = (int) ($fan['queued'] ?? 0);
     }
-    return ['ok' => true, 'delivered' => $delivered];
+    return ['ok' => true, 'delivered' => $delivered, 'queued' => $queued];
 }
 
 /**

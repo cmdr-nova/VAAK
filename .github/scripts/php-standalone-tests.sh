@@ -73,6 +73,7 @@ php_tests=(
   api/bin/dm-media-smoke.php
   api/bin/follow-fallback-smoke.php
   api/bin/fanout-dead-host-smoke.php
+  api/bin/move-fanout-cap-smoke.php
   api/bin/listenbrainz-smoke.php
   api/bin/nostr-smoke.php
   api/bin/home-bsky-index-smoke.php
