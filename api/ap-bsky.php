@@ -962,6 +962,36 @@ function ap_bsky_is_local_note_id(string $noteId): bool
 }
 
 /**
+ * True while a local reply parent is still on its way to Bluesky: its publish
+ * delivery or mirror retry has not finished. Replies run before top-level
+ * posts in the delivery queue, so a reply posted right after its parent can
+ * reach the crosspost step first.
+ */
+function ap_bsky_local_parent_mirror_pending(string $parentNoteId): bool
+{
+    $parentNoteId = rtrim(trim($parentNoteId), '/');
+    if (!ap_bsky_is_local_note_id($parentNoteId)) {
+        return false;
+    }
+    $ids = [$parentNoteId, $parentNoteId . '/'];
+    foreach ([
+        "SELECT 1 FROM ap_publish_delivery_queue WHERE note_id IN (?, ?) AND status IN ('pending', 'processing') LIMIT 1",
+        "SELECT 1 FROM bsky_crosspost_retries WHERE note_id IN (?, ?) AND status IN ('pending', 'processing') LIMIT 1",
+    ] as $sql) {
+        try {
+            $st = ap_db()->prepare($sql);
+            $st->execute($ids);
+            if ($st->fetchColumn()) {
+                return true;
+            }
+        } catch (Throwable $e) {
+            // Table missing on this install; check the next source.
+        }
+    }
+    return false;
+}
+
+/**
  * Cache/DB-only: local VAAK note id if this Bluesky URI is (part of) a
  * VAAK→Bluesky mirror thread — including long-post split tails whose root or
  * tip is mapped but the segment itself has no fediverseId.
@@ -12822,6 +12852,13 @@ function ap_bsky_crosspost_status_inner(
             ];
         }
         $parent = ap_bsky_resolve_strong_ref($inReplyTo, $ownerUserId);
+        if ($parent === null && ap_bsky_local_parent_mirror_pending($inReplyTo)) {
+            return [
+                'ok' => false,
+                'deferred' => true,
+                'error' => 'Reply parent mirror pending',
+            ];
+        }
         if ($parent === null) {
             // Pure Fediverse parent (Mastodon/Akkoma/etc.) with no Bluesky/Bridgy twin —
             // keep the reply on fedi only; do not orphan a root post on Bluesky.
