@@ -6760,6 +6760,31 @@ function ap_deliver_signed_json(string $inboxUrl, array $activity, string $keyId
 // comment so older call sites / docs that pointed here stay discoverable.
 
 /**
+ * Deliver to the first $inlineMax inboxes now and hand the rest to the
+ * durable fan-out queue. Profile Updates and Moves used to stop at 50
+ * inboxes, so followers past the 50th never heard about a movedTo.
+ *
+ * @param list<string> $targets
+ * @return array{delivered:int,queued:int}
+ */
+function ap_deliver_inline_then_queue(array $activity, array $targets, string $keyId, string $privPath, int $inlineMax = 50): array
+{
+    $targets = array_values($targets);
+    $delivered = 0;
+    foreach (array_slice($targets, 0, $inlineMax) as $inbox) {
+        if (ap_deliver_signed_json($inbox, $activity, $keyId, $privPath)) {
+            $delivered++;
+        }
+    }
+    $rest = array_slice($targets, $inlineMax);
+    $queued = 0;
+    if ($rest !== [] && ap_deliver_fanout_background($activity, $rest, $keyId, $privPath)) {
+        $queued = count($rest);
+    }
+    return ['delivered' => $delivered, 'queued' => $queued];
+}
+
+/**
  * Queue remaining inbox deliveries in a background PHP worker so admin compose
  * can return to "Your posts" immediately after priority (followers) fan-out.
  *
@@ -9600,17 +9625,8 @@ function ap_publish_profile_update(?string $actorKey = null, bool $background = 
             ];
         }
 
-        $delivered = 0;
-        $n = 0;
-        foreach ($targets as $inbox) {
-            if ($n >= 50) {
-                break;
-            }
-            if (ap_deliver_signed_json($inbox, $update, $keyId, $priv)) {
-                $delivered++;
-            }
-            $n++;
-        }
+        $fan = ap_deliver_inline_then_queue($update, $targets, $keyId, $priv);
+        $delivered = $fan['delivered'];
 
         ap_metrics_record(
             'Update',
@@ -9621,11 +9637,12 @@ function ap_publish_profile_update(?string $actorKey = null, bool $background = 
             'profile_update',
             $actor['name'] ?? $actorKey
         );
-        ap_log("profile_update actor=$actorKey id=$updateId delivered=$delivered targets=" . count($targets));
+        ap_log("profile_update actor=$actorKey id=$updateId delivered=$delivered queued=" . $fan['queued'] . ' targets=' . count($targets));
 
         return [
             'ok' => true,
             'delivered' => $delivered,
+            'queued' => $fan['queued'],
             'update_id' => $updateId,
             'targets' => count($targets),
         ];
@@ -9651,7 +9668,7 @@ function ap_cmdr_publish_profile_update(?string $actorKey = null): array
 /**
  * Best-effort AS2 Move activity (we are the old account → target is new).
  *
- * @return array{ok:bool,delivered?:int,error?:string}
+ * @return array{ok:bool,delivered?:int,queued?:int,targets?:int,error?:string}
  */
 function ap_send_move_activity(string $targetActorId, ?string $actorKey = null): array
 {
@@ -9701,20 +9718,11 @@ function ap_send_move_activity(string $targetActorId, ?string $actorKey = null):
             ],
         ];
         $targets = ap_delivery_targets_filtered(ap_followers_list($actorId), []);
-        $delivered = 0;
-        $n = 0;
-        foreach ($targets as $inbox) {
-            if ($n >= 50) {
-                break;
-            }
-            if (ap_deliver_signed_json($inbox, $move, $keyId, $priv)) {
-                $delivered++;
-            }
-            $n++;
-        }
+        $fan = ap_deliver_inline_then_queue($move, $targets, $keyId, $priv);
+        $delivered = $fan['delivered'];
         ap_metrics_record('Move', $actorId, $moveId, $targetActorId, strlen(json_encode($move) ?: ''), 'local_move_out', $targetActorId);
-        ap_log("move_out actor=$actorKey id=$moveId target=$targetActorId delivered=$delivered");
-        return ['ok' => true, 'delivered' => $delivered];
+        ap_log("move_out actor=$actorKey id=$moveId target=$targetActorId delivered=$delivered queued=" . $fan['queued'] . ' targets=' . count($targets));
+        return ['ok' => true, 'delivered' => $delivered, 'queued' => $fan['queued'], 'targets' => count($targets)];
     } finally {
         if (function_exists('ap_request_actor_set')) {
             if (is_array($prevReq) && !empty($prevReq['key'])) {
