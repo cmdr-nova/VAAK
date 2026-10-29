@@ -154,5 +154,13 @@ $check($r['status'] === 'pending' && (int) $r['attempts'] === 1, 'a real downloa
 $worker = (string) file_get_contents($root . '/ap-media-warm-worker.php');
 $check(str_contains($worker, '--budget=') && str_contains($worker, 'while (empty($stats[\'busy\'])'), 'worker keeps claiming batches within its budget');
 
+// 5) Object-storage instances answer with a 301 to the bucket. The fetch
+// follows guarded redirects and drops each hop's body.
+$r2 = (string) file_get_contents($root . '/ap-r2.php');
+$get = vaak_extract_function($r2, 'ap_remote_media_http_get');
+$check(str_contains($get, 'ap_net_curl_exec($ch, $url, 3)'), 'media fetch follows up to 3 guarded redirects');
+$check(str_contains($get, 'CURLOPT_HEADERFUNCTION') && str_contains($get, "str_starts_with(\$line, 'HTTP/')"), 'each redirect hop resets the body buffer');
+$check(str_contains($get, '$ok === false && strlen($buf) <= $maxBytes'), 'a cut-off transfer is never returned as a whole image');
+
 @unlink(ap_media_warm_lock_path());
 echo "post-media-warm-busy-smoke ok checks={$n}\n";

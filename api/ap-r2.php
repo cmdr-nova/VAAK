@@ -955,8 +955,8 @@ function ap_as2_media_url(mixed $node, ?string $baseActorUrl = null): ?string
 }
 
 /**
- * GET one remote image with curl pinned to the guard's addresses. No
- * redirects. Reads at most $maxBytes + 1 bytes so the caller can tell an
+ * GET one remote image with curl pinned to the guard's addresses, following
+ * up to 3 redirects (each hop re-pinned). Reads at most $maxBytes + 1 bytes so the caller can tell an
  * oversized file from a complete one.
  *
  * @return array{status:int,body:string,content_type:string,refused:bool}
@@ -984,8 +984,26 @@ function ap_remote_media_http_get(string $url, float $timeoutSec, int $maxBytes,
             $buf .= $data;
             return strlen($buf) > $maxBytes ? 0 : strlen($data);
         },
+        // Each redirect hop is its own response. Drop the previous hop's
+        // body (a short 301 page) so it is not glued onto the image.
+        CURLOPT_HEADERFUNCTION => static function ($ch, string $line) use (&$buf): int {
+            if (str_starts_with($line, 'HTTP/')) {
+                $buf = '';
+            }
+            return strlen($line);
+        },
     ]);
-    $ok = ap_net_curl_exec($ch, $url);
+    // Follow up to 3 redirects, each hop re-checked by the outbound guard.
+    // Instances that keep media in object storage (GoToSocial, Akkoma)
+    // answer the attachment URL with a 301 to the bucket; without this every
+    // one of them failed with "Remote media HTTP 301" and stayed hotlinked.
+    $ok = ap_net_curl_exec($ch, $url, 3);
+    if ($ok === false && strlen($buf) <= $maxBytes) {
+        // Timeout or reset mid-transfer: never hand a truncated image to the
+        // converter as if it were whole. An oversized read keeps its extra
+        // byte so callers still report "too large".
+        $buf = '';
+    }
     $out['refused'] = $ok === false && ap_net_last_refusal() !== '';
     $out['status'] = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
     $ctype = curl_getinfo($ch, CURLINFO_CONTENT_TYPE);
