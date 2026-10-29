@@ -955,8 +955,8 @@ function ap_as2_media_url(mixed $node, ?string $baseActorUrl = null): ?string
 }
 
 /**
- * GET one remote image with curl pinned to the guard's addresses. No
- * redirects. Reads at most $maxBytes + 1 bytes so the caller can tell an
+ * GET one remote image with curl pinned to the guard's addresses, following
+ * up to 3 redirects (each hop re-pinned). Reads at most $maxBytes + 1 bytes so the caller can tell an
  * oversized file from a complete one.
  *
  * @return array{status:int,body:string,content_type:string,refused:bool}
@@ -984,8 +984,26 @@ function ap_remote_media_http_get(string $url, float $timeoutSec, int $maxBytes,
             $buf .= $data;
             return strlen($buf) > $maxBytes ? 0 : strlen($data);
         },
+        // Each redirect hop is its own response. Drop the previous hop's
+        // body (a short 301 page) so it is not glued onto the image.
+        CURLOPT_HEADERFUNCTION => static function ($ch, string $line) use (&$buf): int {
+            if (str_starts_with($line, 'HTTP/')) {
+                $buf = '';
+            }
+            return strlen($line);
+        },
     ]);
-    $ok = ap_net_curl_exec($ch, $url);
+    // Follow up to 3 redirects, each hop re-checked by the outbound guard.
+    // Instances that keep media in object storage (GoToSocial, Akkoma)
+    // answer the attachment URL with a 301 to the bucket; without this every
+    // one of them failed with "Remote media HTTP 301" and stayed hotlinked.
+    $ok = ap_net_curl_exec($ch, $url, 3);
+    if ($ok === false && strlen($buf) <= $maxBytes) {
+        // Timeout or reset mid-transfer: never hand a truncated image to the
+        // converter as if it were whole. An oversized read keeps its extra
+        // byte so callers still report "too large".
+        $buf = '';
+    }
     $out['refused'] = $ok === false && ap_net_last_refusal() !== '';
     $out['status'] = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
     $ctype = curl_getinfo($ch, CURLINFO_CONTENT_TYPE);
@@ -1147,15 +1165,24 @@ function ap_remote_post_media_ensure(string $sourceUrl): ?string
     $sourceUrl = ap_profile_sanitize_https_url($sourceUrl) ?: '';
     if ($sourceUrl === '') return null;
     $lock = @fopen(sys_get_temp_dir() . '/vaak-post-media-' . hash('sha256', $sourceUrl) . '.lock', 'c+');
+    // Another download holds this URL or host. Without a cached copy that is
+    // not a success: report busy so the worker retries instead of marking the
+    // job done with nothing cached (ON CONFLICT would never queue it again).
+    $busy = static function () use ($sourceUrl): ?string {
+        $public = (string) (ap_remote_post_media_get($sourceUrl)['public_url'] ?? '');
+        if ($public !== '') return $public;
+        $GLOBALS['ap_media_last_error'] = 'Download slot busy';
+        return null;
+    };
     if ($lock === false || !flock($lock, LOCK_EX | LOCK_NB)) {
         if (is_resource($lock)) fclose($lock);
-        return (string) (ap_remote_post_media_get($sourceUrl)['public_url'] ?? $sourceUrl);
+        return $busy();
     }
     $slot = ap_remote_media_download_slot((string) (parse_url($sourceUrl, PHP_URL_HOST) ?: 'unknown'));
     if ($slot === null) {
         flock($lock, LOCK_UN);
         fclose($lock);
-        return (string) (ap_remote_post_media_get($sourceUrl)['public_url'] ?? $sourceUrl);
+        return $busy();
     }
     try {
         $cached = ap_remote_post_media_get($sourceUrl);
@@ -1164,7 +1191,9 @@ function ap_remote_post_media_ensure(string $sourceUrl): ?string
             ap_remote_post_media_touch($sourceUrl);
             return (string) $cached['public_url'];
         }
-        $dl = ap_remote_post_media_download($sourceUrl);
+        // Background job only: give slow remote servers the full 15 s. The
+        // 6 s default timed out large originals on every retry.
+        $dl = ap_remote_post_media_download($sourceUrl, 15.0);
         if (empty($dl['ok'])) throw new RuntimeException((string) ($dl['error'] ?? 'download failed'));
         $body = (string) $dl['body'];
         $type = (string) $dl['content_type'];
@@ -1600,6 +1629,15 @@ function ap_media_warm_worker_run(int $limit = 3): array
                 }
             } catch (Throwable $e) {
                 $error = substr($e->getMessage(), 0, 400);
+            }
+            // Busy slot from ap_remote_post_media_ensure: retry soon without
+            // spending one of the job's attempts.
+            if (!$ok && $error === 'Download slot busy') {
+                $u = $db->prepare("UPDATE ap_media_warm_queue SET status = 'pending', next_attempt_at = ?,
+                                   claimed_at = NULL, last_error = ?, updated_at = ? WHERE id = ?");
+                $u->execute([gmdate('c', time() + 20), $error, gmdate('c'), $id]);
+                $stats['retried']++;
+                continue;
             }
             $attempt = (int) ($row['attempts'] ?? 0) + 1;
             $max = max(1, (int) ($row['max_attempts'] ?? 8));
