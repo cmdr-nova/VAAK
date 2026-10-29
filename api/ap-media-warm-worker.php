@@ -41,9 +41,16 @@ if (getenv('VAAK_MEDIA_WARM_LOCKED') !== '1') {
 }
 
 $limit = 3;
+// Keep claiming batches until the queue is empty or this many seconds have
+// passed. A nudge used to run one batch of 3, so the rest of a cold Home
+// page (up to 12 images) waited for cron. --budget=0 runs a single batch.
+$budget = 45;
 foreach (array_slice($argv, 1) as $arg) {
     if (preg_match('/^--limit=(\d+)$/', $arg, $m)) {
         $limit = max(1, min(10, (int) $m[1]));
+    }
+    if (preg_match('/^--budget=(\d+)$/', $arg, $m)) {
+        $budget = max(0, min(240, (int) $m[1]));
     }
 }
 
@@ -52,7 +59,17 @@ try {
     require_once __DIR__ . '/ap-db.php';
     require_once __DIR__ . '/ap-r2.php';
     require_once __DIR__ . '/ap-inbox.php';
+    $started = microtime(true);
     $stats = ap_media_warm_worker_run($limit);
+    $lastClaimed = $stats['claimed'];
+    while (empty($stats['busy']) && $budget > 0 && $lastClaimed > 0
+        && microtime(true) - $started < $budget) {
+        $next = ap_media_warm_worker_run($limit);
+        foreach (['claimed', 'succeeded', 'retried', 'failed'] as $k) {
+            $stats[$k] += $next[$k];
+        }
+        $lastClaimed = $next['claimed'];
+    }
     fwrite(STDOUT, sprintf(
         "[%s] media_warm claimed=%d succeeded=%d retried=%d failed=%d%s\n",
         gmdate('c'), $stats['claimed'], $stats['succeeded'], $stats['retried'], $stats['failed'],

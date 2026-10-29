@@ -34,6 +34,7 @@ fi
 php_tests=(
   api/bin/account-acct-key-error-smoke.php
   api/bin/avatar-refresh-smoke.php
+  api/bin/post-media-warm-busy-smoke.php
   api/bin/bite-queue-smoke.php
   api/bin/local-boost-resolve-smoke.php
   api/bin/bsky-shadow-repost-smoke.php
