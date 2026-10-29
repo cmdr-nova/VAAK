@@ -216,6 +216,9 @@ SQL);
 /** Reasons we ingest into VAAK notifications (DMs stay out). */
 const AP_BSKY_NOTIF_REASONS = ['mention', 'reply', 'quote', 'repost', 'like', 'follow'];
 
+/** Seconds of Bluesky calls per account per notification poll / hide-set refresh (CLI cron). */
+const AP_BSKY_NOTIF_POLL_BUDGET = 45;
+
 /** events.action_taken for Bluesky follows (not AP followers table). */
 const AP_BSKY_FOLLOW_ACTION = 'bsky_follow';
 
@@ -10637,14 +10640,11 @@ function ap_bsky_refresh_hide_set(int $ownerUserId, bool $force = false): array
     $listBlockCount = 0;
     $listMuteCount = 0;
 
-    // Replace pull-sourced rows for this owner (keep vaak-pushed hide rows that might not be in pull yet).
-    try {
-        ap_db()->prepare(
-            "DELETE FROM bsky_hide_dids WHERE owner_user_id = ? AND reason IN ('block','mute','listblock','listmute')"
-        )->execute([$ownerUserId]);
-    } catch (Throwable $e) {
-        return ['ok' => false, 'error' => $e->getMessage()];
-    }
+    // Upsert what the pull returns, then drop older pull rows only for the parts
+    // that fetched completely. A failed AppView call keeps the previous hide set
+    // instead of leaving it empty until the next refresh.
+    $complete = ['block' => true, 'mute' => true, 'listblock' => true, 'listmute' => true];
+    $failedLists = [];
 
     // Blocks
     $cursor = null;
@@ -10655,6 +10655,7 @@ function ap_bsky_refresh_hide_set(int $ownerUserId, bool $force = false): array
         }
         $j = $fetchPage('app.bsky.graph.getBlocks', $q);
         if ($j === null) {
+            $complete['block'] = false;
             break;
         }
         foreach ((array) ($j['blocks'] ?? []) as $prof) {
@@ -10680,6 +10681,7 @@ function ap_bsky_refresh_hide_set(int $ownerUserId, bool $force = false): array
         }
         $j = $fetchPage('app.bsky.graph.getMutes', $q);
         if ($j === null) {
+            $complete['mute'] = false;
             break;
         }
         foreach ((array) ($j['mutes'] ?? []) as $prof) {
@@ -10706,7 +10708,9 @@ function ap_bsky_refresh_hide_set(int $ownerUserId, bool $force = false): array
         $fetchPage,
         $ownerUserId,
         &$listBlockCount,
-        &$listMuteCount
+        &$listMuteCount,
+        &$complete,
+        &$failedLists
     ): void {
         $listUris = [];
         $cursor = null;
@@ -10717,6 +10721,7 @@ function ap_bsky_refresh_hide_set(int $ownerUserId, bool $force = false): array
             }
             $j = $fetchPage($listsNsid, $q);
             if ($j === null) {
+                $complete[$reason] = false;
                 break;
             }
             foreach ((array) ($j['lists'] ?? []) as $list) {
@@ -10739,6 +10744,7 @@ function ap_bsky_refresh_hide_set(int $ownerUserId, bool $force = false): array
                 }
                 $j = $fetchPage('app.bsky.graph.getList', $q);
                 if ($j === null) {
+                    $failedLists[$listUri] = true;
                     break;
                 }
                 foreach ((array) ($j['items'] ?? []) as $item) {
@@ -10766,6 +10772,24 @@ function ap_bsky_refresh_hide_set(int $ownerUserId, bool $force = false): array
     $expandSubscribedLists('app.bsky.graph.getListBlocks', 'listblock');
     $expandSubscribedLists('app.bsky.graph.getListMutes', 'listmute');
 
+    foreach ($complete as $reason => $ok) {
+        if (!$ok) {
+            continue;
+        }
+        $sql = 'DELETE FROM bsky_hide_dids WHERE owner_user_id = ? AND reason = ? AND updated_at < ?';
+        $args = [$ownerUserId, $reason, $now];
+        if ($failedLists !== [] && ($reason === 'listblock' || $reason === 'listmute')) {
+            $sql .= ' AND list_uri NOT IN (' . implode(',', array_fill(0, count($failedLists), '?')) . ')';
+            $args = array_merge($args, array_keys($failedLists));
+        }
+        try {
+            ap_db()->prepare($sql)->execute($args);
+        } catch (Throwable $e) {
+            error_log('[ap-bsky] hide set prune: ' . $e->getMessage());
+        }
+    }
+    $partial = in_array(false, $complete, true) || $failedLists !== [];
+
     $listCount = $listBlockCount + $listMuteCount;
     @file_put_contents($cachePath, json_encode([
         'at' => $now,
@@ -10788,8 +10812,8 @@ function ap_bsky_refresh_hide_set(int $ownerUserId, bool $force = false): array
         ap_notification_projection_invalidate_owner($ownerUserId);
     }
 
-    return [
-        'ok' => true,
+    return ($partial ? ['error' => 'partial fetch, kept previous rows'] : []) + [
+        'ok' => !$partial,
         'blocks' => $blockCount,
         'mutes' => $muteCount,
         'list_members' => $listCount,
@@ -14911,7 +14935,18 @@ function ap_bsky_poll_all_notifications(int $limit = 50): array
             continue;
         }
         $users++;
-        $res = ap_bsky_poll_notifications($uid, $limit);
+        // Per-account Bluesky time cap so one slow account cannot hold the cron lock.
+        $ownBudget = ap_bsky_budget_remaining() === null;
+        if ($ownBudget) {
+            ap_bsky_budget_begin(AP_BSKY_NOTIF_POLL_BUDGET);
+        }
+        try {
+            $res = ap_bsky_poll_notifications($uid, $limit);
+        } finally {
+            if ($ownBudget) {
+                ap_bsky_budget_clear();
+            }
+        }
         if (empty($res['ok'])) {
             $errors[] = 'user ' . $uid . ': ' . (string) ($res['error'] ?? 'fail');
             continue;
