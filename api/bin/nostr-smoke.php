@@ -164,7 +164,7 @@ $check(array_keys($names) === [$nip19] && ($names[$nip19]['name'] ?? '') === 'np
 if (!function_exists('reference_load')) {
     require __DIR__ . '/migration-reference-functions.php';
 }
-reference_load(dirname(__DIR__) . '/ap-masto-entities.php', ['ap_masto_mention_is_nostr', 'ap_masto_nostr_status_fields']);
+reference_load(dirname(__DIR__) . '/ap-masto-entities.php', ['ap_masto_mention_is_nostr', 'ap_masto_nostr_status_fields', 'ap_masto_nostr_note_media']);
 $noteHex = str_repeat('ab', 32);
 $noteUrl = 'https://njump.me/' . ap_nostr_bech32_encode('note', (string) hex2bin($noteHex));
 $actorUrl = 'https://njump.me/' . $npub;
@@ -228,6 +228,23 @@ $xdb->exec("UPDATE nostr_profiles SET display_name = '', picture = 'javascript:a
 $id = ap_nostr_compose_identity(3, true, $xdb);
 $check(($id['name'] ?? '') === 'val' && ($id['picture'] ?? 'x') === '', 'falls back to name; only https pictures');
 $check(ap_nostr_compose_identity(3, false, $xdb) === null, 'non-admins see no box while Nostr is admin only');
+
+// Notification cards painted by PHP get the stored note's media, like Home.
+$mdb = new PDO('sqlite::memory:');
+$mdb->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+$mdb->exec('CREATE TABLE nostr_events (id TEXT PRIMARY KEY, content TEXT, tags TEXT)');
+$picId = str_repeat('cd', 32);
+$mdb->prepare('INSERT INTO nostr_events (id, content, tags) VALUES (?, ?, ?)')->execute([
+    $picId,
+    "Look <here> #photo\n\nhttps://media.example/a.webp\nhttps://example.com/page.",
+    json_encode([['imeta', 'url https://media.example/a.webp', 'm image/webp', 'alt a bug']]),
+]);
+$pic = ap_masto_nostr_note_media(['vaak_nostr_event_id' => $picId, 'content' => '<p>old</p>'], $mdb);
+$check(count($pic['media_attachments'] ?? []) === 1 && $pic['media_attachments'][0]['url'] === 'https://media.example/a.webp'
+    && $pic['media_attachments'][0]['type'] === 'image' && $pic['media_attachments'][0]['description'] === 'a bug', 'stored note media becomes an attachment');
+$check(!str_contains($pic['content'], 'a.webp') && str_contains($pic['content'], '&lt;here&gt;')
+    && str_contains($pic['content'], 'href="https://example.com/page"'), 'media link leaves the text, other text escaped and linked: ' . $pic['content']);
+$check(ap_masto_nostr_note_media(['vaak_nostr_event_id' => str_repeat('ef', 32), 'content' => 'x'], $mdb) === ['vaak_nostr_event_id' => str_repeat('ef', 32), 'content' => 'x'], 'unstored notes are left alone');
 
 if ($failures !== []) {
     fwrite(STDERR, "nostr-smoke: " . count($failures) . " of {$checks} checks failed\n - " . implode("\n - ", $failures) . "\n");

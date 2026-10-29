@@ -5681,6 +5681,117 @@ function ap_masto_nostr_status_fields(array $status, string $noteUrl, string $au
 }
 
 /**
+ * Text and media of the stored Nostr note behind a notification status
+ * (nostr_events), the way nostr/render.rs paints Home cards: image and
+ * video links (by NIP-92 imeta mime or file extension) become attachments
+ * and leave the text. PHP paints notification pages that Rust hands back
+ * (grouped like cards), so without this a crossposted photo showed as a
+ * bare link. Unchanged when the note isn't stored.
+ *
+ * @param array<string,mixed> $status
+ * @return array<string,mixed>
+ */
+function ap_masto_nostr_note_media(array $status, ?PDO $db = null): array
+{
+    $id = (string) ($status['vaak_nostr_event_id'] ?? '');
+    if (!preg_match('/^[0-9a-f]{64}$/', $id)) {
+        return $status;
+    }
+    static $cache = [];
+    if (!array_key_exists($id, $cache)) {
+        $cache[$id] = null;
+        try {
+            $db ??= function_exists('ap_db') ? ap_db() : null;
+            if ($db instanceof PDO) {
+                $st = $db->prepare('SELECT content, tags FROM nostr_events WHERE id = ? LIMIT 1');
+                $st->execute([$id]);
+                $row = $st->fetch(PDO::FETCH_ASSOC);
+                $cache[$id] = is_array($row) ? $row : null;
+            }
+        } catch (Throwable $e) {
+            $cache[$id] = null;
+        }
+    }
+    $row = $cache[$id];
+    if (!is_array($row)) {
+        return $status;
+    }
+    $tags = is_string($row['tags']) ? json_decode($row['tags'], true) : $row['tags'];
+    $meta = [];
+    foreach (is_array($tags) ? $tags : [] as $tag) {
+        if (!is_array($tag) || ($tag[0] ?? '') !== 'imeta') {
+            continue;
+        }
+        $url = $mime = $alt = '';
+        foreach (array_slice($tag, 1) as $part) {
+            [$k, $v] = array_pad(explode(' ', (string) $part, 2), 2, '');
+            if ($k === 'url') {
+                $url = trim($v);
+            } elseif ($k === 'm') {
+                $mime = strtolower(trim($v));
+            } elseif ($k === 'alt') {
+                $alt = mb_substr(trim($v), 0, 1500);
+            }
+        }
+        if (str_starts_with($url, 'https://')) {
+            $meta[$url] = [$mime, $alt];
+        }
+    }
+    $kind = static function (string $url, string $mime): ?string {
+        if (str_starts_with($mime, 'image/')) {
+            return 'image';
+        }
+        if (str_starts_with($mime, 'video/')) {
+            return 'video';
+        }
+        $path = strtolower((string) preg_replace('/[?#].*$/', '', $url));
+        if (preg_match('/\.(png|jpe?g|gif|webp|avif)$/', $path)) {
+            return 'image';
+        }
+        return preg_match('/\.(mp4|webm|mov|m4v)$/', $path) ? 'video' : null;
+    };
+    $text = trim((string) $row['content']);
+    $html = '';
+    $media = [];
+    $at = 0;
+    $esc = static fn (string $t): string => str_replace("\n", '<br>', htmlspecialchars($t, ENT_QUOTES, 'UTF-8'));
+    preg_match_all('~https?://[^\s<>"]+~', $text, $m, PREG_OFFSET_CAPTURE);
+    foreach ($m[0] as [$raw, $pos]) {
+        $url = rtrim($raw, '.,;:!?)]}"\'');
+        $html .= $esc(substr($text, $at, $pos - $at));
+        $at = $pos + strlen($url);
+        [$mime, $alt] = $meta[$url] ?? ['', ''];
+        $type = str_starts_with($url, 'https://') ? $kind($url, $mime) : null;
+        if ($type !== null && count($media) < 4) {
+            $media[] = [
+                'id' => 'nostr:' . $id . '-m' . (count($media) + 1),
+                'type' => $type,
+                'url' => $url,
+                'preview_url' => $type === 'image' ? $url : null,
+                'remote_url' => $url,
+                'description' => $alt !== '' ? $alt : null,
+                'blurhash' => null,
+            ];
+            continue;
+        }
+        $shown = (string) preg_replace('~^https?://~', '', $url);
+        if (mb_strlen($shown) > 48) {
+            $shown = mb_substr($shown, 0, 47) . '…';
+        }
+        $html .= '<a href="' . htmlspecialchars($url, ENT_QUOTES, 'UTF-8') . '" target="_blank" rel="nofollow noopener noreferrer">'
+            . htmlspecialchars($shown, ENT_QUOTES, 'UTF-8') . '</a>';
+    }
+    $html .= $esc(substr($text, $at));
+    if ($media === []) {
+        return $status;
+    }
+    $html = (string) preg_replace('~^(\s*<br>\s*)+|(\s*<br>\s*)+$~', '', trim($html));
+    $status['content'] = $html !== '' ? '<p>' . $html . '</p>' : '';
+    $status['media_attachments'] = $media;
+    return $status;
+}
+
+/**
  * Resolve a Bluesky handle/DID/profile URL to a linked VAAK owner_user_id (0 if none).
  */
 function ap_masto_notif_bsky_owner_user_id(string $handleOrDidOrUrl): int
@@ -6150,9 +6261,9 @@ function ap_masto_notification_entity(array $item): ?array
             if (trim(strip_tags((string) ($status['content'] ?? ''))) === '') {
                 $status['content'] = '<p>Nostr note</p>';
             }
-            $status = ap_masto_nostr_status_fields($status, $objectId, '');
+            $status = ap_masto_nostr_note_media(ap_masto_nostr_status_fields($status, $objectId, ''));
         } else {
-            $status = ap_masto_nostr_status_fields($status, $objectId, $actorId);
+            $status = ap_masto_nostr_note_media(ap_masto_nostr_status_fields($status, $objectId, $actorId));
         }
     } elseif ($type === 'favourite' || $type === 'reblog') {
         $status = ap_masto_resolve_our_liked_status($objectId);
