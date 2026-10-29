@@ -36,7 +36,7 @@ bin_ships() {
       return 1 ;;
   esac
   case "$base" in
-    *-backfill.php|*-cleanup.php|*-warm.php|repair-*.php|deploy-canary.php|notif-projection-fill.php|nostr-notif-ingest.php|phyrian-decay.php|phyrian-sync.php|ranked-warm.php)
+    *-backfill.php|*-cleanup.php|*-warm.php|repair-*.php|deploy-canary.php|notif-projection-fill.php|nostr-notif-ingest.php|phyrian-decay.php|phyrian-sync.php|ranked-warm.php|inbox-spool-drain.php)
       return 0 ;;
   esac
   return 1

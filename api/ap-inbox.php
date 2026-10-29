@@ -955,6 +955,7 @@ function ap_inbox_try_verify(string $raw): ?array
     if ($okPath === null) {
         return ap_inbox_verify_fail('Invalid signature');
     }
+    ap_inbox_rust_key_mirror($sig['keyId'], $pem);
     return ['sig' => $sig, 'path' => $okPath];
 }
 
@@ -1076,6 +1077,7 @@ function ap_inbox_try_verify_rfc9421(string $raw, string $sigHdr, string $sigInp
     if ($okPath === null) {
         return ap_inbox_verify_fail('Invalid signature');
     }
+    ap_inbox_rust_key_mirror($keyId, $pem);
     return [
         'sig' => [
             'keyId' => $keyId,
@@ -2112,6 +2114,105 @@ function ap_inbox_forget_actor_pubkey(string $keyId): void
     if (is_file($cacheFile)) {
         @unlink($cacheFile);
     }
+    if (ap_inbox_rust_accept_enabled() && function_exists('ap_redis_delete')) {
+        ap_redis_delete(ap_inbox_rust_key_mirror_key($keyId));
+    }
+}
+
+function ap_inbox_rust_accept_enabled(): bool
+{
+    return trim((string) getenv('VAAK_INBOX_RUST_ACCEPT')) === '1';
+}
+
+function ap_inbox_rust_key_mirror_key(string $keyId): string
+{
+    return 'vaak:inbox:key:v1:' . hash('sha256', trim($keyId));
+}
+
+/**
+ * Rust cutover F2: after a key verifies a delivery, share it with the Rust
+ * inbox (which runs with a private /tmp and never fetches keys). Accepted
+ * relay keys are not shared, so relay deliveries keep coming to PHP.
+ */
+function ap_inbox_rust_key_mirror(string $keyId, $pem): void
+{
+    if (!ap_inbox_rust_accept_enabled() || !is_string($pem) || !str_contains($pem, 'BEGIN')) {
+        return;
+    }
+    try {
+        if (!function_exists('ap_relay_is_accepted_key')) {
+            require_once __DIR__ . '/ap-relays.php';
+        }
+        if (function_exists('ap_relay_is_accepted_key') && ap_relay_is_accepted_key($keyId)) {
+            return;
+        }
+        $redis = function_exists('ap_redis_client') ? ap_redis_client() : null;
+        if (!$redis) {
+            return;
+        }
+        $json = json_encode(['pem' => $pem, 'owner' => ap_key_owner_cached($keyId)], JSON_UNESCAPED_SLASHES);
+        if (is_string($json)) {
+            $redis->setEx(ap_inbox_rust_key_mirror_key($keyId), AP_INBOX_KEY_CACHE_TTL, $json);
+        }
+    } catch (Throwable $e) {
+        error_log('[ap-inbox] rust key mirror failed: ' . $e->getMessage());
+    }
+}
+
+/**
+ * Route one delivery the Rust inbox accepted into ap_inbox_spool. Rust
+ * already verified the signature with a key PHP verified before, checked the
+ * block list and that the signer is the actor; this repeats the cheap checks
+ * and then does what ap_inbox_main does after a verified signature.
+ *
+ * @param array<string,mixed> $row
+ * @return array{state:string,result:string}
+ */
+function ap_inbox_spool_process(array $row): array
+{
+    $raw = (string) ($row['body'] ?? '');
+    $keyId = (string) ($row['key_id'] ?? '');
+    $json = json_decode($raw, true);
+    if (!is_array($json)) {
+        return ['state' => 'dropped', 'result' => 'bad_json'];
+    }
+    $type = is_string($json['type'] ?? null) ? (preg_replace('/[^A-Za-z0-9._-]/', '', $json['type']) ?: 'unknown') : 'unknown';
+
+    // Each row is its own request: personal inbox paths act as that user.
+    ap_request_actor_set(null);
+    $_SERVER['REQUEST_METHOD'] = 'POST';
+    $_SERVER['REQUEST_URI'] = (string) ($row['request_path'] ?? '/inbox');
+    ap_inbox_bootstrap_request_actor();
+
+    $keyHost = parse_url($keyId, PHP_URL_HOST);
+    if (!is_string($keyHost) || $keyHost === '') {
+        return ['state' => 'dropped', 'result' => 'bad_key'];
+    }
+    $keyHost = strtolower($keyHost);
+    if (ap_is_blocked_host($keyHost)) {
+        ap_log(sprintf('blocked_reject_keyhost_spool id=%d type=%s keyId=%s', (int) ($row['id'] ?? 0), $type, ap_short($keyId)));
+        return ['state' => 'dropped', 'result' => 'blocked'];
+    }
+    $claimedActor = ap_as_id($json['actor'] ?? null);
+    if ($claimedActor === null || !ap_inbox_actor_matches_key($keyId, $claimedActor)) {
+        return ['state' => 'dropped', 'result' => 'actor_mismatch'];
+    }
+    ap_log(sprintf(
+        'accepted via=rust_spool id=%d ip=%s type=%s bytes=%d keyId=%s',
+        (int) ($row['id'] ?? 0),
+        (string) ($row['client_ip'] ?? ''),
+        $type,
+        strlen($raw),
+        ap_short($keyId)
+    ));
+    if (function_exists('ap_inbox_host_seen_note')) {
+        ap_inbox_host_seen_note($keyHost, $type);
+    }
+    if (function_exists('ap_fanout_host_note_inbound')) {
+        ap_fanout_host_note_inbound($keyHost);
+    }
+    $action = ap_route_verified_activity($json, strlen($raw));
+    return ['state' => 'done', 'result' => substr((string) $action, 0, 120)];
 }
 
 /**

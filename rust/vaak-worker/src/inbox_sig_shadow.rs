@@ -107,6 +107,11 @@ impl Request<'_> {
 /// `ap_inbox_try_verify` for one shadow record.
 pub fn verify(rec: &Record) -> Verdict {
     let body = base64::engine::general_purpose::STANDARD.decode(rec.body_b64.as_bytes()).unwrap_or_default();
+    verify_body(rec, body)
+}
+
+/// The same check for a live request, whose body is already in hand.
+pub(crate) fn verify_body(rec: &Record, body: Vec<u8>) -> Verdict {
     let req = Request { rec, body };
     let sig_input = req.header("Signature-Input");
     if !sig_input.is_empty() {
@@ -627,6 +632,16 @@ fn spki_rsa_key(der: &[u8]) -> Option<Vec<u8>> {
 pub fn replay(input: &Value) -> Result<Value> {
     let rec: Record = serde_json::from_value(input.clone())?;
     Ok(verify(&rec).to_json())
+}
+
+/// The keyId a request claims, from Signature-Input (RFC 9421) or the
+/// draft-cavage Signature header. Only a claim until it verifies.
+pub(crate) fn claimed_key_id(headers: &HashMap<String, String>) -> Option<String> {
+    match headers.get("signature-input").filter(|v| !v.is_empty()) {
+        Some(input) => parse_signature_input(input)?.params.get("keyid").cloned(),
+        None => parse_signature(headers.get("signature")?)?.remove("keyId"),
+    }
+    .filter(|k| !k.is_empty())
 }
 
 fn summary(rec: &Record, php: &Verdict, rust: &Verdict) -> Value {
