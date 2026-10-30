@@ -41,6 +41,18 @@
       "expect": {"text": "Helloworld"}
     },
     {
+      "id": "normalize-wafrn-note-ask",
+      "op": "normalize",
+      "value": "<p>anonymous asked </p> <blockquote>Desktop Stripper</blockquote> <p><a href=\"https://www.youtube.com/watch?v=CiVtoO65BRY\">https://www.youtube.com/watch?v=CiVtoO65BRY</a></p> <p>To properly see this ask, <a href=\"https://app.wafrn.net/fediverse/post/ask-html\">check the post in the original instance</a></p>",
+      "expect": {"text": "DesktopStripperhttps://www.youtube.com/watch?v=CiVtoO65BRY"}
+    },
+    {
+      "id": "normalize-wafrn-named-note-ask",
+      "op": "normalize",
+      "value": "<p>@fox@app.wafrn.net asked</p><blockquote>crows?</blockquote><p>yes</p>",
+      "expect": {"text": "crows?yes"}
+    },
+    {
       "id": "ask-linked",
       "op": "ask",
       "linked": true,
@@ -167,6 +179,35 @@
       ],
       "expect": {
         "drop": ["at://did:plc:wafrn/app.bsky.feed.post/3"],
+        "learn": []
+      }
+    },
+    {
+      "id": "fallback-wafrn-note-ask-html",
+      "op": "plan",
+      "did_to_actors": {
+        "did:plc:wafrn": ["https://app.wafrn.net/fediverse/blog/admin"]
+      },
+      "posts": [
+        {
+          "id": "event:9",
+          "network": "ap",
+          "object_id": "https://app.wafrn.net/fediverse/post/ask-html",
+          "actor_id": "https://app.wafrn.net/fediverse/blog/admin",
+          "created_at": 1700000000,
+          "text": "<p>anonymous asked </p> <blockquote>Desktop Stripper</blockquote> <p><a href=\"https://www.youtube.com/watch?v=CiVtoO65BRY\">https://www.youtube.com/watch?v=CiVtoO65BRY</a></p> <p>To properly see this ask, <a href=\"https://app.wafrn.net/fediverse/post/ask-html\">check the post in the original instance</a></p>"
+        },
+        {
+          "id": "at://did:plc:wafrn/app.bsky.feed.post/9",
+          "network": "bsky",
+          "fediverse_id": "",
+          "author_did": "did:plc:wafrn",
+          "created_at": 1700000060,
+          "text": "Anonymous asked: Desktop Stripper\n\nhttps://www.youtube.com/watch?v=CiVtoO65BRY"
+        }
+      ],
+      "expect": {
+        "drop": ["at://did:plc:wafrn/app.bsky.feed.post/9"],
         "learn": []
       }
     },

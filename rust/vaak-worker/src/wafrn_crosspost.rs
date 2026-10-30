@@ -70,7 +70,9 @@ pub fn post_identity(raw: &str) -> String {
 
 pub fn normalize_text(text: &str) -> String {
     let plain = plain_text(text);
+    let plain = ask_footer().replace(&plain, "");
     let stripped = asked_prefix().replace(&plain, "");
+    let stripped = note_asked_prefix().replace(stripped.as_ref(), "");
     whitespace()
         .replace_all(stripped.as_ref(), "")
         .into_owned()
@@ -445,6 +447,111 @@ pub async fn stamp_text_asks(db: &Client, statuses: &mut [Value]) -> Result<()> 
         });
     }
     Ok(())
+}
+
+/// Paint-only. Sets `vaak_fedi_twin` on Bluesky posts whose record or
+/// `bsky_post_links` row names a fediverse post. `filter_statuses` only sees
+/// one page, so a twin split across infinite-scroll pages or live polls
+/// reaches the browser; the card carries the fediverse id as an alias and
+/// the browser's seen-card check drops whichever copy arrives second.
+pub async fn stamp_fedi_twins(db: &Client, statuses: &mut [Value]) -> Result<()> {
+    let mut pending: Vec<(usize, String)> = Vec::new();
+    for (index, status) in statuses.iter_mut().enumerate() {
+        if !is_bsky(status) {
+            continue;
+        }
+        let uri = json_str(status, "uri").trim().trim_end_matches('/').to_string();
+        let direct = post_identity(&json_str(status, "fediverse_id"));
+        if !direct.is_empty() {
+            status["vaak_fedi_twin"] = json!(direct);
+        } else if uri.starts_with("at://") {
+            pending.push((index, uri));
+        }
+    }
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let uris: Vec<String> = pending.iter().map(|(_, uri)| uri.clone()).collect();
+    let links = lookup_links(db, &uris).await?;
+    for (index, uri) in pending {
+        let fedi = links.get(&uri).map(|fedi| post_identity(fedi)).unwrap_or_default();
+        if fedi.starts_with("https://") {
+            statuses[index]["vaak_fedi_twin"] = json!(fedi);
+        }
+    }
+    Ok(())
+}
+
+/// The fediverse post a Bluesky post says it mirrors: `bsky_post_links`, or
+/// the cached record's `fediverseId` when the link row is not written yet.
+pub async fn bsky_fediverse_id(db: &Client, uri: &str) -> Result<String> {
+    let uri = uri.trim();
+    if !uri.starts_with("at://") {
+        return Ok(String::new());
+    }
+    let links = lookup_links(db, &[uri.to_string()]).await?;
+    if let Some(fedi) = links.get(uri) {
+        let fedi = post_identity(fedi);
+        if fedi.starts_with("https://") {
+            return Ok(fedi);
+        }
+    }
+    let row = db
+        .query_opt("SELECT raw_json FROM bsky_posts WHERE bsky_uri = $1 LIMIT 1", &[&uri])
+        .await?;
+    let raw: Option<String> = row.and_then(|row| row.get(0));
+    let fedi = raw
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .and_then(|raw| {
+            raw.pointer("/record/fediverseId")
+                .and_then(Value::as_str)
+                .map(post_identity)
+        })
+        .unwrap_or_default();
+    Ok(if fedi.starts_with("https://") { fedi } else { String::new() })
+}
+
+/// Fediverse actors whose posts a Bluesky twin from `did` duplicates: the
+/// learned Wafrn link for the DID, plus whoever VAAK saw create `fedi`.
+pub async fn twin_fedi_actors(db: &Client, did: &str, fedi: &str) -> Result<Vec<String>> {
+    let mut out: HashSet<String> = HashSet::new();
+    if did.starts_with("did:") {
+        match db
+            .query("SELECT actor_id FROM wafrn_bsky_actors WHERE bsky_did = $1", &[&did])
+            .await
+        {
+            Ok(rows) => {
+                for row in rows {
+                    let actor: String = row.get(0);
+                    out.insert(post_identity(&actor));
+                }
+            }
+            Err(err) => {
+                let err = anyhow::Error::from(err);
+                if !missing_actors_table(&err) {
+                    return Err(err);
+                }
+            }
+        }
+    }
+    if fedi.starts_with("https://") {
+        let slash = format!("{fedi}/");
+        let rows = db
+            .query(
+                "SELECT DISTINCT actor_id FROM events
+                 WHERE object_id IN ($1, $2) AND type = 'Create'
+                 LIMIT 4",
+                &[&fedi, &slash],
+            )
+            .await?;
+        for row in rows {
+            let actor: Option<String> = row.get(0);
+            out.insert(post_identity(&actor.unwrap_or_default()));
+        }
+    }
+    let mut list: Vec<String> = out.into_iter().filter(|a| a.starts_with("https://")).collect();
+    list.sort();
+    Ok(list)
 }
 
 fn posts_from_json(value: Option<&Value>) -> Vec<Post> {
@@ -822,6 +929,22 @@ fn activity_path() -> &'static regex::Regex {
 fn asked_prefix() -> &'static regex::Regex {
     static RE: OnceLock<regex::Regex> = OnceLock::new();
     RE.get_or_init(|| regex::Regex::new(r"(?u)\A.{1,240}? asked:[ \t]*").unwrap())
+}
+
+/// Wafrn's ActivityPub Note opens with `<p>anonymous asked </p>` or
+/// `<p>@user@host asked </p>` (no colon), where Bluesky says "Name asked:".
+fn note_asked_prefix() -> &'static regex::Regex {
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    RE.get_or_init(|| regex::Regex::new(r"(?i)\A(?:anonymous|@\S{1,240}?)\s+asked").unwrap())
+}
+
+/// Wafrn appends this to federated asks only, never to the Bluesky copy.
+fn ask_footer() -> &'static regex::Regex {
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        regex::Regex::new(r"(?is)\s*To properly see this ask,\s*check the post in the original instance\.?\s*\z")
+            .unwrap()
+    })
 }
 
 fn whitespace() -> &'static regex::Regex {

@@ -560,6 +560,19 @@ async fn local_follower_owner_ids(db: &Client, actor_id: &str, limit: i64) -> Re
     Ok(ids)
 }
 
+/// Owners who follow the fediverse account behind a Bluesky twin.
+async fn home_bsky_twin_owners(db: &Client, uri: &str, did: &str) -> Result<HashSet<i64>> {
+    let mut out = HashSet::new();
+    let fedi = crate::wafrn_crosspost::bsky_fediverse_id(db, uri).await?;
+    if fedi.is_empty() {
+        return Ok(out);
+    }
+    for actor in crate::wafrn_crosspost::twin_fedi_actors(db, did, &fedi).await? {
+        out.extend(local_follower_owner_ids(db, &actor, max_recipients() as i64).await?);
+    }
+    Ok(out)
+}
+
 async fn bsky_observer_ids(db: &Client, did: &str, limit: i64) -> Result<Vec<i64>> {
     let did = did.trim();
     if !did.starts_with("did:") {
@@ -791,7 +804,15 @@ async fn process_home_bsky(
     }
     let do_rewarm = rewarm_max() > 0 && owners.len() <= rewarm_max();
     let bsky_profile = format!("https://bsky.app/profile/{did}");
+    // Wafrn-style dual-publish: the record's fediverseId names a fediverse
+    // post. Owners who follow that fediverse account get the ActivityPub copy
+    // through their own fan-out, so the Bluesky twin never enters their Home.
+    let twin_owners = home_bsky_twin_owners(db, uri, did).await.unwrap_or_default();
     for owner in &owners {
+        if twin_owners.contains(owner) {
+            stats.skipped += 1;
+            continue;
+        }
         if crate::home_bsky_mirrors::own_did(db, *owner).await?.as_deref() == Some(did) {
             stats.skipped += 1;
             continue;

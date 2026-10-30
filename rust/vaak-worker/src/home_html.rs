@@ -125,6 +125,7 @@ async fn stamp_ask_identities(
     let _ = crate::home_hydrate_ranked::attach_ask_identities(db, slice).await;
     let _ = crate::status_emoji::attach_custom_emojis(db, slice).await;
     let _ = crate::wafrn_crosspost::stamp_text_asks(db, slice).await;
+    let _ = crate::wafrn_crosspost::stamp_fedi_twins(db, slice).await;
     if extra.is_empty() {
         return;
     }
@@ -138,6 +139,7 @@ async fn stamp_ask_identities(
     let _ = crate::home_hydrate_ranked::attach_ask_identities(db, &mut vals).await;
     let _ = crate::status_emoji::attach_custom_emojis(db, &mut vals).await;
     let _ = crate::wafrn_crosspost::stamp_text_asks(db, &mut vals).await;
+    let _ = crate::wafrn_crosspost::stamp_fedi_twins(db, &mut vals).await;
     for (key, value) in keys.into_iter().zip(vals) {
         extra.insert(key, value);
     }
@@ -373,6 +375,7 @@ async fn tl_html_older(
     let _ = crate::wafrn_crosspost::filter_statuses(&db, &mut statuses).await;
     let _ = crate::wafrn_crosspost::filter_bridgy_twins(&db, &mut statuses).await;
     let _ = crate::wafrn_crosspost::stamp_text_asks(&db, &mut statuses).await;
+    let _ = crate::wafrn_crosspost::stamp_fedi_twins(&db, &mut statuses).await;
     crate::post_media_cache::swap_cached_post_media(&db, &mut statuses, None).await;
     crate::nostr::act::stamp_viewer_flags(&db, owner_user_id, &mut statuses).await;
     let viewer_actor = owner_actor;

@@ -42612,6 +42612,9 @@ window.vaakBootStatusThread();
         add(bsky.indexOf('bsky:') === 0 ? bsky.slice(5) : ('bsky:' + bsky));
       }
       if (timelineKey.indexOf('bsky:') === 0) add(timelineKey.slice(5));
+      // Wafrn-style Bluesky twin of a fediverse post: whichever copy lands
+      // first claims both ids, so a later page or live poll drops the other.
+      add(node.getAttribute('data-fedi-twin'));
       const rss = node.getAttribute('data-rss-item') || '';
       if (rss) add('rss:' + rss);
     });
