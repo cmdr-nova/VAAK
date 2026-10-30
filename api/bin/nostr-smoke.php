@@ -246,6 +246,17 @@ $check(!str_contains($pic['content'], 'a.webp') && str_contains($pic['content'],
     && str_contains($pic['content'], 'href="https://example.com/page"'), 'media link leaves the text, other text escaped and linked: ' . $pic['content']);
 $check(ap_masto_nostr_note_media(['vaak_nostr_event_id' => str_repeat('ef', 32), 'content' => 'x'], $mdb) === ['vaak_nostr_event_id' => str_repeat('ef', 32), 'content' => 'x'], 'unstored notes are left alone');
 
+// NIP-46 bunker pairing: input checks before any worker call, and the status line.
+$check(str_contains((string) (ap_nostr_bunker_save(1, 'nsec1abcdef', $mdb)['error'] ?? ''), 'Never paste your nsec'), 'an nsec pasted in the bunker box is refused');
+$check(str_contains((string) (ap_nostr_bunker_save(1, 'https://example.com', $mdb)['error'] ?? ''), 'bunker://'), 'a non-bunker link is refused');
+$check(ap_nostr_bunker_save(0, 'bunker://x', $mdb)['ok'] === false, 'signed-out users cannot pair');
+$check(ap_nostr_bunker_save(1, '', $mdb) === ['ok' => true, 'connected' => false, 'removed' => false], 'empty input disconnects (no table on SQLite: nothing to do)');
+$check(ap_nostr_bunker_for_user(1, $mdb) === null, 'SQLite has no bunker rows');
+$bunkerLine = ap_nostr_bunker_status_line(['signer_pubkey' => str_repeat('ab', 32), 'connected_at' => 1000, 'last_used_at' => 2000, 'last_error' => 'unauthorized', 'last_error_at' => 3000], 3030);
+$check(str_starts_with($bunkerLine, 'Connected to bunker npub1') && str_contains($bunkerLine, 'Last signed') && str_contains($bunkerLine, 'Last problem (just now): unauthorized.'), 'bunker status line: ' . $bunkerLine);
+$check(!str_contains(ap_nostr_bunker_status_line(['signer_pubkey' => str_repeat('ab', 32), 'connected_at' => 1000, 'last_used_at' => 3000, 'last_error' => 'old', 'last_error_at' => 2000], 3030), 'old'), 'a problem older than the last signature is not shown');
+$check(ap_nostr_bunker_status_line(null, 5) === '', 'no pairing, no line');
+
 if ($failures !== []) {
     fwrite(STDERR, "nostr-smoke: " . count($failures) . " of {$checks} checks failed\n - " . implode("\n - ", $failures) . "\n");
     exit(1);

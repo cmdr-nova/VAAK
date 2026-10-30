@@ -182,6 +182,10 @@ pub async fn serve(cfg: Config, bind: SocketAddr) -> Result<()> {
         // copy the viewer's signer extension signed (nostr::act).
         .route("/shadow/nostr-prepare", post(shadow_nostr_prepare))
         .route("/shadow/nostr-publish", post(shadow_nostr_publish))
+        // NIP-46: pair with a user's bunker, and sign through it for pages
+        // with no signer extension (nostr::bunker).
+        .route("/shadow/nostr-bunker-connect", post(shadow_nostr_bunker_connect))
+        .route("/shadow/nostr-bunker-sign", post(shadow_nostr_bunker_sign))
         // Stored notes as timeline statuses, for PHP bookmark rows (nostr:{id}).
         .route("/shadow/nostr-statuses", post(shadow_nostr_statuses))
         // One Nostr card's HTML, for PHP pages that fall back from Rust.
@@ -269,6 +273,8 @@ async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
             "/api/v1/notifications",
             "/shadow/nostr-prepare (POST)",
             "/shadow/nostr-publish (POST)",
+            "/shadow/nostr-bunker-connect (POST)",
+            "/shadow/nostr-bunker-sign (POST)",
             "/shadow/nostr-statuses (POST)",
             "/shadow/nostr-card (POST)",
             "/shadow/nostr-likes (POST)",
@@ -719,6 +725,35 @@ async fn shadow_nostr_publish(State(state): State<AppState>, Json(body): Json<No
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"ok": false, "error": "owner required"}))).into_response();
     }
     nostr_reply(crate::nostr::act::publish(&state.cfg, body.owner_id, &body.nonce, &body.event).await)
+}
+
+#[derive(serde::Deserialize)]
+struct NostrBunkerConnectBody {
+    owner_id: i64,
+    uri: String,
+}
+
+async fn shadow_nostr_bunker_connect(State(state): State<AppState>, Json(body): Json<NostrBunkerConnectBody>) -> axum::response::Response {
+    if body.owner_id < 1 {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"ok": false, "error": "owner required"}))).into_response();
+    }
+    nostr_reply(crate::nostr::bunker::connect(&state.cfg, body.owner_id, &body.uri).await)
+}
+
+#[derive(serde::Deserialize)]
+struct NostrBunkerSignBody {
+    owner_id: i64,
+    nonce: String,
+    /// The user's text, for a reply or quote.
+    #[serde(default)]
+    content: String,
+}
+
+async fn shadow_nostr_bunker_sign(State(state): State<AppState>, Json(body): Json<NostrBunkerSignBody>) -> axum::response::Response {
+    if body.owner_id < 1 {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"ok": false, "error": "owner required"}))).into_response();
+    }
+    nostr_reply(crate::nostr::bunker::sign(&state.cfg, body.owner_id, &body.nonce, &body.content).await)
 }
 
 #[derive(serde::Deserialize)]

@@ -1,0 +1,27 @@
+# NIP-46 bunker for one Nostr key (ops/nostr-bunker/README.md).
+# Install: cp vaak-bunker.service /etc/systemd/system/ && systemctl daemon-reload
+#          && systemctl enable --now vaak-bunker
+[Unit]
+Description=VAAK Nostr bunker (NIP-46 remote signer)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=vaak-bunker
+Group=vaak-bunker
+Environment=VAAK_NOSTR_KEY=/home/vaak-bunker/.config/vaak-nostr/nsec
+Environment=VAAK_BUNKER_DIR=/home/vaak-bunker/.config/vaak-bunker
+Environment=VAAK_BUNKER_RELAYS=wss://relay.nsec.app,wss://nos.lol
+ExecStart=/opt/vaak-bunker/venv/bin/python /opt/vaak-bunker/vaak_bunker.py run
+Restart=always
+RestartSec=10
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/vaak-bunker/.config/vaak-bunker
+MemoryMax=128M
+CPUQuota=25%
+
+[Install]
+WantedBy=multi-user.target
