@@ -142,6 +142,9 @@ fn canonical(input:&str)->Result<String>{
  let encoded=values.into_iter().map(|(key,value)|format!("{}={}",form(&key),form(&value))).collect::<Vec<_>>().join("&");
  Ok(format!("{}://{host}{path}{}",cap[1].to_ascii_lowercase(),if encoded.is_empty(){String::new()}else{format!("?{encoded}")}))
 }
+/// The link_preview_cards key PHP uses for one extracted URL
+/// (ap_link_preview_canonicalize_url over ap_link_preview_normalize_url).
+pub(crate) fn cache_key(raw:&str)->Option<String>{canonical(&normalize(raw).ok()?).ok()}
 pub(crate) fn extract_url(input:&str)->Result<Option<String>>{
  if input.len()>256*1024{bail!("PHP fallback: preview input size")}
  let plain=strip_tags(input)?;
