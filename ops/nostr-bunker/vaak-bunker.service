@@ -21,7 +21,7 @@ ProtectSystem=strict
 ProtectHome=read-only
 ReadWritePaths=/home/vaak-bunker/.config/vaak-bunker
 MemoryMax=128M
-CPUQuota=25%
+CPUQuota=100%
 
 [Install]
 WantedBy=multi-user.target
