@@ -6,7 +6,9 @@
  * never asks for or stores a Nostr private key, so it cannot publish anything
  * as the user by itself. Likes, replies and follows from Home cards are signed
  * in the browser by the user's signer extension (NIP-07) and only relayed by
- * the worker (ap_nostr_action below, nostr/act.rs). `vaak-worker nostr-sync`
+ * the worker (ap_nostr_action below, nostr/act.rs); pages with no extension
+ * can sign through the user's NIP-46 bunker instead (nostr/bunker.rs,
+ * ops/nostr-bunker). `vaak-worker nostr-sync`
  * (rust/vaak-worker/src/nostr, deploy/vaak-nostr-sync.timer) reads the user's
  * follow list and their follows' recent notes from public relays, and Home
  * mixes those notes in.
@@ -388,6 +390,15 @@ function ap_nostr_action(string $action, int $ownerUserId, bool $isAdmin, array 
             }
             $payload['reason'] = $reason;
         }
+    } elseif ($action === 'nostr_bunker_sign') {
+        // No signer extension on this page (an iPhone Home Screen app):
+        // the worker asks the user's NIP-46 bunker to sign instead.
+        $nonce = (string) ($post['nonce'] ?? '');
+        if (!preg_match('/^[0-9a-f]{32}$/', $nonce)) {
+            return $fail(400, 'That action expired. Try again.');
+        }
+        $path = '/shadow/nostr-bunker-sign';
+        $payload = ['owner_id' => $ownerUserId, 'nonce' => $nonce, 'content' => (string) ($post['content'] ?? '')];
     } elseif ($action === 'nostr_publish') {
         $nonce = (string) ($post['nonce'] ?? '');
         $event = json_decode((string) ($post['event'] ?? ''), true);
@@ -401,6 +412,97 @@ function ap_nostr_action(string $action, int $ownerUserId, bool $isAdmin, array 
     }
     // Follow edits read the current list from relays before answering.
     return ap_nostr_worker_call($path, $payload, 30000);
+}
+
+/**
+ * The user's NIP-46 bunker pairing (nostr_bunkers, made by the worker's
+ * `/shadow/nostr-bunker-connect`), or null. Never includes the client key.
+ *
+ * @return array<string,mixed>|null
+ */
+function ap_nostr_bunker_for_user(int $userId, ?PDO $db = null): ?array
+{
+    if ($userId <= 0) {
+        return null;
+    }
+    try {
+        $db ??= ap_db();
+        if (strtolower((string) $db->getAttribute(PDO::ATTR_DRIVER_NAME)) !== 'pgsql') {
+            return null;
+        }
+        if (!is_string($db->query("SELECT to_regclass('public.nostr_bunkers')")->fetchColumn())) {
+            return null;
+        }
+        $st = $db->prepare('SELECT signer_pubkey, connected_at, last_used_at, last_error, last_error_at FROM nostr_bunkers WHERE owner_user_id = ? LIMIT 1');
+        $st->execute([$userId]);
+        $row = $st->fetch(PDO::FETCH_ASSOC);
+        return is_array($row) ? $row : null;
+    } catch (Throwable $e) {
+        return null;
+    }
+}
+
+/**
+ * Pair with the bunker in a pasted bunker:// link, or (empty input) forget
+ * the pairing. The worker does the NIP-46 handshake and checks the bunker
+ * holds the linked npub's key.
+ *
+ * @return array{ok:bool,connected?:bool,removed?:bool,error?:string}
+ */
+function ap_nostr_bunker_save(int $userId, string $uri, ?PDO $db = null): array
+{
+    if ($userId <= 0) {
+        return ['ok' => false, 'error' => 'Sign in again to change this.'];
+    }
+    $uri = trim($uri);
+    if ($uri === '') {
+        try {
+            $db ??= ap_db();
+            $removed = ap_nostr_bunker_for_user($userId, $db) !== null;
+            if ($removed) {
+                $db->prepare('DELETE FROM nostr_bunkers WHERE owner_user_id = ?')->execute([$userId]);
+            }
+            return ['ok' => true, 'connected' => false, 'removed' => $removed];
+        } catch (Throwable $e) {
+            error_log('[nostr] bunker forget failed: ' . $e->getMessage());
+            return ['ok' => false, 'error' => 'Could not disconnect the bunker.'];
+        }
+    }
+    if (stripos($uri, 'nsec1') !== false) {
+        return ['ok' => false, 'error' => 'That looks like a secret key. Never paste your nsec on VAAK; paste the bunker:// link instead.'];
+    }
+    if (stripos($uri, 'bunker://') !== 0) {
+        return ['ok' => false, 'error' => 'Paste the whole bunker:// link from your bunker.'];
+    }
+    $reply = ap_nostr_worker_call('/shadow/nostr-bunker-connect', ['owner_id' => $userId, 'uri' => $uri], 50000);
+    $body = $reply['body'];
+    if (empty($body['ok'])) {
+        return ['ok' => false, 'error' => (string) ($body['error'] ?? 'Could not reach the bunker.')];
+    }
+    return ['ok' => true, 'connected' => true];
+}
+
+/** One line under the bunker box describing the pairing. */
+function ap_nostr_bunker_status_line(?array $bunker, int $now): string
+{
+    if (!is_array($bunker)) {
+        return '';
+    }
+    $ago = static function (int $at) use ($now): string {
+        $d = max(0, $now - $at);
+        return $d < 90 ? 'just now' : ($d < 5400 ? (int) round($d / 60) . ' min ago' : ($d < 172800 ? (int) round($d / 3600) . ' h ago' : (int) round($d / 86400) . ' days ago'));
+    };
+    $line = 'Connected to bunker ' . substr(ap_nostr_npub((string) ($bunker['signer_pubkey'] ?? '')), 0, 16) . '… ' . $ago((int) ($bunker['connected_at'] ?? 0)) . '.';
+    $used = (int) ($bunker['last_used_at'] ?? 0);
+    if ($used > 0) {
+        $line .= ' Last signed ' . $ago($used) . '.';
+    }
+    $error = trim((string) ($bunker['last_error'] ?? ''));
+    $errorAt = (int) ($bunker['last_error_at'] ?? 0);
+    if ($error !== '' && $errorAt >= $used) {
+        $line .= ' Last problem (' . $ago($errorAt) . '): ' . $error . '.';
+    }
+    return $line;
 }
 
 /**

@@ -8,14 +8,18 @@
 //! and `notif` the replies, mentions, likes and reposts in Notifications.
 //! `archive` keeps a permanent copy of linked users' own events, which
 //! `backup_relay` serves as a write-restricted relay.
+//! `bunker` signs through a user's NIP-46 remote signer (with `nip44`) for
+//! pages that have no extension, such as an iPhone Home Screen app.
 
 pub mod act;
 pub mod archive;
 pub mod backup_relay;
 pub mod bech32;
+pub mod bunker;
 pub mod event;
 pub mod home;
 pub mod moderation;
+pub mod nip44;
 pub mod notif;
 pub mod relay;
 pub mod relay_book;

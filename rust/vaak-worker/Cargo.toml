@@ -40,4 +40,7 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring",
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 webpki-roots = "1"
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
-k256 = { version = "0.14", default-features = false, features = ["schnorr", "std"] }
+k256 = { version = "0.14", default-features = false, features = ["schnorr", "ecdh", "std"] }
+# NIP-44 v2 encryption for NIP-46 remote signing (nostr/bunker.rs).
+chacha20 = "0.10"
+hmac = "0.13"

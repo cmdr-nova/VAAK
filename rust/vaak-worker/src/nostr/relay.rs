@@ -263,6 +263,88 @@ pub async fn publish(url: &str, event: &Event, deadline: Instant) -> Result<(boo
     send_event(ws, event, deadline).await
 }
 
+/// NIP-46 round trip on one relay: subscribe with `filter`, send `request`,
+/// and return the first event `accept` takes (the signer's answer) before
+/// `deadline`. A relay that refuses the request fails at once.
+pub async fn rpc<T, F>(url: &str, request: &Event, filter: &Value, deadline: Instant, accept: F) -> Result<T>
+where
+    F: Fn(&Event) -> Option<T>,
+{
+    let url = normalize_relay_url(url).ok_or_else(|| anyhow!("unusable relay url"))?;
+    if let Some(base) = test_relay_base() {
+        let target = format!("{base}/{}", url.trim_start_matches("wss://"));
+        let tcp = TcpStream::connect(base.trim_start_matches("ws://").split('/').next().unwrap_or("")).await?;
+        let (ws, _) = tokio_tungstenite::client_async_with_config(handshake_request(&target)?, tcp, Some(ws_config())).await?;
+        return run_rpc(ws, request, filter, deadline, accept).await;
+    }
+    let host = host_of(&url).to_string();
+    let tcp = timeout_at(deadline, guarded_tcp(&host)).await.map_err(|_| anyhow!("deadline"))??;
+    let name = rustls::pki_types::ServerName::try_from(host.clone()).map_err(|_| anyhow!("bad tls name"))?;
+    let tls = timeout_at(deadline, tokio_rustls::TlsConnector::from(tls_config()).connect(name, tcp))
+        .await
+        .map_err(|_| anyhow!("tls timeout"))?
+        .context("tls")?;
+    let (ws, _) = timeout_at(deadline, tokio_tungstenite::client_async_with_config(handshake_request(&url)?, tls, Some(ws_config())))
+        .await
+        .map_err(|_| anyhow!("websocket timeout"))?
+        .context("websocket")?;
+    run_rpc(ws, request, filter, deadline, accept).await
+}
+
+async fn run_rpc<S, T, F>(mut ws: tokio_tungstenite::WebSocketStream<S>, request: &Event, filter: &Value, deadline: Instant, accept: F) -> Result<T>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+    F: Fn(&Event) -> Option<T>,
+{
+    const SUB: &str = "vaak-rpc";
+    ws.send(Message::text(json!(["REQ", SUB, filter]).to_string())).await?;
+    ws.send(Message::text(json!(["EVENT", request]).to_string())).await?;
+    loop {
+        let msg = match timeout_at(deadline, ws.next()).await {
+            Ok(Some(Ok(msg))) => msg,
+            Ok(Some(Err(e))) => return Err(e.into()),
+            Ok(None) => bail!("closed before the signer answered"),
+            Err(_) => bail!("the signer did not answer in time"),
+        };
+        let text = match msg {
+            Message::Text(t) => t.to_string(),
+            Message::Ping(p) => {
+                ws.send(Message::Pong(p)).await?;
+                continue;
+            }
+            Message::Close(_) => bail!("closed before the signer answered"),
+            _ => continue,
+        };
+        let Ok(Value::Array(parts)) = serde_json::from_str::<Value>(&text) else {
+            continue;
+        };
+        match parts.first().and_then(Value::as_str) {
+            Some("EVENT") if parts.get(1).and_then(Value::as_str) == Some(SUB) => {
+                let Some(ev) = parts.get(2).and_then(|raw| serde_json::from_value::<Event>(raw.clone()).ok()) else {
+                    continue;
+                };
+                if let Some(answer) = accept(&ev) {
+                    let _ = ws.send(Message::text(json!(["CLOSE", SUB]).to_string())).await;
+                    let _ = ws.close(None).await;
+                    return Ok(answer);
+                }
+            }
+            Some("OK") if parts.get(1).and_then(Value::as_str) == Some(request.id.as_str()) => {
+                if !parts.get(2).and_then(Value::as_bool).unwrap_or(false) {
+                    let message: String = parts.get(3).and_then(Value::as_str).unwrap_or("").chars().take(160).collect();
+                    let _ = ws.close(None).await;
+                    bail!("relay refused the request: {message}");
+                }
+            }
+            Some("CLOSED") if parts.get(1).and_then(Value::as_str) == Some(SUB) => {
+                let message: String = parts.get(2).and_then(Value::as_str).unwrap_or("").chars().take(160).collect();
+                bail!("relay closed the subscription: {message}");
+            }
+            _ => {}
+        }
+    }
+}
+
 async fn send_event<S>(mut ws: tokio_tungstenite::WebSocketStream<S>, event: &Event, deadline: Instant) -> Result<(bool, String)>
 where
     S: AsyncRead + AsyncWrite + Unpin,

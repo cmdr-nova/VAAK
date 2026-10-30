@@ -1062,7 +1062,7 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
     // Nostr like/reply/follow from Home cards: JSON in and out, signed by the
     // browser's signer extension (ap_nostr_action, nostr/act.rs).
     $nostrModeration = in_array($action, ['nostr_hide', 'nostr_unhide', 'nostr_block', 'nostr_unblock'], true);
-    if ($action === 'nostr_prepare' || $action === 'nostr_publish' || $nostrModeration) {
+    if ($action === 'nostr_prepare' || $action === 'nostr_publish' || $action === 'nostr_bunker_sign' || $nostrModeration) {
         require_once __DIR__ . '/ap-nostr.php';
         $nostrReply = $nostrModeration
             ? ap_nostr_moderation_action($action, (int) admin_owner_user_id(), !empty($vaakIsAdmin), $_POST)
@@ -2491,6 +2491,23 @@ $vaakAdminOnlyActions = [
                     : 'Nostr npub saved. Posts from people you follow there show up in Home within a few minutes.';
             } else {
                 $error = (string) ($nostrSaved['error'] ?? 'Could not save your npub.');
+            }
+        }
+        $view = 'profile';
+    } elseif ($action === 'save_nostr_bunker') {
+        require_once __DIR__ . '/ap-nostr.php';
+        if (!ap_nostr_form_visible(!empty($vaakIsAdmin))) {
+            $error = 'Nostr in Home is not open on this server yet.';
+        } else {
+            $bunkerSaved = ap_nostr_bunker_save(admin_owner_user_id(), (string) ($_POST['nostr_bunker'] ?? ''));
+            if (!empty($bunkerSaved['ok'])) {
+                $notice = !empty($bunkerSaved['connected'])
+                    ? 'Bunker connected. Pages without a signer extension now sign Nostr actions through it.'
+                    : (!empty($bunkerSaved['removed'])
+                        ? 'Bunker disconnected. Also revoke VAAK on the bunker itself.'
+                        : 'Paste a bunker:// link from your bunker first.');
+            } else {
+                $error = (string) ($bunkerSaved['error'] ?? 'Could not connect the bunker.');
             }
         }
         $view = 'profile';
@@ -33832,7 +33849,16 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
             <label class="meta" style="font-weight:400"><input type="checkbox" form="nostr-link-form" name="nostr_show_in_home" value="1"<?= $nostrShow ? ' checked' : '' ?>> Show posts from people I follow on Nostr in Home</label>
             <div class="meta">VAAK only needs your public npub. Never paste your nsec anywhere on VAAK. Leave it empty to unlink.<?php if ($nostrStatus !== ''): ?> <?= h($nostrStatus) ?><?php endif; ?></div>
             <div class="meta">To like, reply and follow on Nostr from Home, install a Nostr signer extension in your browser, such as <a href="https://github.com/fiatjaf/nos2x" target="_blank" rel="noopener noreferrer">nos2x</a> or <a href="https://getalby.com/" target="_blank" rel="noopener noreferrer">Alby</a> (on iPhone or iPad, <a href="https://apps.apple.com/app/nostash/id6744309333" target="_blank" rel="noopener noreferrer">Nostash</a> for Safari, then switch it on under Settings &gt; Apps &gt; Safari &gt; Extensions), and add your key there. The extension signs each action and can ask you first; VAAK never sees your key. It must hold the same key as the npub above.</div>
-            <?php if ($nostrHex !== ''): ?><?= ap_nostr_moderation_settings_html((int) $vaakOwnerId, !empty($vaakIsAdmin)) ?><?php endif; ?>
+            <?php if ($nostrHex !== ''): ?>
+            <?php $nostrBunker = ap_nostr_bunker_for_user((int) $vaakOwnerId); ?>
+            <label for="nostr-bunker" style="margin-top:.75rem">Nostr bunker (for the Home Screen app)</label>
+            <div class="supporter-reward-row">
+              <input id="nostr-bunker" form="nostr-bunker-form" name="nostr_bunker" type="password" autocomplete="off" spellcheck="false" maxlength="2000" value="" placeholder="<?= h(is_array($nostrBunker) ? 'Connected. Leave empty and save to disconnect.' : 'bunker://…') ?>">
+              <button class="btn btn-primary" type="submit" form="nostr-bunker-form"><?= is_array($nostrBunker) ? 'Save' : 'Connect' ?></button>
+            </div>
+            <div class="meta">A site added to the iPhone Home Screen can't use Safari extensions. Paste a NIP-46 <code>bunker://</code> link from a signer that holds your key somewhere else, and pages without an extension sign through it. The bunker decides what it signs and can revoke VAAK; VAAK still never sees your key.<?php $bunkerLine = ap_nostr_bunker_status_line($nostrBunker, time()); if ($bunkerLine !== ''): ?> <?= h($bunkerLine) ?><?php endif; ?></div>
+            <?= ap_nostr_moderation_settings_html((int) $vaakOwnerId, !empty($vaakIsAdmin)) ?>
+            <?php endif; ?>
           </div>
           <?php endif; ?>
         </div>
@@ -33845,6 +33871,10 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
         <form id="nostr-link-form" method="post" action="?view=profile" hidden>
           <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
           <input type="hidden" name="action" value="save_nostr">
+        </form>
+        <form id="nostr-bunker-form" method="post" action="?view=profile" hidden>
+          <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
+          <input type="hidden" name="action" value="save_nostr_bunker">
         </form>
         <?php endif; ?>
         <?php
@@ -50452,11 +50482,26 @@ if (VIEW === 'analytics') loadAnalytics();
     return { ok: false, error: 'VAAK did not answer. Try again.' };
   }
 
+  // No extension (an iPhone Home Screen app never loads Safari extensions):
+  // ask the worker to have the user's NIP-46 bunker sign instead. It signs
+  // only the event prepared under `nonce` (nostr/bunker.rs).
+  const bunkerSigner = {
+    vaakBunker: true,
+    async signEvent(unsigned, nonce) {
+      const res = await post({ action: 'nostr_bunker_sign', nonce: nonce, content: unsigned.content || '' });
+      if (res && res.ok && res.event) return res.event;
+      const err = new Error((res && res.error) || 'Your Nostr bunker did not sign it.');
+      err.vaakMessage = res && res.no_bunker
+        ? 'To act on Nostr posts, install a signer extension such as nos2x or Alby (Nostash in Safari on iPhone), or connect a bunker in Settings > Profile.'
+        : err.message;
+      throw err;
+    }
+  };
+
   function signerReady() {
     const signer = window.nostr;
     if (!signer || typeof signer.signEvent !== 'function' || typeof signer.getPublicKey !== 'function') {
-      toast('To act on Nostr posts, install a signer extension such as nos2x or Alby (Nostash in Safari on iPhone), then reload this page.');
-      return null;
+      return bunkerSigner;
     }
     return signer;
   }
@@ -50473,7 +50518,11 @@ if (VIEW === 'analytics') loadAnalytics();
 
   async function signAndPublish(signer, prep, content) {
     let pubkey = '';
-    try { pubkey = String(await signer.getPublicKey() || '').toLowerCase(); } catch (e) {}
+    if (signer.vaakBunker) {
+      pubkey = String(prep.pubkey || '');
+    } else {
+      try { pubkey = String(await signer.getPublicKey() || '').toLowerCase(); } catch (e) {}
+    }
     if (!pubkey) { toast('Your signer extension did not share its key.'); return null; }
     if (pubkey !== prep.pubkey) {
       toast('Your signer extension uses a different key than the npub linked in Settings > Profile.');
@@ -50487,8 +50536,12 @@ if (VIEW === 'analytics') loadAnalytics();
       content: prep.needs_content ? content + (prep.suffix || '') : prep.template.content
     };
     let signed = null;
-    try { signed = await signer.signEvent(unsigned); } catch (e) {}
-    if (!signed || typeof signed !== 'object') { toast('Signing was cancelled.'); return null; }
+    let signError = '';
+    try {
+      if (signer.vaakBunker) toast('Asking your Nostr bunker to sign…');
+      signed = await (signer.vaakBunker ? signer.signEvent(unsigned, prep.nonce) : signer.signEvent(unsigned));
+    } catch (e) { signError = (e && e.vaakMessage) || ''; }
+    if (!signed || typeof signed !== 'object') { toast(signError || 'Signing was cancelled.'); return null; }
     const done = await post({ action: 'nostr_publish', nonce: prep.nonce, event: JSON.stringify(signed) });
     if (!done.ok) { toast(done.error || 'No relay accepted it.'); return null; }
     return done;

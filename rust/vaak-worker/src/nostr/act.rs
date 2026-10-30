@@ -62,7 +62,7 @@ fn refuse(message: &str) -> Result<Value> {
     Ok(json!({"ok": false, "error": message}))
 }
 
-fn pending_key(owner: i64, nonce: &str) -> String {
+pub(super) fn pending_key(owner: i64, nonce: &str) -> String {
     format!("vaak:nostr:pending:{owner}:{nonce}")
 }
 
@@ -195,6 +195,12 @@ pub fn check_signed(ev: &Event, pending: &Pending, linked: &str, now: i64) -> Re
     if ev.pubkey != linked {
         return Err("Your signer used a different key than the npub linked in Settings > Profile.".into());
     }
+    check_template(ev, pending, now)
+}
+
+/// Everything but the key and signature: kind, tags, text and time are the
+/// prepared ones. Also what a bunker is asked to sign (nostr::bunker).
+pub fn check_template(ev: &Event, pending: &Pending, now: i64) -> Result<(), String> {
     if ev.kind != pending.kind || ev.tags != pending.tags {
         return Err("The signed event isn't the one VAAK prepared.".into());
     }
@@ -221,7 +227,7 @@ pub fn check_signed(ev: &Event, pending: &Pending, linked: &str, now: i64) -> Re
     Ok(())
 }
 
-async fn linked_pubkey(db: &Client, owner: i64) -> Result<Option<(String, i64, i64)>> {
+pub(super) async fn linked_pubkey(db: &Client, owner: i64) -> Result<Option<(String, i64, i64)>> {
     Ok(db
         .query_opt("SELECT pubkey, follow_count::bigint, follow_list_at FROM nostr_links WHERE owner_user_id = $1", &[&owner])
         .await
