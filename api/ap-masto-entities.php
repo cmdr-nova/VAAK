@@ -4663,6 +4663,27 @@ function ap_masto_remote_account(string $actorId, bool $allowFetch = false): arr
         if (!empty($GLOBALS['vaak_search_collect_account_sources'])) $GLOBALS['vaak_search_account_sources'][hash('sha256',json_encode($memo[$memoKey],JSON_THROW_ON_ERROR))]??=$actorId;
         return $memo[$memoKey];
     }
+    // Local actors reach here from mention/event/thread rows. Their remote_actors
+    // copy is stale (old avatar, no display name) and the hashed id splits them
+    // from the real account, so answer with the local account entity.
+    if (function_exists('ap_masto_is_local_actor_url') && function_exists('ap_masto_account_from_user')
+        && ap_masto_is_local_actor_url($actorId)) {
+        $localUser = null;
+        try {
+            $st = ap_db()->prepare(
+                'SELECT * FROM ap_users WHERE lower(actor_key) = lower(?) AND disabled_at IS NULL LIMIT 1'
+            );
+            $st->execute([basename($actorId)]);
+            $localUser = $st->fetch();
+        } catch (Throwable $e) {
+            $localUser = null;
+        }
+        if (is_array($localUser)) {
+            $account = ap_masto_account_from_user($localUser);
+            if (!empty($GLOBALS['vaak_search_collect_account_sources'])) $GLOBALS['vaak_search_account_sources'][hash('sha256',json_encode($account,JSON_THROW_ON_ERROR))]??=$actorId;
+            return $memo[$memoKey] = $account;
+        }
+    }
     $fallback = defined('AP_REMOTE_AVATAR_FALLBACK')
         ? AP_REMOTE_AVATAR_FALLBACK
         : 'https://mkultra.monster/img/avatar/default.jpg';
