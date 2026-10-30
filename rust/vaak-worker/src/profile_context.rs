@@ -637,7 +637,8 @@ async fn prepare_raw_quote(db:&Client,viewer:&crate::profile_materialize::Profil
  // The cache step only reads, apart from DNS and a cold warm, which its
  // guard checks first; the check after rendering covers its reads.
  if allowed{crate::profile_bridge::timed(crate::profile_bridge::Stage::QuoteCache,product.complete_cache(db,dns,&grant)).await?;}
- let html=if allowed{crate::profile_raw::render_quote(&raw_quote_facts(product.status().unwrap(),target),facts)?}else{String::new()};
+ // A resolved quote paints the quoted author (avatar, name, handle) like every other surface.
+ let html=if !allowed{String::new()}else if crate::library::card::feed_quote_paintable(product.status().unwrap()){crate::library::card::feed_quote_embed(product.status().unwrap(),facts,false)?}else{crate::profile_raw::render_quote(&raw_quote_facts(product.status().unwrap(),target),facts)?};
  crate::profile_bridge::timed(crate::profile_bridge::Stage::QuoteCurrent,async{product.require_current(db).await?;page.require_current_ledger(db).await}).await?;
  Ok((html,product,mapping_changes))
 }

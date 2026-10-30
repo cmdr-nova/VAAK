@@ -318,10 +318,21 @@ pub(crate) fn status_urls_equivalent(a:&str,b:&str)->bool {
     !status_candidates(a).is_disjoint(&status_candidates(b))
 }
 
-/// Status/thread quote. Same stored account fields the Home lean card paints:
-/// avatar, display name, handle, and time, inside the feed's nested post chrome.
-/// Library and profile quotes stay on [`quote_card`].
-fn feed_quote_embed(status: &Value, facts: &CardFacts, silent: bool) -> Result<String> {
+/// A resolved quote names its author. Cold, unavailable and preview stubs
+/// carry their own footer label and stay on [`quote_card`].
+pub(crate) fn feed_quote_paintable(status: &Value) -> bool {
+    if status.get("vaak_quote_open_label").is_some() { return false; }
+    let account = status.get("account").unwrap_or(&Value::Null);
+    ["acct", "display_name", "username"].iter().any(|key| {
+        let value = php_trim(string(account, key)).trim_start_matches('@');
+        !value.is_empty() && value != "?"
+    })
+}
+
+/// Resolved quote on every surface. Same stored account fields the Home lean
+/// card paints: avatar, display name, handle, and time, inside the feed's
+/// nested post chrome. RSS mirror quotes stay on [`quote_card`].
+pub(crate) fn feed_quote_embed(status: &Value, facts: &CardFacts, silent: bool) -> Result<String> {
     let account = status.get("account").unwrap_or(&Value::Null);
     let acct = string(account, "acct").trim().trim_start_matches('@').to_string();
     let display = {
@@ -350,9 +361,11 @@ fn feed_quote_embed(status: &Value, facts: &CardFacts, silent: bool) -> Result<S
     if !uri.starts_with("https://") { uri = string(status, "url"); }
     let created = string(status, "created_at");
     let rel = if created.is_empty() { String::new() } else { relative_time(&created, facts.now) };
-    let when = if rel.is_empty() { String::new() } else if uri.starts_with("https://") {
-        let href = status_href(&uri, view);
-        if href.is_empty() || href == "#" { format!("<span class=\"meta\"> · {}</span>", esc(&rel)) } else { format!("<a class=\"meta tweet-time\" href=\"{}\" title=\"Open post\"> · {}</a>", esc(&href), esc(&rel)) }
+    let open_href = if uri.starts_with("https://") { status_href(&uri, view) } else { String::new() };
+    let openable = !open_href.is_empty() && open_href != "#";
+    let time_linked = openable && !rel.is_empty();
+    let when = if rel.is_empty() { String::new() } else if time_linked {
+        format!("<a class=\"meta tweet-time\" href=\"{}\" title=\"Open post\"> · {}</a>", esc(&open_href), esc(&rel))
     } else { format!("<span class=\"meta\"> · {}</span>", esc(&rel)) };
     let header = format!("<div class=\"tweet-hd\">{av_block}<div class=\"tweet-hd-main tweet-hd-main--fedi\"><div>{who}{when}</div></div></div>");
     let scrubbed = super::body::scrub_as2(&plain(string(status, "content")));
@@ -383,6 +396,8 @@ fn feed_quote_embed(status: &Value, facts: &CardFacts, silent: bool) -> Result<S
         let preview = link_preview_mode(&card, false)?;
         if !preview.is_empty() { body.push_str(&format!("<div class=\"quote-link-card\" data-quote-chrome=\"1\" style=\"margin-top:.45rem;pointer-events:none\">{preview}</div>")); }
     }
+    // No timestamp to carry the link: keep an explicit way into the quoted post.
+    if openable && !time_linked { body.push_str(&format!("<div class=\"meta\" style=\"margin-top:.35rem\"><a href=\"{}\">Open quoted</a></div>", esc(&open_href))); }
     let bsky = string(status, "source").eq_ignore_ascii_case("bluesky") || string(status, "id").starts_with("bsky:") || string(status, "uri").contains("bsky.app/") || string(status, "url").contains("bsky.app/") || string(status, "uri").starts_with("at://") || acct.to_ascii_lowercase().ends_with("@bsky.app");
     let sid = scalar_string(status, "id").trim().trim_end_matches('/').to_string();
     let mut attrs = String::new();
@@ -805,7 +820,7 @@ fn render_core_mode(status:&Value,facts:&CardFacts,direct:Option<&crate::direct_
     body.push_str(&media_row_mode(&paint_media, facts.lazy_media,silent));
     if let Some(quote) = st.get("quote").filter(|quote|quote.is_object()) {
         if let Some(quoted) = quote.get("quoted_status").filter(|v| v.is_object()) {
-            if direct.is_some_and(|presentation| presentation.feed_quote()) && facts.rss_quote_row.is_none() { body.push_str(&feed_quote_embed(quoted, facts, silent)?); }
+            if facts.rss_quote_row.is_none() && feed_quote_paintable(quoted) { body.push_str(&feed_quote_embed(quoted, facts, silent)?); }
             else { body.push_str(&quote_card_mode(quoted, facts,silent)?); }
         }
         else if let Some(pending)=direct.and_then(|presentation|presentation.pending_quote()){body.push_str(&pending.render(facts)?);}
@@ -1017,7 +1032,7 @@ mod tests {
     }
 
     #[test]
-    fn status_surface_paints_the_feed_quote_and_profile_keeps_the_compact_card() {
+    fn every_surface_paints_the_quoted_author_avatar() {
         let quoted_avatar = "https://cdn.example/avatars/quoted.webp";
         let quoted = serde_json::json!({
             "id":"https://remote.test/users/quoted/statuses/9",
@@ -1041,18 +1056,18 @@ mod tests {
             "quote":{"state":"accepted","quoted_status":quoted}
         });
         let facts = CardFacts { current_action_counts: None, bsky: None, owner_id: 1, owner_actor: "https://mkultra.monster/users/fixture".into(), return_view: "local".into(), auto_unblur_sensitive: false, resolved_avatar: "https://mkultra.monster/img/avatar/default.webp".into(), csrf: "csrf".into(), favourited: false, bookmarked: false, boosted: false, own: None, rss_row: None, rss_quote_row: None, rss_quoted: false, emoji_by_actor: Default::default(), reply_mentions: Vec::new(), moderation: Default::default(), poll_row: None, ask_row: None, now: chrono::DateTime::from_timestamp(1792627200, 0).unwrap(), lazy_media: false };
-        let status_view = crate::direct_context::DirectPresentation::fixture(true);
+        let status_view = crate::direct_context::DirectPresentation::fixture();
         let html = render_core_mode(&outer, &facts, Some(&status_view), None, false, true).unwrap();
         assert!(html.contains("notif-status-embed") && html.contains(quoted_avatar) && html.contains("Quoted Person"), "{html}");
         assert!(!html.contains("qt-label"), "{html}");
-        let profile = crate::direct_context::DirectPresentation::fixture(false);
-        let compact = render_core_mode(&outer, &facts, Some(&profile), None, false, true).unwrap();
-        assert!(compact.contains("qt-label") && compact.contains("@quoted@remote.test"), "{compact}");
-        assert!(!compact.contains(quoted_avatar) && !compact.contains("notif-status-embed"), "{compact}");
-        let mut library = facts.clone();
-        library.return_view = "bookmarks".into();
-        let saved = render(&outer, &library).unwrap();
-        assert!(saved.contains("qt-label") && !saved.contains(quoted_avatar), "{saved}");
+        // Profiles paint through the direct presentation; Library and search without one.
+        for view in ["remote_profile", "outbox", "home", "bookmarks", "favourites", "search"] {
+            let mut surface = facts.clone();
+            surface.return_view = view.into();
+            let painted = if matches!(view, "bookmarks" | "favourites" | "search") { render(&outer, &surface) } else { render_core_mode(&outer, &surface, Some(&status_view), None, false, true) }.unwrap();
+            assert!(painted.contains("notif-status-embed") && painted.contains(quoted_avatar) && painted.contains("Quoted Person"), "{view}: {painted}");
+            assert!(!painted.contains("qt-label"), "{view}: {painted}");
+        }
     }
 
     /// Library, search and status pages paint with this card. These pin the
@@ -1090,7 +1105,7 @@ mod tests {
             assert!(quote.contains("quote-media") && quote.contains(QIMG), "quoted image must paint in the quote: {quote}");
             let html = render(&st, &facts()).unwrap();
             let at = html.find(QIMG).expect("quoted image paints on the card");
-            let inside = html.find("quote-media").expect("quote media row");
+            let inside = html.find("quote-block").expect("quote card");
             assert!(inside < at, "quoted image must sit inside the quote, not on the outer card: {html}");
         }
 
