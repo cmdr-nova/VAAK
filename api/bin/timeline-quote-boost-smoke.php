@@ -272,6 +272,24 @@ foreach (['home', 'local', 'feed'] as $view) {
     timeline_quote_assert_copy($own, $ownNote, $view, 'own boost ' . $view);
 }
 
+// Every surface paints the quoted author: avatar, display name, handle.
+// (Profile, search and status cards render empty in this offline harness; the Rust
+// card tests cover those surfaces.)
+$authorAvatar = 'https://example.test/author.webp';
+$withAvatar = $plainQuote;
+$withAvatar['quote']['quoted_status']['account']['avatar'] = $authorAvatar;
+$withAvatar['quote']['quoted_status']['account']['display_name'] = 'Original Author';
+foreach (['home', 'local', 'feed', 'outbox', 'bookmarks', 'favourites'] as $view) {
+    $GLOBALS['view'] = $view;
+    $html = timeline_quote_render($withAvatar, $view);
+    $quoteAt = strpos($html, 'quote-block');
+    $avatarAt = strpos($html, $authorAvatar);
+    timeline_quote_assert($quoteAt !== false && $avatarAt !== false && $avatarAt > $quoteAt, 'quoted author avatar ' . $view);
+    timeline_quote_assert(str_contains(substr($html, $quoteAt), 'Original Author'), 'quoted author name ' . $view);
+    timeline_quote_assert(!str_contains($html, 'qt-label'), 'compact quote card on ' . $view);
+}
+unset($GLOBALS['view']);
+
 $unresolved = $plainQuote;
 $unresolved['media_attachments'] = [timeline_quote_image($parentMedia), timeline_quote_image($quotedMedia)];
 $unresolved['quote']['quoted_status']['media_attachments'] = [];

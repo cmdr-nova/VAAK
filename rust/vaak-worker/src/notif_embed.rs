@@ -1794,21 +1794,35 @@ fn paint_nested_quote(status: &Value, q_raw: &Value, from: &str, viewer_actor: &
         }
         let text = preview.get("text").and_then(Value::as_str).unwrap_or("").trim();
         if !text.is_empty() {
-            let acct = preview.get("acct").and_then(Value::as_str).unwrap_or("").trim();
-            let url = unresolved_quote_url(status, q_raw);
-            let mut html = String::from("<div class=\"quote-block\" style=\"margin-top:.55rem\">");
-            if !acct.is_empty() {
-                html.push_str(&format!("<div class=\"meta\" style=\"margin-top:.3rem\">{}</div>", esc(acct)));
+            // Summary snippet only: paint it as the quoted author's card
+            // (PHP builds the same status from vaak_quote_preview).
+            let field = |key: &str| preview.get(key).and_then(Value::as_str).unwrap_or("").trim().to_string();
+            let url = {
+                let own = field("url");
+                if own.starts_with("https://") { own } else { unresolved_quote_url(status, q_raw) }
+            };
+            let display = {
+                let d = field("display");
+                if d.is_empty() { field("display_name") } else { d }
+            };
+            let mut account = serde_json::json!({
+                "acct": field("acct").trim_start_matches('@'),
+                "display_name": display,
+            });
+            let avatar = field("avatar");
+            if avatar.starts_with("https://") {
+                account["avatar"] = Value::String(avatar.clone());
+                account["avatar_static"] = Value::String(avatar);
             }
-            html.push_str(&format!("<div style=\"margin-top:.25rem;white-space:pre-wrap\">{}</div>", esc(text)));
-            if !url.is_empty() {
-                html.push_str(&format!(
-                    "<div class=\"meta\" style=\"margin-top:.35rem\"><a href=\"{}\">Open quoted</a></div>",
-                    esc(&crate::library::actions::in_app_status_href(&url, from))
-                ));
-            }
-            html.push_str("</div>");
-            return html;
+            let synthetic = serde_json::json!({
+                "uri": url,
+                "url": url,
+                "content": format!("<p>{}</p>", esc(text)),
+                "created_at": field("created_at"),
+                "account": account,
+                "media_attachments": [],
+            });
+            return wrap(paint_lean_embed_from(&synthetic, false, from, viewer_actor, false));
         }
     }
     let url = unresolved_quote_url(status, q_raw);
@@ -5569,9 +5583,10 @@ mod tests {
     #[test]
     fn pending_quote_falls_back_to_summary_preview() {
         let mut st = pending_quote_boost(json!({"state":"pending","quoted_status":null}), Some("https://misskey.test/notes/p"));
-        st["reblog"]["vaak_quote_preview"] = json!({"acct":"@helper@misskey.test","text":"Rent is due, any help counts","url":"https://misskey.test/notes/p"});
+        st["reblog"]["vaak_quote_preview"] = json!({"acct":"@helper@misskey.test","display":"Helper","avatar":"https://misskey.test/av.webp","text":"Rent is due, any help counts","url":"https://misskey.test/notes/p"});
         let html = paint_lean_feed_card(&st);
         assert!(html.contains("Rent is due, any help counts") && html.contains("@helper@misskey.test"), "{html}");
+        assert!(html.contains("https://misskey.test/av.webp") && html.contains("Helper"), "{html}");
         assert!(!html.contains("@?") && !html.contains("not cached yet"), "{html}");
     }
 

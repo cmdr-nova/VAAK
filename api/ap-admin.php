@@ -15201,12 +15201,6 @@ function admin_split_quote_summary(string $summaryRaw): ?array
  *   open_external?:bool
  * } $opts
  */
-/** Status/thread pages paint quotes with the feed's nested post card. */
-function admin_status_quote_surface(): bool
-{
-    return ($GLOBALS['view'] ?? '') === 'status';
-}
-
 function admin_quote_https_avatar(array $account): string
 {
     foreach (['avatar', 'avatar_static'] as $key) {
@@ -15218,6 +15212,7 @@ function admin_quote_https_avatar(array $account): string
     return 'https://mkultra.monster/img/avatar/default.webp';
 }
 
+/** The feed quote card needs a named author; anonymous stubs keep the compact card. */
 function admin_quote_status_paintable(array $st): bool
 {
     $account = is_array($st['account'] ?? null) ? $st['account'] : [];
@@ -15227,14 +15222,7 @@ function admin_quote_status_paintable(array $st): bool
             return true;
         }
     }
-    $text = function_exists('admin_html_to_plain')
-        ? trim(admin_html_to_plain((string) ($st['content'] ?? '')))
-        : trim(strip_tags((string) ($st['content'] ?? '')));
-    if ($text !== '') {
-        return true;
-    }
-    $media = $st['media_attachments'] ?? null;
-    return is_array($media) && $media !== [];
+    return false;
 }
 
 /**
@@ -15285,7 +15273,7 @@ function admin_quote_status_from_bsky_preview(array $prev, string $fallbackUrl =
 
 /**
  * Feed quote card for a resolved status: avatar, name, handle, time, body, media.
- * Uses fields already on the status. Library/search keep admin_quote_card_html.
+ * Uses fields already on the status.
  *
  * @param array<string,mixed> $st
  * @param array<string,mixed> $opts
@@ -15335,12 +15323,14 @@ function admin_feed_quote_embed_html(array $st, string $returnView, array $opts)
         }
     }
     $when = '';
+    $openHref = ($uri !== '' && function_exists('admin_status_href')) ? admin_status_href($uri, $from) : '';
+    $timeLinked = false;
     $created = trim((string) ($st['created_at'] ?? ''));
     if ($created !== '') {
         $rel = relative_time($created);
         if ($rel !== '') {
-            $openHref = ($uri !== '' && function_exists('admin_status_href')) ? admin_status_href($uri, $from) : '';
             if ($openHref !== '' && $openHref !== '#') {
+                $timeLinked = true;
                 $when = '<a class="meta tweet-time" href="' . h($openHref) . '" title="Open post"> · ' . h($rel) . '</a>';
             } else {
                 $when = '<span class="meta"> · ' . h($rel) . '</span>';
@@ -15394,6 +15384,10 @@ function admin_feed_quote_embed_html(array $st, string $returnView, array $opts)
             }
         }
     }
+    // No timestamp to carry the link: keep an explicit way into the quoted post.
+    if (!$timeLinked && $openHref !== '' && $openHref !== '#') {
+        $body .= '<div class="meta" style="margin-top:.35rem"><a href="' . h($openHref) . '">Open quoted</a></div>';
+    }
     $bsky = ($st['source'] ?? '') === 'bluesky'
         || str_starts_with((string) ($st['id'] ?? ''), 'bsky:')
         || str_contains((string) ($st['uri'] ?? $st['url'] ?? ''), 'bsky.app/')
@@ -15419,15 +15413,15 @@ function admin_feed_quote_embed_html(array $st, string $returnView, array $opts)
 }
 
 /**
- * Status/thread resolved quotes use the feed card. Every other surface keeps
- * the compact quote card so library/search captures stay stable.
+ * A resolved quote paints as the feed card (avatar, name, handle) on every
+ * surface. RSS mirrors and quotes with no author or body keep the compact card.
  *
  * @param array<string,mixed> $opts
  * @param array<string,mixed>|null $status
  */
 function admin_paint_quote_html(array $opts, string $returnView, ?array $status = null): string
 {
-    if (is_array($status) && admin_status_quote_surface() && empty($opts['is_rss']) && admin_quote_status_paintable($status)) {
+    if (is_array($status) && empty($opts['is_rss']) && admin_quote_status_paintable($status)) {
         return admin_feed_quote_embed_html($status, $returnView, $opts);
     }
     return admin_quote_card_html($opts, $returnView);
@@ -22301,9 +22295,10 @@ function admin_render_outbox_card(array $n, string $returnView): void
                         'open_label' => 'Open original',
                     ], $returnView);
                 } elseif (is_array($quotedStatus)) {
-                    $quoteHtml = admin_quote_card_html(
+                    $quoteHtml = admin_paint_quote_html(
                         admin_quote_opts_from_status($quotedStatus, $openUrl),
-                        $returnView
+                        $returnView,
+                        $quotedStatus
                     );
                 } else {
                     $qAttMedia = [];

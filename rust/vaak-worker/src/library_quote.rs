@@ -673,7 +673,8 @@ mod tests {
         let pictured_html = render(&pictured, &facts(&pictured)).unwrap();
         assert!(pictured_html.contains("Quoted with a picture"));
         assert!(pictured_html.contains("https://media.test/quoted.jpg"));
-        assert!(pictured_html.contains("quote-media"));
+        let quote_at = pictured_html.find("quote-block").expect("quote card");
+        assert!(pictured_html.find("https://media.test/quoted.jpg").is_some_and(|at| at > quote_at), "quoted image sits inside the quote: {pictured_html}");
         assert!(!pictured_html.contains('↪'));
 
         let bsky = project(&fixture["bluesky"]);
