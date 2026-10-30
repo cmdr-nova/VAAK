@@ -120,10 +120,13 @@ $check($status === 418, 'signer who is not the actor is forwarded');
 [$status] = smoke_post($rust, '/inbox', smoke_like($alice, '6'), $aliceKey, $priv, '/outbox');
 $check($status === 418, 'bad signature is forwarded');
 
+[$status] = smoke_post($rust, '/users/nobody_here/inbox', smoke_like($alice, '7'), $aliceKey, $priv);
+$check($status === 418, 'personal inbox of an unknown user is forwarded (PHP answers 404)');
+
 $spooled = (int) $db->query("SELECT count(*) FROM ap_inbox_spool")->fetchColumn();
 $check($spooled === 2, 'only the two good deliveries were spooled');
 $stats = $redis->hGetAll('vaak:inbox_rust:stats:v1');
 $check((int) ($stats['spooled'] ?? 0) === 2 && (int) ($stats['fwd_no_key'] ?? 0) === 1 && (int) ($stats['fwd_blocked'] ?? 0) === 1
-    && (int) ($stats['fwd_actor_mismatch'] ?? 0) === 1 && (int) ($stats['fwd_signature'] ?? 0) === 1, 'stats count each outcome');
+    && (int) ($stats['fwd_actor_mismatch'] ?? 0) === 1 && (int) ($stats['fwd_signature'] ?? 0) === 1 && (int) ($stats['fwd_unknown_user'] ?? 0) === 1, 'stats count each outcome');
 
 echo "inbox-rust-accept: {$n} checks passed\n";
