@@ -410,8 +410,9 @@ function ap_nostr_action(string $action, int $ownerUserId, bool $isAdmin, array 
     } else {
         return $fail(400, 'Unknown Nostr action.');
     }
-    // Follow edits read the current list from relays before answering.
-    return ap_nostr_worker_call($path, $payload, 30000);
+    // Follow edits read the current list from relays before answering; a
+    // bunker gets up to 35 s to answer (bunker.rs SIGN_DEADLINE).
+    return ap_nostr_worker_call($path, $payload, $path === '/shadow/nostr-bunker-sign' ? 45000 : 30000);
 }
 
 /**
@@ -474,7 +475,7 @@ function ap_nostr_bunker_save(int $userId, string $uri, ?PDO $db = null): array
     if (stripos($uri, 'bunker://') !== 0) {
         return ['ok' => false, 'error' => 'Paste the whole bunker:// link from your bunker.'];
     }
-    $reply = ap_nostr_worker_call('/shadow/nostr-bunker-connect', ['owner_id' => $userId, 'uri' => $uri], 50000);
+    $reply = ap_nostr_worker_call('/shadow/nostr-bunker-connect', ['owner_id' => $userId, 'uri' => $uri], 90000);
     $body = $reply['body'];
     if (empty($body['ok'])) {
         return ['ok' => false, 'error' => (string) ($body['error'] ?? 'Could not reach the bunker.')];

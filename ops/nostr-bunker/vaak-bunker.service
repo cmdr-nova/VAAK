@@ -11,7 +11,7 @@ User=vaak-bunker
 Group=vaak-bunker
 Environment=VAAK_NOSTR_KEY=/home/vaak-bunker/.config/vaak-nostr/nsec
 Environment=VAAK_BUNKER_DIR=/home/vaak-bunker/.config/vaak-bunker
-Environment=VAAK_BUNKER_RELAYS=wss://relay.nsec.app,wss://nos.lol
+Environment=VAAK_BUNKER_RELAYS=wss://relay.primal.net,wss://nos.lol
 ExecStart=/opt/vaak-bunker/venv/bin/python /opt/vaak-bunker/vaak_bunker.py run
 Restart=always
 RestartSec=10
@@ -21,7 +21,7 @@ ProtectSystem=strict
 ProtectHome=read-only
 ReadWritePaths=/home/vaak-bunker/.config/vaak-bunker
 MemoryMax=128M
-CPUQuota=25%
+CPUQuota=100%
 
 [Install]
 WantedBy=multi-user.target
