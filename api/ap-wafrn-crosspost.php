@@ -53,11 +53,15 @@ function ap_wafrn_post_identity(string $url): string
     return 'https://' . $host . $path;
 }
 
-/** Strip tags, one leading "X asked:" prefix, and every whitespace character. */
+/** Strip tags, one leading ask header ("X asked:" or Wafrn's Note "X asked"), and every whitespace character. */
 function ap_wafrn_normalize_text(string $text): string
 {
     $plain = ap_wafrn_plain_text($text);
+    // Wafrn's federated asks end with this line; the Bluesky copy never does.
+    $plain = preg_replace('/\s*To properly see this ask,\s*check the post in the original instance\.?\s*$/isu', '', $plain) ?? $plain;
     $plain = preg_replace('/^.{1,240}? asked:[ \t]*/u', '', $plain, 1) ?? $plain;
+    // The ActivityPub Note opens with "<p>anonymous asked </p>" (no colon).
+    $plain = preg_replace('/^(?:anonymous|@\S{1,240}?)\s+asked/iu', '', $plain, 1) ?? $plain;
     $plain = preg_replace('/\s+/u', '', $plain) ?? $plain;
 
     return $plain;

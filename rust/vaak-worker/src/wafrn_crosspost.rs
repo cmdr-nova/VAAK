@@ -70,7 +70,9 @@ pub fn post_identity(raw: &str) -> String {
 
 pub fn normalize_text(text: &str) -> String {
     let plain = plain_text(text);
+    let plain = ask_footer().replace(&plain, "");
     let stripped = asked_prefix().replace(&plain, "");
+    let stripped = note_asked_prefix().replace(stripped.as_ref(), "");
     whitespace()
         .replace_all(stripped.as_ref(), "")
         .into_owned()
@@ -443,6 +445,39 @@ pub async fn stamp_text_asks(db: &Client, statuses: &mut [Value]) -> Result<()> 
             "ask_answer": answer,
             "ask_actor": "",
         });
+    }
+    Ok(())
+}
+
+/// Paint-only. Sets `vaak_fedi_twin` on Bluesky posts whose record or
+/// `bsky_post_links` row names a fediverse post. `filter_statuses` only sees
+/// one page, so a twin split across infinite-scroll pages or live polls
+/// reaches the browser; the card carries the fediverse id as an alias and
+/// the browser's seen-card check drops whichever copy arrives second.
+pub async fn stamp_fedi_twins(db: &Client, statuses: &mut [Value]) -> Result<()> {
+    let mut pending: Vec<(usize, String)> = Vec::new();
+    for (index, status) in statuses.iter_mut().enumerate() {
+        if !is_bsky(status) {
+            continue;
+        }
+        let uri = json_str(status, "uri").trim().trim_end_matches('/').to_string();
+        let direct = post_identity(&json_str(status, "fediverse_id"));
+        if !direct.is_empty() {
+            status["vaak_fedi_twin"] = json!(direct);
+        } else if uri.starts_with("at://") {
+            pending.push((index, uri));
+        }
+    }
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let uris: Vec<String> = pending.iter().map(|(_, uri)| uri.clone()).collect();
+    let links = lookup_links(db, &uris).await?;
+    for (index, uri) in pending {
+        let fedi = links.get(&uri).map(|fedi| post_identity(fedi)).unwrap_or_default();
+        if fedi.starts_with("https://") {
+            statuses[index]["vaak_fedi_twin"] = json!(fedi);
+        }
     }
     Ok(())
 }
@@ -822,6 +857,22 @@ fn activity_path() -> &'static regex::Regex {
 fn asked_prefix() -> &'static regex::Regex {
     static RE: OnceLock<regex::Regex> = OnceLock::new();
     RE.get_or_init(|| regex::Regex::new(r"(?u)\A.{1,240}? asked:[ \t]*").unwrap())
+}
+
+/// Wafrn's ActivityPub Note opens with `<p>anonymous asked </p>` or
+/// `<p>@user@host asked </p>` (no colon), where Bluesky says "Name asked:".
+fn note_asked_prefix() -> &'static regex::Regex {
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    RE.get_or_init(|| regex::Regex::new(r"(?i)\A(?:anonymous|@\S{1,240}?)\s+asked").unwrap())
+}
+
+/// Wafrn appends this to federated asks only, never to the Bluesky copy.
+fn ask_footer() -> &'static regex::Regex {
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        regex::Regex::new(r"(?is)\s*To properly see this ask,\s*check the post in the original instance\.?\s*\z")
+            .unwrap()
+    })
 }
 
 fn whitespace() -> &'static regex::Regex {

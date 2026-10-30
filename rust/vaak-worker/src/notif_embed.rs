@@ -3619,15 +3619,25 @@ fn ask_card_parts(content: &str) -> Option<(String, String)> {
     let re = regex::Regex::new(
         r#"(?is)^\s*<p[^>]*>(.*?)\s*<a[^>]*>asked</a>\s*</p>\s*<blockquote[^>]*>(.*?)</blockquote>\s*(.*)$"#,
     ).ok()?;
-    let (header, question, answer) = if let Some(caps) = re.captures(content.trim()) {
+    // Wafrn's own Note HTML (utils/activitypub/postToJSONLD.ts): the asker
+    // is plain text, `@user@host` or `anonymous`, with no link on "asked".
+    let wafrn = regex::Regex::new(
+        r#"(?is)^\s*<p[^>]*>\s*(anonymous|@[^\s<]+)\s+asked\s*</p>\s*<blockquote[^>]*>(.*?)</blockquote>\s*(.*)$"#,
+    ).ok()?;
+    let (header, question, answer) = if let Some(caps) = re.captures(content.trim()).or_else(|| wafrn.captures(content.trim())) {
         let header = strip_tags(caps.get(1)?.as_str()).trim().to_string();
         let question = html_entity_decode_basic(strip_tags(caps.get(2)?.as_str()).trim());
         let answer = html_entity_decode_basic(&strip_tags(caps.get(3).map(|m| m.as_str()).unwrap_or(""))).trim().to_string();
-        (header, question, answer)
+        (header, question, strip_wafrn_ask_footer(&answer))
     } else {
         // Wafrn's federated form is often plain text after ActivityPub
         // normalization: "@asker@host asked\n\nquestion\n\nanswer".
-        let plain = html_entity_decode_basic(&strip_tags(content));
+        // Block boundaries become line breaks first, or `<p>anonymous asked
+        // </p><p>question</p>` would flatten onto one line and never match.
+        let blocks = regex::Regex::new(r"(?i)</?(?:p|blockquote|div)[^>]*>|<br\s*/?>").ok()?;
+        let broken = blocks.replace_all(content, "\n\n");
+        let plain = html_entity_decode_basic(&strip_tags(&broken));
+        let plain = regex::Regex::new(r"[ \t]*\n[ \t\n]*\n[ \t]*").ok()?.replace_all(&plain, "\n\n").into_owned();
         let compact = regex::Regex::new(r"(?is)^\s*(.{1,240}?)\s+asked\s*\n+(.+)$").ok()?;
         let caps = compact.captures(plain.trim())?;
         let header = caps.get(1)?.as_str().trim().to_string();
@@ -3639,13 +3649,24 @@ fn ask_card_parts(content: &str) -> Option<(String, String)> {
         } else {
             (rest.to_string(), String::new())
         };
-        (header, question, answer)
+        (header, question, strip_wafrn_ask_footer(&answer))
     };
     if header.is_empty() || question.is_empty() {
         return None;
     }
     let card = ask_question_card("", &ask_label_block("", &header, ""), &question);
     Some((card, answer))
+}
+
+/// Wafrn ends federated asks with "To properly see this ask, check the post
+/// in the original instance". The card already shows the ask.
+fn strip_wafrn_ask_footer(answer: &str) -> String {
+    let Ok(re) = regex::Regex::new(
+        r"(?is)\s*To properly see this ask,\s*check the post in the original instance\.?\s*$",
+    ) else {
+        return answer.trim().to_string();
+    };
+    re.replace(answer, "").trim().to_string()
 }
 
 fn ask_host_from_url(url: &str) -> String {
@@ -4083,6 +4104,15 @@ pub fn paint_lean_embed_from(
         let at = bsky_at_uri(status, uri);
         if at.starts_with("at://") {
             article_attrs.push_str(&format!(" data-bsky-uri=\"{}\"", esc(&at)));
+        }
+        // Wafrn (and other dual-publishers) twin: the browser treats the
+        // fediverse copy's id as already seen when this card is on screen.
+        if let Some(twin) = status
+            .get("vaak_fedi_twin")
+            .and_then(Value::as_str)
+            .filter(|twin| twin.starts_with("https://"))
+        {
+            article_attrs.push_str(&format!(" data-fedi-twin=\"{}\"", esc(twin)));
         }
         if uri.starts_with("at://") {
             article_attrs.push_str(&format!(" data-timeline-key=\"bsky:{}\"", esc(uri)));
@@ -6078,6 +6108,66 @@ mod tests {
         assert!(!html.contains("ask-divider"), "{html}");
         assert!(!html.contains("ask-answer"), "{html}");
         assert!(html.find("ask-container").unwrap() < html.find("feed-body").unwrap(), "{html}");
+    }
+
+    #[test]
+    fn timeline_ask_parses_wafrn_note_html() {
+        // Exact shape of Wafrn's postToJSONLD.ts ask content.
+        let st = json!({
+            "uri": "https://app.wafrn.net/fediverse/post/html-ask",
+            "content": "<p>anonymous asked </p> <blockquote>Desktop Stripper</blockquote> <p><a href=\"https://www.youtube.com/watch?v=CiVtoO65BRY\">https://www.youtube.com/watch?v=CiVtoO65BRY</a></p> <p>To properly see this ask, <a href=\"https://app.wafrn.net/fediverse/post/html-ask\">check the post in the original instance</a></p>",
+            "account": {"acct": "admin@app.wafrn.net", "display_name": "Wafrn"}
+        });
+        let html = paint_lean_feed_card(&st);
+        assert!(html.contains("ask-container"), "{html}");
+        assert!(html.contains("Desktop Stripper"), "{html}");
+        assert!(html.contains("youtube.com/watch?v=CiVtoO65BRY"), "{html}");
+        assert!(!html.contains("To properly see this ask"), "{html}");
+        assert!(html.find("ask-container").unwrap() < html.find("feed-body").unwrap(), "{html}");
+
+        let named = json!({
+            "uri": "https://app.wafrn.net/fediverse/post/html-ask-2",
+            "content": "<p>@fox@app.wafrn.net asked </p><blockquote>crows?</blockquote><p>yes</p>",
+            "account": {"acct": "admin@app.wafrn.net", "display_name": "Wafrn"}
+        });
+        let html = paint_lean_feed_card(&named);
+        assert!(html.contains("ask-container"), "{html}");
+        assert!(html.contains("@fox@app.wafrn.net"), "{html}");
+
+        // Ordinary posts that merely start with "... asked" stay plain.
+        let plain = json!({
+            "uri": "https://example.test/notes/1",
+            "content": "<p>My cat asked</p><blockquote>for food</blockquote>",
+            "account": {"acct": "a@example.test", "display_name": "A"}
+        });
+        assert!(!paint_lean_feed_card(&plain).contains("ask-container"));
+    }
+
+    #[test]
+    fn timeline_ask_parses_wafrn_paragraph_form() {
+        // Same ask after a sanitizer turned the blockquote into a paragraph.
+        let st = json!({
+            "uri": "https://app.wafrn.net/fediverse/post/p-ask",
+            "content": "<p>anonymous asked</p><p>Desktop Stripper</p><p>https://www.youtube.com/watch?v=CiVtoO65BRY</p>",
+            "account": {"acct": "admin@app.wafrn.net", "display_name": "Wafrn"}
+        });
+        let html = paint_lean_feed_card(&st);
+        assert!(html.contains("ask-container"), "{html}");
+        assert!(html.contains("Desktop Stripper</blockquote>"), "{html}");
+    }
+
+    #[test]
+    fn bluesky_wafrn_twin_carries_fedi_alias() {
+        let st = json!({
+            "id": "bsky:abc",
+            "uri": "at://did:plc:wafrn/app.bsky.feed.post/3abc",
+            "source": "bluesky",
+            "content": "Anonymous asked: Desktop Stripper\n\nhttps://www.youtube.com/watch?v=CiVtoO65BRY",
+            "account": {"acct": "wafrn.net", "display_name": "Wafrn", "id": "did:plc:wafrn"},
+            "vaak_fedi_twin": "https://app.wafrn.net/fediverse/post/html-ask"
+        });
+        let html = paint_lean_feed_card(&st);
+        assert!(html.contains("data-fedi-twin=\"https://app.wafrn.net/fediverse/post/html-ask\""), "{html}");
     }
 
     #[test]
