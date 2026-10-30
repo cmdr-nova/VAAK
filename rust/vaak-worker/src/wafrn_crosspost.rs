@@ -482,6 +482,78 @@ pub async fn stamp_fedi_twins(db: &Client, statuses: &mut [Value]) -> Result<()>
     Ok(())
 }
 
+/// The fediverse post a Bluesky post says it mirrors: `bsky_post_links`, or
+/// the cached record's `fediverseId` when the link row is not written yet.
+pub async fn bsky_fediverse_id(db: &Client, uri: &str) -> Result<String> {
+    let uri = uri.trim();
+    if !uri.starts_with("at://") {
+        return Ok(String::new());
+    }
+    let links = lookup_links(db, &[uri.to_string()]).await?;
+    if let Some(fedi) = links.get(uri) {
+        let fedi = post_identity(fedi);
+        if fedi.starts_with("https://") {
+            return Ok(fedi);
+        }
+    }
+    let row = db
+        .query_opt("SELECT raw_json FROM bsky_posts WHERE bsky_uri = $1 LIMIT 1", &[&uri])
+        .await?;
+    let raw: Option<String> = row.and_then(|row| row.get(0));
+    let fedi = raw
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .and_then(|raw| {
+            raw.pointer("/record/fediverseId")
+                .and_then(Value::as_str)
+                .map(post_identity)
+        })
+        .unwrap_or_default();
+    Ok(if fedi.starts_with("https://") { fedi } else { String::new() })
+}
+
+/// Fediverse actors whose posts a Bluesky twin from `did` duplicates: the
+/// learned Wafrn link for the DID, plus whoever VAAK saw create `fedi`.
+pub async fn twin_fedi_actors(db: &Client, did: &str, fedi: &str) -> Result<Vec<String>> {
+    let mut out: HashSet<String> = HashSet::new();
+    if did.starts_with("did:") {
+        match db
+            .query("SELECT actor_id FROM wafrn_bsky_actors WHERE bsky_did = $1", &[&did])
+            .await
+        {
+            Ok(rows) => {
+                for row in rows {
+                    let actor: String = row.get(0);
+                    out.insert(post_identity(&actor));
+                }
+            }
+            Err(err) => {
+                let err = anyhow::Error::from(err);
+                if !missing_actors_table(&err) {
+                    return Err(err);
+                }
+            }
+        }
+    }
+    if fedi.starts_with("https://") {
+        let slash = format!("{fedi}/");
+        let rows = db
+            .query(
+                "SELECT DISTINCT actor_id FROM events
+                 WHERE object_id IN ($1, $2) AND type = 'Create'
+                 LIMIT 4",
+                &[&fedi, &slash],
+            )
+            .await?;
+        for row in rows {
+            let actor: Option<String> = row.get(0);
+            out.insert(post_identity(&actor.unwrap_or_default()));
+        }
+    }
+    let mut list: Vec<String> = out.into_iter().filter(|a| a.starts_with("https://")).collect();
+    list.sort();
+    Ok(list)
+}
+
 fn posts_from_json(value: Option<&Value>) -> Vec<Post> {
     value
         .and_then(Value::as_array)
