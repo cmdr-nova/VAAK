@@ -83,6 +83,44 @@ pub fn canonicalize_preview_url(url: &str) -> String {
     url.trim_end_matches('/').to_string()
 }
 
+/// Canonical open.spotify.com item URL (PHP `ap_link_preview_spotify_url`).
+/// PHP caches Spotify cards under this too, whatever `?si=` the post carried.
+fn spotify_canonical_url(url: &str) -> Option<String> {
+    static PATTERN: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let pattern = PATTERN.get_or_init(|| {
+        regex::Regex::new(
+            r"(?i)^https://(?:www\.)?open\.spotify\.com/(?:intl-[a-z]{2}(?:-[a-z]{2})?/)?(album|track|playlist|artist|episode|show)/([A-Za-z0-9]{10,40})(?:[/?#]|$)",
+        )
+        .expect("spotify url pattern")
+    });
+    let cap = pattern.captures(url.trim())?;
+    Some(format!(
+        "https://open.spotify.com/{}/{}",
+        cap[1].to_ascii_lowercase(),
+        &cap[2]
+    ))
+}
+
+/// Every `link_preview_cards` key a body URL may be cached under, best first.
+/// PHP stores cards under its canonical form (lowercase host, no www, sorted
+/// query without trackers), so the raw link alone misses e.g. `?si=…&nd=1`.
+fn lookup_keys(url: &str) -> Vec<String> {
+    let mut keys = vec![canonicalize_preview_url(url), url.to_string()];
+    let ascii_len = url
+        .bytes()
+        .take_while(|b| (0x21..=0x7e).contains(b))
+        .count();
+    if let Some(key) = crate::direct_preview::cache_key(&url[..ascii_len]) {
+        keys.push(key);
+    }
+    if let Some(key) = spotify_canonical_url(url) {
+        keys.push(key);
+    }
+    let mut seen = HashSet::new();
+    keys.retain(|k| k.starts_with("https://") && seen.insert(k.clone()));
+    keys
+}
+
 fn status_needs_card(st: &Value) -> bool {
     if st
         .get("media_attachments")
@@ -107,11 +145,7 @@ fn collect_candidate_urls(st: &Value, into: &mut HashSet<String>) {
     }
     let content = st.get("content").and_then(|v| v.as_str()).unwrap_or("");
     for url in first_https_urls(content) {
-        let canon = canonicalize_preview_url(&url);
-        if canon.starts_with("https://") {
-            into.insert(canon);
-            into.insert(url);
-        }
+        into.extend(lookup_keys(&url));
     }
 }
 
@@ -150,11 +184,11 @@ fn attach_card_if_missing(st: &mut Value, by_url: &HashMap<String, Value>) {
         .unwrap_or("")
         .to_string();
     for url in first_https_urls(&content) {
-        let canon = canonicalize_preview_url(&url);
-        if let Some(card) = by_url.get(&canon).or_else(|| by_url.get(&url)) {
+        if let Some(card) = lookup_keys(&url).iter().find_map(|k| by_url.get(k)) {
             st["card"] = card.clone();
             return;
         }
+        let canon = canonicalize_preview_url(&url);
         // YouTube without a cache row still gets a usable card for lean paint.
         if canon.contains("youtube.com/watch?v=") {
             if let Some(id) = canon.rsplit("v=").next() {
@@ -220,6 +254,62 @@ pub async fn attach_cached_cards(db: &Client, statuses: &mut [Value]) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spotify_share_link_finds_canonical_and_php_keys() {
+        let keys = lookup_keys(
+            "https://open.spotify.com/intl-de/track/4cOdK2wGLETKBW3PvgPWqT?si=abc&nd=1",
+        );
+        assert!(keys.contains(&"https://open.spotify.com/track/4cOdK2wGLETKBW3PvgPWqT".to_string()));
+        assert!(keys.contains(
+            &"https://open.spotify.com/intl-de/track/4cOdK2wGLETKBW3PvgPWqT?nd=1&si=abc"
+                .to_string()
+        ));
+        assert_eq!(
+            spotify_canonical_url("https://open.spotify.com/user/abc"),
+            None
+        );
+    }
+
+    #[test]
+    fn attaches_card_cached_under_spotify_canonical_url() {
+        let card = card_json_from_row(
+            "https://open.spotify.com/track/4cOdK2wGLETKBW3PvgPWqT",
+            Some("Song".into()),
+            None,
+            Some("https://i.scdn.co/image/x".into()),
+            Some("Spotify".into()),
+        );
+        let mut by_url = HashMap::new();
+        by_url.insert(
+            "https://open.spotify.com/track/4cOdK2wGLETKBW3PvgPWqT".to_string(),
+            card,
+        );
+        let mut st = json!({
+            "content": "<p>listen <a href=\"https://open.spotify.com/track/4cOdK2wGLETKBW3PvgPWqT?si=f00&amp;nd=1\">https://open.spotify.com/track/4cOdK2wGLETKBW3PvgPWqT?si=f00&amp;nd=1</a></p>",
+            "media_attachments": [],
+            "card": null
+        });
+        attach_card_if_missing(&mut st, &by_url);
+        assert_eq!(st["card"]["title"], "Song");
+        assert_eq!(st["card"]["provider_name"], "Spotify");
+    }
+
+    #[test]
+    fn php_sorted_query_key_matches() {
+        let card = card_json_from_row(
+            "https://example.com/a?b=2&z=1",
+            Some("Article".into()),
+            None,
+            None,
+            None,
+        );
+        let mut by_url = HashMap::new();
+        by_url.insert("https://example.com/a?b=2&z=1".to_string(), card);
+        let mut st = json!({"content": "<p>https://www.example.com/a?z=1&amp;b=2&amp;utm_source=x</p>", "card": null});
+        attach_card_if_missing(&mut st, &by_url);
+        assert_eq!(st["card"]["title"], "Article");
+    }
 
     #[test]
     fn canonicalizes_youtu_be() {
