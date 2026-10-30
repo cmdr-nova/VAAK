@@ -33831,7 +33831,7 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
             </div>
             <label class="meta" style="font-weight:400"><input type="checkbox" form="nostr-link-form" name="nostr_show_in_home" value="1"<?= $nostrShow ? ' checked' : '' ?>> Show posts from people I follow on Nostr in Home</label>
             <div class="meta">VAAK only needs your public npub. Never paste your nsec anywhere on VAAK. Leave it empty to unlink.<?php if ($nostrStatus !== ''): ?> <?= h($nostrStatus) ?><?php endif; ?></div>
-            <div class="meta">To like, reply and follow on Nostr from Home, install a Nostr signer extension in your browser, such as <a href="https://github.com/fiatjaf/nos2x" target="_blank" rel="noopener noreferrer">nos2x</a> or <a href="https://getalby.com/" target="_blank" rel="noopener noreferrer">Alby</a> (on iPhone, Nostore for Safari), and add your key there. The extension signs each action and can ask you first; VAAK never sees your key. It must hold the same key as the npub above.</div>
+            <div class="meta">To like, reply and follow on Nostr from Home, install a Nostr signer extension in your browser, such as <a href="https://github.com/fiatjaf/nos2x" target="_blank" rel="noopener noreferrer">nos2x</a> or <a href="https://getalby.com/" target="_blank" rel="noopener noreferrer">Alby</a> (on iPhone or iPad, <a href="https://apps.apple.com/app/nostash/id6744309333" target="_blank" rel="noopener noreferrer">Nostash</a> for Safari, then switch it on under Settings &gt; Apps &gt; Safari &gt; Extensions), and add your key there. The extension signs each action and can ask you first; VAAK never sees your key. It must hold the same key as the npub above.</div>
             <?php if ($nostrHex !== ''): ?><?= ap_nostr_moderation_settings_html((int) $vaakOwnerId, !empty($vaakIsAdmin)) ?><?php endif; ?>
           </div>
           <?php endif; ?>
@@ -50412,7 +50412,7 @@ if (VIEW === 'analytics') loadAnalytics();
 </script>
 <script>
 // Nostr like / reply / repost / quote / follow on Home cards. The browser's signer extension
-// (NIP-07: nos2x, Alby, Nostore…) signs; VAAK never sees the private key.
+// (NIP-07: nos2x, Alby, Nostash…) signs; VAAK never sees the private key.
 // The worker builds each event (nostr_prepare) and only relays the exact
 // copy the extension signed (nostr_publish). See api/ap-nostr.php.
 (function () {
@@ -50455,7 +50455,7 @@ if (VIEW === 'analytics') loadAnalytics();
   function signerReady() {
     const signer = window.nostr;
     if (!signer || typeof signer.signEvent !== 'function' || typeof signer.getPublicKey !== 'function') {
-      toast('To act on Nostr posts, install a signer extension such as nos2x or Alby, then reload this page.');
+      toast('To act on Nostr posts, install a signer extension such as nos2x or Alby (Nostash in Safari on iPhone), then reload this page.');
       return null;
     }
     return signer;
