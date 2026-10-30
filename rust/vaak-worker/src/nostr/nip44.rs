@@ -44,16 +44,10 @@ fn message_keys(conversation: &[u8; 32], nonce: &[u8; 32]) -> ([u8; 32], [u8; 12
     let t1 = hmac(conversation, &[nonce, &[1]]);
     let t2 = hmac(conversation, &[&t1, nonce, &[2]]);
     let t3 = hmac(conversation, &[&t2, nonce, &[3]]);
-    let mut okm = [0u8; 96];
-    okm[..32].copy_from_slice(&t1);
-    okm[32..64].copy_from_slice(&t2);
-    okm[64..].copy_from_slice(&t3);
-    let mut key = [0u8; 32];
-    let mut iv = [0u8; 12];
-    let mut mac = [0u8; 32];
-    key.copy_from_slice(&okm[..32]);
-    iv.copy_from_slice(&okm[32..44]);
-    mac.copy_from_slice(&okm[44..76]);
+    let okm: Vec<u8> = [t1, t2, t3].concat();
+    let key: [u8; 32] = okm[..32].try_into().expect("32 bytes");
+    let iv: [u8; 12] = okm[32..44].try_into().expect("12 bytes");
+    let mac: [u8; 32] = okm[44..76].try_into().expect("32 bytes");
     (key, iv, mac)
 }
 
@@ -86,11 +80,7 @@ pub fn encrypt_with_nonce(conversation: &[u8; 32], plaintext: &str, nonce: &[u8;
 }
 
 pub fn encrypt(conversation: &[u8; 32], plaintext: &str) -> Result<String, &'static str> {
-    let mut nonce = [0u8; 32];
-    {
-        use rand::TryRng;
-        rand::rngs::SysRng.try_fill_bytes(&mut nonce).map_err(|_| "no randomness")?;
-    }
+    let nonce: [u8; 32] = rand::random();
     encrypt_with_nonce(conversation, plaintext, &nonce)
 }
 
@@ -105,8 +95,7 @@ pub fn decrypt(conversation: &[u8; 32], payload: &str) -> Result<String, &'stati
     if raw.len() < 99 || raw[0] != VERSION {
         return Err("unknown encryption version");
     }
-    let mut nonce = [0u8; 32];
-    nonce.copy_from_slice(&raw[1..33]);
+    let nonce: [u8; 32] = raw[1..33].try_into().map_err(|_| "bad payload size")?;
     let (ciphertext, mac) = raw[33..].split_at(raw.len() - 33 - 32);
     let (key, iv, mac_key) = message_keys(conversation, &nonce);
     let mut check = <HmacSha256 as KeyInit>::new_from_slice(&mac_key).expect("hmac takes any key length");
@@ -129,10 +118,9 @@ pub fn decrypt(conversation: &[u8; 32], payload: &str) -> Result<String, &'stati
 mod tests {
     use super::*;
 
+    /// The spec vectors' keys and nonce: 31 zero bytes, then `n`.
     fn key(n: u8) -> [u8; 32] {
-        let mut k = [0u8; 32];
-        k[31] = n;
-        k
+        std::array::from_fn(|i| if i == 31 { n } else { 0 })
     }
 
     fn pubkey_hex(secret: &[u8; 32]) -> String {
