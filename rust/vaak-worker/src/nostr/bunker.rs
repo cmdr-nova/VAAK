@@ -27,9 +27,12 @@ use crate::config::Config;
 
 pub const KIND: i64 = 24133;
 const MAX_RELAYS: usize = 4;
-/// A bunker on a phone may need a moment to wake; a server one answers in
-/// well under a second.
-const SIGN_DEADLINE: Duration = Duration::from_secs(20);
+/// A bunker on a phone may need a moment to wake, and busy public relays
+/// (nos.lol) can sit on an answer for 15+ seconds. The PHP side waits a bit
+/// longer than these (ap-nostr.php).
+const SIGN_DEADLINE: Duration = Duration::from_secs(35);
+/// Pairing: the `connect` round trip, then `get_public_key` gets SIGN_DEADLINE.
+const CONNECT_DEADLINE: Duration = Duration::from_secs(40);
 
 fn refuse(message: &str) -> Result<Value> {
     Ok(json!({"ok": false, "error": message}))
@@ -274,7 +277,7 @@ pub async fn connect(cfg: &Config, owner: i64, uri: &str) -> Result<Value> {
     };
     let secret = new_client_key()?;
     let session = Session { pubkey: pubkey_of(&secret)?, secret, signer: parsed.signer.clone(), relays: parsed.relays.clone() };
-    let deadline = Instant::now() + SIGN_DEADLINE;
+    let deadline = Instant::now() + CONNECT_DEADLINE;
     let perms = "sign_event:1,sign_event:3,sign_event:5,sign_event:6,sign_event:7,sign_event:1984,sign_event:10000".to_string();
     match request(&session, "connect", vec![parsed.signer.clone(), parsed.secret.clone(), perms], deadline).await {
         Ok(Ok(result)) if result == "ack" || (!parsed.secret.is_empty() && result == parsed.secret) => {}

@@ -47,7 +47,7 @@ import vaak_nostr as vn  # noqa: E402
 
 KIND = 24133
 DEFAULT_DIR = Path.home() / ".config" / "vaak-bunker"
-DEFAULT_RELAYS = ["wss://relay.nsec.app", "wss://nos.lol"]
+DEFAULT_RELAYS = ["wss://relay.primal.net", "wss://nos.lol"]
 # Notes, follow list, deletes, reposts, reactions, reports, mute list.
 # Never kind 0 (profile) or 10002 (relay list).
 DEFAULT_KINDS = [1, 3, 5, 6, 7, 1984, 10000]

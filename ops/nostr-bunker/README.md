@@ -43,7 +43,7 @@ sudo -u vaak-bunker sh -c 'umask 077; cat > /home/vaak-bunker/.config/vaak-nostr
 
 alias bunker='sudo -u vaak-bunker /opt/vaak-bunker/venv/bin/python /opt/vaak-bunker/vaak_bunker.py \
   --dir /home/vaak-bunker/.config/vaak-bunker --key /home/vaak-bunker/.config/vaak-nostr/nsec \
-  --relay wss://relay.nsec.app --relay wss://nos.lol'
+  --relay wss://relay.primal.net --relay wss://nos.lol'
 bunker init          # the bunker's own key (prints its npub, not yours)
 
 cp vaak-bunker.service /etc/systemd/system/
