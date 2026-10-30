@@ -196,6 +196,17 @@ async fn fast_path(cfg: &crate::config::Config, uri: &Uri, headers: &HeaderMap, 
     if !actor_matches_key(&key_id, &actor, owner.as_deref()) {
         return Err("actor_mismatch");
     }
+    // ap-user.php answers 404 for a personal inbox with no active local user;
+    // leave those (and any odd user path) to PHP.
+    if let Some(user) = personal_inbox_user(uri.path()) {
+        let found = db
+            .query_opt("SELECT 1 FROM ap_users WHERE lower(username) = $1 AND disabled_at IS NULL LIMIT 1", &[&user])
+            .await
+            .map_err(|_| "db")?;
+        if found.is_none() {
+            return Err("unknown_user");
+        }
+    }
     let id = spool_insert(&db, &ip, &key_id, uri.path(), &sig_path, &kind, body).await.map_err(|e| {
         tracing::warn!(error = %e, "inbox spool insert failed; forwarding to PHP");
         "spool"
@@ -207,6 +218,20 @@ async fn fast_path(cfg: &crate::config::Config, uri: &Uri, headers: &HeaderMap, 
         let _: Result<(), _> = redis::pipe().lpush(&key, id).expire(&key, 86400).query_async(&mut queue).await;
     }
     Ok(id)
+}
+
+/// The username in `/users/{name}/inbox[/]`, lowercased, when it is one
+/// `ap_local_user_by_username` would look up. `Some("")` for any other
+/// personal inbox path, which then never matches a user.
+pub(crate) fn personal_inbox_user(path: &str) -> Option<String> {
+    let rest = path.strip_prefix("/users/")?;
+    let name = rest.strip_suffix("/inbox/").or_else(|| rest.strip_suffix("/inbox"))?;
+    let name = name.to_ascii_lowercase();
+    let ok = name.len() >= 2
+        && name.len() <= 30
+        && name.starts_with(|c: char| c.is_ascii_lowercase())
+        && name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
+    Some(if ok { name } else { String::new() })
 }
 
 async fn spool_insert(db: &Client, ip: &str, key_id: &str, path: &str, sig_path: &str, kind: &str, body: &[u8]) -> Result<i64> {
@@ -346,6 +371,15 @@ mod tests {
         h.insert("x-forwarded-for".to_string(), "203.0.113.9, 127.0.0.1".to_string());
         assert_eq!(client_ip(&h), "203.0.113.9");
         assert_eq!(client_ip(&HashMap::new()), "unknown");
+    }
+
+    #[test]
+    fn personal_inbox_user_matches_php_pattern() {
+        assert_eq!(personal_inbox_user("/inbox"), None);
+        assert_eq!(personal_inbox_user("/users/Juno_Flux/inbox/").as_deref(), Some("juno_flux"));
+        assert_eq!(personal_inbox_user("/users/x/inbox").as_deref(), Some(""));
+        assert_eq!(personal_inbox_user("/users/9abc/inbox").as_deref(), Some(""));
+        assert_eq!(personal_inbox_user("/users/a%2Fb/inbox").as_deref(), Some(""));
     }
 
     #[test]
