@@ -560,7 +560,11 @@ function ap_masto_bearer_raw(): string
     return '';
 }
 
-function ap_masto_require_token(?string $needScope): array
+/**
+ * Extra scopes in $orScopes are alternatives: the token passes if it covers
+ * $needScope OR any of them (Mastodon lets "profile" read verify_credentials).
+ */
+function ap_masto_require_token(?string $needScope, string ...$orScopes): array
 {
     $auth = $_SERVER['HTTP_AUTHORIZATION'] ?? $_SERVER['REDIRECT_HTTP_AUTHORIZATION'] ?? '';
     $token = ap_oauth_token_lookup(is_string($auth) ? $auth : null);
@@ -573,7 +577,16 @@ function ap_masto_require_token(?string $needScope): array
         ap_masto_json(['error' => 'This method requires an authenticated user'], 403);
     }
     if ($needScope !== null && !ap_oauth_scopes_allow($scopes, $needScope)) {
-        ap_masto_json(['error' => 'This action is outside the authorized scopes'], 403);
+        $allowed = false;
+        foreach ($orScopes as $alt) {
+            if (ap_oauth_scopes_allow($scopes, $alt)) {
+                $allowed = true;
+                break;
+            }
+        }
+        if (!$allowed) {
+            ap_masto_json(['error' => 'This action is outside the authorized scopes'], 403);
+        }
     }
     // Bind request to the token's ap_users row.
     // Legacy NULL user_id tokens are cmdr_nova-only (pre-multi-user Ice Cubes).
@@ -1623,7 +1636,8 @@ function ap_masto_api(string $method, string $path): void
     }
 
     if ($path === '/api/v1/accounts/verify_credentials' && $method === 'GET') {
-        ap_masto_require_token('read');
+        // Login-only apps ask for "profile" (Mastodon 4.3+) or "read:accounts".
+        ap_masto_require_token('read:accounts', 'profile');
         ap_masto_json(ap_masto_account());
         return;
     }
