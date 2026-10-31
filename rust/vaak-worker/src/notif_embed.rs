@@ -2537,17 +2537,10 @@ fn paint_moderation_overflow(
             esc(&open)
         ));
         let remote = remote_object_href(object, status.get("url").and_then(Value::as_str).unwrap_or(""));
-        if remote.starts_with("http://") || remote.starts_with("https://") {
-        menu.push_str(&format!(
-            "<a class=\"menu-action\" href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\">{}</a>",
-                esc(&remote),
-                if is_bsky_object {
-                    "Open on Bluesky"
-                } else {
-                    "Remote"
-            }
+        menu.push_str(&crate::library::actions::external_menu_anchor(
+            &remote,
+            if is_bsky_object { "Open on Bluesky" } else { "Remote" },
         ));
-    }
         menu.push_str(&crate::library::actions::copy_link_button(object, from_q));
     }
     if !object.starts_with("https://") {

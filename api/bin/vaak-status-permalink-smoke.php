@@ -63,6 +63,24 @@ permalink_check(
         === '/vaak/@shana_flux/eb1e9cc40f1996e6?from=search',
     'a pasted permalink folds back to the note id'
 );
+permalink_check(
+    ap_vaak_local_status_href('https://mkultra.monster/users/juno_flux/notes/3b96b4b69e5b29b7', 'remote_profile')
+        === '/vaak/@juno_flux/3b96b4b69e5b29b7',
+    'a local note opened from a local profile is not tagged from=remote_profile'
+);
+permalink_check(
+    ap_vaak_local_status_card_from('https://mkultra.monster/users/juno_flux/notes/3b96b4b69e5b29b7', 'remote_profile') === 'home',
+    'a local note does not keep the remote-profile card origin'
+);
+permalink_check(
+    ap_vaak_local_status_card_from('https://remote.example/users/alice/statuses/1', 'remote_profile') === 'remote_profile',
+    'a remote post keeps the remote-profile card origin'
+);
+permalink_check(
+    ap_vaak_status_retry_href($note, 'remote_profile')
+        === '/vaak/@shana_flux/eb1e9cc40f1996e6?refresh_thread=1',
+    'retry on a local note does not reintroduce from=remote_profile'
+);
 
 $savedGet = $_GET;
 $savedServer = $_SERVER;
@@ -127,6 +145,8 @@ permalink_check($applyAt !== false && $guestAt !== false && $applyAt < $guestAt,
 $admin = (string) file_get_contents($root . '/api/ap-admin.php');
 permalink_check(str_contains($admin, 'ap_vaak_local_status_href'), 'status links are built by the short-permalink helper');
 permalink_check(str_contains($admin, 'window.vaakStatusHref = function'), 'the SPA builds the short form');
+permalink_check(str_contains($admin, "localFrom !== 'remote_profile'"), 'the SPA does not tag local notes as remote profiles');
+permalink_check(str_contains($admin, "if (from === 'remote_profile') from = 'home';"), 'a short permalink drops a stale remote_profile origin');
 $copiedAt = strpos($admin, 'A copied local permalink is not an ActivityPub id.');
 $fetchAt = strpos($admin, 'ap_masto_resolve_pasted_status_url');
 permalink_check($copiedAt !== false && $fetchAt !== false && $copiedAt < $fetchAt, 'search does not fetch a pasted short permalink');
