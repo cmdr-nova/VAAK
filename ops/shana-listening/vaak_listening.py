@@ -46,7 +46,9 @@ PC_OLLAMA = os.environ.get("SHANA_PC_OLLAMA", "http://127.0.0.1:11435")
 LOCAL_OLLAMA = "http://127.0.0.1:11434"
 FALLBACK_MODEL = os.environ.get("SHANA_FALLBACK_MODEL", "shana-qwen3-4b")
 
-FRESH_MIN = 15             # a scrobble older than this doesn't count as "listening now"
+# A scrobble older than this doesn't count as "listening now". Spotify listens reach
+# ListenBrainz through its importer with no playing-now and some delay, so keep it generous.
+FRESH_MIN = int(os.environ.get("LB_FRESH_MIN", "30"))
 MAX_PER_DAY = 2
 MIN_GAP_HOURS = 6
 CHANCE = 0.35              # per new song while Nova is listening; ~3 checks an hour
@@ -341,11 +343,15 @@ def tick(state):
     seen_before, state["last_seen"] = state.get("last_seen") == key, key
     if seen_before:
         return  # one coin flip per song, even a long one
+    song = f"{t['artist']} - {t['track']} ({source})"
     why = repeat(state, t) or limits(state)
     if why:
+        log(f"skip {song}: {why}")
         return
     if random.random() >= CHANCE:
+        log(f"skip {song}: coin flip")
         return
+    log(f"writing about {song}")
     text, model = compose(state, t)
     if not text:
         log(f"no usable draft from {model} for {t['artist']} - {t['track']}")
