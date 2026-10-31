@@ -18,10 +18,21 @@ There are two services:
 | unit | what it does |
 |---|---|
 | `mkultra-radio-card` | `nowplaying.py` polls status-json every 5 s. When the song changes it looks up the cover (iTunes Search, then MusicBrainz/Cover Art Archive, then `RADIO_LOGO`, then a ♪ placeholder) and atomically rewrites `/var/lib/mkultra-radio/card.png`. Covers are cached in `art/`, and real misses are cached for 7 days. |
-| `mkultra-radio-stream` | `stream.sh` runs ffmpeg. It reads `card.png` again every frame, so a new song shows up with no restart. It draws the bars and scope over the card and encodes 720p30 H.264 (no B-frames, 1 s keyframes, CBR 2500k) plus AAC 160k, which is what Streamplace asks for. It pushes to `rtmps://rtmp.stream.place:1935/live/<key>`. |
+| `mkultra-radio-stream` | `stream.sh` runs ffmpeg. It reads `card.png` again every frame, so a new song shows up with no restart. It draws the bars and scope over the card and encodes 720p24 H.264 (no B-frames, 1 s keyframes, CBR 2500k) plus AAC 160k, which is what Streamplace asks for. It pushes to `rtmps://rtmp.stream.place:1935/live/<key>`. |
 
-The encoder used about 0.7 of one core in testing. The unit caps it at 120% CPU and 768 MB of RAM.
-If the grid box needs more room, set `STREAM_FPS=24` or `STREAM_VBITRATE=2000k`.
+Pinned to a single core, the encoder ran at 1.32x realtime at 30 fps, which means about 76% of that core. The default is 24 fps, which works out to roughly 60%, to leave headroom under the 90% cap. It is kept away from everything else on the box:
+
+- `AllowedCPUs=3` pins both services to a single core (cgroup cpuset), so ffmpeg's threads can't run anywhere else.
+- `CPUQuota=90%` stops it from ever taking that whole core, even when it bursts.
+- `Nice=10`, `CPUWeight=20` and `CPUSchedulingPolicy=batch` make it yield to anything else that lands on that core.
+- `MemoryMax=768M` and no swap, plus `IOWeight=20`.
+- ffmpeg itself is capped at 2 x264 threads and 1 filter thread.
+
+Before enabling, pick the core: run `lscpu -e` and choose one that OpenSim isn't busy on. Shana's timer uses 0 and 8.
+If 3 is taken, run `systemctl edit mkultra-radio-stream mkultra-radio-card` and set `AllowedCPUs=` to the free core
+(or to both hyperthread siblings of one physical core).
+If the encode can't keep up inside 90% of one core (`journalctl` shows `speed=` below 1x, or Streamplace stutters),
+set `STREAM_FPS=20` or `STREAM_VBITRATE=2000k` rather than widening the pin.
 
 ## Setup on the grid box (as root)
 

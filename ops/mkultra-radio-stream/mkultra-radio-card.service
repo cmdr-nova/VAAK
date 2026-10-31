@@ -12,6 +12,10 @@ ExecStart=/usr/bin/python3 /opt/mkultra-radio-stream/nowplaying.py
 Restart=always
 RestartSec=10
 Nice=10
+# Same core as the encoder; it wakes every 5 s and redraws only on song change.
+AllowedCPUs=3
+CPUWeight=20
+CPUSchedulingPolicy=batch
 
 [Install]
 WantedBy=multi-user.target

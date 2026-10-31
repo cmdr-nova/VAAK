@@ -11,7 +11,7 @@ set -eu
 : "${ICECAST_URL:?set ICECAST_URL}"
 STATE_DIR="${RADIO_STATE_DIR:-/var/lib/mkultra-radio}"
 CARD="$STATE_DIR/card.png"
-FPS="${STREAM_FPS:-30}"
+FPS="${STREAM_FPS:-24}"
 VB="${STREAM_VBITRATE:-2500k}"
 AB="${STREAM_ABITRATE:-160k}"
 if [ -n "${STREAM_OUT:-}" ]; then
@@ -25,7 +25,8 @@ fi
 # Bars: 72 bands (0-16 kHz; MP3 has little above that) drawn as a white mask, blown up with nearest-neighbour to
 # 1152 px, cut into blocks by two black grids, then used as the alpha of a
 # green -> yellow -> red gradient. Scope: a pink centre line under the bars.
-exec ffmpeg -hide_banner -loglevel warning -nostdin \
+# Thread counts are capped so ffmpeg works within the one core systemd gives it.
+exec ffmpeg -hide_banner -loglevel warning -nostdin -filter_threads 1 -filter_complex_threads 1 \
   -thread_queue_size 64 -f image2 -loop 1 -framerate "$FPS" -i "$CARD" \
   -reconnect 1 -reconnect_streamed 1 -reconnect_on_network_error 1 -reconnect_delay_max 30 \
   -rw_timeout 15000000 -i "$ICECAST_URL" \
@@ -38,7 +39,7 @@ scale=1152x170:flags=neighbor,drawgrid=w=16:h=170:t=3:c=black,drawgrid=w=1152:h=
 [ascope]showwaves=s=1152x50:mode=cline:rate=$FPS:colors=0xff3cc8,format=rgba,colorkey=black:0.1[scope];\
 [0:v]fps=$FPS,format=rgba[bg];[bg][bars]overlay=64:466:shortest=1[v1];[v1][scope]overlay=64:628,format=yuv420p[vout]" \
   -map "[vout]" -map "[aout]" \
-  -c:v libx264 -preset veryfast -tune zerolatency -profile:v main -bf 0 \
+  -c:v libx264 -threads 2 -preset veryfast -tune zerolatency -profile:v main -bf 0 \
   -g "$FPS" -keyint_min "$FPS" -sc_threshold 0 \
   -b:v "$VB" -maxrate "$VB" -bufsize "$VB" \
   -c:a aac -b:a "$AB" -ar 48000 -ac 2 \

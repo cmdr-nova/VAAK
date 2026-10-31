@@ -13,10 +13,19 @@ EnvironmentFile=/etc/mkultra-radio/stream.env
 ExecStart=/opt/mkultra-radio-stream/stream.sh
 Restart=always
 RestartSec=15
-Nice=5
-# Keep the encode to about one core so it can't starve the box.
-CPUQuota=120%
+# Isolation: the encode lives on ONE core and yields to everything else.
+# AllowedCPUs pins it (cgroup cpuset, so ffmpeg's threads can't spread to
+# other cores). Pick a core OpenSim and Shana (0 and 8) don't use: check
+# `lscpu -e` and override with `systemctl edit` if 3 is busy. On a
+# hyperthreaded box you can give it both siblings of one physical core.
+AllowedCPUs=3
+CPUQuota=90%
+CPUWeight=20
+Nice=10
+CPUSchedulingPolicy=batch
+IOWeight=20
 MemoryMax=768M
+MemorySwapMax=0
 
 [Install]
 WantedBy=multi-user.target
