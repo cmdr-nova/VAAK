@@ -1,0 +1,22 @@
+[Unit]
+Description=MKULTRA Radio 24/7 visualizer stream to Streamplace
+After=network-online.target mkultra-radio-card.service
+Wants=network-online.target mkultra-radio-card.service
+# Back off if Icecast or Streamplace keeps refusing: at most 10 starts in 10 min.
+StartLimitIntervalSec=600
+StartLimitBurst=10
+
+[Service]
+User=mkradio
+Group=mkradio
+EnvironmentFile=/etc/mkultra-radio/stream.env
+ExecStart=/opt/mkultra-radio-stream/stream.sh
+Restart=always
+RestartSec=15
+Nice=5
+# Keep the encode to about one core so it can't starve the box.
+CPUQuota=120%
+MemoryMax=768M
+
+[Install]
+WantedBy=multi-user.target

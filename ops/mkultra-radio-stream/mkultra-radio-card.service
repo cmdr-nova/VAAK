@@ -1,0 +1,17 @@
+[Unit]
+Description=MKULTRA Radio now-playing card for the Streamplace stream
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=mkradio
+Group=mkradio
+EnvironmentFile=/etc/mkultra-radio/stream.env
+StateDirectory=mkultra-radio
+ExecStart=/usr/bin/python3 /opt/mkultra-radio-stream/nowplaying.py
+Restart=always
+RestartSec=10
+Nice=10
+
+[Install]
+WantedBy=multi-user.target
