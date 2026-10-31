@@ -1,0 +1,17 @@
+[Unit]
+Description=Shana posts now and then about what Nova is listening to (ListenBrainz) as @shana_flux
+After=network-online.target
+ConditionPathExists=/home/shana/.local/ai/.vaak_token.json
+
+[Service]
+Type=oneshot
+User=shana
+Group=shana
+WorkingDirectory=/home/shana/.local/ai
+Environment="SHANA_PC_OLLAMA=http://127.0.0.1:11435"
+Environment="SHANA_FALLBACK_MODEL=shana-qwen3-4b"
+Environment="LB_USER=foxx_nova"
+ExecStart=/home/shana/.local/ai/venv/bin/python /home/shana/.local/ai/vaak_listening.py --tick
+AllowedCPUs=0 8
+Nice=10
+TimeoutStartSec=15min

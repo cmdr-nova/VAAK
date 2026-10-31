@@ -1,0 +1,10 @@
+[Unit]
+Description=Check what Nova is listening to every 20 minutes
+
+[Timer]
+OnCalendar=*:0/20
+RandomizedDelaySec=60
+Persistent=false
+
+[Install]
+WantedBy=timers.target
