@@ -112,6 +112,17 @@ pub(crate) fn local_note_parts(object: &str) -> Option<(String, String)> {
     Some((key.to_ascii_lowercase(), id.to_owned()))
 }
 
+/// PHP `vaak_is_local_url`, plus the human `/vaak/@key/id` permalink.
+pub(crate) fn is_local_instance_url(url: &str) -> bool {
+    if local_note_parts(url).is_some() {
+        return true;
+    }
+    let url = url.trim().trim_end_matches('/');
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| regex::Regex::new(r"^https://mkultra\.monster/users/[A-Za-z0-9_]+(?:/|$)").expect("local actor"))
+        .is_match(url)
+}
+
 fn open_target(object:&str)->String {
     let trimmed = object.trim();
     let stripped = strip_announce_fragment(trimmed);
@@ -131,7 +142,13 @@ fn local_from_token(from: &str) -> String {
 pub(crate) fn in_app_status_href(object: &str, from: &str) -> String {
     let target = open_target(object);
     if let Some((key, id)) = local_note_parts(&target) {
-        return format!("/vaak/@{key}/{id}?from={}", query(&local_from_token(from)));
+        let from = local_from_token(from);
+        // Local notes are not remote-profile objects. The profile list used
+        // to stamp ?from=remote_profile on every Open link.
+        if from == "remote_profile" {
+            return format!("/vaak/@{key}/{id}");
+        }
+        return format!("/vaak/@{key}/{id}?from={}", query(&from));
     }
     format!("?view=status&object={}&from={}", query(&target), query(from))
 }
@@ -157,6 +174,15 @@ pub(crate) fn copy_link_button(object: &str, view: &str) -> String {
         None => format!("https://mkultra.monster/vaak/{}", status_href(object, view)),
     };
     format!("<button type=\"button\" class=\"menu-action\" data-copy-value=\"{}\" title=\"Copy link to post\">Copy link</button>", esc(&href))
+}
+
+/// External overflow link. Local notes stay in VAAK — `/users/…/notes/…` is
+/// the old HTML view, not a remote original. Unsafe schemes are omitted.
+pub(crate) fn external_menu_anchor(href: &str, label: &str) -> String {
+    if !(href.starts_with("https://") || href.starts_with("http://")) || is_local_instance_url(href) {
+        return String::new();
+    }
+    format!("<a class=\"menu-action\" href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\">{}</a>", esc(href), esc(label))
 }
 
 pub fn reply_suffix(mentions: &[String], spoiler: &str, sensitive: bool) -> String {
@@ -272,13 +298,16 @@ pub(crate) fn render_moderation_with_protocol_navigation(ctx: &FediActionContext
     if fedi && state.personal_block_id.is_none() { menu.push_str(&format!("<a class=\"menu-action\" href=\"?view=dms&amp;peer={}\">DM</a>", query(actor))); }
     if state.is_local || state.is_wafrn { menu.push_str(&format!("<a class=\"menu-action\" href=\"?view=ask&amp;target_actor={}&amp;from={}\">Ask</a>", query(actor), query(link_from))); }
     if ctx.object_id.starts_with("https://") {
-        menu.push_str(&format!("<a class=\"menu-action\" href=\"{}\">Open</a><a class=\"menu-action\" href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\">{}</a>", esc(&status_href(&ctx.object_id, &ctx.return_view)), esc(if ctx.remote_url.starts_with("https://"){&ctx.remote_url}else{&ctx.object_id}), if ctx.object_id.to_lowercase().contains("bsky.app") { "Open on Bluesky" } else { "Remote" }));
+        let remote = if ctx.remote_url.starts_with("https://") { ctx.remote_url.as_str() } else { ctx.object_id.as_str() };
+        let label = if ctx.object_id.to_lowercase().contains("bsky.app") { "Open on Bluesky" } else { "Remote" };
+        menu.push_str(&format!("<a class=\"menu-action\" href=\"{}\">Open</a>", esc(&status_href(&ctx.object_id, &ctx.return_view))));
+        menu.push_str(&external_menu_anchor(remote, label));
         menu.push_str(&copy_link_button(&ctx.object_id, &ctx.return_view));
     }
     if !ctx.object_id.is_empty() && !ctx.object_id.starts_with("https://") {
         if let Some(show_open) = protocol_open {
             if show_open { menu.push_str(&format!("<a class=\"menu-action\" href=\"{}\">Open</a>", esc(&status_href(&ctx.object_id, &ctx.return_view)))); }
-            if ctx.remote_url.starts_with("https://") || ctx.remote_url.starts_with("http://") { menu.push_str(&format!("<a class=\"menu-action\" href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\">Remote</a>", esc(&ctx.remote_url))); }
+            menu.push_str(&external_menu_anchor(&ctx.remote_url, "Remote"));
             menu.push_str(&copy_link_button(&ctx.object_id, &ctx.return_view));
         }
     }
@@ -456,6 +485,43 @@ mod tests {
             in_app_status_href("https://mkultra.monster/vaak/@Shana_Flux/eb1e9cc40f1996e6?from=local", "search"),
             "/vaak/@shana_flux/eb1e9cc40f1996e6?from=search"
         );
+        assert_eq!(
+            in_app_status_href("https://mkultra.monster/users/juno_flux/notes/3b96b4b69e5b29b7", "remote_profile"),
+            "/vaak/@juno_flux/3b96b4b69e5b29b7"
+        );
+        assert!(in_app_status_href("https://remote.test/users/alice/statuses/1", "remote_profile").contains("from=remote_profile"));
+    }
+    #[test]
+    fn local_posts_omit_remote_menu_and_remote_posts_keep_it() {
+        let mut ctx = context();
+        ctx.object_id = "https://mkultra.monster/users/juno_flux/notes/3b96b4b69e5b29b7".into();
+        ctx.actor_id = "https://mkultra.monster/users/juno_flux".into();
+        ctx.remote_url = ctx.object_id.clone();
+        ctx.return_view = "remote_profile".into();
+        ctx.moderation.is_local = true;
+        let html = render_moderation_with_protocol_navigation(&ctx, "remote_profile", None);
+        assert!(html.contains(">Open</a>"), "{html}");
+        assert!(html.contains("href=\"/vaak/@juno_flux/3b96b4b69e5b29b7\""), "{html}");
+        assert!(!html.contains("/vaak/@juno_flux/3b96b4b69e5b29b7?from=remote_profile"), "{html}");
+        assert!(!html.contains(">Remote</a>"), "{html}");
+        assert!(!html.contains("/users/juno_flux/notes/"), "{html}");
+        let guest = read_only_overflow(&ctx.object_id, "remote_profile", &ctx.remote_url);
+        assert!(guest.contains("href=\"/vaak/@juno_flux/3b96b4b69e5b29b7\""), "{guest}");
+        assert!(!guest.contains(">Remote</a>"), "{guest}");
+        assert!(!guest.contains("from=remote_profile"), "{guest}");
+        let remote = read_only_overflow(
+            "https://remote.test/users/alice/statuses/1",
+            "remote_profile",
+            "https://remote.test/@alice/1",
+        );
+        assert!(remote.contains(">Remote</a>"), "{remote}");
+        assert!(remote.contains("from=remote_profile"), "{remote}");
+        let bsky = read_only_overflow(
+            "https://bsky.app/profile/dame.is/post/example",
+            "home",
+            "https://bsky.app/profile/dame.is/post/example",
+        );
+        assert!(bsky.contains(">Remote</a>"), "{bsky}");
     }
 }
 
@@ -463,7 +529,7 @@ mod tests {
 pub(crate) fn read_only_overflow(uri:&str,view:&str,remote:&str)->String{read_only_overflow_mode(uri,view,remote,true)}
 pub(crate) fn read_only_overflow_mode(uri:&str,view:&str,remote:&str,show_open:bool)->String{
  if uri.is_empty(){return String::new()}let mut menu=if show_open{format!("<a class=\"menu-action\" href=\"{}\">Open</a>",esc(&status_href(uri,view)))}else{String::new()};
- if remote.starts_with("https://")||remote.starts_with("http://"){menu.push_str(&format!("<a class=\"menu-action\" href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\">Remote</a>",esc(remote)));}
+ menu.push_str(&external_menu_anchor(remote, "Remote"));
  menu.push_str(&copy_link_button(uri,view));
  if menu.is_empty(){return String::new()}
  format!("<details class=\"post-action-menu\"><summary class=\"icon-btn\" title=\"More actions\" aria-label=\"More actions\">⋯</summary><div class=\"post-action-menu__body\">{menu}</div></details>")

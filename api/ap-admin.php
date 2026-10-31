@@ -18718,6 +18718,37 @@ function admin_global_domain_control(string $host): ?array
         : null;
 }
 
+/** True when an overflow "Remote" target is this instance's own actor or note. */
+function admin_menu_target_is_local(string $href): bool
+{
+    $href = trim($href);
+    if ($href === '') {
+        return false;
+    }
+    if (function_exists('vaak_is_local_url') && vaak_is_local_url($href)) {
+        return true;
+    }
+    if (!function_exists('ap_vaak_local_note_parts') && is_file(__DIR__ . '/ap-vaak-status-route.php')) {
+        require_once __DIR__ . '/ap-vaak-status-route.php';
+    }
+    return function_exists('ap_vaak_local_note_parts') && ap_vaak_local_note_parts($href) !== null;
+}
+
+/**
+ * External overflow link. Local notes stay in VAAK — the ActivityPub
+ * /users/…/notes/… URL is the old HTML view, not a remote original.
+ */
+function admin_external_menu_anchor(string $href, string $label): string
+{
+    if (!str_starts_with($href, 'https://') && !str_starts_with($href, 'http://')) {
+        return '';
+    }
+    if (admin_menu_target_is_local($href)) {
+        return '';
+    }
+    return '<a class="menu-action" href="' . h($href) . '" target="_blank" rel="noopener noreferrer">' . h($label) . '</a>';
+}
+
 /** Navigation-only overflow for guest and minimal post cards; never adds mutations. */
 function admin_post_navigation_menu_html(string $openHref, string $remoteHref = '', string $openLabel = 'Open', bool $externalOpen = false, string $copyHref = ''): string
 {
@@ -18726,9 +18757,7 @@ function admin_post_navigation_menu_html(string $openHref, string $remoteHref = 
         $menu .= '<a class="menu-action" href="' . h($openHref) . '"'
             . ($externalOpen ? ' target="_blank" rel="noopener noreferrer"' : '') . '>' . h($openLabel) . '</a>';
     }
-    if (str_starts_with($remoteHref, 'https://') || str_starts_with($remoteHref, 'http://')) {
-        $menu .= '<a class="menu-action" href="' . h($remoteHref) . '" target="_blank" rel="noopener noreferrer">Remote</a>';
-    }
+    $menu .= admin_external_menu_anchor($remoteHref, 'Remote');
     $copySource = $copyHref !== '' ? $copyHref : (!$externalOpen ? $openHref : '');
     if (!function_exists('ap_vaak_status_copy_url') && is_file(__DIR__ . '/ap-vaak-status-route.php')) {
         require_once __DIR__ . '/ap-vaak-status-route.php';
@@ -18827,8 +18856,10 @@ function block_quick_actions(?string $actorId, ?string $host, string $returnView
     if (!$isSelf && $objectId !== '' && str_starts_with($objectId, 'https://')) {
         $menu .= '<a class="menu-action" href="' . h(admin_status_href($objectId, $returnView)) . '">Open</a>';
         $isBskyObject = str_contains(strtolower($objectId), 'bsky.app');
-        $menu .= '<a class="menu-action" href="' . h(admin_remote_object_href($objectId, $objectUrlHint)) . '" target="_blank" rel="noopener noreferrer">'
-            . ($isBskyObject ? 'Open on Bluesky' : 'Remote') . '</a>';
+        $menu .= admin_external_menu_anchor(
+            admin_remote_object_href($objectId, $objectUrlHint),
+            $isBskyObject ? 'Open on Bluesky' : 'Remote'
+        );
         $menu .= admin_post_copy_button($objectId, $returnView);
     }
     // Protocol objects keep navigation in this same permission-aware menu.
@@ -18836,10 +18867,7 @@ function block_quick_actions(?string $actorId, ?string $host, string $returnView
         if ($protocolShowOpen) {
             $menu .= '<a class="menu-action" href="' . h(admin_status_href($objectId, $returnView)) . '">Open</a>';
         }
-        $remoteHref = admin_remote_object_href($objectId, $objectUrlHint);
-        if (str_starts_with($remoteHref, 'https://') || str_starts_with($remoteHref, 'http://')) {
-            $menu .= '<a class="menu-action" href="' . h($remoteHref) . '" target="_blank" rel="noopener noreferrer">Remote</a>';
-        }
+        $menu .= admin_external_menu_anchor(admin_remote_object_href($objectId, $objectUrlHint), 'Remote');
         $menu .= admin_post_copy_button($objectId, $returnView);
     }
     // Personal mute/block first — available to every signed-in user, including admins.
@@ -23324,9 +23352,10 @@ if ($isPartial && $view === 'status' && (string) ($_GET['thread'] ?? '') === 'pu
     header('Content-Type: text/html; charset=utf-8');
     header('Cache-Control: private, no-store');
     require_once __DIR__ . '/ap-masto-entities.php';
-    $html = admin_status_published_reply_html(trim((string) ($_GET['object'] ?? '')),
+    $publishedObject = trim((string) ($_GET['object'] ?? ''));
+    $html = admin_status_published_reply_html($publishedObject,
         trim((string) ($_GET['note_id'] ?? '')), $followingIds,
-        preg_replace('/[^a-z_]/', '', (string) ($_GET['from'] ?? 'home')) ?: 'home');
+        ap_vaak_local_status_card_from($publishedObject, preg_replace('/[^a-z_]/', '', (string) ($_GET['from'] ?? 'home')) ?: 'home'));
     if ($html === null) { http_response_code(404); exit; }
     echo $html;
     exit;
@@ -23680,7 +23709,7 @@ function admin_bsky_thread_posts(array $tree, string $focus, bool $ancestors, bo
 // AJAX fragment: Status Open — ancestors and/or replies (Mastodon-style progressive load)
 if ($isPartial && $view === 'status' && isset($_GET['thread'])) {
     $stObject = trim((string) ($_GET['object'] ?? ''));
-    $stFrom = preg_replace('/[^a-z_]/', '', (string) ($_GET['from'] ?? 'home')) ?: 'home';
+    $stFrom = ap_vaak_local_status_card_from($stObject, preg_replace('/[^a-z_]/', '', (string) ($_GET['from'] ?? 'home')) ?: 'home');
     $threadPart = preg_replace('/[^a-z_]/', '', (string) ($_GET['thread'] ?? '1')) ?: '1';
     // thread=1|ancestors → parents above; thread=replies|descendants → replies below
     // thread=focus → ensure + render the source/focus post itself
@@ -23843,6 +23872,7 @@ if ($isPartial && $view === 'status' && isset($_GET['thread'])) {
         echo $html;
         exit;
     };
+    $stFrom = ap_vaak_local_status_card_from($stObject, $stFrom);
     if ($wantFocus) {
         // Re-load local/event after ensure above
         $focusLocal = null;
@@ -36047,7 +36077,7 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
                   exit;
               }
           }
-          $stFrom = preg_replace('/[^a-z_]/', '', (string) ($_GET['from'] ?? 'home')) ?: 'home';
+          $stFrom = ap_vaak_local_status_card_from($stObject, preg_replace('/[^a-z_]/', '', (string) ($_GET['from'] ?? 'home')) ?: 'home');
           // Logged-out visitor on a shared link: paint only what this instance
           // already stores (cache-only, no remote fetches, no thread AJAX).
           $stGuest = !empty($GLOBALS['vaak_guest_status']);
@@ -36328,6 +36358,8 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
               $stMaybeMoreThread = false;
               $stMaybeMoreReplies = false;
           }
+          // A Bluesky URL can fall back to its local twin after $stFrom was chosen.
+          $stFrom = ap_vaak_local_status_card_from($stObject, $stFrom);
         ?>
         <div class="page-back status-back">
           <a class="btn btn-ghost" href="<?= h($stBackHref) ?>"<?= $stBackView !== '' ? ' data-vaak-soft-nav="' . h($stBackView) . '"' : '' ?>><?= h($stBackLabel) ?></a>
@@ -39890,16 +39922,22 @@ if (!empty($GLOBALS['vaak_profile_shell'])) {
     var href;
     if (parts) {
       var localFrom = String(from || 'home').replace(/[^a-z_]/g, '') || 'home';
-      href = '/vaak/@' + parts.key + '/' + parts.id + '?from=' + encodeURIComponent(localFrom);
+      href = '/vaak/@' + parts.key + '/' + parts.id;
+      // Local notes are not remote-profile objects.
+      if (localFrom !== 'remote_profile') {
+        href += '?from=' + encodeURIComponent(localFrom);
+      }
     } else {
       var remoteFrom = (from == null || from === '') ? 'home' : String(from);
       href = '/vaak/?view=status&object=' + encodeURIComponent(String(objectUrl || ''))
         + '&from=' + encodeURIComponent(remoteFrom);
     }
+    var sep = href.indexOf('?') === -1 ? '?' : '&';
     Object.keys(extra).forEach(function (k) {
       if (k === 'object' || k === 'from' || k === 'view') return;
       if (extra[k] != null && extra[k] !== '') {
-        href += '&' + encodeURIComponent(k) + '=' + encodeURIComponent(String(extra[k]));
+        href += sep + encodeURIComponent(k) + '=' + encodeURIComponent(String(extra[k]));
+        sep = '&';
       }
     });
     return href;
@@ -39917,6 +39955,7 @@ if (!empty($GLOBALS['vaak_profile_shell'])) {
         object = 'https://mkultra.monster/users/' + m[1].toLowerCase() + '/notes/' + m[2];
       }
       var from = String(u.searchParams.get('from') || 'home').replace(/[^a-z_]/g, '') || 'home';
+      if (from === 'remote_profile') from = 'home';
       return {
         object: object,
         from: from,

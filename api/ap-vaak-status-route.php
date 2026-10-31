@@ -63,6 +63,20 @@ function ap_vaak_local_note_parts(string $objectUrl): ?array
     ];
 }
 
+/**
+ * Card origin for a status open.
+ * Local notes are not remote profiles. ?from=remote_profile used to paint
+ * their single-post view through the remote-profile card path.
+ */
+function ap_vaak_local_status_card_from(string $objectUrl, string $from): string
+{
+    $from = preg_replace('/[^a-z_]/', '', $from) ?: 'home';
+    if ($from === 'remote_profile' && ap_vaak_local_note_parts($objectUrl) !== null) {
+        return 'home';
+    }
+    return $from;
+}
+
 /** In-app href for a local note, or null so the caller keeps ?view=status. */
 function ap_vaak_local_status_href(string $objectUrl, string $from = 'home'): ?string
 {
@@ -71,7 +85,12 @@ function ap_vaak_local_status_href(string $objectUrl, string $from = 'home'): ?s
         return null;
     }
     $from = preg_replace('/[^a-z_]/', '', $from) ?: 'home';
-    return '/vaak/@' . $parts['key'] . '/' . $parts['id'] . '?from=' . rawurlencode($from);
+    $path = '/vaak/@' . $parts['key'] . '/' . $parts['id'];
+    // A local profile list used to stamp this query on every Open link.
+    if ($from === 'remote_profile') {
+        return $path;
+    }
+    return $path . '?from=' . rawurlencode($from);
 }
 
 /**

@@ -51,6 +51,19 @@ foreach (['https://remote.test/post/1','http://remote.test/post/1'] as $safeRemo
  $navigation=admin_post_navigation_menu_html('?view=status&object=fixture',$safeRemote);
  menu_card_assert(str_contains($navigation,'href="'.h($safeRemote).'"'),'guest/minimal HTTP(S) Remote retained');
 }
+$localNote='https://mkultra.monster/users/juno_flux/notes/3b96b4b69e5b29b7';
+$localOpen=admin_status_href($localNote,'remote_profile');
+menu_card_assert($localOpen==='/vaak/@juno_flux/3b96b4b69e5b29b7','local Open link is not tagged from=remote_profile');
+$localMenu=block_quick_actions('https://mkultra.monster/users/juno_flux','mkultra.monster','remote_profile',1,false,'remote_profile',$localNote,$localNote,true);
+menu_card_assert(str_contains($localMenu,'href="'.h($localOpen).'"'),'local profile overflow still opens the post');
+menu_card_assert(!str_contains($localMenu,'>Remote</a>'),'local posts hide Remote');
+menu_card_assert(!str_contains($localMenu,'/users/juno_flux/notes/'),'local Remote target is not the ActivityPub note URL');
+$localGuest=admin_post_navigation_menu_html($localOpen,$localNote);
+menu_card_assert(str_contains($localGuest,'href="'.h($localOpen).'"')&&!str_contains($localGuest,'>Remote</a>'),'guest local menu hides Remote');
+$remoteMenu=block_quick_actions('https://remote.test/users/alice','remote.test','remote_profile',1,false,'remote_profile','https://remote.test/users/alice/statuses/1','https://remote.test/@alice/1',true);
+menu_card_assert(str_contains($remoteMenu,'>Remote</a>')&&str_contains($remoteMenu,'from=remote_profile'),'remote posts keep Remote and from=remote_profile');
+$bskyMenu=block_quick_actions('https://bsky.app/profile/dame.is','bsky.app','home',1,false,'home','https://bsky.app/profile/dame.is/post/example','https://bsky.app/profile/dame.is/post/example',true);
+menu_card_assert(str_contains($bskyMenu,'>Open on Bluesky</a>'),'Bluesky posts keep Open on Bluesky');
 // A supplied card cannot bypass direct source existence.
 ap_db()->exec('DELETE FROM bsky_posts');
 ob_start();admin_render_masto_status_card($baseline,[],'status');$withdrawn=(string)ob_get_clean();
