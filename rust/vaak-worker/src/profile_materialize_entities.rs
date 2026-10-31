@@ -71,10 +71,11 @@ impl Projector<'_> {
  }
  async fn bare_mention(&mut self,user:&str)->Result<Option<Value>>{
   let needle=crate::library::card::php_trim(user).to_ascii_lowercase();if let Some(cached)=self.bare_memo.get(&needle){return Ok(cached.clone())}if needle=="cmdr_nova"{let value=Some(self.mention_from_actor("https://mkultra.monster/users/cmdr_nova").await?);self.bare_memo.insert(needle,value.clone());return Ok(value)}
-  let rows=self.rows(BARE_ACTORS,json!({"username":needle})).await?;
-  // ap_masto_resolve_bare_username then tries ap_local_user_by_username.
-  let local=if rows.is_empty()&&re!(r"^[A-Za-z0-9_]{2,32}$").is_match(crate::library::card::php_trim(user))&&re!(r"^[a-z][a-z0-9_]{1,29}$").is_match(&needle){self.rows(LOCAL_USER,json!({"username":needle})).await?.first().map(|r|s(r,"actor_id").to_owned()).filter(|a|!a.is_empty())}else{None};
-  let value=if let Some(row)=rows.first(){Some(self.mention_from_actor(s(row,"actor_id")).await?)}else if let Some(actor)=local{Some(self.mention_from_actor(&actor).await?)}else{None};self.bare_memo.insert(needle,value.clone());Ok(value)
+  // ap_masto_resolve_bare_username tries ap_local_user_by_username first: a
+  // bare @user on VAAK names the local account before a same-named remote one.
+  let local=if re!(r"^[A-Za-z0-9_]{2,32}$").is_match(crate::library::card::php_trim(user))&&re!(r"^[a-z][a-z0-9_]{1,29}$").is_match(&needle){self.rows(LOCAL_USER,json!({"username":needle})).await?.first().map(|r|s(r,"actor_id").to_owned()).filter(|a|!a.is_empty())}else{None};
+  let rows=if local.is_none(){self.rows(BARE_ACTORS,json!({"username":needle})).await?}else{Vec::new()};
+  let value=if let Some(actor)=local{Some(self.mention_from_actor(&actor).await?)}else if let Some(row)=rows.first(){Some(self.mention_from_actor(s(row,"actor_id")).await?)}else{None};self.bare_memo.insert(needle,value.clone());Ok(value)
  }
  pub(super) async fn canonical_pack(&mut self,raw:&str)->Result<Value>{self.canonical_pack_with_actors(raw,&[]).await}
  pub(super) async fn canonical_pack_with_actors(&mut self,raw:&str,extra:&[String])->Result<Value>{

@@ -365,6 +365,28 @@ if (
         }
     }
 }
+// A bare @user mention that could not be resolved when its card was painted
+// links to ?view=search&q=@user&type=accounts&resolve=1. When that name is a
+// local account (made after the card was cached, or missed by the painter),
+// open the profile instead of a one-row Search page. Full loads get a 302;
+// soft-nav partials get X-VAAK-Profile and switch to the profile shell.
+if ($view === 'search' && strtoupper((string) ($_SERVER['REQUEST_METHOD'] ?? 'GET')) === 'GET') {
+    $earlySearchProfile = admin_search_local_mention_profile_href(
+        (string) ($_GET['q'] ?? ''),
+        (string) ($_GET['type'] ?? ''),
+        !empty($_GET['resolve'])
+    );
+    if ($earlySearchProfile !== null) {
+        if (isset($_GET['partial']) || isset($_GET['ajax'])) {
+            header('Cache-Control: private, no-store');
+            header('X-VAAK-Profile: ' . $earlySearchProfile);
+            header('X-VAAK-View: search');
+            exit;
+        }
+        header('Location: ' . $earlySearchProfile, true, 302);
+        exit;
+    }
+}
 // Account switcher lands with ?switched=1&as=actor_key (303 after switch_account).
 if (isset($_GET['switched']) && (string) $_GET['switched'] === '1') {
     $as = strtolower(preg_replace('/[^a-z0-9_]/', '', (string) ($_GET['as'] ?? '')) ?? '');
@@ -16447,6 +16469,64 @@ function admin_apply_bsky_link_facets(string $html, array $st): string
     return $html;
 }
 
+/**
+ * Profile path for a local account named by a bare @user mention link
+ * (?view=search&q=@user&type=accounts&resolve=1), or null to run Search.
+ * Only the exact mention-link shape qualifies, so typed searches still search.
+ */
+function admin_search_local_mention_profile_href(string $q, string $type, bool $resolve): ?string
+{
+    if (!$resolve || $type !== 'accounts') {
+        return null;
+    }
+    $q = trim($q);
+    if (!preg_match('/^@([A-Za-z0-9_]{2,32})(?:@(?:www\.)?(?:mkultra|vaak)\.monster)?$/i', $q, $m)) {
+        return null;
+    }
+    if (!function_exists('ap_local_user_by_username') || !function_exists('ap_vaak_pretty_profile_path')) {
+        return null;
+    }
+    $row = ap_local_user_by_username($m[1]);
+    if (!is_array($row)) {
+        return null;
+    }
+    $key = trim((string) ($row['actor_key'] ?? ''));
+    if ($key === '') {
+        return null;
+    }
+    $from = preg_replace('/[^a-z_]/', '', (string) ($_GET['from'] ?? '')) ?: 'home';
+    return ap_vaak_pretty_profile_path($key, ['from' => $from]);
+}
+
+/**
+ * Local account for a bare @user, or null. A bare handle written on VAAK
+ * names the VAAK account first; remote caches only fill in when no local
+ * account has that name.
+ *
+ * @return array{acct:string,username:string,url:string}|null
+ */
+function admin_local_bare_mention(string $user): ?array
+{
+    static $memo = [];
+    $key = strtolower(trim($user));
+    if (array_key_exists($key, $memo)) {
+        return $memo[$key];
+    }
+    if (!function_exists('ap_local_user_by_username')) {
+        return null;
+    }
+    $row = ap_local_user_by_username($key);
+    if (!is_array($row)) {
+        return $memo[$key] = null;
+    }
+    $actor = rtrim(trim((string) ($row['actor_id'] ?? '')), '/');
+    $name = trim((string) ($row['username'] ?? ''));
+    if ($actor === '' || !str_starts_with($actor, 'https://') || $name === '') {
+        return $memo[$key] = null;
+    }
+    return $memo[$key] = ['acct' => $name, 'username' => $name, 'url' => $actor];
+}
+
 function admin_linkify_body_html(string $plain, string $returnView = 'home', array $mentions = [], ?string $emojiActorId = null): string
 {
     $plain = html_entity_decode(trim($plain), ENT_QUOTES | ENT_HTML5, 'UTF-8');
@@ -16611,6 +16691,11 @@ function admin_linkify_body_html(string $plain, string $returnView = 'home', arr
                     'username' => vaak_actor_key(),
                     'url' => vaak_actor_id(),
                 ];
+                continue;
+            }
+            $local = admin_local_bare_mention($user);
+            if ($local !== null) {
+                $byAcct[strtolower($local['acct'])] = $local;
                 continue;
             }
             if (function_exists('ap_masto_resolve_bare_username')) {
@@ -45214,6 +45299,23 @@ window.vaakBootStatusThread();
         if (typeof window.vaakRedirectToLogin === 'function') window.vaakRedirectToLogin('softNav');
         else hardNav(view, filter, extra);
         return;
+      }
+      // A bare @user mention link that names a local account: the server
+      // answers with that profile instead of a Search page.
+      if (view === 'search' && res.headers.get('X-VAAK-Profile')) {
+        const stub = document.createElement('a');
+        stub.href = res.headers.get('X-VAAK-Profile');
+        const here = (new URL(window.location.href).searchParams.get('view') || '').replace(/[^a-z_]/g, '');
+        if (here && here !== 'search' && SOFT_VIEWS.has(here)) {
+          const withFrom = new URL(stub.href);
+          withFrom.searchParams.set('from', here);
+          stub.href = withFrom.href;
+        }
+        const target = profileTargetFromAnchor(stub);
+        if (target) {
+          queuedNavigation = { profile: target, push: push !== false };
+          return;
+        }
       }
       if (view === 'status' && res.headers.get('X-VAAK-Redirect')) {
         const target = new URL(res.headers.get('X-VAAK-Redirect'), location.href);

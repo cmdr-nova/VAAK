@@ -3437,7 +3437,16 @@ function ap_masto_resolve_bare_username(string $username): ?array
         return $cache[$needle] = ap_masto_mention_from_actor('https://mkultra.monster/users/cmdr_nova');
     }
     try {
-        // Prefer remote_actors exact username (indexed). Never LIKE-scan events —
+        // A bare @user written on VAAK names the local account first. Checking
+        // remote_actors first sent @radio to some other server's "radio".
+        if (preg_match('/^[A-Za-z0-9_]{2,32}$/', $username)
+            && function_exists('ap_local_user_by_username')) {
+            $local = ap_local_user_by_username($username);
+            if (is_array($local) && !empty($local['actor_id'])) {
+                return $cache[$needle] = ap_masto_mention_from_actor((string) $local['actor_id']);
+            }
+        }
+        // Then remote_actors exact username (indexed). Never LIKE-scan events —
         // that was a multi-second seq scan on every unknown @bare handle in timelines.
         $st = ap_db()->prepare(
             'SELECT actor_id FROM remote_actors WHERE lower(username) = ? ORDER BY updated_at DESC LIMIT 3'
@@ -3447,14 +3456,6 @@ function ap_masto_resolve_bare_username(string $username): ?array
         if (count($rows) >= 1) {
             // If multiple hosts share the username, still use the most recently updated
             return $cache[$needle] = ap_masto_mention_from_actor((string) $rows[0]['actor_id']);
-        }
-        // Local instance account
-        if (preg_match('/^[A-Za-z0-9_]{2,32}$/', $username)
-            && function_exists('ap_local_user_by_username')) {
-            $local = ap_local_user_by_username($username);
-            if (is_array($local) && !empty($local['actor_id'])) {
-                return $cache[$needle] = ap_masto_mention_from_actor((string) $local['actor_id']);
-            }
         }
     } catch (Throwable $e) {
         // ignore

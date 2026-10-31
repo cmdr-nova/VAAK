@@ -458,11 +458,13 @@ async fn mention_from_actor<R:BodyMentionResolver>(resolver:&mut R,actor:&str)->
 async fn resolve_bare<R:BodyMentionResolver>(resolver:&mut R,memo:&mut std::collections::HashMap<String,Option<BodyMention>>,username:&str)->Result<Option<BodyMention>>{
  let username=super::card::php_trim(username);if username.is_empty(){return Ok(None)}
  let needle=username.to_ascii_lowercase();if let Some(value)=memo.get(&needle){return Ok(value.clone())}
+ // A bare @user written on VAAK names the local account before any remote
+ // actor that shares the name (PHP checks ap_users first too).
+ let local=if needle!="cmdr_nova"&&static_regex!(r"^[A-Za-z0-9_]{2,32}$").is_match(username)&&static_regex!(r"^[a-z][a-z0-9_]{1,29}$").is_match(&needle){resolver.local_username_actor(&needle).await?.filter(|actor|!actor.is_empty())}else{None};
  let value=if needle=="cmdr_nova"{Some(mention_from_actor(resolver,CMDR_NOVA).await?)}
+ else if let Some(actor)=local{Some(mention_from_actor(resolver,&actor).await?)}
  else if let Some(actor)=resolver.remote_username_actor(&needle).await?{Some(mention_from_actor(resolver,&actor).await?)}
- else if static_regex!(r"^[A-Za-z0-9_]{2,32}$").is_match(username)&&static_regex!(r"^[a-z][a-z0-9_]{1,29}$").is_match(&needle){
-  match resolver.local_username_actor(&needle).await?.filter(|actor|!actor.is_empty()){Some(actor)=>Some(mention_from_actor(resolver,&actor).await?),None=>None}
- }else{None};
+ else{None};
  memo.insert(needle,value.clone());Ok(value)
 }
 /// ap_masto_resolve_bsky_handle_actor; `?:` turns NULL (and "0") into ''.

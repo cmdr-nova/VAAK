@@ -34,11 +34,14 @@ $fixture = [
         ['actor_id' => 'https://x.example/users/bob', 'username' => 'bob', 'host' => 'x.example', 'updated_at' => '2026-01-01T00:00:00Z'],
         ['actor_id' => 'https://money.example/users/cash', 'username' => 'cash', 'host' => 'money.example', 'updated_at' => '2026-01-01T00:00:00Z'],
         ['actor_id' => 'https://tilde.example/~zed', 'username' => 'zed', 'host' => 'tilde.example', 'updated_at' => '2026-01-01T00:00:00Z'],
+        // A remote "radio" must not win over the local radio account.
+        ['actor_id' => 'https://stream.example/users/radio', 'username' => 'radio', 'host' => 'stream.example', 'updated_at' => '2026-01-09T00:00:00Z'],
     ],
     'ap_users' => [
         ['id' => 1, 'username' => 'fixture', 'actor_id' => 'https://mkultra.monster/users/fixture', 'disabled_at' => null],
         ['id' => 2, 'username' => 'luna', 'actor_id' => 'https://mkultra.monster/users/luna', 'disabled_at' => null],
         ['id' => 3, 'username' => 'ghost', 'actor_id' => 'https://mkultra.monster/users/ghost', 'disabled_at' => '2026-01-01T00:00:00Z'],
+        ['id' => 4, 'username' => 'radio', 'actor_id' => 'https://mkultra.monster/users/radio', 'disabled_at' => null],
     ],
     'mentions' => [
         'https://bsky.brid.gy/ap/did:plc:alice' => ['username' => 'alice.bsky.social', 'acct' => 'alice.bsky.social', 'url' => 'https://bsky.brid.gy/ap/did:plc:alice'],
@@ -50,6 +53,7 @@ $fixture = [
         'https://money.example/users/cash' => ['username' => 'ca$h', 'acct' => 'cash@money.example', 'url' => 'https://money.example/users/cash'],
         'https://tilde.example/~zed' => ['username' => 'zed', 'acct' => 'zed@tilde.example', 'url' => 'https://tilde.example/~zed'],
         'https://mkultra.monster/users/luna' => ['username' => 'luna', 'acct' => 'luna', 'url' => 'https://mkultra.monster/users/luna'],
+        'https://mkultra.monster/users/radio' => ['username' => 'radio', 'acct' => 'radio', 'url' => 'https://mkultra.monster/users/radio'],
     ],
 ];
 
@@ -132,6 +136,7 @@ $texts = [
     'trailing' => 'ping @dup!!! @Gargron@mastodon.social, @alice.bsky.social…',
     'multiline' => "first @luna\n\n@Gargron@mastodon.social\nlast @nobody",
     'whitespace' => '   ',
+    'local_over_remote' => 'Welcome to VAAK, @radio! 🌟 say hi to @ghost',
 ];
 $cases = [];
 foreach ($texts as $name => $text) {
