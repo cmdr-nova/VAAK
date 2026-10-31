@@ -23,7 +23,7 @@ js=js.replace(/<\?=([\s\S]*?)\?>/g,(_,expr)=>{
 });
 function target(){const listeners=new Map();return {addEventListener(k,f){const a=listeners.get(k)||[];a.push(f);listeners.set(k,a)},emit(k,e={}){for(const f of listeners.get(k)||[])f(e)}}}
 const win=target(),doc=target(),sw=target();win.VAAK_ACTOR_KEY='one';win.vaakGuestProfile=false;
-const elements={};for(const id of ['notif-badge','dm-badge','nav-phyrian-badge','nav-you-phyrian-badge'])elements[id]={id,hidden:true,textContent:'0',hasAttribute(){return false},setAttribute(){}};
+const elements={};for(const id of ['notif-badge','dm-badge','nav-phyrian-badge','nav-gaming-phyrian-badge'])elements[id]={id,hidden:true,textContent:'0',hasAttribute(){return false},setAttribute(){}};
 doc.getElementById=id=>elements[id];doc.visibilityState='visible';doc.title='';
 let now=0,serial=0;const timers=new Map(),calls=[],queue=[];const flush=async()=>{for(let n=0;n<20;n++)await Promise.resolve()};
 function defer(){let resolve,reject;const promise=new Promise((a,b)=>{resolve=a;reject=b});return{promise,resolve,reject}}
