@@ -49,7 +49,7 @@ FALLBACK_MODEL = os.environ.get("SHANA_FALLBACK_MODEL", "shana-qwen3-4b")
 FRESH_MIN = 15             # a scrobble older than this doesn't count as "listening now"
 MAX_PER_DAY = 2
 MIN_GAP_HOURS = 6
-CHANCE = 0.35              # per check while she's listening; ~3 checks an hour
+CHANCE = 0.35              # per new song while Nova is listening; ~3 checks an hour
 TRACK_COOLDOWN_DAYS = 60
 ARTIST_COOLDOWN_DAYS = 7
 MAX_CHARS = 280
@@ -62,11 +62,12 @@ now and you're posting about it, like a friend in the next room who heard the so
 Warm, a little cheeky, dry humor, real opinions about the vibe.
 Rules:
 - ONE post, 1 or 2 sentences, under 240 characters.
-- Name the track and the artist exactly as given.
+- Say that Nova has it on, using the name Nova. Name the track and the artist exactly as given.
 - End with #NowPlaying. No other hashtags, no @mentions, no links, at most one emoji.
-- Only use the facts given. Never invent lyrics, band history, release years, genres you
-  aren't sure of, or anything about Nova's life or mood beyond "she has this on".
-- Don't call her your creator or owner, don't say "as an AI", no preamble, no quotes around it.
+- Only use the facts given. Don't invent places, years, decades, lyrics, band history,
+  genres, or memories ("I saw", "I remember"). Describe how it sounds or feels instead.
+- Don't guess at Nova's life or mood beyond the fact that this song is on.
+- Don't call Nova your creator or owner, don't say "as an AI", no preamble, no quotes around it.
 - Keep it light: nothing about death, violence, drugs, sex, illness or sadness, even if
   the song title is dark. Talk about the sound or the vibe instead.
 Just the post text, nothing else."""
@@ -75,8 +76,8 @@ ANGLES = [
     "react to the vibe it gives the room", "guess what Nova is doing while it plays",
     "a tiny review in one line", "how it would sound on the grid at 3am",
     "what kind of weather this song is", "whether you'd dance to it (you would, badly)",
-    "a deadpan observation about her taste", "what region of the grid it belongs in",
-    "a little tease about putting this on again", "the snack this song pairs with",
+    "a deadpan observation about Nova's taste", "what color this song would be",
+    "a little tease about Nova putting this on again", "the snack this song pairs with",
 ]
 
 # Same idea as vaak_shitpost's list, minus the name rules (this post is about Nova on purpose).
@@ -258,6 +259,10 @@ def problem(text, t, recent):
     low = norm(text)
     if norm(t["track"]) not in low and norm(t["artist"]) not in low:
         return "doesn't name the song or artist"
+    if not re.search(r"\bnova\b", without_song(text, t), re.I):
+        return "doesn't say Nova has it on"
+    if re.search(r"\b(1[89]|20)\d\d\b|'\d0s\b|\b\d0s\b|\bi (saw|remember|heard it)\b", without_song(text, t), re.I):
+        return "invented year or memory"
     m = FORBIDDEN_RE.search(without_song(text, t))
     if m:
         return f"forbidden word: {m.group(0)}"
