@@ -20,11 +20,18 @@ else
   : "${STREAMPLACE_KEY:?set STREAMPLACE_KEY}"
   OUT="rtmps://rtmp.stream.place:1935/live/$STREAMPLACE_KEY"
 fi
-[ -f "$CARD" ] || { echo "no card at $CARD yet (is mkultra-radio-card running?)" >&2; exit 1; }
+# On a fresh start the card service may not have drawn the first card yet.
+i=0
+while [ ! -f "$CARD" ]; do
+  i=$((i + 1))
+  [ "$i" -gt 30 ] && { echo "no card at $CARD after 30 s (is mkultra-radio-card running?)" >&2; exit 1; }
+  sleep 1
+done
 
 # Bars: 72 bands (0-16 kHz; MP3 has little above that) drawn as a white mask, blown up with nearest-neighbour to
 # 1152 px, cut into blocks by two black grids, then used as the alpha of a
-# green -> yellow -> red gradient. Scope: a pink centre line under the bars.
+# green -> yellow -> red gradient. Scope: a pink centre line under the bars
+# (mono, so showwaves doesn't paint the right channel in its default blue).
 # Thread counts are capped so ffmpeg works within the one core systemd gives it.
 exec ffmpeg -hide_banner -loglevel warning -nostdin -filter_threads 1 -filter_complex_threads 1 \
   -thread_queue_size 64 -f image2 -loop 1 -framerate "$FPS" -i "$CARD" \
@@ -36,7 +43,7 @@ exec ffmpeg -hide_banner -loglevel warning -nostdin -filter_threads 1 -filter_co
 [abars]aresample=32000,showfreqs=s=72x170:mode=bar:ascale=log:fscale=log:win_size=2048:averaging=2:colors=white,format=gray,\
 scale=1152x170:flags=neighbor,drawgrid=w=16:h=170:t=3:c=black,drawgrid=w=1152:h=6:t=2:c=black[mask];\
 [2:v]format=rgba[grad];[grad][mask]alphamerge[bars];\
-[ascope]showwaves=s=1152x50:mode=cline:rate=$FPS:colors=0xff3cc8,format=rgba,colorkey=black:0.1[scope];\
+[ascope]aformat=channel_layouts=mono,showwaves=s=1152x50:mode=cline:draw=full:rate=$FPS:colors=0xff3cc8,format=rgba,colorkey=black:0.1[scope];\
 [0:v]fps=$FPS,format=rgba[bg];[bg][bars]overlay=64:466:shortest=1[v1];[v1][scope]overlay=64:628,format=yuv420p[vout]" \
   -map "[vout]" -map "[aout]" \
   -c:v libx264 -threads 2 -preset veryfast -tune zerolatency -profile:v main -bf 0 \

@@ -1,0 +1,10 @@
+[Unit]
+Description=Hourly MKULTRA Radio now-playing post
+
+[Timer]
+OnCalendar=hourly
+RandomizedDelaySec=5min
+Persistent=false
+
+[Install]
+WantedBy=timers.target

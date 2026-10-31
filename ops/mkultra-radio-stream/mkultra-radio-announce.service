@@ -1,0 +1,16 @@
+[Unit]
+Description=Post MKULTRA Radio's current track to Bluesky (mkultra-radio account)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=mkradio
+Group=mkradio
+EnvironmentFile=/etc/mkultra-radio/stream.env
+StateDirectory=mkultra-radio
+ExecStart=/usr/bin/python3 /opt/mkultra-radio-stream/announce.py
+AllowedCPUs=2
+Nice=10
+CPUSchedulingPolicy=batch
+TimeoutStartSec=2min

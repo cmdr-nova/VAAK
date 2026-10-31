@@ -2,6 +2,7 @@
 Description=MKULTRA Radio now-playing card for the Streamplace stream
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=0
 
 [Service]
 User=mkradio
@@ -13,7 +14,7 @@ Restart=always
 RestartSec=10
 Nice=10
 # Same core as the encoder; it wakes every 5 s and redraws only on song change.
-AllowedCPUs=3
+AllowedCPUs=2
 CPUWeight=20
 CPUSchedulingPolicy=batch
 
