@@ -31060,7 +31060,8 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       $discussUnreadNav = function_exists('ap_discuss_unread_topic_count') ? ap_discuss_unread_topic_count($vaakOwnerId) : 0;
       $noticesUnreadNav = isset($noticesUnreadNav) ? (int) $noticesUnreadNav : 0;
       $navLibraryOpen = false;
-      $navYouOpen = ($view === 'rss' || $view === 'phyrian' || $view === 'profile' || $view === 'blog' || $view === 'queue' || $view === 'drafts');
+      $navYouOpen = ($view === 'rss' || $view === 'profile' || $view === 'blog' || $view === 'queue' || $view === 'drafts');
+      $navGamingOpen = ($view === 'phyrian');
       $navAdminOpen = false;
       $navSiteOpen = false;
       $reportsOpenCount = function_exists('ap_reports_open_count') ? ap_reports_open_count() : 0;
@@ -31107,16 +31108,11 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       <details class="nav-group" data-nav-key="you" <?= $navYouOpen ? 'open' : '' ?>>
         <summary>
           <span class="ico"><i class="ph ph-user" aria-hidden="true"></i></span><span class="label">You</span>
-          <span class="nav-badge" id="nav-you-phyrian-badge" style="position:static"<?= $phyrianPendingNav > 0 ? '' : ' hidden' ?> aria-label="<?= (int) $phyrianPendingNav ?> Phyrian requests"><?= $phyrianPendingNav > 99 ? '99+' : (string) (int) $phyrianPendingNav ?></span>
         </summary>
         <div class="nav-sub">
           <a class="<?= $view === 'profile' ? 'active' : '' ?>" href="/vaak/?view=profile"><span class="ico">◇</span><span class="label">Settings</span></a>
           <a class="<?= $view === 'blog' ? 'active' : '' ?>" href="/vaak/?view=blog"><span class="ico"><i class="ph ph-article" aria-hidden="true"></i></span><span class="label">Blog</span></a>
           <a class="<?= $view === 'rss' ? 'active' : '' ?>" href="/vaak/?view=rss"><span class="ico">📰</span><span class="label">RSS</span></a>
-          <a class="<?= $view === 'phyrian' ? 'active' : '' ?>" href="/vaak/?view=phyrian" id="nav-phyrian">
-            <span class="ico">◈</span><span class="label">Phyrian Strains</span>
-            <span class="nav-badge" id="nav-phyrian-badge"<?= $phyrianPendingNav > 0 ? '' : ' hidden' ?>><?= $phyrianPendingNav > 99 ? '99+' : (string) (int) $phyrianPendingNav ?></span>
-          </a>
           <a class="<?= $view === 'queue' ? 'active' : '' ?>" href="/vaak/?view=queue"><span class="ico">⏱</span><span class="label">Queue</span></a>
           <a class="<?= $view === 'drafts' ? 'active' : '' ?>" href="/vaak/?view=drafts" id="nav-drafts">
             <span class="ico">📄</span><span class="label">Drafts</span>
@@ -31132,6 +31128,20 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           <?php endif; ?>
       <a class="<?= $view === 'security' ? 'active' : '' ?>" href="/vaak/?view=security"><span class="ico">⚿</span><span class="label">Security</span></a>
           <a class="<?= $view === 'import_export' ? 'active' : '' ?>" href="/vaak/?view=import_export"><span class="ico">⇄</span><span class="label">Import / Export</span></a>
+        </div>
+      </details>
+      <hr class="nav-sep">
+      <details class="nav-group" data-nav-key="gaming" <?= $navGamingOpen ? 'open' : '' ?>>
+        <summary>
+          <span class="ico"><i class="ph ph-game-controller" aria-hidden="true"></i></span><span class="label">Gaming</span>
+          <span class="nav-badge" id="nav-gaming-phyrian-badge" style="position:static"<?= $phyrianPendingNav > 0 ? '' : ' hidden' ?> aria-label="<?= (int) $phyrianPendingNav ?> Phyrian requests"><?= $phyrianPendingNav > 99 ? '99+' : (string) (int) $phyrianPendingNav ?></span>
+        </summary>
+        <div class="nav-sub">
+          <a class="<?= $view === 'phyrian' ? 'active' : '' ?>" href="/vaak/?view=phyrian" id="nav-phyrian">
+            <span class="ico">◈</span><span class="label">Phyrian Strains</span>
+            <span class="nav-badge" id="nav-phyrian-badge"<?= $phyrianPendingNav > 0 ? '' : ' hidden' ?>><?= $phyrianPendingNav > 99 ? '99+' : (string) (int) $phyrianPendingNav ?></span>
+          </a>
+          <a href="https://hustle.mkultra.monster/" target="_blank" rel="noopener"><span class="ico"><i class="ph ph-briefcase" aria-hidden="true"></i></span><span class="label">Mafia Hustle</span></a>
         </div>
       </details>
       <?php if (!empty($vaakIsAdmin)): ?>
@@ -40406,7 +40416,7 @@ if (!empty($GLOBALS['vaak_profile_shell'])) {
   const notifBadge = document.getElementById('notif-badge');
   const dmBadge = document.getElementById('dm-badge');
   const phyrianBadge = document.getElementById('nav-phyrian-badge');
-  const youPhyrianBadge = document.getElementById('nav-you-phyrian-badge');
+  const youPhyrianBadge = document.getElementById('nav-gaming-phyrian-badge');
   // Digit-only snowflake comparison keeps unread-tip tracking stable across polls.
   const snowflakeDigits = (v) => String(v || '').replace(/\D+/g, '') || '0';
   const snowflakeNewer = (a, b) => {
@@ -40434,7 +40444,7 @@ if (!empty($GLOBALS['vaak_profile_shell'])) {
     if (n > 0) {
       el.textContent = label;
       el.hidden = false;
-      if (el.hasAttribute('aria-label') || el.id === 'nav-you-phyrian-badge') {
+      if (el.hasAttribute('aria-label') || el.id === 'nav-gaming-phyrian-badge') {
         el.setAttribute('aria-label', label + ' Phyrian requests');
       }
     } else {
