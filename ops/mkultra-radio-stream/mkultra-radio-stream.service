@@ -2,9 +2,9 @@
 Description=MKULTRA Radio 24/7 visualizer stream to Streamplace
 After=network-online.target mkultra-radio-card.service
 Wants=network-online.target mkultra-radio-card.service
-# Back off if Icecast or Streamplace keeps refusing: at most 10 starts in 10 min.
-StartLimitIntervalSec=600
-StartLimitBurst=10
+# 24/7: never give up. Retries back off from 10 s up to 5 min while
+# Icecast or Streamplace is down (RestartSteps needs systemd 254+).
+StartLimitIntervalSec=0
 
 [Service]
 User=mkradio
@@ -12,13 +12,16 @@ Group=mkradio
 EnvironmentFile=/etc/mkultra-radio/stream.env
 ExecStart=/opt/mkultra-radio-stream/stream.sh
 Restart=always
-RestartSec=15
+RestartSec=10
+RestartSteps=6
+RestartMaxDelaySec=300
 # Isolation: the encode lives on ONE core and yields to everything else.
 # AllowedCPUs pins it (cgroup cpuset, so ffmpeg's threads can't spread to
-# other cores). Pick a core OpenSim and Shana (0 and 8) don't use: check
-# `lscpu -e` and override with `systemctl edit` if 3 is busy. On a
+# other cores). On the grid box 2 is the quiet one (opensim-core is on 3/7/11/15,
+# ollama bursts on 6/14, Shana's timer on 0/8). Check `lscpu -e` and
+# override with `systemctl edit` elsewhere. On a
 # hyperthreaded box you can give it both siblings of one physical core.
-AllowedCPUs=3
+AllowedCPUs=2
 CPUQuota=90%
 CPUWeight=20
 Nice=10
