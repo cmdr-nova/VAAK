@@ -2248,7 +2248,115 @@ pub(crate) async fn hydrate_local_quote_targets(db: &Client, statuses: &mut [Val
             }
         }
     }
+    // A text-only quote summary ("RE: <url>" + "↪ QT: …" without @acct) whose
+    // target is not cached still names the author in its URL. Fill the author
+    // from remote_actors, else from the URL, so the card does not read
+    // "Quoted post @quoted" with the default avatar.
+    let anon_targets: Vec<String> = statuses
+        .iter()
+        .filter(|st| quoted_author_is_anonymous(st))
+        .filter_map(|st| st.get("quote").and_then(|q| q.get("quoted_status")).and_then(|q| q.get("uri")).and_then(Value::as_str))
+        .map(|u| u.trim_end_matches('/').to_string())
+        .filter(|u| fed_targets.contains(u))
+        .collect();
+    if !anon_targets.is_empty() {
+        let actor_ids: Vec<String> = anon_targets.iter().flat_map(|u| quote_author_candidates(u)).collect();
+        let actors = fetch_actors_map(db, &actor_ids).await.unwrap_or_default();
+        for st in statuses.iter_mut() {
+            if !quoted_author_is_anonymous(st) {
+                continue;
+            }
+            let target = st["quote"]["quoted_status"]["uri"].as_str().unwrap_or("").trim_end_matches('/').to_string();
+            if !anon_targets.contains(&target) {
+                continue;
+            }
+            let account = quote_author_candidates(&target)
+                .iter()
+                .find_map(|id| actors.get(id.as_str()))
+                .map(actor_to_account)
+                .or_else(|| quote_author_from_url(&target));
+            if let Some(account) = account {
+                st["quote"]["quoted_status"]["account"] = account.clone();
+                if st.get("vaak_quote_preview").is_some_and(Value::is_object) {
+                    st["vaak_quote_preview"]["account"] = account;
+                }
+            }
+        }
+    }
     Ok(())
+}
+
+/// The quote card still carries split_quote_summary's anonymous stub author.
+fn quoted_author_is_anonymous(st: &Value) -> bool {
+    let Some(q) = st.get("quote").and_then(|q| q.get("quoted_status")).filter(|v| v.is_object()) else { return false };
+    if q.get("source").and_then(Value::as_str) != Some("quote-summary") {
+        return false;
+    }
+    let acct = q.get("account").and_then(|a| a.get("acct")).and_then(Value::as_str).unwrap_or("").trim();
+    acct.is_empty() || acct == "quoted"
+}
+
+/// Actor ids a status URL most likely belongs to, cache keys for remote_actors.
+/// `https://h/users/a/statuses/1` and `https://h/ap/users/9/statuses/1` keep
+/// their prefix; Mastodon web `https://h/@a/1` maps to `https://h/users/a`.
+pub(crate) fn quote_author_candidates(url: &str) -> Vec<String> {
+    let url = url.trim().trim_end_matches('/');
+    let Some(rest) = url.strip_prefix("https://") else { return Vec::new() };
+    let Some((host, path)) = rest.split_once('/') else { return Vec::new() };
+    if host.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for marker in ["/statuses/", "/notes/", "/posts/"] {
+        if let Some(idx) = url.find(marker) {
+            let prefix = &url[..idx];
+            if prefix.len() > "https://".len() + host.len() {
+                out.push(prefix.to_string());
+            }
+        }
+    }
+    if let Some(user) = path.strip_prefix('@').and_then(|p| p.split('/').next()) {
+        if !user.is_empty() && !user.contains('@') {
+            out.push(format!("https://{host}/users/{user}"));
+            out.push(format!("https://{host}/@{user}"));
+        }
+    }
+    out.dedup();
+    out
+}
+
+/// Uncached author: a readable handle from the URL when it has one, else the
+/// host as the handle (numeric /ap/users/{id} actors have no name in the URL).
+fn quote_author_from_url(url: &str) -> Option<Value> {
+    let trimmed = url.trim().trim_end_matches('/');
+    let rest = trimmed.strip_prefix("https://")?;
+    let (host, path) = rest.split_once('/')?;
+    let host = host.to_ascii_lowercase();
+    let user = path
+        .strip_prefix('@')
+        .and_then(|p| p.split('/').next())
+        .or_else(|| {
+            path.strip_prefix("users/")
+                .and_then(|p| p.split('/').next())
+        })
+        .filter(|u| !u.is_empty() && !u.contains('@') && !u.chars().all(|c| c.is_ascii_digit()));
+    let actor_url = quote_author_candidates(trimmed).into_iter().next().unwrap_or_default();
+    let (acct, display) = match user {
+        Some(user) => (format!("{user}@{host}"), user.to_string()),
+        None => (host.clone(), "Quoted post".to_string()),
+    };
+    Some(json!({
+        "id": actor_url,
+        "username": display,
+        "acct": acct,
+        "display_name": display,
+        "avatar": DEFAULT_AVATAR,
+        "avatar_static": DEFAULT_AVATAR,
+        "url": actor_url,
+        "uri": actor_url,
+        "emojis": [],
+        "fields": []
+    }))
 }
 
 /// Pull https attachment URLs from a stored Create/Note JSON blob.
@@ -6239,6 +6347,35 @@ mod tests {
         assert_eq!(account["display_name"], "girlcock.club");
         assert_eq!(account["username"], "user");
         assert_eq!(account["uri"], actor.actor_id);
+    }
+
+    #[test]
+    fn anonymous_quote_author_comes_from_the_status_url() {
+        let wafrn = "https://friki.test/ap/users/117375/statuses/117540";
+        assert_eq!(quote_author_candidates(wafrn), vec!["https://friki.test/ap/users/117375".to_string()]);
+        assert_eq!(
+            quote_author_candidates("https://masto.test/@alice/123"),
+            vec!["https://masto.test/users/alice".to_string(), "https://masto.test/@alice".to_string()]
+        );
+        assert_eq!(
+            quote_author_candidates("https://masto.test/users/alice/statuses/1"),
+            vec!["https://masto.test/users/alice".to_string()]
+        );
+        assert!(quote_author_candidates("https://misskey.test/notes/abc").is_empty());
+
+        // Numeric actor ids have no name in the URL: show the host, never @quoted.
+        let numeric = quote_author_from_url(wafrn).unwrap();
+        assert_eq!(numeric["acct"], "friki.test");
+        assert_eq!(numeric["url"], "https://friki.test/ap/users/117375");
+        let named = quote_author_from_url("https://masto.test/@alice/123").unwrap();
+        assert_eq!(named["acct"], "alice@masto.test");
+        assert_eq!(named["display_name"], "alice");
+
+        let (_, stub) = split_quote_summary(&format!("oi\n\nRE: {wafrn}\n\n↪ QT: so it's not only me"));
+        let st = json!({"quote": {"state": "accepted", "quoted_status": stub.unwrap()}});
+        assert!(quoted_author_is_anonymous(&st));
+        let named_st = json!({"quote": {"quoted_status": {"source": "quote-summary", "account": {"acct": "alice@masto.test"}}}});
+        assert!(!quoted_author_is_anonymous(&named_st));
     }
 
     #[test]

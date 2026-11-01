@@ -92,4 +92,13 @@ mod tests {
             .collect();
         assert_eq!(super::targets(&many).len(), super::MAX_PER_PAGE);
     }
+
+    #[test]
+    fn text_only_quote_summaries_are_still_warmed() {
+        let url = "https://friki.test/ap/users/117/statuses/118";
+        let summary = json!({"id": "1", "quote": {"state": "accepted", "quoted_status": {
+            "source": "quote-summary", "uri": url, "url": url,
+            "content": "<p>so it's not only me</p>", "account": {"acct": "quoted", "display_name": "Quoted post"}}}});
+        assert_eq!(super::targets(&[summary]), vec![url.to_string()]);
+    }
 }

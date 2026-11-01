@@ -20,7 +20,34 @@
   count warns, and only above 1000. `VAAK_FANOUT_DEAD_DAYS` (default 7) and
   `VAAK_FANOUT_DEAD_FAILURES` (default 20) are the same knobs the delivery
   worker uses. A recent success, or a recent HTTP 401, 403, or 500, keeps a
-  host out of the suspended count.
+  host out of the suspended count. It also checks Caddy and every long-running
+  VAAK unit that is enabled on the box (an enabled unit that is not active
+  warns; the Rust HTTP unit going down is critical).
+- Phone alerts: when `/etc/mkultra/vaak-alert.env` names an ntfy topic, warn
+  and crit results are pushed by `vaak-alert-notify.sh`. The same set of
+  problems is sent once and then at most every 6 hours (counts are ignored
+  when comparing, so a growing queue does not re-alert every 15 minutes); a
+  new problem sends at once, and the first clean run after an alert sends one
+  "recovered" push. Without the file nothing is sent.
+
+### Phone alerts setup
+
+1. Install the ntfy app (iOS/Android) and subscribe to a long random topic,
+   for example the output of `openssl rand -hex 16`. Anyone who knows the
+   topic name can read it on ntfy.sh, so treat it like a password, or use a
+   self-hosted ntfy with an access token.
+2. As root:
+
+```bash
+install -m 0755 deploy/vaak-alert-notify.sh /usr/local/sbin/vaak-alert-notify.sh
+install -m 0755 deploy/vaak-integrity-check.sh /usr/local/sbin/vaak-integrity-check.sh
+install -m 0600 /dev/null /etc/mkultra/vaak-alert.env
+echo 'VAAK_ALERT_NTFY_URL=https://ntfy.sh/<your topic>' >> /etc/mkultra/vaak-alert.env
+# optional: VAAK_ALERT_NTFY_TOKEN=tk_...   VAAK_ALERT_REPEAT_HOURS=6
+/usr/local/sbin/vaak-alert-notify.sh test
+```
+
+`bash deploy/test_alert_notify.sh` exercises the notifier with a fake curl.
 
 The workstation pulls completed VPS backups to `/mnt/disc3/Backups/VAAK` with
 the user-level `vaak-disc3-backup.timer`. It runs daily at 03:15 (and on the

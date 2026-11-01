@@ -6,15 +6,33 @@ BACKUP_DIR="${VAAK_BACKUP_DIR:-/var/backups/mkultra/vaak}"
 DRILL_STAMP="${VAAK_DRILL_STATE_DIR:-/var/lib/mkultra/vaak-restore-drill}/last-ok"
 DRILL_MAX_DAYS="${VAAK_DRILL_MAX_AGE_DAYS:-40}"
 LOG_TAG="vaak-integrity"
+NOTIFY="${VAAK_ALERT_NOTIFY:-/usr/local/sbin/vaak-alert-notify.sh}"
 WARN=0
 CRIT=0
+ALERTS="$(mktemp)"
+trap 'rm -f "${ALERTS}"' EXIT
 
-warn() { WARN=1; logger -t "${LOG_TAG}" -p user.warning -- "$*" 2>/dev/null || true; echo "WARN $*"; }
-crit() { CRIT=1; logger -t "${LOG_TAG}" -p user.err -- "$*" 2>/dev/null || true; echo "CRIT $*"; }
+warn() { WARN=1; logger -t "${LOG_TAG}" -p user.warning -- "$*" 2>/dev/null || true; echo "WARN $*"; echo "WARN $*" >>"${ALERTS}"; }
+crit() { CRIT=1; logger -t "${LOG_TAG}" -p user.err -- "$*" 2>/dev/null || true; echo "CRIT $*"; echo "CRIT $*" >>"${ALERTS}"; }
+
+# Phone push (deploy/vaak-alert-notify.sh). Missing notifier or config is fine.
+notify() { [[ -x "${NOTIFY}" ]] && "${NOTIFY}" "$1" "${ALERTS}" || true; }
 
 if ! systemctl is-active --quiet postgresql; then crit "postgresql inactive"; fi
 if ! systemctl is-active --quiet php8.3-fpm; then crit "php8.3-fpm inactive"; fi
 if ! systemctl is-active --quiet redis-server; then warn "redis-server inactive (optional cache/queue accelerator)"; fi
+if ! systemctl is-active --quiet caddy; then crit "caddy inactive"; fi
+
+# Long-running VAAK units: only units that are enabled on this box are checked,
+# so an optional unit that was never installed stays quiet.
+for unit in vaak-worker-shadow-http vaak-worker-timeline-fanout vaak-worker-ranked-warm \
+  vaak-worker-notif vaak-worker-notif-list vaak-redis-queue-worker vaak-nostr-relay \
+  ap-bsky-jetstream@0 ap-bsky-jetstream@1; do
+  systemctl is-enabled --quiet "${unit}" 2>/dev/null || continue
+  if ! systemctl is-active --quiet "${unit}"; then
+    if [[ "${unit}" == vaak-worker-shadow-http ]]; then crit "${unit} inactive"; else warn "${unit} inactive"; fi
+  fi
+done
 
 if [[ ! -d "${BACKUP_DIR}" ]]; then
   crit "backup directory missing: ${BACKUP_DIR}"
@@ -69,6 +87,7 @@ done <<<"${q}"
 
 if ! df -P / | awk 'NR==2 {gsub(/%/,"",$5); exit ($5 >= 85 ? 1 : 0)}'; then warn "root filesystem is at or above 85%"; fi
 
-if (( CRIT > 0 )); then exit 2; fi
-if (( WARN > 0 )); then exit 1; fi
+if (( CRIT > 0 )); then notify crit; exit 2; fi
+if (( WARN > 0 )); then notify warn; exit 1; fi
+notify ok
 echo "integrity_ok"
