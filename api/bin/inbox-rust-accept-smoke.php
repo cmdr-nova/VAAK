@@ -91,15 +91,23 @@ $check(is_array($row) && $row['body'] === $like && $row['state'] === 'pending' &
 $check(($row['client_ip'] ?? '') === '203.0.113.7' && ($row['signature_path'] ?? '') === '/inbox', 'spool row records client address and signed path');
 $out = ap_inbox_spool_process($row);
 $check($out['state'] === 'done' && $out['result'] !== '', 'spooled Like routes through PHP (' . $out['result'] . ')');
+$blockedObject = json_encode(['id' => $alice . '#announce-blocked', 'type' => 'Announce', 'actor' => $alice, 'object' => 'https://blocked.test/notes/1']);
+$out = ap_inbox_spool_process(['id' => 0, 'client_ip' => '', 'key_id' => $aliceKey, 'request_path' => '/inbox', 'body' => $blockedObject]);
+$check($out['state'] === 'dropped' && $out['result'] === 'rejected: Object instance blocked', 'a delivery routing rejects is dropped, not a process exit');
 
 // Personal inbox path, drained by the CLI worker.
 $like2 = smoke_like($alice, '2');
 [$status] = smoke_post($rust, '/users/ci_owner/inbox', $like2, $aliceKey, $priv);
 $check($status === 202, 'personal inbox delivery is spooled');
+// A row whose run died mid-processing, already at the attempt limit.
+$db->exec("INSERT INTO ap_inbox_spool (key_id, request_path, signature_path, activity_type, body, state, attempts, claimed_at)
+           VALUES ('https://stale.test/users/x#main-key', '/inbox', '/inbox', 'Like', '{}', 'processing', 5, now() - interval '11 minutes')");
 $cmd = escapeshellarg(PHP_BINARY) . ' ' . escapeshellarg(__DIR__ . '/inbox-spool-drain.php') . ' --once 2>&1';
 $drain = (string) shell_exec('VAAK_FPM_POOL_CONF=/nonexistent ' . $cmd);
 $state = $db->query("SELECT state FROM ap_inbox_spool WHERE body = " . $db->quote($like2))->fetchColumn();
 $check($state === 'done', 'drain worker processes the pending row (' . trim($drain) . ')');
+$stale = $db->query("SELECT state FROM ap_inbox_spool WHERE key_id = 'https://stale.test/users/x#main-key'")->fetchColumn();
+$check($stale === 'failed', 'a row stuck in processing at the attempt limit is failed, not requeued');
 
 // Fallbacks reach PHP byte for byte.
 $bob = 'https://other.test/users/bob';
@@ -123,7 +131,7 @@ $check($status === 418, 'bad signature is forwarded');
 [$status] = smoke_post($rust, '/users/nobody_here/inbox', smoke_like($alice, '7'), $aliceKey, $priv);
 $check($status === 418, 'personal inbox of an unknown user is forwarded (PHP answers 404)');
 
-$spooled = (int) $db->query("SELECT count(*) FROM ap_inbox_spool")->fetchColumn();
+$spooled = (int) $db->query("SELECT count(*) FROM ap_inbox_spool WHERE key_id <> 'https://stale.test/users/x#main-key'")->fetchColumn();
 $check($spooled === 2, 'only the two good deliveries were spooled');
 $stats = $redis->hGetAll('vaak:inbox_rust:stats:v1');
 $check((int) ($stats['spooled'] ?? 0) === 2 && (int) ($stats['fwd_no_key'] ?? 0) === 1 && (int) ($stats['fwd_blocked'] ?? 0) === 1

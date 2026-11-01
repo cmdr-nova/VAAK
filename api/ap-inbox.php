@@ -279,8 +279,16 @@ function ap_inbox_rate_admit(string $ip, bool $claimsRelay): bool
         && ap_rate_limit('relay_' . $ip, AP_INBOX_RATE_MAX_RELAY);
 }
 
+/** ap_fail() while draining the spool: no request to answer, and exit would kill the drain. */
+final class ApInboxSpoolReject extends RuntimeException
+{
+}
+
 function ap_fail(string $message, int $code): void
 {
+    if (!empty($GLOBALS['ap_inbox_spool_routing'])) {
+        throw new ApInboxSpoolReject($message, $code);
+    }
     $detail = (string) ($GLOBALS['ap_inbox_reject_detail'] ?? '');
     $uri = (string) ($_SERVER['REQUEST_URI'] ?? '');
     $host = (string) ($_SERVER['HTTP_HOST'] ?? ap_header('Host'));
@@ -2211,7 +2219,14 @@ function ap_inbox_spool_process(array $row): array
     if (function_exists('ap_fanout_host_note_inbound')) {
         ap_fanout_host_note_inbound($keyHost);
     }
-    $action = ap_route_verified_activity($json, strlen($raw));
+    $GLOBALS['ap_inbox_spool_routing'] = true;
+    try {
+        $action = ap_route_verified_activity($json, strlen($raw));
+    } catch (ApInboxSpoolReject $e) {
+        return ['state' => 'dropped', 'result' => substr('rejected: ' . $e->getMessage(), 0, 120)];
+    } finally {
+        $GLOBALS['ap_inbox_spool_routing'] = false;
+    }
     return ['state' => 'done', 'result' => substr((string) $action, 0, 120)];
 }
 
