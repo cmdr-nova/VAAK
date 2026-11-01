@@ -22,7 +22,7 @@
   `VAAK_FANOUT_DEAD_DAYS` window before suspension. Only the healthy count
   warns, and only above 1000; the dying count is printed as `dying_fanout`. `VAAK_FANOUT_DEAD_DAYS` (default 7) and
   `VAAK_FANOUT_DEAD_FAILURES` (default 20) are the same knobs the delivery
-  worker uses. A recent success, or a recent HTTP 401, 403, or 500, keeps a
+  worker uses. A recent success, or a recent HTTP 401, 403, 429, or 500, keeps a
   host out of the suspended count. It also checks Caddy and every long-running
   VAAK unit that is enabled on the box (an enabled unit that is not active
   warns; the Rust HTTP unit going down is critical).
