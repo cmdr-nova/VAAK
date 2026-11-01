@@ -272,6 +272,7 @@ pub async fn tl_html_fill(
         crate::nostr::act::stamp_viewer_flags(&db, owner_user_id, &mut slice).await;
     }
 
+    crate::home_quote_warm::kick(cfg, owner_user_id, &slice);
     let units = plan_feed_paint_units(&slice, &extra_parents);
     let paint = |st: &serde_json::Value, from: &str, viewer: &str| {
         paint_lean_feed_card_opts(st, from, viewer)
@@ -379,6 +380,7 @@ async fn tl_html_older(
     crate::post_media_cache::swap_cached_post_media(&db, &mut statuses, None).await;
     crate::nostr::act::stamp_viewer_flags(&db, owner_user_id, &mut statuses).await;
     let viewer_actor = owner_actor;
+    crate::home_quote_warm::kick(cfg, owner_user_id, &statuses);
     let units = plan_feed_paint_units(&statuses, &std::collections::HashMap::new());
     let paint = |st: &serde_json::Value, from: &str, viewer: &str| {
         paint_lean_feed_card_opts(st, from, viewer)
@@ -451,6 +453,7 @@ pub async fn home_html_since(
         crate::post_media_cache::swap_cached_post_media(&db, &mut slice, Some(&mut extra_parents)).await;
         crate::nostr::act::stamp_viewer_flags(&db, owner_user_id, &mut slice).await;
     }
+    crate::home_quote_warm::kick(cfg, owner_user_id, &slice);
     let units = plan_feed_paint_units(&slice, &extra_parents);
     let paint = |st: &serde_json::Value, from: &str, viewer: &str| {
         stamp_poll_card(paint_lean_feed_card_opts(st, from, viewer), st)
@@ -517,6 +520,7 @@ pub async fn tl_html_since(
         crate::post_media_cache::swap_cached_post_media(&db, &mut slice, Some(&mut extra_parents)).await;
         crate::nostr::act::stamp_viewer_flags(&db, owner_user_id, &mut slice).await;
     }
+    crate::home_quote_warm::kick(cfg, owner_user_id, &slice);
     let units = plan_feed_paint_units(&slice, &extra_parents);
     let paint = |st: &serde_json::Value, from: &str, viewer: &str| {
         stamp_poll_card(paint_lean_feed_card_opts(st, from, viewer), st)

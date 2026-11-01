@@ -6,7 +6,7 @@ use serde::{Deserialize,Serialize};
 use std::{future::Future,pin::Pin,path::PathBuf,io::{Read,Write,Seek,SeekFrom},process::Stdio,time::Duration};
 use sha2::{Digest,Sha256};
 use tokio_postgres::Client;
-type GrantFuture<'a>=Pin<Box<dyn Future<Output=Result<()>>+Send+'a>>;
+pub(crate) type GrantFuture<'a>=Pin<Box<dyn Future<Output=Result<()>>+Send+'a>>;
 type EffectFuture<'a>=Pin<Box<dyn Future<Output=Result<bool>>+Send+'a>>;
 /// Implemented only against current SQL source/owner/audience capabilities.
 pub(crate) trait CurrentQuoteGrant:Sync{fn require_current(&self)->GrantFuture<'_>;
