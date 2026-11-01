@@ -6,7 +6,7 @@ define('AP_BSKY_PUBLIC_API','https://public.api.bsky.app');define('AP_BSKY_POST_
 function ap_bsky_xrpc(string $base,string $nsid,string $method,array $query=[],mixed $body=null,?string $bearer=null,int $timeout=8):array{
  $GLOBALS['thread_calls'][]=compact('base','nsid','method','query','bearer','timeout');
  if(is_callable($GLOBALS['thread_mutation']??null))($GLOBALS['thread_mutation'])();
- if($nsid==='app.bsky.feed.getPostThread')return $GLOBALS['thread_reply'];
+ if($nsid==='app.bsky.feed.getPostThread')return !empty($GLOBALS['thread_reply_queue'])?array_shift($GLOBALS['thread_reply_queue']):$GLOBALS['thread_reply'];
  if($nsid==='app.bsky.feed.getPosts'&&!empty($GLOBALS['thread_posts_fault']))return ['ok'=>false];
  if($nsid==='app.bsky.feed.getPosts'&&isset($GLOBALS['thread_posts_body']))return $GLOBALS['thread_posts_body'];
  if($nsid==='app.bsky.feed.getPosts')return ['ok'=>true,'json'=>['posts'=>[$GLOBALS['thread_focus']]]];
@@ -32,6 +32,21 @@ thread_check(count($GLOBALS['thread_calls'])===2,'one public thread request per 
 $GLOBALS['thread_reply']['json']['thread']['post']['uri']=$child['uri'];thread_check(admin_bsky_thread_fragment($focus['uri'],'replies','home',[])===null,'wrong returned focus refused');$GLOBALS['thread_reply']['json']['thread']=$tree;
 $GLOBALS['thread_mutation']=static function(){ap_db()->exec("INSERT INTO ap_muted_words VALUES(1,'Changed during transport')");$GLOBALS['thread_mutation']=null;};thread_check(admin_bsky_thread_fragment($focus['uri'],'replies','home',[])===null,'durable policy-row mutation refuses buffer (no Settings POST claim)');ap_db()->exec('DELETE FROM ap_muted_words');
 $GLOBALS['thread_mutation']=static function(){ap_db()->exec("DELETE FROM bsky_posts WHERE bsky_uri='at://did:plc:fixture/app.bsky.feed.post/focus'");$GLOBALS['thread_mutation']=null;};thread_check(admin_bsky_thread_fragment($focus['uri'],'replies','home',[])===null,'source withdrawn during transport refuses');ap_bsky_post_upsert_from_feed_item(['post'=>$focus],1);
+// Busy threads: counts, seen_at, avatar or repost reason rewritten while the AppView read runs must not refuse.
+$GLOBALS['thread_mutation']=static function(){ap_db()->exec("UPDATE bsky_posts SET like_count=COALESCE(like_count,0)+7,reply_count=3,seen_at='2099-01-01T00:00:00Z',updated_at='2099-01-01T00:00:00Z',author_avatar='https://cdn.example/new.jpg',reason_json='{\"x\":1}' WHERE bsky_uri='at://did:plc:fixture/app.bsky.feed.post/focus'");$GLOBALS['thread_mutation']=null;};
+thread_check(is_string(admin_bsky_thread_fragment($focus['uri'],'replies','home',[])),'volatile focus row columns do not refuse');
+// A new moderation label on the focus still refuses.
+$GLOBALS['thread_mutation']=static function()use($focus){$p=$focus;$p['labels']=[['val'=>'porn','src'=>'did:plc:mod']];ap_db()->prepare("UPDATE bsky_posts SET raw_json=? WHERE bsky_uri=?")->execute([json_encode($p),$focus['uri']]);$GLOBALS['thread_mutation']=null;};
+thread_check(admin_bsky_thread_fragment($focus['uri'],'replies','home',[])===null,'label change during transport refuses');ap_bsky_post_upsert_from_feed_item(['post'=>$focus],1);
+// One AppView timeout is retried once; a 4xx is not.
+$okReply=$GLOBALS['thread_reply'];$GLOBALS['thread_reply_queue']=[['ok'=>false,'status'=>0,'error'=>'timeout'],$okReply];$before=count($GLOBALS['thread_calls']);
+thread_check(is_string(admin_bsky_thread_fragment($focus['uri'],'replies','home',[])),'timeout then success renders');
+$threadCalls=array_values(array_filter(array_slice($GLOBALS['thread_calls'],$before),static fn($c)=>$c['nsid']==='app.bsky.feed.getPostThread'));
+thread_check(count($threadCalls)===2&&$threadCalls[1]['timeout']===6,'one longer retry after a timeout');
+$GLOBALS['thread_reply_queue']=[['ok'=>false,'status'=>400,'error'=>'NotFound']];$before=count($GLOBALS['thread_calls']);
+thread_check(admin_bsky_thread_fragment($focus['uri'],'replies','home',[])===null,'4xx refuses');
+$threadCalls=array_values(array_filter(array_slice($GLOBALS['thread_calls'],$before),static fn($c)=>$c['nsid']==='app.bsky.feed.getPostThread'));
+thread_check(count($threadCalls)===1,'no retry after a 4xx');$GLOBALS['thread_reply_queue']=[];
 $GLOBALS['thread_reply']['json']['thread']['$type']='app.bsky.feed.defs#blockedPost';thread_check(admin_bsky_thread_fragment($focus['uri'],'replies','home',[])===null,'blocked root sentinel refuses even if post field supplied');$GLOBALS['thread_reply']['json']['thread']=$tree;
 $bad=$tree;$bad['replies'][0]['post']['author']['did']='did:plc:impostor';thread_check(admin_bsky_thread_posts($bad,$focus['uri'],false,true)===[],'malformed author plus disconnected nested reply suppressed');
 $cycle=$tree;$cycle['parent']['parent']=$cycle;thread_check(count(admin_bsky_thread_posts($cycle,$focus['uri'],true,false))===1,'ancestor cycle bounded');
