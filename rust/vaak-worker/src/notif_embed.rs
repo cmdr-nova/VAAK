@@ -1794,7 +1794,14 @@ pub(crate) fn unresolved_quote_target(status: &Value) -> Option<String> {
     if !matches!(state, "" | "pending" | "accepted") {
         return None;
     }
-    if quote_status_paintable(&normalized_quote_preview(q_raw)) {
+    // A text-only quote summary paints, but it is not the cached post: it
+    // lacks the author's avatar and media, so it still needs a warm.
+    let summary_only = q_raw
+        .get("quoted_status")
+        .and_then(|q| q.get("source"))
+        .and_then(Value::as_str)
+        == Some("quote-summary");
+    if !summary_only && quote_status_paintable(&normalized_quote_preview(q_raw)) {
         return None;
     }
     let url = unresolved_quote_url(status, q_raw);
