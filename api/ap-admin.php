@@ -23523,13 +23523,29 @@ function admin_bsky_thread_fragment(string $object, string $part, string $from, 
         $wantReplies = in_array($part, ['replies', 'descendants', 'both'], true);
         $tree = null;
         if ($wantAncestors || $wantReplies) {
-            $got = ap_bsky_xrpc(AP_BSKY_PUBLIC_API, 'app.bsky.feed.getPostThread', 'GET',
-                ['uri'=>$at, 'depth'=>$wantReplies ? '4' : '0', 'parentHeight'=>$wantAncestors ? '12' : '0'], null, null, 4);
+            $threadQuery = ['uri'=>$at, 'depth'=>$wantReplies ? '4' : '0', 'parentHeight'=>$wantAncestors ? '12' : '0'];
+            $got = ap_bsky_xrpc(AP_BSKY_PUBLIC_API, 'app.bsky.feed.getPostThread', 'GET', $threadQuery, null, null, 4);
+            // The public AppView sometimes times out or 5xxs on one read and
+            // answers the next. Try once more before the whole part fails.
+            $status = (int) ($got['status'] ?? 0);
+            if (empty($got['ok']) && ($status === 0 || $status >= 500)) {
+                $got = ap_bsky_xrpc(AP_BSKY_PUBLIC_API, 'app.bsky.feed.getPostThread', 'GET', $threadQuery, null, null, 6);
+            }
             $tree = is_array($got['json']['thread'] ?? null) ? $got['json']['thread'] : null;
-            if (empty($got['ok']) || !is_array($tree) || !admin_bsky_thread_node_valid($tree) || ($tree['post']['uri'] ?? '') !== $at
-                || !admin_bsky_thread_focus_allowed(['post'=>$tree['post']], $owner)) return null;
+            if (empty($got['ok']) || !is_array($tree)) {
+                admin_bsky_thread_log($at, $part, 'appview ' . (int) ($got['status'] ?? 0) . ' ' . substr((string) ($got['error'] ?? ''), 0, 80));
+                return null;
+            }
+            if (!admin_bsky_thread_node_valid($tree) || ($tree['post']['uri'] ?? '') !== $at
+                || !admin_bsky_thread_focus_allowed(['post'=>$tree['post']], $owner)) {
+                admin_bsky_thread_log($at, $part, 'focus not usable in AppView thread');
+                return null;
+            }
         }
-        if ($rootSource !== admin_bsky_thread_source_snapshot([$at], $rootTwins)) return null;
+        if ($rootSource !== admin_bsky_thread_source_snapshot([$at], $rootTwins)) {
+            admin_bsky_thread_log($at, $part, 'focus source changed during fetch');
+            return null;
+        }
         $posts = $part === 'focus' ? [$focus['post']] : admin_bsky_thread_posts($tree ?? [], $at, $wantAncestors, $wantReplies);
         $seen = [$at=>true];$cards = [];$selectedUris=[$at];$selectedTwins=$rootTwins;
         foreach ($posts as $post) {
@@ -23563,7 +23579,10 @@ function admin_bsky_thread_fragment(string $object, string $part, string $from, 
         if ($owner !== admin_owner_user_id() || $sources !== admin_bsky_thread_source_snapshot(array_values(array_unique($selectedUris)), $selectedTwins)
             || $policy !== admin_bsky_thread_policy_snapshot($owner)
             || !admin_bsky_thread_focus_allowed($focus, $owner)
-            || !admin_direct_status_allowed($source, $owner)) return null;
+            || !admin_direct_status_allowed($source, $owner)) {
+            admin_bsky_thread_log($at, $part, 'source or policy changed while rendering');
+            return null;
+        }
         foreach ($cards as $entry) {
             if (!($part === 'focus' ? admin_bsky_thread_focus_allowed(['post'=>$entry['post']], $owner) : admin_library_bsky_item_allowed(['post'=>$entry['post']], $owner, 0, true))
                 || !admin_direct_status_allowed($entry['card'], $owner)
@@ -23572,6 +23591,7 @@ function admin_bsky_thread_fragment(string $object, string $part, string $from, 
         return $html;
     } catch (Throwable $e) {
         while (ob_get_level() > $level) ob_end_clean();
+        admin_bsky_thread_log($object, $part, 'error ' . substr($e->getMessage(), 0, 120));
         return null;
     } finally {
         if ($galleryBudget === null) unset($GLOBALS['admin_bsky_gallery_repair_budget']);
@@ -23580,6 +23600,12 @@ function admin_bsky_thread_fragment(string $object, string $part, string $from, 
 }
 
 /** Validate a public PostView before its first cache write; repair only the focus. */
+/** One journal line per refused Bluesky thread part, so "Couldn't load" has a reason. */
+function admin_bsky_thread_log(string $object, string $part, string $why): void
+{
+    error_log('[bsky-thread] refused part=' . preg_replace('/[^a-z_]/', '', $part) . ' uri=' . substr($object, 0, 160) . ' why=' . $why);
+}
+
 function admin_bsky_thread_focus_item(string $at, int $owner, bool $repairFocus): ?array
 {
     $cached=ap_bsky_post_item_by_uri($at);
@@ -23764,9 +23790,51 @@ function admin_bsky_thread_source_snapshot(array $uris, array $twins): array
         'masto_statuses'=>['note_id',$twins], 'outbox_notes'=>['id',$twins]] as $table=>$scope){
         [$column,$keys]=$scope;if(!$keys){$out[$table]=[];continue;}
         $q=ap_db()->prepare('SELECT * FROM '.$table.' WHERE '.$column.' IN ('.implode(',',array_fill(0,count($keys),'?')).')');$q->execute($keys);
-        $rows=$q->fetchAll(PDO::FETCH_ASSOC);usort($rows,static fn($a,$b)=>strcmp(serialize($a),serialize($b)));$out[$table]=$rows;
+        $rows=array_map(static fn(array $row)=>admin_bsky_thread_snapshot_row($table,$row),$q->fetchAll(PDO::FETCH_ASSOC));
+        usort($rows,static fn($a,$b)=>strcmp(serialize($a),serialize($b)));$out[$table]=$rows;
     }
     return $out;
+}
+
+/**
+ * The part of a source row that decides whether a thread may still be shown.
+ * Bluesky rows are rewritten every time a timeline, notification or search
+ * read sees the post (counts, seen_at, display name, avatar, repost reason),
+ * so comparing whole rows refused busy threads for nothing. Keep identity,
+ * content, reply position and moderation labels; a delete still removes the
+ * row and is still caught.
+ */
+function admin_bsky_thread_snapshot_row(string $table, array $row): array
+{
+    if ($table === 'bsky_post_links') {
+        unset($row['seen_at'], $row['updated_at']);
+        return $row;
+    }
+    if ($table !== 'bsky_posts') return $row;
+    $raw = json_decode((string) ($row['raw_json'] ?? ''), true);
+    $raw = is_array($raw) ? (is_array($raw['post'] ?? null) ? $raw['post'] : $raw) : [];
+    $labels = static function (mixed $list): array {
+        if (is_array($list) && is_array($list['values'] ?? null)) $list = $list['values'];
+        $out = [];
+        foreach (is_array($list) ? $list : [] as $label) {
+            $val = is_array($label) ? (string) ($label['val'] ?? '') : (is_string($label) ? $label : '');
+            $neg = is_array($label) && !empty($label['neg']);
+            if ($val !== '') $out[] = ($neg ? '!' : '') . $val;
+        }
+        sort($out);
+        return array_values(array_unique($out));
+    };
+    return [
+        'bsky_uri' => $row['bsky_uri'] ?? null,
+        'bsky_cid' => $row['bsky_cid'] ?? null,
+        'author_did' => $row['author_did'] ?? null,
+        'text' => $row['text'] ?? null,
+        'reply_parent' => $row['reply_parent'] ?? null,
+        'reply_root' => $row['reply_root'] ?? null,
+        'labels' => $labels($raw['labels'] ?? null),
+        'author_labels' => $labels($raw['author']['labels'] ?? null),
+        'self_labels' => $labels($raw['record']['labels'] ?? null),
+    ];
 }
 
 function admin_bsky_thread_policy_snapshot(int $owner): array
