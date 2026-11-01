@@ -81,7 +81,12 @@ while (time() < $deadline) {
     if (time() - $lastHousekeeping >= 60) {
         $lastHousekeeping = time();
         ap_block_list_cached(true);
-        $db->exec("UPDATE ap_inbox_spool SET state = 'pending', claimed_at = NULL
+        // A row whose run died (no exception to catch) still counts the attempt.
+        $db->exec("UPDATE ap_inbox_spool
+                   SET state = CASE WHEN attempts >= 5 THEN 'failed' ELSE 'pending' END,
+                       result = CASE WHEN attempts >= 5 THEN 'error: run ended while processing' ELSE result END,
+                       finished_at = CASE WHEN attempts >= 5 THEN now() END,
+                       claimed_at = NULL
                    WHERE state = 'processing' AND claimed_at < now() - interval '10 minutes'");
         $db->exec("DELETE FROM ap_inbox_spool WHERE id IN (
                        SELECT id FROM ap_inbox_spool
