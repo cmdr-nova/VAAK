@@ -56,11 +56,12 @@ $check(ap_fanout_host_normalize('*') === '' && ap_fanout_host_normalize('localho
 $check(ap_fanout_host_is_bluesky_host('bsky.social') && ap_fanout_host_is_bluesky_host('https://Bsky.App/x'), 'bluesky hosts are recognized');
 $check(!ap_fanout_host_is_bluesky_host('tube.baeddel.social'), 'a dead peer is not bluesky');
 
-foreach (['HTTP 401', 'upstream HTTP 403 Forbidden', 'HTTP 500 '] as $live) {
+foreach (['HTTP 401', 'upstream HTTP 403 Forbidden', 'HTTP 429 Too Many Requests', 'HTTP 500 '] as $live) {
     $check(ap_fanout_live_rejection_status($live) !== null, $live . ' is a live rejection');
     $check(!ap_fanout_counts_as_dead_failure($live), $live . ' is not a dead failure');
 }
 $check(ap_fanout_live_rejection_status('HTTP 5000') === null, 'HTTP 5000 is not HTTP 500');
+$check(ap_fanout_live_rejection_status('HTTP 4290') === null && !ap_fanout_counts_as_dead_failure('HTTP 429'), 'HTTP 429 is live, 4290 is not');
 $check(ap_fanout_live_rejection_status('HTTP 404') === null && ap_fanout_counts_as_dead_failure('HTTP 404'), 'other HTTP statuses can still count');
 foreach (['Remote host circuit is open', 'Suspended remote host', 'Worker lease expired', 'Signing key is unavailable', ''] as $skip) {
     $check(!ap_fanout_counts_as_dead_failure($skip), 'inconclusive error is not a dead failure: ' . $skip);

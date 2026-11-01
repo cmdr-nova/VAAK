@@ -3,8 +3,9 @@
  * Durable health for ActivityPub fan-out peers.
  *
  * A host is suspended only after a long streak of terminal transport failures
- * and no recent success. HTTP 401, 403 and 500 are live answers: they do not
- * count as a dead streak, and a recent one keeps the host unsuspended.
+ * and no recent success. HTTP 401, 403, 429 and 500 are live answers: they
+ * do not count as a dead streak, and a recent one keeps the host unsuspended.
+ * (429 is a busy server asking us to slow down, not a missing one.)
  * Bluesky hosts and Bluesky activities are never probed. The only new outbound
  * request is at most one ActivityPub delivery per suspended host per day.
  */
@@ -86,7 +87,7 @@ function ap_fanout_host_is_bluesky_host(string $host): bool
 /** HTTP status when the peer answered with a live rejection, otherwise null. */
 function ap_fanout_live_rejection_status(string $error): ?int
 {
-    if (preg_match('/\bHTTP\s+(401|403|500)\b/', $error, $match) === 1) {
+    if (preg_match('/\bHTTP\s+(401|403|429|500)\b/', $error, $match) === 1) {
         return (int) $match[1];
     }
     return null;
@@ -142,7 +143,7 @@ function ap_fanout_activity_is_bluesky(string $activityJson): bool
 
 /**
  * Suspended when the dead streak is old enough and long enough, and the host
- * has neither succeeded nor answered 401/403/500 inside the same window.
+ * has neither succeeded nor answered 401/403/429/500 inside the same window.
  */
 function ap_fanout_host_suspended(?int $lastSuccessUnix, ?int $streakStartedUnix, int $consecutive, ?int $lastLiveUnix, int $now, ?int $deadDays = null, ?int $deadFailures = null): bool
 {
