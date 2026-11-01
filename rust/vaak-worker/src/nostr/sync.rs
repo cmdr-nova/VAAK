@@ -515,6 +515,8 @@ struct NotesReport {
     relays_ok: usize,
     stored: u64,
     rejected: usize,
+    /// Authors (or reposters) with at least one newly stored row this run.
+    fresh_authors: HashSet<String>,
 }
 
 async fn sync_notes(db: &mut Client, s: &Settings, now: i64, deadline: Instant) -> Result<NotesReport> {
@@ -549,7 +551,7 @@ async fn sync_notes(db: &mut Client, s: &Settings, now: i64, deadline: Instant) 
         synced_at.insert(key.clone(), row.get(2));
         authors.push((key, relays));
     }
-    let mut report = NotesReport { authors: authors.len(), relays: 0, relays_ok: 0, stored: 0, rejected: 0 };
+    let mut report = NotesReport { authors: authors.len(), relays: 0, relays_ok: 0, stored: 0, rejected: 0, fresh_authors: HashSet::new() };
     if authors.is_empty() {
         return Ok(report);
     }
@@ -606,9 +608,13 @@ async fn sync_notes(db: &mut Client, s: &Settings, now: i64, deadline: Instant) 
         let tags = serde_json::to_value(&ev.tags).unwrap_or(Value::Array(Vec::new()));
         let kind = ev.kind as i32;
         let relay = relay_of.get(&ev.id).cloned().unwrap_or_default();
-        report.stored += tx
+        let n = tx
             .execute(&insert, &[&ev.id, &ev.pubkey, &kind, &ev.created_at, &ev.content, &tags, &is_reply, &pks, &parent, &relay, &now])
             .await?;
+        if n > 0 {
+            report.fresh_authors.insert(ev.pubkey.clone());
+        }
+        report.stored += n;
     }
     let no_pks: Vec<String> = Vec::new();
     for ev in &reposted.reposts {
@@ -616,9 +622,13 @@ async fn sync_notes(db: &mut Client, s: &Settings, now: i64, deadline: Instant) 
         let tags = serde_json::to_value(&ev.tags).unwrap_or(Value::Array(Vec::new()));
         let relay = relay_of.get(&ev.id).cloned().unwrap_or_default();
         // The embedded copy is stored as its own row; keep the repost small.
-        report.stored += tx
+        let n = tx
             .execute(&insert, &[&ev.id, &ev.pubkey, &6i32, &ev.created_at, &"", &tags, &false, &no_pks, &target, &relay, &now])
             .await?;
+        if n > 0 {
+            report.fresh_authors.insert(ev.pubkey.clone());
+        }
+        report.stored += n;
     }
     let good_list: Vec<String> = good_authors.into_iter().collect();
     if !good_list.is_empty() {
@@ -798,6 +808,52 @@ async fn cleanup(db: &Client, s: &Settings, now: i64) -> Result<u64> {
     Ok(n)
 }
 
+/// Most owners one sync run asks to rebuild Home for.
+const HOME_REWARM_MAX_OWNERS: usize = 20;
+
+/// Home's ranked list only re-reads Nostr when its churn gate opens (at most
+/// every 5 minutes), on top of this timer's ~3 minute cadence. When a run
+/// stores new notes, ask the timeline-fanout worker for an `owner_rewarm` of
+/// each owner who follows one of those authors with Nostr in Home, the same
+/// rebuild a Deprioritize change uses. `VAAK_NOSTR_HOME_LIVE=0` turns it off.
+async fn rewarm_homes_with_fresh_notes(cfg: &Config, db: &Client, fresh: &HashSet<String>) -> Result<usize> {
+    if fresh.is_empty() || std::env::var("VAAK_NOSTR_HOME_LIVE").is_ok_and(|v| matches!(v.trim(), "0" | "off" | "false" | "no")) {
+        return Ok(0);
+    }
+    let owners = home_owners_following(db, fresh).await?;
+    if owners.is_empty() {
+        return Ok(0);
+    }
+    let mut q = crate::redis_util::connect(&cfg.redis_queue_url).await?;
+    for owner in &owners {
+        let job = serde_json::json!({"op": "owner_rewarm", "owner": owner}).to_string();
+        crate::redis_util::queue_push(&mut q, crate::timeline_fanout::QUEUE_NAME, &job).await?;
+    }
+    Ok(owners.len())
+}
+
+/// Active owners with Nostr in Home who follow any of `authors`.
+async fn home_owners_following(db: &Client, authors: &HashSet<String>) -> Result<Vec<i64>> {
+    let authors: Vec<String> = authors.iter().cloned().collect();
+    let owners: Vec<i64> = db
+        .query(
+            "SELECT DISTINCT f.owner_user_id::bigint
+             FROM nostr_follows f
+             JOIN nostr_links l ON l.owner_user_id = f.owner_user_id AND l.show_in_home
+             JOIN ap_users u ON u.id = l.owner_user_id AND u.disabled_at IS NULL
+             WHERE f.pubkey = ANY($1)
+             ORDER BY 1
+             LIMIT $2",
+            &[&authors, &(HOME_REWARM_MAX_OWNERS as i64)],
+        )
+        .await
+        .context("owners following fresh nostr authors")?
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    Ok(owners)
+}
+
 pub async fn run_once(cfg: &Config, budget_secs: u64) -> Result<String> {
     if disabled_by_env() {
         return Ok("nostr-sync skipped=disabled".into());
@@ -815,6 +871,10 @@ pub async fn run_once(cfg: &Config, budget_secs: u64) -> Result<String> {
     sync_links(&mut db, &s, now, deadline, &mut log).await?;
     let meta = sync_followee_meta(&db, &s, now, deadline).await?;
     let notes = sync_notes(&mut db, &s, now, deadline).await?;
+    let rewarmed = rewarm_homes_with_fresh_notes(cfg, &db, &notes.fresh_authors).await.unwrap_or_else(|e| {
+        tracing::warn!(error = %format!("{e:#}"), "nostr home rewarm enqueue failed");
+        0
+    });
     let notifs = super::notif::sync(&mut db, &s, now, deadline).await?;
     // The backup copy never holds up Home, notifications or clean-up.
     let archive = super::archive::pull(&db, &s, now, deadline).await.unwrap_or_else(|e| {
@@ -829,7 +889,7 @@ pub async fn run_once(cfg: &Config, budget_secs: u64) -> Result<String> {
     let cleaned = cleanup(&db, &s, now).await?;
     relay_book::prune(&db, now).await?;
     Ok(format!(
-        "nostr-sync {}meta={meta} authors={} relays={}/{} stored={} rejected={} notifs={}/{} ingest={} {} cleaned={cleaned} ms={}",
+        "nostr-sync {}meta={meta} authors={} relays={}/{} stored={} rejected={} rewarm={rewarmed} notifs={}/{} ingest={} {} cleaned={cleaned} ms={}",
         if log.is_empty() { String::new() } else { format!("{} ", log.join(" ")) },
         notes.authors,
         notes.relays_ok,
@@ -847,6 +907,25 @@ pub async fn run_once(cfg: &Config, budget_secs: u64) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Runs where a disposable fixture database is configured; skipped otherwise.
+    #[tokio::test]
+    async fn fresh_notes_rewarm_only_active_owners_with_nostr_in_home() {
+        let Ok(url) = std::env::var("LIBRARY_FIXTURE_DB") else { return };
+        let db = crate::db::connect(&url).await.unwrap();
+        db.batch_execute(
+            "CREATE TEMP TABLE nostr_follows (owner_user_id BIGINT, pubkey TEXT);
+             CREATE TEMP TABLE nostr_links (owner_user_id BIGINT, show_in_home BOOLEAN);
+             CREATE TEMP TABLE ap_users (id BIGINT, disabled_at TEXT);
+             INSERT INTO ap_users VALUES (1, NULL), (2, NULL), (3, '2026-01-01'), (4, NULL);
+             INSERT INTO nostr_links VALUES (1, true), (2, false), (3, true), (4, true);
+             INSERT INTO nostr_follows VALUES (1, 'aa'), (2, 'aa'), (3, 'aa'), (4, 'bb'), (1, 'bb');",
+        ).await.unwrap();
+        let fresh: HashSet<String> = ["aa".to_string()].into_iter().collect();
+        assert_eq!(home_owners_following(&db, &fresh).await.unwrap(), vec![1]);
+        let both: HashSet<String> = ["aa".to_string(), "bb".to_string()].into_iter().collect();
+        assert_eq!(home_owners_following(&db, &both).await.unwrap(), vec![1, 4]);
+    }
 
     fn a(name: &str, relays: &[&str]) -> (String, Vec<String>) {
         (name.to_string(), relays.iter().map(|r| r.to_string()).collect())
