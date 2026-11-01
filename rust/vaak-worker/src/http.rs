@@ -122,7 +122,7 @@ pub async fn serve(cfg: Config, bind: SocketAddr) -> Result<()> {
     let state = AppState {
         cfg: Arc::new(cfg),
     };
-    tokio::spawn(crate::profile_bridge::warm_on_start(state.cfg.database_url.clone()));
+    tokio::spawn(crate::profile_bridge::warm_on_start((*state.cfg).clone()));
     // Rust cutover F1: repeat PHP's inbox signature checks and log agreement.
     if std::env::var("VAAK_INBOX_SIG_SHADOW").is_ok_and(|v| v.trim() == "1") {
         tokio::spawn(crate::inbox_sig_shadow::run(state.cfg.clone()));

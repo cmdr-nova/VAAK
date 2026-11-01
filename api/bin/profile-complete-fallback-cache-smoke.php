@@ -37,7 +37,8 @@ if (ap_profile_complete_fallback_ttl() !== 5) fallback_fail('ttl clamps low');
 putenv('VAAK_PROFILE_COMPLETE_FALLBACK_TTL=');
 
 $key = ap_profile_complete_fallback_key('Cmdr_Nova', 'page', 'posts');
-if ($key !== 'vaak:profile-complete-fallback:v1:page:cmdr_nova:posts') fallback_fail('fallback key shape');
+if ($key !== 'vaak:profile-complete-fallback:v2:page:signed:cmdr_nova:posts') fallback_fail('fallback key shape');
+if (ap_profile_complete_fallback_key('cmdr_nova', 'page', 'posts', true) !== 'vaak:profile-complete-fallback:v2:page:guest:cmdr_nova:posts') fallback_fail('guest fallback key shape');
 $secretBody = 'quoted post body must stay out of the cache';
 ap_profile_complete_observe_transport('cmdr_nova', 'page', 'posts', 422, '{"fallback":true,"reason":"bluesky_quote","content":"' . $secretBody . '"}');
 $stored = ap_redis_json_get($key);
@@ -56,6 +57,11 @@ $timeout = ap_redis_json_get(ap_profile_complete_fallback_key('shana_flux', 'ful
 if (!is_array($timeout) || ($timeout['reason'] ?? '') !== 'timeout') fallback_fail('transport timeout code');
 ap_profile_complete_observe_transport('fresh_actor', 'page', 'posts', 200, '{"ok":true}');
 if (ap_profile_complete_fallback_cached('fresh_actor', 'page', 'posts')) fallback_fail('success must not skip rust');
+
+// A signed-in refusal never sends guests of the same profile to PHP.
+$GLOBALS['vaak_guest_profile'] = true;
+if (ap_profile_complete_fallback_cached('cmdr_nova', 'page', 'posts')) fallback_fail('signed-in fallback leaked to guests');
+unset($GLOBALS['vaak_guest_profile']);
 
 putenv('VAAK_PROFILE_COMPLETE_NATIVE=1');
 putenv('VAAK_PROFILE_COMPLETE_SECRET=' . str_repeat('a', 32));

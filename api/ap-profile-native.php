@@ -36,12 +36,16 @@ function ap_profile_complete_fallback_ttl(): int
     $ttl = is_string($raw) && ctype_digit(trim($raw)) ? (int) trim($raw) : 30;
     return max(5, min(120, $ttl));
 }
-function ap_profile_complete_fallback_key(string $actorKey, string $route, string $tab): string
+/** Guest and signed-in refusals are kept apart: an owner-only fallback
+ * (their own profile paints extra controls) must not send every guest of
+ * that profile to PHP for the next TTL window, and the reverse. */
+function ap_profile_complete_fallback_key(string $actorKey, string $route, string $tab, ?bool $guest = null): string
 {
     $route = preg_replace('/[^a-z]/', '', strtolower($route)) ?: 'page';
     $tab = preg_replace('/[^a-z_]/', '', strtolower($tab)) ?: 'posts';
     $actorKey = preg_replace('/[^a-z0-9_]/', '', strtolower($actorKey)) ?: 'actor';
-    return 'vaak:profile-complete-fallback:v1:' . $route . ':' . $actorKey . ':' . $tab;
+    $viewer = ($guest ?? !empty($GLOBALS['vaak_guest_profile'])) ? 'guest' : 'signed';
+    return 'vaak:profile-complete-fallback:v2:' . $route . ':' . $viewer . ':' . $actorKey . ':' . $tab;
 }
 function ap_profile_complete_fallback_cached(string $actorKey, string $route, string $tab): bool
 {

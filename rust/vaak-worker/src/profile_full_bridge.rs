@@ -63,6 +63,18 @@ async fn paint_full_with_warm(db:&tokio_postgres::Client,request:&FullRequest,de
  super::mark_step("serialize");let serialize_started=std::time::Instant::now();let bytes=serde_json::to_vec(&reply)?;super::record_stage(super::Stage::Serialize,serialize_started);if bytes.len()>MAX_REPLY{bail!("full profile reply size")}
  super::mark_step("publish");super::timed(super::Stage::Publish,prepared.require_current(db)).await?;Ok(bytes)
 }
+/// Guest first paint of a local profile's Posts tab, thrown away. Used at
+/// worker start to fill the header/card caches and prepare the backend.
+/// Preview budgets are 0, so no link or quote preview fetch starts.
+pub(crate) async fn warm_guest_paint(cfg:&crate::config::Config,actor_key:&str)->Result<()>{
+ let request=decode_full(&serde_json::to_vec(&json!({
+  "protocol_version":1,"viewer":{"kind":"guest"},"actor_key":actor_key,
+  "actor":format!("https://mkultra.monster/users/{actor_key}"),"tab":"posts","from":"","post":"","page":1,
+  "shell":false,"lazy_media":false,"status_preview_budget":0,"quote_preview_budget":0,"bsky_budget_deadline":null,
+ }))?)?;
+ let db=crate::db::profile_reused(&cfg.database_url).await?;
+ paint_full(cfg,&db,&request,&crate::direct_preview::PreviewDependencies::production()).await.map(|_|())
+}
 pub(crate) async fn render_full(cfg:&crate::config::Config,headers:HeaderMap,bytes:Bytes)->Response{
  if super::enabled(){super::prewarm_complete_profile();}
  let response=super::with_production_budget(async{

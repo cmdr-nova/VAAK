@@ -38,13 +38,39 @@ pub(crate) fn prewarm_complete_profile(){
  });
 }
 /// Run once when the HTTP worker starts with the switch on: compile the
-/// regexes and park two pooled database connections, so the first visitor
-/// after a restart does not pay for them inside the budget.
-pub(crate) async fn warm_on_start(database_url:String){
+/// regexes, park two pooled database connections, then paint each warm
+/// profile once as a guest with no budget. The first visitor after a restart
+/// used to pay for cold caches (header ~475 ms) inside the 1 s budget and got
+/// the PHP page instead.
+pub(crate) async fn warm_on_start(cfg:crate::config::Config){
  if !enabled(){return}
+ let database_url=cfg.database_url.clone();
  prewarm_complete_profile();
  let(first,second)=tokio::join!(crate::db::profile_reused(&database_url),crate::db::profile_reused(&database_url));
  for conn in [first,second]{match conn{Ok(conn)=>{if let Err(error)=conn.simple_query("SELECT 1").await{tracing::warn!(target:"vaak.profile.complete",error=%error,"profile warm-up query failed");}},Err(_)=>tracing::warn!(target:"vaak.profile.complete","profile warm-up connect failed")}}
+ let keys=match warm_profile_keys(std::env::var("VAAK_PROFILE_COMPLETE_WARM_KEYS").ok().as_deref()){Some(keys)=>keys,None=>match crate::db::profile_reused(&database_url).await{Ok(db)=>db.query_opt("SELECT lower(actor_key::text) FROM ap_users WHERE id::bigint=1 AND disabled_at IS NULL",&[]).await.ok().flatten().map(|row|vec![row.get::<_,String>(0)]).unwrap_or_default(),Err(_)=>Vec::new()}};
+ for key in keys{
+  let started=std::time::Instant::now();
+  // Same scope as a real request, so the schema-probe memo and the shared
+  // Redis connection fill too, with a long deadline instead of the 1 s budget.
+  let paint=PROFILE_DEADLINE.scope(std::time::Instant::now()+std::time::Duration::from_secs(30),PROFILE_STAGES.scope(std::cell::Cell::new(StageTimes::default()),full::warm_guest_paint(&cfg,&key))).await;
+  match paint{
+   Ok(())=>tracing::info!(target:"vaak.profile.complete",profile_target=%key,elapsed_ms=started.elapsed().as_millis() as u64,"profile warm-up paint done"),
+   Err(error)=>tracing::warn!(target:"vaak.profile.complete",profile_target=%key,elapsed_ms=started.elapsed().as_millis() as u64,reason=fallback_reason(&error),"profile warm-up paint failed"),
+  }
+ }
+}
+/// `VAAK_PROFILE_COMPLETE_WARM_KEYS`: comma-separated local usernames, at most
+/// five. Unset means "the owner account"; set but empty turns paints off.
+pub(crate) fn warm_profile_keys(raw:Option<&str>)->Option<Vec<String>>{
+ let raw=raw?;
+ let mut keys:Vec<String>=Vec::new();
+ for key in raw.split(',').map(|k|k.trim().trim_start_matches('@').to_ascii_lowercase()){
+  if key.is_empty()||key.len()>80||!key.chars().all(|c|c.is_ascii_alphanumeric()||c=='_')||keys.contains(&key){continue}
+  keys.push(key);
+  if keys.len()==5{break}
+ }
+ Some(keys)
 }
 pub(crate) async fn with_production_budget<T>(fut:impl std::future::Future<Output=T>)->T{
  PROFILE_DEADLINE.scope(std::time::Instant::now()+complete_budget(),PROFILE_STAGES.scope(std::cell::Cell::new(StageTimes::default()),fut)).await
@@ -210,6 +236,12 @@ pub(crate) async fn fixture_request(cfg:&crate::config::Config,secret:&str,heade
 #[cfg(test)]
 mod tests{
  use super::*;
+ #[test]fn warm_keys_parse_and_cap(){
+  assert_eq!(warm_profile_keys(None),None);
+  assert_eq!(warm_profile_keys(Some("")),Some(vec![]));
+  assert_eq!(warm_profile_keys(Some(" @Cmdr_Nova, luna_naloc,cmdr_nova,bad key,../x ")),Some(vec!["cmdr_nova".to_string(),"luna_naloc".to_string()]));
+  assert_eq!(warm_profile_keys(Some("a,b,c,d,e,f,g")).unwrap().len(),5);
+ }
  #[test]fn fallback_reason_codes_hide_source_text(){
   let budget=anyhow::anyhow!("profile_fallback_code=budget");assert_eq!(fallback_reason(&budget),"budget");
   assert_eq!(fallback_reason(&anyhow::anyhow!("PHP fallback: associative quote tag order requires raw decoding")),"quote_tag_order");
