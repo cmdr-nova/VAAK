@@ -5136,7 +5136,9 @@ pub async fn warm_view(
             // Ranked caches can briefly contain an item from before a mute or
             // instance block changed. Filter again at hydration so stale
             // envelopes cannot leak blocked actors into the Rust timeline.
-            if crate::hidden::ordinary_status_hidden(&st, &hidden) {
+            if crate::hidden::ordinary_status_hidden(&st, &hidden)
+                || (view == "home" && crate::hidden::reply_target_hidden(&st, &hidden))
+            {
                 continue;
             }
             if view == "home" && e.kind == "bsky" {
@@ -5173,7 +5175,8 @@ pub async fn warm_view(
     crate::audience::filter_statuses(&db, owner_user_id, crate::audience::Surface::timeline(view), &mut statuses).await?;
     let selected:Vec<String> = statuses.iter().filter_map(|status|status.get("uri").and_then(Value::as_str).map(str::to_owned)).collect();
     crate::hidden::load_ordinary_owned_notes(&db, owner_user_id, &selected, &mut hidden).await?;
-    statuses.retain(|st| !crate::hidden::ordinary_status_hidden(st, &hidden));
+    statuses.retain(|st| !crate::hidden::ordinary_status_hidden(st, &hidden)
+        && !(view == "home" && crate::hidden::reply_target_hidden(st, &hidden)));
     if view == "home" {
         crate::home_bsky_mirrors::filter_statuses(&db, owner_user_id, &mut statuses).await?;
     }
@@ -5725,7 +5728,9 @@ pub(crate) async fn statuses_for_older_hits(
             _ => None,
         };
         let Some(mut st) = built else { continue };
-        if crate::hidden::ordinary_status_hidden(&st, &hidden) {
+        if crate::hidden::ordinary_status_hidden(&st, &hidden)
+            || (view == "home" && crate::hidden::reply_target_hidden(&st, &hidden))
+        {
             continue;
         }
         st["vaak_tl_cursor"] = json!(crate::timeline_cursor::pack(&hit.cursor()));
