@@ -1110,6 +1110,20 @@ struct ActorRow {
     host: String,
     icon: String,
     emojis: Value,
+    /// The cached actor document says Service or Application (Mastodon's
+    /// "bot" accounts, Misskey/Sharkey `isBot`, most feed bridges).
+    bot: bool,
+}
+
+/// ActivityStreams actor types that mean an automated account.
+pub(crate) fn actor_doc_is_bot(profile: &Value) -> bool {
+    let is_bot_type = |v: &Value| matches!(v.as_str(), Some("Service" | "Application"));
+    let typed = match profile.get("type") {
+        Some(Value::Array(types)) => types.iter().any(is_bot_type),
+        Some(t) => is_bot_type(t),
+        None => false,
+    };
+    typed || profile.get("isBot").and_then(Value::as_bool).unwrap_or(false)
 }
 
 struct OutboxRow {
@@ -1680,6 +1694,9 @@ fn actor_to_account(actor: &ActorRow) -> Value {
         &actor.icon,
     );
     account["emojis"] = actor.emojis.clone();
+    if actor.bot {
+        account["bot"] = json!(true);
+    }
     account
 }
 
@@ -3230,7 +3247,9 @@ async fn fetch_actors_map(db: &Client, actor_ids: &[String]) -> Result<HashMap<S
         // when the denormalized label/avatar columns are blank or still the
         // numeric /ap/users/{id} segment.
         let mut emojis = Value::Array(Vec::new());
+        let mut bot = false;
         if let Ok(profile) = serde_json::from_str::<Value>(&row.get::<_, String>(5)) {
+            bot = actor_doc_is_bot(&profile);
             if username_is_placeholder(&username) {
                 if let Some(pref) = profile
                     .get("preferredUsername")
@@ -3276,6 +3295,7 @@ async fn fetch_actors_map(db: &Client, actor_ids: &[String]) -> Result<HashMap<S
                 host: row.get(3),
                 icon,
                 emojis,
+                bot,
             },
         );
     }
@@ -5751,6 +5771,18 @@ mod tests {
     }
 
     #[test]
+    fn service_and_application_actors_are_bots() {
+        use super::actor_doc_is_bot;
+        assert!(actor_doc_is_bot(&json!({"type": "Service"})));
+        assert!(actor_doc_is_bot(&json!({"type": "Application"})));
+        assert!(actor_doc_is_bot(&json!({"type": ["Person", "Service"]})));
+        assert!(actor_doc_is_bot(&json!({"type": "Person", "isBot": true})));
+        assert!(!actor_doc_is_bot(&json!({"type": "Person"})));
+        assert!(!actor_doc_is_bot(&json!({"type": "Group"})));
+        assert!(!actor_doc_is_bot(&json!({})));
+    }
+
+    #[test]
     fn quote_target_reads_activitypub_quote_field() {
         let raw = r#"{"type":"Create","object":{"type":"Note","quote":"https://mkultra.monster/users/cmdr_nova/notes/quoted/"}}"#;
         assert_eq!(quote_target_from_raw_create(raw), "https://mkultra.monster/users/cmdr_nova/notes/quoted");
@@ -6029,6 +6061,7 @@ mod tests {
             host: "mkultra.monster".into(),
             icon: DEFAULT_AVATAR.into(),
             emojis: Value::Array(Vec::new()),
+            bot: false,
         };
         let local = EventRow {
             id: 41,
@@ -6120,6 +6153,7 @@ mod tests {
             host: "chaosfem.tw".into(),
             icon: "https://cdn.example/booster.webp".into(),
             emojis: serde_json::Value::Array(Vec::new()),
+            bot: false,
         };
         (announce, booster)
     }
@@ -6155,6 +6189,7 @@ mod tests {
                 host: "chaosfem.tw".into(),
                 icon: "https://cdn.example/author.webp".into(),
                 emojis: serde_json::Value::Array(Vec::new()),
+                bot: false,
             },
         );
         let st = materialize_announce(&announce, Some(&booster), None, &actors);
@@ -6197,6 +6232,7 @@ mod tests {
             host: "girlcock.club".into(),
             icon: String::new(),
             emojis: serde_json::Value::Array(Vec::new()),
+            bot: false,
         };
         let account = actor_to_account(&actor);
         assert_eq!(account["acct"], "girlcock.club");

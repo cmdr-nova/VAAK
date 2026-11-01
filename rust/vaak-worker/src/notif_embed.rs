@@ -1772,6 +1772,16 @@ fn unresolved_quote_url(status: &Value, quote: &Value) -> String {
         .unwrap_or_default()
 }
 
+/// A remote account flagged `bot` (its actor document is a Service or
+/// Application) gets the same 🤖 local automated accounts show. Local names
+/// already carry it in `display_name`, and RSS feed accounts are bots by
+/// construction, so neither gets a second badge.
+fn remote_bot_badge_due(account: &Value, display: &str) -> bool {
+    account.get("bot").and_then(Value::as_bool).unwrap_or(false)
+        && !display.contains('🤖')
+        && !account.get("id").and_then(Value::as_str).unwrap_or("").starts_with("rss-feed:")
+}
+
 /// Target URL of a quote this card would paint as pending ("not cached
 /// yet"), or None when the card has no quote or its quoted post is cached.
 /// Only the `quote` envelope counts: a summary preview alone still means the
@@ -4029,7 +4039,10 @@ pub fn paint_lean_embed_from(
     // Custom emoji come from hydrate (status_emoji::attach_custom_emojis).
     let body_emoji = vaak_types::emoji::status_emoji_map(status);
     let name_emoji = vaak_types::emoji::account_emoji_map(&account);
-    let display_html = crate::library::body::emojis(display, &name_emoji, true);
+    let mut display_html = crate::library::body::emojis(display, &name_emoji, true);
+    if remote_bot_badge_due(&account, display) {
+        display_html.push_str(" <span class=\"automated-badge\" title=\"Automated account\" aria-label=\"Automated account\">🤖</span>");
+    }
     let uri_owned = resolvable_status_uri(status);
     let uri = uri_owned.as_str();
     let created = status
@@ -5590,6 +5603,21 @@ mod tests {
             "account": {"acct": "ahri@enby.test", "display_name": "Ahri Enby", "uri": "https://enby.test/users/ahri"},
             "media_attachments": [], "reblog": inner
         })
+    }
+
+    #[test]
+    fn remote_bot_accounts_get_the_robot_badge_once() {
+        let card = |account: Value| {
+            paint_lean_feed_card(&json!({"id": "1", "uri": "https://m.test/@b/1", "url": "https://m.test/@b/1", "content": "<p>beep</p>", "created_at": "2026-11-01T00:00:00.000Z", "account": account}))
+        };
+        let bot = card(json!({"id": "https://m.test/users/b", "acct": "b@m.test", "display_name": "Beep", "bot": true, "uri": "https://m.test/users/b"}));
+        assert_eq!(bot.matches("🤖").count(), 1, "{bot}");
+        let person = card(json!({"id": "https://m.test/users/p", "acct": "p@m.test", "display_name": "Pat", "bot": false, "uri": "https://m.test/users/p"}));
+        assert!(!person.contains("🤖"));
+        let local = card(json!({"id": "1", "acct": "shana_flux", "display_name": "Shana 🤖", "bot": true, "uri": "https://mkultra.monster/users/shana_flux"}));
+        assert_eq!(local.matches("🤖").count(), 1, "local names already carry the badge");
+        let rss = card(json!({"id": "rss-feed:3", "acct": "feed", "display_name": "Feed", "bot": true}));
+        assert!(!rss.contains("🤖"), "RSS feeds stay unbadged");
     }
 
     #[test]
