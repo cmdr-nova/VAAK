@@ -60,6 +60,14 @@ impl HiddenSets {
                 return true;
             }
         }
+        // The other direction: Bridgy Fed shows a Bluesky account on the
+        // fediverse as https://bsky.brid.gy/ap/<did>, so a Bluesky block,
+        // mute or moderation list entry hides that copy too.
+        if let Some(did) = bridgy_bsky_did(actor) {
+            if self.actor_hidden(&did, ignore_personal_mute) {
+                return true;
+            }
+        }
         // A Bridgy Fed account is `user.host.ap.brid.gy` on Bluesky, so a
         // blocked fediverse actor or domain also hides its bridged account.
         if let Some(handle) = bridgy_ap_handle(actor) {
@@ -73,6 +81,64 @@ impl HiddenSets {
 }
 
 const BRIDGY_AP_SUFFIX: &str = ".ap.brid.gy";
+
+/// The Bluesky DID behind a Bridgy Fed fediverse actor
+/// (`https://bsky.brid.gy/ap/did:plc:...`), or None.
+fn bridgy_bsky_did(actor: &str) -> Option<String> {
+    let actor = actor.trim().trim_end_matches('/');
+    let rest = match actor.get(..24) {
+        Some(prefix) if prefix.eq_ignore_ascii_case("https://bsky.brid.gy/ap/") => &actor[24..],
+        _ => return None,
+    };
+    let did = raw_percent_decode(rest);
+    (did.starts_with("did:") && did.len() > 4 && !did.contains(['/', '?', '#', '@'])).then_some(did)
+}
+
+/// The author of the post a reply answers, from the parent's URL alone:
+/// `at://did/...`, `https://bsky.app/profile/x/post/...`, or a fediverse
+/// `/users/x/statuses/...`, `/@x/...` or `/notes/` URL. None when the URL
+/// does not name its author (Misskey `/notes/<id>` and the like).
+pub fn reply_parent_actor(parent: &str) -> Option<String> {
+    let parent = parent.trim().trim_end_matches('/');
+    if let Some(rest) = parent.strip_prefix("at://") {
+        let did = rest.split('/').next().unwrap_or("");
+        return did.starts_with("did:").then(|| did.to_owned());
+    }
+    if let Some(rest) = parent.get(..25).filter(|p| p.eq_ignore_ascii_case("https://bsky.app/profile/")).map(|_| &parent[25..]) {
+        let who = rest.split('/').next().unwrap_or("");
+        return (!who.is_empty()).then(|| format!("https://bsky.app/profile/{who}"));
+    }
+    if !parent.starts_with("https://") {
+        return None;
+    }
+    for marker in ["/statuses/", "/notes/", "/posts/"] {
+        if let Some((actor, _)) = parent.split_once(marker) {
+            let path = actor.splitn(4, '/').nth(3).unwrap_or("");
+            if path.starts_with("users/") || path.starts_with('@') {
+                return Some(actor.to_owned());
+            }
+        }
+    }
+    // Mastodon web form: https://host/@user/123
+    static WEB_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    WEB_RE.get_or_init(|| regex::Regex::new(r"(?i)^(https://[^/]+/@[^/?#@]+)/[0-9]+$").unwrap())
+        .captures(parent).map(|c| c[1].to_owned())
+}
+
+/// True when a reply answers a post by someone the viewer has blocked or muted
+/// (VAAK or Bluesky moderation, including lists), or a post on a blocked
+/// domain. Home drops these, as Mastodon's home feed does; the reply's own
+/// author is checked separately by `status_hidden`.
+pub fn reply_target_hidden(status: &Value, hidden: &HiddenSets) -> bool {
+    let check = |st: &Value| {
+        let Some(parent) = st.get("vaak_in_reply_to_url").and_then(Value::as_str).filter(|p| !p.is_empty()) else { return false };
+        if let Some(host) = host_of(parent) {
+            if hidden.host_blocked(&host.to_ascii_lowercase()) { return true; }
+        }
+        reply_parent_actor(parent).is_some_and(|actor| hidden.is_hidden(&actor))
+    };
+    check(status) || status.get("reblog").filter(|v| v.is_object()).is_some_and(check)
+}
 
 /// Lowercased Bluesky handle when `actor` names a Bridgy Fed bridged
 /// fediverse account, as a bare handle or a bsky.app profile URL.
@@ -1978,5 +2044,65 @@ mod bsky_hide_notification_tests {
         )];
         drop_bsky_hidden_senders(&mut items, &HashSet::new(), &handles());
         assert_eq!(items.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod home_reply_block_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn sets() -> HiddenSets {
+        let mut hidden = HiddenSets::default();
+        apply_bsky_hide_rows(&mut hidden, &[("did:plc:listed".into(), "listblock".into()), ("did:plc:muted".into(), "mute".into())]);
+        insert_actor_aliases(&mut hidden.user_blocked_actors, "https://bad.example/users/troll");
+        hidden.user_blocked_domains.insert("blocked.example".into());
+        hidden
+    }
+
+    #[test]
+    fn bridgy_copy_of_a_bluesky_block_is_hidden() {
+        let hidden = sets();
+        assert!(hidden.is_hidden("https://bsky.brid.gy/ap/did:plc:listed"));
+        assert!(hidden.is_hidden("https://bsky.brid.gy/ap/did%3Aplc%3Alisted/"));
+        assert!(hidden.is_hidden("https://bsky.brid.gy/ap/did:plc:muted"));
+        assert!(!hidden.is_hidden("https://bsky.brid.gy/ap/did:plc:friend"));
+        assert!(!hidden.is_hidden("https://bsky.brid.gy/ap/did:plc:listed/outbox/x"));
+        let status = json!({"uri": "https://bsky.brid.gy/convert/ap/at://did:plc:listed/app.bsky.feed.post/1",
+            "account": {"uri": "https://bsky.brid.gy/ap/did:plc:listed"}, "content": "hi"});
+        assert!(status_hidden(&status, &hidden));
+    }
+
+    #[test]
+    fn parent_actor_from_reply_urls() {
+        assert_eq!(reply_parent_actor("at://did:plc:x/app.bsky.feed.post/1").as_deref(), Some("did:plc:x"));
+        assert_eq!(reply_parent_actor("https://bsky.app/profile/a.bsky.social/post/1").as_deref(), Some("https://bsky.app/profile/a.bsky.social"));
+        assert_eq!(reply_parent_actor("https://m.example/users/a/statuses/1").as_deref(), Some("https://m.example/users/a"));
+        assert_eq!(reply_parent_actor("https://mkultra.monster/users/a/notes/abc").as_deref(), Some("https://mkultra.monster/users/a"));
+        assert_eq!(reply_parent_actor("https://m.example/@a/123").as_deref(), Some("https://m.example/@a"));
+        assert_eq!(reply_parent_actor("https://misskey.example/notes/9abc"), None);
+        assert_eq!(reply_parent_actor("https://m.example/objects/1"), None);
+    }
+
+    #[test]
+    fn replies_to_hidden_accounts_are_dropped_from_home() {
+        let hidden = sets();
+        let reply = |parent: &str| json!({"uri": "https://friend.example/users/f/statuses/2",
+            "account": {"uri": "https://friend.example/users/f"}, "content": "reply", "vaak_in_reply_to_url": parent});
+        for parent in [
+            "at://did:plc:listed/app.bsky.feed.post/1",
+            "at://did:plc:muted/app.bsky.feed.post/1",
+            "https://bad.example/users/troll/statuses/1",
+            "https://bad.example/@troll/1",
+            "https://sub.blocked.example/notes/1",
+        ] {
+            assert!(reply_target_hidden(&reply(parent), &hidden), "{parent}");
+        }
+        for parent in ["at://did:plc:friend/app.bsky.feed.post/1", "https://good.example/users/a/statuses/1", "https://misskey.example/notes/1"] {
+            assert!(!reply_target_hidden(&reply(parent), &hidden), "{parent}");
+        }
+        assert!(!reply_target_hidden(&json!({"content": "not a reply"}), &hidden));
+        let boost = json!({"reblog": reply("at://did:plc:listed/app.bsky.feed.post/1")});
+        assert!(reply_target_hidden(&boost, &hidden));
     }
 }
