@@ -20048,6 +20048,27 @@ function admin_visibility_badge_html(mixed $visibility): string
  * @param array<string,mixed> $st
  * @param array<string,bool> $followingIds
  */
+/**
+ * Remote author of a card is an automated account: the payload's Mastodon
+ * `bot` flag, else the cached actor document (Service/Application/isBot).
+ * Cache-only, so a card paint never fetches.
+ */
+function admin_remote_account_is_bot(mixed $account, string $actorRef): bool
+{
+    if (is_array($account) && !empty($account['bot'])) {
+        return true;
+    }
+    if ($actorRef === '' || !str_starts_with($actorRef, 'https://') || !function_exists('ap_remote_actor_get') || !function_exists('ap_actor_doc_is_bot')) {
+        return false;
+    }
+    try {
+        $row = ap_remote_actor_get($actorRef);
+    } catch (Throwable) {
+        return false;
+    }
+    return is_array($row) && ap_actor_doc_is_bot($row['profile_json'] ?? null);
+}
+
 function admin_render_masto_status_card(
     array $st,
     array $followingIds,
@@ -21012,7 +21033,7 @@ function admin_render_masto_status_card(
                     <span class="who"><?= h($display !== '' ? $display : 'RSS') ?></span>
                     <span class="meta"> · <?= h(relative_time((string) ($st['created_at'] ?? ''))) ?></span>
                   <?php elseif ($actorRef !== '' && !$isLocal && $profileAppHref !== ''): ?>
-                    <a class="who" href="<?= h($profileAppHref) ?>" style="color:inherit;text-decoration:none"><?= admin_emoji_html($display, $actorRef) ?></a>
+                    <a class="who" href="<?= h($profileAppHref) ?>" style="color:inherit;text-decoration:none"><?= admin_emoji_html($display, $actorRef) ?><?php if (!$isLocal && admin_remote_account_is_bot($st['account'] ?? null, $actorRef) && !str_contains($display, '🤖')): ?> <span class="automated-badge" title="Automated account" aria-label="Automated account">🤖</span><?php endif; ?></a>
                     <a class="meta" href="<?= h($profileAppHref) ?>" style="color:var(--muted);text-decoration:none"> @<?= h($acct) ?></a>
                     <span class="meta"> · <?= h(relative_time((string) ($st['created_at'] ?? ''))) ?></span>
                     <?php if (!empty($st['edited_at'])): ?>
@@ -21021,7 +21042,7 @@ function admin_render_masto_status_card(
                     <?php if (!empty($st['vaak_from_followed_tag'])): ?><span class="tag" title="Matched a hashtag you follow">followed tag</span><?php endif; ?>
                     <?= admin_anti_ai_tag_html($plain, $actorRef !== '' ? $actorRef : null) ?>
                   <?php else: ?>
-                    <span class="who"><?= admin_emoji_html($display, $actorRef !== '' ? $actorRef : null) ?></span>
+                    <span class="who"><?= admin_emoji_html($display, $actorRef !== '' ? $actorRef : null) ?><?php if (!$isLocal && admin_remote_account_is_bot($st['account'] ?? null, $actorRef) && !str_contains($display, '🤖')): ?> <span class="automated-badge" title="Automated account" aria-label="Automated account">🤖</span><?php endif; ?></span>
                     <?php if ($acct !== ''): ?><span class="meta"> @<?= h($acct) ?></span><?php endif; ?>
                     <?php if ($isLocal): ?><span class="tag" style="margin-left:.35rem">you</span><?php endif; ?>
                     <span class="meta"> · <?= h(relative_time((string) ($st['created_at'] ?? ''))) ?></span>
