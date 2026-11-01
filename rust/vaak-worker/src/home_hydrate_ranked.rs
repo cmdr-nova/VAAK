@@ -4722,7 +4722,7 @@ pub async fn warm_view(
     limits.dedup();
     let want = *limits.iter().max().unwrap_or(&MAX_HYDRATE_LIMIT) as usize;
 
-    let db = crate::db::connect(&cfg.database_url).await?;
+    let db = crate::db::timeline_reused(&cfg.database_url).await?;
     let algorithm_on = crate::recommendations::algorithm_enabled(&db, owner_user_id).await?;
     let mut redis = redis_util::connect(&cfg.redis_url).await?;
     let (head, _logical) =

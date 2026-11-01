@@ -293,7 +293,7 @@ pub async fn view_hydrate(
     if report.cache_hit && !report.items.is_empty() {
         // Moderation changes must invalidate stale cached envelopes at read
         // time, not only when the fan-out worker happens to rewarm them.
-        let moderation_db = crate::db::connect(&cfg.database_url).await?;
+        let moderation_db = crate::db::timeline_reused(&cfg.database_url).await?;
         let before = report.items.len();
         if view == "home" {
             let enabled = crate::recommendations::algorithm_enabled(&moderation_db, owner_user_id).await?;

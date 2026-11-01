@@ -498,7 +498,7 @@ async fn shadow_notif_embed(
     let viewer = crate::home_html::load_viewer_actor(&state.cfg, owner).await;
     let mut status = status;
     let checked = async {
-        let db = crate::db::connect(&state.cfg.database_url).await?;
+        let db = crate::db::timeline_reused(&state.cfg.database_url).await?;
         let mut items = vec![serde_json::json!({"status": status.clone()})];
         crate::audience::filter_notifications(&db, owner, &mut items).await?;
         anyhow::Ok(!items.is_empty())
@@ -509,7 +509,7 @@ async fn shadow_notif_embed(
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
     }
 
-    if let Ok(db) = crate::db::connect(&state.cfg.database_url).await {
+    if let Ok(db) = crate::db::timeline_reused(&state.cfg.database_url).await {
         if let Ok(moderation) = crate::hidden::load_viewer_moderation(&db, owner).await {
             crate::notif_embed::stamp_viewer_moderation_tree(&mut status, &moderation);
         }

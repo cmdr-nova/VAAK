@@ -5083,6 +5083,41 @@ function ap_cmdr_actor_document(string $publicKeyPem): array
 }
 
 /**
+ * Top 80 hosts by event count, busiest first, as rows of ['host' => ..., 'c' => ...].
+ *
+ * The GROUP BY scans all of `events` (measured ~0.8 s), and profile Updates,
+ * bites and site publishes ask for it, bites twice. The ranking moves slowly,
+ * so it is kept in cache Redis for an hour and per process for the request.
+ * Callers still apply their own skips on every call.
+ *
+ * @return list<array{host:string,c:int}>
+ */
+function ap_known_federating_hosts(): array
+{
+    static $memo = null;
+    if (is_array($memo)) {
+        return $memo;
+    }
+    $key = 'vaak:known_federating_hosts:v1';
+    if (function_exists('ap_redis_json_get')) {
+        $cached = ap_redis_json_get($key);
+        if (is_array($cached) && isset($cached['rows']) && is_array($cached['rows'])) {
+            return $memo = array_values($cached['rows']);
+        }
+    }
+    $rows = [];
+    foreach (ap_db()->query(
+        'SELECT host, COUNT(*) AS c FROM events WHERE host IS NOT NULL AND host != \'\' GROUP BY host ORDER BY c DESC LIMIT 80'
+    )->fetchAll() as $row) {
+        $rows[] = ['host' => (string) ($row['host'] ?? ''), 'c' => (int) ($row['c'] ?? 0)];
+    }
+    if ($rows !== [] && function_exists('ap_redis_json_set')) {
+        ap_redis_json_set($key, ['rows' => $rows], 3600);
+    }
+    return $memo = $rows;
+}
+
+/**
  * Shared inboxes for hosts we've already seen federating with us.
  * Used to push profile Updates (e.g. clear stale movedTo caches) beyond local followers.
  *
@@ -5091,9 +5126,7 @@ function ap_cmdr_actor_document(string $publicKeyPem): array
 function ap_known_shared_inboxes(int $limit = 40): array
 {
     $limit = max(1, min(80, $limit));
-    $rows = ap_db()->query(
-        'SELECT host, COUNT(*) AS c FROM events WHERE host IS NOT NULL AND host != \'\' GROUP BY host ORDER BY c DESC LIMIT 80'
-    )->fetchAll();
+    $rows = ap_known_federating_hosts();
     $inboxes = [];
     // Wafrn friend servers are delivered via ap_wafrn_friend_inboxes() (correct shared inbox path);
     // guessing https://HOST/inbox for them only produces HTTP 405.
