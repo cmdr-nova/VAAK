@@ -91,6 +91,9 @@ $check(is_array($row) && $row['body'] === $like && $row['state'] === 'pending' &
 $check(($row['client_ip'] ?? '') === '203.0.113.7' && ($row['signature_path'] ?? '') === '/inbox', 'spool row records client address and signed path');
 $out = ap_inbox_spool_process($row);
 $check($out['state'] === 'done' && $out['result'] !== '', 'spooled Like routes through PHP (' . $out['result'] . ')');
+$blockedObject = json_encode(['id' => $alice . '#announce-blocked', 'type' => 'Announce', 'actor' => $alice, 'object' => 'https://blocked.test/notes/1']);
+$out = ap_inbox_spool_process(['id' => 0, 'client_ip' => '', 'key_id' => $aliceKey, 'request_path' => '/inbox', 'body' => $blockedObject]);
+$check($out['state'] === 'dropped' && $out['result'] === 'rejected: Object instance blocked', 'a delivery routing rejects is dropped, not a process exit');
 
 // Personal inbox path, drained by the CLI worker.
 $like2 = smoke_like($alice, '2');
