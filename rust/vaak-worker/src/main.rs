@@ -16,6 +16,7 @@ mod settings_profile_save;
 mod admin_actions;
 mod settings_actions;
 mod home_html;
+mod home_quote_warm;
 mod home_bsky_mirrors;
 mod wafrn_crosspost;
 mod ap_public_doc;

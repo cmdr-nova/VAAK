@@ -1772,6 +1772,25 @@ fn unresolved_quote_url(status: &Value, quote: &Value) -> String {
         .unwrap_or_default()
 }
 
+/// Target URL of a quote this card would paint as pending ("not cached
+/// yet"), or None when the card has no quote or its quoted post is cached.
+/// Only the `quote` envelope counts: a summary preview alone still means the
+/// target itself was never fetched, which is what Home warms.
+pub(crate) fn unresolved_quote_target(status: &Value) -> Option<String> {
+    let q_raw = status.get("quote").filter(|v| v.is_object())?;
+    // Rejected, revoked, deleted or unauthorized quotes are final: fetching
+    // the target again cannot make them paintable.
+    let state = q_raw.get("state").and_then(Value::as_str).unwrap_or("");
+    if !matches!(state, "" | "pending" | "accepted") {
+        return None;
+    }
+    if quote_status_paintable(&normalized_quote_preview(q_raw)) {
+        return None;
+    }
+    let url = unresolved_quote_url(status, q_raw);
+    (!url.is_empty()).then_some(url)
+}
+
 /// Nested quote inside a timeline card. A resolved quote paints as a lean
 /// embed; an unresolved one paints PHP's pending/unavailable quote chrome
 /// (`admin_render_masto_status_card`) instead of an anonymous empty card.
