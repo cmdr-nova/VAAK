@@ -23,7 +23,11 @@ if (!defined('AP_INBOX_LIB_ONLY')) {
 }
 require_once __DIR__ . '/ap-inbox.php';
 
-const AP_FOLLOW_IMPORT_STATE = '/var/lib/mkultra/ap/follow-import-state.json';
+require_once __DIR__ . '/ap-import-export.php';
+// Same per-owner file You > Import uses (owner = cmdr_nova in CLI, no session).
+// A legacy shared state file is still read once so older imports resume.
+define('AP_FOLLOW_IMPORT_STATE', ap_ie_follow_state_path());
+define('AP_FOLLOW_IMPORT_STATE_READ', ap_ie_follow_state_read_path());
 const AP_FOLLOW_IMPORT_LOG = '/var/log/mkultra/ap-follow-import.log';
 
 function fi_log(string $msg): void
@@ -34,7 +38,7 @@ function fi_log(string $msg): void
 
 function fi_load_state(): array
 {
-    if (!is_readable(AP_FOLLOW_IMPORT_STATE)) {
+    if (!is_readable(AP_FOLLOW_IMPORT_STATE_READ)) {
         return [
             'csv' => '',
             'handles' => [],
@@ -49,7 +53,7 @@ function fi_load_state(): array
             'finished_at' => null,
         ];
     }
-    $j = json_decode((string) file_get_contents(AP_FOLLOW_IMPORT_STATE), true);
+    $j = json_decode((string) file_get_contents(AP_FOLLOW_IMPORT_STATE_READ), true);
     return is_array($j) ? $j : fi_load_state_empty();
 }
 
