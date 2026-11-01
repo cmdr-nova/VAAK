@@ -558,20 +558,10 @@ async fn fetch_home_events(
     Ok(items)
 }
 
-/// Add recent cached Fediverse events matching the user's followed hashtags.
-/// This is deliberately bounded and cache-only; it never performs remote work.
-async fn fetch_followed_tag_events(
-    db: &Client,
-    tags: &[String],
-    hidden: &hidden::HiddenSets,
-) -> Result<Vec<TimelineItem>> {
-    if tags.is_empty() {
-        return Ok(Vec::new());
-    }
-    let since = (chrono::Utc::now() - chrono::Duration::days(14)).to_rfc3339();
-    let rows = db
-        .query(
-            "SELECT id, type, actor_id, summary, media_urls, created_at, visibility,
+/// Followed-tag candidates by plain scan, newest first. `$1` is the RFC 3339
+/// cut-off. The Announce clause keeps boosts that carry their own body or
+/// whose original Create is cached, as the timeline painter needs one.
+const FOLLOWED_TAG_SCAN_SQL: &str = "SELECT id, type, actor_id, summary, media_urls, created_at, visibility,
                     COALESCE(object_id, ''), COALESCE(target_actor, '')
              FROM events
              WHERE type = ANY(ARRAY['Create','Announce','Quote','QuotePost'])
@@ -592,11 +582,91 @@ async fn fetch_followed_tag_events(
                  )
                )
              ORDER BY created_at DESC, id DESC
-             LIMIT 600",
-            &[&since],
-        )
-        .await
-        .context("select followed hashtag events")?;
+             LIMIT 600";
+
+/// Same rows, found through `ap_search_docs.body_tsv`. `$2` is the tsquery
+/// from [`followed_tag_tsquery`].
+const FOLLOWED_TAG_INDEXED_SQL: &str = "WITH hits AS (
+        SELECT d.source_pk FROM ap_search_docs d
+        WHERE d.source = 'event'
+          AND d.body_tsv @@ to_tsquery('simple', $2)
+          AND d.created_at >= $1
+        ORDER BY d.created_at DESC
+        LIMIT 600
+     )
+     SELECT id, type, actor_id, summary, media_urls, created_at, visibility,
+            COALESCE(object_id, ''), COALESCE(target_actor, '')
+     FROM events
+     JOIN hits ON hits.source_pk = events.id
+     WHERE type = ANY(ARRAY['Create','Announce','Quote','QuotePost'])
+       AND action_taken = ANY(ARRAY['log','local_observe'])
+       AND created_at >= $1
+       AND (
+         type <> 'Announce'
+         OR COALESCE(summary, '') <> ''
+         OR COALESCE(media_urls, '') NOT IN ('', '[]')
+         OR (
+           COALESCE(object_id, '') <> ''
+           AND EXISTS (
+             SELECT 1 FROM events original
+             WHERE original.type = 'Create'
+               AND original.action_taken = ANY(ARRAY['log','local_observe'])
+               AND original.object_id = events.object_id
+           )
+         )
+       )
+     ORDER BY created_at DESC, id DESC
+     LIMIT 600";
+
+/// `htag_a | htag_b` for the tags [`extract_hashtags`] can ever match
+/// (ASCII letters, digits and `_`, 2 to 64 long). None when no tag qualifies.
+fn followed_tag_tsquery(tags: &[String]) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    for tag in tags {
+        let tag = tag.trim().trim_start_matches('#').to_ascii_lowercase();
+        if !(2..=64).contains(&tag.len())
+            || !tag.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            || tag.trim_matches('_').is_empty()
+        {
+            continue;
+        }
+        let part = format!("htag_{tag}");
+        if !parts.contains(&part) {
+            parts.push(part);
+        }
+    }
+    (!parts.is_empty()).then(|| parts.join(" | "))
+}
+
+/// Add recent cached Fediverse events matching the user's followed hashtags.
+/// This is deliberately bounded and cache-only; it never performs remote work.
+async fn fetch_followed_tag_events(
+    db: &Client,
+    tags: &[String],
+    hidden: &hidden::HiddenSets,
+) -> Result<Vec<TimelineItem>> {
+    if tags.is_empty() {
+        return Ok(Vec::new());
+    }
+    let since = (chrono::Utc::now() - chrono::Duration::days(14)).to_rfc3339();
+    // Index path: the search docs carry an `htag_<tag>` token per hashtag
+    // (ap_search_fts_normalize_body), so the GIN index finds tagged posts
+    // directly. The old path read the newest 600 events of every kind and
+    // filtered tags afterwards, which was slow and missed any tagged post
+    // older than those 600 rows. It stays as the fallback for a box without
+    // ap_search_docs.
+    let rows = match followed_tag_tsquery(tags) {
+        Some(tsquery) => match db.query(FOLLOWED_TAG_INDEXED_SQL, &[&since, &tsquery]).await {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::debug!(error = %e, "followed tag index query failed; scanning events");
+                db.query(FOLLOWED_TAG_SCAN_SQL, &[&since])
+                    .await
+                    .context("select followed hashtag events")?
+            }
+        },
+        None => return Ok(Vec::new()),
+    };
     let wanted: HashSet<&str> = tags.iter().map(String::as_str).collect();
     let mut out = Vec::new();
     for row in rows {
@@ -4487,5 +4557,57 @@ mod tests {
         // PHP: sprintf('%u', crc32('1|2026-10-04-16')) → 3395297329
         assert_eq!(php_crc32(b"1|2026-10-04-16"), 3_395_297_329);
         assert_eq!(php_crc32(b"123456789"), 3_421_780_262);
+    }
+}
+
+#[cfg(test)]
+mod followed_tag_tests {
+    use super::*;
+
+    #[test]
+    fn tsquery_keeps_only_tags_the_matcher_can_see() {
+        let tags: Vec<String> = ["Cats", "#cats", "my_tag", "x", "café", "___", "a b", "dogs|x"]
+            .iter().map(|s| s.to_string()).collect();
+        assert_eq!(followed_tag_tsquery(&tags).as_deref(), Some("htag_cats | htag_my_tag"));
+        assert_eq!(followed_tag_tsquery(&["é".to_string()]), None);
+    }
+
+    /// Runs where a disposable fixture database is configured; skipped otherwise.
+    /// Temp tables shadow the real ones, so nothing outside the session changes.
+    #[tokio::test]
+    async fn indexed_path_finds_tagged_posts_older_than_the_newest_600() {
+        let Ok(url) = std::env::var("LIBRARY_FIXTURE_DB") else { return };
+        let db = crate::db::connect(&url).await.unwrap();
+        db.batch_execute(
+            "CREATE TEMP TABLE events (id BIGINT PRIMARY KEY, type TEXT, actor_id TEXT, summary TEXT,
+                media_urls TEXT, created_at TEXT, visibility TEXT, object_id TEXT, target_actor TEXT,
+                action_taken TEXT);
+             CREATE TEMP TABLE ap_search_docs (id BIGSERIAL PRIMARY KEY, source TEXT, source_pk BIGINT,
+                object_id TEXT, created_at TEXT, body TEXT,
+                body_tsv tsvector GENERATED ALWAYS AS (to_tsvector('simple', body)) STORED);",
+        ).await.unwrap();
+        let now = chrono::Utc::now();
+        let old = (now - chrono::Duration::hours(3)).to_rfc3339();
+        db.execute(
+            "INSERT INTO events VALUES (1,'Create','https://r.test/users/a','Look #Cats','[]',$1,'public','https://r.test/n/1','','log')",
+            &[&old],
+        ).await.unwrap();
+        db.execute(
+            "INSERT INTO ap_search_docs (source,source_pk,object_id,created_at,body) VALUES ('event',1,'https://r.test/n/1',$1,'Look #Cats htag_cats')",
+            &[&old],
+        ).await.unwrap();
+        // 700 newer untagged posts push the tagged one out of a plain newest-600 scan.
+        for i in 0..700i64 {
+            let ts = (now - chrono::Duration::seconds(i)).to_rfc3339();
+            db.execute(
+                "INSERT INTO events VALUES ($1,'Create','https://r.test/users/b','plain','[]',$2,'public','','','log')",
+                &[&(i + 10), &ts],
+            ).await.unwrap();
+        }
+        let hidden = hidden::HiddenSets::default();
+        let items = fetch_followed_tag_events(&db, &["cats".to_string()], &hidden).await.unwrap();
+        assert_eq!(items.len(), 1, "the tagged post is found through the index");
+        let scan = db.query(FOLLOWED_TAG_SCAN_SQL, &[&(now - chrono::Duration::days(14)).to_rfc3339()]).await.unwrap();
+        assert!(scan.iter().all(|r| r.get::<_, i64>(0) != 1), "the old scan missed it");
     }
 }
