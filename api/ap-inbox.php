@@ -17,6 +17,8 @@ const AP_INBOX_RATE_MAX = 600;             // requests / window / IP (normal pee
 const AP_INBOX_RATE_MAX_RELAY = 12000;     // requests / window / IP for accepted relay hosts
 const AP_INBOX_RATE_WINDOW = 3600;         // seconds
 const AP_INBOX_KEY_CACHE_TTL = 3600;
+/** Rust inbox key mirror. A rotated key fails in Rust and comes back to PHP, which re-mirrors it. */
+const AP_INBOX_RUST_KEY_MIRROR_TTL = 86400;
 /** How long to remember "this keyId is not fetchable" (Threads dead actors, etc.). */
 const AP_INBOX_KEY_NEG_CACHE_TTL = 900; // 15 minutes
 const AP_INBOX_KEY_FETCH_TIMEOUT = 8;
@@ -2140,7 +2142,8 @@ function ap_inbox_rust_key_mirror_key(string $keyId): string
 /**
  * Rust cutover F2: after a key verifies a delivery, share it with the Rust
  * inbox (which runs with a private /tmp and never fetches keys). Accepted
- * relay keys are not shared, so relay deliveries keep coming to PHP.
+ * relay keys are marked, so Rust gives them the relay rate ceiling and
+ * spools the Creates and Announces they forward for ap_inbox_spool_process.
  */
 function ap_inbox_rust_key_mirror(string $keyId, $pem): void
 {
@@ -2151,16 +2154,14 @@ function ap_inbox_rust_key_mirror(string $keyId, $pem): void
         if (!function_exists('ap_relay_is_accepted_key')) {
             require_once __DIR__ . '/ap-relays.php';
         }
-        if (function_exists('ap_relay_is_accepted_key') && ap_relay_is_accepted_key($keyId)) {
-            return;
-        }
+        $relay = function_exists('ap_relay_is_accepted_key') && ap_relay_is_accepted_key($keyId);
         $redis = function_exists('ap_redis_client') ? ap_redis_client() : null;
         if (!$redis) {
             return;
         }
-        $json = json_encode(['pem' => $pem, 'owner' => ap_key_owner_cached($keyId)], JSON_UNESCAPED_SLASHES);
+        $json = json_encode(['pem' => $pem, 'owner' => ap_key_owner_cached($keyId), 'relay' => $relay], JSON_UNESCAPED_SLASHES);
         if (is_string($json)) {
-            $redis->setEx(ap_inbox_rust_key_mirror_key($keyId), AP_INBOX_KEY_CACHE_TTL, $json);
+            $redis->setEx(ap_inbox_rust_key_mirror_key($keyId), AP_INBOX_RUST_KEY_MIRROR_TTL, $json);
         }
     } catch (Throwable $e) {
         error_log('[ap-inbox] rust key mirror failed: ' . $e->getMessage());
@@ -2202,8 +2203,28 @@ function ap_inbox_spool_process(array $row): array
         return ['state' => 'dropped', 'result' => 'blocked'];
     }
     $claimedActor = ap_as_id($json['actor'] ?? null);
-    if ($claimedActor === null || !ap_inbox_actor_matches_key($keyId, $claimedActor)) {
+    if ($claimedActor === null) {
         return ['state' => 'dropped', 'result' => 'actor_mismatch'];
+    }
+    if (!ap_inbox_actor_matches_key($keyId, $claimedActor)) {
+        // Only an accepted relay's forwarded Create or Announce, as in ap_inbox_main.
+        if (!function_exists('ap_relay_is_accepted_key')) {
+            require_once __DIR__ . '/ap-relays.php';
+        }
+        $relayOk = in_array($type, ['Create', 'Announce'], true)
+            && function_exists('ap_relay_is_accepted_key') && ap_relay_is_accepted_key($keyId);
+        if (!$relayOk) {
+            return ['state' => 'dropped', 'result' => 'actor_mismatch'];
+        }
+        ap_log(sprintf('relay_forward via=rust_spool type=%s keyId=%s actor=%s', $type, ap_short($keyId), ap_short($claimedActor)));
+        // The relay vouches for delivery, not for the post.
+        if ($type === 'Create') {
+            $refetched = ap_inbox_refetch_forwarded_create($json);
+            if ($refetched === null) {
+                return ['state' => 'dropped', 'result' => 'forward_dropped'];
+            }
+            $json = $refetched;
+        }
     }
     ap_log(sprintf(
         'accepted via=rust_spool id=%d ip=%s type=%s bytes=%d keyId=%s',
