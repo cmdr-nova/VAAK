@@ -475,7 +475,7 @@ function ap_masto_account(): array
         'acct' => $username,
         'display_name' => $displayName,
         'locked' => !empty($p['manually_approves']),
-        'bot' => false,
+        'bot' => !empty($p['automated']),
         'discoverable' => !empty($p['discoverable']),
         'indexable' => array_key_exists('indexable', $p) ? !empty($p['indexable']) : true,
         'group' => false,
@@ -545,7 +545,7 @@ function ap_masto_account_from_user(array $user): array
         'acct' => $username,
         'display_name' => $displayName,
         'locked' => !empty($p['manually_approves']),
-        'bot' => false,
+        'bot' => !empty($p['automated']),
         'discoverable' => !empty($p['discoverable']),
         'indexable' => array_key_exists('indexable', $p) ? !empty($p['indexable']) : true,
         'group' => false,
@@ -4655,6 +4655,32 @@ function ap_masto_site_syndication_for_url(string $pageUrl): ?array
 /**
  * Best-effort remote Account entity from an ActivityPub actor id.
  */
+/**
+ * A cached actor document describes an automated account: AS2 type Service
+ * or Application (string or array form), or Misskey's `isBot`. Same rule as
+ * the Rust painters (home_hydrate_ranked::actor_doc_is_bot).
+ */
+function ap_actor_doc_is_bot(mixed $profileJson): bool
+{
+    if (!is_string($profileJson) || $profileJson === '' || $profileJson[0] !== '{') {
+        return false;
+    }
+    $doc = json_decode($profileJson, true);
+    if (!is_array($doc)) {
+        return false;
+    }
+    if (($doc['isBot'] ?? null) === true) {
+        return true;
+    }
+    $types = $doc['type'] ?? null;
+    foreach (is_array($types) ? $types : [$types] as $type) {
+        if (is_string($type) && in_array(strtolower($type), ['service', 'application'], true)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 function ap_masto_remote_account(string $actorId, bool $allowFetch = false): array
 {
     $actorId = rtrim(trim($actorId), '/');
