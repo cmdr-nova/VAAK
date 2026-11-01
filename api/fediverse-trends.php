@@ -75,16 +75,30 @@ foreach (array_slice($upstreamTags, 0, 5) as $tag) {
 
     $uses = 0;
     $accounts = 0;
+    $daily = [];
     foreach (($tag['history'] ?? []) as $history) {
-        $uses += max(0, (int) ($history['uses'] ?? 0));
+        if (!is_array($history)) {
+            continue;
+        }
+        $dayUses = max(0, (int) ($history['uses'] ?? 0));
+        $uses += $dayUses;
         $accounts += max(0, (int) ($history['accounts'] ?? 0));
+        if (count($daily) < 7) {
+            $daily[] = $dayUses;
+        }
     }
+    // Upstream history is newest day first; the site draws oldest to newest.
+    while (count($daily) < 7) {
+        $daily[] = 0;
+    }
+    $daily = array_reverse($daily);
 
     $tags[] = [
         'name' => $name,
         'url' => 'https://mkultra.monster/vaak/?view=search&q=' . rawurlencode('#' . $name),
         'uses' => $uses,
         'accounts' => $accounts,
+        'daily_uses' => $daily,
     ];
 }
 
