@@ -3387,7 +3387,29 @@ fn observation_actor_keys(self_actor: &str, following: &[String]) -> Vec<String>
 struct StoredWarm {
     token: String,
     logical: Option<String>,
+    built_at: std::time::Instant,
 }
+
+/// Home inputs that change every minute whether or not this owner's Home
+/// would: Jetstream writes every observed Bluesky post, the Nostr relay
+/// archives every event, sessions refresh tokens, RSS polls rewrite items.
+/// New posts from followed Bluesky accounts already reach Home through the
+/// live `home_bsky` fan-out, so a change here only forces a rebuild once
+/// [`HOME_CHURN_MIN_SECS`] have passed since the last one. Every other
+/// input (follows, blocks, mutes, own posts, favourites) still rebuilds on
+/// the next tick.
+const HOME_CHURN_TABLES: &[&str] = &[
+    "bsky_posts",
+    "bsky_post_observations",
+    "bsky_post_links",
+    "bsky_sessions",
+    "nostr_events",
+    "rss_items",
+    "masto_statuses",
+];
+const HOME_CHURN_MIN_SECS: u64 = 300;
+/// Separates the exact part of a warm token from its churn part.
+const CHURN_SEP: &str = "|churn:";
 
 fn view_input_tables(view: &str) -> &'static [&'static str] {
     match view {
@@ -3502,21 +3524,48 @@ fn view_warm_token(view: &str, inputs: &WarmInputs, owner: i64, hour_bucket: i64
     if view == "home" || view == "feed" {
         parts.push(events_token_part(view, inputs, home_global)?);
     }
+    let mut churn = Vec::new();
     for name in view_input_tables(view) {
         if *name == "events" {
             continue;
         }
-        match inputs.tables.get(*name) {
-            Some(ticks) => parts.push(format!("{name}={}:{}:{}", ticks.ins, ticks.upd, ticks.del)),
-            None => parts.push(format!("{name}=-")),
+        let part = match inputs.tables.get(*name) {
+            Some(ticks) => format!("{name}={}:{}:{}", ticks.ins, ticks.upd, ticks.del),
+            None => format!("{name}=-"),
+        };
+        if view == "home" && HOME_CHURN_TABLES.contains(name) {
+            churn.push(part);
+        } else {
+            parts.push(part);
         }
     }
-    Some(parts.join(";"))
+    let mut token = parts.join(";");
+    if !churn.is_empty() {
+        token.push_str(CHURN_SEP);
+        token.push_str(&churn.join(";"));
+    }
+    Some(token)
 }
 
 fn warm_should_skip(previous: Option<&str>, token: Option<&str>) -> bool {
     match (previous, token) {
         (Some(prev), Some(next)) => !prev.is_empty() && prev == next,
+        _ => false,
+    }
+}
+
+/// Like [`warm_should_skip`], but a token whose only change is in its churn
+/// part still skips until the last build is [`HOME_CHURN_MIN_SECS`] old.
+fn warm_should_skip_aged(previous: Option<&str>, token: Option<&str>, built_secs_ago: u64) -> bool {
+    if warm_should_skip(previous, token) {
+        return true;
+    }
+    let (Some(prev), Some(next)) = (previous, token) else { return false };
+    if prev.is_empty() || built_secs_ago >= HOME_CHURN_MIN_SECS {
+        return false;
+    }
+    match (prev.split_once(CHURN_SEP), next.split_once(CHURN_SEP)) {
+        (Some((prev_exact, _)), Some((next_exact, _))) => prev_exact == next_exact,
         _ => false,
     }
 }
@@ -3850,7 +3899,8 @@ pub async fn run_loop(
                 let key = (owner, view.to_string());
                 let previous_token = memory.get(&key).map(|state| state.token.clone());
                 let previous_logical = memory.get(&key).and_then(|state| state.logical.clone());
-                if warm_should_skip(previous_token.as_deref(), token.as_deref()) {
+                let built_secs_ago = memory.get(&key).map(|state| state.built_at.elapsed().as_secs()).unwrap_or(u64::MAX);
+                if warm_should_skip_aged(previous_token.as_deref(), token.as_deref(), built_secs_ago) {
                     if let Some(logical) = previous_logical {
                         if redis.is_none() {
                             redis = redis_util::connect(&cfg.redis_url).await.ok();
@@ -3893,6 +3943,7 @@ pub async fn run_loop(
                                 StoredWarm {
                                     token,
                                     logical: warm_line_logical(&line),
+                                    built_at: std::time::Instant::now(),
                                 },
                             );
                         } else {
@@ -4017,6 +4068,29 @@ mod tests {
         assert!(!warm_should_skip(None, Some("x")));
         assert!(!warm_should_skip(Some("x"), None));
         assert!(!warm_should_skip(Some(""), Some("")));
+    }
+
+    #[test]
+    fn home_churn_waits_but_real_changes_rebuild_at_once() {
+        let mut inputs = sample_inputs();
+        inputs.tables.insert("bsky_posts".into(), TableTicks { ins: 100, upd: 0, del: 0 });
+        inputs.tables.insert("ap_mutes".into(), TableTicks { ins: 1, upd: 0, del: 0 });
+        let before = view_warm_token("home", &inputs, 1, 5);
+        assert!(before.as_deref().is_some_and(|t| t.contains(CHURN_SEP) && t.contains("bsky_posts=100")));
+        let mut churned = inputs.clone();
+        churned.tables.get_mut("bsky_posts").unwrap().ins = 900;
+        let after = view_warm_token("home", &churned, 1, 5);
+        assert_ne!(before, after);
+        assert!(warm_should_skip_aged(before.as_deref(), after.as_deref(), 60), "churn alone waits");
+        assert!(!warm_should_skip_aged(before.as_deref(), after.as_deref(), HOME_CHURN_MIN_SECS), "churn rebuilds once old enough");
+        let mut muted = churned.clone();
+        muted.tables.get_mut("ap_mutes").unwrap().ins = 2;
+        let muted_token = view_warm_token("home", &muted, 1, 5);
+        assert!(!warm_should_skip_aged(before.as_deref(), muted_token.as_deref(), 0), "a new mute rebuilds right away");
+        assert!(!warm_should_skip_aged(None, after.as_deref(), 0));
+        // Local and Federated keep exact tokens.
+        assert!(!view_warm_token("local", &inputs, 1, 5).unwrap().contains(CHURN_SEP));
+        assert!(!view_warm_token("feed", &inputs, 1, 5).unwrap().contains(CHURN_SEP));
     }
 
     #[test]
