@@ -84,8 +84,10 @@ low=()
 command -v nice >/dev/null 2>&1 && low+=(nice -n 19)
 command -v ionice >/dev/null 2>&1 && low+=(ionice -c 3 -t)
 pg_opts="-c maintenance_work_mem=${MAINT_MEM} -c max_parallel_maintenance_workers=0 -c synchronous_commit=off"
+# The dumps are root:vaak-backup 0640, so the postgres user cannot open them.
+# Root opens the file and hands it to pg_restore on stdin (fine with --jobs=1).
 pg env PGOPTIONS="${pg_opts}" "${low[@]}" pg_restore --no-owner --no-privileges --exit-on-error --jobs=1 \
-  --dbname="${SCRATCH_DB}" "${BACKUP_DIR}/${dump}" || fail "pg_restore of ${dump} failed"
+  --dbname="${SCRATCH_DB}" < "${BACKUP_DIR}/${dump}" || fail "pg_restore of ${dump} failed"
 restore_secs=$(( $(date +%s) - started ))
 
 summary=()
