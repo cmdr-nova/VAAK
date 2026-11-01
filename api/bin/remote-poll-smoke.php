@@ -3,7 +3,7 @@ declare(strict_types=1);
 /** Remote Questions keep their poll options so timelines can paint them, and local accounts can vote on them. */
 require __DIR__ . '/migration-reference-functions.php';
 reference_load(dirname(__DIR__) . '/ap-db.php', ['ap_db_driver', 'ap_remote_polls_migrate', 'ap_remote_poll_id_base', 'ap_remote_poll_public_id',
-    'ap_remote_poll_row_id', 'ap_remote_poll_from_doc', 'ap_remote_poll_store', 'ap_remote_poll_find', 'ap_remote_poll_own_votes',
+    'ap_remote_poll_row_id', 'ap_remote_poll_from_doc', 'ap_remote_poll_host', 'ap_remote_poll_store', 'ap_remote_poll_find', 'ap_remote_poll_own_votes',
     'ap_remote_poll_is_expired', 'ap_remote_poll_ballot', 'ap_remote_poll_vote_activities', 'ap_remote_poll_record_vote', 'ap_remote_poll_forget_vote']);
 reference_load(dirname(__DIR__) . '/ap-inbox.php', ['ap_remote_poll_vote']);
 reference_load(dirname(__DIR__) . '/ap-masto-entities.php', ['ap_masto_format_time', 'ap_masto_remote_poll_entity', 'ap_masto_attach_remote_polls', 'ap_masto_api_poll',
@@ -60,7 +60,8 @@ try {
     $multi = ap_remote_poll_from_doc(['type' => 'Question', 'id' => 'https://x/2', 'closed' => '2020-01-01T00:00:00Z', 'anyOf' => [$choice('a', 1), $choice('b', 2)]]);
     rp_check($multi['multiple'] && $multi['closed'] && $multi['expires_at'] === '2020-01-01T00:00:00Z', 'anyOf and closed');
 
-    rp_check(ap_remote_poll_store($q) === true, 'stores remote poll');
+    $author = 'https://social.example/users/a';
+    rp_check(ap_remote_poll_store($q, $author) === true, 'stores remote poll');
     $r = $row('https://social.example/users/a/statuses/1');
     rp_check((int) $r['votes_count'] === 7 && (int) $r['voters_count'] === 7 && (int) $r['multiple'] === 0, 'row stored');
     rp_check((int) $row('https://old.example/notes/1')['id'] > 0 && (int) $r['id'] > 0 && (int) $r['id'] !== (int) $row('https://old.example/notes/1')['id'], 'legacy and new rows numbered');
@@ -70,11 +71,19 @@ try {
     rp_check(ap_remote_poll_find($pollId)['note_id'] === $r['note_id'] && ap_remote_poll_find(42) === null, 'find by public id');
     $q['oneOf'] = [$choice('Tea', 9), $choice('Coffee', 3)];
     $q['votersCount'] = 12;
-    ap_remote_poll_store($q);
+    // Another server embedding (or serving) a copy cannot rewrite the counts.
+    $spoof = $q;
+    $spoof['oneOf'] = [$choice('Tea', 9000), $choice('Coffee', 1)];
+    $spoof['votersCount'] = 9001;
+    rp_check(ap_remote_poll_store($spoof, 'https://evil.example/users/x') === false, 'off-host source refused');
+    rp_check(ap_remote_poll_store($spoof, 'https://evil.example/notes/9') === false, 'off-host fetch refused');
+    rp_check(ap_remote_poll_store($spoof, '') === false && ap_remote_poll_store($spoof, 'http://social.example/x') === false, 'no or plain-http source refused');
+    rp_check((int) $row('https://social.example/users/a/statuses/1')['votes_count'] === 7, 'spoofed counts never stored');
+    ap_remote_poll_store($q, 'https://SOCIAL.example/users/a/statuses/1');
     $r = $row('https://social.example/users/a/statuses/1');
     rp_check((int) $r['votes_count'] === 12 && json_decode($r['options_json'], true)[0]['votes_count'] === 9, 'Update refreshes counts');
-    rp_check(ap_remote_poll_store(['type' => 'Question', 'id' => 'https://mkultra.monster/users/me/notes/1', 'oneOf' => [$choice('a', 1)]]) === false, 'local polls stay in masto_polls');
-    rp_check(ap_remote_poll_store(['type' => 'Note', 'id' => 'https://x/3']) === false, 'notes ignored');
+    rp_check(ap_remote_poll_store(['type' => 'Question', 'id' => 'https://mkultra.monster/users/me/notes/1', 'oneOf' => [$choice('a', 1)]], 'https://mkultra.monster/users/me') === false, 'local polls stay in masto_polls');
+    rp_check(ap_remote_poll_store(['type' => 'Note', 'id' => 'https://x/3'], 'https://x/u') === false, 'notes ignored');
 
     // Ballots.
     rp_check(ap_remote_poll_ballot($r, [1]) === ['ok' => true, 'indexes' => [1]], 'index ballot');
@@ -109,7 +118,7 @@ try {
     rp_check(ap_remote_poll_vote(ap_remote_poll_id_base() + 999, RP_VOTER, [0])['error'] === 'Poll not found', 'unknown poll');
     // The author's Update replaces the optimistic counts but keeps the ballot.
     $q['oneOf'] = [$choice('Tea', 9), $choice('Coffee', 5)];
-    ap_remote_poll_store($q);
+    ap_remote_poll_store($q, $author);
     rp_check(json_decode($row($r['note_id'])['options_json'], true)[1]['votes_count'] === 5 && ap_remote_poll_own_votes($r['note_id'], RP_VOTER) === [1], 'Update keeps own vote');
 
     // Rows from before actor_id ask the origin for the author; failed delivery rolls back.
