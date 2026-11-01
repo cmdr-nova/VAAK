@@ -65,6 +65,8 @@ fi
 # before the migration has been applied.
 dead_days="${VAAK_FANOUT_DEAD_DAYS:-7}"
 dead_failures="${VAAK_FANOUT_DEAD_FAILURES:-20}"
+rejected_hosts_warn="${VAAK_INTEGRITY_REJECTED_HOSTS_WARN:-25}"
+if [[ ! "${rejected_hosts_warn}" =~ ^[0-9]+$ ]] || (( rejected_hosts_warn < 1 )); then rejected_hosts_warn=25; fi
 if [[ ! "${dead_days}" =~ ^[0-9]+$ ]] || (( dead_days < 1 || dead_days > 90 )); then dead_days=7; fi
 if [[ ! "${dead_failures}" =~ ^[0-9]+$ ]] || (( dead_failures < 1 || dead_failures > 100000 )); then dead_failures=20; fi
 health_table="$(runuser -u postgres -- psql -d "${DB_NAME}" -At -c "SELECT CASE WHEN to_regclass('public.ap_fanout_host_health') IS NULL THEN 0 ELSE 1 END" 2>/dev/null || echo 0)"
@@ -77,8 +79,13 @@ if [[ "${health_table}" == "1" && "${cutoff}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-
   #   dying:     a terminal-failure streak of at least VAAK_FANOUT_DEAD_FAILURES
   #              with no success since it began, still inside the
   #              VAAK_FANOUT_DEAD_DAYS wait. It will be suspended on its own.
-  #   healthy:   everything else. Only these can raise the warning.
-  q="$(runuser -u postgres -- psql -d "${DB_NAME}" -At -F '|' -c "WITH f AS (SELECT lower(split_part(split_part(regexp_replace(q.inbox_url, '^https://', ''), '/', 1), ':', 1)) AS host FROM ap_fanout_delivery_queue q WHERE q.status='failed'), c AS (SELECT f.host, CASE WHEN h.host IS NULL THEN 'healthy' WHEN h.consecutive_terminal_failures >= ${dead_failures} AND h.streak_started_at IS NOT NULL AND h.streak_started_at <= '${cutoff}' AND (h.last_success_at IS NULL OR h.last_success_at <= '${cutoff}') AND (h.last_live_at IS NULL OR h.last_live_at <= '${cutoff}') THEN 'suspended' WHEN h.consecutive_terminal_failures >= ${dead_failures} AND h.streak_started_at IS NOT NULL AND (h.last_success_at IS NULL OR h.last_success_at <= h.streak_started_at) THEN 'dying' ELSE 'healthy' END AS k FROM f LEFT JOIN ap_fanout_host_health h ON h.host = f.host AND h.host <> '*') SELECT 'failed_fanout_' || k, count(*) FROM c GROUP BY k UNION ALL SELECT 'dying_fanout_hosts', count(DISTINCT host) FROM c WHERE k = 'dying' UNION ALL SELECT 'pending_fanout',count(*) FROM ap_fanout_delivery_queue WHERE status='pending' UNION ALL SELECT 'pending_action',count(*) FROM ap_action_queue WHERE status='pending' UNION ALL SELECT 'failed_action',count(*) FROM ap_action_queue WHERE status='failed';")"
+  #   rejected:  the row's last error is a live rejection (HTTP 401, 403,
+  #              429 or 500): the host answered and refused. That is the
+  #              remote side's problem (a stale key record, an overloaded
+  #              server), so it warns only when it spans many hosts at once,
+  #              which would point at VAAK's own signing.
+  #   healthy:   everything else. Only these count toward the 1000 warning.
+  q="$(runuser -u postgres -- psql -d "${DB_NAME}" -At -F '|' -c "WITH f AS (SELECT lower(split_part(split_part(regexp_replace(q.inbox_url, '^https://', ''), '/', 1), ':', 1)) AS host, coalesce(q.last_error, '') AS err FROM ap_fanout_delivery_queue q WHERE q.status='failed'), c AS (SELECT f.host, CASE WHEN h.consecutive_terminal_failures >= ${dead_failures} AND h.streak_started_at IS NOT NULL AND h.streak_started_at <= '${cutoff}' AND (h.last_success_at IS NULL OR h.last_success_at <= '${cutoff}') AND (h.last_live_at IS NULL OR h.last_live_at <= '${cutoff}') THEN 'suspended' WHEN h.consecutive_terminal_failures >= ${dead_failures} AND h.streak_started_at IS NOT NULL AND (h.last_success_at IS NULL OR h.last_success_at <= h.streak_started_at) THEN 'dying' WHEN f.err ~ '(^|[^A-Za-z])HTTP[[:space:]]+(401|403|429|500)([^0-9]|\$)' THEN 'rejected' ELSE 'healthy' END AS k FROM f LEFT JOIN ap_fanout_host_health h ON h.host = f.host AND h.host <> '*') SELECT 'failed_fanout_' || k, count(*) FROM c GROUP BY k UNION ALL SELECT 'dying_fanout_hosts', count(DISTINCT host) FROM c WHERE k = 'dying' UNION ALL SELECT 'rejected_fanout_hosts', count(DISTINCT host) FROM c WHERE k = 'rejected' UNION ALL SELECT 'pending_fanout',count(*) FROM ap_fanout_delivery_queue WHERE status='pending' UNION ALL SELECT 'pending_action',count(*) FROM ap_action_queue WHERE status='pending' UNION ALL SELECT 'failed_action',count(*) FROM ap_action_queue WHERE status='failed';")"
 else
   q="$(runuser -u postgres -- psql -d "${DB_NAME}" -At -F '|' -c "SELECT 'pending_fanout',count(*) FROM ap_fanout_delivery_queue WHERE status='pending' UNION ALL SELECT 'failed_fanout',count(*) FROM ap_fanout_delivery_queue WHERE status='failed' UNION ALL SELECT 'pending_action',count(*) FROM ap_action_queue WHERE status='pending' UNION ALL SELECT 'failed_action',count(*) FROM ap_action_queue WHERE status='failed';")"
 fi
@@ -89,6 +96,11 @@ while IFS='|' read -r kind count; do
   if [[ "${kind}" == failed_fanout_suspended ]]; then echo "suspended_fanout ${count}"; fi
   if [[ "${kind}" == failed_fanout_dying ]]; then echo "dying_fanout ${count}"; fi
   if [[ "${kind}" == dying_fanout_hosts && "${count}" -gt 0 ]]; then echo "dying_fanout_hosts ${count}"; fi
+  if [[ "${kind}" == failed_fanout_rejected ]]; then echo "rejected_fanout ${count}"; fi
+  if [[ "${kind}" == rejected_fanout_hosts && "${count}" -gt 0 ]]; then
+    echo "rejected_fanout_hosts ${count}"
+    if (( count >= rejected_hosts_warn )); then warn "fan-out refused (HTTP 401/403/429/500) by ${count} live hosts; check VAAK's signing"; fi
+  fi
   if [[ "${kind}" == pending_fanout && "${count}" -gt 500 ]]; then crit "${count} pending fan-out deliveries"; fi
   if [[ "${kind}" == failed_action && "${count}" -gt 25 ]]; then warn "${count} failed user actions require review"; fi
 done <<<"${q}"
