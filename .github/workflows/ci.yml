@@ -68,6 +68,7 @@ jobs:
           bash deploy/assemble-release.sh --self-test
           bash deploy/test_runner_job_guard.sh
           bash deploy/test_backup_restore_drill.sh
+          bash deploy/test_alert_notify.sh
 
   cargo-audit:
     name: Cargo audit
