@@ -163,6 +163,105 @@ pub async fn notif_reused(database_url: &str) -> Result<NotifConn> {
     Ok(NotifConn { url: database_url.to_owned(), client: Some(client) })
 }
 
+/// A small list of idle connections for one family of loopback routes.
+/// Take one with [`IdlePool::take`]; it goes back on drop unless it closed
+/// or the list is full. Only for routes that run plain queries: no
+/// transactions left open, session SETs, LISTEN or temp tables, so a
+/// returned connection carries no state into the next request.
+pub struct IdlePool {
+    max: usize,
+    idle: std::sync::Mutex<Vec<(String, Client)>>,
+}
+
+impl IdlePool {
+    pub const fn new(max: usize) -> Self {
+        Self { max, idle: std::sync::Mutex::new(Vec::new()) }
+    }
+
+    /// Take an idle connection for this database, or open a new one.
+    pub async fn take(&'static self, database_url: &str) -> Result<PooledConn> {
+        let idle = self.idle.lock().ok().and_then(|mut idle| {
+            idle.retain(|(_, client)| !client.is_closed());
+            let at = idle.iter().rposition(|(url, _)| url == database_url)?;
+            Some(idle.swap_remove(at).1)
+        });
+        let client = match idle {
+            Some(client) => client,
+            None => connect(database_url).await?,
+        };
+        Ok(PooledConn { pool: self, url: database_url.to_owned(), client: Some(client) })
+    }
+
+    #[cfg(test)]
+    fn idle_len(&self) -> usize {
+        self.idle.lock().map(|idle| idle.len()).unwrap_or(0)
+    }
+}
+
+pub struct PooledConn {
+    pool: &'static IdlePool,
+    url: String,
+    client: Option<Client>,
+}
+
+impl std::ops::Deref for PooledConn {
+    type Target = Client;
+    fn deref(&self) -> &Client {
+        self.client.as_ref().expect("pooled client present until drop")
+    }
+}
+
+impl Drop for PooledConn {
+    fn drop(&mut self) {
+        let Some(client) = self.client.take() else { return };
+        if client.is_closed() {
+            return;
+        }
+        if let Ok(mut idle) = self.pool.idle.lock() {
+            if idle.len() < self.pool.max {
+                idle.push((std::mem::take(&mut self.url), client));
+            }
+        }
+    }
+}
+
+/// Idle connections for the Home/Local/Federated paint routes (first paint,
+/// scroll fill, "since" polls, notification embed fragments). One Home fill
+/// used to open three or four fresh backends: the hydrate, the moderation
+/// overlay, the viewer lookup and the card enrichment. These run plain reads
+/// and single-statement writes only. Four covers a fill plus a since poll in
+/// flight. Separate from Search, profiles and notifications so a timeline
+/// burst cannot take their warm connections.
+pub static TIMELINE_POOL: IdlePool = IdlePool::new(4);
+
+/// Take an idle timeline connection for this database, or open a new one.
+pub async fn timeline_reused(database_url: &str) -> Result<PooledConn> {
+    TIMELINE_POOL.take(database_url).await
+}
+
+#[cfg(test)]
+mod timeline_pool_tests {
+    static TEST_POOL: super::IdlePool = super::IdlePool::new(1);
+
+    /// Runs where a disposable fixture database is configured; skipped otherwise.
+    #[tokio::test]
+    async fn timeline_pool_reuses_one_backend_and_respects_its_cap() {
+        let Ok(url) = std::env::var("LIBRARY_FIXTURE_DB") else { return };
+        let first = TEST_POOL.take(&url).await.unwrap();
+        let pid: i32 = first.query_one("SELECT pg_backend_pid()", &[]).await.unwrap().get(0);
+        let second = TEST_POOL.take(&url).await.unwrap();
+        let other: i32 = second.query_one("SELECT pg_backend_pid()", &[]).await.unwrap().get(0);
+        assert_ne!(pid, other, "a connection in use is never handed out twice");
+        drop(first);
+        drop(second);
+        assert_eq!(TEST_POOL.idle_len(), 1, "the idle list keeps at most its cap");
+        let again = TEST_POOL.take(&url).await.unwrap();
+        let reused: i32 = again.query_one("SELECT pg_backend_pid()", &[]).await.unwrap().get(0);
+        assert!(reused == pid || reused == other, "an idle connection is taken before opening a new one");
+        assert_eq!(TEST_POOL.idle_len(), 0);
+    }
+}
+
 #[cfg(test)]
 mod profile_pool_tests {
     /// Runs where a disposable fixture database is configured; skipped otherwise.

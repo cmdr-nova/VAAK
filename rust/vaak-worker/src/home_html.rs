@@ -87,7 +87,7 @@ async fn load_self_thread_parents(
 }
 
 pub(crate) async fn load_viewer_actor(cfg: &Config, owner_user_id: i64) -> String {
-    let Ok(db) = db::connect(&cfg.database_url).await else {
+    let Ok(db) = db::timeline_reused(&cfg.database_url).await else {
         return String::new();
     };
     let Ok(row) = db
@@ -239,7 +239,7 @@ pub async fn tl_html_fill(
     let viewer_actor = load_viewer_actor(cfg, owner_user_id).await;
     let mut extra_parents = std::collections::HashMap::new();
     // Attach cached OG/YouTube cards (PHP paint parity) before lean HTML.
-    if let Ok(db) = db::connect(&cfg.database_url).await {
+    if let Ok(db) = db::timeline_reused(&cfg.database_url).await {
         let _ = crate::link_preview::attach_cached_cards(&db, &mut slice).await;
         // Mute/block labels for lean ⋯ menus (PHP block_quick_actions parity).
         if let Ok(moderation) = crate::hidden::load_viewer_moderation(&db, owner_user_id).await {
@@ -317,7 +317,7 @@ async fn tl_html_older(
     let Some(cursor) = crate::timeline_cursor::unpack(before) else {
         return Ok(None);
     };
-    let Ok(db) = db::connect(&cfg.database_url).await else {
+    let Ok(db) = db::timeline_reused(&cfg.database_url).await else {
         return Ok(None);
     };
     let owner_actor = load_viewer_actor(cfg, owner_user_id).await;
@@ -432,7 +432,7 @@ pub async fn home_html_since(
     let mut slice = report.items;
     let viewer_actor = load_viewer_actor(cfg, owner_user_id).await;
     let mut extra_parents = std::collections::HashMap::new();
-    if let Ok(db) = db::connect(&cfg.database_url).await {
+    if let Ok(db) = db::timeline_reused(&cfg.database_url).await {
         let _ = crate::link_preview::attach_cached_cards(&db, &mut slice).await;
         if let Ok(moderation) = crate::hidden::load_viewer_moderation(&db, owner_user_id).await {
             crate::notif_embed::stamp_viewer_moderation(&mut slice, &moderation);
@@ -498,7 +498,7 @@ pub async fn tl_html_since(
     let mut slice = report.items;
     let viewer_actor = load_viewer_actor(cfg, owner_user_id).await;
     let mut extra_parents = std::collections::HashMap::new();
-    if let Ok(db) = db::connect(&cfg.database_url).await {
+    if let Ok(db) = db::timeline_reused(&cfg.database_url).await {
         let _ = crate::link_preview::attach_cached_cards(&db, &mut slice).await;
         if let Ok(moderation) = crate::hidden::load_viewer_moderation(&db, owner_user_id).await {
             crate::notif_embed::stamp_viewer_moderation(&mut slice, &moderation);
