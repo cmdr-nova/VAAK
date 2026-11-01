@@ -30,6 +30,24 @@ function ap_ie_follow_state_path(): string
     return '/var/lib/mkultra/ap/follow-import-state-' . $ownerId . '.json';
 }
 
+/** Single shared state file the follow-import CLIs used before per-owner state. */
+const AP_IE_FOLLOW_STATE_LEGACY = '/var/lib/mkultra/ap/follow-import-state.json';
+
+/**
+ * Where the follow-import CLIs read state from: the owner's own file (the
+ * one You > Import writes), or the legacy shared file when only that exists,
+ * so an import started before this change still resumes. Writes always go
+ * to ap_ie_follow_state_path().
+ */
+function ap_ie_follow_state_read_path(): string
+{
+    $path = ap_ie_follow_state_path();
+    if (!is_readable($path) && is_readable(AP_IE_FOLLOW_STATE_LEGACY)) {
+        return AP_IE_FOLLOW_STATE_LEGACY;
+    }
+    return $path;
+}
+
 /* ===================== CSV primitives ===================== */
 
 function ap_ie_csv_escape(string $value): string
@@ -789,7 +807,8 @@ function ap_ie_follow_queue_from_rows(array $rows): array
     if (!is_dir(AP_IE_UPLOAD_DIR)) {
         @mkdir(AP_IE_UPLOAD_DIR, 0750, true);
     }
-    $saved = AP_IE_UPLOAD_DIR . '/following_accounts_' . gmdate('Ymd_His') . '.csv';
+    // Two imports in the same second used to share (and overwrite) one audit file.
+    $saved = AP_IE_UPLOAD_DIR . '/following_accounts_' . gmdate('Ymd_His') . '_' . bin2hex(random_bytes(3)) . '.csv';
     $fp = $saved . '|' . count($handles) . '|' . md5(implode(',', array_slice($handles, 0, 5)));
     $state = [
         'csv' => $saved,

@@ -428,6 +428,42 @@ function ap_queue_cancel(int $id): array
 }
 
 /**
+ * True when a pending/publishing/failed queue item or any saved draft still
+ * lists this media id. Drafts used to be ignored, so cancelling a queued post
+ * deleted the upload out from under a draft that shared it. The LIKE is only
+ * a prefilter: ids are compared exactly after decoding, so media 12 is not
+ * kept alive by a row that lists 123.
+ */
+function ap_queue_media_still_referenced(int $mediaId): bool
+{
+    if ($mediaId < 1) {
+        return false;
+    }
+    $queries = [
+        "SELECT media_ids_json FROM ap_post_queue
+         WHERE state IN ('pending','publishing','failed') AND media_ids_json LIKE ?",
+        'SELECT media_ids_json FROM ap_drafts WHERE media_ids_json LIKE ?',
+    ];
+    foreach ($queries as $sql) {
+        try {
+            $st = ap_db()->prepare($sql);
+            $st->execute(['%' . $mediaId . '%']);
+        } catch (Throwable $e) {
+            // Unknown table or query failure: keep the media rather than risk deleting it.
+            error_log('[ap-queue] media reference check: ' . $e->getMessage());
+            return true;
+        }
+        while (($json = $st->fetchColumn()) !== false) {
+            $ids = json_decode((string) $json, true);
+            if (is_array($ids) && in_array($mediaId, array_map('intval', $ids), true)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+/**
  * @param list<int|string> $mediaIds
  */
 function ap_queue_scrub_media_ids(array $mediaIds): void
@@ -442,16 +478,9 @@ function ap_queue_scrub_media_ids(array $mediaIds): void
         if (!empty($row['status_local_id'])) {
             continue; // already published somehow
         }
-        // Still referenced by another pending queue item?
+        // Still attached to another live queue item or to a draft?
         $mid = (int) $row['local_id'];
-        $ref = ap_db()->prepare(
-            "SELECT id FROM ap_post_queue
-             WHERE state IN ('pending','publishing','failed')
-               AND media_ids_json LIKE ?
-             LIMIT 1"
-        );
-        $ref->execute(['%' . $mid . '%']);
-        if ($ref->fetch()) {
+        if (ap_queue_media_still_referenced($mid)) {
             continue;
         }
         $key = (string) ($row['s3_key'] ?? '');

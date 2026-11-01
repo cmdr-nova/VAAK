@@ -37,6 +37,7 @@ php_tests=(
   api/bin/post-media-warm-busy-smoke.php
   api/bin/bite-queue-smoke.php
   api/bin/known-shared-inboxes-cache-smoke.php
+  api/bin/queue-media-draft-ref-smoke.php
   api/bin/local-boost-resolve-smoke.php
   api/bin/bsky-shadow-repost-smoke.php
   api/bin/bsky-hide-set-refresh-smoke.php
