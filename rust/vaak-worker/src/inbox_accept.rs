@@ -4,9 +4,11 @@
 //! delivery (a key PHP already fetched and verified, a signature that checks
 //! out, a signer who is the activity's actor, a host that is not blocked) is
 //! written to `ap_inbox_spool` and answered 202; api/bin/inbox-spool-drain.php
-//! processes it with the same PHP routing as before. Every other request is
-//! forwarded byte for byte to PHP on a loopback listener, so origin
-//! recovery, relays, forwarded Creates, key fetches and rejections keep their
+//! processes it with the same PHP routing as before. A Create or Announce an
+//! accepted relay signed for someone else is spooled too; the drain does
+//! PHP's relay-forward handling (re-fetching a forwarded Create). Every other
+//! request is forwarded byte for byte to PHP on a loopback listener, so origin
+//! recovery, other forwarded Creates, key fetches and rejections keep their
 //! PHP behaviour. Rust never fetches a key and never routes an activity.
 
 use std::collections::HashMap;
@@ -24,9 +26,10 @@ use tokio_postgres::Client;
 
 use crate::inbox_sig_shadow::{claimed_key_id, verify_body, Record};
 
-/// Same limits as PHP (AP_INBOX_MAX_BODY, AP_INBOX_RATE_MAX/WINDOW).
+/// Same limits as PHP (AP_INBOX_MAX_BODY, AP_INBOX_RATE_MAX/_RELAY/WINDOW).
 pub const MAX_BODY: usize = 262_144;
 const RATE_MAX: i64 = 600;
+const RATE_MAX_RELAY: i64 = 12_000;
 const RATE_WINDOW: i64 = 3600;
 const STATS_KEY: &str = "vaak:inbox_rust:stats:v1";
 const SPOOL_QUEUE: &str = "inbox_spool";
@@ -161,18 +164,36 @@ async fn fast_path(cfg: &crate::config::Config, uri: &Uri, headers: &HeaderMap, 
     let ip = client_ip(&map);
     let mut redis = redis_conn(&cfg.redis_url).await.map_err(|_| "redis")?;
 
-    let now = chrono::Utc::now().timestamp();
-    let rate_key = format!("vaak:inbox_rust:rate:v1:{ip}:{}", now / RATE_WINDOW);
-    let (count, _): (i64, bool) =
-        redis::pipe().incr(&rate_key, 1).expire(&rate_key, RATE_WINDOW * 2).query_async(&mut redis).await.map_err(|_| "redis")?;
-    if count > RATE_MAX {
-        return Err("rate");
-    }
-
+    // Unknown keys go to PHP, which counts them against its own limits.
     let mirrored: Option<String> = redis::cmd("GET").arg(key_mirror_key(&key_id)).query_async(&mut redis).await.map_err(|_| "redis")?;
     let mirrored: Value = mirrored.and_then(|raw| serde_json::from_str(&raw).ok()).ok_or("no_key")?;
     let pem = mirrored.get("pem").and_then(Value::as_str).ok_or("no_key")?.to_string();
     let owner = mirrored.get("owner").and_then(Value::as_str).map(str::to_string);
+    let relay = mirrored.get("relay").and_then(Value::as_bool).unwrap_or(false);
+
+    // Like ap_inbox_rate_admit: a relay draws on its own bucket but still
+    // needs room in the IP's normal one.
+    let now = chrono::Utc::now().timestamp();
+    let window = now / RATE_WINDOW;
+    let normal_key = format!("vaak:inbox_rust:rate:v1:{ip}:{window}");
+    let admitted = if relay {
+        let relay_key = format!("vaak:inbox_rust:rate:v1:relay:{ip}:{window}");
+        let (normal, count, _): (Option<i64>, i64, bool) = redis::pipe()
+            .get(&normal_key)
+            .incr(&relay_key, 1)
+            .expire(&relay_key, RATE_WINDOW * 2)
+            .query_async(&mut redis)
+            .await
+            .map_err(|_| "redis")?;
+        normal.unwrap_or(0) < RATE_MAX && count <= RATE_MAX_RELAY
+    } else {
+        let (count, _): (i64, bool) =
+            redis::pipe().incr(&normal_key, 1).expire(&normal_key, RATE_WINDOW * 2).query_async(&mut redis).await.map_err(|_| "redis")?;
+        count <= RATE_MAX
+    };
+    if !admitted {
+        return Err("rate");
+    }
 
     let mut server = HashMap::new();
     server.insert("REQUEST_METHOD".to_string(), "POST".to_string());
@@ -193,7 +214,7 @@ async fn fast_path(cfg: &crate::config::Config, uri: &Uri, headers: &HeaderMap, 
         return Err("blocked");
     }
     let (kind, actor) = activity_head(body).ok_or("body")?;
-    if !actor_matches_key(&key_id, &actor, owner.as_deref()) {
+    if !actor_matches_key(&key_id, &actor, owner.as_deref()) && !relay_forwardable(relay, &kind) {
         return Err("actor_mismatch");
     }
     // ap-user.php answers 404 for a personal inbox with no active local user;
@@ -218,6 +239,12 @@ async fn fast_path(cfg: &crate::config::Config, uri: &Uri, headers: &HeaderMap, 
         let _: Result<(), _> = redis::pipe().lpush(&key, id).expire(&key, 86400).query_async(&mut queue).await;
     }
     Ok(id)
+}
+
+/// An accepted relay re-signs other people's Creates and Announces; PHP takes
+/// those from it (re-fetching a Create) and nothing else.
+pub(crate) fn relay_forwardable(relay: bool, kind: &str) -> bool {
+    relay && matches!(kind, "Create" | "Announce")
 }
 
 /// The username in `/users/{name}/inbox[/]`, lowercased, when it is one
@@ -380,6 +407,15 @@ mod tests {
         assert_eq!(personal_inbox_user("/users/x/inbox").as_deref(), Some(""));
         assert_eq!(personal_inbox_user("/users/9abc/inbox").as_deref(), Some(""));
         assert_eq!(personal_inbox_user("/users/a%2Fb/inbox").as_deref(), Some(""));
+    }
+
+    #[test]
+    fn relays_forward_only_creates_and_announces() {
+        assert!(relay_forwardable(true, "Create"));
+        assert!(relay_forwardable(true, "Announce"));
+        assert!(!relay_forwardable(true, "Delete"));
+        assert!(!relay_forwardable(true, "Update"));
+        assert!(!relay_forwardable(false, "Create"));
     }
 
     #[test]

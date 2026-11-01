@@ -29,6 +29,8 @@ $check = static function (bool $ok, string $why) use (&$n): void {
 $db = ap_db();
 $db->exec("INSERT INTO ap_blocks (created_at, updated_at, scope, value, kind) VALUES ('2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 'domain', 'blocked.test', 'block')");
 ap_block_list_cached(true);
+// Before anything reads the relay list, which PHP memoizes for 30 seconds.
+$db->exec("INSERT INTO ap_relays (inbox_url, state, created_at, updated_at) VALUES ('https://relay.test/inbox', 'accepted', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')");
 
 $res = openssl_pkey_new(['private_key_bits' => 2048, 'private_key_type' => OPENSSL_KEYTYPE_RSA]);
 openssl_pkey_export($res, $priv);
@@ -131,10 +133,33 @@ $check($status === 418, 'bad signature is forwarded');
 [$status] = smoke_post($rust, '/users/nobody_here/inbox', smoke_like($alice, '7'), $aliceKey, $priv);
 $check($status === 418, 'personal inbox of an unknown user is forwarded (PHP answers 404)');
 
+// An accepted relay forwards someone else's Announce: spooled and routed;
+// anything else it signs for another actor stays with PHP.
+$relayKey = 'https://relay.test/actor#main-key';
+ap_inbox_rust_key_mirror($relayKey, $pem);
+$mirror = json_decode((string) $redis->get(ap_inbox_rust_key_mirror_key($relayKey)), true);
+$check(($mirror['relay'] ?? null) === true && $redis->ttl(ap_inbox_rust_key_mirror_key($relayKey)) > 3600, 'relay keys are mirrored, marked, for a day');
+$announce = json_encode(['id' => $alice . '#announces/8', 'type' => 'Announce', 'actor' => $alice, 'object' => 'https://vaak.test/users/ci_owner/statuses/8'], JSON_UNESCAPED_SLASHES);
+[$status] = smoke_post($rust, '/inbox', $announce, $relayKey, $priv);
+$check($status === 202, 'relay-forwarded Announce is spooled (got ' . $status . ')');
+$row = $db->query("SELECT * FROM ap_inbox_spool WHERE key_id = " . $db->quote($relayKey))->fetch(PDO::FETCH_ASSOC);
+$out = is_array($row) ? ap_inbox_spool_process($row) : ['state' => 'missing'];
+$check($out['state'] === 'done', 'spooled relay Announce routes through PHP (' . ($out['result'] ?? '') . ')');
+$delete = json_encode(['id' => $alice . '#delete/9', 'type' => 'Delete', 'actor' => $alice, 'object' => $alice . '/statuses/9'], JSON_UNESCAPED_SLASHES);
+[$status] = smoke_post($rust, '/inbox', $delete, $relayKey, $priv);
+$check($status === 418, 'relay-signed Delete for another actor is forwarded');
+$announce2 = str_replace('announces/8', 'announces/10', $announce);
+[$status] = smoke_post($rust, '/inbox', $announce2, $relayKey, $priv);
+$check($status === 202, 'second relay Announce is spooled');
+$db->exec("UPDATE ap_relays SET state = 'idle'");
+shell_exec('VAAK_FPM_POOL_CONF=/nonexistent ' . $cmd);
+$late = $db->query("SELECT state, result FROM ap_inbox_spool WHERE body = " . $db->quote($announce2))->fetch(PDO::FETCH_ASSOC);
+$check(($late['state'] ?? '') === 'dropped' && ($late['result'] ?? '') === 'actor_mismatch', 'the drain re-checks that the relay is still accepted');
+
 $spooled = (int) $db->query("SELECT count(*) FROM ap_inbox_spool WHERE key_id <> 'https://stale.test/users/x#main-key'")->fetchColumn();
-$check($spooled === 2, 'only the two good deliveries were spooled');
+$check($spooled === 4, 'only the four good deliveries were spooled');
 $stats = $redis->hGetAll('vaak:inbox_rust:stats:v1');
-$check((int) ($stats['spooled'] ?? 0) === 2 && (int) ($stats['fwd_no_key'] ?? 0) === 1 && (int) ($stats['fwd_blocked'] ?? 0) === 1
-    && (int) ($stats['fwd_actor_mismatch'] ?? 0) === 1 && (int) ($stats['fwd_signature'] ?? 0) === 1 && (int) ($stats['fwd_unknown_user'] ?? 0) === 1, 'stats count each outcome');
+$check((int) ($stats['spooled'] ?? 0) === 4 && (int) ($stats['fwd_no_key'] ?? 0) === 1 && (int) ($stats['fwd_blocked'] ?? 0) === 1
+    && (int) ($stats['fwd_actor_mismatch'] ?? 0) === 2 && (int) ($stats['fwd_signature'] ?? 0) === 1 && (int) ($stats['fwd_unknown_user'] ?? 0) === 1, 'stats count each outcome');
 
 echo "inbox-rust-accept: {$n} checks passed\n";
