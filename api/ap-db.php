@@ -20075,10 +20075,36 @@ function ap_remote_poll_from_doc(mixed $doc): ?array
 }
 
 /** Upsert a remote Question's poll; Update activities refresh the counts. */
-function ap_remote_poll_store(mixed $doc): bool
+/**
+ * Host part of an https URL or actor id, lowercased, or '' when there is none.
+ */
+function ap_remote_poll_host(string $url): string
+{
+    $url = trim($url);
+    if (!str_starts_with($url, 'https://')) {
+        return '';
+    }
+    return strtolower((string) (parse_url($url, PHP_URL_HOST) ?: ''));
+}
+
+/**
+ * Store a remote Question's options and counts.
+ *
+ * `$source` is where the doc came from: the signed activity's actor for an
+ * embedded object, or the URL it was fetched from. The poll is kept only when
+ * that source lives on the poll's own host, so a third server cannot embed a
+ * copy of someone else's poll (or answer a fetch with one) and rewrite its
+ * counts. A boost of a poll therefore never writes counts; the boosted
+ * note's own origin does.
+ */
+function ap_remote_poll_store(mixed $doc, string $source): bool
 {
     $poll = ap_remote_poll_from_doc($doc);
     if ($poll === null || str_starts_with($poll['note_id'], 'https://mkultra.monster/')) {
+        return false;
+    }
+    $sourceHost = ap_remote_poll_host($source);
+    if ($sourceHost === '' || $sourceHost !== ap_remote_poll_host($poll['note_id'])) {
         return false;
     }
     ap_remote_polls_migrate();

@@ -3102,6 +3102,7 @@ function ap_enrich_activity_for_feed(array $activity, string $type, ?string $obj
     $inReplyTo = null;
     $obj = $activity['object'] ?? null;
     $cw = ap_note_cw_from_doc(is_array($obj) ? $obj : null);
+    $pollNeedsOrigin = false;
     $quoteTypes = ['QuotePost', 'Quote', 'QuoteRequest'];
     $isQuoteActivity = in_array($type, $quoteTypes, true)
         || (is_array($obj) && in_array((string) ($obj['type'] ?? ''), $quoteTypes, true))
@@ -3111,9 +3112,16 @@ function ap_enrich_activity_for_feed(array $activity, string $type, ?string $obj
         $media = ap_extract_media_urls($obj);
         $inReplyTo = ap_as_id($obj['inReplyTo'] ?? null);
         // Remote Questions: keep the options so timelines can paint the poll.
-        ap_remote_poll_store($obj);
+        // Only the poll's own server is trusted for its counts: an embedded
+        // copy from anyone else (a boost, a quote) asks its origin instead.
+        $activityActor = (string) (ap_as_id($activity['actor'] ?? null) ?? '');
+        if (!ap_remote_poll_store($obj, $activityActor) && ap_remote_poll_from_doc($obj) !== null) {
+            $pollNeedsOrigin = true;
+        }
         if (($type === 'Announce' || $isQuoteActivity) && isset($obj['object']) && is_array($obj['object'])) {
-            ap_remote_poll_store($obj['object']);
+            if (!ap_remote_poll_store($obj['object'], $activityActor) && ap_remote_poll_from_doc($obj['object']) !== null) {
+                $pollNeedsOrigin = true;
+            }
             $media = array_values(array_unique(array_merge($media, ap_extract_media_urls($obj['object']))));
             if (($summary === null || $summary === '') && isset($obj['object']['content']) && is_string($obj['object']['content'])) {
                 $summary = ap_fix_utf8($obj['object']['content']);
@@ -3140,9 +3148,11 @@ function ap_enrich_activity_for_feed(array $activity, string $type, ?string $obj
             || $summary === ''
             || ($type === 'Announce' && !$media)
             || ($hasAttachment && !$media)
-            || $isQuoteActivity;
+            || $isQuoteActivity
+            || $pollNeedsOrigin;
 
         if ($needsFetch) {
+            $remoteFrom = $objectId;
             $remote = ap_fetch_as2_object($objectId);
             // Mastodon …/QuotePost URLs often 404 for unsigned/authorized-fetch; try parent status.
             if ($remote === null || (is_array($remote) && empty($remote['content']) && ($remote['type'] ?? '') === 'QuotePost')) {
@@ -3151,11 +3161,12 @@ function ap_enrich_activity_for_feed(array $activity, string $type, ?string $obj
                     $parentDoc = ap_fetch_as2_object($parent);
                     if (is_array($parentDoc)) {
                         $remote = $parentDoc;
+                        $remoteFrom = $parent;
                     }
                 }
             }
             if (is_array($remote)) {
-                ap_remote_poll_store($remote);
+                ap_remote_poll_store($remote, $remoteFrom);
                 $media = array_values(array_unique(array_merge($media, ap_extract_media_urls($remote))));
                 if (($summary === null || $summary === '') && isset($remote['content']) && is_string($remote['content'])) {
                     $summary = ap_fix_utf8($remote['content']);
@@ -6250,7 +6261,7 @@ function ap_local_observe(array $activity): void
                 break;
             }
         }
-        ap_remote_poll_store($object);
+        ap_remote_poll_store($object, (string) ($actorId ?? ''));
         // Collect https image URLs for admin preview only — never download/store bytes.
         $mediaUrls = ap_extract_media_urls($object);
         // Announce may wrap a nested Note/object
@@ -6266,7 +6277,7 @@ function ap_local_observe(array $activity): void
     } elseif (is_string($object) && str_starts_with($object, 'https://') && !str_starts_with($object, 'https://mkultra.monster/')) {
         $remoteDoc = ap_fetch_as2_object($object);
         if (is_array($remoteDoc)) {
-            ap_remote_poll_store($remoteDoc);
+            ap_remote_poll_store($remoteDoc, $object);
             $objType = is_string($remoteDoc['type'] ?? null) ? $remoteDoc['type'] : $type;
             if (isset($remoteDoc['content']) && is_string($remoteDoc['content'])) {
                 $content = $remoteDoc['content'];
@@ -9180,7 +9191,7 @@ function ap_remote_poll_vote(int|string $pollRef, string $voterActorId, array $c
         $doc = ap_fetch_as2_object($noteId);
         $fresh = ap_remote_poll_from_doc($doc);
         if (is_array($fresh) && $fresh['note_id'] === $noteId) {
-            ap_remote_poll_store($doc);
+            ap_remote_poll_store($doc, $noteId);
             $row = ap_remote_poll_find($noteId) ?? $row;
             $author = $fresh['actor_id'];
         }
