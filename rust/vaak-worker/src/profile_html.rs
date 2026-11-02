@@ -647,6 +647,98 @@ fn html_escape_text(s: &str) -> String {
 }
 
 /// Build local profile tab HTML (posts / replies / media / boosts).
+/// Boosts tab page for the complete profile bridge: the durable
+/// `masto_reblogs` history (Fediverse, local, Bluesky, RSS, Nostr) painted with
+/// the lean Home card, one source slot per row. The Announce ledger in
+/// `events` only keeps the retention window and never held Bluesky reposts.
+pub(crate) struct LeanBoostPage {
+    pub cards: Vec<(usize, String)>,
+    pub source_count: usize,
+    pub next_offset: i64,
+    pub has_more: bool,
+}
+
+const BOOST_SLOT_KEY: &str = "vaak_profile_slot";
+
+pub(crate) async fn lean_boost_page(
+    db: &Client,
+    actor_url: &str,
+    viewer_owner_id: i64,
+    limit: i64,
+    offset: i64,
+) -> Result<LeanBoostPage> {
+    let offset = offset.max(0);
+    let (slots, has_more) = crate::home_hydrate_ranked::load_profile_boost_slots(
+        db,
+        actor_url,
+        viewer_owner_id,
+        limit,
+        offset,
+    )
+    .await?;
+    let source_count = slots.len();
+    let mut statuses: Vec<Value> = Vec::new();
+    for (slot, item) in slots.into_iter().enumerate() {
+        if let Some(mut st) = item {
+            st[BOOST_SLOT_KEY] = json!(slot);
+            statuses.push(st);
+        }
+    }
+    let viewer_actor = if viewer_owner_id > 0 {
+        load_viewer_actor(db, viewer_owner_id).await?
+    } else {
+        String::new()
+    };
+    if !statuses.is_empty() {
+        let _ = hydrate_local_quote_targets(db, &mut statuses).await;
+        let _ = crate::home_hydrate_ranked::hydrate_local_quote_targets(db, &mut statuses).await;
+        let _ = crate::interaction_flags::apply_to_statuses(db, viewer_owner_id, &mut statuses).await;
+        if viewer_owner_id > 0 {
+            if let Ok(moderation) = crate::hidden::load_viewer_moderation(db, viewer_owner_id).await {
+                crate::notif_embed::stamp_viewer_moderation(&mut statuses, &moderation);
+            }
+        }
+        let _ = crate::link_preview::attach_cached_cards(db, &mut statuses).await;
+        let _ = crate::home_hydrate_ranked::attach_polls(db, &mut statuses, &viewer_actor).await;
+        let _ = crate::home_hydrate_ranked::attach_bsky_link_facets(db, &mut statuses).await;
+        let _ = crate::home_hydrate_ranked::attach_ask_identities(db, &mut statuses).await;
+        let _ = crate::status_emoji::attach_custom_emojis(db, &mut statuses).await;
+        let mut hidden = crate::hidden::load_timeline_hidden_sets(db, viewer_owner_id).await?;
+        crate::audience::filter_statuses(db, viewer_owner_id, crate::audience::Surface::Profile, &mut statuses).await?;
+        let selected: Vec<String> = statuses
+            .iter()
+            .filter_map(|status| status.get("uri").and_then(Value::as_str).map(str::to_owned))
+            .collect();
+        crate::hidden::load_ordinary_owned_notes(db, viewer_owner_id, &selected, &mut hidden).await?;
+        statuses.retain(|st| !crate::hidden::ordinary_status_hidden_on_profile(st, &hidden));
+    }
+    let mut cards = Vec::with_capacity(statuses.len());
+    for mut st in statuses {
+        let Some(slot) = st
+            .as_object_mut()
+            .and_then(|obj| obj.remove(BOOST_SLOT_KEY))
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize)
+            .filter(|slot| *slot < source_count)
+        else {
+            continue;
+        };
+        let html = paint_lean_feed_card_opts(&st, "remote_profile", &viewer_actor);
+        if !html.trim().is_empty() {
+            cards.push((slot, html));
+        }
+    }
+    // Source order, one card per slot (the bridge checks strictly increasing ordinals).
+    cards.sort_by_key(|(slot, _)| *slot);
+    cards.dedup_by_key(|(slot, _)| *slot);
+    Ok(LeanBoostPage {
+        cards,
+        source_count,
+        next_offset: offset + source_count as i64,
+        has_more,
+    })
+}
+
 pub async fn profile_html_fill(
     cfg: &Config,
     viewer_owner_id: i64,
@@ -956,6 +1048,30 @@ pub async fn fetch_outbox_statuses_by_uris(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Seeded by hand: a cached Fediverse boost, an uncached one, and a cached
+    /// Bluesky repost (see the PR for the seed SQL). Run with
+    /// BOOSTS_TEST_DATABASE_URL against a schema built by pg-ci-schema.php.
+    #[tokio::test]
+    #[ignore = "requires seeded PostgreSQL fixture"]
+    async fn lean_boost_page_keeps_one_slot_per_reblog_row() -> Result<()> {
+        let url = std::env::var("BOOSTS_TEST_DATABASE_URL")?;
+        let (db, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls).await?;
+        tokio::spawn(connection);
+        let actor = "https://mkultra.monster/users/cmdr_nova";
+        let page = lean_boost_page(&db, actor, 1, 12, 0).await?;
+        assert_eq!(page.source_count, 3);
+        assert_eq!(page.next_offset, 3);
+        assert!(!page.has_more);
+        let slots: Vec<usize> = page.cards.iter().map(|(slot, _)| *slot).collect();
+        assert_eq!(slots, vec![0, 2], "uncached original consumes slot 1 without a card");
+        assert!(page.cards[0].1.contains("Hello from alice"));
+        assert!(page.cards[1].1.contains("Bluesky hello"));
+        assert!(!page.cards.iter().any(|(_, html)| html.contains("vaak_profile_slot")));
+        let second = lean_boost_page(&db, actor, 2, 2, 0).await?;
+        assert_eq!((second.source_count, second.next_offset, second.has_more), (2, 2, true));
+        Ok(())
+    }
 
     /// Profiles build statuses separately from Home; they must meet the same
     /// vaak-types contract and paint with the same painter.

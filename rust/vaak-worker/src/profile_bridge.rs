@@ -188,6 +188,9 @@ struct Reply<'a>{protocol_version:u8,ok:bool,request_binding:Binding<'a>,page:Pa
 fn secret()->Option<String>{if std::env::var("VAAK_PROFILE_COMPLETE_NATIVE").ok().as_deref()!=Some("1"){return None}std::env::var("VAAK_PROFILE_COMPLETE_SECRET").ok().filter(|secret|secret.len()>=32)}
 pub(crate) fn enabled()->bool{secret().is_some()}
 pub(crate) async fn no_store(mut response:Response)->Response{response.headers_mut().insert(axum::http::header::CACHE_CONTROL,axum::http::HeaderValue::from_static("no-store"));response}
+/// Signed-in Boosts tab pages the durable masto_reblogs history with the lean
+/// Home card. VAAK_PROFILE_BOOSTS_LEAN=0 returns to the events Announce ledger.
+pub(crate) fn lean_boosts_enabled()->bool{!matches!(std::env::var("VAAK_PROFILE_BOOSTS_LEAN").ok().as_deref().map(str::trim),Some("0"|"false"|"off"|"no"))}
 fn authorized(headers:&HeaderMap,secret:&str)->bool{let supplied=headers.get("x-vaak-profile-token").and_then(|header|header.to_str().ok()).unwrap_or("");supplied.len()==secret.len()&&supplied.bytes().zip(secret.bytes()).fold(0u8,|diff,(a,b)|diff|(a^b))==0}
 fn decode(bytes:&[u8])->Result<Request>{
  if bytes.is_empty()||bytes.len()>MAX_BYTES{bail!("profile request size")}
@@ -207,6 +210,11 @@ async fn paint(cfg:&crate::config::Config,db:&tokio_postgres::Client,request:&Re
   Viewer::Authenticated{owner_id,csrf,bsky}=>{let mut session=crate::profile_context::AuthenticatedProfileSession::from_php_session(*owner_id,csrf.clone(),request.actor_key.clone(),request.actor.clone(),request.lazy_media,request.status_preview_budget)?.with_quote_preview_budget(request.quote_preview_budget).with_warm_context(warm);if let Some(bsky)=bsky{session=session.with_php_bsky(db,bsky.clone()).await?;}authenticated=session;crate::profile_materialize::ProfileViewer::Auth(&authenticated)}
  };
  record_stage(Stage::Session,session_started);
+ if let (Viewer::Authenticated{owner_id,..},true)=(&request.viewer,request.tab=="boosts"&&lean_boosts_enabled()){
+  let page=timed(Stage::Cards,crate::profile_html::lean_boost_page(db,&request.actor,*owner_id,request.limit,request.offset)).await?;
+  let reply=Reply{protocol_version:1,ok:true,request_binding:Binding{actor_key:&request.actor_key,actor:&request.actor,tab:&request.tab,mode:&request.mode,offset:request.offset,limit:request.limit},page:Page{source_count:page.source_count,next_offset:page.next_offset,has_more:page.has_more},cards:page.cards.into_iter().map(|(source_index,html)|Card{source_index,html}).collect(),status_preview_state:crate::direct_preview::PreviewState::from_remaining(request.status_preview_budget,request.status_preview_budget,page.source_count)?,quote_preview_state:QuoteState{initial:request.quote_preview_budget,remaining:request.quote_preview_budget,attempts:0}};
+  let bytes=serde_json::to_vec(&reply)?;if bytes.len()>MAX_REPLY{bail!("profile reply size")}return Ok(bytes);
+ }
  let selected=timed(Stage::Source,crate::profile_source::select(db,&request.actor_key,&request.actor,&request.tab,request.limit,request.offset)).await?;
  let mut prepared=timed(Stage::Cards,crate::profile_context::prepare_ordered_profile_page(db,&viewer,selected,deps.dns)).await?;
  #[cfg(test)] if let Some(clock)=deps.render_clock{prepared.set_render_clock_for_fixture(clock)?;}

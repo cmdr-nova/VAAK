@@ -153,7 +153,7 @@ function ap_maintain_queue_retention_plan(): array
 }
 
 /** @param list<string> $states */
-function ap_maintain_archive_expired(PDO $db, string $table, string $timeColumn, array $states, string $cutoff, bool $isPostgres): int
+function ap_maintain_archive_expired(PDO $db, string $table, string $timeColumn, array $states, string $cutoff, bool $isPostgres, string $keepSql = ''): int
 {
     $allowed = [
         'ap_publish_delivery_queue', 'ap_fanout_delivery_queue',
@@ -167,6 +167,10 @@ function ap_maintain_archive_expired(PDO $db, string $table, string $timeColumn,
     if ($states !== []) {
         $where = 'status IN (' . implode(',', array_fill(0, count($states), '?')) . ') AND ' . $where;
         $params = array_merge($states, [$cutoff]);
+    }
+    // Static SQL only (no binds): rows the caller's DELETE also keeps.
+    if ($keepSql !== '') {
+        $where .= ' AND ' . $keepSql;
     }
     $rows = $db->prepare("SELECT * FROM {$table} WHERE {$where}");
     $rows->execute($params);
@@ -409,7 +413,11 @@ try {
 
         // --- Firehose / Home events retention ---
         $eventsCutoff = $nowUtc->modify('-' . $eventsDays . ' days')->format('c');
-        $st = $db->prepare('SELECT COUNT(*) FROM events WHERE created_at < ?');
+        // Remote content only. Rows written by local accounts (their boosts,
+        // likes, follows) are their own history: the profile Boosts tab and
+        // other surfaces read them long after the remote cache expires.
+        $eventsKeepLocal = "COALESCE(actor_id, '') NOT LIKE 'https://mkultra.monster/users/%'";
+        $st = $db->prepare('SELECT COUNT(*) FROM events WHERE created_at < ? AND ' . $eventsKeepLocal);
         $st->execute([$eventsCutoff]);
         $n = (int) $st->fetchColumn();
         if ($n > 0) {
@@ -417,11 +425,11 @@ try {
                 $log("would_delete events older_than=$eventsCutoff count=$n");
             } else {
                 try {
-                    ap_maintain_archive_expired($db, 'events', 'created_at', [], $eventsCutoff, $isPostgres);
+                    ap_maintain_archive_expired($db, 'events', 'created_at', [], $eventsCutoff, $isPostgres, $eventsKeepLocal);
                 } catch (Throwable $e) {
                     $log('events cold archive skipped: ' . $e->getMessage());
                 }
-                $del = $db->prepare('DELETE FROM events WHERE created_at < ?');
+                $del = $db->prepare('DELETE FROM events WHERE created_at < ? AND ' . $eventsKeepLocal);
                 $del->execute([$eventsCutoff]);
                 $stats['events_deleted'] = $del->rowCount();
                 $log("deleted events older_than=$eventsCutoff count={$stats['events_deleted']}");

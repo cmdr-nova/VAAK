@@ -42,6 +42,7 @@ async fn paint_full_with_warm(db:&tokio_postgres::Client,request:&FullRequest,de
  #[cfg(not(test))] let _=clock;
  super::mark_step("quote_state");let(source_count,status_remaining,quote_remaining,status_attempts,quote_attempts,effective_tab)=match &prepared{
   crate::profile_context::LocalProfileFirstPaint::Timeline{header,body,..}|crate::profile_context::LocalProfileFirstPaint::Secondary{header,body,..}=>{let(_,quote,attempts)=body.quote_state();(body.page().source_count(),body.status_state().remaining(),quote.context("full profile quote state missing")?,body.status_state().attempts(),attempts,header.facts().effective_tab().to_owned())},
+  crate::profile_context::LocalProfileFirstPaint::LeanBoosts{header,page,..}=>(page.source_count,request.status_preview_budget,request.quote_preview_budget,0,0,header.facts().effective_tab().to_owned()),
   crate::profile_context::LocalProfileFirstPaint::Featured{header,content}=>(content.source_count(),request.status_preview_budget,request.quote_preview_budget,0,0,header.facts().effective_tab().to_owned()),
   crate::profile_context::LocalProfileFirstPaint::Blog(header)=>(0,request.status_preview_budget,request.quote_preview_budget,0,0,header.facts().effective_tab().to_owned()),
   crate::profile_context::LocalProfileFirstPaint::Blocked(_)=>(0,request.status_preview_budget,request.quote_preview_budget,0,0,request.tab.clone()),
@@ -50,6 +51,7 @@ async fn paint_full_with_warm(db:&tokio_postgres::Client,request:&FullRequest,de
  let html=prepared.render()?;
  let(kind,header_bytes,card_ordinals,source_page)=match &prepared{
   crate::profile_context::LocalProfileFirstPaint::Timeline{header,body,..}=>("timeline",crate::profile_header::render(header)?.len(),body.cards().iter().map(|(ordinal,_)|*ordinal).collect(),SourcePage{source_count,next_offset:body.page().next_offset(),has_more:body.page().has_more()}),
+  crate::profile_context::LocalProfileFirstPaint::LeanBoosts{header,page,..}=>("timeline",crate::profile_header::render(header)?.len(),page.cards.iter().map(|(ordinal,_)|*ordinal).collect(),SourcePage{source_count,next_offset:page.next_offset,has_more:page.has_more}),
   crate::profile_context::LocalProfileFirstPaint::Secondary{header,body,..}=>("secondary",crate::profile_header::render(header)?.len(),body.cards().iter().map(|(ordinal,_)|*ordinal).collect(),SourcePage{source_count,next_offset:body.page().next_offset(),has_more:false}),
   crate::profile_context::LocalProfileFirstPaint::Featured{header,content}=>("featured",crate::profile_header::render(header)?.len(),content.card_ordinals(),SourcePage{source_count,next_offset:source_count as i64,has_more:false}),
   crate::profile_context::LocalProfileFirstPaint::Blog(header)=>("blog",crate::profile_header::render(header)?.len(),Vec::new(),SourcePage{source_count:0,next_offset:0,has_more:false}),
