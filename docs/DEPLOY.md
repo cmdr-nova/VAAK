@@ -198,6 +198,18 @@ GRANT vaak_migrate TO "www-data";
 
 Run that SQL as a superuser. The env file also sets `AP_DB_PASSWORD`. Keep that value only on the server. `GRANT vaak_migrate TO "www-data";` is required once tables are owned by `vaak_migrate`. `"www-data"` inherits that membership, which is what lets request-time DDL succeed.
 
+### CPU priority tiers
+
+`deploy/vaak-cpu-tiers.sh` gives the background units lower `CPUWeight`/`IOWeight` (and `Nice` for warmers) so page loads win when the box is busy. php-fpm, Caddy, Postgres, Redis and the Axum server keep the defaults. The release does not ship `deploy/`, so copy the script over and run it as root:
+
+```bash
+bash vaak-cpu-tiers.sh status   # what is live now
+bash vaak-cpu-tiers.sh apply    # writes <unit>.d/50-vaak-cpu-tier.conf, daemon-reload
+bash vaak-cpu-tiers.sh remove   # deletes only those drop-ins
+```
+
+Weights apply on reload. `Nice` applies on the next start; `apply` prints the restarts for the long-running warmers.
+
 ## What the activate step does
 
 `deploy/remote/vaak-release-activate.sh` runs on the server as `vaak-deploy`.
