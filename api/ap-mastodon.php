@@ -164,6 +164,32 @@ function ap_masto_notification_policy(): array
     ];
 }
 
+/**
+ * Actor id of the VAAK account named by the first bare @name in a private
+ * mention ("@juno_flux hi"), or null. @user@host mentions are handled by the
+ * caller; disabled accounts are skipped.
+ */
+function ap_masto_dm_local_mention_peer(string $status): ?string
+{
+    if (!preg_match_all('/(?<![A-Za-z0-9_@\/.])@([A-Za-z0-9_]{1,64})(?![A-Za-z0-9_@])/', $status, $mm)) {
+        return null;
+    }
+    foreach ($mm[1] as $name) {
+        try {
+            $st = ap_db()->prepare('SELECT actor_id FROM ap_users WHERE LOWER(actor_key) = ? AND disabled_at IS NULL LIMIT 1');
+            $st->execute([strtolower($name)]);
+            $actor = (string) ($st->fetchColumn() ?: '');
+        } catch (Throwable $e) {
+            error_log('[ap-masto] dm local mention: ' . $e->getMessage());
+            return null;
+        }
+        if ($actor !== '') {
+            return rtrim($actor, '/');
+        }
+    }
+    return null;
+}
+
 function ap_masto_json(mixed $data, int $code = 200): void
 {
     http_response_code($code);
@@ -2622,6 +2648,10 @@ function ap_masto_api(string $method, string $path): void
             if ($dmPeer === null) {
                 if (preg_match('/@([A-Za-z0-9_]+)@([A-Za-z0-9.-]+\.[A-Za-z]{2,})/', $status, $mm)) {
                     $dmPeer = '@' . $mm[1] . '@' . $mm[2];
+                } else {
+                    // Apps write a local account as a bare @name (its acct has
+                    // no host). A private mention to one is a local DM.
+                    $dmPeer = ap_masto_dm_local_mention_peer($status);
                 }
             }
             if ($dmPeer === null || $dmPeer === '') {

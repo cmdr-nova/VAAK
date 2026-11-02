@@ -101,6 +101,7 @@ function actor_handle(?string $actorId, ?string $username = null, bool $allowFet
 $root = dirname(__DIR__, 2);
 reference_load($root . '/api/ap-db.php', ['ap_dm_thread', 'ap_dm_thread_after']);
 reference_load($root . '/api/ap-inbox.php', ['ap_dm_local_recipient', 'ap_dm_deliver_local']);
+reference_load($root . '/api/ap-mastodon.php', ['ap_masto_dm_local_mention_peer']);
 reference_load($root . '/api/ap-admin.php', ['admin_dm_message_rows_html', 'admin_dm_people_search', 'admin_local_actor_key_from_id']);
 
 $db = new PDO('sqlite::memory:');
@@ -173,6 +174,16 @@ $GLOBALS['personal_blocks'] = ['5|https://mkultra.monster/users/nova' => true];
 $ok = ap_dm_deliver_local($juno, 'https://mkultra.monster/users/nova', ['object_id' => 'x', 'content' => 'blocked']);
 dm_ws_check($ok === true && $GLOBALS['stored'] === [], 'a recipient who blocked the sender gets nothing, silently');
 $GLOBALS['personal_blocks'] = [];
+
+// ---- private mentions from apps (Ice Cubes etc.) ----
+dm_ws_check(ap_masto_dm_local_mention_peer('@juno hi there') === 'https://mkultra.monster/users/juno', 'a bare @name private mention reaches the local account');
+dm_ws_check(ap_masto_dm_local_mention_peer('hey @JUNO') === 'https://mkultra.monster/users/juno', 'bare mentions match case-insensitively');
+dm_ws_check(ap_masto_dm_local_mention_peer('@gone hi') === null, 'a disabled account is not a DM target');
+dm_ws_check(ap_masto_dm_local_mention_peer('mail me at a@juno') === null, 'an email-like word is not a mention');
+dm_ws_check(ap_masto_dm_local_mention_peer('see https://x.test/@juno') === null, 'a profile URL is not a mention');
+dm_ws_check(ap_masto_dm_local_mention_peer('@nobody @juno') === 'https://mkultra.monster/users/juno', 'the first mention that is a real account wins');
+$masto = (string) file_get_contents($root . '/api/ap-mastodon.php');
+dm_ws_check(str_contains($masto, '$dmPeer = ap_masto_dm_local_mention_peer($status);'), 'direct statuses fall back to bare local mentions');
 
 // ---- people picker ----
 $db->exec("INSERT INTO following (owner_actor_id, actor_id) VALUES
