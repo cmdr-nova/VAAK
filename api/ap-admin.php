@@ -4426,6 +4426,24 @@ $vaakAdminOnlyActions = [
             echo json_encode($ajaxOut, JSON_UNESCAPED_SLASHES);
             exit;
         }
+    } elseif ($action === 'bsky_feed_edit') {
+        // Library > Feeds: reorder, pin/unpin, remove saved Bluesky feeds.
+        $view = 'bsky_feeds';
+        $feedOp = preg_replace('/[^a-z]/', '', (string) ($_POST['op'] ?? '')) ?: '';
+        $feedUri = trim((string) ($_POST['feed_uri'] ?? ''));
+        $editResult = (function_exists('ap_bsky_tab_enabled') && ap_bsky_tab_enabled() && function_exists('ap_bsky_saved_feeds_edit'))
+            ? ap_bsky_saved_feeds_edit((int) $vaakOwnerId, $feedOp, $feedUri)
+            : ['ok' => false, 'error' => 'Bluesky is disabled on this instance.'];
+        if (!empty($editResult['ok'])) {
+            $notice = match ($feedOp) {
+                'pin' => 'Pinned to your Home feeds',
+                'unpin' => 'Unpinned (still saved)',
+                'remove' => 'Removed from your saved feeds',
+                default => 'Feed order saved',
+            };
+        } else {
+            $error = (string) ($editResult['error'] ?? 'Could not change the feed.');
+        }
     } elseif ($action === 'bsky_feed_pin' || $action === 'bsky_feed_unpin') {
         // Search > Feeds: pin/unpin in the account's Bluesky preferences.
         $view = 'search';
@@ -14968,6 +14986,7 @@ function view_title(string $view): string
         'tags' => 'Hashtags',
         'collections' => 'Collections',
         'lists' => 'Lists',
+        'bsky_feeds' => 'Feeds',
         'mod_lists' => 'Mod Lists',
         'import_export' => 'Import / Export',
         'report' => 'Report',
@@ -25908,6 +25927,80 @@ if (isset($_GET['partial'], $_GET['shell'])
 }
 
 /**
+ * Library > Feeds: the viewer's saved Bluesky feeds in Bluesky's order.
+ * Pinned ones are the Home chips. Every change writes the same
+ * savedFeedsPrefV2 record bsky.app uses, so both apps stay in step.
+ */
+function admin_render_bsky_feeds_page(int $ownerUserId): void
+{
+    if (!admin_bsky_connected()) {
+        echo '<div class="empty">Connect a Bluesky account in <a href="?view=atmosphere">ATmosphere settings</a> to manage feeds here.</div>';
+        return;
+    }
+    $list = ap_bsky_saved_feed_list($ownerUserId);
+    echo '<div class="meta" style="margin:0 0 1rem;line-height:1.45">Pinned feeds show as chips on Home, in this order. '
+        . 'Changes here also show up in the Bluesky app. '
+        . '<a href="' . h(admin_search_href('', 'feeds', true)) . '" data-vaak-soft-nav="search" data-search-q="" data-search-type="feeds">Find more feeds</a></div>';
+    if (empty($list['ok'])) {
+        echo '<div class="empty">Could not load your Bluesky feeds: ' . h((string) ($list['error'] ?? 'unknown error')) . '</div>';
+        return;
+    }
+    $items = is_array($list['items'] ?? null) ? $list['items'] : [];
+    $labels = function_exists('ap_bsky_feed_labels') ? ap_bsky_feed_labels($items, 12) : [];
+    $groups = ['Pinned' => [], 'Saved' => []];
+    foreach ($items as $item) {
+        $groups[!empty($item['pinned']) ? 'Pinned' : 'Saved'][] = $item;
+    }
+    foreach ($groups as $title => $rows) {
+        echo '<section class="search-section search-section-accounts" style="margin-bottom:1.3rem"><div class="search-sec-hd"><h3>'
+            . h($title) . '</h3></div>';
+        if ($rows === []) {
+            echo '<div class="meta" style="padding:.5rem 0">'
+                . ($title === 'Pinned' ? 'Nothing pinned. Pin a feed below or from Search to add it to Home.' : 'No other saved feeds.')
+                . '</div></section>';
+            continue;
+        }
+        echo '<div data-search-list>';
+        $n = count($rows);
+        foreach ($rows as $i => $item) {
+            echo admin_bsky_feed_manage_row_html($item, (string) ($labels[$item['value']] ?? ''), $i > 0, $i < $n - 1);
+        }
+        echo '</div></section>';
+    }
+}
+
+/** @param array{type:string,value:string,pinned:bool} $item */
+function admin_bsky_feed_manage_row_html(array $item, string $label, bool $canUp, bool $canDown): string
+{
+    $value = (string) $item['value'];
+    $isTimeline = $value === 'following';
+    $name = $isTimeline ? 'Following' : ($label !== '' ? $label : basename($value));
+    $kind = $isTimeline ? 'Your Bluesky follows' : ((string) $item['type'] === 'list' ? 'List' : 'Feed');
+    $open = '?view=bluesky&feed=' . rawurlencode($value);
+    $form = static function (string $op, string $text, string $title, string $class, bool $confirm = false) use ($value): string {
+        return '<form method="post" action="?view=bsky_feeds"' . ($confirm ? ' onsubmit="return confirm(' . h(json_encode('Remove this feed from your saved feeds?')) . ');"' : '') . '>'
+            . '<input type="hidden" name="action" value="bsky_feed_edit">'
+            . '<input type="hidden" name="return_view" value="bsky_feeds">'
+            . '<input type="hidden" name="op" value="' . h($op) . '">'
+            . '<input type="hidden" name="feed_uri" value="' . h($value) . '">'
+            . '<button class="' . h($class) . '" type="submit" title="' . h($title) . '" aria-label="' . h($title) . '">' . $text . '</button></form>';
+    };
+    $html = '<article class="search-account search-feed">'
+        . '<div class="search-account-who"><div class="search-account-name"><a href="' . h($open) . '" data-vaak-soft-nav="bluesky" data-bsky-feed="' . h($value) . '">'
+        . h($name) . '</a></div><div class="search-account-handle">' . h($kind) . '</div></div>'
+        . '<div class="search-account-act">';
+    $html .= $canUp ? $form('up', '↑', 'Move up', 'btn btn-ghost btn-compact') : '';
+    $html .= $canDown ? $form('down', '↓', 'Move down', 'btn btn-ghost btn-compact') : '';
+    $html .= !empty($item['pinned'])
+        ? $form('unpin', '★', 'Pinned. Click to unpin', 'btn btn-ghost btn-compact btn-following')
+        : $form('pin', '☆', 'Pin to Home', 'btn btn-primary btn-compact');
+    if (!$isTimeline) {
+        $html .= $form('remove', '✕', 'Remove from saved feeds', 'btn btn-ghost btn-compact', true);
+    }
+    return $html . '</div></article>';
+}
+
+/**
  * Bluesky view column: feed chips, first page, sentinel. Shared by the full
  * page and the soft-nav shell (view=bluesky&partial=1&shell=1).
  */
@@ -32740,6 +32833,9 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           <a class="<?= $view === 'tags' ? 'active' : '' ?>" href="/vaak/?view=tags"><span class="ico">＃</span><span class="label">Hashtags</span></a>
           <a class="<?= $view === 'collections' ? 'active' : '' ?>" href="/vaak/?view=collections"><span class="ico">▦</span><span class="label">Collections</span></a>
           <a class="<?= $view === 'lists' ? 'active' : '' ?>" href="/vaak/?view=lists"><span class="ico">☰</span><span class="label">Lists</span></a>
+          <?php if (admin_bsky_connected()): ?>
+            <a class="<?= $view === 'bsky_feeds' ? 'active' : '' ?>" href="/vaak/?view=bsky_feeds"><span class="ico"><i class="ph ph-rss-simple" aria-hidden="true"></i></span><span class="label">Feeds</span></a>
+          <?php endif; ?>
         </div>
       </details>
       <hr class="nav-sep">
@@ -37691,6 +37787,9 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
           <?php if (!$modLists): ?><div class="empty">No moderation lists yet. Connect Bluesky in ATmosphere to import your existing subscriptions.</div><?php endif; ?>
           <?php foreach ($modLists as $modRow): ?><article class="tweet"><div class="tweet-hd-main"><span class="who"><?= h((string) $modRow['title']) ?></span> <span class="tag"><?= ($modRow['bsky_moderation_action'] ?? 'none') === 'none' ? 'inactive' : h((string) $modRow['bsky_moderation_action']) ?></span><div class="meta"><?= (int) ($modRow['member_count'] ?? 0) ?> members<?= ($modRow['bsky_list_source'] ?? '') === 'subscription' ? ' · subscribed Bluesky list' : (($modRow['bsky_list_source'] ?? '') === 'bsky' ? ' · owned Bluesky list' : (!empty($modRow['bsky_list_uri']) ? ' · Bluesky synced' : ' · VAAK only')) ?></div></div><div class="tweet-actions"><a class="btn btn-primary" href="?view=mod_lists&amp;id=<?= (int) $modRow['id'] ?>">Open</a></div></article><?php endforeach; ?>
         <?php endif; ?>
+
+      <?php elseif ($view === 'bsky_feeds'): ?>
+        <?php admin_render_bsky_feeds_page((int) $vaakOwnerId); ?>
 
       <?php elseif ($view === 'lists'): ?>
         <?php

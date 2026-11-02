@@ -30,6 +30,29 @@ $check(!ap_bsky_feed_uri_valid('at://did:plc:abc/app.bsky.feed.generator/'), 'mi
 $check(!ap_bsky_feed_uri_valid('at://did:plc:abc/app.bsky.feed.generator/hot/extra'), 'extra path segment');
 $check(!ap_bsky_feed_uri_valid("at://did:plc:abc/app.bsky.feed.generator/hot\n"), 'trailing newline');
 
+// Saved-feed list edits (pure, no I/O).
+$mk = static function (array $rows): array {
+    return array_map(static fn ($r) => (object) ['type' => $r[0], 'value' => $r[1], 'pinned' => $r[2], 'id' => 'x' . $r[1]], $rows);
+};
+$vals = static fn (?array $items): string => $items === null ? 'null'
+    : implode(',', array_map(static fn ($i) => $i->value . ($i->pinned ? '*' : ''), $items));
+$base = $mk([['timeline', 'following', true], ['feed', 'A', true], ['feed', 'S1', false], ['feed', 'B', true], ['feed', 'S2', false]]);
+$check($vals(ap_bsky_saved_feed_items_apply($mk([['timeline', 'following', true], ['feed', 'A', true], ['feed', 'S1', false], ['feed', 'B', true], ['feed', 'S2', false]]), 'up', 'B'))
+    === 'following*,B*,S1,A*,S2', 'up swaps with the previous pinned item, skipping saved ones');
+$check($vals(ap_bsky_saved_feed_items_apply($mk([['timeline', 'following', true], ['feed', 'A', true], ['feed', 'S1', false], ['feed', 'B', true], ['feed', 'S2', false]]), 'down', 'S1'))
+    === 'following*,A*,S2,B*,S1', 'down swaps with the next saved item');
+$check($vals(ap_bsky_saved_feed_items_apply($mk([['timeline', 'following', true], ['feed', 'A', true]]), 'up', 'following'))
+    === 'following*,A*', 'up at the top is a no-op');
+$check($vals(ap_bsky_saved_feed_items_apply($base, 'remove', 'A')) === 'following*,S1,B*,S2', 'remove drops the item');
+$check($vals(ap_bsky_saved_feed_items_apply($mk([['feed', 'S1', false]]), 'pin', 'S1')) === 'S1*', 'pin flips a saved item');
+$check($vals(ap_bsky_saved_feed_items_apply($mk([['feed', 'A', true]]), 'unpin', 'A')) === 'A', 'unpin keeps it saved');
+$new = ap_bsky_saved_feed_items_apply($mk([['feed', 'A', true]]), 'pin', 'at://did:plc:x/app.bsky.graph.list/l1');
+$check(is_array($new) && count($new) === 2 && $new[1]->type === 'list' && $new[1]->pinned === true && strlen((string) $new[1]->id) === 14,
+    'pin adds a missing list as type list with a fresh id');
+$check(ap_bsky_saved_feed_items_apply($mk([['feed', 'A', true]]), 'remove', 'Z') === null, 'remove of a missing feed reports it');
+$check(json_encode(['preferences' => [(object) ['$type' => 't', 'x' => new stdClass()]]]) === '{"preferences":[{"$type":"t","x":{}}]}',
+    'object prefs keep {} when encoded for putPreferences');
+
 if ($failures !== []) {
     fwrite(STDERR, "bsky-feed-pin-uri-smoke FAILED: " . implode('; ', $failures) . "\n");
     exit(1);
