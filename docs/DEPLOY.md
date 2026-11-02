@@ -198,6 +198,34 @@ GRANT vaak_migrate TO "www-data";
 
 Run that SQL as a superuser. The env file also sets `AP_DB_PASSWORD`. Keep that value only on the server. `GRANT vaak_migrate TO "www-data";` is required once tables are owned by `vaak_migrate`. `"www-data"` inherits that membership, which is what lets request-time DDL succeed.
 
+### CPU priority tiers
+
+`deploy/vaak-cpu-tiers.sh` gives the background units lower `CPUWeight`/`IOWeight` (and `Nice` for warmers) so page loads win when the box is busy. php-fpm, Caddy, Postgres, Redis and the Axum server keep the defaults. The release does not ship `deploy/`, so copy the script over and run it as root:
+
+```bash
+bash vaak-cpu-tiers.sh status   # what is live now
+bash vaak-cpu-tiers.sh apply    # writes <unit>.d/50-vaak-cpu-tier.conf, daemon-reload
+bash vaak-cpu-tiers.sh remove   # deletes only those drop-ins
+```
+
+Weights apply on reload. `Nice` applies on the next start; `apply` prints the restarts for the long-running warmers.
+
+### Notification nudge stream
+
+With `VAAK_NOTIF_STREAM=1` in the PHP-FPM env, each signed-in page gets a 12-hour token (Redis `vaak:notif_stream:token:v1:<sha256>`) and opens `GET /vaak/notif-stream` on the Axum server. The stream sends `event: notif` only when the owner's newest notification row, read marker, unread DMs or pending Phyrian requests change. The page then runs its usual `?ajax=notif_unread` poll, and otherwise polls every 120 s instead of every 12 s. It carries no notification content. Caps: 8 streams per owner, 400 in total, 10-minute lifetime (the browser reconnects).
+
+Caddy has to send that one path to the worker without buffering. Put this inside the mkultra.monster site block, before the `/vaak` PHP handling:
+
+```caddy
+handle /vaak/notif-stream {
+    reverse_proxy 127.0.0.1:8787 {
+        flush_interval -1
+    }
+}
+```
+
+Order: deploy, add the Caddy block and `systemctl reload caddy`, check `curl -si 'https://mkultra.monster/vaak/notif-stream?t=x'` answers `401`, then set the flag and reload php8.3-fpm. To turn it off, remove the flag and reload php8.3-fpm; open pages fall back to polling when their stream closes.
+
 ## What the activate step does
 
 `deploy/remote/vaak-release-activate.sh` runs on the server as `vaak-deploy`.

@@ -206,6 +206,26 @@ function ap_notification_list_epoch(int $ownerUserId): string
     }
 }
 
+/**
+ * One-page token for the Rust notification nudge stream (/vaak/notif-stream).
+ * Empty unless VAAK_NOTIF_STREAM=1. Redis maps sha256(token) to the owner id
+ * for 12 hours; the worker never needs a PHP secret.
+ */
+function ap_notif_stream_token(int $ownerUserId): string
+{
+    if ($ownerUserId < 1 || getenv('VAAK_NOTIF_STREAM') !== '1') return '';
+    $redis = ap_redis_client('cache');
+    if (!$redis) return '';
+    try {
+        $token = bin2hex(random_bytes(24));
+        $redis->set('vaak:notif_stream:token:v1:' . hash('sha256', $token), (string) $ownerUserId, ['ex' => 43200]);
+        return $token;
+    } catch (Throwable $e) {
+        error_log('[ap-redis] notif stream token failed: ' . $e->getMessage());
+        return '';
+    }
+}
+
 function ap_notification_list_epoch_bump(?int $ownerUserId = null): void
 {
     $redis = ap_redis_client('cache');

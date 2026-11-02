@@ -10,6 +10,11 @@
 //! request is forwarded byte for byte to PHP on a loopback listener, so origin
 //! recovery, other forwarded Creates, key fetches and rejections keep their
 //! PHP behaviour. Rust never fetches a key and never routes an activity.
+//!
+//! Two deliveries are answered 202 without reaching PHP or the spool: a
+//! repeat of an activity id already spooled for the same inbox path in the
+//! last day (stat `duplicate`), and an account self-Delete from an actor with
+//! no remote_actors/followers/following row (stat `unknown_self_delete`).
 
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
@@ -53,18 +58,47 @@ pub async fn handle(State(state): State<crate::http::AppState>, uri: Uri, header
     let cfg = state.cfg.clone();
     let decision = fast_path(&cfg, &uri, &headers, &body).await;
     let field = match &decision {
-        Ok(_) => "spooled".to_string(),
+        Ok(accepted) => accepted.stat_field().to_string(),
         Err(reason) => format!("fwd_{reason}"),
     };
     stat(&cfg, &field).await;
     match decision {
-        Ok(_) => (
+        Ok(accepted) => (
             StatusCode::ACCEPTED,
             [("content-type", "application/json"), ("cache-control", "no-store"), ("x-content-type-options", "nosniff")],
-            r#"{"status":"accepted","action":"spooled"}"#,
+            accepted.body(),
         )
             .into_response(),
         Err(_) => forward(&uri, &headers, body).await,
+    }
+}
+
+/// What the fast path did with a delivery it answered itself.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Accepted {
+    Spooled(i64),
+    /// Same activity id already spooled for this inbox path in the last day.
+    Duplicate,
+    /// `Delete` of an actor VAAK holds nothing for. PHP would fetch the gone
+    /// key, then the gone actor, and end at `delete_noop`.
+    UnknownSelfDelete,
+}
+
+impl Accepted {
+    fn stat_field(&self) -> &'static str {
+        match self {
+            Accepted::Spooled(_) => "spooled",
+            Accepted::Duplicate => "duplicate",
+            Accepted::UnknownSelfDelete => "unknown_self_delete",
+        }
+    }
+
+    fn body(&self) -> &'static str {
+        match self {
+            Accepted::Spooled(_) => r#"{"status":"accepted","action":"spooled"}"#,
+            Accepted::Duplicate => r#"{"status":"accepted","action":"duplicate"}"#,
+            Accepted::UnknownSelfDelete => r#"{"status":"accepted","action":"ignored"}"#,
+        }
     }
 }
 
@@ -152,7 +186,7 @@ pub(crate) fn activity_head(body: &[u8]) -> Option<(String, String)> {
     (!kind.is_empty() && actor.starts_with("https://")).then_some((kind, actor))
 }
 
-async fn fast_path(cfg: &crate::config::Config, uri: &Uri, headers: &HeaderMap, body: &Bytes) -> Result<i64, &'static str> {
+async fn fast_path(cfg: &crate::config::Config, uri: &Uri, headers: &HeaderMap, body: &Bytes) -> Result<Accepted, &'static str> {
     if !enabled() {
         return Err("off");
     }
@@ -163,6 +197,18 @@ async fn fast_path(cfg: &crate::config::Config, uri: &Uri, headers: &HeaderMap, 
     let key_id = claimed_key_id(&map).ok_or("no_signature")?;
     let ip = client_ip(&map);
     let mut redis = redis_conn(&cfg.redis_url).await.map_err(|_| "redis")?;
+
+    // Account deletions are broadcast to every server the account ever
+    // reached. When VAAK has no row for the actor there is nothing to remove,
+    // and the key is already gone, so skip PHP's two doomed fetches.
+    if let Some(actor) = self_delete_actor(body).filter(|actor| host_of(actor) == host_of(&key_id)) {
+        let db = conn(cfg).await.map_err(|_| "db")?;
+        let known = actor_known(&db, &actor).await.map_err(|_| "db")?;
+        idle_return(db);
+        if !known {
+            return Ok(Accepted::UnknownSelfDelete);
+        }
+    }
 
     // Unknown keys go to PHP, which counts them against its own limits.
     let mirrored: Option<String> = redis::cmd("GET").arg(key_mirror_key(&key_id)).query_async(&mut redis).await.map_err(|_| "redis")?;
@@ -228,17 +274,82 @@ async fn fast_path(cfg: &crate::config::Config, uri: &Uri, headers: &HeaderMap, 
             return Err("unknown_user");
         }
     }
-    let id = spool_insert(&db, &ip, &key_id, uri.path(), &sig_path, &kind, body).await.map_err(|e| {
-        tracing::warn!(error = %e, "inbox spool insert failed; forwarding to PHP");
-        "spool"
-    })?;
+    // Relays plus direct delivery, and senders retrying after a slow answer,
+    // hand over the same activity more than once. The inbox path is part of
+    // the key because a personal inbox decides which local user it is for.
+    let seen_key = activity_id(body).map(|id| seen_key(uri.path(), &id));
+    if let Some(key) = &seen_key {
+        let fresh: Option<String> =
+            redis::cmd("SET").arg(key).arg(1).arg("NX").arg("EX").arg(SEEN_TTL).query_async(&mut redis).await.map_err(|_| "redis")?;
+        if fresh.is_none() {
+            idle_return(db);
+            return Ok(Accepted::Duplicate);
+        }
+    }
+    let id = match spool_insert(&db, &ip, &key_id, uri.path(), &sig_path, &kind, body).await {
+        Ok(id) => id,
+        Err(e) => {
+            tracing::warn!(error = %e, "inbox spool insert failed; forwarding to PHP");
+            if let Some(key) = &seen_key {
+                let _: Result<(), _> = redis::cmd("DEL").arg(key).query_async(&mut redis).await;
+            }
+            return Err("spool");
+        }
+    };
     idle_return(db);
     // The drain worker also scans for pending rows, so a lost wake-up only delays.
     if let Ok(mut queue) = redis_conn(&cfg.redis_queue_url).await {
         let key = format!("vaak:queue:{SPOOL_QUEUE}");
         let _: Result<(), _> = redis::pipe().lpush(&key, id).expire(&key, 86400).query_async(&mut queue).await;
     }
-    Ok(id)
+    Ok(Accepted::Spooled(id))
+}
+
+/// How long a spooled activity id counts as seen.
+const SEEN_TTL: i64 = 86400;
+
+fn seen_key(path: &str, activity_id: &str) -> String {
+    let path = path.trim_end_matches('/');
+    format!("vaak:inbox_rust:seen:v1:{}", hex::encode(Sha256::digest(format!("{path}\n{}", activity_id.trim()).as_bytes())))
+}
+
+/// The activity's own https id, when it has one.
+pub(crate) fn activity_id(body: &[u8]) -> Option<String> {
+    let doc: Value = serde_json::from_slice(body).ok()?;
+    let id = doc.get("id")?.as_str()?.trim();
+    (id.starts_with("https://") && id.len() <= 2048).then(|| id.to_string())
+}
+
+/// The actor of a `Delete` whose object is that same actor (an account
+/// deletion), or None for anything else.
+pub(crate) fn self_delete_actor(body: &[u8]) -> Option<String> {
+    let doc: Value = serde_json::from_slice(body).ok()?;
+    if doc.get("type")?.as_str()? != "Delete" {
+        return None;
+    }
+    let id_of = |v: &Value| match v {
+        Value::String(id) => Some(id.trim().trim_end_matches('/').to_string()),
+        Value::Object(obj) => obj.get("id")?.as_str().map(|id| id.trim().trim_end_matches('/').to_string()),
+        _ => None,
+    };
+    let actor = id_of(doc.get("actor")?)?;
+    let object = id_of(doc.get("object")?)?;
+    (actor.starts_with("https://") && actor == object).then_some(actor)
+}
+
+/// Whether VAAK has any row for this actor: a cached profile, a follower, or
+/// someone a local account follows.
+async fn actor_known(db: &Client, actor: &str) -> Result<bool> {
+    let slash = format!("{actor}/");
+    let row = db
+        .query_one(
+            "SELECT EXISTS (SELECT 1 FROM remote_actors WHERE actor_id IN ($1, $2))
+                 OR EXISTS (SELECT 1 FROM followers WHERE actor_id IN ($1, $2))
+                 OR EXISTS (SELECT 1 FROM following WHERE actor_id IN ($1, $2))",
+            &[&actor, &slash],
+        )
+        .await?;
+    Ok(row.get(0))
 }
 
 /// An accepted relay re-signs other people's Creates and Announces; PHP takes
@@ -416,6 +527,37 @@ mod tests {
         assert!(!relay_forwardable(true, "Delete"));
         assert!(!relay_forwardable(true, "Update"));
         assert!(!relay_forwardable(false, "Create"));
+    }
+
+    #[test]
+    fn self_delete_actor_only_matches_account_deletes() {
+        let a = "https://m.test/users/gone";
+        assert_eq!(self_delete_actor(format!(r#"{{"type":"Delete","actor":"{a}","object":"{a}"}}"#).as_bytes()).as_deref(), Some(a));
+        assert_eq!(
+            self_delete_actor(format!(r#"{{"type":"Delete","actor":{{"id":"{a}/"}},"object":{{"id":"{a}"}}}}"#).as_bytes()).as_deref(),
+            Some(a)
+        );
+        assert_eq!(self_delete_actor(format!(r#"{{"type":"Delete","actor":"{a}","object":"{a}/statuses/1"}}"#).as_bytes()), None);
+        assert_eq!(self_delete_actor(format!(r#"{{"type":"Undo","actor":"{a}","object":"{a}"}}"#).as_bytes()), None);
+        assert_eq!(self_delete_actor(br#"{"type":"Delete","actor":"http://m.test/u","object":"http://m.test/u"}"#), None);
+        assert_eq!(self_delete_actor(b"nope"), None);
+    }
+
+    #[test]
+    fn seen_key_separates_inboxes_and_needs_https_id() {
+        assert_eq!(activity_id(br#"{"id":"https://a.test/1"}"#).as_deref(), Some("https://a.test/1"));
+        assert_eq!(activity_id(br#"{"id":"urn:x"}"#), None);
+        assert_eq!(activity_id(br#"{"type":"Like"}"#), None);
+        assert_eq!(seen_key("/inbox", "https://a.test/1"), seen_key("/inbox/", "https://a.test/1"));
+        assert_ne!(seen_key("/inbox", "https://a.test/1"), seen_key("/users/juno_flux/inbox", "https://a.test/1"));
+        assert_ne!(seen_key("/inbox", "https://a.test/1"), seen_key("/inbox", "https://a.test/2"));
+    }
+
+    #[test]
+    fn accepted_bodies_and_stats() {
+        assert_eq!(Accepted::Spooled(3).stat_field(), "spooled");
+        assert_eq!(Accepted::Duplicate.stat_field(), "duplicate");
+        assert!(Accepted::UnknownSelfDelete.body().contains("ignored"));
     }
 
     #[test]

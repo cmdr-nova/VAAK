@@ -195,6 +195,9 @@ pub async fn serve(cfg: Config, bind: SocketAddr) -> Result<()> {
         .route_layer(axum::middleware::from_fn_with_state(shadow_token, crate::shadow_auth::require));
     let mut app = Router::new()
         .route("/healthz", get(healthz))
+        // Browser notification nudges (SSE). Auth is a Redis token PHP
+        // issues per page; see notif_stream.rs.
+        .route("/vaak/notif-stream", get(crate::notif_stream::handle))
         // Guarded migration endpoint. Disabled unless an internal token is
         // configured; loopback binding is still required by `serve`.
         .route("/internal/phyrian/mutate", post(internal_phyrian_mutate))
