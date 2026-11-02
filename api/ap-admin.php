@@ -44890,6 +44890,9 @@ window.vaakBootStatusThread();
     const actor = items.dataset.actor || '';
     const tab = items.dataset.tab || 'posts';
     let io = null;
+    // Boosts pages can paint nothing when every original is uncached. The
+    // sentinel then stays in view without a new IO event, so keep walking.
+    let emptyRun = 0;
     const abort = () => {
       try { if (io) io.disconnect(); } catch (e) {}
       io = null;
@@ -44927,9 +44930,14 @@ window.vaakBootStatusThread();
         offset = next > requestOffset ? next : requestOffset + limit;
         items.dataset.offset = String(offset);
         items.dataset.hasMore = hasMore ? '1' : '0';
-        if (html.trim()) {
+        const painted = html.replace(/<!--[\s\S]*?-->/g, '').trim() !== '';
+        if (painted) {
           items.insertAdjacentHTML('beforeend', html);
           if (typeof window.novaEnhanceTweetFolds === 'function') window.novaEnhanceTweetFolds(items);
+          if (typeof window.novaEnqueueBoostHydrates === 'function') window.novaEnqueueBoostHydrates(items);
+          emptyRun = 0;
+        } else {
+          emptyRun++;
         }
         if (status) {
           status.textContent = (typeof window.vaakProfileScrollStatus === 'function')
@@ -44941,6 +44949,13 @@ window.vaakBootStatusThread();
         if (status) status.textContent = 'Could not load more';
       } finally {
         loading = false;
+      }
+      if (hasMore && items.isConnected && emptyRun < 8) {
+        const box = sentinel.getBoundingClientRect();
+        const view = root ? root.getBoundingClientRect() : { top: 0, bottom: window.innerHeight };
+        if (box.top < view.bottom + 180 && box.bottom > view.top - 180) {
+          window.requestAnimationFrame(() => loadMore());
+        }
       }
     };
     const style = feed ? window.getComputedStyle(feed) : null;

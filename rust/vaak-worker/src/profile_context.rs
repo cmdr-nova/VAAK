@@ -78,6 +78,8 @@ pub(crate) async fn admit_blocked_header_guest(db:&Client,session:&GuestProfileS
 pub(crate) enum LocalProfileFirstPaint {
  Blocked(AdmittedBlockedProfileHeader),
  Timeline{header:AdmittedProfileHeader,body:OrderedProfilePage,actor:String,tab:String,featured_preload:Option<featured::FeaturedContent>},
+ /// Signed-in Boosts tab from masto_reblogs (see profile_html::lean_boost_page).
+ LeanBoosts{header:AdmittedProfileHeader,page:crate::profile_html::LeanBoostPage,actor:String},
  Secondary{header:AdmittedProfileHeader,body:OrderedProfilePage,tab:String},
  Blog(AdmittedProfileHeader),
  Featured{header:AdmittedProfileHeader,content:featured::FeaturedContent},
@@ -86,6 +88,7 @@ impl LocalProfileFirstPaint {
  pub(crate) async fn require_current(&self,db:&Client)->Result<()>{match self{
   Self::Blocked(header)=>header.require_current(db).await,
   Self::Timeline{header,body,featured_preload,..}=>{header.require_current(db).await?;if let Some(content)=featured_preload{content.require_current(db).await?;}body.require_current(db).await},
+  Self::LeanBoosts{header,..}=>header.require_current(db).await,
   Self::Secondary{header,body,..}=>{header.require_current(db).await?;body.require_current(db).await},
   Self::Blog(header)=>header.require_current(db).await,
   Self::Featured{header,content}=>{header.require_current(db).await?;content.require_current(db).await},
@@ -95,6 +98,14 @@ impl LocalProfileFirstPaint {
   Self::Featured{header,content}=>Ok(format!("{}<div class=\"remote-profile-posts\">{}</div>",crate::profile_header::render(header)?,content.render())),
   Self::Blog(header)=>Ok(format!("{}<div class=\"remote-profile-posts\">{}</div>",crate::profile_header::render(header)?,crate::profile_header::render_blog(header)?)),
   Self::Secondary{header,body,tab}=>{let mut html=crate::profile_header::render(header)?;html.push_str("<div class=\"remote-profile-posts\">");if tab=="pinned"{if body.page().source_count()==0{html.push_str("<div class=\"empty\">No pinned posts.</div>");}else{html.push_str("<div class=\"profile-pinned-feed\" data-vaak-pinned-feed=\"1\">");for(_,card)in body.cards(){html.push_str(card);}html.push_str("</div>");}}else if body.selected_slots()==0{html.push_str("<div class=\"empty\">No answered Asks yet.</div>");}else{for(_,card)in body.cards(){html.push_str(card);}}html.push_str("</div>");Ok(html)},
+  Self::LeanBoosts{header,page,actor}=>{
+   let h=crate::library::actions::esc;let mut html=crate::profile_header::render(header)?;html.push_str("<div class=\"remote-profile-posts\">");
+   if page.source_count==0{html.push_str("<div class=\"empty\">No boosts yet.</div>");}
+   let more=page.has_more;
+   html.push_str(&format!("<div id=\"timeline-items\" data-view=\"remote_profile\" data-actor=\"{}\" data-tab=\"boosts\" data-offset=\"{}\" data-limit=\"12\" data-has-more=\"{}\" data-newest=\"0\">",h(actor),page.next_offset,u8::from(more)));
+   for(_,card)in &page.cards{html.push_str(card);}
+   html.push_str(&format!("</div><div id=\"timeline-status\" class=\"meta\" style=\"padding:.75rem 0;text-align:center\">{}</div><div id=\"timeline-sentinel\" aria-hidden=\"true\" style=\"height:1px\"></div><button type=\"button\" class=\"feed-top-btn\" id=\"feed-top-btn\" title=\"Back to top\" aria-label=\"Back to top\">↑</button></div>",crate::profile_source::profile_scroll_status(more)));Ok(html)
+  }
   Self::Timeline{header,body,actor,tab,..}=>{
    let h=crate::library::actions::esc;let mut html=crate::profile_header::render(header)?;html.push_str("<div class=\"remote-profile-posts\">");
    if body.page().source_count()==0{html.push_str(&format!("<div class=\"empty\">No {} available.</div>",h(tab)));}
@@ -113,7 +124,10 @@ pub(crate) async fn prepare_local_profile_first_paint(db:&Client,viewer:&crate::
  let featured=if crate::library::card::php_trim(&request.tab).eq_ignore_ascii_case("featured"){let content=featured::prepare(db,&header,&request.from).await?;header.facts.apply_featured_presentation_count(content.displayed_count())?;Some(content)}else{None};
  let tab=header.facts().effective_tab().to_owned();crate::profile_bridge::record_stage(crate::profile_bridge::Stage::Header,header_started);
  let result=if tab=="featured"{LocalProfileFirstPaint::Featured{header,content:featured.context("missing native Featured selection")?}}else if tab=="blog"{LocalProfileFirstPaint::Blog(header)}else if matches!(tab.as_str(),"posts"|"replies"|"boosts"|"media"){
-  crate::profile_bridge::mark_step("source");let selection=crate::profile_bridge::timed(crate::profile_bridge::Stage::Source,crate::profile_source::select(db,key,actor,&tab,12,0)).await?;let body=crate::profile_bridge::timed(crate::profile_bridge::Stage::Cards,prepare_ordered_profile_page(db,viewer,selection,dns)).await?;LocalProfileFirstPaint::Timeline{header,body,actor:actor.into(),tab,featured_preload:featured}
+  if let (crate::profile_materialize::ProfileViewer::Auth(_),true)=(viewer,tab=="boosts"&&crate::profile_bridge::lean_boosts_enabled()){
+   crate::profile_bridge::mark_step("source");let page=crate::profile_bridge::timed(crate::profile_bridge::Stage::Cards,crate::profile_html::lean_boost_page(db,actor,owner,12,0)).await?;LocalProfileFirstPaint::LeanBoosts{header,page,actor:actor.into()}
+  }else{
+  crate::profile_bridge::mark_step("source");let selection=crate::profile_bridge::timed(crate::profile_bridge::Stage::Source,crate::profile_source::select(db,key,actor,&tab,12,0)).await?;let body=crate::profile_bridge::timed(crate::profile_bridge::Stage::Cards,prepare_ordered_profile_page(db,viewer,selection,dns)).await?;LocalProfileFirstPaint::Timeline{header,body,actor:actor.into(),tab,featured_preload:featured}}
  }else if matches!(tab.as_str(),"pinned"|"asks"){crate::profile_bridge::mark_step("source");let selection=crate::profile_bridge::timed(crate::profile_bridge::Stage::Source,crate::profile_source::select_secondary(db,key,actor,if tab=="pinned"{"pinned"}else{"asks"})).await?;let body=crate::profile_bridge::timed(crate::profile_bridge::Stage::Cards,prepare_ordered_profile_page(db,viewer,selection,dns)).await?;LocalProfileFirstPaint::Secondary{header,body,tab}}else{bail!("PHP fallback: full secondary profile content assembly incomplete")};
  crate::profile_bridge::mark_step("recheck");crate::profile_bridge::timed(crate::profile_bridge::Stage::Recheck,result.require_current(db)).await?;Ok(result)
 }

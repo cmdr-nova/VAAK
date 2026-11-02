@@ -4763,6 +4763,27 @@ pub(crate) async fn load_profile_boost_page(
     })
 }
 
+/// One source slot per `masto_reblogs` row for the complete profile bridge,
+/// which needs `next_offset == offset + rows consumed`. A `None` slot is a
+/// boost whose original is not cached (or an RSS row a non-owner cannot see):
+/// it consumes the cursor but paints nothing.
+pub(crate) async fn load_profile_boost_slots(
+    db: &Client,
+    actor_url: &str,
+    viewer_owner_id: i64,
+    limit: i64,
+    offset: i64,
+) -> Result<(Vec<Option<Value>>, bool)> {
+    let limit = limit.clamp(1, 50);
+    let profile_owner_id = profile_owner_user_id(db, actor_url).await?;
+    let mut rows = fetch_profile_reblog_rows(db, actor_url, limit + 1, offset.max(0)).await?;
+    let has_more = rows.len() as i64 > limit;
+    rows.truncate(limit as usize);
+    let slots =
+        materialize_profile_reblog_window(db, &rows, viewer_owner_id, profile_owner_id).await?;
+    Ok((slots, has_more))
+}
+
 /// True when the card cannot show a human handle without a fetch.
 /// A missing row whose URL already ends in `/users/alice` is fine.
 /// `/ap/users/{snowflake}` is not.
