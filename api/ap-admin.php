@@ -40063,6 +40063,7 @@ if (!empty($GLOBALS['vaak_profile_shell'])) {
   window.VAAK_USERNAME = <?= json_encode((string) ($vaakUsername ?? ''), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) ?>;
   window.VAAK_HANDLE = <?= json_encode((string) ($vaakHandle ?? ''), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) ?>;
   window.VAAK_ACTOR_KEY = <?= json_encode((string) (($vaakGuestProfile ?? false) ? '' : ($vaakActorKey ?? '')), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) ?>;
+  window.VAAK_NOTIF_STREAM_TOKEN = <?= json_encode((($vaakGuestProfile ?? false) || !function_exists('ap_notif_stream_token')) ? '' : ap_notif_stream_token((int) admin_owner_user_id())) ?>;
   window.vaakCsrfApply = function (fd) {
     if (fd && typeof fd.set === 'function' && window.VAAK_CSRF) {
       fd.set('csrf', window.VAAK_CSRF);
@@ -40782,7 +40783,50 @@ if (!empty($GLOBALS['vaak_profile_shell'])) {
     notifPollInFlight = flight;
     return flight.promise;
   };
-  const notifPollMs = () => (document.visibilityState === 'visible' ? 12000 : 45000);
+  // Nudge stream (Rust, /vaak/notif-stream): while it is open the badge is
+  // fetched when the server says something changed, plus a slow safety poll.
+  // A 401 (expired token) or a missing route closes it and polling resumes.
+  let notifStream = null;
+  let notifStreamLive = false;
+  function closeNotifStream() {
+    if (notifStream) { try { notifStream.close(); } catch (e) {} }
+    notifStream = null;
+    notifStreamLive = false;
+  }
+  function openNotifStream() {
+    const token = String(window.VAAK_NOTIF_STREAM_TOKEN || '');
+    if (!token || notifStream || !window.EventSource || window.vaakGuestProfile || notifPollSuspended) return;
+    let source;
+    try {
+      source = new window.EventSource('/vaak/notif-stream?t=' + encodeURIComponent(token));
+    } catch (e) {
+      return;
+    }
+    notifStream = source;
+    source.addEventListener('ready', () => {
+      if (notifStream !== source) return;
+      const wasLive = notifStreamLive;
+      notifStreamLive = true;
+      // A reconnect may have missed a change.
+      if (wasLive || source.__vaakReconnected) pollNotif();
+      scheduleNotifPoll();
+    });
+    source.addEventListener('notif', () => { if (notifStream === source) pollNotif(); });
+    source.onerror = () => {
+      if (notifStream !== source) return;
+      source.__vaakReconnected = true;
+      if (source.readyState === 2) {
+        // Closed for good (401, 429, no route): back to plain polling.
+        notifStream = null;
+        notifStreamLive = false;
+        window.VAAK_NOTIF_STREAM_TOKEN = '';
+        scheduleNotifPoll();
+      } else {
+        notifStreamLive = false;
+      }
+    };
+  }
+  const notifPollMs = () => (notifStreamLive ? 120000 : (document.visibilityState === 'visible' ? 12000 : 45000));
   const scheduleNotifPoll = () => {
     if (window.vaakGuestProfile || notifPollSuspended) return;
     if (notifPollTimer) clearTimeout(notifPollTimer);
@@ -40793,6 +40837,7 @@ if (!empty($GLOBALS['vaak_profile_shell'])) {
   };
   if (!window.vaakGuestProfile) {
     scheduleNotifPoll();
+    openNotifStream();
     document.addEventListener('visibilitychange', () => {
       if (document.visibilityState === 'visible') {
         pollNotif();
@@ -40803,6 +40848,7 @@ if (!empty($GLOBALS['vaak_profile_shell'])) {
     window.addEventListener('vaak:mobile-nav-open', () => { pollNotif(); });
     window.addEventListener('pagehide', () => {
       notifPollSuspended = true;
+      closeNotifStream();
       cancelNotifPoll();
       if (notifPollTimer) clearTimeout(notifPollTimer);
       notifPollTimer = null;
@@ -40811,6 +40857,7 @@ if (!empty($GLOBALS['vaak_profile_shell'])) {
       notifPollSuspended = false;
       pollNotif();
       scheduleNotifPoll();
+      openNotifStream();
     });
   }
   window.vaakPollNotif = pollNotif;

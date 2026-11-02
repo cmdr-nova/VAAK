@@ -29,6 +29,7 @@ mod notif_embed;
 mod status_emoji;
 mod quote_media;
 mod notif_list;
+mod notif_stream;
 mod notif_page;
 mod notif_entity;
 mod profile_html;
