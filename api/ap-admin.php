@@ -38317,7 +38317,7 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
               <?php endif; ?>
               <?php if (empty($GLOBALS['vaak_guest_profile'])): ?>
                 <?php if ($rpIsBsky): ?>
-                  <a href="<?= h($rpActor) ?>" target="_blank" rel="noopener noreferrer">Open on Bluesky</a>
+                  <a href="<?= h(function_exists('ap_bsky_normalize_web_url') ? ap_bsky_normalize_web_url($rpActor) : $rpActor) ?>" target="_blank" rel="noopener noreferrer">Open on Bluesky</a>
                 <?php elseif (!$rpIsLocal): ?>
                   <a href="<?= h($rpOpenHref ?? admin_remote_actor_href($rpActor, is_array($rpMeta) ? (string) ($rpMeta['username'] ?? '') : null)) ?>" target="_blank" rel="noopener noreferrer"><?= h(admin_open_profile_label($rpActor)) ?></a>
                   <?php if (!$rpIsOwn): ?>

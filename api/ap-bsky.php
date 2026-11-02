@@ -9704,6 +9704,23 @@ function ap_bsky_actor_viewer_cache_update(int $ownerUserId, string $did, ?strin
     if (!ap_bsky_actor_refresh_migrate($db)) return;
     $now = gmdate('c');
     $refs = [$did, 'https://bsky.app/profile/' . rawurlencode($did)];
+    // Profiles opened by handle are cached under the handle URL too; keep
+    // those viewer rows in step, or the page reads a stale "not following".
+    try {
+        $aliases = $db->prepare('SELECT actor_ref FROM bsky_actor_profiles WHERE did = ? LIMIT 20');
+        $aliases->execute([$did]);
+        foreach ($aliases->fetchAll(PDO::FETCH_COLUMN) ?: [] as $alias) {
+            $alias = trim((string) $alias);
+            if ($alias !== '' && !in_array($alias, $refs, true)) {
+                $refs[] = $alias;
+            }
+        }
+    } catch (Throwable $e) {
+        // Fall back to the DID refs above.
+    }
+    if (function_exists('ap_redis_delete_pattern')) {
+        ap_redis_delete_pattern('vaak:profile:v1:bsky:' . $ownerUserId . ':*');
+    }
     foreach ($refs as $ref) {
         try {
             $st = $db->prepare('SELECT followed_by FROM bsky_actor_viewers WHERE owner_user_id = ? AND actor_ref = ? LIMIT 1');

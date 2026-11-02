@@ -475,3 +475,21 @@ fn html_exact_short_page_remains_authoritative() {
     assert_eq!(page.next_max_id, "10");
     assert!(raw_page(json!({"items": [{"type": "follow"}]}), "fixture".into(), "exact-raw", 12, None, false).unwrap().is_none());
 }
+
+#[test]
+fn followed_bluesky_handle_hides_follow_back() {
+    let actor = "https://bsky.app/profile/meltheparadox.bsky.social";
+    let mut set = HashSet::new();
+    remember_follow(&mut set, "did:plc:lxe2vhjemjyuefyromy27sbq");
+    let before = paint_notif_card_follows(&follow_row(actor, actor), "https://mkultra.monster/users/cmdr_nova", &set);
+    assert!(before.contains(">Follow back</button>"), "DID alone cannot match a handle URL");
+    remember_bsky_handle(&mut set, "MelTheParadox.bsky.social");
+    assert!(already_following(&set, actor));
+    let after = paint_notif_card_follows(&follow_row(actor, actor), "https://mkultra.monster/users/cmdr_nova", &set);
+    assert!(!after.contains(">Follow back</button>"));
+    let mut junk = HashSet::new();
+    for bad in ["", "did:plc:abc", "nodot", "evil.test/../x", "a b.test"] {
+        remember_bsky_handle(&mut junk, bad);
+    }
+    assert!(junk.is_empty());
+}
