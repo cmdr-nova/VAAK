@@ -4425,6 +4425,19 @@ $vaakAdminOnlyActions = [
             echo json_encode($ajaxOut, JSON_UNESCAPED_SLASHES);
             exit;
         }
+    } elseif ($action === 'bsky_feed_pin' || $action === 'bsky_feed_unpin') {
+        // Search > Feeds: pin/unpin in the account's Bluesky preferences.
+        $view = 'search';
+        $_GET['type'] = 'feeds';
+        $feedUri = trim((string) ($_POST['feed_uri'] ?? ''));
+        $pinResult = (function_exists('ap_bsky_tab_enabled') && ap_bsky_tab_enabled() && function_exists('ap_bsky_feed_set_pinned'))
+            ? ap_bsky_feed_set_pinned((int) $vaakOwnerId, $feedUri, $action === 'bsky_feed_pin')
+            : ['ok' => false, 'error' => 'Bluesky is disabled on this instance.'];
+        if (!empty($pinResult['ok'])) {
+            $notice = $action === 'bsky_feed_pin' ? 'Pinned to your Home feeds' : 'Unpinned from your Home feeds';
+        } else {
+            $error = (string) ($pinResult['error'] ?? 'Could not change the feed.');
+        }
     } elseif ($action === 'bsky_create_account' || $action === 'bsky_connect' || $action === 'bsky_disconnect' || $action === 'bsky_sync_profile' || $action === 'bsky_refresh_follow_sync' || $action === 'bsky_follow_carry_save') {
         $view = preg_replace('/[^a-z_]/', '', (string) ($_POST['return_view'] ?? 'profile')) ?: 'profile';
         if (!function_exists('ap_bsky_tab_enabled') || !ap_bsky_tab_enabled()) {
@@ -8693,6 +8706,7 @@ if (
     echo '<a class="btn btn-ghost" href="?view=' . h($view) . '" title="Reload this view">↻</a>';
     echo '</div></div>';
     echo '<div class="feed timeline-feed">';
+    echo admin_bsky_home_chips_slot('vaak');
     echo '<div class="compose-inline-slot" id="compose-inline-slot"></div>';
     // Keep a small overlap so delayed Bluesky/RSS ingestion whose source
     // timestamp predates the painted head can still reach newer=1; the
@@ -14152,9 +14166,15 @@ function admin_search_render_head(string $sq, string $stype, bool $sresolve, ?ar
         . '<span class="search-switch" aria-hidden="true"></span><span>Look up remote</span></label></div>'
         . '</form>';
     echo '<nav class="search-tabs" aria-label="Search results">';
-    foreach (['' => 'Top', 'accounts' => 'People', 'hashtags' => 'Tags', 'statuses' => 'Posts'] as $type => $label) {
+    $searchTabs = ['' => 'Top', 'accounts' => 'People', 'hashtags' => 'Tags', 'statuses' => 'Posts'];
+    if (admin_bsky_connected()) {
+        // Bluesky custom feeds. Searched only when this tab is opened.
+        $searchTabs['feeds'] = 'Feeds';
+    }
+    foreach ($searchTabs as $type => $label) {
         $count = '';
-        if ($type !== '' && $sq !== '' && is_array($sresults) && ($stype === '' || $stype === $type)) {
+        if ($type !== '' && $sq !== '' && is_array($sresults) && ($stype === '' || $stype === $type)
+            && ($type !== 'feeds' || $stype === 'feeds')) {
             $n = count(is_array($sresults[$type] ?? null) ? $sresults[$type] : []);
             $count = '<span class="search-tab-n">' . $n . (!empty($more[$type]) ? '+' : '') . '</span>';
         }
@@ -14267,6 +14287,13 @@ function admin_search_render_no_results(string $sq, bool $sresolve): void
 function admin_search_render_page(string $sq, string $stype, bool $sresolve, array $followingIds): void
 {
     $searchLimit = 20;
+    if ($stype === 'feeds') {
+        if (admin_bsky_connected()) {
+            admin_search_render_feeds_page($sq, $sresolve);
+            return;
+        }
+        $stype = '';
+    }
     $sresults = $sq === '' ? null : admin_search_run($sq, $stype, $sresolve, $searchLimit, 0);
     admin_search_render_head($sq, $stype, $sresolve, $sresults);
     if ($sq === '' || !is_array($sresults)) {
@@ -14298,6 +14325,81 @@ function admin_search_render_page(string $sq, string $stype, bool $sresolve, arr
         admin_search_render_sections($sresults, $sq, $stype, $sresolve, $searchLimit, $followingIds);
     }
     echo '</div>';
+}
+
+/** Search > Feeds: Bluesky custom feeds by name, with Open and Pin to Home. */
+function admin_search_render_feeds_page(string $sq, bool $sresolve): void
+{
+    $owner = (int) admin_owner_user_id();
+    $res = $sq === '' ? null : ap_bsky_search_feeds($owner, $sq, 25);
+    $feeds = is_array($res['feeds'] ?? null) ? $res['feeds'] : [];
+    admin_search_render_head($sq, 'feeds', $sresolve, $sq === '' ? null : ['feeds' => $feeds]);
+    echo '<div class="search-results-feed" data-search-results="' . h($sq) . '">';
+    if ($sq === '') {
+        echo '<div class="search-state"><b>Search Bluesky feeds</b>'
+            . '<span class="meta">Find custom feeds by name, open them here, and pin the ones you like to the Home feed chips.</span></div>';
+    } elseif (empty($res['ok'])) {
+        echo '<div class="search-state"><b>Feed search is not answering right now</b><span class="meta">'
+            . h((string) ($res['error'] ?? '')) . '</span></div>';
+    } elseif ($feeds === []) {
+        echo '<div class="search-state"><b>No feeds for “' . h($sq) . '”</b></div>';
+    } else {
+        $pinned = ap_bsky_pinned_feed_uris($owner);
+        echo '<section class="search-section search-section-accounts search-section-feeds"><div class="search-sec-hd"><h3>Bluesky feeds</h3></div>'
+            . '<div data-search-list>';
+        foreach ($feeds as $f) {
+            if (is_array($f)) {
+                echo admin_search_feed_row_html($f, isset($pinned[(string) ($f['uri'] ?? '')]), $sq, $sresolve);
+            }
+        }
+        echo '</div></section>';
+    }
+    echo '</div>';
+}
+
+/** @param array<string,mixed> $f one row from ap_bsky_search_feeds */
+function admin_search_feed_row_html(array $f, bool $isPinned, string $sq, bool $sresolve): string
+{
+    $uri = (string) ($f['uri'] ?? '');
+    $name = (string) ($f['name'] ?? basename($uri));
+    $avatar = (string) ($f['avatar'] ?? '');
+    if (!str_starts_with($avatar, 'https://')) {
+        $avatar = 'https://mkultra.monster/img/avatar/default.webp';
+    }
+    $openHref = '?view=bluesky&feed=' . rawurlencode($uri);
+    $bskyUrl = '';
+    if (preg_match('~^at://([^/]+)/app\.bsky\.feed\.generator/([A-Za-z0-9._:~-]+)$~', $uri, $m)) {
+        $bskyUrl = 'https://bsky.app/profile/' . rawurlencode($m[1]) . '/feed/' . rawurlencode($m[2]);
+    }
+    $by = (string) ($f['creator_handle'] ?? '');
+    $likes = (int) ($f['likes'] ?? 0);
+    $meta = ($by !== '' ? 'by @' . h($by) : '') . ($likes > 0 ? ($by !== '' ? ' · ' : '') . h(admin_format_compact_count($likes)) . ' likes' : '');
+    $html = '<article class="search-account search-feed">'
+        . '<a class="search-account-av" href="' . h($openHref) . '" data-vaak-soft-nav="bluesky" data-bsky-feed="' . h($uri) . '" tabindex="-1" aria-hidden="true">'
+        . '<img src="' . h($avatar) . '" alt="" width="44" height="44" loading="lazy" decoding="async" referrerpolicy="no-referrer" style="border-radius:10px"'
+        . ' onerror="this.onerror=null;this.src=\'https://mkultra.monster/img/avatar/default.webp\'"></a>'
+        . '<div class="search-account-who"><div class="search-account-name"><a href="' . h($openHref) . '" data-vaak-soft-nav="bluesky" data-bsky-feed="' . h($uri) . '">'
+        . h($name) . '</a></div>';
+    if ($meta !== '') {
+        $html .= '<div class="search-account-handle">' . $meta . '</div>';
+    }
+    $desc = trim((string) ($f['description'] ?? ''));
+    if ($desc !== '') {
+        $html .= '<div class="search-account-bio">' . h($desc) . '</div>';
+    }
+    $html .= '</div><div class="search-account-act">'
+        . '<form method="post" action="' . h(admin_search_href($sq, 'feeds', $sresolve)) . '">'
+        . '<input type="hidden" name="action" value="' . ($isPinned ? 'bsky_feed_unpin' : 'bsky_feed_pin') . '">'
+        . '<input type="hidden" name="return_view" value="search">'
+        . '<input type="hidden" name="feed_uri" value="' . h($uri) . '">'
+        . ($isPinned
+            ? '<button class="btn btn-ghost btn-compact btn-following" type="submit" title="Pinned to Home. Click to unpin">Pinned</button>'
+            : '<button class="btn btn-primary btn-compact" type="submit" title="Add to the Home feed chips">Pin</button>')
+        . '</form>';
+    if ($bskyUrl !== '') {
+        $html .= '<a class="search-account-open" href="' . h($bskyUrl) . '" target="_blank" rel="noopener noreferrer" title="Open on Bluesky" aria-label="Open on Bluesky">↗</a>';
+    }
+    return $html . '</div></article>';
 }
 
 /** Section heading with an optional jump to that section's own tab. */
@@ -25363,24 +25465,87 @@ if ($isPartial && $view === 'remote_profile') {
     }
 }
 
-/**
- * Home / Local / Federated / Bluesky pill in the timeline top bar. The
- * Bluesky entry only needs the instance flag; the view itself explains how
- * to connect an account, so painting the pill costs no lookup.
- */
+/** Home / Local / Federated pill in the timeline top bar. */
 function admin_timeline_tabs_html(string $view): string
 {
     $tabs = ['home' => 'Home', 'local' => 'Local', 'feed' => 'Federated'];
-    if (function_exists('ap_bsky_tab_enabled') && ap_bsky_tab_enabled()) {
-        $tabs['bluesky'] = 'Bluesky';
-    }
+    // A Bluesky feed is shown as Home with that feed chip picked.
+    $view = $view === 'bluesky' ? 'home' : $view;
     $html = '<nav class="timeline-tabs" aria-label="Timeline views">';
     foreach ($tabs as $tabView => $tabLabel) {
         $active = $view === $tabView ? ' class="active" aria-current="page"' : '';
-        $html .= '<a' . $active . ' href="?view=' . h($tabView) . '" data-vaak-soft-nav="' . h($tabView) . '"'
-            . ($tabView === 'bluesky' ? ' data-bsky-feed="following"' : '') . '>' . h($tabLabel) . '</a>';
+        $html .= '<a' . $active . ' href="?view=' . h($tabView) . '" data-vaak-soft-nav="' . h($tabView) . '">' . h($tabLabel) . '</a>';
     }
     return $html . '</nav>';
+}
+
+/** True when this viewer has a Bluesky account connected (one PK lookup, memoised). */
+function admin_bsky_connected(): bool
+{
+    static $memo = null;
+    if ($memo !== null) {
+        return $memo;
+    }
+    $owner = function_exists('admin_owner_user_id') ? (int) admin_owner_user_id() : (int) ($GLOBALS['vaak_owner_id'] ?? 0);
+    return $memo = function_exists('ap_bsky_tab_enabled') && ap_bsky_tab_enabled()
+        && function_exists('ap_bsky_session_row') && $owner > 0 && ap_bsky_session_row($owner) !== null;
+}
+
+/**
+ * Empty slot for the Home feed chips. The chips are fetched after paint
+ * (view=bluesky&partial=1&chips=1) so Home never waits on Bluesky; viewers
+ * without a Bluesky account get an empty answer and the slot stays hidden.
+ */
+function admin_bsky_home_chips_slot(string $active): string
+{
+    if (!function_exists('ap_bsky_tab_enabled') || !ap_bsky_tab_enabled()) {
+        return '';
+    }
+    return '<div class="home-feed-chips" data-bsky-home-chips data-active="' . h($active !== '' ? $active : 'vaak') . '" hidden></div>';
+}
+
+/**
+ * Chip row: VAAK (the Home timeline) first, then the account's pinned
+ * Bluesky feeds in Bluesky's order. Cached 10 min per owner; pinning from
+ * Search clears it. '' when no Bluesky account is connected.
+ */
+function admin_bsky_home_chips_html(int $ownerUserId): string
+{
+    if ($ownerUserId < 1 || !admin_bsky_connected()) {
+        return '';
+    }
+    $cacheKey = 'vaak:bsky:chips:v1:' . $ownerUserId;
+    $hit = function_exists('ap_redis_json_get') ? ap_redis_json_get($cacheKey) : null;
+    if (is_array($hit) && is_string($hit['html'] ?? null)) {
+        return $hit['html'];
+    }
+    $prefsRaw = ap_bsky_get_preferences($ownerUserId);
+    $prefs = ap_bsky_parse_feed_prefs(!empty($prefsRaw['ok']) && is_array($prefsRaw['preferences'] ?? null) ? $prefsRaw['preferences'] : []);
+    $pinned = is_array($prefs['pinned'] ?? null) ? $prefs['pinned'] : [];
+    $labels = function_exists('ap_bsky_feed_labels') ? ap_bsky_feed_labels($pinned) : [];
+    $chips = [['vaak', 'VAAK', '?view=home', 'home']];
+    foreach ($pinned as $tab) {
+        $tType = (string) ($tab['type'] ?? '');
+        $tVal = (string) ($tab['value'] ?? '');
+        $key = ($tType === 'timeline' || $tVal === 'following') ? 'following' : $tVal;
+        if ($key !== 'following' && !str_starts_with($key, 'at://')) {
+            continue; // pinned searches etc. have no feed to load here
+        }
+        $label = $key === 'following' ? 'Following' : (string) ($labels[$tVal] ?? basename($tVal));
+        $chips[] = [$key, $label, '?view=bluesky&feed=' . rawurlencode($key), 'bluesky'];
+    }
+    $html = '<nav class="bsky-feed-tabs" aria-label="Feeds">';
+    foreach ($chips as [$key, $label, $href, $softView]) {
+        $html .= '<a class="btn btn-ghost" href="' . h($href) . '" data-vaak-soft-nav="' . h($softView) . '"'
+            . ($softView === 'bluesky' ? ' data-bsky-feed="' . h($key) . '"' : '')
+            . ' data-chip="' . h($key) . '">' . h($label) . '</a>';
+    }
+    $html .= '</nav>';
+    // Only cache once preferences actually loaded, so a hiccup is not kept.
+    if (!empty($prefsRaw['ok']) && function_exists('ap_redis_json_set')) {
+        ap_redis_json_set($cacheKey, ['html' => $html], 600);
+    }
+    return $html;
 }
 
 // Soft-nav shell for the Bluesky view (partial=1&shell=1). Same column as the
@@ -25400,12 +25565,13 @@ if (isset($_GET['partial'], $_GET['shell'])
     header('Cache-Control: no-store');
     header('X-VAAK-View: bluesky');
     $shellFeed = trim((string) ($_GET['feed'] ?? 'following'));
-    echo '<div class="topbar topbar-timeline"><h1>Bluesky</h1><div class="topbar-actions">';
+    echo '<div class="topbar topbar-timeline"><h1>Home</h1><div class="topbar-actions">';
     echo admin_timeline_tabs_html('bluesky');
     echo '<a class="btn btn-ghost" href="?view=bluesky&amp;feed=' . h(rawurlencode($shellFeed !== '' ? $shellFeed : 'following'))
         . '&amp;_r=' . rawurlencode((string) time()) . '" title="Reload this view">↻</a>';
     echo '</div></div>';
     echo '<div class="feed timeline-feed">';
+    echo admin_bsky_home_chips_slot($shellFeed !== '' ? $shellFeed : 'following');
     admin_render_bsky_view_body((int) $vaakOwnerId);
     echo '</div>';
     exit;
@@ -25479,7 +25645,6 @@ function admin_render_bsky_view_body(int $vaakOwnerId): void
               else:
                 $feed = is_array($tl['feed'] ?? null) ? $tl['feed'] : [];
                 $nextCursor = is_string($tl['cursor'] ?? null) ? (string) $tl['cursor'] : '';
-                $pinnedTabs = is_array($bskyPrefs['pinned'] ?? null) ? $bskyPrefs['pinned'] : [];
                 $mergePending = !empty($tl['merge_pending']);
         ?>
           <div class="meta" style="margin:0 0 .65rem">
@@ -25487,26 +25652,6 @@ function admin_render_bsky_view_body(int $vaakOwnerId): void
             ·
             <a href="https://bsky.app/profile/<?= h(rawurlencode((string) ($bskySess['handle'] ?? ''))) ?>" target="_blank" rel="noopener noreferrer">Open profile</a>
           </div>
-          <?php if ($pinnedTabs !== []): ?>
-            <?php $feedLabels = function_exists('ap_bsky_feed_labels') ? ap_bsky_feed_labels($pinnedTabs) : []; ?>
-            <nav class="bsky-feed-tabs" aria-label="Bluesky feeds">
-              <?php foreach ($pinnedTabs as $tab): ?>
-                <?php
-                  $tType = (string) ($tab['type'] ?? '');
-                  $tVal = (string) ($tab['value'] ?? '');
-                  $tabKey = ($tType === 'timeline' || $tVal === 'following') ? 'following' : $tVal;
-                  if ($tabKey !== 'following' && !str_starts_with($tabKey, 'at://')) {
-                      continue; // pinned searches etc. have no feed to load here
-                  }
-                  $tabLabel = ($tabKey === 'following')
-                      ? 'Following'
-                      : (string) ($feedLabels[$tVal] ?? basename($tVal));
-                  $active = ($bskyFeedKey === $tabKey) || ($bskyFeedKey === 'timeline' && $tabKey === 'following');
-                ?>
-                <a class="btn <?= $active ? 'btn-primary' : 'btn-ghost' ?>" href="?view=bluesky&amp;feed=<?= h(rawurlencode($tabKey)) ?>" data-vaak-soft-nav="bluesky" data-bsky-feed="<?= h($tabKey) ?>"<?= $active ? ' aria-current="page"' : '' ?>><?= h($tabLabel) ?></a>
-              <?php endforeach; ?>
-            </nav>
-          <?php endif; ?>
           <?php if ($feed === []): ?>
             <div class="empty">
               No posts in this Bluesky feed yet.
@@ -25558,6 +25703,13 @@ if ($isPartial && $view === 'bluesky') {
     header('Cache-Control: no-store');
     if (!function_exists('ap_bsky_tab_enabled') || !ap_bsky_tab_enabled() || !is_array(ap_bsky_session_row($vaakOwnerId))) {
         header('X-Has-More: 0');
+        exit;
+    }
+    if (isset($_GET['chips'])) {
+        if (function_exists('ap_auth_session_write_close')) {
+            ap_auth_session_write_close();
+        }
+        echo admin_bsky_home_chips_html((int) $vaakOwnerId);
         exit;
     }
     $bskyFeedKey = trim((string) ($_GET['feed'] ?? 'following'));
@@ -32336,7 +32488,7 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
 <?php endif; ?>
     <div class="topbar<?= in_array($view, ['home', 'local', 'feed', 'bluesky'], true) ? ' topbar-timeline' : '' ?>">
       <?php
-        $topTitle = view_title($view);
+        $topTitle = $view === 'bluesky' ? view_title('home') : view_title($view);
         if ($view === 'remote_profile') {
             $topActor = rtrim(trim((string) ($_GET['actor'] ?? '')), '/');
             if (preg_match('#^https://mkultra\.monster/users/[A-Za-z0-9_]+$#', $topActor)) {
@@ -32401,6 +32553,9 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
               @flush();
           }
         ?>
+      <?php endif; ?>
+      <?php if (in_array($view, ['home', 'local', 'feed', 'bluesky'], true)): ?>
+        <?= admin_bsky_home_chips_slot($view === 'bluesky' ? (trim((string) ($_GET['feed'] ?? '')) ?: 'following') : 'vaak') ?>
       <?php endif; ?>
       <?php if (in_array($view, ['home', 'local', 'feed'], true) && !$autoOpenComposer): ?>
         <?php $GLOBALS['admin_compose_panel_inline'] = true; ?>
@@ -45322,6 +45477,7 @@ window.vaakBootStatusThread();
         const v = m ? m[1] : '';
         a.classList.toggle('active', v === nextView);
       });
+      if (typeof window.vaakSyncBskyChips === 'function') window.vaakSyncBskyChips(nextView);
       document.querySelectorAll('#admin-rail-left a[href*="view="]').forEach((a) => {
         const href = a.getAttribute('href') || '';
         if (!/[?&]view=(home|local|feed)(?:&|$)/.test(href)) return;
@@ -45579,6 +45735,59 @@ window.vaakBootStatusThread();
 </script>
 
 <script>
+// Home feed chips: VAAK (Home) first, then the viewer's pinned Bluesky feeds.
+// The row is fetched once per page load after paint and reused for every
+// soft-nav; viewers without a Bluesky account get nothing and see nothing.
+(function () {
+  let chipsHtml = null;
+  let chipsNone = false;
+  let pending = null;
+  function liveView() {
+    const items = document.querySelector('section.main #timeline-items');
+    if (items && items.dataset.view) return String(items.dataset.view);
+    try { return new URL(window.location.href).searchParams.get('view') || 'home'; } catch (e) { return 'home'; }
+  }
+  function paint(slot, view) {
+    if (view === 'home') slot.dataset.active = 'vaak';
+    if ((view !== 'home' && view !== 'bluesky') || !chipsHtml) { slot.hidden = true; return; }
+    if (slot.dataset.filled !== '1') {
+      slot.innerHTML = chipsHtml;
+      slot.dataset.filled = '1';
+    }
+    const active = slot.dataset.active || 'vaak';
+    slot.querySelectorAll('a[data-chip]').forEach((a) => {
+      const on = a.dataset.chip === active;
+      a.classList.toggle('btn-primary', on);
+      a.classList.toggle('btn-ghost', !on);
+      if (on) a.setAttribute('aria-current', 'page'); else a.removeAttribute('aria-current');
+    });
+    slot.hidden = false;
+  }
+  window.vaakSyncBskyChips = function (viewHint) {
+    const slots = document.querySelectorAll('section.main [data-bsky-home-chips]');
+    if (!slots.length) return;
+    const view = String(viewHint || liveView());
+    slots.forEach((slot) => paint(slot, view));
+    if (chipsHtml !== null || chipsNone || pending) return;
+    pending = fetch('?view=bluesky&partial=1&chips=1', {
+      credentials: 'same-origin',
+      headers: { 'Accept': 'text/html', 'X-Requested-With': 'XMLHttpRequest' },
+      cache: 'no-store'
+    }).then((res) => (res.ok ? res.text() : ''))
+      .then((text) => {
+        const t = String(text || '').trim();
+        if (t.indexOf('<nav') === 0) chipsHtml = t; else chipsNone = true;
+      })
+      .catch(() => { chipsNone = true; })
+      .finally(() => { pending = null; if (chipsHtml) window.vaakSyncBskyChips(); });
+  };
+  const boot = () => { try { window.vaakSyncBskyChips(); } catch (e) {} };
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot, { once: true });
+  else boot();
+})();
+</script>
+
+<script>
 // Soft-nav for primary left-rail / timeline destinations. Keeps rails + CSS;
 // swaps section.main. Falls back to full navigation when a shell or boot is missing.
 (function () {
@@ -45588,7 +45797,7 @@ window.vaakBootStatusThread();
     mentions: 'Notifications', outbox: 'Your posts',
     favourites: 'Favourites', bookmarks: 'Bookmarks',
     following: 'Following', followers: 'Followers', search: 'Search', status: 'Post',
-    bluesky: 'Bluesky'
+    bluesky: 'Home'
   };
   let busy = false;
   let leaving = false;
@@ -45663,13 +45872,14 @@ window.vaakBootStatusThread();
     if (view === 'dms') document.body.classList.add('dm-fullscreen');
     else if (view === 'blog') document.body.classList.add('blog-fullscreen');
     if (typeof window.vaakSetCurrentViewTitle === 'function') window.vaakSetCurrentViewTitle(view);
+    if (typeof window.vaakSyncBskyChips === 'function') window.vaakSyncBskyChips(view);
     const mobileTitle = document.querySelector('.mobile-topbar__title');
     if (mobileTitle) mobileTitle.innerHTML = '<span>VAAK</span> · ' + (TL_TITLES[view] || view);
     document.querySelectorAll('#admin-rail-left a[href*="view="]').forEach((a) => {
       const href = a.getAttribute('href') || '';
       const m = href.match(/[?&]view=([a-z_]+)/);
       const linkView = m ? m[1] : '';
-      const current = (view === 'local' || view === 'feed') ? 'home' : view;
+      const current = (view === 'local' || view === 'feed' || view === 'bluesky') ? 'home' : view;
       a.classList.toggle('active', linkView === current);
     });
     if (typeof window.vaakSyncNavSelection === 'function') window.vaakSyncNavSelection();
@@ -46360,6 +46570,8 @@ window.vaakBootStatusThread();
 
   function columnParkKey(view, filter) {
     if (view === 'home' || view === 'local' || view === 'feed') return 'timeline:' + view;
+    // Bluesky feeds park per feed so flipping between chips is instant.
+    if (view === 'bluesky') return 'bsky:' + String(filter || 'following');
     if (view === 'mentions') {
       const name = String(filter || 'all');
       return 'mentions:' + (name === '' ? 'all' : name);
@@ -46382,7 +46594,7 @@ window.vaakBootStatusThread();
 
   function liveColumnState() {
     const main = document.querySelector('section.main');
-    if (!main || main.querySelector('.vaak-soft-loading')) return null;
+    if (!main || main.querySelector('.vaak-soft-loading, [data-soft-loading]')) return null;
     const items = main.querySelector('#timeline-items');
     if (!items) return null;
     const view = String(items.dataset.view || '');
@@ -46395,6 +46607,11 @@ window.vaakBootStatusThread();
       if (items.dataset.initialPending === '1') return null;
       if (!items.querySelector('article, .empty')) return null;
       return { main: main, view: view, filter: filter, key: columnParkKey(view, filter) };
+    }
+    if (view === 'bluesky') {
+      if (!items.querySelector('article')) return null;
+      const feedKey = String(items.dataset.feed || 'following') || 'following';
+      return { main: main, view: view, filter: feedKey, key: columnParkKey(view, feedKey) };
     }
     return null;
   }
@@ -46434,8 +46651,14 @@ window.vaakBootStatusThread();
       scroll: scroll,
       view: state.view,
       filter: state.filter,
-      timelineSnap: timelineSnap || null
+      timelineSnap: timelineSnap || null,
+      parkedAt: Date.now()
     });
+    if (state.view === 'bluesky') {
+      // Keep the three most recent Bluesky feeds; Map order is insert order.
+      const bsky = Array.from(parkedColumns.keys()).filter((k) => k.indexOf('bsky:') === 0);
+      while (bsky.length > 3) parkedColumns.delete(bsky.shift());
+    }
     return true;
   }
 
@@ -46465,6 +46688,8 @@ window.vaakBootStatusThread();
     const parked = parkedColumns.get(key);
     if (!parked) return null;
     parkedColumns.delete(key);
+    // A parked Bluesky feed older than its page cache would look frozen.
+    if (view === 'bluesky' && Date.now() - (parked.parkedAt || 0) > 600000) return null;
     return parked;
   }
 
@@ -46477,11 +46702,12 @@ window.vaakBootStatusThread();
   }
 
   function restoreParkedColumn(view, push, filter, extra) {
-    const parked = takeParkedColumn(view, filter);
+    const parkFilter = view === 'bluesky' ? String((extra && extra.feed) || 'following') : filter;
+    const parked = takeParkedColumn(view, parkFilter);
     if (!parked) return false;
     const main = document.querySelector('section.main');
     if (!main) {
-      parkedColumns.set(columnParkKey(view, filter), parked);
+      parkedColumns.set(columnParkKey(view, parkFilter), parked);
       return false;
     }
     if (push !== false) saveViewPosition();
@@ -46501,6 +46727,8 @@ window.vaakBootStatusThread();
       }
     } else if (view === 'mentions') {
       bindNotifScroll(main);
+    } else if (view === 'bluesky' && typeof window.vaakBootTimeline === 'function') {
+      try { window.vaakBootTimeline('bluesky'); } catch (e) {}
     }
     if (typeof window.vaakHideLoading === 'function') window.vaakHideLoading();
     window.__vaakNavigationPending = false;
@@ -46510,6 +46738,36 @@ window.vaakBootStatusThread();
       applyColumnScroll(main, savedScroll);
     });
     return true;
+  }
+
+  // Top bar + chip row copy with the target chip already picked and a post
+  // skeleton under it. null when the live column has no visible chip row.
+  function feedChipChrome(main, view, extra) {
+    const slot = main.querySelector('[data-bsky-home-chips]');
+    const topbar = main.querySelector(':scope > .topbar');
+    if (!slot || slot.hidden || !topbar) return null;
+    const frag = document.createElement('div');
+    frag.appendChild(topbar.cloneNode(true));
+    const feed = document.createElement('div');
+    feed.className = 'feed timeline-feed';
+    const chips = slot.cloneNode(true);
+    const active = view === 'home' ? 'vaak' : String((extra && extra.feed) || 'following');
+    chips.dataset.active = active;
+    chips.querySelectorAll('a[data-chip]').forEach((a) => {
+      const on = a.dataset.chip === active;
+      a.classList.toggle('btn-primary', on);
+      a.classList.toggle('btn-ghost', !on);
+    });
+    feed.appendChild(chips);
+    const skeleton = document.createElement('div');
+    skeleton.className = 'timeline-skeleton';
+    skeleton.setAttribute('data-soft-loading', '1');
+    skeleton.setAttribute('role', 'status');
+    skeleton.setAttribute('aria-busy', 'true');
+    skeleton.innerHTML = '<div class="timeline-skeleton-row"></div><div class="timeline-skeleton-row"></div><div class="timeline-skeleton-row"></div>';
+    feed.appendChild(skeleton);
+    frag.appendChild(feed);
+    return frag;
   }
 
   async function softNavTo(view, push, filter, extra) {
@@ -46571,6 +46829,10 @@ window.vaakBootStatusThread();
     }
     const loadingLabel = view === 'search' ? 'Searching…' : 'Loading…';
     if (typeof window.vaakShowLoading === 'function') window.vaakShowLoading(loadingLabel);
+    // Switching Home feed chips (VAAK ↔ a Bluesky feed): keep the top bar and
+    // the chip row on screen and only blank the posts, so the switch reads as
+    // a tab change, not a page reload. Copied before the column is parked.
+    const chipSwitch = (view === 'bluesky' || view === 'home') ? feedChipChrome(main, view, extra) : null;
     // Move the composer out, then detach a painted timeline or notifications
     // column before the spinner replaces section.main. innerHTML used to
     // destroy the only compose panel and the Home cards we can show again.
@@ -46578,9 +46840,16 @@ window.vaakBootStatusThread();
     if (typeof window.vaakStopStatusThread === 'function') window.vaakStopStatusThread();
     // Replace main immediately so slow shells show a spinner instead of stale content.
     try {
-      // Keep the shell visually empty while the detached global indicator
-      // communicates progress; avoid two simultaneous Loading… messages.
-      main.innerHTML = '<div class="vaak-soft-loading" role="status" aria-live="polite" aria-busy="true"></div>';
+      if (chipSwitch) {
+        main.innerHTML = '';
+        main.appendChild(chipSwitch);
+        while (chipSwitch.firstChild) main.insertBefore(chipSwitch.firstChild, chipSwitch);
+        chipSwitch.remove();
+      } else {
+        // Keep the shell visually empty while the detached global indicator
+        // communicates progress; avoid two simultaneous Loading… messages.
+        main.innerHTML = '<div class="vaak-soft-loading" role="status" aria-live="polite" aria-busy="true"></div>';
+      }
     } catch (e) {}
     let mentionsPrefetch = null;
     let mentionsPrefetchHeld = false;

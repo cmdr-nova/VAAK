@@ -7133,6 +7133,178 @@ function ap_bsky_feed_labels(array $pinned): array
     return $out;
 }
 
+/**
+ * Search Bluesky feed generators by name (the same lookup bsky.app uses).
+ * Runs only when someone opens the Feeds tab in Search. Results carry no
+ * viewer state, so they are cached for 10 min and shared by every user.
+ *
+ * @return array{ok:bool,error?:string,feeds?:list<array<string,mixed>>,cache?:string}
+ */
+function ap_bsky_search_feeds(int $ownerUserId, string $query, int $limit = 25): array
+{
+    $query = trim(preg_replace('/\s+/u', ' ', $query) ?? '');
+    if ($query === '' || mb_strlen($query) > 100) {
+        return ['ok' => false, 'error' => 'Type a feed name to search'];
+    }
+    $limit = max(1, min(50, $limit));
+    $cacheKey = 'vaak:bsky:feedsearch:v1:' . substr(hash('sha256', mb_strtolower($query) . "\n" . $limit), 0, 32);
+    $cached = function_exists('ap_redis_json_get') ? ap_redis_json_get($cacheKey) : null;
+    if (is_array($cached) && is_array($cached['feeds'] ?? null)) {
+        return ['ok' => true, 'feeds' => $cached['feeds'], 'cache' => 'hit'];
+    }
+    $params = ['query' => $query, 'limit' => $limit];
+    // Public AppView first (no token, shareable). Fall back to the account's
+    // PDS proxy if the public endpoint refuses an unauthenticated call.
+    $got = defined('AP_BSKY_PUBLIC_API')
+        ? ap_bsky_xrpc(AP_BSKY_PUBLIC_API, 'app.bsky.unspecced.getPopularFeedGenerators', 'GET', $params, null, null, 6)
+        : ['ok' => false, 'error' => 'No public API'];
+    if (empty($got['ok']) && $ownerUserId > 0) {
+        $tok = ap_bsky_access_token($ownerUserId, false);
+        $row = ap_bsky_session_row($ownerUserId);
+        if (!empty($tok['ok']) && is_array($row)) {
+            $pds = rtrim((string) ($row['pds_host'] ?? AP_BSKY_DEFAULT_PDS), '/');
+            $got = ap_bsky_xrpc($pds, 'app.bsky.unspecced.getPopularFeedGenerators', 'GET', $params, null, (string) $tok['access'], 6);
+        }
+    }
+    if (empty($got['ok']) || !is_array($got['json'] ?? null)) {
+        return ['ok' => false, 'error' => (string) ($got['error'] ?? 'Feed search failed')];
+    }
+    $feeds = [];
+    foreach ((array) ($got['json']['feeds'] ?? []) as $f) {
+        if (!is_array($f)) {
+            continue;
+        }
+        $uri = (string) ($f['uri'] ?? '');
+        if (!str_starts_with($uri, 'at://')) {
+            continue;
+        }
+        $creator = is_array($f['creator'] ?? null) ? $f['creator'] : [];
+        $avatar = (string) ($f['avatar'] ?? '');
+        $feeds[] = [
+            'uri' => $uri,
+            'name' => trim((string) ($f['displayName'] ?? '')) ?: basename($uri),
+            'description' => mb_substr(trim((string) ($f['description'] ?? '')), 0, 300),
+            'avatar' => str_starts_with($avatar, 'https://') ? $avatar : '',
+            'creator_handle' => (string) ($creator['handle'] ?? ''),
+            'creator_did' => (string) ($creator['did'] ?? ''),
+            'likes' => max(0, (int) ($f['likeCount'] ?? 0)),
+        ];
+    }
+    if (function_exists('ap_redis_json_set')) {
+        ap_redis_json_set($cacheKey, ['feeds' => $feeds], 600);
+    }
+    return ['ok' => true, 'feeds' => $feeds, 'cache' => 'miss'];
+}
+
+/** AT-URIs of the owner's pinned feeds/lists, from the cached preferences. */
+function ap_bsky_pinned_feed_uris(int $ownerUserId): array
+{
+    $prefsRaw = ap_bsky_get_preferences($ownerUserId);
+    $prefs = ap_bsky_parse_feed_prefs(!empty($prefsRaw['ok']) ? (array) ($prefsRaw['preferences'] ?? []) : []);
+    $out = [];
+    foreach ((array) ($prefs['pinned'] ?? []) as $pin) {
+        $v = is_array($pin) ? (string) ($pin['value'] ?? '') : '';
+        if (str_starts_with($v, 'at://')) {
+            $out[$v] = true;
+        }
+    }
+    return $out;
+}
+
+/**
+ * Pin or unpin a feed (or list) in the account's Bluesky preferences, the
+ * same savedFeedsPrefV2 record bsky.app edits. Reads preferences fresh right
+ * before the write so other settings are kept as they are. Unpinning leaves
+ * the feed saved, like the official app.
+ *
+ * @return array{ok:bool,error?:string}
+ */
+function ap_bsky_feed_set_pinned(int $ownerUserId, string $feedUri, bool $pinned): array
+{
+    $feedUri = trim($feedUri);
+    if (!preg_match('~^at://[^/\s]+/app\.bsky\.(feed\.generator|graph\.list)/[A-Za-z0-9._:~-]+$~', $feedUri)) {
+        return ['ok' => false, 'error' => 'Invalid feed'];
+    }
+    $row = ap_bsky_session_row($ownerUserId);
+    if (!is_array($row)) {
+        return ['ok' => false, 'error' => 'No Bluesky account connected'];
+    }
+    $tok = ap_bsky_access_token($ownerUserId, false);
+    if (empty($tok['ok'])) {
+        $tok = ap_bsky_access_token($ownerUserId, true);
+        if (empty($tok['ok'])) {
+            return ['ok' => false, 'error' => (string) ($tok['error'] ?? 'Not connected')];
+        }
+    }
+    // Preferences live on the PDS itself, never behind the AppView proxy.
+    // Read them fresh and decode as objects: putPreferences replaces the whole
+    // list, and an array decode would turn every {} into [] in other prefs.
+    $pds = rtrim((string) ($row['pds_host'] ?? AP_BSKY_DEFAULT_PDS), '/');
+    $got = ap_bsky_xrpc($pds, 'app.bsky.actor.getPreferences', 'GET', null, null, (string) $tok['access'], 10);
+    if (($got['status'] ?? 0) === 401) {
+        $tok = ap_bsky_access_token($ownerUserId, true);
+        if (empty($tok['ok'])) {
+            return ['ok' => false, 'error' => (string) ($tok['error'] ?? 'Session expired')];
+        }
+        $got = ap_bsky_xrpc($pds, 'app.bsky.actor.getPreferences', 'GET', null, null, (string) $tok['access'], 10);
+    }
+    $doc = (!empty($got['ok']) && is_string($got['body'] ?? null)) ? json_decode((string) $got['body'], false) : null;
+    if (!is_object($doc) || !isset($doc->preferences) || !is_array($doc->preferences)) {
+        return ['ok' => false, 'error' => (string) ($got['error'] ?? 'Could not read Bluesky preferences')];
+    }
+    $prefs = array_values($doc->preferences);
+    $saved = null;
+    foreach ($prefs as $pref) {
+        if (is_object($pref) && (string) ($pref->{'$type'} ?? '') === 'app.bsky.actor.defs#savedFeedsPrefV2') {
+            $saved = $pref;
+            break;
+        }
+    }
+    if ($saved === null) {
+        $saved = (object) ['$type' => 'app.bsky.actor.defs#savedFeedsPrefV2', 'items' => [
+            (object) ['type' => 'timeline', 'value' => 'following', 'pinned' => true, 'id' => bin2hex(random_bytes(7))],
+        ]];
+        $prefs[] = $saved;
+    }
+    $items = isset($saved->items) && is_array($saved->items) ? array_values($saved->items) : [];
+    $found = false;
+    foreach ($items as $item) {
+        if (is_object($item) && (string) ($item->value ?? '') === $feedUri) {
+            $item->pinned = $pinned;
+            $found = true;
+        }
+    }
+    if (!$found && $pinned) {
+        $items[] = (object) [
+            'type' => str_contains($feedUri, '/app.bsky.graph.list/') ? 'list' : 'feed',
+            'value' => $feedUri,
+            'pinned' => true,
+            'id' => bin2hex(random_bytes(7)),
+        ];
+    }
+    $saved->items = $items;
+    // $prefs holds stdClass objects; ap_bsky_xrpc's json_encode keeps {} as {}.
+    $put = ap_bsky_xrpc($pds, 'app.bsky.actor.putPreferences', 'POST', null, ['preferences' => $prefs], (string) $tok['access'], 10);
+    if (($put['status'] ?? 0) === 401) {
+        $tok = ap_bsky_access_token($ownerUserId, true);
+        if (!empty($tok['ok'])) {
+            $put = ap_bsky_xrpc($pds, 'app.bsky.actor.putPreferences', 'POST', null, ['preferences' => $prefs], (string) $tok['access'], 10);
+        }
+    }
+    if (empty($put['ok'])) {
+        return ['ok' => false, 'error' => (string) ($put['error'] ?? 'Bluesky refused the change')];
+    }
+    @file_put_contents(
+        sys_get_temp_dir() . '/vaak-bsky-prefs-' . $ownerUserId . '.json',
+        json_encode(['preferences' => $prefs], JSON_UNESCAPED_SLASHES),
+        LOCK_EX
+    );
+    if (function_exists('ap_redis_delete')) {
+        ap_redis_delete('vaak:bsky:chips:v1:' . $ownerUserId);
+    }
+    return ['ok' => true];
+}
+
 /** Bluesky feed head cache (mirrors admin TL / Masto JSON head discipline). */
 function ap_bsky_tl_cache_dir(): string
 {
