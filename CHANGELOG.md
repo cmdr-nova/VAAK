@@ -12,6 +12,18 @@ anything else bumps the patch number.
 Releases up to **0.9.83** used a two-digit deploy counter (0.9.05, 0.9.83)
 and have no notes here; their tags and GitHub Releases are unchanged.
 
+## [0.11.0](https://github.com/cmdr-nova/VAAK/releases/tag/v0.11.0) - 2026-11-02
+
+### ✨ Features
+* Bluesky DMs on the DM screen (behind VAAK_BSKY_DMS=1) by @cmdr-nova in https://github.com/cmdr-nova/VAAK/pull/324
+* DM screen: no underlines when hovering conversations by @cmdr-nova in https://github.com/cmdr-nova/VAAK/pull/325
+* Home feed chips (VAAK first), Bluesky feed search, smoother feed switching by @cmdr-nova in https://github.com/cmdr-nova/VAAK/pull/326
+* Bluesky DMs: requests, reactions, mute/leave, DM on Bluesky profiles by @cmdr-nova in https://github.com/cmdr-nova/VAAK/pull/327
+### 🐛 Fixes
+* Keep Bluesky posting working through AppView takedowns by @cmdr-nova in https://github.com/cmdr-nova/VAAK/pull/328
+
+**Full Changelog**: https://github.com/cmdr-nova/VAAK/compare/v0.10.0...v0.11.0
+
 ## [0.10.0](https://github.com/cmdr-nova/VAAK/releases/tag/v0.10.0) - 2026-11-02
 
 ### ✨ Features
