@@ -337,9 +337,8 @@ async fn load_followed_tags(db: &Client, owner: i64) -> Vec<String> {
             .ok()
             .flatten()
             .unwrap_or_default()
-            .trim()
-            .trim_start_matches('#')
-            .to_ascii_lowercase();
+            .to_string();
+        let tag = crate::hashtags::normalize_name(&tag);
         if !tag.is_empty() && seen.insert(tag.clone()) {
             tags.push(tag);
         }
@@ -619,13 +618,15 @@ const FOLLOWED_TAG_INDEXED_SQL: &str = "WITH hits AS (
      LIMIT 600";
 
 /// `htag_a | htag_b` for the tags [`extract_hashtags`] can ever match
-/// (ASCII letters, digits and `_`, 2 to 64 long). None when no tag qualifies.
+/// (Unicode letters, numbers and `_`, 2 to 64 long). None when no tag qualifies.
 fn followed_tag_tsquery(tags: &[String]) -> Option<String> {
     let mut parts: Vec<String> = Vec::new();
     for tag in tags {
-        let tag = tag.trim().trim_start_matches('#').to_ascii_lowercase();
-        if !(2..=64).contains(&tag.len())
-            || !tag.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        // Letters, numbers and `_` only, so nothing here can be a tsquery
+        // operator. `htag_café` parses as the phrase `htag <-> café`, the same
+        // way the indexer's `htag_café` token was parsed into the tsvector.
+        let tag = crate::hashtags::normalize_name(tag);
+        if !(2..=64).contains(&tag.chars().count())
             || tag.trim_matches('_').is_empty()
         {
             continue;
@@ -1919,35 +1920,7 @@ fn strip_tags_lower(text: &str) -> String {
 }
 
 fn extract_hashtags(text: &str) -> Vec<String> {
-    let plain = strip_tags_lower(text);
-    let mut tags = Vec::new();
-    let mut seen = HashSet::new();
-    let bytes = plain.as_bytes();
-    let mut i = 0usize;
-    while i < bytes.len() {
-        if bytes[i] == b'#' {
-            let start = i + 1;
-            let mut end = start;
-            while end < bytes.len() {
-                let c = bytes[end] as char;
-                if c.is_ascii_alphanumeric() || c == '_' {
-                    end += 1;
-                } else {
-                    break;
-                }
-            }
-            if end > start {
-                let tag = plain[start..end].to_string();
-                if (2..=64).contains(&tag.len()) && seen.insert(tag.clone()) {
-                    tags.push(tag);
-                }
-                i = end;
-                continue;
-            }
-        }
-        i += 1;
-    }
-    tags
+    crate::hashtags::extract(text)
 }
 
 /// Letters, numbers, and underscores keep going as one token.
@@ -2394,26 +2367,43 @@ async fn load_favourite_actor_weights(db: &Client, owner: i64) -> HashMap<String
     weights
 }
 
+/// Passive signals (one row per post seen, clicked or dwelt on) share
+/// `ap_user_signals` with likes, boosts and replies. Read them with separate
+/// caps, the way Twitter's user-signal-service caps each signal type, so a
+/// long scroll session cannot push weeks of explicit actions out of a single
+/// newest-N window. Explicit rows keep the 90-day retention window; passive
+/// rows are weighted at -0.03..0.3 with the same 14-day decay, so 14 days
+/// covers nearly all of their effect.
+const SIGNAL_PASSIVE_KINDS: [&str; 3] = ["impression", "click", "dwell"];
+const SIGNAL_EXPLICIT_DAYS: i64 = 90;
+const SIGNAL_PASSIVE_DAYS: i64 = 14;
+const SIGNAL_ACTOR_WEIGHTS_SQL: &str = "(SELECT signal_type, weight::float8, metadata_json, created_at::text
+        FROM ap_user_signals
+        WHERE owner_user_id = $1 AND created_at >= $2
+          AND NOT (lower(signal_type) = ANY($4::text[]))
+        ORDER BY id DESC LIMIT 2000)
+     UNION ALL
+     (SELECT signal_type, weight::float8, metadata_json, created_at::text
+        FROM ap_user_signals
+        WHERE owner_user_id = $1 AND created_at >= $3
+          AND lower(signal_type) = ANY($4::text[])
+        ORDER BY id DESC LIMIT 500)";
+
 async fn load_signal_actor_weights(db: &Client, owner: i64) -> HashMap<String, f64> {
     if owner < 1 {
         return HashMap::new();
     }
-    // Keep more of the durable interaction history available to ranking while
-    // retaining a hard row bound so a very active account cannot make rebuilds
-    // unbounded. The database retention window is longer than the old 45-day
-    // native read window.
-    let since = chrono::Utc::now() - chrono::Duration::days(90);
-    let since_s = since.to_rfc3339();
+    let since_s = (chrono::Utc::now() - chrono::Duration::days(SIGNAL_EXPLICIT_DAYS)).to_rfc3339();
+    let passive_since_s =
+        (chrono::Utc::now() - chrono::Duration::days(SIGNAL_PASSIVE_DAYS)).to_rfc3339();
+    let passive: Vec<&str> = SIGNAL_PASSIVE_KINDS.to_vec();
     let rows = db
-        .query(
-            "SELECT signal_type, weight, metadata_json, created_at
-             FROM ap_user_signals
-             WHERE owner_user_id = $1 AND created_at >= $2
-             ORDER BY id DESC LIMIT 2000",
-            &[&owner, &since_s],
-        )
+        .query(SIGNAL_ACTOR_WEIGHTS_SQL, &[&owner, &since_s, &passive_since_s, &passive])
         .await
-        .unwrap_or_default();
+        .unwrap_or_else(|e| {
+            tracing::debug!(error = %e, owner, "signal actor weights unavailable");
+            Vec::new()
+        });
     let kind_weight = |kind: &str| -> f64 {
         match kind {
             "like" => 1.4,
@@ -4566,9 +4556,13 @@ mod followed_tag_tests {
 
     #[test]
     fn tsquery_keeps_only_tags_the_matcher_can_see() {
-        let tags: Vec<String> = ["Cats", "#cats", "my_tag", "x", "café", "___", "a b", "dogs|x"]
+        let tags: Vec<String> = ["Cats", "#cats", "my_tag", "x", "Café", "日本語", "___", "a b", "dogs|x", "!&"]
             .iter().map(|s| s.to_string()).collect();
-        assert_eq!(followed_tag_tsquery(&tags).as_deref(), Some("htag_cats | htag_my_tag"));
+        // Operators and spaces are stripped like PHP ap_masto_normalize_tag_name.
+        assert_eq!(
+            followed_tag_tsquery(&tags).as_deref(),
+            Some("htag_cats | htag_my_tag | htag_café | htag_日本語 | htag_ab | htag_dogsx")
+        );
         assert_eq!(followed_tag_tsquery(&["é".to_string()]), None);
     }
 
@@ -4609,5 +4603,89 @@ mod followed_tag_tests {
         assert_eq!(items.len(), 1, "the tagged post is found through the index");
         let scan = db.query(FOLLOWED_TAG_SCAN_SQL, &[&(now - chrono::Duration::days(14)).to_rfc3339()]).await.unwrap();
         assert!(scan.iter().all(|r| r.get::<_, i64>(0) != 1), "the old scan missed it");
+    }
+
+    /// Non-ASCII followed tags used to be skipped by the tsquery builder and
+    /// cut short by the matcher (`#café` read as `caf`), so they never reached Home.
+    #[tokio::test]
+    async fn unicode_followed_tags_reach_home() {
+        let Ok(url) = std::env::var("LIBRARY_FIXTURE_DB") else { return };
+        let db = crate::db::connect(&url).await.unwrap();
+        db.batch_execute(
+            "CREATE TEMP TABLE events (id BIGINT PRIMARY KEY, type TEXT, actor_id TEXT, summary TEXT,
+                media_urls TEXT, created_at TEXT, visibility TEXT, object_id TEXT, target_actor TEXT,
+                action_taken TEXT);
+             CREATE TEMP TABLE ap_search_docs (id BIGSERIAL PRIMARY KEY, source TEXT, source_pk BIGINT,
+                object_id TEXT, created_at TEXT, body TEXT,
+                body_tsv tsvector GENERATED ALWAYS AS (to_tsvector('simple', body)) STORED);",
+        ).await.unwrap();
+        let ts = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+        // Bodies as ap_search_fts_normalize_body writes them: text plus htag_<mb_strtolower(tag)>.
+        let rows = [
+            (1i64, "Morning <a>#Café</a>", "Morning #Café htag_café"),
+            (2, "今日は #日本語", "今日は #日本語 htag_日本語"),
+            (3, "Just #cafe", "Just #cafe htag_cafe"),
+        ];
+        for (id, summary, body) in rows {
+            db.execute(
+                "INSERT INTO events VALUES ($1,'Create','https://r.test/users/a',$2,'[]',$3,'public',$4,'','log')",
+                &[&id, &summary, &ts, &format!("https://r.test/n/{id}")],
+            ).await.unwrap();
+            db.execute(
+                "INSERT INTO ap_search_docs (source,source_pk,object_id,created_at,body) VALUES ('event',$1,$2,$3,$4)",
+                &[&id, &format!("https://r.test/n/{id}"), &ts, &body],
+            ).await.unwrap();
+        }
+        let hidden = hidden::HiddenSets::default();
+        let tags = ["café".to_string(), "日本語".to_string()];
+        let mut ids: Vec<String> = fetch_followed_tag_events(&db, &tags, &hidden)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|it| it.object_id)
+            .collect();
+        ids.sort();
+        assert_eq!(ids, vec!["https://r.test/n/1", "https://r.test/n/2"], "#cafe is a different tag");
+    }
+}
+
+#[cfg(test)]
+mod signal_window_tests {
+    use super::*;
+
+    /// Runs where a disposable fixture database is configured; skipped otherwise.
+    #[tokio::test]
+    async fn impressions_do_not_push_likes_out_of_the_window() {
+        let Ok(url) = std::env::var("LIBRARY_FIXTURE_DB") else { return };
+        let db = crate::db::connect(&url).await.unwrap();
+        db.batch_execute(
+            "CREATE TEMP TABLE ap_user_signals (id BIGSERIAL PRIMARY KEY, owner_user_id BIGINT NOT NULL,
+                platform TEXT NOT NULL, signal_type TEXT NOT NULL, target_key TEXT NOT NULL,
+                weight REAL NOT NULL DEFAULT 1, metadata_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL);",
+        ).await.unwrap();
+        let now = chrono::Utc::now();
+        // Older likes first (lower ids), then a long scroll session of impressions.
+        let liked = (now - chrono::Duration::days(3)).to_rfc3339();
+        for i in 0..5i64 {
+            db.execute(
+                "INSERT INTO ap_user_signals (owner_user_id,platform,signal_type,target_key,weight,metadata_json,created_at)
+                 VALUES (7,'fedi','like',$1,1,'{\"target_actor\":\"https://r.test/users/fav\"}',$2)",
+                &[&format!("https://r.test/n/{i}"), &liked],
+            ).await.unwrap();
+        }
+        let seen = (now - chrono::Duration::hours(1)).to_rfc3339();
+        db.execute(
+            "INSERT INTO ap_user_signals (owner_user_id,platform,signal_type,target_key,weight,metadata_json,created_at)
+             SELECT 7,'fedi','impression','https://r.test/s/' || g,1,'{\"target_actor\":\"https://r.test/users/other\"}',$1
+             FROM generate_series(1,2500) g",
+            &[&seen],
+        ).await.unwrap();
+        let weights = load_signal_actor_weights(&db, 7).await;
+        let fav = *weights.get("https://r.test/users/fav").unwrap_or(&0.0);
+        assert!(fav > 5.0, "five likes still count after 2500 newer impressions: {fav}");
+        let other = *weights.get("https://r.test/users/other").unwrap_or(&0.0);
+        // Passive rows are capped at 500: 500 x -0.03 ~= -15, clamped to -3.
+        assert!(other < 0.0 && other >= -3.0, "impressions still add fatigue: {other}");
     }
 }

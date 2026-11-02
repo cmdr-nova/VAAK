@@ -5,6 +5,7 @@ mod ap_actor_warm;
 mod config;
 mod db;
 mod hidden;
+mod hashtags;
 mod html_entities;
 mod audience;
 mod http;
