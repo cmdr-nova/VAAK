@@ -7404,7 +7404,7 @@ function ap_bsky_get_custom_feed(int $ownerUserId, string $feedUri, int $limit =
  * @param list<array{id?:string,type?:string,value?:string}> $pinned
  * @return array<string,string>
  */
-function ap_bsky_feed_labels(array $pinned): array
+function ap_bsky_feed_labels(array $pinned, int $maxLookups = 4): array
 {
     $out = [];
     $lookups = 0;
@@ -7421,7 +7421,7 @@ function ap_bsky_feed_labels(array $pinned): array
             $out[$uri] = $name !== '' ? $name : $fallback;
             continue;
         }
-        if ($lookups >= 4 || !defined('AP_BSKY_PUBLIC_API')) {
+        if ($lookups >= $maxLookups || !defined('AP_BSKY_PUBLIC_API')) {
             $out[$uri] = $fallback;
             continue;
         }
@@ -7527,19 +7527,48 @@ function ap_bsky_pinned_feed_uris(int $ownerUserId): array
     return $out;
 }
 
+/** True for a feed generator or list AT-URI (what savedFeedsPrefV2 can pin). */
+function ap_bsky_feed_uri_valid(string $uri): bool
+{
+    // '#' delimiter: '~' appears inside the record-key class below.
+    return preg_match('#^at://[^/\s]+/app\.bsky\.(feed\.generator|graph\.list)/[A-Za-z0-9._:~-]+$#D', $uri) === 1;
+}
+
 /**
  * Pin or unpin a feed (or list) in the account's Bluesky preferences, the
- * same savedFeedsPrefV2 record bsky.app edits. Reads preferences fresh right
- * before the write so other settings are kept as they are. Unpinning leaves
- * the feed saved, like the official app.
+ * same savedFeedsPrefV2 record bsky.app edits. Unpinning leaves the feed
+ * saved, like the official app.
  *
  * @return array{ok:bool,error?:string}
  */
 function ap_bsky_feed_set_pinned(int $ownerUserId, string $feedUri, bool $pinned): array
 {
+    return ap_bsky_saved_feeds_edit($ownerUserId, $pinned ? 'pin' : 'unpin', $feedUri);
+}
+
+/**
+ * Edit the account's saved feeds (savedFeedsPrefV2) in place.
+ *   pin / unpin  set the pinned flag (pin also saves a feed not saved yet)
+ *   remove       drop it from saved feeds entirely (Following cannot be removed)
+ *   up / down    move it one place among items with the same pinned state
+ * Preferences are read fresh from the PDS and decoded as objects right before
+ * the write: putPreferences replaces the whole list, and an array decode would
+ * turn every {} into [] in the account's other preferences.
+ *
+ * @return array{ok:bool,error?:string}
+ */
+function ap_bsky_saved_feeds_edit(int $ownerUserId, string $op, string $feedUri): array
+{
     $feedUri = trim($feedUri);
-    if (!preg_match('~^at://[^/\s]+/app\.bsky\.(feed\.generator|graph\.list)/[A-Za-z0-9._:~-]+$~', $feedUri)) {
+    $isTimeline = $feedUri === 'following';
+    if (!in_array($op, ['pin', 'unpin', 'remove', 'up', 'down'], true)) {
+        return ['ok' => false, 'error' => 'Unknown feed change'];
+    }
+    if (!$isTimeline && !ap_bsky_feed_uri_valid($feedUri)) {
         return ['ok' => false, 'error' => 'Invalid feed'];
+    }
+    if ($isTimeline && $op === 'remove') {
+        return ['ok' => false, 'error' => 'Following can be unpinned but not removed'];
     }
     $row = ap_bsky_session_row($ownerUserId);
     if (!is_array($row)) {
@@ -7553,8 +7582,6 @@ function ap_bsky_feed_set_pinned(int $ownerUserId, string $feedUri, bool $pinned
         }
     }
     // Preferences live on the PDS itself, never behind the AppView proxy.
-    // Read them fresh and decode as objects: putPreferences replaces the whole
-    // list, and an array decode would turn every {} into [] in other prefs.
     $pds = rtrim((string) ($row['pds_host'] ?? AP_BSKY_DEFAULT_PDS), '/');
     $got = ap_bsky_xrpc($pds, 'app.bsky.actor.getPreferences', 'GET', null, null, (string) $tok['access'], 10);
     if (($got['status'] ?? 0) === 401) {
@@ -7583,20 +7610,9 @@ function ap_bsky_feed_set_pinned(int $ownerUserId, string $feedUri, bool $pinned
         $prefs[] = $saved;
     }
     $items = isset($saved->items) && is_array($saved->items) ? array_values($saved->items) : [];
-    $found = false;
-    foreach ($items as $item) {
-        if (is_object($item) && (string) ($item->value ?? '') === $feedUri) {
-            $item->pinned = $pinned;
-            $found = true;
-        }
-    }
-    if (!$found && $pinned) {
-        $items[] = (object) [
-            'type' => str_contains($feedUri, '/app.bsky.graph.list/') ? 'list' : 'feed',
-            'value' => $feedUri,
-            'pinned' => true,
-            'id' => bin2hex(random_bytes(7)),
-        ];
+    $items = ap_bsky_saved_feed_items_apply($items, $op, $feedUri);
+    if ($items === null) {
+        return ['ok' => false, 'error' => 'That feed is not in your saved feeds'];
     }
     $saved->items = $items;
     // $prefs holds stdClass objects; ap_bsky_xrpc's json_encode keeps {} as {}.
@@ -7619,6 +7635,103 @@ function ap_bsky_feed_set_pinned(int $ownerUserId, string $feedUri, bool $pinned
         ap_redis_delete('vaak:bsky:chips:v1:' . $ownerUserId);
     }
     return ['ok' => true];
+}
+
+/**
+ * The account's saved feeds in Bluesky's order, from cached preferences.
+ *
+ * @return array{ok:bool,error?:string,items?:list<array{type:string,value:string,pinned:bool}>}
+ */
+function ap_bsky_saved_feed_list(int $ownerUserId): array
+{
+    $raw = ap_bsky_get_preferences($ownerUserId);
+    if (empty($raw['ok']) || !is_array($raw['preferences'] ?? null)) {
+        return ['ok' => false, 'error' => (string) ($raw['error'] ?? 'Could not read Bluesky preferences')];
+    }
+    $out = [];
+    foreach ($raw['preferences'] as $pref) {
+        if (!is_array($pref) || (string) ($pref['$type'] ?? '') !== 'app.bsky.actor.defs#savedFeedsPrefV2') {
+            continue;
+        }
+        foreach ((array) ($pref['items'] ?? []) as $item) {
+            $type = is_array($item) ? (string) ($item['type'] ?? '') : '';
+            $value = is_array($item) ? (string) ($item['value'] ?? '') : '';
+            if ($type === 'timeline' && $value === 'following') {
+                $out[] = ['type' => 'timeline', 'value' => 'following', 'pinned' => !empty($item['pinned'])];
+            } elseif (($type === 'feed' || $type === 'list') && str_starts_with($value, 'at://')) {
+                $out[] = ['type' => $type, 'value' => $value, 'pinned' => !empty($item['pinned'])];
+            }
+        }
+        return ['ok' => true, 'items' => $out];
+    }
+    // Old accounts with only savedFeedsPref (v1): show what it lists.
+    $prefs = ap_bsky_parse_feed_prefs($raw['preferences']);
+    $pinned = [];
+    foreach ((array) ($prefs['pinned'] ?? []) as $pin) {
+        $v = (string) ($pin['value'] ?? '');
+        $pinned[$v] = true;
+        $out[] = ['type' => (string) ($pin['type'] ?? 'feed'), 'value' => $v, 'pinned' => true];
+    }
+    foreach ((array) ($prefs['savedFeedUris'] ?? []) as $v) {
+        if (!isset($pinned[$v])) {
+            $out[] = ['type' => str_contains($v, '/app.bsky.graph.list/') ? 'list' : 'feed', 'value' => $v, 'pinned' => false];
+        }
+    }
+    return ['ok' => true, 'items' => $out];
+}
+
+/**
+ * Pure list edit behind ap_bsky_saved_feeds_edit (no I/O, so it is testable).
+ * Items are savedFeedsPrefV2 entries as stdClass objects. Returns null when
+ * the op needs an existing item that is not there.
+ *
+ * @param list<object> $items
+ * @return list<object>|null
+ */
+function ap_bsky_saved_feed_items_apply(array $items, string $op, string $value): ?array
+{
+    $items = array_values(array_filter($items, 'is_object'));
+    $at = null;
+    foreach ($items as $i => $item) {
+        if ((string) ($item->value ?? '') === $value) {
+            $at = $i;
+            break;
+        }
+    }
+    if ($op === 'pin' && $at === null) {
+        $items[] = (object) [
+            'type' => $value === 'following' ? 'timeline' : (str_contains($value, '/app.bsky.graph.list/') ? 'list' : 'feed'),
+            'value' => $value,
+            'pinned' => true,
+            'id' => bin2hex(random_bytes(7)),
+        ];
+        return $items;
+    }
+    if ($at === null) {
+        return $op === 'unpin' ? $items : null;
+    }
+    if ($op === 'pin' || $op === 'unpin') {
+        foreach ($items as $item) {
+            if ((string) ($item->value ?? '') === $value) {
+                $item->pinned = $op === 'pin';
+            }
+        }
+        return $items;
+    }
+    if ($op === 'remove') {
+        return array_values(array_filter($items, static fn ($item) => (string) ($item->value ?? '') !== $value));
+    }
+    // up / down: swap with the nearest neighbour in the same group (pinned
+    // or saved), which is the order the Home chips and the Library page show.
+    $pinned = !empty($items[$at]->pinned);
+    $step = $op === 'up' ? -1 : 1;
+    for ($j = $at + $step; $j >= 0 && $j < count($items); $j += $step) {
+        if (!empty($items[$j]->pinned) === $pinned) {
+            [$items[$at], $items[$j]] = [$items[$j], $items[$at]];
+            break;
+        }
+    }
+    return $items;
 }
 
 /** Bluesky feed head cache (mirrors admin TL / Masto JSON head discipline). */
