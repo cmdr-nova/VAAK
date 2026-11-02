@@ -36900,6 +36900,15 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
                   if (!$cachedBsky && preg_match('~^https://bsky\.app/profile/(did:[^/?#]+)~i', $rpBskyRequestedRef, $bskyDid)) {
                       $cachedBsky = ap_bsky_actor_profile_cache_get($bskyDid[1], $vaakOwnerId);
                   }
+                  // Nothing cached yet: one bounded inline fetch (profile + first
+                  // post page) so the first paint is not the "refreshing" card.
+                  if (!$cachedBsky && function_exists('ap_bsky_actor_profile_cold_fill')) {
+                      $cachedBsky = ap_bsky_actor_profile_cold_fill(
+                          $vaakOwnerId,
+                          $rpBskyRequestedRef,
+                          in_array($rpRequestedTab, ['posts', 'replies', 'boosts', 'media'], true)
+                      );
+                  }
                   if (function_exists('ap_bsky_actor_refresh_enqueue')) {
                       ap_bsky_actor_refresh_enqueue($vaakOwnerId, $rpBskyRequestedRef, $rpForceRefresh);
                   }

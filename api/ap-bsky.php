@@ -9968,6 +9968,74 @@ function ap_bsky_follow_sync_worker(int $ownerUserId): array
     }
 }
 
+/**
+ * Cold Bluesky profile view: one bounded inline getProfile, plus the first
+ * author-feed page when no posts are cached for that author, so the first
+ * paint has a bio and posts instead of the "being refreshed" placeholder that
+ * only clears after the background queue runs and the viewer reloads twice.
+ *
+ * The whole fill shares one wall-clock budget (default 4 s) on top of any
+ * budget the request already has. A failed or empty attempt is remembered for
+ * two minutes per owner and ref, so a dead handle never costs more than one
+ * slow load. VAAK_BSKY_PROFILE_COLD_FILL=0 turns it off; the queued refresh
+ * then does all the work as before.
+ *
+ * @return array{profile:array<string,mixed>,did:?string,updated_at:string,viewer?:array<string,mixed>}|null
+ */
+function ap_bsky_actor_profile_cold_fill(int $ownerUserId, string $actorRef, bool $withFeed, int $budgetSec = 4): ?array
+{
+    $switch = getenv('VAAK_BSKY_PROFILE_COLD_FILL');
+    if ($switch !== false && in_array(strtolower(trim((string) $switch)), ['0', 'off', 'false', 'no'], true)) {
+        return null;
+    }
+    $actorRef = trim($actorRef);
+    if ($ownerUserId < 1 || $actorRef === '' || !ap_bsky_is_profile_ref($actorRef)) {
+        return null;
+    }
+    static $tried = [];
+    $markKey = 'vaak:bsky:profile-cold-fill:v1:' . $ownerUserId . ':' . hash('sha256', strtolower($actorRef));
+    if (isset($tried[$markKey])) {
+        return null;
+    }
+    $tried[$markKey] = true;
+    if (function_exists('ap_redis_json_get') && is_array(ap_redis_json_get($markKey))) {
+        return null;
+    }
+    $previousDeadline = $GLOBALS['ap_bsky_budget_deadline'] ?? null;
+    $deadline = microtime(true) + max(1, $budgetSec);
+    if (is_float($previousDeadline) || is_int($previousDeadline)) {
+        $deadline = min($deadline, (float) $previousDeadline);
+    }
+    $GLOBALS['ap_bsky_budget_deadline'] = $deadline;
+    $filled = null;
+    try {
+        $result = ap_bsky_get_profile($ownerUserId, $actorRef);
+        if (!empty($result['ok']) && is_array($result['profile'] ?? null)) {
+            ap_bsky_actor_profile_cache_upsert($actorRef, $ownerUserId, $result['profile']);
+            $filled = ap_bsky_actor_profile_cache_get($actorRef, $ownerUserId);
+            $did = trim((string) ($result['profile']['did'] ?? ''));
+            if ($withFeed && str_starts_with($did, 'did:') && !ap_bsky_budget_exceeded()
+                && function_exists('ap_bsky_posts_for_author') && ap_bsky_posts_for_author($did, 1) === []) {
+                // Indexes the page into bsky_posts; failures leave the queue to retry.
+                ap_bsky_get_author_feed($ownerUserId, 25, null, $did);
+            }
+        }
+    } catch (Throwable $e) {
+        error_log('[ap-bsky] cold profile fill failed: ' . $e->getMessage());
+        $filled = null;
+    } finally {
+        if ($previousDeadline === null) {
+            unset($GLOBALS['ap_bsky_budget_deadline']);
+        } else {
+            $GLOBALS['ap_bsky_budget_deadline'] = $previousDeadline;
+        }
+    }
+    if ($filled === null && function_exists('ap_redis_json_set')) {
+        ap_redis_json_set($markKey, ['at' => time()], 120);
+    }
+    return $filled;
+}
+
 /** Coalesced durable enqueue; no network I/O occurs on the web request. */
 function ap_bsky_actor_refresh_enqueue(int $ownerUserId, string $actorRef, bool $force = false, ?PDO $db = null): void
 {
