@@ -7527,6 +7527,13 @@ function ap_bsky_pinned_feed_uris(int $ownerUserId): array
     return $out;
 }
 
+/** True for a feed generator or list AT-URI (what savedFeedsPrefV2 can pin). */
+function ap_bsky_feed_uri_valid(string $uri): bool
+{
+    // '#' delimiter: '~' appears inside the record-key class below.
+    return preg_match('#^at://[^/\s]+/app\.bsky\.(feed\.generator|graph\.list)/[A-Za-z0-9._:~-]+$#D', $uri) === 1;
+}
+
 /**
  * Pin or unpin a feed (or list) in the account's Bluesky preferences, the
  * same savedFeedsPrefV2 record bsky.app edits. Reads preferences fresh right
@@ -7538,7 +7545,7 @@ function ap_bsky_pinned_feed_uris(int $ownerUserId): array
 function ap_bsky_feed_set_pinned(int $ownerUserId, string $feedUri, bool $pinned): array
 {
     $feedUri = trim($feedUri);
-    if (!preg_match('~^at://[^/\s]+/app\.bsky\.(feed\.generator|graph\.list)/[A-Za-z0-9._:~-]+$~', $feedUri)) {
+    if (!ap_bsky_feed_uri_valid($feedUri)) {
         return ['ok' => false, 'error' => 'Invalid feed'];
     }
     $row = ap_bsky_session_row($ownerUserId);

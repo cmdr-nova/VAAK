@@ -14531,7 +14531,7 @@ function admin_search_feed_row_html(array $f, bool $isPinned, string $sq, bool $
     }
     $openHref = '?view=bluesky&feed=' . rawurlencode($uri);
     $bskyUrl = '';
-    if (preg_match('~^at://([^/]+)/app\.bsky\.feed\.generator/([A-Za-z0-9._:~-]+)$~', $uri, $m)) {
+    if (preg_match('#^at://([^/]+)/app\.bsky\.feed\.generator/([A-Za-z0-9._:~-]+)$#', $uri, $m)) {
         $bskyUrl = 'https://bsky.app/profile/' . rawurlencode($m[1]) . '/feed/' . rawurlencode($m[2]);
     }
     $by = (string) ($f['creator_handle'] ?? '');
