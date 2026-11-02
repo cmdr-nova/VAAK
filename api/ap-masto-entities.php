@@ -15837,16 +15837,8 @@ function ap_masto_suggestions_v2_uncached(int $limit = 40): array
         $signalSt->execute([$ownerUserId, gmdate('c', time() - 90 * 86400)]);
         foreach ($signalSt->fetchAll() as $signal) {
             $meta = json_decode((string) ($signal['metadata_json'] ?? '{}'), true);
-            $actor = is_array($meta) ? trim((string) ($meta['target_actor'] ?? '')) : '';
-            if ($actor === '' && is_array($meta)) {
-                $actor = trim((string) ($meta['author_did'] ?? ''));
-            }
-            if ($actor === '' && is_array($meta)) {
-                $handle = trim((string) ($meta['author_handle'] ?? ''));
-                if ($handle !== '') {
-                    $actor = 'https://bsky.app/profile/' . rawurlencode(ltrim($handle, '@'));
-                }
-            }
+            require_once __DIR__ . '/ap-signals.php';
+            $actor = is_array($meta) ? ap_signal_meta_actor($meta) : '';
             if ($actor === '') continue;
             $weight = (float) ($signal['weight'] ?? 0);
             if ($weight > 0) {

@@ -9588,12 +9588,8 @@ function admin_home_signal_actor_weights(int $ownerUserId): array
             if ($base <= 0) continue;
             $meta = json_decode((string) ($row['metadata_json'] ?? '{}'), true);
             if (!is_array($meta)) $meta = [];
-            $actor = rtrim(trim((string) ($meta['target_actor'] ?? '')), '/');
-            if ($actor === '') $actor = rtrim(trim((string) ($meta['author_did'] ?? '')), '/');
-            if ($actor === '') {
-                $handle = ltrim(trim((string) ($meta['author_handle'] ?? '')), '@');
-                if ($handle !== '') $actor = 'https://bsky.app/profile/' . rawurlencode($handle);
-            }
+            require_once __DIR__ . '/ap-signals.php';
+            $actor = ap_signal_meta_actor($meta);
             if ($actor === '') continue;
             $kind = strtolower((string) ($row['signal_type'] ?? ''));
             $multiplier = (float) ($kindWeight[$kind] ?? 0.5);

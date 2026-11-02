@@ -2,6 +2,29 @@
 /** Low-cost interaction signals used by background recommendation jobs. */
 declare(strict_types=1);
 
+/** Author DID of an at://did:.../collection/rkey URI, or '' for anything else. */
+function ap_signal_did_from_at_uri(string $uri): string
+{
+    return preg_match('#^at://(did:(?:plc|web):[A-Za-z0-9._:%-]+)/#', trim($uri), $m) ? $m[1] : '';
+}
+
+/**
+ * Actor key a signal row's metadata points at: target_actor, author_did,
+ * author_handle, then the author DID inside a Bluesky AT-URI (older
+ * like/repost/bookmark rows stored only the URI). '' when none.
+ */
+function ap_signal_meta_actor(array $meta): string
+{
+    $actor = rtrim(trim((string) ($meta['target_actor'] ?? '')), '/');
+    if ($actor === '') $actor = rtrim(trim((string) ($meta['author_did'] ?? '')), '/');
+    if ($actor === '') {
+        $handle = ltrim(trim((string) ($meta['author_handle'] ?? '')), '@');
+        if ($handle !== '') $actor = 'https://bsky.app/profile/' . rawurlencode($handle);
+    }
+    if ($actor === '') $actor = ap_signal_did_from_at_uri((string) ($meta['uri'] ?? ''));
+    return $actor;
+}
+
 /** Record an interaction after its desired state has been queued. */
 function ap_signal_record(int $ownerUserId, string $platform, string $kind, string $targetKey, bool $desired, array $payload = []): void
 {
@@ -16,6 +39,12 @@ function ap_signal_record(int $ownerUserId, string $platform, string $kind, stri
             'object_id' => trim((string) ($payload['object_id'] ?? '')),
             'uri' => trim((string) ($payload['uri'] ?? '')),
         ];
+        if ($metadata['target_actor'] === '' && $metadata['author_did'] === '') {
+            // Bluesky like/repost/bookmark payloads only carry the post
+            // AT-URI. Its authority is the author DID, which is what the
+            // Home rankers key Bluesky authors by.
+            $metadata['author_did'] = ap_signal_did_from_at_uri($metadata['uri'] !== '' ? $metadata['uri'] : $targetKey);
+        }
         $json = json_encode($metadata, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
         ap_db()->prepare(
             'INSERT INTO ap_user_signals

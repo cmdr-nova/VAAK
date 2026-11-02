@@ -2394,6 +2394,25 @@ const SIGNAL_ACTOR_WEIGHTS_SQL: &str = "(SELECT signal_type, weight::float8, met
           AND lower(signal_type) = ANY($4::text[])
         ORDER BY id DESC LIMIT 500)";
 
+/// Author DID of `at://did:.../collection/rkey`, or "" for anything else.
+fn signal_did_from_at_uri(uri: &str) -> String {
+    let Some(rest) = uri.trim().strip_prefix("at://") else {
+        return String::new();
+    };
+    let Some((did, tail)) = rest.split_once('/') else {
+        return String::new();
+    };
+    let ok_prefix = did.starts_with("did:plc:") || did.starts_with("did:web:");
+    let ok_chars = did
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '%' | '-'));
+    if ok_prefix && ok_chars && did.len() > 8 && !tail.is_empty() {
+        did.to_string()
+    } else {
+        String::new()
+    }
+}
+
 async fn load_signal_actor_weights(db: &Client, owner: i64) -> HashMap<String, f64> {
     if owner < 1 {
         return HashMap::new();
@@ -2472,6 +2491,15 @@ async fn load_signal_actor_weights(db: &Client, owner: i64) -> HashMap<String, f
                     actor = format!("https://bsky.app/profile/{handle}");
                 }
             }
+        }
+        if actor.is_empty() {
+            // Older Bluesky like/repost/bookmark rows carry only the post
+            // AT-URI; its authority is the author DID (PHP ap_signal_meta_actor).
+            actor = meta
+                .get("uri")
+                .and_then(|v| v.as_str())
+                .map(signal_did_from_at_uri)
+                .unwrap_or_default();
         }
         if actor.is_empty() {
             continue;
@@ -4868,5 +4896,29 @@ mod burst_spread_tests {
         ];
         let exempt: HashSet<String> = ["me".to_string()].into_iter().collect();
         assert_eq!(burst_shifts(&entries, &exempt, now), vec![0; 8]);
+    }
+}
+
+#[cfg(test)]
+mod signal_at_uri_tests {
+    use super::signal_did_from_at_uri;
+
+    #[test]
+    fn bluesky_post_uri_yields_author_did() {
+        assert_eq!(
+            signal_did_from_at_uri("at://did:plc:abc123xyz/app.bsky.feed.post/3kq2"),
+            "did:plc:abc123xyz"
+        );
+        assert_eq!(
+            signal_did_from_at_uri("at://did:web:feed.example.com/app.bsky.feed.post/x"),
+            "did:web:feed.example.com"
+        );
+    }
+
+    #[test]
+    fn other_shapes_yield_nothing() {
+        for bad in ["", "https://r.test/n/1", "at://did:plc:abc", "at://alice.bsky.social/app.bsky.feed.post/x", "at://did:plc:a b/x/y"] {
+            assert_eq!(signal_did_from_at_uri(bad), "", "{bad}");
+        }
     }
 }
