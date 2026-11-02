@@ -98,6 +98,7 @@ $check(ap_nostr_action('nostr_prepare', 1, false, ['purpose' => 'like', 'target'
 $check(ap_nostr_action('nostr_prepare', 0, true, ['purpose' => 'like', 'target' => $hex])['status'] === 401, 'no user, no action');
 $check(ap_nostr_action('nostr_prepare', 1, true, ['purpose' => 'boost_everything', 'target' => $hex])['status'] === 400, 'unknown purpose refused');
 $check(ap_nostr_action('nostr_prepare', 1, true, ['purpose' => 'like', 'target' => 'note1abc'])['status'] === 400, 'non-hex target refused');
+$check(ap_nostr_action('nostr_zap_status', 1, true, ['watch' => 'nope'])['status'] === 400, 'zap status needs a watch token');
 foreach (['repost', 'quote', 'delete'] as $purpose) {
     $res = ap_nostr_action('nostr_prepare', 1, true, ['purpose' => $purpose, 'target' => $hex]);
     $check(($res['body']['error'] ?? '') !== 'Unknown Nostr action.', "{$purpose} passes PHP checks and goes to the worker");

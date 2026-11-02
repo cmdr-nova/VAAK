@@ -434,6 +434,13 @@ function ap_nostr_action(string $action, int $ownerUserId, bool $isAdmin, array 
         }
         $path = '/shadow/nostr-publish';
         $payload = ['owner_id' => $ownerUserId, 'nonce' => $nonce, 'event' => $event];
+    } elseif ($action === 'nostr_zap_status') {
+        // A zap's pay panel asking whether its invoice was paid yet.
+        $watch = (string) ($post['watch'] ?? '');
+        if (!preg_match('/^[0-9a-f]{32}$/', $watch)) {
+            return $fail(400, 'Unknown zap.');
+        }
+        return ap_nostr_worker_call('/shadow/nostr-zap-status', ['owner_id' => $ownerUserId, 'watch' => $watch], 15000);
     } else {
         return $fail(400, 'Unknown Nostr action.');
     }

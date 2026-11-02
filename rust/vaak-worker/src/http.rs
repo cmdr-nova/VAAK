@@ -182,6 +182,8 @@ pub async fn serve(cfg: Config, bind: SocketAddr) -> Result<()> {
         // copy the viewer's signer extension signed (nostr::act).
         .route("/shadow/nostr-prepare", post(shadow_nostr_prepare))
         .route("/shadow/nostr-publish", post(shadow_nostr_publish))
+        // A zap's pay panel asking whether its invoice was paid yet.
+        .route("/shadow/nostr-zap-status", post(shadow_nostr_zap_status))
         // NIP-46: pair with a user's bunker, and sign through it for pages
         // with no signer extension (nostr::bunker).
         .route("/shadow/nostr-bunker-connect", post(shadow_nostr_bunker_connect))
@@ -276,6 +278,7 @@ async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
             "/api/v1/notifications",
             "/shadow/nostr-prepare (POST)",
             "/shadow/nostr-publish (POST)",
+            "/shadow/nostr-zap-status (POST)",
             "/shadow/nostr-bunker-connect (POST)",
             "/shadow/nostr-bunker-sign (POST)",
             "/shadow/nostr-statuses (POST)",
@@ -734,6 +737,19 @@ async fn shadow_nostr_publish(State(state): State<AppState>, Json(body): Json<No
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"ok": false, "error": "owner required"}))).into_response();
     }
     nostr_reply(crate::nostr::act::publish(&state.cfg, body.owner_id, &body.nonce, &body.event).await)
+}
+
+#[derive(serde::Deserialize)]
+struct NostrZapStatusBody {
+    owner_id: i64,
+    watch: String,
+}
+
+async fn shadow_nostr_zap_status(State(state): State<AppState>, Json(body): Json<NostrZapStatusBody>) -> axum::response::Response {
+    if body.owner_id < 1 {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"ok": false, "error": "owner required"}))).into_response();
+    }
+    nostr_reply(crate::nostr::act::zap_status(&state.cfg, body.owner_id, &body.watch).await)
 }
 
 #[derive(serde::Deserialize)]
