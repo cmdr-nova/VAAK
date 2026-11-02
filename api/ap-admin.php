@@ -33860,7 +33860,7 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
               <div id="dm-message-last" class="dm-thread-end" aria-hidden="true"></div>
             </div>
             <?php if ($dmBskyCanSend): ?>
-            <form class="composer dm-reply-form" method="post" action="?view=dms&amp;bsky=<?= urlencode($dmBskyConvoId) ?>" data-dm-form="reply">
+            <form class="composer dm-reply-form" method="post" action="?view=dms&amp;bsky=<?= urlencode($dmBskyConvoId) ?>" data-dm-form="reply" data-ajax-submit="1">
               <input type="hidden" name="action" value="bsky_dm_send">
               <input type="hidden" name="convo" value="<?= h($dmBskyConvoId) ?>">
               <div class="dm-compose-row">
@@ -33880,7 +33880,7 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
               <a class="btn btn-ghost dm-back" href="?view=dms" aria-label="All conversations">←</a>
               <div class="dm-pane-title">New message</div>
             </div>
-            <form class="composer dm-new-form" method="post" action="?view=dms" enctype="multipart/form-data" data-dm-form="new">
+            <form class="composer dm-new-form" method="post" action="?view=dms" enctype="multipart/form-data" data-dm-form="new" data-ajax-submit="1">
               <input type="hidden" name="action" value="dm_send">
               <label class="dm-label" for="dm-to">To</label>
               <div class="dm-picker">
@@ -33944,7 +33944,7 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
               <div id="dm-message-last" class="dm-thread-end" aria-hidden="true"></div>
             </div>
             <?php if (!$dmPeerBlocked): ?>
-            <form class="composer dm-reply-form" method="post" action="?view=dms&amp;peer=<?= urlencode($dmPeer) ?>" enctype="multipart/form-data" data-dm-form="reply">
+            <form class="composer dm-reply-form" method="post" action="?view=dms&amp;peer=<?= urlencode($dmPeer) ?>" enctype="multipart/form-data" data-dm-form="reply" data-ajax-submit="1">
               <input type="hidden" name="action" value="dm_reply">
               <input type="hidden" name="to" value="<?= h($dmPeer) ?>">
               <input type="hidden" name="peer" value="<?= h($dmPeer) ?>">
@@ -34605,6 +34605,9 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
                 .finally(function () {
                   form.dataset.dmSending = '0';
                   if (submit) submit.disabled = false;
+                  // The composer reports progress itself; never leave the
+                  // page-level Saving… pill up after an in-place send.
+                  if (typeof window.vaakHideLoading === 'function') window.vaakHideLoading();
                 });
             });
           });
