@@ -5,11 +5,12 @@
 //! out, a signer who is the activity's actor, a host that is not blocked) is
 //! written to `ap_inbox_spool` and answered 202; api/bin/inbox-spool-drain.php
 //! processes it with the same PHP routing as before. A Create or Announce an
-//! accepted relay signed for someone else is spooled too; the drain does
-//! PHP's relay-forward handling (re-fetching a forwarded Create). Every other
-//! request is forwarded byte for byte to PHP on a loopback listener, so origin
-//! recovery, other forwarded Creates, key fetches and rejections keep their
-//! PHP behaviour. Rust never fetches a key and never routes an activity.
+//! accepted relay signed for someone else is spooled too, as is any other
+//! verified delivery whose signer is not the actor; the drain does PHP's
+//! forward handling and origin recovery for those. Every other request is
+//! forwarded byte for byte to PHP on a loopback listener, so unknown keys,
+//! bad signatures, blocks and the other rejections keep their PHP behaviour.
+//! Rust never fetches a key and never routes an activity.
 //!
 //! Two deliveries are answered 202 without reaching PHP or the spool: a
 //! repeat of an activity id already spooled for the same inbox path in the
@@ -77,6 +78,9 @@ pub async fn handle(State(state): State<crate::http::AppState>, uri: Uri, header
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Accepted {
     Spooled(i64),
+    /// Signed by a key that is not the actor's (and not a relay forward):
+    /// the drain does PHP's forward check or origin recovery.
+    SpooledMismatch(i64),
     /// Same activity id already spooled for this inbox path in the last day.
     Duplicate,
     /// `Delete` of an actor VAAK holds nothing for. PHP would fetch the gone
@@ -88,6 +92,7 @@ impl Accepted {
     fn stat_field(&self) -> &'static str {
         match self {
             Accepted::Spooled(_) => "spooled",
+            Accepted::SpooledMismatch(_) => "spooled_mismatch",
             Accepted::Duplicate => "duplicate",
             Accepted::UnknownSelfDelete => "unknown_self_delete",
         }
@@ -95,7 +100,7 @@ impl Accepted {
 
     fn body(&self) -> &'static str {
         match self {
-            Accepted::Spooled(_) => r#"{"status":"accepted","action":"spooled"}"#,
+            Accepted::Spooled(_) | Accepted::SpooledMismatch(_) => r#"{"status":"accepted","action":"spooled"}"#,
             Accepted::Duplicate => r#"{"status":"accepted","action":"duplicate"}"#,
             Accepted::UnknownSelfDelete => r#"{"status":"accepted","action":"ignored"}"#,
         }
@@ -260,9 +265,10 @@ async fn fast_path(cfg: &crate::config::Config, uri: &Uri, headers: &HeaderMap, 
         return Err("blocked");
     }
     let (kind, actor) = activity_head(body).ok_or("body")?;
-    if !actor_matches_key(&key_id, &actor, owner.as_deref()) && !relay_forwardable(relay, &kind) {
-        return Err("actor_mismatch");
-    }
+    // A verified signer who is not the actor is not a rejection yet: PHP
+    // takes followed accounts' forwards and recovers the rest from the
+    // actor's server, so the drain decides.
+    let mismatch = !actor_matches_key(&key_id, &actor, owner.as_deref()) && !relay_forwardable(relay, &kind);
     // ap-user.php answers 404 for a personal inbox with no active local user;
     // leave those (and any odd user path) to PHP.
     if let Some(user) = personal_inbox_user(uri.path()) {
@@ -277,7 +283,9 @@ async fn fast_path(cfg: &crate::config::Config, uri: &Uri, headers: &HeaderMap, 
     // Relays plus direct delivery, and senders retrying after a slow answer,
     // hand over the same activity more than once. The inbox path is part of
     // the key because a personal inbox decides which local user it is for.
-    let seen_key = activity_id(body).map(|id| seen_key(uri.path(), &id));
+    // Not for mismatches: any signer can claim any id, and must not be able to
+    // shadow the real delivery.
+    let seen_key = activity_id(body).filter(|_| !mismatch).map(|id| seen_key(uri.path(), &id));
     if let Some(key) = &seen_key {
         let fresh: Option<String> =
             redis::cmd("SET").arg(key).arg(1).arg("NX").arg("EX").arg(SEEN_TTL).query_async(&mut redis).await.map_err(|_| "redis")?;
@@ -302,7 +310,7 @@ async fn fast_path(cfg: &crate::config::Config, uri: &Uri, headers: &HeaderMap, 
         let key = format!("vaak:queue:{SPOOL_QUEUE}");
         let _: Result<(), _> = redis::pipe().lpush(&key, id).expire(&key, 86400).query_async(&mut queue).await;
     }
-    Ok(Accepted::Spooled(id))
+    Ok(if mismatch { Accepted::SpooledMismatch(id) } else { Accepted::Spooled(id) })
 }
 
 /// How long a spooled activity id counts as seen.
@@ -556,6 +564,7 @@ mod tests {
     #[test]
     fn accepted_bodies_and_stats() {
         assert_eq!(Accepted::Spooled(3).stat_field(), "spooled");
+        assert_eq!(Accepted::SpooledMismatch(3).stat_field(), "spooled_mismatch");
         assert_eq!(Accepted::Duplicate.stat_field(), "duplicate");
         assert!(Accepted::UnknownSelfDelete.body().contains("ignored"));
     }

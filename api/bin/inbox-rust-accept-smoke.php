@@ -124,8 +124,9 @@ ap_inbox_rust_key_mirror($evil . '#main-key', $pem);
 $check($status === 418, 'blocked key host is forwarded, not spooled');
 
 $mallory = 'https://remote.test/users/mallory';
-[$status] = smoke_post($rust, '/inbox', smoke_like($mallory, '5'), $aliceKey, $priv);
-$check($status === 418, 'signer who is not the actor is forwarded');
+$mismatched = smoke_like($mallory, '5');
+[$status] = smoke_post($rust, '/inbox', $mismatched, $aliceKey, $priv);
+$check($status === 202, 'verified signer who is not the actor is spooled for the drain to decide');
 
 [$status] = smoke_post($rust, '/inbox', smoke_like($alice, '6'), $aliceKey, $priv, '/outbox');
 $check($status === 418, 'bad signature is forwarded');
@@ -133,8 +134,7 @@ $check($status === 418, 'bad signature is forwarded');
 [$status] = smoke_post($rust, '/users/nobody_here/inbox', smoke_like($alice, '7'), $aliceKey, $priv);
 $check($status === 418, 'personal inbox of an unknown user is forwarded (PHP answers 404)');
 
-// An accepted relay forwards someone else's Announce: spooled and routed;
-// anything else it signs for another actor stays with PHP.
+// An accepted relay forwards someone else's Announce: spooled and routed.
 $relayKey = 'https://relay.test/actor#main-key';
 ap_inbox_rust_key_mirror($relayKey, $pem);
 $mirror = json_decode((string) $redis->get(ap_inbox_rust_key_mirror_key($relayKey)), true);
@@ -147,7 +147,7 @@ $out = is_array($row) ? ap_inbox_spool_process($row) : ['state' => 'missing'];
 $check($out['state'] === 'done', 'spooled relay Announce routes through PHP (' . ($out['result'] ?? '') . ')');
 $delete = json_encode(['id' => $alice . '#delete/9', 'type' => 'Delete', 'actor' => $alice, 'object' => $alice . '/statuses/9'], JSON_UNESCAPED_SLASHES);
 [$status] = smoke_post($rust, '/inbox', $delete, $relayKey, $priv);
-$check($status === 418, 'relay-signed Delete for another actor is forwarded');
+$check($status === 202, 'relay-signed Delete for another actor is spooled too');
 $announce2 = str_replace('announces/8', 'announces/10', $announce);
 [$status] = smoke_post($rust, '/inbox', $announce2, $relayKey, $priv);
 $check($status === 202, 'second relay Announce is spooled');
@@ -155,11 +155,17 @@ $db->exec("UPDATE ap_relays SET state = 'idle'");
 shell_exec('VAAK_FPM_POOL_CONF=/nonexistent ' . $cmd);
 $late = $db->query("SELECT state, result FROM ap_inbox_spool WHERE body = " . $db->quote($announce2))->fetch(PDO::FETCH_ASSOC);
 $check(($late['state'] ?? '') === 'dropped' && ($late['result'] ?? '') === 'actor_mismatch', 'the drain re-checks that the relay is still accepted');
+// Neither is a forward PHP takes, and origin recovery finds nothing: dropped
+// where PHP answered 401.
+foreach (['mismatched Like' => $mismatched, 'relay-signed Delete' => $delete] as $label => $body) {
+    $r = $db->query("SELECT state, result FROM ap_inbox_spool WHERE body = " . $db->quote($body))->fetch(PDO::FETCH_ASSOC);
+    $check(($r['state'] ?? '') === 'dropped' && ($r['result'] ?? '') === 'actor_mismatch', "unrecoverable {$label} is dropped by the drain");
+}
 
 $spooled = (int) $db->query("SELECT count(*) FROM ap_inbox_spool WHERE key_id <> 'https://stale.test/users/x#main-key'")->fetchColumn();
-$check($spooled === 4, 'only the four good deliveries were spooled');
+$check($spooled === 6, 'only the six signed deliveries were spooled');
 $stats = $redis->hGetAll('vaak:inbox_rust:stats:v1');
-$check((int) ($stats['spooled'] ?? 0) === 4 && (int) ($stats['fwd_no_key'] ?? 0) === 1 && (int) ($stats['fwd_blocked'] ?? 0) === 1
-    && (int) ($stats['fwd_actor_mismatch'] ?? 0) === 2 && (int) ($stats['fwd_signature'] ?? 0) === 1 && (int) ($stats['fwd_unknown_user'] ?? 0) === 1, 'stats count each outcome');
+$check((int) ($stats['spooled'] ?? 0) === 4 && (int) ($stats['spooled_mismatch'] ?? 0) === 2 && (int) ($stats['fwd_no_key'] ?? 0) === 1
+    && (int) ($stats['fwd_blocked'] ?? 0) === 1 && !isset($stats['fwd_actor_mismatch']) && (int) ($stats['fwd_signature'] ?? 0) === 1 && (int) ($stats['fwd_unknown_user'] ?? 0) === 1, 'stats count each outcome');
 
 echo "inbox-rust-accept: {$n} checks passed\n";
