@@ -22,13 +22,24 @@ pub async fn hidden_keys(db: &Client, owner: i64) -> HashSet<String> {
             &[&owner],
         )
         .await;
-    match rows {
+    let mut keys: HashSet<String> = match rows {
         Ok(rows) => rows.iter().map(|r| r.get(0)).collect(),
         Err(e) => {
             tracing::warn!(owner, error = %format!("{e:#}"), "nostr hidden keys skipped");
             HashSet::new()
         }
-    }
+    };
+    keys.extend(list_keys(&crate::hidden::load_moderation_list_members(db, owner).await));
+    keys
+}
+
+/// Nostr keys (`nostr:<hex>`) on the viewer's active moderation lists.
+fn list_keys(rows: &[(String, String, String)]) -> Vec<String> {
+    rows.iter()
+        .filter_map(|(actor, _, _)| actor.trim().strip_prefix("nostr:"))
+        .map(str::to_ascii_lowercase)
+        .filter(|hex| super::event::is_hex64(hex))
+        .collect()
 }
 
 fn quoted_status(v: &Value) -> Option<&Value> {
@@ -67,6 +78,17 @@ pub async fn filter_statuses(db: &Client, owner: i64, statuses: &mut Vec<Value>)
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn moderation_list_nostr_members_become_hidden_keys() {
+        let hex = "ab".repeat(32);
+        let rows = vec![
+            (format!("nostr:{}", hex.to_uppercase()), String::new(), "block".to_string()),
+            ("https://example.social/users/a".to_string(), String::new(), "mute".to_string()),
+            ("nostr:short".to_string(), String::new(), "mute".to_string()),
+        ];
+        assert_eq!(list_keys(&rows), vec![hex]);
+    }
 
     #[test]
     fn hides_authors_reposted_and_quoted_keys() {

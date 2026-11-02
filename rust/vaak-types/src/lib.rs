@@ -18,4 +18,8 @@ mod audience;
 
 pub use audience::{visibility_badge_html, visibility_label};
 
+mod list_add;
+
+pub use list_add::{list_add_actor_ok, list_add_button_html};
+
 pub use timeline::{check_value as check_timeline_status, MediaAttachment, Poll, PollOption, PreviewCard, Quote, TimelineStatus, REMOTE_POLL_ID_BASE};

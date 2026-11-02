@@ -13619,6 +13619,12 @@ function ap_row_is_hidden(?string $actorId, ?string $host = null, ?int $ownerUse
     if ($actorId !== null && $actorId !== '' && ap_is_muted_actor($actorId, $ownerUserId)) {
         return true;
     }
+    // Members of an active moderation list are muted/blocked for this viewer,
+    // whatever their network (ap-lists.php).
+    if ($actorId !== null && $actorId !== '' && function_exists('ap_lists_moderation_action_for_actor')
+        && ap_lists_moderation_action_for_actor($actorId, $ownerUserId) !== 'none') {
+        return true;
+    }
     return ap_user_is_blocked($actorId, $host, $ownerUserId);
 }
 
@@ -13634,6 +13640,10 @@ function ap_actor_is_content_blocked(?string $actorId, ?string $host = null, ?in
     }
     if ($ownerUserId === null || $ownerUserId < 1) {
         return false;
+    }
+    if ($actorId !== null && $actorId !== '' && function_exists('ap_lists_moderation_action_for_actor')
+        && ap_lists_moderation_action_for_actor($actorId, $ownerUserId) === 'block') {
+        return true;
     }
     return ap_user_is_blocked($actorId, $host, $ownerUserId);
 }
