@@ -5085,6 +5085,46 @@ $vaakAdminOnlyActions = [
                 $error = $result['error'] ?? 'Could not publish draft.';
             }
         }
+    } elseif ($action === 'bsky_dm_action') {
+        // Bluesky conversation actions: accept/decline a request, mute, leave, react.
+        $view = 'dms';
+        $bskyActConvo = trim((string) ($_POST['convo'] ?? ''));
+        $bskyActOp = (string) ($_POST['op'] ?? '');
+        $bskyActRes = ap_bsky_chat_action(
+            (int) $vaakOwnerId,
+            $bskyActConvo,
+            $bskyActOp,
+            trim((string) ($_POST['message'] ?? '')),
+            trim((string) ($_POST['value'] ?? ''))
+        );
+        if (($_SERVER['HTTP_X_VAAK_DM'] ?? '') === '1') {
+            header('Content-Type: application/json; charset=utf-8');
+            header('Cache-Control: no-store');
+            if (empty($bskyActRes['ok'])) {
+                http_response_code(422);
+            }
+            echo json_encode([
+                'ok' => !empty($bskyActRes['ok']),
+                'error' => $bskyActRes['error'] ?? null,
+                'href' => !empty($bskyActRes['gone']) ? '?view=dms' : '?view=dms&bsky=' . rawurlencode($bskyActConvo),
+            ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+            exit;
+        }
+        if (!empty($bskyActRes['ok'])) {
+            $notice = [
+                'accept' => 'Request accepted.',
+                'decline' => 'Request declined.',
+                'leave' => 'You left the conversation.',
+                'mute' => 'Conversation muted.',
+                'unmute' => 'Conversation unmuted.',
+            ][$bskyActOp] ?? null;
+            if (empty($bskyActRes['gone'])) {
+                $_GET['bsky'] = $bskyActConvo;
+            }
+        } else {
+            $error = (string) ($bskyActRes['error'] ?? 'That did not work on Bluesky.');
+            $_GET['bsky'] = $bskyActConvo;
+        }
     } elseif ($action === 'bsky_dm_send'
         || ($action === 'dm_send' && ap_bsky_chat_ready_for((int) $vaakOwnerId)
             && ap_bsky_chat_recipient_is_bluesky((string) ($_POST['to'] ?? '')))) {
@@ -7046,9 +7086,14 @@ if (isset($_GET['ajax']) && in_array((string) $_GET['ajax'], ['dm_thread', 'dm_l
                 ap_bsky_chat_sync($dmOwnerAjax);
                 $dmConvoRow = ap_bsky_chat_convo($dmOwnerAjax, $dmConvoAjax) ?? $dmConvoRow;
                 $dmRows = ap_bsky_chat_messages($dmOwnerAjax, $dmConvoAjax, 50, $dmAfterRev);
+                $dmOwnDidAjax = ap_bsky_chat_own_did($dmOwnerAjax);
+                $dmReactAjax = ap_bsky_chat_reactions($dmOwnerAjax, $dmConvoAjax, $dmOwnDidAjax);
                 $dmOut['html'] = $dmRows !== []
-                    ? admin_bsky_dm_message_rows_html($dmRows, ap_bsky_chat_own_did($dmOwnerAjax), $dmConvoRow)
+                    ? admin_bsky_dm_message_rows_html($dmRows, $dmOwnDidAjax, $dmConvoRow, $dmReactAjax)
                     : '';
+                // Every message with reactions, so chips on older rows stay current too.
+                $dmOut['reactions'] = array_map('admin_bsky_dm_reactions_html', $dmReactAjax);
+                $dmOut['status'] = (string) ($dmConvoRow['status'] ?? 'accepted');
                 $dmOut['last_rev'] = admin_bsky_dm_last_rev($dmRows, $dmAfterRev);
                 $dmOut['count'] = count($dmRows);
                 if ($dmMarkRead && (int) ($dmConvoRow['unread_count'] ?? 0) > 0) {
@@ -17805,7 +17850,8 @@ function admin_bsky_dm_conversation_row(array $convo, string $activeConvo, strin
         . ' data-dm-peer="bsky:' . h($convoId) . '" data-dm-search="' . h(strtolower($name . ' @' . $handle . ' bluesky')) . '"'
         . ($active ? ' aria-current="page"' : '') . '>'
         . '<span class="dm-conversation-avatar">' . admin_bsky_dm_avatar_html((string) ($convo['peer_avatar'] ?? '')) . '</span>'
-        . '<span class="dm-conversation-copy"><span class="dm-conversation-top"><span class="dm-conversation-name">' . h($name) . '</span>';
+        . '<span class="dm-conversation-copy"><span class="dm-conversation-top"><span class="dm-conversation-name">' . h($name)
+        . ((int) ($convo['muted'] ?? 0) === 1 ? ' <span class="dm-muted-mark" title="Muted" aria-label="Muted">🔕</span>' : '') . '</span>';
     if ($lastAt !== '') {
         $html .= '<time class="dm-conversation-time" datetime="' . h($lastAt) . '">' . h(relative_time($lastAt)) . '</time>';
     }
@@ -17823,7 +17869,7 @@ function admin_bsky_dm_conversation_row(array $convo, string $activeConvo, strin
  *
  * @param list<array<string,mixed>> $rows from ap_bsky_chat_messages
  */
-function admin_bsky_dm_message_rows_html(array $rows, string $ownDid, array $convo): string
+function admin_bsky_dm_message_rows_html(array $rows, string $ownDid, array $convo, array $reactions = []): string
 {
     $html = '';
     foreach ($rows as $m) {
@@ -17854,10 +17900,38 @@ function admin_bsky_dm_message_rows_html(array $rows, string $ownDid, array $con
         if (!$isOut) {
             $html .= '<span class="dm-msg-av">' . admin_bsky_dm_avatar_html((string) ($convo['peer_avatar'] ?? ''), 'dm-msg-avatar') . '</span>';
         }
-        $html .= '<div class="dm-msg-body"><div class="dm-bubble ' . ($isOut ? 'dm-out' : 'dm-in') . '">' . $body . '</div>'
+        $messageId = (string) ($m['message_id'] ?? '');
+        $canReact = (int) ($m['deleted'] ?? 0) !== 1 && $messageId !== '';
+        $html .= '<div class="dm-msg-body"><div class="dm-bubble-row"><div class="dm-bubble ' . ($isOut ? 'dm-out' : 'dm-in') . '">' . $body . '</div>'
+            . ($canReact ? '<button class="dm-react-btn" type="button" data-dm-react-open="' . h($messageId) . '" aria-label="React" title="React">☺</button>' : '')
+            . '</div>'
+            . '<div class="dm-reactions" data-dm-react-for="' . h($messageId) . '">' . admin_bsky_dm_reactions_html($reactions[$messageId] ?? []) . '</div>'
             . '<div class="dm-msg-meta"><time' . ($iso !== '' ? ' datetime="' . h($iso) . '"' : '') . '>'
             . h($sentAt !== '' ? relative_time($sentAt) : '') . '</time></div>'
             . '</div></div>';
+    }
+    return $html;
+}
+
+/**
+ * Reaction chips under one Bluesky message. Clicking your own removes it,
+ * clicking someone else's adds the same emoji.
+ *
+ * @param list<array{value:string,count:int,mine:bool}> $chips
+ */
+function admin_bsky_dm_reactions_html(array $chips): string
+{
+    $html = '';
+    foreach ($chips as $chip) {
+        $value = (string) ($chip['value'] ?? '');
+        if ($value === '') {
+            continue;
+        }
+        $count = max(1, (int) ($chip['count'] ?? 1));
+        $mine = !empty($chip['mine']);
+        $html .= '<button class="dm-reaction' . ($mine ? ' is-mine' : '') . '" type="button" data-dm-react="' . h($value) . '"'
+            . ' aria-pressed="' . ($mine ? 'true' : 'false') . '" title="' . h($mine ? 'Remove your reaction' : 'React with this too') . '">'
+            . h($value) . ($count > 1 ? ' <span class="dm-reaction-n">' . $count . '</span>' : '') . '</button>';
     }
     return $html;
 }
@@ -19771,6 +19845,12 @@ function block_quick_actions(?string $actorId, ?string $host, string $returnView
         && !str_starts_with(strtolower($actorId), 'at://');
     if ($isFediverseActor && !$isSelf && !is_array($personalBlock)) {
         $menu .= '<a class="menu-action" href="?view=dms&amp;peer=' . h(rawurlencode($actorId)) . '">DM</a>';
+    } elseif (!$isSelf && !is_array($personalBlock)
+        && preg_match('~^https://bsky\.app/profile/([^/?#]+)$~i', $actorId, $bskyDmMatch)
+        && function_exists('ap_bsky_chat_ready_for')
+        && ap_bsky_chat_ready_for($ownerUserId > 0 ? $ownerUserId : (function_exists('admin_owner_user_id') ? admin_owner_user_id() : 0))) {
+        // Bluesky actors get a Bluesky DM (chat.bsky), never the fediverse composer.
+        $menu .= '<a class="menu-action" href="?view=dms&amp;new=1&amp;to=' . h(rawurlencode('bsky:' . rawurldecode($bskyDmMatch[1]))) . '">DM on Bluesky</a>';
     }
     if (!$isSelf && ($isLocal || (function_exists('ap_wafrn_actor_host_known') && ap_wafrn_actor_host_known($actorId)))) {
         $menu .= '<a class="menu-action" href="?view=ask&amp;target_actor=' . h(rawurlencode($actorId)) . '&amp;from=' . h(rawurlencode($returnFrom !== '' ? $returnFrom : $returnView)) . '">Ask</a>';
@@ -29807,6 +29887,54 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     .dm-net-chip--bsky { background: rgba(32, 139, 254, .16); color: #5aa9ff; }
     .dm-bsky-scope, .dm-bsky-note { margin: .5rem .25rem; padding: .5rem .65rem; border: 1px solid rgba(32, 139, 254, .35); border-radius: 10px; font-size: .78rem; }
     .dm-bsky-shared { font-size: .85rem; }
+    /* Bluesky reactions, request banner and conversation menu. */
+    .dm-bubble-row { display: flex; align-items: center; gap: .3rem; position: relative; max-width: 100%; }
+    .dm-msg--out .dm-bubble-row { flex-direction: row-reverse; }
+    .dm-react-btn {
+      flex: 0 0 auto; width: 1.9rem; height: 1.9rem; border-radius: 50%; border: 1px solid var(--border);
+      background: var(--panel); color: var(--muted); font-size: 1rem; line-height: 1; cursor: pointer;
+      opacity: 0; transition: opacity .12s ease;
+    }
+    .dm-msg:hover .dm-react-btn, .dm-react-btn:focus-visible, .dm-bubble-row:has(.dm-react-pop) .dm-react-btn { opacity: 1; }
+    @media (hover: none) { .dm-react-btn { opacity: .7; } }
+    .dm-react-btn:hover { color: var(--primary); border-color: var(--primary); }
+    .dm-react-pop {
+      position: absolute; bottom: calc(100% + .3rem); z-index: 5; display: flex; gap: .15rem; padding: .25rem;
+      border: 1px solid var(--border); border-radius: 999px; background: var(--panel); box-shadow: 0 6px 18px rgba(0, 0, 0, .35);
+    }
+    .dm-msg--in .dm-react-pop { left: 0; }
+    .dm-msg--out .dm-react-pop { right: 0; }
+    .dm-react-pop button { width: 2.1rem; height: 2.1rem; border: 0; border-radius: 50%; background: transparent; font-size: 1.15rem; cursor: pointer; }
+    .dm-react-pop button:hover, .dm-react-pop button:focus-visible { background: var(--primary-dim); }
+    .dm-reactions { display: flex; flex-wrap: wrap; gap: .25rem; margin-top: .2rem; }
+    .dm-reactions:empty { display: none; }
+    .dm-reaction {
+      display: inline-flex; align-items: center; gap: .2rem; padding: .05rem .45rem; border-radius: 999px;
+      border: 1px solid var(--border); background: var(--panel); color: var(--text); font-size: .85rem; cursor: pointer;
+    }
+    .dm-reaction.is-mine { border-color: var(--primary); background: var(--primary-dim); }
+    .dm-reaction-n { font-size: .72rem; color: var(--muted); }
+    .dm-bsky-request {
+      display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: .6rem;
+      margin: .5rem 0; padding: .65rem .8rem; border: 1px solid rgba(32, 139, 254, .35); border-radius: 12px; font-size: .86rem;
+    }
+    .dm-bsky-request-actions { display: flex; gap: .45rem; }
+    .dm-bsky-request-actions form { margin: 0; }
+    .dm-convo-menu { position: relative; flex: 0 0 auto; }
+    .dm-convo-menu > summary { list-style: none; min-width: 2.3rem; text-align: center; padding-inline: .6rem; }
+    .dm-convo-menu > summary::-webkit-details-marker { display: none; }
+    .dm-convo-menu-body {
+      position: absolute; right: 0; top: calc(100% + .3rem); z-index: 6; min-width: 13rem; padding: .3rem;
+      border: 1px solid var(--border); border-radius: 10px; background: var(--panel); box-shadow: 0 8px 24px rgba(0, 0, 0, .4);
+    }
+    .dm-convo-menu-body form { margin: 0; }
+    .dm-convo-menu-body .menu-action {
+      display: block; width: 100%; padding: .5rem .65rem; border: 0; border-radius: 6px; background: transparent;
+      color: var(--text); text-align: left; font: inherit; cursor: pointer;
+    }
+    .dm-convo-menu-body .menu-action:hover { background: var(--primary-dim); }
+    .dm-convo-menu-body .menu-action.danger { color: var(--danger); }
+    .menu-action.is-armed, .btn.is-armed { color: var(--danger); font-weight: 700; }
     .dm-pane .dm-reply-form { padding: .6rem 0 0; margin: 0; border: 0; border-top: 1px solid var(--border); border-radius: 0; background: none; box-shadow: none; }
     .dm-compose-row { display: flex; align-items: flex-end; gap: .45rem; }
     .dm-reply-form .dm-compose-row textarea {
@@ -33622,6 +33750,13 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
           // Bluesky DMs (VAAK_BSKY_DMS=1 and a connected Bluesky account).
           $dmBskyOn = ap_bsky_chat_ready_for((int) $vaakOwnerId);
           $dmBskyConvoId = $dmBskyOn && $dmPeer === '' ? trim((string) ($_GET['bsky'] ?? '')) : '';
+          // "Message" on a Bluesky profile (?new=1&to=bsky:did) opens the existing chat when there is one.
+          if ($dmBskyOn && $dmPeer === '' && $dmBskyConvoId === '' && str_starts_with((string) ($_GET['to'] ?? ''), 'bsky:did:')) {
+              $dmBskyExisting = ap_bsky_chat_convo_for_peer((int) $vaakOwnerId, substr((string) $_GET['to'], 5));
+              if ($dmBskyExisting !== null) {
+                  $dmBskyConvoId = (string) $dmBskyExisting['convo_id'];
+              }
+          }
           $dmBskyConvo = $dmBskyConvoId !== '' ? ap_bsky_chat_convo((int) $vaakOwnerId, $dmBskyConvoId) : null;
           if ($dmBskyConvo === null) {
               $dmBskyConvoId = '';
@@ -33679,15 +33814,49 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
                 </span>
               </a>
               <span class="dm-peer-chip dm-net-chip--bsky">Bluesky</span>
+              <?php $dmBskyMuted = (int) ($dmBskyConvo['muted'] ?? 0) === 1; ?>
+              <details class="dm-convo-menu">
+                <summary class="btn btn-ghost" aria-label="Conversation options" title="Conversation options">⋯</summary>
+                <div class="dm-convo-menu-body">
+                  <form method="post" action="?view=dms&amp;bsky=<?= urlencode($dmBskyConvoId) ?>" data-dm-action>
+                    <input type="hidden" name="action" value="bsky_dm_action">
+                    <input type="hidden" name="convo" value="<?= h($dmBskyConvoId) ?>">
+                    <input type="hidden" name="op" value="<?= $dmBskyMuted ? 'unmute' : 'mute' ?>">
+                    <button class="menu-action" type="submit"><?= $dmBskyMuted ? 'Unmute conversation' : 'Mute conversation' ?></button>
+                  </form>
+                  <form method="post" action="?view=dms" data-dm-action data-dm-confirm="Tap again to leave">
+                    <input type="hidden" name="action" value="bsky_dm_action">
+                    <input type="hidden" name="convo" value="<?= h($dmBskyConvoId) ?>">
+                    <input type="hidden" name="op" value="leave">
+                    <button class="menu-action danger" type="submit">Leave conversation</button>
+                  </form>
+                </div>
+              </details>
             </div>
             <?php if ((string) ($dmBskyConvo['status'] ?? '') === 'request'): ?>
-              <div class="dm-bsky-note meta" role="note">Message request. Replying accepts it on Bluesky.</div>
+              <div class="dm-bsky-request" role="note">
+                <div><b><?= h(admin_bsky_dm_peer_name($dmBskyConvo)) ?></b> wants to message you on Bluesky. Accept to keep chatting, or decline to remove the request. Replying also accepts it.</div>
+                <div class="dm-bsky-request-actions">
+                  <form method="post" action="?view=dms&amp;bsky=<?= urlencode($dmBskyConvoId) ?>" data-dm-action>
+                    <input type="hidden" name="action" value="bsky_dm_action">
+                    <input type="hidden" name="convo" value="<?= h($dmBskyConvoId) ?>">
+                    <input type="hidden" name="op" value="accept">
+                    <button class="btn btn-primary" type="submit">Accept</button>
+                  </form>
+                  <form method="post" action="?view=dms" data-dm-action data-dm-confirm="Tap again to decline">
+                    <input type="hidden" name="action" value="bsky_dm_action">
+                    <input type="hidden" name="convo" value="<?= h($dmBskyConvoId) ?>">
+                    <input type="hidden" name="op" value="decline">
+                    <button class="btn btn-ghost" type="submit">Decline</button>
+                  </form>
+                </div>
+              </div>
             <?php endif; ?>
             <div id="dm-thread" class="dm-thread" role="log" aria-label="Messages" data-dm-last-rev="<?= h(admin_bsky_dm_last_rev($dmBskyRows)) ?>">
               <?php if (!$dmBskyRows): ?>
                 <div class="empty dm-thread-empty">No messages yet. Say hi below.</div>
               <?php endif; ?>
-              <?= admin_bsky_dm_message_rows_html($dmBskyRows, $dmBskyOwnDid, $dmBskyConvo) ?>
+              <?= admin_bsky_dm_message_rows_html($dmBskyRows, $dmBskyOwnDid, $dmBskyConvo, ap_bsky_chat_reactions((int) $vaakOwnerId, $dmBskyConvoId, $dmBskyOwnDid)) ?>
               <div id="dm-message-last" class="dm-thread-end" aria-hidden="true"></div>
             </div>
             <?php if ($dmBskyCanSend): ?>
@@ -34147,6 +34316,7 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
                 const next = parseInt(data.last_id, 10) || 0;
                 if (next > lastId) lastId = next;
                 if (typeof data.last_rev === 'string' && data.last_rev > lastRev) lastRev = data.last_rev;
+                if (data.reactions && typeof data.reactions === 'object') applyReactions(data.reactions);
                 const result = appendRows(data.html || '');
                 if (!result.added) return;
                 if (wasNear) {
@@ -34227,6 +34397,100 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
             schedulePoll();
           });
           schedulePoll();
+
+          // ---- Bluesky reactions and conversation actions ----
+          function applyReactions(map) {
+            if (!thread) return;
+            thread.querySelectorAll('.dm-reactions[data-dm-react-for]').forEach(function (slot) {
+              const id = slot.getAttribute('data-dm-react-for');
+              const html = Object.prototype.hasOwnProperty.call(map, id) ? String(map[id] || '') : '';
+              if (slot.innerHTML !== html) slot.innerHTML = html;
+            });
+          }
+          function bskyAction(fields) {
+            const fd = new FormData();
+            fd.set('action', 'bsky_dm_action');
+            fd.set('convo', bskyConvo);
+            Object.keys(fields).forEach(function (k) { fd.set(k, fields[k]); });
+            if (typeof window.vaakCsrfApply === 'function') window.vaakCsrfApply(fd);
+            return fetch('?view=dms&bsky=' + encodeURIComponent(bskyConvo), {
+              method: 'POST', body: fd, credentials: 'same-origin',
+              headers: { 'Accept': 'application/json', 'X-VAAK-DM': '1', 'X-VAAK-CSRF': window.VAAK_CSRF || '' },
+            }).then(function (res) { return res.json().catch(function () { return { ok: false }; }); });
+          }
+          const QUICK_REACTIONS = ['❤️', '😂', '👍', '😮', '😢', '🔥'];
+          let reactPop = null;
+          function closeReactPop() {
+            if (reactPop) { reactPop.remove(); reactPop = null; }
+          }
+          function sendReaction(messageId, value, remove) {
+            closeReactPop();
+            bskyAction({ op: remove ? 'unreact' : 'react', message: messageId, value: value }).then(function (data) {
+              if (!data || !data.ok) { toast((data && data.error) || 'Could not react to that message.', true); return; }
+              fetchNew();
+            }).catch(function () { toast('Network error, reaction not sent.', true); });
+          }
+          if (thread && bskyConvo) {
+            thread.addEventListener('click', function (event) {
+              const opener = event.target.closest('[data-dm-react-open]');
+              if (opener) {
+                event.preventDefault();
+                const id = opener.getAttribute('data-dm-react-open');
+                const wasOpen = reactPop && reactPop.getAttribute('data-for') === id;
+                closeReactPop();
+                if (wasOpen) return;
+                reactPop = document.createElement('div');
+                reactPop.className = 'dm-react-pop';
+                reactPop.setAttribute('role', 'toolbar');
+                reactPop.setAttribute('aria-label', 'React');
+                reactPop.setAttribute('data-for', id);
+                QUICK_REACTIONS.forEach(function (emoji) {
+                  const b = document.createElement('button');
+                  b.type = 'button';
+                  b.textContent = emoji;
+                  b.setAttribute('aria-label', 'React ' + emoji);
+                  b.addEventListener('click', function () {
+                    const mine = thread.querySelector('.dm-reactions[data-dm-react-for="' + cssId(id) + '"] .dm-reaction.is-mine[data-dm-react="' + cssId(emoji) + '"]');
+                    sendReaction(id, emoji, !!mine);
+                  });
+                  reactPop.appendChild(b);
+                });
+                opener.parentNode.appendChild(reactPop);
+                const first = reactPop.querySelector('button');
+                if (first) first.focus();
+                return;
+              }
+              const chip = event.target.closest('.dm-reaction[data-dm-react]');
+              if (chip) {
+                const slot = chip.closest('[data-dm-react-for]');
+                if (slot) sendReaction(slot.getAttribute('data-dm-react-for'), chip.getAttribute('data-dm-react'), chip.classList.contains('is-mine'));
+              }
+            });
+            document.addEventListener('click', function (event) {
+              if (reactPop && !event.target.closest('.dm-react-pop, [data-dm-react-open]')) closeReactPop();
+            });
+            document.addEventListener('keydown', function (event) {
+              if (event.key === 'Escape') closeReactPop();
+            });
+          }
+          // Leave/decline need a second tap; nothing here opens a browser dialog.
+          document.querySelectorAll('form[data-dm-confirm]').forEach(function (form) {
+            form.addEventListener('submit', function (event) {
+              const button = form.querySelector('button[type="submit"]');
+              if (form.dataset.dmArmed === '1') return;
+              event.preventDefault();
+              form.dataset.dmArmed = '1';
+              if (button) {
+                button.dataset.label = button.textContent;
+                button.textContent = form.getAttribute('data-dm-confirm');
+                button.classList.add('is-armed');
+              }
+              window.setTimeout(function () {
+                form.dataset.dmArmed = '0';
+                if (button && button.dataset.label) { button.textContent = button.dataset.label; button.classList.remove('is-armed'); }
+              }, 4000);
+            });
+          });
 
           // ---- conversation search ----
           const filterInput = document.getElementById('dm-conversation-filter');
