@@ -476,10 +476,27 @@ fn actions(w: &mut W, f: &Facts) {
     }
     w.indent(14);
     w.indent(16);
-    w.line(18, &format!("<a href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\">Open on Bluesky</a>", esc(&f.actor)));
+    w.line(18, &format!("<a href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\">Open on Bluesky</a>", esc(&bsky_web_href(&f.actor))));
     w.indent(16);
     w.indent(14);
     w.line(12, "</div>");
+}
+
+/// Same as PHP ap_bsky_normalize_web_url for profile links: the Bluesky web
+/// app 404s on `did%3Aplc%3A…`, so the DID segment is written unescaped.
+fn bsky_web_href(actor: &str) -> String {
+    const PREFIX: &str = "https://bsky.app/profile/";
+    let Some(rest) = actor.strip_prefix(PREFIX) else { return actor.to_owned() };
+    let (ident, tail) = match rest.find(['/', '?', '#']) {
+        Some(i) => rest.split_at(i),
+        None => (rest, ""),
+    };
+    let lower = ident.to_ascii_lowercase();
+    if !lower.starts_with("did%3a") {
+        return actor.to_owned();
+    }
+    let decoded = ident.replace("%3A", ":").replace("%3a", ":");
+    format!("{PREFIX}{decoded}{tail}")
 }
 
 fn is_bridgy_actor(actor: &str) -> bool {
@@ -612,6 +629,18 @@ mod tests {
         assert!(paint_bsky(&json!({"actor": "https://remote.example/users/ada"})).is_err());
         assert!(paint_bsky(&json!({"actor": "https://bsky.app/profile/ada.example", "bsky_handle": "ada.example"})).is_ok());
         assert!(paint_bsky(&json!({"actor": "did:plc:aaaaaaaaaaaaaaaaaaaaaa", "bsky_handle": "ada.example"})).is_ok());
+    }
+
+    #[test]
+    fn open_on_bluesky_link_keeps_did_unescaped() {
+        assert_eq!(bsky_web_href("https://bsky.app/profile/did%3Aplc%3Aabc123"), "https://bsky.app/profile/did:plc:abc123");
+        assert_eq!(bsky_web_href("https://bsky.app/profile/did%3aplc%3aabc/post/x"), "https://bsky.app/profile/did:plc:abc/post/x");
+        assert_eq!(bsky_web_href("https://bsky.app/profile/ada.example"), "https://bsky.app/profile/ada.example");
+        assert_eq!(bsky_web_href("https://bsky.app/profile/did:plc:abc"), "https://bsky.app/profile/did:plc:abc");
+        let painted = paint_bsky(&json!({"actor": "https://bsky.app/profile/did%3Aplc%3Aabc123", "bsky_handle": "ada.example"})).unwrap();
+        let html = format!("{}{}", painted.header, painted.chrome);
+        assert!(html.contains("href=\"https://bsky.app/profile/did:plc:abc123\" target=\"_blank\" rel=\"noopener noreferrer\">Open on Bluesky"));
+        assert!(!html.contains("href=\"https://bsky.app/profile/did%3A"));
         assert!(paint_bsky(&json!({"actor": "https://bsky.brid.gy/ap/did:plc:aaaaaaaaaaaaaaaaaaaaaa"})).is_ok());
         assert!(paint_bsky(&json!({"actor": "at://did:plc:aaaaaaaaaaaaaaaaaaaaaa"})).is_ok());
     }
