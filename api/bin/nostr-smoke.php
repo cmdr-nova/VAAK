@@ -110,6 +110,13 @@ foreach (['', '0', '-5', '21.5', '1000001', '00021', 'lots'] as $badSats) {
 }
 $check(ap_nostr_action('nostr_prepare', 1, true, ['purpose' => 'zap', 'target' => $hex, 'zap_sats' => '21', 'zap_comment' => str_repeat('é', 281)])['status'] === 400, 'a long zap comment is refused');
 $zapRes = ap_nostr_action('nostr_prepare', 1, true, ['purpose' => 'zap', 'target' => $hex, 'zap_sats' => '1000000', 'zap_comment' => str_repeat('é', 280)]);
+foreach (['nope', 'a@b', 'a b@c.io', str_repeat('a', 320) . '@b.io'] as $badLn) {
+    $check(ap_nostr_action('nostr_prepare', 1, true, ['purpose' => 'lightning', 'lightning' => $badLn])['status'] === 400, "lightning address '{$badLn}' refused");
+}
+$lnRes = ap_nostr_action('nostr_prepare', 1, true, ['purpose' => 'lightning', 'lightning' => ' Nova@Strike.me ']);
+$check(($lnRes['body']['error'] ?? '') !== 'Unknown Nostr action.' && $lnRes['status'] !== 400, 'a good Lightning address goes to the worker without a note target');
+$check(ap_nostr_lightning_from_pay_url('https://strike.me/.well-known/lnurlp/nova') === 'nova@strike.me' && ap_nostr_lightning_from_pay_url('https://pay.example/lnurl/x') === '', 'stored pay URLs read back as addresses');
+$check(ap_nostr_lightning_address('nope') === ['address' => '', 'zaps' => null], 'no key, no address');
 $check(!in_array($zapRes['body']['error'] ?? '', ['Unknown Nostr action.', 'Pick an amount from 1 to 1,000,000 sats.', 'Keep the zap comment under 280 characters.'], true), 'a good zap goes to the worker');
 $check(ap_nostr_action('nostr_publish', 1, true, ['nonce' => 'xyz', 'event' => '{}'])['status'] === 400, 'bad nonce refused');
 $check(ap_nostr_action('nostr_publish', 1, true, ['nonce' => str_repeat('a', 32), 'event' => 'not json'])['status'] === 400, 'non-JSON event refused');

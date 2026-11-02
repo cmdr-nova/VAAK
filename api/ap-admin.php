@@ -36510,6 +36510,13 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
               <button class="btn btn-primary" type="submit" form="nostr-bunker-form"><?= is_array($nostrBunker) ? 'Save' : 'Connect' ?></button>
             </div>
             <div class="meta">A site added to the iPhone Home Screen can't use Safari extensions. Paste a NIP-46 <code>bunker://</code> link from a signer that holds your key somewhere else, and pages without an extension sign through it. The bunker decides what it signs and can revoke VAAK; VAAK still never sees your key.<?php $bunkerLine = ap_nostr_bunker_status_line($nostrBunker, time()); if ($bunkerLine !== ''): ?> <?= h($bunkerLine) ?><?php endif; ?></div>
+            <?php $nostrLightning = ap_nostr_lightning_address($nostrHex); ?>
+            <label for="nostr-lightning" style="margin-top:.75rem">Lightning address (for zaps)</label>
+            <div class="supporter-reward-row nostr-lightning-row">
+              <input id="nostr-lightning" type="text" inputmode="email" autocomplete="off" spellcheck="false" maxlength="320" value="<?= h($nostrLightning['address']) ?>" placeholder="name@wallet.com">
+              <button class="btn btn-primary" type="button" data-nostr-lightning-save>Save to Nostr</button>
+            </div>
+            <div class="meta">Where zaps to your Nostr posts go, from VAAK and every other Nostr app. Use the Lightning address from your wallet (Strike, Alby, Wallet of Satoshi…). Saving updates your Nostr profile, so your signer asks you to sign it. Leave it empty and save to remove it.<?php if ($nostrLightning['zaps'] === false): ?> This wallet doesn't send Nostr zap receipts, so zaps still arrive but won't show in Notifications.<?php endif; ?></div>
             <?= ap_nostr_moderation_settings_html((int) $vaakOwnerId, !empty($vaakIsAdmin)) ?>
             <?php endif; ?>
           </div>
@@ -54052,7 +54059,34 @@ if (VIEW === 'analytics') loadAnalytics();
     box.focus();
   }
 
+  // Settings > Profile: the Lightning address in your Nostr profile.
+  async function saveLightning(btn) {
+    const input = document.getElementById('nostr-lightning');
+    if (!input || btn.dataset.nostrBusy === '1') return;
+    const address = input.value.trim().toLowerCase();
+    if (address && !/^[a-z0-9._+-]+@[a-z0-9.-]+\.[a-z0-9-]+$/.test(address)) {
+      toast('That isn\'t a Lightning address. It looks like name@wallet.com.');
+      input.focus();
+      return;
+    }
+    btn.dataset.nostrBusy = '1';
+    btn.disabled = true;
+    try {
+      const res = await run('lightning', '', '', '', { lightning: address });
+      if (!res) return;
+      input.value = address;
+      if (!address) toast('Lightning address removed from your Nostr profile.');
+      else if (res.zaps) toast('Saved to your Nostr profile. Zaps to your posts go to ' + address + '.');
+      else toast('Saved, but this wallet doesn\'t send Nostr zap receipts, so zaps won\'t show in Notifications.');
+    } finally {
+      btn.dataset.nostrBusy = '';
+      btn.disabled = false;
+    }
+  }
+
   document.addEventListener('click', async function (event) {
+    const lnBtn = event.target.closest('[data-nostr-lightning-save]');
+    if (lnBtn) { event.preventDefault(); await saveLightning(lnBtn); return; }
     const vaakBtn = event.target.closest('[data-nostr-vaak]');
     if (vaakBtn) {
       event.preventDefault();

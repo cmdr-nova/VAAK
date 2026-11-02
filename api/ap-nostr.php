@@ -375,6 +375,20 @@ function ap_nostr_action(string $action, int $ownerUserId, bool $isAdmin, array 
             'note' => ['content' => $note['content'], 'tags' => $note['tags']],
         ], 30000);
     }
+    if ($action === 'nostr_prepare' && (string) ($post['purpose'] ?? '') === 'lightning') {
+        // Settings > Profile: set (or clear) lud16 on the user's own Nostr
+        // profile. The worker edits the newest kind 0; the signer signs it.
+        $address = strtolower(trim((string) ($post['lightning'] ?? '')));
+        if ($address !== '' && (strlen($address) > 320 || !preg_match('/^[a-z0-9._+-]+@[a-z0-9.-]+\.[a-z0-9-]+$/', $address))) {
+            return $fail(400, 'That isn\'t a Lightning address. It looks like name@wallet.com.');
+        }
+        return ap_nostr_worker_call('/shadow/nostr-prepare', [
+            'owner_id' => $ownerUserId,
+            'purpose' => 'lightning',
+            'target' => '',
+            'lightning' => $address,
+        ], 30000);
+    }
     if ($action === 'nostr_prepare') {
         $purpose = (string) ($post['purpose'] ?? '');
         $target = strtolower(trim((string) ($post['target'] ?? '')));
@@ -434,6 +448,48 @@ function ap_nostr_action(string $action, int $ownerUserId, bool $isAdmin, array 
  *
  * @return array<string,mixed>|null
  */
+/**
+ * The Lightning address in a key's Nostr profile, as profile sync stored it
+ * (nostr_zap_addrs, nostr/zap.rs): `name@domain` for a lud16, '' when none.
+ *
+ * @return array{address: string, zaps: ?bool}
+ */
+function ap_nostr_lightning_address(string $pubkey, ?PDO $db = null): array
+{
+    $none = ['address' => '', 'zaps' => null];
+    if (!preg_match('/^[0-9a-f]{64}$/', $pubkey)) {
+        return $none;
+    }
+    try {
+        $db ??= ap_db();
+        if (strtolower((string) $db->getAttribute(PDO::ATTR_DRIVER_NAME)) !== 'pgsql'
+            || !is_string($db->query("SELECT to_regclass('public.nostr_zap_addrs')")->fetchColumn())) {
+            return $none;
+        }
+        $st = $db->prepare('SELECT pay_url, allows_nostr, checked_at FROM nostr_zap_addrs WHERE pubkey = ? LIMIT 1');
+        $st->execute([$pubkey]);
+        $row = $st->fetch(PDO::FETCH_ASSOC);
+    } catch (Throwable $e) {
+        return $none;
+    }
+    if (!is_array($row)) {
+        return $none;
+    }
+    return [
+        'address' => ap_nostr_lightning_from_pay_url((string) $row['pay_url']),
+        'zaps' => (int) $row['checked_at'] > 0 ? in_array($row['allows_nostr'], [true, 't', 1, '1'], true) : null,
+    ];
+}
+
+/** `https://domain/.well-known/lnurlp/name` → `name@domain` ('' otherwise). */
+function ap_nostr_lightning_from_pay_url(string $url): string
+{
+    if (preg_match('#^https://([a-z0-9.-]+)/\.well-known/lnurlp/([a-z0-9._+-]+)$#', $url, $m)) {
+        return $m[2] . '@' . $m[1];
+    }
+    return '';
+}
+
 function ap_nostr_bunker_for_user(int $userId, ?PDO $db = null): ?array
 {
     if ($userId <= 0) {
