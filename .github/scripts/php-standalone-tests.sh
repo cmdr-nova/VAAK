@@ -60,6 +60,7 @@ php_tests=(
   api/bin/bsky-own-repost-profile-smoke.php
   api/bin/bsky-follow-carry-smoke.php
   api/bin/dm-workspace-smoke.php
+  api/bin/bsky-dm-smoke.php
   api/bin/bsky-profile-cold-fill-smoke.php
   api/bin/remote-poll-smoke.php
   api/bin/reply-preview-smoke.php
