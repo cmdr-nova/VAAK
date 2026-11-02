@@ -34,6 +34,7 @@ require_once __DIR__ . '/ap-asks.php';
 // never perform a live Bluesky fetch.
 require_once __DIR__ . '/ap-bsky.php';
 require_once __DIR__ . '/ap-profile-html.php';
+require_once __DIR__ . '/ap-banned-account.php';
 
 $uri = (string) ($_SERVER['REQUEST_URI'] ?? '/');
 $path = parse_url($uri, PHP_URL_PATH) ?: '/';
@@ -55,6 +56,16 @@ if ($username === '') {
     header('Content-Type: application/json');
     echo '{"error":"Not found"}';
     exit;
+}
+
+// Banned local accounts: every public route says "banned" and nothing else
+// (no profile, posts, collections or feeds). Runs before any cache.
+if ($username !== 'cmdr_nova') {
+    $bannedUser = ap_local_banned_user_by_username($username);
+    if ($bannedUser !== null) {
+        ap_user_serve_banned($bannedUser, $sub);
+        exit;
+    }
 }
 
 // Bare /users/{key} and /@{key} HTML is the on-VAAK profile (guest when logged out).
@@ -2078,3 +2089,4 @@ function ap_user_html_shell_end(): void
     }
     echo '</body></html>';
 }
+

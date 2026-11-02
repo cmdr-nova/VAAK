@@ -5682,12 +5682,13 @@ function ap_identity_for_local_actor(string $localActorId): ?array
 }
 
 /**
- * Local actors that should notify a remote of an instance-wide Block.
- * Prefer accounts with a follow relationship; always include the current session actor.
+ * Local accounts that should send Undo(Block) when a server-wide actor block is
+ * lifted: the ones that actually sent a Block for it (older VAAK fanned a Block
+ * out from every local account), minus anyone who still personally blocks it.
  *
  * @return list<string>
  */
-function ap_local_actors_for_instance_block_fanout(string $targetActorId): array
+function ap_local_actors_for_instance_block_fanout(string $targetActorId, ?PDO $db = null): array
 {
     $targetActorId = rtrim(trim($targetActorId), '/');
     $alt = $targetActorId . '/';
@@ -5698,32 +5699,28 @@ function ap_local_actors_for_instance_block_fanout(string $targetActorId): array
             $out[$id] = true;
         }
     };
-    $session = rtrim((string) (ap_outbound_identity()['id'] ?? ''), '/');
-    if ($session !== '') {
-        $add($session);
-    }
+    // Server-wide blocks are enforced locally only (like Mastodon) and no
+    // longer send a Block "from" every local account. This list is only used
+    // for unblocks: undo the Blocks that older fan-outs really sent, from the
+    // accounts that sent them, so the remote side forgets them.
     try {
-        $st = ap_db()->prepare(
-            'SELECT DISTINCT owner_actor_id AS a FROM followers WHERE actor_id = ? OR actor_id = ?
-             UNION
-             SELECT DISTINCT owner_actor_id AS a FROM following WHERE actor_id = ? OR actor_id = ?'
+        $st = ($db ?? ap_db())->prepare(
+            "SELECT DISTINCT actor_id AS a FROM events
+              WHERE type = 'Block' AND (target_actor = ? OR target_actor = ?)
+                AND actor_id LIKE 'https://mkultra.monster/users/%'
+                AND NOT EXISTS (
+                    SELECT 1 FROM ap_user_blocks b JOIN ap_users u ON u.id = b.owner_user_id
+                     WHERE rtrim(u.actor_id, '/') = rtrim(events.actor_id, '/')
+                       AND b.scope = 'actor' AND b.kind = 'block'
+                       AND (b.value = ? OR b.value = ?)
+                )"
         );
         $st->execute([$targetActorId, $alt, $targetActorId, $alt]);
         foreach ($st->fetchAll(PDO::FETCH_COLUMN) ?: [] as $a) {
             $add((string) $a);
         }
-        // Instance-wide: also notify from every local account that has keys (full server block).
-        $users = ap_db()->query(
-            "SELECT actor_id FROM ap_users
-             WHERE actor_id LIKE 'https://mkultra.monster/users/%'
-             ORDER BY id ASC
-             LIMIT 80"
-        );
-        foreach ($users->fetchAll(PDO::FETCH_COLUMN) ?: [] as $a) {
-            $add((string) $a);
-        }
     } catch (Throwable $e) {
-        // keep session actor at least
+        // nothing to undo
     }
     return array_keys($out);
 }
@@ -5821,7 +5818,8 @@ function ap_instance_unfollow_pairs(array $pairs): array
 }
 
 /**
- * Federate Block/Undo from all relevant local actors for a server-wide actor block.
+ * Server-wide actor block federation. Blocking sends nothing (enforced locally);
+ * unblocking sends Undo(Block) for Blocks that older fan-outs sent.
  *
  * @return array{ok:bool,attempted:int,delivered:int}
  */
@@ -5833,6 +5831,12 @@ function ap_instance_federate_actor_block(string $targetActorId, bool $blocking 
     }
     $attempted = 0;
     $delivered = 0;
+    if ($blocking) {
+        // Server blocks stay server-side: inbound is rejected and follows are
+        // severed by ap_block_apply_side_effects; nobody gets a Block in a
+        // local user's name.
+        return ['ok' => true, 'attempted' => 0, 'delivered' => 0];
+    }
     foreach (ap_local_actors_for_instance_block_fanout($targetActorId) as $localId) {
         $ident = ap_identity_for_local_actor($localId);
         if ($ident === null) {

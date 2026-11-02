@@ -67,6 +67,12 @@ if ($username !== null) {
     }
 }
 
+// A banned local account still resolves to its own (suspended) actor so
+// remote servers show it as banned instead of following the Bridgy fallback.
+if ($localUser === null && $username !== null && function_exists('ap_local_banned_user_by_username')) {
+    $localUser = ap_local_banned_user_by_username($username);
+}
+
 if ($localUser === null) {
     $q = $resource !== '' ? ('?resource=' . rawurlencode($resource)) : '';
     header('Location: https://fed.brid.gy/.well-known/webfinger' . $q, true, 302);

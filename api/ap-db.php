@@ -9438,6 +9438,30 @@ function ap_local_user_by_username(string $username): ?array
     }
 }
 
+/**
+ * A banned (disabled) local account by username, or null. Public routes use it
+ * to show "banned" instead of the profile, posts or a 404.
+ *
+ * @return array<string,mixed>|null
+ */
+function ap_local_banned_user_by_username(string $username, ?PDO $db = null): ?array
+{
+    $username = strtolower(trim($username));
+    if ($username === '' || $username === 'cmdr_nova' || !preg_match('/^[a-z][a-z0-9_]{1,29}$/', $username)) {
+        return null;
+    }
+    try {
+        $st = ($db ?? ap_db())->prepare(
+            "SELECT * FROM ap_users WHERE lower(username) = ? AND disabled_at IS NOT NULL AND disabled_at <> '' LIMIT 1"
+        );
+        $st->execute([$username]);
+        $row = $st->fetch();
+        return is_array($row) ? $row : null;
+    } catch (Throwable $e) {
+        return null;
+    }
+}
+
 function ap_followers_list(?string $ownerActorId = null): array
 {
     $owner = rtrim((string) ($ownerActorId ?? ''), '/');
@@ -11105,28 +11129,13 @@ function ap_block_upsert(string $scope, string $value, string $kind = 'block', ?
     $idRow->execute([$scope, $value]);
     $id = (int) ($idRow->fetch()['id'] ?? 0);
     $out = ['ok' => true, 'id' => $id, 'scope' => $scope, 'value' => $value, 'side_effects' => $side];
-    // Actor block/suspend: full block — reject inbound locally AND notify remotes via Block
-    // fan-out from local accounts (background so admin UI is not stuck on N× HTTP).
-    // Domain blocks stay local reject (no mass Block fan-out).
-    // Server-wide mute stays local-only (no ActivityPub Mute).
-    // Bluesky targets: VAAK-wide hide only — do not fan AP Block or push into
-    // every local user's Bluesky blocklist. Admin dual personal+server block
+    // Server-wide blocks, suspends and mutes are enforced on this server only,
+    // like Mastodon: inbound is rejected and follows are severed above
+    // (Undo Follow for local follows). No Block is federated in any local
+    // user's name, and users cannot lift a server block from their own
+    // block list because it lives in ap_blocks, not ap_user_blocks.
+    // Bluesky targets: VAAK-wide hide only. Admin dual personal+server block
     // is applied by the moderation UI for the acting admin.
-    $isBskyTarget = str_contains(strtolower($value), 'bsky.app/profile/')
-        || str_starts_with($value, 'did:');
-    if ($scope === 'actor' && in_array($kind, ['block', 'suspend'], true) && !$isBskyTarget) {
-        if (!function_exists('ap_instance_federate_actor_block_background')) {
-            if (!defined('AP_INBOX_LIB_ONLY')) {
-                define('AP_INBOX_LIB_ONLY', true);
-            }
-            require_once __DIR__ . '/ap-inbox.php';
-        }
-        if (function_exists('ap_instance_federate_actor_block_background')) {
-            $out['federated'] = ap_instance_federate_actor_block_background($value, true);
-        } elseif (function_exists('ap_instance_federate_actor_block')) {
-            $out['federated'] = ap_instance_federate_actor_block($value, true);
-        }
-    }
     return $out;
 }
 

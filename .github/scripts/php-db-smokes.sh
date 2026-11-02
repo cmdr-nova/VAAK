@@ -198,4 +198,6 @@ for _ in $(seq 1 60); do
 done
 VAAK_INBOX_RUST_URL="$inbox_url" run "$runner" api/bin/inbox-rust-accept-smoke.php
 
-echo "db smokes: 14 passed"
+VAAK_SMOKE_DSN="$AP_DB_DSN" run "$runner" api/bin/banned-account-server-block-smoke.php
+
+echo "db smokes: 15 passed"
