@@ -1093,8 +1093,20 @@ async fn final_page_admission(db: &tokio_postgres::Client, owner: i64, items: &m
     Ok(())
 }
 
-/// Raw favourite/reblog groups still need PHP's action forms. This uses only
-/// the envelope, before identity or status alias facts are loaded.
+/// Grouped like/boost/zap stacks paint natively (`paint_grouped_card`) unless
+/// `VAAK_MENTIONS_GROUPED_NATIVE=0`. The stack's nested card is the same lean
+/// embed that single like/boost rows already get here; handing the whole page
+/// to PHP instead re-rendered every card in PHP (~1 s each, 5-25 s fills).
+fn grouped_cards_native() -> bool {
+    match std::env::var("VAAK_MENTIONS_GROUPED_NATIVE") {
+        Ok(v) if !v.trim().is_empty() => !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off" | "no"),
+        _ => true,
+    }
+}
+
+/// Pages holding a favourite/reblog group that PHP paints when grouped cards
+/// are switched back to PHP. This uses only the envelope, before identity or
+/// status alias facts are loaded.
 fn page_needs_php_grouped_cards(items: &[Value]) -> bool {
     group_notification_rows_with_facts(items, &GroupingFacts::default())
         .iter()
@@ -1112,9 +1124,10 @@ pub async fn mentions_html_fill(
     let limit = limit.clamp(1, 60);
     let mut redis = crate::redis_util::connect(&cfg.redis_url).await?;
     let Some(mut report) = html_page_selected(&mut redis, owner_user_id, limit, types, max_id).await? else { return Ok(None); };
-    // Grouped like/boost cards still need PHP's CSRF forms. Decide that from
-    // the raw envelope before opening a database connection.
-    if page_needs_php_grouped_cards(&report.items) {
+    // Rollback switch only: with VAAK_MENTIONS_GROUPED_NATIVE=0, grouped
+    // like/boost pages go back to PHP. Decided from the raw envelope before
+    // opening a database connection.
+    if !grouped_cards_native() && page_needs_php_grouped_cards(&report.items) {
         return Ok(None);
     }
     let policy_db = crate::db::notif_reused(&cfg.database_url).await?;
@@ -1195,10 +1208,11 @@ pub async fn mentions_html_fill(
     }).unwrap_or_default();
 
     let grouped_rows = group_notification_rows_with_facts(&report.items, &facts);
-    // The current grouped embed uses the lean card painter. Genuine PHP
-    // captures require CSRF-bearing action forms and the local delete row ID.
-    // Recover this whole fragment until that complete card contract is native.
-    if grouped_rows.iter().any(|grouped| grouped.count > 1 && grouped.row.get("status").is_some_and(Value::is_object)) {
+    // Grouped stacks use the same lean nested card as single like rows. Only
+    // the rollback switch sends them back to PHP (after alias facts merged rows).
+    if !grouped_cards_native()
+        && grouped_rows.iter().any(|grouped| grouped.count > 1 && grouped.row.get("status").is_some_and(Value::is_object))
+    {
         return Ok(None);
     }
     // Fragment cache is a side effect of a page we actually return. A miss
