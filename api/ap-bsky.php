@@ -7642,6 +7642,84 @@ function ap_bsky_saved_feeds_edit(int $ownerUserId, string $op, string $feedUri)
  *
  * @return array{ok:bool,error?:string,items?:list<array{type:string,value:string,pinned:bool}>}
  */
+/** Seconds between background samples of one owner's saved feeds. */
+const AP_BSKY_FEED_SAMPLE_EVERY = 900;
+
+/**
+ * Next saved feed to sample, round-robin over every saved feed and list
+ * (pinned or not). Following is the Home timeline and is skipped.
+ *
+ * @param list<array{type?:string,value?:string,pinned?:bool}> $items
+ */
+function ap_bsky_feed_sample_pick(array $items, int $turn): ?string
+{
+    $uris = [];
+    foreach ($items as $item) {
+        $uri = is_array($item) ? (string) ($item['value'] ?? '') : '';
+        if ($uri !== 'following' && ap_bsky_feed_uri_valid($uri) && !in_array($uri, $uris, true)) {
+            $uris[] = $uri;
+        }
+    }
+    if ($uris === []) {
+        return null;
+    }
+    return $uris[(($turn % count($uris)) + count($uris)) % count($uris)];
+}
+
+/**
+ * Background sample for Home recommendations: at most one saved feed per
+ * owner every AP_BSKY_FEED_SAMPLE_EVERY seconds, through the same Redis page
+ * cache and single-flight lock the chips use. A fresh fetch records its top
+ * AP_BSKY_CUSTOM_FEED_INDEX_HEAD posts as seen (bsky_post_observations), which
+ * is where Home's Bluesky recommendations come from. Off with
+ * VAAK_BSKY_FEED_SAMPLE=0, and skipped entirely without Redis (no gate).
+ *
+ * @return array{sampled:bool,feed?:string,posts?:int,cache?:string,reason?:string}
+ */
+function ap_bsky_feed_sample_tick(int $ownerUserId, bool $dryRun = false): array
+{
+    $flag = getenv('VAAK_BSKY_FEED_SAMPLE');
+    if ($flag !== false && trim((string) $flag) === '0') {
+        return ['sampled' => false, 'reason' => 'off'];
+    }
+    if ($ownerUserId < 1 || !function_exists('ap_redis_client') || !($redis = ap_redis_client())) {
+        return ['sampled' => false, 'reason' => 'no-redis'];
+    }
+    $gateKey = 'vaak:bsky:feedsample:gate:v1:' . $ownerUserId;
+    $turnKey = 'vaak:bsky:feedsample:turn:v1:' . $ownerUserId;
+    try {
+        if ($redis->exists($gateKey)) {
+            return ['sampled' => false, 'reason' => 'recent'];
+        }
+        $list = ap_bsky_saved_feed_list($ownerUserId);
+        $items = !empty($list['ok']) && is_array($list['items'] ?? null) ? $list['items'] : [];
+        $turn = (int) $redis->get($turnKey);
+        $uri = ap_bsky_feed_sample_pick($items, $turn);
+        if ($uri === null) {
+            if (!$dryRun) {
+                $redis->set($gateKey, '1', ['ex' => AP_BSKY_FEED_SAMPLE_EVERY]);
+            }
+            return ['sampled' => false, 'reason' => 'no-saved-feeds'];
+        }
+        if ($dryRun) {
+            return ['sampled' => false, 'feed' => $uri, 'reason' => 'dry-run'];
+        }
+        // Gate first so a slow or failing feed never retries every tick.
+        $redis->set($gateKey, '1', ['ex' => AP_BSKY_FEED_SAMPLE_EVERY]);
+        $redis->set($turnKey, (string) ($turn + 1), ['ex' => 30 * 86400]);
+        $got = ap_bsky_get_custom_feed($ownerUserId, $uri, AP_BSKY_CUSTOM_FEED_INDEX_HEAD, null);
+        return [
+            'sampled' => !empty($got['ok']),
+            'feed' => $uri,
+            'posts' => is_array($got['feed'] ?? null) ? count($got['feed']) : 0,
+            'cache' => (string) ($got['cache'] ?? ''),
+            'reason' => !empty($got['ok']) ? '' : (string) ($got['error'] ?? 'fetch failed'),
+        ];
+    } catch (Throwable $e) {
+        return ['sampled' => false, 'reason' => 'error: ' . $e->getMessage()];
+    }
+}
+
 function ap_bsky_saved_feed_list(int $ownerUserId): array
 {
     $raw = ap_bsky_get_preferences($ownerUserId);

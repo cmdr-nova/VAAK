@@ -1,8 +1,10 @@
 <?php
 /**
  * CLI: warm durable Bluesky post cache (bsky_posts) from each connected session's
- * home timeline (and author feed when home is empty). Custom feeds are
- * fetched on demand only, never from this cron.
+ * home timeline (and author feed when home is empty). Each owner also gets
+ * one saved custom feed sampled at most every 15 min (round-robin, 8 posts,
+ * Redis-cached) so Home recommendations see feeds nobody opened. Turn that
+ * off with --no-feed-sample or VAAK_BSKY_FEED_SAMPLE=0.
  *
  * Usage:
  *   php ap-bsky-tl-warm.php
@@ -27,7 +29,11 @@ $userId = 0;
 $sleepMs = 750;
 $maxUsers = 2;
 $dryRun = false;
+$feedSample = true;
 foreach ($argv as $arg) {
+    if ($arg === '--no-feed-sample') {
+        $feedSample = false;
+    }
     if (preg_match('/^--limit=(\d+)$/', $arg, $m)) {
         $limit = max(5, min(50, (int) $m[1]));
     }
@@ -124,11 +130,26 @@ try {
                     $tl = $own;
                 }
             }
-            // Custom feeds are no longer sampled here. They load on demand
-            // when someone opens one (ap_bsky_get_custom_feed, Redis-cached),
-            // so an idle owner costs no getFeed calls or bsky_posts writes.
+            // One saved feed per owner per 15 min (gate in Redis), so Home's
+            // Bluesky recommendations also draw on feeds nobody opened.
             $feedExtra = 0;
             $savedUris = [];
+            if ($feedSample) {
+                $sample = ap_bsky_feed_sample_tick($uid, $dryRun);
+                if (!empty($sample['feed'])) {
+                    $savedUris[] = (string) $sample['feed'];
+                }
+                $feedExtra = (int) ($sample['posts'] ?? 0);
+                if (($sample['reason'] ?? '') !== '' && ($sample['reason'] ?? '') !== 'recent') {
+                    fwrite(STDOUT, sprintf(
+                        "[%s] bsky_tl_warm user=%d feed_sample %s%s\n",
+                        gmdate('c'),
+                        $uid,
+                        (string) $sample['reason'],
+                        !empty($sample['feed']) ? ' feed=' . (string) $sample['feed'] : ''
+                    ));
+                }
+            }
             $n = 0;
             if (!$dryRun) {
                 foreach ($feed as $item) {

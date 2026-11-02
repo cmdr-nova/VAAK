@@ -53,6 +53,15 @@ $check(ap_bsky_saved_feed_items_apply($mk([['feed', 'A', true]]), 'remove', 'Z')
 $check(json_encode(['preferences' => [(object) ['$type' => 't', 'x' => new stdClass()]]]) === '{"preferences":[{"$type":"t","x":{}}]}',
     'object prefs keep {} when encoded for putPreferences');
 
+// Background feed sampler: round-robin over saved feeds, pinned or not.
+$fa = 'at://did:plc:abc/app.bsky.feed.generator/a';
+$fb = 'at://did:plc:abc/app.bsky.graph.list/b';
+$items = [['type' => 'timeline', 'value' => 'following', 'pinned' => true], ['type' => 'feed', 'value' => $fa, 'pinned' => true], ['type' => 'list', 'value' => $fb, 'pinned' => false], ['type' => 'feed', 'value' => $fa, 'pinned' => false]];
+$check(ap_bsky_feed_sample_pick($items, 0) === $fa && ap_bsky_feed_sample_pick($items, 1) === $fb && ap_bsky_feed_sample_pick($items, 2) === $fa,
+    'sampler cycles saved feeds and lists, skipping Following and duplicates');
+$check(ap_bsky_feed_sample_pick([['type' => 'timeline', 'value' => 'following']], 3) === null, 'sampler has nothing to do with only Following');
+$check(ap_bsky_feed_sample_pick([['value' => "at://did:plc:abc/app.bsky.feed.generator/a\n"]], 0) === null, 'sampler refuses invalid URIs');
+
 if ($failures !== []) {
     fwrite(STDERR, "bsky-feed-pin-uri-smoke FAILED: " . implode('; ', $failures) . "\n");
     exit(1);

@@ -26212,9 +26212,11 @@ function admin_render_bsky_view_body(int $vaakOwnerId): void
                 } ?>
               <?php endforeach; ?>
             </div>
-            <div id="timeline-sentinel" class="meta" style="text-align:center;padding:1rem 0 2rem">
-              <?= $nextCursor !== '' ? 'Scroll for more…' : 'End of Bluesky feed' ?>
-            </div>
+            <?php // Same status + 1px sentinel pair as Home, so the scroll loader can
+                  // put its shimmer rows above the status line. ?>
+            <div id="timeline-status" class="meta" style="padding:.75rem 0 2rem;text-align:center"><?= $nextCursor !== '' ? 'Scroll for more…' : 'End of Bluesky feed' ?></div>
+            <div id="timeline-sentinel" aria-hidden="true" style="height:1px"></div>
+            <button type="button" class="feed-top-btn" id="feed-top-btn" title="Back to top" aria-label="Back to top">↑</button>
           <?php endif; ?>
         <?php
               endif;
