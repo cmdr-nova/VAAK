@@ -14196,11 +14196,61 @@ function ap_masto_trend_source_downrank_ref_set(int $ownerUserId): ?array
     }catch(Throwable $e){return null;}
 }
 
+/**
+ * Trending score for one tag from 7 days of history (index 0 = today).
+ *
+ * Counts people, not posts: each account adds 1, plus 0.25 for a second post
+ * the same day, and nothing after that. Posts with no known account count
+ * like separate people. The tag is then compared with its own usual level:
+ * (today + half of yesterday) against the daily mean of days 2-6, as
+ * (current - baseline) / sqrt(baseline + 1). A tag that is always busy no
+ * longer stays pinned, one account repeating a tag cannot outrank several
+ * people, and a new tag several people pick up today rises fastest.
+ * Twitter describes trends the same way (velocity above a topic's normal
+ * level, by distinct accounts); this is a fresh formula, not their code.
+ *
+ * @param list<int> $uses posts per day
+ * @param list<array<string,int>> $accounts per day: account => posts that day
+ */
+function ap_masto_trend_tag_score(array $uses, array $accounts): float
+{
+    $activity = [];
+    $people = 0;
+    for ($i = 0; $i < 7; $i++) {
+        $dayAccounts = is_array($accounts[$i] ?? null) ? $accounts[$i] : [];
+        $known = 0;
+        $value = 0.0;
+        foreach ($dayAccounts as $posts) {
+            $posts = max(1, (int) $posts);
+            $known += $posts;
+            $value += 1.0 + ($posts >= 2 ? 0.25 : 0.0);
+        }
+        $value += max(0, (int) ($uses[$i] ?? 0) - $known);
+        $activity[$i] = $value;
+        if ($i <= 1) {
+            $people += count($dayAccounts);
+        }
+    }
+    $current = $activity[0] + (0.5 * $activity[1]);
+    $baseline = ($activity[2] + $activity[3] + $activity[4] + $activity[5] + $activity[6]) / 5.0;
+    if ($current <= 0.0) {
+        // Only older use: keep it listed, below anything active now.
+        return 0.01 * $baseline;
+    }
+    $score = (($current - $baseline) / sqrt($baseline + 1.0)) + (0.1 * $current);
+    if ($people < 2) {
+        // One person talking to themselves is not a trend yet.
+        $score *= 0.25;
+    }
+    // Stay above the older-use tier even when below baseline.
+    return max(0.05, $score + 0.05);
+}
+
 function ap_masto_trend_tags_recount(array $sources, int $ownerUserId = 0): array
 {
     // dayIndex 0 = today … 6 = 6 days ago
     $dayStart = (int) (floor(time() / 86400) * 86400);
-    /** @var array<string,array{uses:list<int>,accounts:list<array<string,bool>>}> $stats */
+    /** @var array<string,array{uses:list<int>,accounts:list<array<string,int>>}> $stats */
     $stats = [];
 
     $ingest = static function (string $text, int $ts, string $accountKey) use (&$stats, $dayStart): void {
@@ -14233,7 +14283,8 @@ function ap_masto_trend_tags_recount(array $sources, int $ownerUserId = 0): arra
             }
             $stats[$key]['uses'][$dayIdx]++;
             if ($accountKey !== '') {
-                $stats[$key]['accounts'][$dayIdx][$accountKey] = true;
+                // Posts per account, so one account repeating a tag can be capped.
+                $stats[$key]['accounts'][$dayIdx][$accountKey] = (int) ($stats[$key]['accounts'][$dayIdx][$accountKey] ?? 0) + 1;
             }
         }
     };
@@ -14280,25 +14331,13 @@ function ap_masto_trend_tags_recount(array $sources, int $ownerUserId = 0): arra
         $ingest($text,$ts,ap_search_canonical_actor($sourceActor));
     }
 
-    // Score: today/yesterday dominate so the sidebar moves through the week
     $scored = [];
     foreach ($stats as $name => $s) {
         $totalUses = array_sum($s['uses']);
         if ($totalUses < 2) {
             continue;
         }
-        $score = 0.0;
-        $weights = [20, 8, 3, 1.5, 1, 0.5, 0.25];
-        for ($i = 0; $i < 7; $i++) {
-            $uses = (int) $s['uses'][$i];
-            $accts = count($s['accounts'][$i]);
-            $score += $weights[$i] * ($uses + (0.5 * $accts));
-        }
-        // Prefer tags that actually appeared today
-        if ((int) $s['uses'][0] > 0) {
-            $score *= 1.35;
-        }
-        $scored[$name] = $score;
+        $scored[$name] = ap_masto_trend_tag_score($s['uses'], $s['accounts']);
     }
     arsort($scored, SORT_NUMERIC);
 
@@ -14394,7 +14433,7 @@ function ap_masto_trend_link_current_rows(array $sources): array
 function ap_masto_trend_links_recount(array $sources,int $ownerUserId=0,bool $allowMetadataFetch=false): array
 {
     $dayStart = (int) (floor(time() / 86400) * 86400);
-    /** @var array<string,array{uses:list<int>,accounts:list<array<string,bool>>}> $stats */
+    /** @var array<string,array{uses:list<int>,accounts:list<array<string,int>>}> $stats */
     $stats = [];
 
     $ingest = static function (string $text, int $ts, string $accountKey) use (&$stats, $dayStart): void {
