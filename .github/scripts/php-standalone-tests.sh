@@ -44,6 +44,7 @@ php_tests=(
   api/bin/bsky-shadow-repost-smoke.php
   api/bin/bsky-hide-set-refresh-smoke.php
   api/bin/bsky-reply-parent-pending-smoke.php
+  api/bin/bsky-appview-takedown-smoke.php
   api/bin/bite-ingest-notify-smoke.php
   api/bin/deprioritize-queue-smoke.php
   api/bin/bsky-thread-fragment-smoke.php
