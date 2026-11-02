@@ -12,6 +12,18 @@ anything else bumps the patch number.
 Releases up to **0.9.83** used a two-digit deploy counter (0.9.05, 0.9.83)
 and have no notes here; their tags and GitHub Releases are unchanged.
 
+## [0.12.0](https://github.com/cmdr-nova/VAAK/releases/tag/v0.12.0) - 2026-11-02
+
+### ✨ Features
+* Keep the page Saving pill off DM sends by @cmdr-nova in https://github.com/cmdr-nova/VAAK/pull/329
+* Add + "Add to list" button on posts; moderation lists block/mute any account by @cmdr-nova in https://github.com/cmdr-nova/VAAK/pull/331
+* Count Bluesky likes, reposts and bookmarks toward Home ranking by @cmdr-nova in https://github.com/cmdr-nova/VAAK/pull/332
+* Inbox: Rust spools signer/actor mismatches; the drain forwards or recovers them by @cmdr-nova in https://github.com/cmdr-nova/VAAK/pull/333
+### 🐛 Fixes
+* Fix "Invalid feed" on pin; add Library > Feeds page by @cmdr-nova in https://github.com/cmdr-nova/VAAK/pull/330
+
+**Full Changelog**: https://github.com/cmdr-nova/VAAK/compare/v0.11.0...v0.12.0
+
 ## [0.11.0](https://github.com/cmdr-nova/VAAK/releases/tag/v0.11.0) - 2026-11-02
 
 ### ✨ Features
