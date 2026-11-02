@@ -320,9 +320,14 @@ fn follow_back_hidden_when_already_following() {
         "https://mkultra.monster/users/cmdr_nova",
         &set,
     );
-    assert!(!html.contains("follow_remote"));
+    assert!(!html.contains("value=\"follow_remote\""));
     assert!(!html.contains("Follow back"));
     assert!(html.contains(">Profile</a>"));
+    // The control stays: Following, click to unfollow (same form as the profile header).
+    assert!(html.contains("name=\"action\" value=\"unfollow_remote\""));
+    assert!(html.contains("name=\"actor_id\" value=\"https://example.test/users/alice\""));
+    assert!(html.contains(">Following</button>"));
+    assert!(html.contains("confirm('Unfollow this account?')"));
 }
 
 #[test]
@@ -487,6 +492,7 @@ fn followed_bluesky_handle_hides_follow_back() {
     assert!(already_following(&set, actor));
     let after = paint_notif_card_follows(&follow_row(actor, actor), "https://mkultra.monster/users/cmdr_nova", &set);
     assert!(!after.contains(">Follow back</button>"));
+    assert!(after.contains(">Following</button>") && after.contains("value=\"unfollow_remote\""));
     let mut junk = HashSet::new();
     for bad in ["", "did:plc:abc", "nodot", "evil.test/../x", "a b.test"] {
         remember_bsky_handle(&mut junk, bad);

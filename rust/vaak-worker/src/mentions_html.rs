@@ -812,8 +812,19 @@ fn paint_notif_card_follows(n: &Value, viewer_actor: &str, following: &HashSet<S
         let viewer = viewer_actor.trim().trim_end_matches('/');
         if actor.starts_with("https://")
             && !same_actor(&actor, viewer)
-            && !already_following(following, &actor)
+            && already_following(following, &actor)
         {
+            // Keep the control in place: Following, click to unfollow (same
+            // queued unfollow_remote form and label as the profile header).
+            actions.push_str(&format!(
+                "<form method=\"post\" action=\"?view=mentions\" style=\"display:inline\" onsubmit=\"return confirm('Unfollow this account?');\">\
+                 <input type=\"hidden\" name=\"action\" value=\"unfollow_remote\">\
+                 <input type=\"hidden\" name=\"return_view\" value=\"mentions\">\
+                 <input type=\"hidden\" name=\"actor_id\" value=\"{actor}\">\
+                 <button class=\"btn btn-ghost btn-following\" type=\"submit\" title=\"Following — click to unfollow\" style=\"padding:.25rem .7rem;font-size:.8rem\">Following</button></form>",
+                actor = esc(&actor),
+            ));
+        } else if actor.starts_with("https://") && !same_actor(&actor, viewer) {
             actions.push_str(&format!(
                 "<form method=\"post\" action=\"?view=mentions\" style=\"display:inline\">\
                  <input type=\"hidden\" name=\"action\" value=\"follow_remote\">\

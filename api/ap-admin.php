@@ -26685,6 +26685,13 @@ function admin_render_notification_card(array $n, array $followingIds, array $fo
           <input type="hidden" name="actor_id" value="<?= h($nActorRef) ?>">
           <button class="btn btn-ghost btn-compact" type="submit">Follow</button>
         </form>
+      <?php elseif ($nActorRef !== '' && $alreadyFollowing): ?>
+        <form method="post" action="?view=mentions" style="display:inline" onsubmit="return confirm('Unfollow this account?');">
+          <input type="hidden" name="action" value="unfollow_remote">
+          <input type="hidden" name="return_view" value="mentions">
+          <input type="hidden" name="actor_id" value="<?= h($nActorRef) ?>">
+          <button class="btn btn-ghost btn-compact btn-following" type="submit" title="Following — click to unfollow">Following</button>
+        </form>
       <?php endif; ?>
     </div>
     </article>
@@ -50079,7 +50086,18 @@ if (VIEW === 'analytics') loadAnalytics();
     const actionInput = form.querySelector('input[name="action"]');
     const button = form.querySelector('button[type="submit"]');
     if (!actionInput || !button || !['follow_remote', 'unfollow_remote'].includes(actionInput.value)) return;
+    // An inline confirm('Unfollow this account?') that was cancelled.
+    if (ev.defaultPrevented) return;
     ev.preventDefault();
+    // The inline confirm belongs to the painted action. This handler flips the
+    // form between follow and unfollow, so take the confirm over from here:
+    // a flipped "Follow" must not ask "Unfollow?", and a re-followed button must.
+    if (form.hasAttribute('onsubmit')) {
+      form.removeAttribute('onsubmit');
+    } else if (actionInput.value === 'unfollow_remote'
+      && !window.confirm(button.textContent.trim() === 'Requested' ? 'Cancel this follow request?' : 'Unfollow this account?')) {
+      return;
+    }
     // Background queue — never leave the page-level Saving… pill up.
     if (typeof window.vaakHideLoading === 'function') window.vaakHideLoading();
     if (form.dataset.queueBusy === '1' || form.dataset.queuePending === '1') {
