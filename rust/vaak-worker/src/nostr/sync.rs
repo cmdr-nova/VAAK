@@ -448,6 +448,20 @@ async fn sync_followee_meta(db: &Client, s: &Settings, now: i64, deadline: Insta
     let stale = now - META_REFRESH_SECS;
     // People who notified someone stay fresh too, once that table exists.
     let notifiers = if super::notif::ready(db).await { "UNION SELECT n.actor FROM nostr_notifs n" } else { "" };
+    // Profiles read before zaps shipped have no nostr_zap_addrs row yet
+    // (not even an empty one): read them again now rather than in a day,
+    // so their ⚡ shows. Keys with no kind 0 (profile_at 0) wait for the
+    // normal refresh, and one whose profile didn't turn up is asked again
+    // at most hourly.
+    let zap_backfill = if super::zap::ready(db).await {
+        format!(
+            "OR (p.profile_at > 0 AND p.meta_fetched_at < $1 + {}
+                 AND NOT EXISTS (SELECT 1 FROM nostr_zap_addrs z WHERE z.pubkey = p.pubkey))",
+            META_REFRESH_SECS - 3600
+        )
+    } else {
+        String::new()
+    };
     let rows = db
         .query(
             &format!("WITH wanted AS (
@@ -459,7 +473,7 @@ async fn sync_followee_meta(db: &Client, s: &Settings, now: i64, deadline: Insta
              )
              SELECT w.pubkey FROM wanted w
              LEFT JOIN nostr_profiles p ON p.pubkey = w.pubkey
-             WHERE p.pubkey IS NULL OR p.meta_fetched_at < $1
+             WHERE p.pubkey IS NULL OR p.meta_fetched_at < $1 {zap_backfill}
              ORDER BY COALESCE(p.meta_fetched_at, 0), w.pubkey
              LIMIT $2"),
             &[&stale, &META_AUTHORS_PER_RUN],

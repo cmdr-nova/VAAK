@@ -332,23 +332,17 @@ pub async fn ready(db: &Client) -> bool {
         .unwrap_or(false)
 }
 
-/// Profile sync: remember a key's zap address from its kind 0 (or forget it
-/// when the newer profile dropped it). A changed address is checked again.
+/// Profile sync: remember a key's zap address from its kind 0, or that it
+/// has none (an empty row, so the zap backfill in `sync` knows the profile
+/// was checked). A changed address is asked about again.
 pub async fn store_addr(db: &Client, pubkey: &str, url: &str, profile_at: i64) -> Result<()> {
-    if url.is_empty() {
-        db.execute(
-            "UPDATE nostr_zap_addrs SET pay_url = '', callback = '', allows_nostr = FALSE, zap_pubkey = '', profile_at = $2, checked_at = 0
-             WHERE pubkey = $1 AND profile_at <= $2 AND pay_url <> ''",
-            &[&pubkey, &profile_at],
-        )
-        .await
-        .context("nostr zap address clear")?;
-        return Ok(());
-    }
     db.execute(
         "INSERT INTO nostr_zap_addrs (pubkey, pay_url, profile_at) VALUES ($1, $2, $3)
          ON CONFLICT (pubkey) DO UPDATE SET pay_url = EXCLUDED.pay_url, profile_at = EXCLUDED.profile_at,
-             checked_at = CASE WHEN nostr_zap_addrs.pay_url = EXCLUDED.pay_url THEN nostr_zap_addrs.checked_at ELSE 0 END
+             checked_at = CASE WHEN nostr_zap_addrs.pay_url = EXCLUDED.pay_url THEN nostr_zap_addrs.checked_at ELSE 0 END,
+             callback = CASE WHEN EXCLUDED.pay_url = '' THEN '' ELSE nostr_zap_addrs.callback END,
+             allows_nostr = CASE WHEN EXCLUDED.pay_url = '' THEN FALSE ELSE nostr_zap_addrs.allows_nostr END,
+             zap_pubkey = CASE WHEN EXCLUDED.pay_url = '' THEN '' ELSE nostr_zap_addrs.zap_pubkey END
          WHERE nostr_zap_addrs.profile_at <= EXCLUDED.profile_at",
         &[&pubkey, &url, &profile_at],
     )
