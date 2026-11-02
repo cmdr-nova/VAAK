@@ -12,6 +12,15 @@ anything else bumps the patch number.
 Releases up to **0.9.83** used a two-digit deploy counter (0.9.05, 0.9.83)
 and have no notes here; their tags and GitHub Releases are unchanged.
 
+## [0.14.0](https://github.com/cmdr-nova/VAAK/releases/tag/v0.14.0) - 2026-11-02
+
+### ✨ Features
+* Bluesky feeds: background sampling for Home, scroll shimmer, back-to-top by @cmdr-nova in https://github.com/cmdr-nova/VAAK/pull/337
+### 🐛 Fixes
+* Fix "List update failed" when adding to Bluesky-linked block lists by @cmdr-nova in https://github.com/cmdr-nova/VAAK/pull/338
+
+**Full Changelog**: https://github.com/cmdr-nova/VAAK/compare/v0.13.0...v0.14.0
+
 ## [0.13.0](https://github.com/cmdr-nova/VAAK/releases/tag/v0.13.0) - 2026-11-02
 
 ### ✨ Features
