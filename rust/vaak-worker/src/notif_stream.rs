@@ -219,12 +219,14 @@ pub async fn handle(State(state): State<crate::http::AppState>, Query(q): Query<
     };
     let state = StreamState { cfg, owner, last: None, started: Instant::now(), _slot: slot };
     let sse = Sse::new(nudges(state)).keep_alive(KeepAlive::new().interval(Duration::from_secs(25)).text("hb"));
-    (
-        [("cache-control", "no-store"), ("x-accel-buffering", "no"), ("x-content-type-options", "nosniff")],
-        sse,
-    )
-        .into_response()
+    (STREAM_HEADERS, sse).into_response()
 }
+
+/// Caddy's site-wide `encode` would gzip text/event-stream and can hold small
+/// events in its buffer; a response that already names its encoding is passed
+/// through untouched, so every nudge goes out at once.
+const STREAM_HEADERS: [(&str, &str); 4] =
+    [("cache-control", "no-store"), ("content-encoding", "identity"), ("x-accel-buffering", "no"), ("x-content-type-options", "nosniff")];
 
 #[cfg(test)]
 mod tests {
@@ -237,6 +239,12 @@ mod tests {
         assert_eq!(next_event(Some("1:0:0:0:0"), Some("2:0:0:0:0")), Some("notif"));
         assert_eq!(next_event(Some("1:0:0:0:0"), None), None, "a failed read never nudges");
         assert_eq!(next_event(None, None), None);
+    }
+
+    #[test]
+    fn stream_opts_out_of_proxy_compression() {
+        assert!(STREAM_HEADERS.contains(&("content-encoding", "identity")));
+        assert!(STREAM_HEADERS.contains(&("cache-control", "no-store")));
     }
 
     #[test]
