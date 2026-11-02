@@ -63,6 +63,31 @@ fn groups_nostr_likes_on_same_note() {
 }
 
 #[test]
+fn zaps_stack_apart_from_likes_and_sum_their_sats() {
+    let note = "https://njump.me/note1abc";
+    let zap = |id: &str, who: &str, sats: i64| {
+        let mut row = fav(id, who, &format!("nostr:npub1{who}"), note);
+        row["vaak_zap_sats"] = json!(sats);
+        row
+    };
+    let rows = vec![
+        zap("30", "a", 21),
+        fav("31", "b", "nostr:npub1b", note),
+        zap("32", "c", 1000),
+        zap("33", "a", 79),
+    ];
+    let grouped = group_notification_rows(&rows);
+    assert_eq!(grouped.len(), 2, "zaps and likes of one note are two stacks");
+    assert_eq!((grouped[0].count, grouped[0].zap_sats), (2, 1100), "two people, every zap's sats");
+    assert!(paint_grouped_card(&grouped[0], "").contains("2 people zapped your post · 1,100 sats"));
+    assert_eq!(grouped[1].zap_sats, 0);
+    assert!(paint_grouped_card(&grouped[1], "").contains("liked your post"));
+    assert!(paint_notif_card(&rows[0], "").contains("⚡ zapped your post · 21 sats"));
+    assert_eq!(sats_label(1), "1 sat");
+    assert_eq!(sats_label(1_234_567), "1,234,567 sats");
+}
+
+#[test]
 fn does_not_group_mentions() {
     let rows = vec![json!({
         "id": "1",

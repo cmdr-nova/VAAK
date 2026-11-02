@@ -5471,7 +5471,7 @@ function ap_masto_status_from_mention(array $row): array
 function ap_masto_mention_target_object_id(string $objectId): string
 {
     $objectId = rtrim($objectId, '/');
-    if (preg_match('/^(https:\/\/.+?)#(like|reblog|update|quote|bite|webmention)-[a-z0-9]+$/i', $objectId, $m)) {
+    if (preg_match('/^(https:\/\/.+?)#(like|reblog|update|quote|bite|webmention|zap)-[a-z0-9]+$/i', $objectId, $m)) {
         return rtrim($m[1], '/');
     }
     return ap_masto_strip_announce_fragment($objectId);
@@ -5704,6 +5704,19 @@ function ap_masto_mention_is_nostr(array $row): bool
     return str_starts_with((string) ($row['activity_id'] ?? ''), 'nostr:')
         || str_starts_with((string) ($row['actor_id'] ?? ''), 'https://njump.me/')
         || str_starts_with((string) ($row['object_id'] ?? ''), 'https://njump.me/');
+}
+
+/**
+ * Sats in a Nostr zap notification (0 for anything else). nostr/notif.rs
+ * stores a zap's object_id as `{note}#zap-{sats}s{hash}`.
+ */
+function ap_masto_mention_zap_sats(string $objectId): int
+{
+    if (!str_starts_with($objectId, 'https://njump.me/')
+        || !preg_match('/#zap-([1-9][0-9]{0,14})s[a-f0-9]{12}$/', $objectId, $m)) {
+        return 0;
+    }
+    return (int) $m[1];
 }
 
 /**
@@ -6080,7 +6093,8 @@ function ap_masto_mention_notif_type(array $row): ?string
     // Bluesky-connected ingest: map by activity_type without requiring local AP note URLs.
     // Nostr rows come from the owner's linked npub the same way.
     if (ap_masto_mention_is_bluesky($row) || ap_masto_mention_is_nostr($row)) {
-        if ($activity === 'like' || $objType === 'like') {
+        // A Nostr zap (NIP-57) is a like with sats (ap_masto_mention_zap_sats).
+        if ($activity === 'like' || $objType === 'like' || $activity === 'zap' || $objType === 'zap') {
             return 'favourite';
         }
         if ($activity === 'announce' || $objType === 'announce') {
@@ -6445,7 +6459,7 @@ function ap_masto_notification_entity(array $item): ?array
         ? (string) $status['id']
         : ($objectId !== '' ? rtrim($objectId, '/') : (string) $id);
     $groupKey = $type . '-' . substr(hash('sha256', ($actorId !== '' ? rtrim($actorId, '/') : '-') . '|' . $groupRef), 0, 24);
-    return [
+    $entity = [
         'id' => $id,
         'type' => $type,
         'group_key' => $groupKey,
@@ -6453,6 +6467,11 @@ function ap_masto_notification_entity(array $item): ?array
         'account' => $account,
         'status' => $status,
     ];
+    $zapSats = $type === 'favourite' ? ap_masto_mention_zap_sats((string) ($row['object_id'] ?? '')) : 0;
+    if ($zapSats > 0) {
+        $entity['vaak_zap_sats'] = $zapSats;
+    }
+    return $entity;
 }
 
 /**

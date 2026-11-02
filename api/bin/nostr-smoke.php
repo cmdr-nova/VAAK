@@ -104,6 +104,20 @@ foreach (['repost', 'quote', 'delete'] as $purpose) {
     $check(ap_nostr_action('nostr_prepare', 1, true, ['purpose' => $purpose, 'target' => 'nope'])['status'] === 400, "{$purpose} still needs a hex target");
 }
 $check(ap_nostr_action('nostr_prepare', 1, true, ['purpose' => 'unrepost', 'target' => $hex])['status'] === 400, 'unrepost is chosen by the worker, not asked for');
+// Zaps (NIP-57): an amount from 1 to 1,000,000 sats and a short comment.
+foreach (['', '0', '-5', '21.5', '1000001', '00021', 'lots'] as $badSats) {
+    $check(ap_nostr_action('nostr_prepare', 1, true, ['purpose' => 'zap', 'target' => $hex, 'zap_sats' => $badSats])['status'] === 400, "zap amount '{$badSats}' refused");
+}
+$check(ap_nostr_action('nostr_prepare', 1, true, ['purpose' => 'zap', 'target' => $hex, 'zap_sats' => '21', 'zap_comment' => str_repeat('é', 281)])['status'] === 400, 'a long zap comment is refused');
+$zapRes = ap_nostr_action('nostr_prepare', 1, true, ['purpose' => 'zap', 'target' => $hex, 'zap_sats' => '1000000', 'zap_comment' => str_repeat('é', 280)]);
+foreach (['nope', 'a@b', 'a b@c.io', str_repeat('a', 320) . '@b.io'] as $badLn) {
+    $check(ap_nostr_action('nostr_prepare', 1, true, ['purpose' => 'lightning', 'lightning' => $badLn])['status'] === 400, "lightning address '{$badLn}' refused");
+}
+$lnRes = ap_nostr_action('nostr_prepare', 1, true, ['purpose' => 'lightning', 'lightning' => ' Nova@Strike.me ']);
+$check(($lnRes['body']['error'] ?? '') !== 'Unknown Nostr action.' && $lnRes['status'] !== 400, 'a good Lightning address goes to the worker without a note target');
+$check(ap_nostr_lightning_from_pay_url('https://strike.me/.well-known/lnurlp/nova') === 'nova@strike.me' && ap_nostr_lightning_from_pay_url('https://pay.example/lnurl/x') === '', 'stored pay URLs read back as addresses');
+$check(ap_nostr_lightning_address('nope') === ['address' => '', 'zaps' => null], 'no key, no address');
+$check(!in_array($zapRes['body']['error'] ?? '', ['Unknown Nostr action.', 'Pick an amount from 1 to 1,000,000 sats.', 'Keep the zap comment under 280 characters.'], true), 'a good zap goes to the worker');
 $check(ap_nostr_action('nostr_publish', 1, true, ['nonce' => 'xyz', 'event' => '{}'])['status'] === 400, 'bad nonce refused');
 $check(ap_nostr_action('nostr_publish', 1, true, ['nonce' => str_repeat('a', 32), 'event' => 'not json'])['status'] === 400, 'non-JSON event refused');
 $check(ap_nostr_action('nostr_sign_anything', 1, true, [])['status'] === 400, 'unknown action refused');
@@ -164,7 +178,8 @@ $check(array_keys($names) === [$nip19] && ($names[$nip19]['name'] ?? '') === 'np
 if (!function_exists('reference_load')) {
     require __DIR__ . '/migration-reference-functions.php';
 }
-reference_load(dirname(__DIR__) . '/ap-masto-entities.php', ['ap_masto_mention_is_nostr', 'ap_masto_nostr_status_fields', 'ap_masto_nostr_note_media']);
+reference_load(dirname(__DIR__) . '/ap-masto-entities.php', ['ap_masto_mention_is_nostr', 'ap_masto_nostr_status_fields', 'ap_masto_nostr_note_media', 'ap_masto_mention_zap_sats', 'ap_masto_mention_target_object_id']);
+reference_load(dirname(__DIR__) . '/ap-admin.php', ['admin_notification_zap_sats', 'admin_zap_sats_label', 'admin_notification_group_key']);
 $noteHex = str_repeat('ab', 32);
 $noteUrl = 'https://njump.me/' . ap_nostr_bech32_encode('note', (string) hex2bin($noteHex));
 $actorUrl = 'https://njump.me/' . $npub;
@@ -175,6 +190,14 @@ $check($fields['source'] === 'nostr' && $fields['vaak_nostr_event_id'] === $note
 $own = ap_masto_nostr_status_fields([], $noteUrl, '');
 $check($own['vaak_nostr_pubkey'] === '' && $own['url'] === $noteUrl, 'a liked note of yours has no author key from the row');
 $check(ap_masto_nostr_status_fields([], 'https://example.com/x', $actorUrl)['vaak_nostr_event_id'] === '', 'only njump note links decode');
+// Zaps: nostr/notif.rs writes `{note}#zap-{sats}s{hash12}`.
+$zapId = $noteUrl . '#zap-2100s0123456789ab';
+$check(ap_masto_mention_zap_sats($zapId) === 2100, 'zap sats read back from the object id');
+$check(ap_masto_mention_zap_sats($noteUrl . '#like-0123456789ab') === 0 && ap_masto_mention_zap_sats('https://evil.example/n#zap-9s0123456789ab') === 0, 'only Nostr zap rows carry sats');
+$check(ap_masto_mention_target_object_id($zapId) === $noteUrl, 'a zap points at the zapped note');
+$zapRow = ['type' => 'favourite', 'vaak_zap_sats' => 2100, 'status' => ['uri' => $noteUrl], 'account' => []];
+$check(admin_notification_zap_sats($zapRow) === 2100 && admin_zap_sats_label(2100) === '2,100 sats' && admin_zap_sats_label(1) === '1 sat', 'zap labels');
+$check(admin_notification_group_key($zapRow) === 'zap:' . $noteUrl && admin_notification_group_key(['type' => 'favourite', 'status' => ['uri' => $noteUrl]]) === 'favourite:' . $noteUrl, 'zaps and likes of one note stack apart');
 
 // Composer crosspost: which posts go to Nostr, and what the note carries.
 if (!function_exists('ap_db_owner_actor_id_for_user_id')) {

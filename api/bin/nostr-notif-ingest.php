@@ -6,7 +6,7 @@ declare(strict_types=1);
  * Store staged Nostr notifications in mentions.
  *
  * `vaak-worker nostr-sync` (rust/vaak-worker/src/nostr/notif.rs) reads the
- * replies, mentions, reposts and likes that tag each linked npub, keeps the
+ * replies, mentions, reposts, likes and zaps that tag each linked npub, keeps the
  * ones that should notify, and stages them in nostr_notifs with the mentions
  * row already built. It runs this script after each sync. Each row goes
  * through ap_mention_store like a Bluesky notification, so the badge, the
@@ -122,7 +122,12 @@ foreach ($rows->fetchAll(PDO::FETCH_ASSOC) as $staged) {
             if (is_array($mrow)) {
                 $nid = ap_masto_notification_id_for_mention((int) $mrow['id'], (string) $mrow['created_at']);
             }
-            ap_webpush_notify_event($type, (string) $row['actor_id'], $nid, (string) ($row['content'] ?? ''), $ownerUserId);
+            $pushBody = (string) ($row['content'] ?? '');
+            $zapSats = ap_masto_mention_zap_sats((string) $row['object_id']);
+            if ($zapSats > 0) {
+                $pushBody = '⚡ zapped ' . number_format($zapSats) . ($zapSats === 1 ? ' sat' : ' sats') . ' · ' . $pushBody;
+            }
+            ap_webpush_notify_event($type, (string) $row['actor_id'], $nid, $pushBody, $ownerUserId);
             $pushed++;
         }
         $done->execute([time(), $ownerUserId, $staged['event_id']]);

@@ -4415,6 +4415,8 @@ fn nostr_card_actions(status: &Value, action_base: &str, from_q: &str) -> String
     let reposted = json_flag(status, "vaak_nostr_reposted");
     let mine = json_flag(status, "vaak_nostr_mine");
     let bm = json_flag(status, "bookmarked");
+    let zappable = json_flag(status, "vaak_nostr_zappable");
+    let zap_sats = status.get("vaak_nostr_zap_sats").and_then(|v| v.as_i64()).unwrap_or(0);
     // Home only carries notes from people the viewer follows.
     let following = status.get("vaak_nostr_following").and_then(|v| v.as_bool()).unwrap_or(true);
     let mut out = String::new();
@@ -4429,6 +4431,18 @@ fn nostr_card_actions(status: &Value, action_base: &str, from_q: &str) -> String
             pressed = if reposted { "true" } else { "false" },
             label = if reposted { "Undo repost" } else { "Repost on Nostr" },
         ));
+        // Zap sits where Bite sits on other posts (NIP-57, nostr::zap): only
+        // when the author names a Lightning address. Own notes show the sats.
+        if zappable && !mine {
+            out.push_str(&format!(
+                "<button type=\"button\" class=\"icon-btn\" data-nostr-act=\"zap\" data-nostr-target=\"{note}\" title=\"Zap (Lightning tip)\" aria-label=\"Zap\"><i class=\"ph ph-lightning\" aria-hidden=\"true\"></i></button>"
+            ));
+        } else if mine && zap_sats > 0 {
+            out.push_str(&format!(
+                "<span class=\"icon-btn has-count nostr-zap-total\" role=\"img\" title=\"{zap_sats} sats in zaps\" aria-label=\"{zap_sats} sats in zaps\"><i class=\"ph-fill ph-lightning\" aria-hidden=\"true\"></i>{count}</span>",
+                count = action_count_html(zap_sats)
+            ));
+        }
         out.push_str(&format!(
             "<button type=\"button\" class=\"icon-btn{on}\" data-nostr-act=\"like\" data-nostr-target=\"{note}\" aria-pressed=\"{pressed}\" title=\"{label}\" aria-label=\"{label}\"><i class=\"{icon} ph-heart\" aria-hidden=\"true\"></i></button>",
             on = if liked { " on" } else { "" },

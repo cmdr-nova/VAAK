@@ -176,6 +176,8 @@ pub struct Profile {
     pub display_name: String,
     pub picture: String,
     pub nip05: String,
+    /// LNURL-pay URL from `lud16` / `lud06` ("" when none), for zaps.
+    pub zap_url: String,
 }
 
 fn clip(s: &str, max: usize) -> String {
@@ -198,6 +200,7 @@ pub fn parse_profile(content: &str) -> Profile {
             String::new()
         },
         nip05: clip(get("nip05"), 120),
+        zap_url: super::zap::pay_url(get("lud16"), get("lud06")).unwrap_or_default(),
     }
 }
 
@@ -323,5 +326,8 @@ pub(crate) mod tests {
         assert_eq!(parse_profile("not json"), Profile::default());
         let p = parse_profile(r#"{"display_name":"A","picture":"https://img.example/a.png"}"#);
         assert_eq!(p.picture, "https://img.example/a.png");
+        assert_eq!(p.zap_url, "");
+        let p = parse_profile(r#"{"name":"n","lud16":"nova@getalby.com"}"#);
+        assert_eq!(p.zap_url, "https://getalby.com/.well-known/lnurlp/nova");
     }
 }

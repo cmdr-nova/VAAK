@@ -27677,6 +27677,10 @@ function admin_render_notification_card(array $n, array $followingIds, array $fo
                     || str_contains($biteTarget, '/objects/'));
             $typeLabel = $biteHasPost ? '🦷 bit your post' : '🦷 bit you';
         }
+        $nZapSats = admin_notification_zap_sats($n);
+        if ($nZapSats > 0) {
+            $typeLabel = '⚡ zapped your post · ' . admin_zap_sats_label($nZapSats);
+        }
         $nRel = $nActorRef !== ''
             ? admin_rel_state($followingIds, $followerIds, $nActorRef, $nWebUrl, $nActorUri)
             : 'none';
@@ -29021,6 +29025,21 @@ function admin_notif_try_embed_status_card(?array $status, array $followingIds, 
  * Status URIs are canonicalized across Fedi/Bluesky twins so dual-network
  * likes on the same post share one card.
  */
+/** Sats in a Nostr zap notification (`vaak_zap_sats`, 0 otherwise). */
+function admin_notification_zap_sats(array $row): int
+{
+    if ((string) ($row['type'] ?? '') !== 'favourite') {
+        return 0;
+    }
+    return max(0, (int) ($row['vaak_zap_sats'] ?? 0));
+}
+
+/** "1 sat", "21 sats", "2,100 sats" (Rust mentions_html sats_label). */
+function admin_zap_sats_label(int $sats): string
+{
+    return number_format($sats) . ($sats === 1 ? ' sat' : ' sats');
+}
+
 function admin_notification_group_key(array $row): ?string
 {
     $type = (string) ($row['type'] ?? 'mention');
@@ -29045,7 +29064,8 @@ function admin_notification_group_key(array $row): ?string
     if ($statusKey === '') {
         return null;
     }
-    return $type . ':' . $statusKey;
+    // Zaps stack apart from plain likes of the same post.
+    return (admin_notification_zap_sats($row) > 0 ? 'zap' : $type) . ':' . $statusKey;
 }
 
 /** Identity key for an account payload (linked Fedi/Bluesky share one key). */
@@ -29090,6 +29110,7 @@ function admin_group_notification_rows(array $rows): array
         $ident = $acct !== [] ? admin_notification_account_identity_key($acct) : ('anon:' . count($out));
         if (!$canGroup || !isset($index[$key])) {
             $row['_group_count'] = 1;
+            $row['_group_zap_sats'] = admin_notification_zap_sats($row);
             $row['_group_accounts'] = $acct !== [] ? [$acct] : [];
             $row['_group_identity_keys'] = [$ident => true];
             // Prefer local AP actor as the card face when a Bluesky twin arrives first.
@@ -29101,6 +29122,8 @@ function admin_group_notification_rows(array $rows): array
             continue;
         }
         $idx = $index[$key];
+        // Every zap's sats count, repeat zaps by one person included.
+        $out[$idx]['_group_zap_sats'] = (int) ($out[$idx]['_group_zap_sats'] ?? 0) + admin_notification_zap_sats($row);
         $seenIdent = is_array($out[$idx]['_group_identity_keys'] ?? null)
             ? $out[$idx]['_group_identity_keys']
             : [];
@@ -29295,7 +29318,10 @@ function admin_render_notification_stream(array $rows, array $followingIds, arra
         $accounts = is_array($n['_group_accounts'] ?? null) ? $n['_group_accounts'] : [];
         $status = is_array($n['status'] ?? null) ? $n['status'] : [];
         $statusUrl = (string) ($status['url'] ?? $status['uri'] ?? '');
-        $label = $type === 'reblog' ? 'boosted your post' : 'liked your post';
+        $groupSats = (int) ($n['_group_zap_sats'] ?? 0);
+        $label = $groupSats > 0
+            ? 'zapped your post · ' . admin_zap_sats_label($groupSats)
+            : ($type === 'reblog' ? 'boosted your post' : 'liked your post');
         echo '<article class="tweet tweet-notif tweet-notif-grouped">';
         echo '<div class="tweet-hd" style="align-items:center">';
         echo '<div class="notification-avatar-stack" style="display:flex;align-items:center;min-width:3rem">';
@@ -32657,6 +32683,17 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     body:not([data-vaak-admin="1"]) .nostr-admin-only { display: none !important; }
     form.nostr-report { display: flex; gap: .5rem; align-items: center; flex-wrap: wrap; margin: .5rem 0 .2rem; }
     form.nostr-report select { padding: .35rem .5rem; border-radius: 8px; border: 1px solid var(--border); background: var(--panel-2); color: var(--text); font: inherit; }
+    /* Zaps (NIP-57): amount picker, then the invoice to pay. */
+    form.nostr-zap { display: flex; flex-direction: column; gap: .5rem; margin: .6rem 0 .2rem; }
+    form.nostr-zap .nostr-zap-row { display: flex; gap: .5rem; align-items: center; flex-wrap: wrap; }
+    form.nostr-zap input { padding: .4rem .55rem; border-radius: 8px; border: 1px solid var(--border); background: var(--panel-2); color: var(--text); font: inherit; min-width: 0; }
+    form.nostr-zap input[type="number"] { width: 7.5rem; }
+    form.nostr-zap input[type="text"] { flex: 1 1 12rem; }
+    form.nostr-zap .nostr-zap-amount.on { border-color: var(--primary); color: var(--primary); }
+    .nostr-zap-pay { display: flex; flex-direction: column; gap: .5rem; align-items: flex-start; margin: .6rem 0 .2rem; }
+    .nostr-zap-qr { background: #fff; padding: .6rem; border-radius: 10px; line-height: 0; }
+    .nostr-zap-qr svg { width: min(16rem, 70vw); height: auto; display: block; }
+    .nostr-zap-total { cursor: default; color: #f5b301; }
     details.nostr-moderation { margin-top: .5rem; }
     details.nostr-moderation > summary { cursor: pointer; }
     .nostr-moderation-row { padding: .3rem 0; }
@@ -36473,6 +36510,13 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
               <button class="btn btn-primary" type="submit" form="nostr-bunker-form"><?= is_array($nostrBunker) ? 'Save' : 'Connect' ?></button>
             </div>
             <div class="meta">A site added to the iPhone Home Screen can't use Safari extensions. Paste a NIP-46 <code>bunker://</code> link from a signer that holds your key somewhere else, and pages without an extension sign through it. The bunker decides what it signs and can revoke VAAK; VAAK still never sees your key.<?php $bunkerLine = ap_nostr_bunker_status_line($nostrBunker, time()); if ($bunkerLine !== ''): ?> <?= h($bunkerLine) ?><?php endif; ?></div>
+            <?php $nostrLightning = ap_nostr_lightning_address($nostrHex); ?>
+            <label for="nostr-lightning" style="margin-top:.75rem">Lightning address (for zaps)</label>
+            <div class="supporter-reward-row nostr-lightning-row">
+              <input id="nostr-lightning" type="text" inputmode="email" autocomplete="off" spellcheck="false" maxlength="320" value="<?= h($nostrLightning['address']) ?>" placeholder="name@wallet.com">
+              <button class="btn btn-primary" type="button" data-nostr-lightning-save>Save to Nostr</button>
+            </div>
+            <div class="meta">Where zaps to your Nostr posts go, from VAAK and every other Nostr app. Use the Lightning address from your wallet (Strike, Alby, Wallet of Satoshi…). Saving updates your Nostr profile, so your signer asks you to sign it. Leave it empty and save to remove it.<?php if ($nostrLightning['zaps'] === false): ?> This wallet doesn't send Nostr zap receipts, so zaps still arrive but won't show in Notifications.<?php endif; ?></div>
             <?= ap_nostr_moderation_settings_html((int) $vaakOwnerId, !empty($vaakIsAdmin)) ?>
             <?php endif; ?>
           </div>
@@ -53633,11 +53677,12 @@ if (VIEW === 'analytics') loadAnalytics();
     return signer;
   }
 
-  async function run(purpose, target, content, reason) {
+  async function run(purpose, target, content, reason, extra) {
     const signer = signerReady();
     if (!signer) return null;
     const prepFields = { action: 'nostr_prepare', purpose: purpose, target: target };
     if (reason) prepFields.reason = reason;
+    if (extra) Object.assign(prepFields, extra);
     const prep = await post(prepFields);
     if (!prep.ok) { toast(prep.error || 'Could not prepare that.'); return null; }
     return signAndPublish(signer, prep, content);
@@ -53787,6 +53832,162 @@ if (VIEW === 'analytics') loadAnalytics();
     pick.focus();
   }
 
+  // Zaps (NIP-57): pick an amount, the signer signs a zap request, the
+  // worker gets an invoice from the author's Lightning wallet provider, and
+  // the viewer's own wallet pays it: a WebLN extension (Alby…) right here,
+  // or any wallet through the QR code / lightning: link. VAAK never touches
+  // the money or a wallet key.
+  const ZAP_AMOUNTS = [21, 100, 1000];
+  const QR_LIB = 'https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/qrcode.min.js';
+  let qrLoading = null;
+
+  function loadQr() {
+    if (window.qrcode) return Promise.resolve(true);
+    if (!qrLoading) {
+      qrLoading = new Promise(function (resolve) {
+        const el = document.createElement('script');
+        el.src = QR_LIB;
+        el.async = true;
+        el.onload = function () { resolve(!!window.qrcode); };
+        el.onerror = function () { qrLoading = null; resolve(false); };
+        document.head.appendChild(el);
+      });
+    }
+    return qrLoading;
+  }
+
+  function satsText(n) {
+    return Number(n).toLocaleString() + (Number(n) === 1 ? ' sat' : ' sats');
+  }
+
+  async function payWithWebln(invoice) {
+    const wallet = window.webln;
+    if (!wallet || typeof wallet.sendPayment !== 'function') return false;
+    try {
+      if (typeof wallet.enable === 'function') await wallet.enable();
+      const paid = await wallet.sendPayment(invoice);
+      return !!(paid && paid.preimage);
+    } catch (e) {
+      return false;
+    }
+  }
+
+  async function showInvoice(form, res) {
+    const invoice = String(res.invoice || '');
+    const panel = document.createElement('div');
+    panel.className = 'nostr-zap-pay';
+    const head = document.createElement('div');
+    head.className = 'meta';
+    head.textContent = 'Pay ' + satsText(res.sats) + ' with any Lightning wallet. The zap shows on Nostr once it is paid.';
+    const qrBox = document.createElement('div');
+    qrBox.className = 'nostr-zap-qr';
+    qrBox.hidden = true;
+    const row = document.createElement('div');
+    row.className = 'nostr-reply-row';
+    const open = document.createElement('a');
+    open.className = 'btn btn-primary';
+    open.href = 'lightning:' + invoice;
+    open.textContent = 'Open in wallet';
+    const copy = document.createElement('button');
+    copy.type = 'button';
+    copy.className = 'btn btn-ghost';
+    copy.textContent = 'Copy invoice';
+    copy.addEventListener('click', async function () {
+      try { await navigator.clipboard.writeText(invoice); copy.textContent = 'Copied'; } catch (e) { toast('Could not copy. Long-press the QR code or use Open in wallet.'); }
+    });
+    const close = document.createElement('button');
+    close.type = 'button';
+    close.className = 'btn btn-ghost';
+    close.textContent = 'Close';
+    close.addEventListener('click', function () { panel.remove(); });
+    row.append(open, copy, close);
+    panel.append(head, qrBox, row);
+    form.replaceWith(panel);
+    if (await loadQr()) {
+      try {
+        const qr = window.qrcode(0, 'L');
+        qr.addData(('lightning:' + invoice).toUpperCase(), 'Alphanumeric');
+        qr.make();
+        qrBox.innerHTML = qr.createSvgTag({ cellSize: 4, margin: 0, scalable: true });
+        qrBox.hidden = false;
+      } catch (e) {}
+    }
+  }
+
+  function openZap(btn, target) {
+    const card = btn.closest('article');
+    if (!card) return;
+    const open = card.querySelector('form.nostr-zap, .nostr-zap-pay');
+    if (open) { open.remove(); return; }
+    const form = document.createElement('form');
+    form.className = 'nostr-zap';
+    const amounts = document.createElement('div');
+    amounts.className = 'nostr-zap-row';
+    const custom = document.createElement('input');
+    custom.type = 'number';
+    custom.min = '1';
+    custom.max = '1000000';
+    custom.step = '1';
+    custom.inputMode = 'numeric';
+    custom.value = String(ZAP_AMOUNTS[0]);
+    custom.setAttribute('aria-label', 'Sats');
+    const chips = ZAP_AMOUNTS.map(function (n) {
+      const chip = document.createElement('button');
+      chip.type = 'button';
+      chip.className = 'btn btn-ghost nostr-zap-amount' + (n === ZAP_AMOUNTS[0] ? ' on' : '');
+      chip.textContent = '⚡ ' + n.toLocaleString();
+      chip.addEventListener('click', function () {
+        custom.value = String(n);
+        chips.forEach(function (c) { c.classList.toggle('on', c === chip); });
+      });
+      return chip;
+    });
+    custom.addEventListener('input', function () {
+      chips.forEach(function (c, i) { c.classList.toggle('on', String(ZAP_AMOUNTS[i]) === custom.value); });
+    });
+    const unit = document.createElement('span');
+    unit.className = 'meta';
+    unit.textContent = 'sats';
+    amounts.append.apply(amounts, chips.concat([custom, unit]));
+    const comment = document.createElement('input');
+    comment.type = 'text';
+    comment.maxLength = 280;
+    comment.placeholder = 'Comment (optional)';
+    comment.setAttribute('aria-label', 'Zap comment');
+    const row = document.createElement('div');
+    row.className = 'nostr-reply-row';
+    const send = document.createElement('button');
+    send.type = 'submit';
+    send.className = 'btn btn-primary';
+    send.textContent = 'Zap';
+    const cancel = document.createElement('button');
+    cancel.type = 'button';
+    cancel.className = 'btn btn-ghost';
+    cancel.textContent = 'Cancel';
+    cancel.addEventListener('click', function () { form.remove(); });
+    row.append(send, cancel);
+    form.append(amounts, comment, row);
+    form.addEventListener('submit', async function (event) {
+      event.preventDefault();
+      const sats = parseInt(custom.value, 10);
+      if (!(sats >= 1 && sats <= 1000000)) { custom.focus(); toast('Pick an amount from 1 to 1,000,000 sats.'); return; }
+      send.disabled = true;
+      const res = await run('zap', target, '', '', { zap_sats: String(sats), zap_comment: comment.value.trim() });
+      send.disabled = false;
+      if (!res || !res.invoice) return;
+      if (await payWithWebln(String(res.invoice))) {
+        const done = document.createElement('div');
+        done.className = 'meta nostr-reply-done';
+        done.textContent = '⚡ Zapped ' + satsText(res.sats) + '.';
+        form.replaceWith(done);
+        return;
+      }
+      await showInvoice(form, res);
+    });
+    card.appendChild(form);
+    custom.focus();
+  }
+
   // Hide on VAAK and the admin Block: no signing, VAAK only.
   async function vaakOnly(btn, action, target) {
     if (action === 'nostr_block' && !window.confirm('Block this Nostr account on VAAK for everyone? Their posts stop showing for all users.')) return;
@@ -53858,7 +54059,34 @@ if (VIEW === 'analytics') loadAnalytics();
     box.focus();
   }
 
+  // Settings > Profile: the Lightning address in your Nostr profile.
+  async function saveLightning(btn) {
+    const input = document.getElementById('nostr-lightning');
+    if (!input || btn.dataset.nostrBusy === '1') return;
+    const address = input.value.trim().toLowerCase();
+    if (address && !/^[a-z0-9._+-]+@[a-z0-9.-]+\.[a-z0-9-]+$/.test(address)) {
+      toast('That isn\'t a Lightning address. It looks like name@wallet.com.');
+      input.focus();
+      return;
+    }
+    btn.dataset.nostrBusy = '1';
+    btn.disabled = true;
+    try {
+      const res = await run('lightning', '', '', '', { lightning: address });
+      if (!res) return;
+      input.value = address;
+      if (!address) toast('Lightning address removed from your Nostr profile.');
+      else if (res.zaps) toast('Saved to your Nostr profile. Zaps to your posts go to ' + address + '.');
+      else toast('Saved, but this wallet doesn\'t send Nostr zap receipts, so zaps won\'t show in Notifications.');
+    } finally {
+      btn.dataset.nostrBusy = '';
+      btn.disabled = false;
+    }
+  }
+
   document.addEventListener('click', async function (event) {
+    const lnBtn = event.target.closest('[data-nostr-lightning-save]');
+    if (lnBtn) { event.preventDefault(); await saveLightning(lnBtn); return; }
     const vaakBtn = event.target.closest('[data-nostr-vaak]');
     if (vaakBtn) {
       event.preventDefault();
@@ -53876,6 +54104,7 @@ if (VIEW === 'analytics') loadAnalytics();
     if (!/^[0-9a-f]{64}$/.test(target)) return;
     if (act === 'reply' || act === 'quote') { openCompose(btn, target, act); return; }
     if (act === 'report') { openReport(btn, target); return; }
+    if (act === 'zap') { openZap(btn, target); return; }
     if (act === 'delete' && !window.confirm('Delete this note on Nostr? Relays are asked to drop it, but copies elsewhere may stay.')) return;
     if (btn.dataset.nostrBusy === '1') return;
     btn.dataset.nostrBusy = '1';

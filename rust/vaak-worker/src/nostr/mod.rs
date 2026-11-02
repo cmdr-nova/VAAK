@@ -10,6 +10,8 @@
 //! `backup_relay` serves as a write-restricted relay.
 //! `bunker` signs through a user's NIP-46 remote signer (with `nip44`) for
 //! pages that have no extension, such as an iPhone Home Screen app.
+//! `zap` is NIP-57: Lightning zaps sent from Nostr cards and receipts that
+//! notify.
 
 pub mod act;
 pub mod archive;
@@ -26,3 +28,4 @@ pub mod relay_book;
 pub mod render;
 pub mod share;
 pub mod sync;
+pub mod zap;

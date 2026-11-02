@@ -151,7 +151,7 @@ struct ResolveRequest {protocol_version:u8,url:String}
 fn mention_target_object_id(raw:&str)->String{
     let id=raw.trim_end_matches('/');
     static INTERACTION:OnceLock<regex::Regex>=OnceLock::new();
-    if let Some(m)=INTERACTION.get_or_init(||regex::Regex::new(r"(?i)^(https://.+?)#(like|reblog|update|quote|bite|webmention)-[a-z0-9]+$").unwrap()).captures(id){return m[1].trim_end_matches('/').to_owned()}
+    if let Some(m)=INTERACTION.get_or_init(||regex::Regex::new(r"(?i)^(https://.+?)#(like|reblog|update|quote|bite|webmention|zap)-[a-z0-9]+$").unwrap()).captures(id){return m[1].trim_end_matches('/').to_owned()}
     let id=trim(id);
     static ANNOUNCE:OnceLock<regex::Regex>=OnceLock::new();
     let stripped=ANNOUNCE.get_or_init(||regex::Regex::new(r"#announce-[0-9]+$").unwrap()).replace(id,"");

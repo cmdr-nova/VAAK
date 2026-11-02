@@ -56,6 +56,7 @@ $check(
         '20261030_nostr_bunkers_postgres.sql',
         '20261102_bsky_chat_postgres.sql',
         '20261102_bsky_chat_reactions_postgres.sql',
+        '20261102_nostr_zaps_postgres.sql',
     ],
     'deploy runner picks up the clans migration and the quote-target table'
 );

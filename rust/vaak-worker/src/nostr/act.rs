@@ -56,7 +56,32 @@ pub struct Pending {
     /// The kind 3 list a follow edit starts from.
     pub base: Option<Event>,
     pub relays: Vec<String>,
+    /// A zap: where the signed request goes instead of relays.
+    #[serde(default)]
+    pub zap: Option<ZapPlan>,
 }
+
+/// The wallet provider call a prepared zap ends in (nostr::zap).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ZapPlan {
+    pub pay_url: String,
+    pub callback: String,
+    pub msats: i64,
+    /// For a Lightning address edit: whether that wallet takes Nostr zaps.
+    #[serde(default)]
+    pub allows_nostr: bool,
+}
+
+/// What the zap picker sent: an amount and an optional comment.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ZapAsk {
+    pub sats: i64,
+    #[serde(default)]
+    pub comment: String,
+}
+
+const MAX_ZAP_SATS: i64 = 1_000_000;
+const MAX_ZAP_COMMENT_CHARS: usize = 280;
 
 fn refuse(message: &str) -> Result<Value> {
     Ok(json!({"ok": false, "error": message}))
@@ -306,7 +331,16 @@ fn note_tags_ok(tags: &[Vec<String>]) -> bool {
         })
 }
 
-pub async fn prepare(cfg: &Config, owner: i64, purpose: &str, target: &str, reason: &str, note: Option<&NewNote>) -> Result<Value> {
+pub async fn prepare(
+    cfg: &Config,
+    owner: i64,
+    purpose: &str,
+    target: &str,
+    reason: &str,
+    note: Option<&NewNote>,
+    zap_ask: Option<&ZapAsk>,
+    lightning: Option<&str>,
+) -> Result<Value> {
     if super::sync::disabled_by_env() {
         return refuse("Nostr is turned off on this server.");
     }
@@ -318,7 +352,7 @@ pub async fn prepare(cfg: &Config, owner: i64, purpose: &str, target: &str, reas
         return refuse("Link your npub in Settings > Profile first.");
     };
     let target = target.trim().to_ascii_lowercase();
-    if purpose != "post" && !event::is_hex64(&target) {
+    if purpose != "post" && purpose != "lightning" && !event::is_hex64(&target) {
         return refuse("That isn't a Nostr note or person.");
     }
     let mut s = super::sync::Settings::from_env(30);
@@ -339,11 +373,12 @@ pub async fn prepare(cfg: &Config, owner: i64, purpose: &str, target: &str, reas
                 tags: note.tags.clone(),
                 content: Some(note.content.clone()),
                 suffix: None,
+                zap: None,
                 base: None,
                 relays: merge_relays(&[&mine, &s.fallback_relays]),
             }
         }
-        "like" | "reply" | "repost" | "quote" | "report" => {
+        "like" | "reply" | "repost" | "quote" | "report" | "zap" => {
             let Some(row) = db
                 .query_opt("SELECT pubkey, relay, tags FROM nostr_events WHERE id = $1", &[&target])
                 .await
@@ -358,7 +393,12 @@ pub async fn prepare(cfg: &Config, owner: i64, purpose: &str, target: &str, reas
             let mine = write_relays_of(&db, std::slice::from_ref(&me)).await;
             let theirs = write_relays_of(&db, std::slice::from_ref(&author)).await;
             let relays = merge_relays(&[&mine, &theirs, &s.fallback_relays]);
-            if purpose == "report" {
+            if purpose == "zap" {
+                match zap_pending(&db, &target, &author, &me, &relays, &s.skip, zap_ask).await? {
+                    Ok(p) => p,
+                    Err(message) => return refuse(&message),
+                }
+            } else if purpose == "report" {
                 if !REPORT_TYPES.contains(&reason) {
                     return refuse("Pick a reason for the report.");
                 }
@@ -372,6 +412,7 @@ pub async fn prepare(cfg: &Config, owner: i64, purpose: &str, target: &str, reas
                     tags: report_tags(&target, &author, reason),
                     content: Some(String::new()),
                     suffix: None,
+                    zap: None,
                     base: None,
                     relays,
                 }
@@ -392,6 +433,7 @@ pub async fn prepare(cfg: &Config, owner: i64, purpose: &str, target: &str, reas
                         tags: vec![tag(&["e", &repost]), tag(&["k", "6"])],
                         content: Some(String::new()),
                         suffix: None,
+                        zap: None,
                         base: None,
                         relays,
                     },
@@ -403,6 +445,7 @@ pub async fn prepare(cfg: &Config, owner: i64, purpose: &str, target: &str, reas
                         tags: repost_tags(&target, &author, &relay_hint, &relays),
                         content: Some(String::new()),
                         suffix: None,
+                        zap: None,
                         base: None,
                         relays,
                     },
@@ -415,6 +458,7 @@ pub async fn prepare(cfg: &Config, owner: i64, purpose: &str, target: &str, reas
                     tags: quote_tags(&target, &author, &relay_hint, &me),
                     content: None,
                     suffix: Some(quote_suffix(&target)),
+                    zap: None,
                     base: None,
                     relays,
                 }
@@ -426,6 +470,7 @@ pub async fn prepare(cfg: &Config, owner: i64, purpose: &str, target: &str, reas
                     tags: reply_tags(&target, &author, &note_tags, &relay_hint, &me),
                     content: None,
                     suffix: None,
+                    zap: None,
                     base: None,
                     relays,
                 }
@@ -444,6 +489,7 @@ pub async fn prepare(cfg: &Config, owner: i64, purpose: &str, target: &str, reas
                         tags: vec![tag(&["e", &reaction]), tag(&["k", "7"])],
                         content: Some(String::new()),
                         suffix: None,
+                        zap: None,
                         base: None,
                         relays,
                     },
@@ -454,6 +500,7 @@ pub async fn prepare(cfg: &Config, owner: i64, purpose: &str, target: &str, reas
                         tags: vec![e_tag(&target, &relay_hint, None), tag(&["p", &author]), tag(&["k", "1"])],
                         content: Some("+".into()),
                         suffix: None,
+                        zap: None,
                         base: None,
                         relays,
                     },
@@ -477,6 +524,7 @@ pub async fn prepare(cfg: &Config, owner: i64, purpose: &str, target: &str, reas
                 tags: vec![tag(&["e", &target]), tag(&["k", &kind.to_string()])],
                 content: Some(String::new()),
                 suffix: None,
+                zap: None,
                 base: None,
                 relays: merge_relays(&[&mine, &s.fallback_relays]),
             }
@@ -509,6 +557,7 @@ pub async fn prepare(cfg: &Config, owner: i64, purpose: &str, target: &str, reas
                 tags,
                 content: Some(base.content.clone()),
                 suffix: None,
+                zap: None,
                 base: Some(base),
                 relays: merge_relays(&[&mine, &s.index_relays, &s.fallback_relays]),
             }
@@ -555,8 +604,67 @@ pub async fn prepare(cfg: &Config, owner: i64, purpose: &str, target: &str, reas
                 tags,
                 content: Some(base_content),
                 suffix: None,
+                zap: None,
                 base,
                 relays: merge_relays(&[&mine, &s.index_relays, &s.fallback_relays]),
+            }
+        }
+        "lightning" => {
+            // Settings > Profile: set or clear `lud16` on the user's kind 0,
+            // starting from the newest profile the relays hold (like a
+            // follow edit) so nothing else in it changes.
+            let address = lightning.unwrap_or("").trim().to_ascii_lowercase();
+            let mut plan = None;
+            if !address.is_empty() {
+                let Some(pay_url) = super::zap::pay_url(&address, "") else {
+                    return refuse("That isn't a Lightning address. It looks like name@wallet.com.");
+                };
+                match super::zap::fetch_pay_info(&pay_url).await {
+                    Ok(info) => {
+                        plan = Some(ZapPlan { pay_url, callback: info.callback, msats: 0, allows_nostr: info.allows_nostr });
+                    }
+                    Err(e) => {
+                        tracing::info!(owner, error = %format!("{e:#}"), "nostr lightning address check failed");
+                        return refuse("That Lightning address didn't answer. Check it in your wallet app and try again.");
+                    }
+                }
+            }
+            let mine = write_relays_of(&db, std::slice::from_ref(&me)).await;
+            let read_from = super::relay_book::without_skipped(merge_relays(&[&mine, &s.index_relays]), &s.skip);
+            let (base, answered) = newest_list(&me, 0, &read_from).await;
+            if answered == 0 {
+                return refuse("No relay answered. Try again in a minute.");
+            }
+            let stored_at: i64 = db
+                .query_opt("SELECT profile_at FROM nostr_profiles WHERE pubkey = $1", &[&me])
+                .await
+                .context("nostr own profile stamp")?
+                .map(|r| r.get(0))
+                .unwrap_or(0);
+            let (tags, content) = match &base {
+                Some(b) if b.created_at < stored_at => {
+                    return refuse("Relays only returned an older copy of your Nostr profile. Try again in a minute so nothing in it gets lost.");
+                }
+                Some(b) => (b.tags.clone(), b.content.clone()),
+                None if stored_at > 0 => {
+                    return refuse("Couldn't find your current Nostr profile on any relay, so VAAK won't risk replacing it.");
+                }
+                None => (Vec::new(), String::new()),
+            };
+            let content = match with_lightning(&content, &address) {
+                Ok(c) => c,
+                Err(e) => return refuse(e),
+            };
+            Pending {
+                purpose: "lightning".into(),
+                target: String::new(),
+                kind: 0,
+                tags,
+                content: Some(content),
+                suffix: None,
+                base,
+                relays: merge_relays(&[&mine, &s.index_relays, &s.fallback_relays]),
+                zap: plan,
             }
         }
         _ => return refuse("Unknown Nostr action."),
@@ -591,6 +699,87 @@ pub async fn prepare(cfg: &Config, owner: i64, purpose: &str, target: &str, reas
     }))
 }
 
+/// A kind 0 profile's JSON with `lud16` set to `address` (and any `lud06`
+/// dropped), or both removed when `address` is empty. Every other field
+/// stays as it was.
+pub fn with_lightning(content: &str, address: &str) -> Result<String, &'static str> {
+    let mut profile = if content.trim().is_empty() {
+        serde_json::Map::new()
+    } else {
+        match serde_json::from_str::<Value>(content) {
+            Ok(Value::Object(map)) => map,
+            _ => return Err("Your Nostr profile isn't readable JSON, so VAAK won't edit it. Set the address in your Nostr app instead."),
+        }
+    };
+    profile.remove("lud06");
+    if address.is_empty() {
+        profile.remove("lud16");
+    } else {
+        profile.insert("lud16".into(), Value::String(address.to_string()));
+    }
+    serde_json::to_string(&Value::Object(profile)).map_err(|_| "Couldn't build your profile.")
+}
+
+/// A zap of `note` by `author`: their Lightning address must take Nostr
+/// zaps, and the amount must be one their wallet accepts.
+async fn zap_pending(
+    db: &Client,
+    note: &str,
+    author: &str,
+    me: &str,
+    relays: &[String],
+    skip: &HashSet<String>,
+    ask: Option<&ZapAsk>,
+) -> Result<std::result::Result<Pending, String>> {
+    use super::zap;
+    if author == me {
+        return Ok(Err("That's your own note.".into()));
+    }
+    if !zap::ready(db).await {
+        return Ok(Err("Zaps aren't set up on this server yet.".into()));
+    }
+    let Some(ask) = ask.filter(|a| a.sats >= 1 && a.sats <= MAX_ZAP_SATS) else {
+        return Ok(Err(format!("Pick an amount from 1 to {MAX_ZAP_SATS} sats.")));
+    };
+    let comment = ask.comment.trim();
+    if comment.chars().count() > MAX_ZAP_COMMENT_CHARS {
+        return Ok(Err(format!("Keep the zap comment under {MAX_ZAP_COMMENT_CHARS} characters.")));
+    }
+    let now = chrono::Utc::now().timestamp();
+    let (pay_url, info) = match zap::pay_info_for(db, author, now, zap::SEND_MAX_AGE_SECS).await {
+        Ok(Some(found)) => found,
+        Ok(None) => return Ok(Err("They haven't added a Lightning address to their Nostr profile.".into())),
+        Err(e) => {
+            tracing::info!(author, error = %format!("{e:#}"), "nostr zap pay info failed");
+            return Ok(Err("Their Lightning wallet didn't answer. Try again in a minute.".into()));
+        }
+    };
+    if !info.allows_nostr {
+        return Ok(Err("Their Lightning wallet doesn't take Nostr zaps.".into()));
+    }
+    let msats = ask.sats * 1000;
+    if msats < info.min_msats || msats > info.max_msats {
+        let low = (info.min_msats + 999) / 1000;
+        let high = (info.max_msats / 1000).min(MAX_ZAP_SATS);
+        return Ok(Err(format!("Their wallet takes {low} to {high} sats.")));
+    }
+    if info.comment_max > 0 && comment.chars().count() > info.comment_max as usize {
+        return Ok(Err(format!("Their wallet takes comments up to {} characters.", info.comment_max)));
+    }
+    let receipt_relays = super::relay_book::without_skipped(relays.to_vec(), skip);
+    Ok(Ok(Pending {
+        purpose: "zap".into(),
+        target: note.to_string(),
+        kind: zap::REQUEST_KIND,
+        tags: zap::request_tags(note, author, msats, &pay_url, &receipt_relays),
+        content: Some(comment.to_string()),
+        suffix: None,
+        base: None,
+        relays: receipt_relays,
+        zap: Some(ZapPlan { pay_url, callback: info.callback, msats, allows_nostr: true }),
+    }))
+}
+
 pub async fn publish(cfg: &Config, owner: i64, nonce: &str, signed: &Value) -> Result<Value> {
     if super::sync::disabled_by_env() {
         return refuse("Nostr is turned off on this server.");
@@ -615,6 +804,21 @@ pub async fn publish(cfg: &Config, owner: i64, nonce: &str, signed: &Value) -> R
     let now = chrono::Utc::now().timestamp();
     if let Err(e) = check_signed(&ev, &pending, &me, now) {
         return refuse(&e);
+    }
+    // A zap request goes to the author's wallet provider, not to relays.
+    // Its invoice is paid by the user's own wallet in the browser.
+    if let Some(plan) = pending.zap.as_ref().filter(|_| pending.purpose == "zap") {
+        return match super::zap::fetch_invoice(&plan.callback, plan.msats, &ev, &plan.pay_url).await {
+            Ok(invoice) => {
+                tracing::info!(owner, sats = plan.msats / 1000, "nostr zap invoice");
+                Ok(json!({"ok": true, "purpose": "zap", "target": pending.target, "invoice": invoice, "sats": plan.msats / 1000}))
+            }
+            Err(e) => {
+                let why: String = format!("{e:#}").chars().take(200).collect();
+                tracing::info!(owner, error = %why, "nostr zap invoice failed");
+                refuse(&format!("Their Lightning wallet didn't make an invoice ({why}). Nothing was paid."))
+            }
+        };
     }
     super::archive::keep_own(&db, &ev).await;
     if let Some(base) = pending.base.as_ref().filter(|b| b.kind == 3) {
@@ -744,6 +948,9 @@ pub async fn publish(cfg: &Config, owner: i64, nonce: &str, signed: &Value) -> R
         "mute" | "unmute" => {
             super::sync::store_mute_list(&db, owner, &ev).await?;
         }
+        "lightning" => {
+            super::sync::upsert_meta(&db, &me, Some(&ev), None, now).await?;
+        }
         _ => {}
     }
     Ok(json!({
@@ -752,13 +959,16 @@ pub async fn publish(cfg: &Config, owner: i64, nonce: &str, signed: &Value) -> R
         "accepted": accepted,
         "asked": results.len(),
         "note": if matches!(pending.purpose.as_str(), "reply" | "quote" | "post") { Value::String(super::bech32::note(&ev.id)) } else { Value::Null },
+        "zaps": pending.purpose == "lightning" && pending.zap.as_ref().is_some_and(|z| z.allows_nostr),
     }))
 }
 
 /// Viewer state on painted Nostr cards (boost wrappers included):
-/// `vaak_nostr_liked`, `vaak_nostr_reposted`, `vaak_nostr_following` and
-/// `vaak_nostr_mine`. Read at paint time so a cached page still shows a
-/// like, repost or unfollow made a moment ago.
+/// `vaak_nostr_liked`, `vaak_nostr_reposted`, `vaak_nostr_following`,
+/// `vaak_nostr_mine`, `vaak_nostr_zappable` (the author names a Lightning
+/// address) and, on the viewer's own notes, `vaak_nostr_zap_sats`. Read at
+/// paint time so a cached page still shows a like, repost or unfollow made
+/// a moment ago.
 pub async fn stamp_viewer_flags(db: &Client, owner: i64, statuses: &mut [Value]) {
     fn cards(statuses: &mut [Value]) -> Vec<&mut Value> {
         statuses
@@ -787,6 +997,8 @@ pub async fn stamp_viewer_flags(db: &Client, owner: i64, statuses: &mut [Value])
         .await);
     let following = set(db.query("SELECT pubkey FROM nostr_follows WHERE owner_user_id = $1 AND pubkey = ANY($2)", &[&owner, &authors]).await);
     let me = linked_pubkey(db, owner).await.ok().flatten().map(|(pk, _, _)| pk).unwrap_or_default();
+    let zappable = super::zap::zappable(db, &authors).await;
+    let zapped = super::zap::sats_by_note(db, owner, &ids).await;
     for st in cards(statuses) {
         let id = field(st, "vaak_nostr_event_id");
         let pk = field(st, "vaak_nostr_pubkey");
@@ -794,6 +1006,10 @@ pub async fn stamp_viewer_flags(db: &Client, owner: i64, statuses: &mut [Value])
         st["vaak_nostr_reposted"] = json!(reposted.contains(&id));
         st["vaak_nostr_following"] = json!(following.contains(&pk));
         st["vaak_nostr_mine"] = json!(!me.is_empty() && pk == me);
+        st["vaak_nostr_zappable"] = json!(zappable.contains(&pk));
+        if let Some(sats) = zapped.get(&id).filter(|s| **s > 0) {
+            st["vaak_nostr_zap_sats"] = json!(sats);
+        }
     }
 }
 
@@ -818,6 +1034,17 @@ mod tests {
         assert_eq!(edit_mute_tags(&base, B, false), Err("They aren't on your Nostr mute list."));
         assert_eq!(report_tags(P, A, "spam"), vec![tag(&["e", P, "spam"]), tag(&["p", A, "spam"])]);
         assert!(REPORT_TYPES.contains(&"other") && !REPORT_TYPES.contains(&""));
+    }
+
+    #[test]
+    fn lightning_edits_keep_the_rest_of_the_profile() {
+        let base = r#"{"name":"nova","about":"hi","lud06":"lnurl1old","picture":"https://x/a.png"}"#;
+        let set: Value = serde_json::from_str(&with_lightning(base, "nova@strike.me").unwrap()).unwrap();
+        assert_eq!(set, json!({"name":"nova","about":"hi","picture":"https://x/a.png","lud16":"nova@strike.me"}));
+        let cleared: Value = serde_json::from_str(&with_lightning(&set.to_string(), "").unwrap()).unwrap();
+        assert_eq!(cleared, json!({"name":"nova","about":"hi","picture":"https://x/a.png"}));
+        assert_eq!(with_lightning("", "a@b.io").unwrap(), r#"{"lud16":"a@b.io"}"#);
+        assert!(with_lightning("[1,2]", "a@b.io").is_err());
     }
 
     #[test]
@@ -891,6 +1118,7 @@ mod tests {
             tags: ev_tags,
             content: Some("+".into()),
             suffix: None,
+            zap: None,
             base: None,
             relays: vec![],
         }
