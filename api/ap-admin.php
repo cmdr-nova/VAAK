@@ -4471,6 +4471,26 @@ $vaakAdminOnlyActions = [
         } else {
             $error = (string) ($editResult['error'] ?? 'Could not change the feed.');
         }
+        if (isset($_POST['ajax']) || str_contains((string) ($_SERVER['HTTP_ACCEPT'] ?? ''), 'application/json')) {
+            // In-page edit: answer with the redrawn list so the page swaps it
+            // in place (no reload, no page-level Saving… pill).
+            if (function_exists('ap_auth_session_write_close')) {
+                ap_auth_session_write_close();
+            }
+            ob_start();
+            admin_render_bsky_feeds_page((int) $vaakOwnerId);
+            $feedsHtml = (string) ob_get_clean();
+            header('Content-Type: application/json; charset=utf-8');
+            header('Cache-Control: no-store');
+            http_response_code(!empty($editResult['ok']) ? 200 : 422);
+            echo json_encode([
+                'ok' => !empty($editResult['ok']),
+                'notice' => (string) ($notice ?? ''),
+                'error' => (string) ($error ?? ''),
+                'html' => $feedsHtml,
+            ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+            exit;
+        }
     } elseif ($action === 'bsky_feed_pin' || $action === 'bsky_feed_unpin') {
         // Search > Feeds: pin/unpin in the account's Bluesky preferences.
         $view = 'search';
@@ -25984,12 +26004,40 @@ if (isset($_GET['partial'], $_GET['shell'])
     exit;
 }
 
+// Soft-nav shell for Library > Feeds (partial=1&shell=1).
+if (isset($_GET['partial'], $_GET['shell'])
+    && (string) $_GET['partial'] === '1'
+    && (string) $_GET['shell'] === '1'
+    && $view === 'bsky_feeds'
+) {
+    if (function_exists('ap_auth_session_write_close')) {
+        ap_auth_session_write_close();
+    } elseif (session_status() === PHP_SESSION_ACTIVE) {
+        session_write_close();
+    }
+    header('Content-Type: text/html; charset=utf-8');
+    header('Cache-Control: no-store');
+    header('X-VAAK-View: bsky_feeds');
+    echo '<div class="topbar"><h1>' . h(view_title('bsky_feeds')) . '</h1><div class="topbar-actions"></div></div>';
+    echo '<div class="feed">';
+    admin_render_bsky_feeds_page((int) $vaakOwnerId);
+    echo '</div>';
+    exit;
+}
+
 /**
  * Library > Feeds: the viewer's saved Bluesky feeds in Bluesky's order.
  * Pinned ones are the Home chips. Every change writes the same
  * savedFeedsPrefV2 record bsky.app uses, so both apps stay in step.
  */
 function admin_render_bsky_feeds_page(int $ownerUserId): void
+{
+    echo '<div data-bsky-feeds-page>';
+    admin_render_bsky_feeds_page_body($ownerUserId);
+    echo '</div>';
+}
+
+function admin_render_bsky_feeds_page_body(int $ownerUserId): void
 {
     if (!admin_bsky_connected()) {
         echo '<div class="empty">Connect a Bluesky account in <a href="?view=atmosphere">ATmosphere settings</a> to manage feeds here.</div>';
@@ -26036,7 +26084,7 @@ function admin_bsky_feed_manage_row_html(array $item, string $label, bool $canUp
     $kind = $isTimeline ? 'Your Bluesky follows' : ((string) $item['type'] === 'list' ? 'List' : 'Feed');
     $open = '?view=bluesky&feed=' . rawurlencode($value);
     $form = static function (string $op, string $text, string $title, string $class, bool $confirm = false) use ($value): string {
-        return '<form method="post" action="?view=bsky_feeds"' . ($confirm ? ' onsubmit="return confirm(' . h(json_encode('Remove this feed from your saved feeds?')) . ');"' : '') . '>'
+        return '<form method="post" action="?view=bsky_feeds" data-bsky-feed-edit' . ($confirm ? ' data-confirm="' . h('Remove this feed from your saved feeds?') . '" onsubmit="return confirm(this.dataset.confirm);"' : '') . '>'
             . '<input type="hidden" name="action" value="bsky_feed_edit">'
             . '<input type="hidden" name="return_view" value="bsky_feeds">'
             . '<input type="hidden" name="op" value="' . h($op) . '">'
@@ -32898,7 +32946,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           <a class="<?= $view === 'collections' ? 'active' : '' ?>" href="/vaak/?view=collections"><span class="ico">▦</span><span class="label">Collections</span></a>
           <a class="<?= $view === 'lists' ? 'active' : '' ?>" href="/vaak/?view=lists"><span class="ico">☰</span><span class="label">Lists</span></a>
           <?php if (admin_bsky_connected()): ?>
-            <a class="<?= $view === 'bsky_feeds' ? 'active' : '' ?>" href="/vaak/?view=bsky_feeds"><span class="ico"><i class="ph ph-rss-simple" aria-hidden="true"></i></span><span class="label">Feeds</span></a>
+            <a class="<?= $view === 'bsky_feeds' ? 'active' : '' ?>" href="/vaak/?view=bsky_feeds" data-vaak-soft-nav="bsky_feeds"><span class="ico"><i class="ph ph-rss-simple" aria-hidden="true"></i></span><span class="label">Feeds</span></a>
           <?php endif; ?>
         </div>
       </details>
@@ -42672,7 +42720,7 @@ if (!empty($GLOBALS['vaak_profile_shell'])) {
   let notifView = <?= json_encode($view === 'mentions') ?>;
   let dmView = <?= json_encode($view === 'dms') ?>;
   let notifBaseTitle = <?= json_encode('VAAK · ' . view_title($view)) ?>;
-  const canonicalViewTitles = <?= json_encode(array_combine($titleViews = ['home', 'local', 'feed', 'bluesky', 'mentions', 'outbox', 'favourites', 'bookmarks', 'following', 'followers', 'search', 'status', 'remote_profile', 'rss', 'dms', 'blog'], array_map('view_title', $titleViews))) ?>;
+  const canonicalViewTitles = <?= json_encode(array_combine($titleViews = ['home', 'local', 'feed', 'bluesky', 'mentions', 'outbox', 'favourites', 'bookmarks', 'following', 'followers', 'search', 'status', 'remote_profile', 'rss', 'dms', 'blog', 'bsky_feeds'], array_map('view_title', $titleViews))) ?>;
   let titleNotifCount = 0;
   let titleDmCount = 0;
   function renderCurrentInboxTitle() {
@@ -46719,6 +46767,12 @@ window.vaakBootStatusThread();
       .catch(() => { chipsNone = true; })
       .finally(() => { pending = null; if (chipsHtml) window.vaakSyncBskyChips(); });
   };
+  // Library > Feeds edits change the pinned set: fetch the row again next time.
+  window.vaakResetBskyChips = function () {
+    chipsHtml = null;
+    chipsNone = false;
+    document.querySelectorAll('[data-bsky-home-chips]').forEach((slot) => { delete slot.dataset.filled; });
+  };
   const boot = () => { try { window.vaakSyncBskyChips(); } catch (e) {} };
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot, { once: true });
   else boot();
@@ -46726,16 +46780,83 @@ window.vaakBootStatusThread();
 </script>
 
 <script>
+// Library > Feeds: ↑ ↓ ★ ✕ save in place. Window capture runs before the
+// document-level Saving… pill and the native submit, so neither shows up;
+// the server answers with the redrawn list.
+(function () {
+  let inFlight = false;
+  window.addEventListener('submit', async (ev) => {
+    const form = ev.target;
+    if (!(form instanceof HTMLFormElement) || !form.hasAttribute('data-bsky-feed-edit')) return;
+    const page = form.closest('[data-bsky-feeds-page]');
+    if (!page || typeof fetch !== 'function') return;
+    ev.preventDefault();
+    ev.stopPropagation();
+    if (inFlight) return;
+    if (form.dataset.confirm && !window.confirm(form.dataset.confirm)) return;
+    const fd = new FormData(form);
+    fd.set('ajax', '1');
+    fd.set('csrf', window.VAAK_CSRF || '');
+    const row = form.closest('article');
+    inFlight = true;
+    page.setAttribute('aria-busy', 'true');
+    if (row) row.style.opacity = '.55';
+    page.querySelectorAll('form[data-bsky-feed-edit] button').forEach((b) => { b.disabled = true; });
+    let data = null;
+    try {
+      const res = await fetch(form.getAttribute('action') || '?view=bsky_feeds', {
+        method: 'POST',
+        body: fd,
+        credentials: 'same-origin',
+        headers: { 'Accept': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
+        cache: 'no-store'
+      });
+      if (res.status === 401 || res.headers.get('X-VAAK-Auth') === 'required') {
+        if (typeof window.vaakRedirectToLogin === 'function') window.vaakRedirectToLogin('feeds-edit');
+        return;
+      }
+      data = await res.json().catch(() => null);
+    } catch (e) {
+      data = null;
+    } finally {
+      inFlight = false;
+      page.removeAttribute('aria-busy');
+    }
+    if (data && typeof data.html === 'string' && data.html.indexOf('data-bsky-feeds-page') !== -1) {
+      const box = document.createElement('div');
+      box.innerHTML = data.html;
+      const fresh = box.querySelector('[data-bsky-feeds-page]');
+      if (fresh) page.replaceWith(fresh);
+    } else {
+      if (row) row.style.opacity = '';
+      page.querySelectorAll('form[data-bsky-feed-edit] button').forEach((b) => { b.disabled = false; });
+    }
+    if (data && data.ok && typeof window.vaakResetBskyChips === 'function') window.vaakResetBskyChips();
+    const msg = data ? (data.ok ? data.notice : data.error) : 'Could not save. Try again.';
+    if (msg && !(data && data.ok)) {
+      // Failures only; a success is visible in the redrawn list.
+      const note = document.createElement('div');
+      note.className = 'empty';
+      note.setAttribute('role', 'alert');
+      note.textContent = msg;
+      const target = document.querySelector('[data-bsky-feeds-page]');
+      if (target) target.prepend(note);
+    }
+  }, true);
+})();
+</script>
+
+<script>
 // Soft-nav for primary left-rail / timeline destinations. Keeps rails + CSS;
 // swaps section.main. Falls back to full navigation when a shell or boot is missing.
 (function () {
-  const SOFT_VIEWS = new Set(['home', 'local', 'feed', 'bluesky', 'mentions', 'outbox', 'favourites', 'bookmarks', 'following', 'followers', 'search', 'status']);
+  const SOFT_VIEWS = new Set(['home', 'local', 'feed', 'bluesky', 'mentions', 'outbox', 'favourites', 'bookmarks', 'following', 'followers', 'search', 'status', 'bsky_feeds']);
   const TL_TITLES = {
     home: 'Home', local: 'Local', feed: 'Federation feed',
     mentions: 'Notifications', outbox: 'Your posts',
     favourites: 'Favourites', bookmarks: 'Bookmarks',
     following: 'Following', followers: 'Followers', search: 'Search', status: 'Post',
-    bluesky: 'Home'
+    bluesky: 'Home', bsky_feeds: 'Feeds'
   };
   let busy = false;
   let leaving = false;

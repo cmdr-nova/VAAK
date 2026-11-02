@@ -55,6 +55,7 @@ same(href('status', '', { object: 'https://ex.social/@a/1', from: 'remote_profil
   'a post names its object and origin, nothing from the profile');
 same(href('status', '', { object: 'x', from: 'home', refresh_thread: '1' }),
   { view: 'status', object: 'x', from: 'home' }, 'refresh_thread never reaches the address bar');
+same(href('bsky_feeds', '', {}), { view: 'bsky_feeds' }, 'Library Feeds is just ?view=bsky_feeds');
 same(href('bluesky', '', { feed: 'following' }), { view: 'bluesky' },
   'Bluesky Following is just ?view=bluesky');
 same(href('bluesky', '', { feed: 'at://did:plc:abc/app.bsky.feed.generator/whats-hot' }),
