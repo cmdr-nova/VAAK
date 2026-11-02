@@ -67,6 +67,7 @@ require_once __DIR__ . '/ap-notices.php'; // Local-only operator notices
 require_once __DIR__ . '/ap-discuss.php'; // Local-only discussion forums
 require_once __DIR__ . '/ap-webpush.php'; // Browser + Ice Cubes Web Push
 require_once __DIR__ . '/ap-bsky.php'; // Phase A Bluesky tab (opt-in, feature-flagged)
+require_once __DIR__ . '/ap-bsky-chat.php'; // Bluesky DMs on the DM screen (VAAK_BSKY_DMS=1)
 require_once __DIR__ . '/ap-reply-preview.php'; // Composer "Replying to" summary (local rows only)
 require_once __DIR__ . '/ap-action-queue.php'; // Durable reversible timeline actions
 require_once __DIR__ . '/ap-rss.php'; // You → RSS → Home mix
@@ -5071,6 +5072,48 @@ $vaakAdminOnlyActions = [
                 $error = $result['error'] ?? 'Could not publish draft.';
             }
         }
+    } elseif ($action === 'bsky_dm_send'
+        || ($action === 'dm_send' && ap_bsky_chat_ready_for((int) $vaakOwnerId)
+            && ap_bsky_chat_recipient_is_bluesky((string) ($_POST['to'] ?? '')))) {
+        // Bluesky DM: an open conversation (convo) or a new one from "To".
+        $view = 'dms';
+        $bskyConvoPost = trim((string) ($_POST['convo'] ?? ''));
+        $bskyToPost = $bskyConvoPost === '' ? trim((string) ($_POST['to'] ?? '')) : '';
+        $bskyFiles = $_FILES['media']['name'] ?? [];
+        $bskyHasFiles = is_array($bskyFiles) ? array_filter($bskyFiles, static fn ($n): bool => (string) $n !== '') !== [] : (string) $bskyFiles !== '';
+        if ($bskyHasFiles) {
+            $bskyRes = ['ok' => false, 'error' => 'Bluesky DMs are text only. Remove the attachment and send again.'];
+        } elseif ($bskyConvoPost === '' && $bskyToPost === '') {
+            $bskyRes = ['ok' => false, 'error' => 'Choose who to message.'];
+        } else {
+            $bskyRes = ap_bsky_chat_send((int) $vaakOwnerId, $bskyConvoPost, $bskyToPost, (string) ($_POST['content'] ?? ''));
+        }
+        $bskyHref = !empty($bskyRes['convo_id']) ? '?view=dms&bsky=' . rawurlencode((string) $bskyRes['convo_id']) : '?view=dms';
+        if (($_SERVER['HTTP_X_VAAK_DM'] ?? '') === '1') {
+            header('Content-Type: application/json; charset=utf-8');
+            header('Cache-Control: no-store');
+            if (empty($bskyRes['ok'])) {
+                http_response_code(422);
+                echo json_encode(['ok' => false, 'error' => (string) ($bskyRes['error'] ?? 'Bluesky did not accept the message.')], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+            } else {
+                echo json_encode([
+                    'ok' => true,
+                    'convo' => (string) $bskyRes['convo_id'],
+                    'delivered' => 1,
+                    'href' => $bskyHref,
+                ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+            }
+            exit;
+        }
+        if (!empty($bskyRes['ok'])) {
+            $notice = 'Sent on Bluesky.';
+            $_GET['bsky'] = (string) $bskyRes['convo_id'];
+        } else {
+            $error = (string) ($bskyRes['error'] ?? 'Bluesky did not accept the message.');
+            if ($bskyConvoPost !== '') {
+                $_GET['bsky'] = $bskyConvoPost;
+            }
+        }
     } elseif ($action === 'dm_send' || $action === 'dm_reply') {
         $view = 'dms';
         $to = trim((string) ($_POST['to'] ?? ''));
@@ -6925,9 +6968,9 @@ if (isset($_GET['partial'], $_GET['shell'])
 
 // DM screen: new rows for the open thread (polled only while that screen is
 // open and visible), the conversation rail, and the "New message" picker.
-if (isset($_GET['ajax']) && in_array((string) $_GET['ajax'], ['dm_thread', 'dm_list', 'dm_people'], true)) {
+if (isset($_GET['ajax']) && in_array((string) $_GET['ajax'], ['dm_thread', 'dm_list', 'dm_people', 'bsky_dm_thread'], true)) {
     $dmAjax = (string) $_GET['ajax'];
-    $dmMarkRead = $dmAjax === 'dm_thread' && (string) ($_GET['read'] ?? '') === '1';
+    $dmMarkRead = ($dmAjax === 'dm_thread' || $dmAjax === 'bsky_dm_thread') && (string) ($_GET['read'] ?? '') === '1';
     // Read-only for the session: release its lock so polls never queue
     // behind a slow page load in another tab.
     if (function_exists('ap_auth_session_write_close')) {
@@ -6944,12 +6987,61 @@ if (isset($_GET['ajax']) && in_array((string) $_GET['ajax'], ['dm_thread', 'dm_l
     }
     $dmOut = ['ok' => true];
     try {
+        $dmOwnerAjax = admin_owner_user_id();
+        $dmBskyOn = ap_bsky_chat_ready_for($dmOwnerAjax);
         if ($dmAjax === 'dm_people') {
-            $dmOut['people'] = admin_dm_people_search((string) ($_GET['q'] ?? ''), 8);
+            $dmPeople = admin_dm_people_search((string) ($_GET['q'] ?? ''), 8);
+            if ($dmBskyOn) {
+                foreach (ap_bsky_chat_people_search($dmOwnerAjax, (string) ($_GET['q'] ?? ''), 4) as $dmBskyPerson) {
+                    $dmBskyPerson['avatar'] = admin_bsky_dm_avatar_html((string) $dmBskyPerson['avatar_url'], 'dm-pick-avatar');
+                    unset($dmBskyPerson['avatar_url']);
+                    $dmBskyPerson['local'] = false;
+                    $dmPeople[] = $dmBskyPerson;
+                }
+            }
+            $dmOut['people'] = $dmPeople;
         } elseif ($dmAjax === 'dm_list') {
             $dmActive = rtrim(trim((string) ($_GET['peer'] ?? '')), '/');
-            $dmOut['html'] = admin_dm_conversation_list_html(ap_dm_conversations(60), $dmActive);
-            $dmOut['unread'] = ap_dm_unread_count();
+            $dmActiveBsky = trim((string) ($_GET['bsky'] ?? ''));
+            $dmBskyRows = [];
+            $dmBskyUnread = 0;
+            if ($dmBskyOn) {
+                // Only the DM screen asks for this, so it is also when Bluesky is refreshed.
+                $dmSync = ap_bsky_chat_sync($dmOwnerAjax);
+                if (empty($dmSync['ok']) && !empty($dmSync['scope'])) {
+                    $dmOut['bsky_scope'] = false;
+                }
+                $dmBskyRows = ap_bsky_chat_conversations($dmOwnerAjax, 60);
+                $dmBskyUnread = ap_bsky_chat_unread_count($dmOwnerAjax);
+            }
+            $dmOut['html'] = admin_dm_conversation_list_html(
+                ap_dm_conversations(60),
+                $dmActive,
+                $dmBskyRows,
+                $dmActiveBsky,
+                $dmBskyOn ? ap_bsky_chat_own_did($dmOwnerAjax) : ''
+            );
+            $dmOut['unread'] = ap_dm_unread_count() + $dmBskyUnread;
+        } elseif ($dmAjax === 'bsky_dm_thread') {
+            $dmConvoAjax = trim((string) ($_GET['convo'] ?? ''));
+            $dmAfterRev = trim((string) ($_GET['after'] ?? ''));
+            $dmConvoRow = $dmBskyOn && $dmConvoAjax !== '' ? ap_bsky_chat_convo($dmOwnerAjax, $dmConvoAjax) : null;
+            if ($dmConvoRow === null) {
+                http_response_code(404);
+                $dmOut = ['ok' => false, 'error' => 'That conversation is not available.'];
+            } else {
+                ap_bsky_chat_sync($dmOwnerAjax);
+                $dmConvoRow = ap_bsky_chat_convo($dmOwnerAjax, $dmConvoAjax) ?? $dmConvoRow;
+                $dmRows = ap_bsky_chat_messages($dmOwnerAjax, $dmConvoAjax, 50, $dmAfterRev);
+                $dmOut['html'] = $dmRows !== []
+                    ? admin_bsky_dm_message_rows_html($dmRows, ap_bsky_chat_own_did($dmOwnerAjax), $dmConvoRow)
+                    : '';
+                $dmOut['last_rev'] = admin_bsky_dm_last_rev($dmRows, $dmAfterRev);
+                $dmOut['count'] = count($dmRows);
+                if ($dmMarkRead && (int) ($dmConvoRow['unread_count'] ?? 0) > 0) {
+                    ap_bsky_chat_mark_read($dmOwnerAjax, $dmConvoAjax);
+                }
+            }
         } else {
             $dmPeerAjax = rtrim(trim((string) ($_GET['peer'] ?? '')), '/');
             $dmAfter = max(0, (int) ($_GET['after'] ?? 0));
@@ -7037,6 +7129,22 @@ if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'notif_unread') {
     } catch (Throwable $e) {
         $phyrianPending = 0;
     }
+    // Bluesky DMs: counts come from VAAK's cache (no network here). The cache
+    // is refreshed after the response is sent, at most every
+    // AP_BSKY_CHAT_BADGE_SYNC_SEC per user, so the next poll sees new messages.
+    $bskyBadgeSync = false;
+    try {
+        if ($ownerForBadge > 0 && ap_bsky_chat_ready_for($ownerForBadge)) {
+            $dmCount += ap_bsky_chat_unread_count($ownerForBadge);
+            $bskyTip = ap_bsky_chat_unread_tip($ownerForBadge);
+            if ($bskyTip !== '') {
+                $latestDmId = admin_dm_unread_tip_join($latestDmId, $bskyTip);
+            }
+            $bskyBadgeSync = ap_bsky_chat_badge_sync_enabled();
+        }
+    } catch (Throwable $e) {
+        $bskyBadgeSync = false;
+    }
     $latestUnread = preg_replace('/\D+/', '', (string) ($state['latest_unread_id'] ?? '')) ?: '';
     $latestAny = preg_replace('/\D+/', '', (string) ($state['latest_id'] ?? '')) ?: '';
     // Mentions badge includes pending Phyrian offers (they render on Mentions).
@@ -7051,6 +7159,16 @@ if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'notif_unread') {
         'last_read_id' => preg_replace('/\D+/', '', (string) ($state['last_read_id'] ?? '0')) ?: '0',
         'latest_dm_id' => $latestDmId,
     ], JSON_UNESCAPED_SLASHES);
+    if ($bskyBadgeSync) {
+        if (function_exists('fastcgi_finish_request')) {
+            fastcgi_finish_request();
+        }
+        try {
+            ap_bsky_chat_sync($ownerForBadge, AP_BSKY_CHAT_BADGE_SYNC_SEC);
+        } catch (Throwable $e) {
+            error_log('[ap-admin] bsky dm badge sync: ' . $e->getMessage());
+        }
+    }
     exit;
 }
 
@@ -17478,10 +17596,17 @@ function admin_dm_composer_fields_html(): string
 }
 
 /** Compact conversation rail used by the full-page DM workspace. */
-function admin_dm_conversation_list_html(array $conversations, string $activePeer = ''): string
+function admin_dm_conversation_list_html(array $conversations, string $activePeer = '', array $bskyConversations = [], string $activeBsky = '', string $ownBskyDid = ''): string
 {
-    if ($conversations === []) {
+    if ($conversations === [] && $bskyConversations === []) {
         return admin_mascot_empty('No direct messages yet.');
+    }
+    // Each row keeps its time so fediverse and Bluesky conversations interleave.
+    $items = [];
+    foreach ($bskyConversations as $bskyConversation) {
+        if (is_array($bskyConversation)) {
+            $items[] = admin_bsky_dm_conversation_row($bskyConversation, $activeBsky, $ownBskyDid);
+        }
     }
     $html = '';
     foreach ($conversations as $conversation) {
@@ -17512,6 +17637,7 @@ function admin_dm_conversation_list_html(array $conversations, string $activePee
         $handle = actor_handle($peer);
         $search = strtolower(trim(actor_display_name($peer) . ' ' . $handle));
         $lastAt = (string) ($last['created_at'] ?? '');
+        $html = '';
         $html .= '<a class="dm-conversation-row' . ($peer === $activePeer ? ' is-active' : '') . ($unread > 0 ? ' is-unread' : '') . '" href="?view=dms&amp;peer=' . rawurlencode($peer) . '"'
             . ' data-dm-peer="' . h($peer) . '" data-dm-search="' . h($search) . '"'
             . ($peer === $activePeer ? ' aria-current="page"' : '') . '>';
@@ -17525,8 +17651,132 @@ function admin_dm_conversation_list_html(array $conversations, string $activePee
             $html .= '<span class="nav-badge dm-conversation-badge">' . ($unread > 99 ? '99+' : (string) $unread) . '</span>';
         }
         $html .= '</a>';
+        $ts = $lastAt !== '' ? strtotime($lastAt) : false;
+        $items[] = ['ts' => $ts !== false ? $ts : 0, 'html' => $html];
     }
+    // Newest activity first; a stable sort keeps each network's own order on ties.
+    usort($items, static fn (array $a, array $b): int => $b['ts'] <=> $a['ts']);
+    $html = implode('', array_column($items, 'html'));
     return $html !== '' ? $html : admin_mascot_empty('No direct messages yet.');
+}
+
+/** Avatar for a Bluesky chat member (cached URL from Bluesky's CDN, or the default). */
+function admin_bsky_dm_avatar_html(string $url, string $class = 'tweet-av'): string
+{
+    $fallback = defined('AP_REMOTE_AVATAR_FALLBACK') ? AP_REMOTE_AVATAR_FALLBACK : 'https://mkultra.monster/img/avatar/default.jpg';
+    $src = $url !== '' && str_starts_with($url, 'https://') ? $url : $fallback;
+    return '<img class="' . h($class) . '" src="' . h($src) . '" alt="" width="40" height="40" loading="lazy" decoding="async" referrerpolicy="no-referrer" '
+        . 'onerror="this.onerror=null;this.src=\'' . h($fallback) . '\'">';
+}
+
+/** Display name for a Bluesky chat member. */
+function admin_bsky_dm_peer_name(array $convo): string
+{
+    $name = trim((string) ($convo['peer_name'] ?? ''));
+    $handle = (string) ($convo['peer_handle'] ?? '');
+    return $name !== '' ? $name : ($handle !== '' ? '@' . $handle : 'Bluesky user');
+}
+
+/**
+ * One Bluesky conversation in the DM rail.
+ *
+ * @return array{ts:int,html:string}
+ */
+function admin_bsky_dm_conversation_row(array $convo, string $activeConvo, string $ownDid): array
+{
+    $convoId = (string) ($convo['convo_id'] ?? '');
+    $handle = (string) ($convo['peer_handle'] ?? '');
+    $unread = (int) ($convo['muted'] ?? 0) === 1 ? 0 : (int) ($convo['unread_count'] ?? 0);
+    $preview = trim(preg_replace('/\s+/u', ' ', (string) ($convo['last_text'] ?? '')) ?? '');
+    if ($preview === '') {
+        $preview = 'No messages yet';
+    } elseif ($ownDid !== '' && (string) ($convo['last_sender_did'] ?? '') === $ownDid) {
+        $preview = 'You: ' . $preview;
+    }
+    $preview = mb_strimwidth($preview, 0, 96, '…', 'UTF-8');
+    $lastAt = (string) ($convo['last_at'] ?? '');
+    $ts = $lastAt !== '' ? strtotime($lastAt) : false;
+    $active = $convoId !== '' && $convoId === $activeConvo;
+    $name = admin_bsky_dm_peer_name($convo);
+    $isRequest = (string) ($convo['status'] ?? '') === 'request';
+    $html = '<a class="dm-conversation-row is-bsky' . ($active ? ' is-active' : '') . ($unread > 0 ? ' is-unread' : '') . '" href="?view=dms&amp;bsky=' . rawurlencode($convoId) . '"'
+        . ' data-dm-peer="bsky:' . h($convoId) . '" data-dm-search="' . h(strtolower($name . ' @' . $handle . ' bluesky')) . '"'
+        . ($active ? ' aria-current="page"' : '') . '>'
+        . '<span class="dm-conversation-avatar">' . admin_bsky_dm_avatar_html((string) ($convo['peer_avatar'] ?? '')) . '</span>'
+        . '<span class="dm-conversation-copy"><span class="dm-conversation-top"><span class="dm-conversation-name">' . h($name) . '</span>';
+    if ($lastAt !== '') {
+        $html .= '<time class="dm-conversation-time" datetime="' . h($lastAt) . '">' . h(relative_time($lastAt)) . '</time>';
+    }
+    $html .= '</span><span class="dm-conversation-preview"><span class="dm-net-chip dm-net-chip--bsky">' . ($isRequest ? 'Bluesky request' : 'Bluesky') . '</span> ' . h($preview) . '</span></span>';
+    if ($unread > 0) {
+        $html .= '<span class="nav-badge dm-conversation-badge">' . ($unread > 99 ? '99+' : (string) $unread) . '</span>';
+    }
+    $html .= '</a>';
+    return ['ts' => $ts !== false ? $ts : 0, 'html' => $html];
+}
+
+/**
+ * Chat rows for one Bluesky conversation, oldest first. Same markup as
+ * fediverse rows so grouping, day separators and scrolling are shared.
+ *
+ * @param list<array<string,mixed>> $rows from ap_bsky_chat_messages
+ */
+function admin_bsky_dm_message_rows_html(array $rows, string $ownDid, array $convo): string
+{
+    $html = '';
+    foreach ($rows as $m) {
+        if (!is_array($m)) {
+            continue;
+        }
+        $isOut = $ownDid !== '' && (string) ($m['sender_did'] ?? '') === $ownDid;
+        $sentAt = (string) ($m['sent_at'] ?? '');
+        $ts = $sentAt !== '' ? strtotime($sentAt) : false;
+        $iso = $ts !== false ? gmdate('c', $ts) : '';
+        if ((int) ($m['deleted'] ?? 0) === 1) {
+            $body = '<span class="meta">Message deleted</span>';
+        } else {
+            $facets = json_decode((string) ($m['facets_json'] ?? ''), true);
+            $body = ap_bsky_chat_text_html((string) ($m['text'] ?? ''), is_array($facets) ? $facets : []);
+            $shared = ap_bsky_chat_embed_url(isset($m['embed_json']) ? (string) $m['embed_json'] : null);
+            if ($shared !== '') {
+                $body .= ($body !== '' ? '<br>' : '') . '<a class="dm-bsky-shared" href="' . h($shared) . '" target="_blank" rel="noopener noreferrer">Shared a Bluesky post ↗</a>';
+            }
+            if ($body === '') {
+                $body = '<span class="meta">(no text in this message)</span>';
+            }
+        }
+        $html .= '<div class="dm-msg ' . ($isOut ? 'dm-msg--out' : 'dm-msg--in') . '"'
+            . ' data-dm-id="' . h((string) ($m['message_id'] ?? '')) . '" data-dm-rev="' . h((string) ($m['rev'] ?? '')) . '"'
+            . ' data-dm-dir="' . ($isOut ? 'out' : 'in') . '"'
+            . ($iso !== '' ? ' data-dm-ts="' . h($iso) . '"' : '') . '>';
+        if (!$isOut) {
+            $html .= '<span class="dm-msg-av">' . admin_bsky_dm_avatar_html((string) ($convo['peer_avatar'] ?? ''), 'dm-msg-avatar') . '</span>';
+        }
+        $html .= '<div class="dm-msg-body"><div class="dm-bubble ' . ($isOut ? 'dm-out' : 'dm-in') . '">' . $body . '</div>'
+            . '<div class="dm-msg-meta"><time' . ($iso !== '' ? ' datetime="' . h($iso) . '"' : '') . '>'
+            . h($sentAt !== '' ? relative_time($sentAt) : '') . '</time></div>'
+            . '</div></div>';
+    }
+    return $html;
+}
+
+/** Unread DM tip across networks: the page only compares it for change. */
+function admin_dm_unread_tip_join(string $fediTip, string $bskyTip): string
+{
+    return $bskyTip === '' ? $fediTip : ($fediTip . ':b' . $bskyTip);
+}
+
+/** Newest rev among rows, the cursor for the next live fetch. */
+function admin_bsky_dm_last_rev(array $rows, string $after = ''): string
+{
+    $last = $after;
+    foreach ($rows as $m) {
+        $rev = is_array($m) ? (string) ($m['rev'] ?? '') : '';
+        if (strcmp($rev, $last) > 0) {
+            $last = $rev;
+        }
+    }
+    return $last;
 }
 
 /**
@@ -26454,6 +26704,9 @@ try {
         );
         $dmSeedSt->execute([$ownerForDmSeed]);
         $dmLatestIdNav = (string) ($dmSeedSt->fetchColumn() ?: '');
+        if (ap_bsky_chat_ready_for($ownerForDmSeed)) {
+            $dmLatestIdNav = admin_dm_unread_tip_join($dmLatestIdNav, ap_bsky_chat_unread_tip($ownerForDmSeed));
+        }
     }
 } catch (Throwable $e) {
     $dmLatestIdNav = '';
@@ -29391,6 +29644,12 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     .dm-peer-copy { display: flex; flex-direction: column; min-width: 0; }
     .dm-peer-copy .who, .dm-peer-copy .meta { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .dm-peer-chip { flex: 0 0 auto; font-size: .72rem; font-weight: 600; padding: .12rem .55rem; border-radius: 999px; background: var(--primary-dim); color: var(--primary); }
+    /* Bluesky DMs: Bluesky's own blue, so the network is clear at a glance on every theme. */
+    .dm-peer-chip.dm-net-chip--bsky { background: rgba(32, 139, 254, .16); color: #5aa9ff; }
+    .dm-net-chip { display: inline-block; font-size: .66rem; font-weight: 700; padding: 0 .4rem; border-radius: 999px; vertical-align: 1px; }
+    .dm-net-chip--bsky { background: rgba(32, 139, 254, .16); color: #5aa9ff; }
+    .dm-bsky-scope, .dm-bsky-note { margin: .5rem .25rem; padding: .5rem .65rem; border: 1px solid rgba(32, 139, 254, .35); border-radius: 10px; font-size: .78rem; }
+    .dm-bsky-shared { font-size: .85rem; }
     .dm-pane .dm-reply-form { padding: .6rem 0 0; margin: 0; border: 0; border-top: 1px solid var(--border); border-radius: 0; background: none; box-shadow: none; }
     .dm-compose-row { display: flex; align-items: flex-end; gap: .45rem; }
     .dm-reply-form .dm-compose-row textarea {
@@ -32150,7 +32409,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     </nav>
     <?php else: ?>
     <?php
-      $dmUnreadNav = ap_dm_unread_count();
+      $dmUnreadNav = ap_dm_unread_count() + ap_bsky_chat_unread_count((int) $vaakOwnerId);
       $discussUnreadNav = function_exists('ap_discuss_unread_topic_count') ? ap_discuss_unread_topic_count($vaakOwnerId) : 0;
       $noticesUnreadNav = isset($noticesUnreadNav) ? (int) $noticesUnreadNav : 0;
       $navLibraryOpen = false;
@@ -33200,29 +33459,94 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
           }
           $dmPeerBlocked = $dmPeer !== '' && function_exists('ap_is_blocked_actor')
               && ap_is_blocked_actor($dmPeer);
-          $dmComposeNew = $dmPeer === '' && (string) ($_GET['new'] ?? '') === '1';
+          // Bluesky DMs (VAAK_BSKY_DMS=1 and a connected Bluesky account).
+          $dmBskyOn = ap_bsky_chat_ready_for((int) $vaakOwnerId);
+          $dmBskyConvoId = $dmBskyOn && $dmPeer === '' ? trim((string) ($_GET['bsky'] ?? '')) : '';
+          $dmBskyConvo = $dmBskyConvoId !== '' ? ap_bsky_chat_convo((int) $vaakOwnerId, $dmBskyConvoId) : null;
+          if ($dmBskyConvo === null) {
+              $dmBskyConvoId = '';
+          }
+          $dmBskyOwnDid = $dmBskyOn ? ap_bsky_chat_own_did((int) $vaakOwnerId) : '';
+          $dmBskyScopeOk = !$dmBskyOn || ap_bsky_chat_scope_ok((int) $vaakOwnerId);
+          $dmBskyConversations = $dmBskyOn ? ap_bsky_chat_conversations((int) $vaakOwnerId, 60) : [];
+          $dmComposeNew = $dmPeer === '' && $dmBskyConvoId === '' && (string) ($_GET['new'] ?? '') === '1';
           $dmToPrefill = $dmPeer === '' ? trim((string) ($_GET['to'] ?? '')) : '';
           $dmConversations = ap_dm_conversations(60);
-          $dmUnread = ap_dm_unread_count();
+          $dmUnread = ap_dm_unread_count() + ($dmBskyOn ? ap_bsky_chat_unread_count((int) $vaakOwnerId) : 0);
+          $dmThreadOpen = $dmPeer !== '' || $dmBskyConvoId !== '';
         ?>
-        <div class="dm-workspace<?= $dmPeer !== '' ? ' is-peer-open' : '' ?><?= $dmComposeNew ? ' is-compose-open' : '' ?>" id="dm-workspace" data-dm-peer="<?= h($dmPeer) ?>">
+        <div class="dm-workspace<?= $dmThreadOpen ? ' is-peer-open' : '' ?><?= $dmComposeNew ? ' is-compose-open' : '' ?>" id="dm-workspace" data-dm-peer="<?= h($dmPeer) ?>" data-dm-bsky="<?= h($dmBskyConvoId) ?>" data-dm-bsky-on="<?= $dmBskyOn ? '1' : '0' ?>">
           <aside class="dm-sidebar" aria-label="Direct message conversations">
             <div class="dm-sidebar-head">
               <div class="dm-sidebar-title">Messages <span class="nav-badge dm-conversation-badge" id="dm-sidebar-unread"<?= $dmUnread > 0 ? '' : ' hidden' ?>><?= $dmUnread > 99 ? '99+' : (string) (int) $dmUnread ?></span></div>
               <a class="btn btn-primary dm-new-btn" href="?view=dms&amp;new=1">New message</a>
             </div>
-            <?php if ($dmConversations !== []): ?>
+            <?php if ($dmBskyOn && !$dmBskyScopeOk): ?>
+              <div class="dm-bsky-scope meta" id="dm-bsky-scope" role="note">Your Bluesky connection can’t read DMs. <a href="?view=atmosphere">Reconnect Bluesky</a> with your account password, or an app password with “Allow access to your direct messages” ticked.</div>
+            <?php endif; ?>
+            <?php if ($dmConversations !== [] || $dmBskyConversations !== []): ?>
               <div class="dm-sidebar-search">
                 <input id="dm-conversation-filter" type="search" placeholder="Search conversations" aria-label="Search conversations" autocomplete="off">
               </div>
             <?php endif; ?>
             <div class="dm-conversation-list" id="dm-conversation-list">
-              <?= admin_dm_conversation_list_html($dmConversations, $dmPeer) ?>
+              <?= admin_dm_conversation_list_html($dmConversations, $dmPeer, $dmBskyConversations, $dmBskyConvoId, $dmBskyOwnDid) ?>
             </div>
             <div class="meta dm-filter-empty" id="dm-filter-empty" hidden>No conversations match.</div>
           </aside>
           <section class="dm-pane">
-        <?php if ($dmPeer === ''): ?>
+        <?php if ($dmBskyConvo !== null): ?>
+          <?php
+            $dmBskyRows = ap_bsky_chat_messages((int) $vaakOwnerId, $dmBskyConvoId, 200);
+            try {
+                ap_bsky_chat_mark_read((int) $vaakOwnerId, $dmBskyConvoId);
+            } catch (Throwable $e) {
+                error_log('[ap-admin] bsky dm mark read: ' . $e->getMessage());
+            }
+            $dmBskyPeerHref = (string) ($dmBskyConvo['peer_did'] ?? '') !== ''
+                ? admin_profile_app_href('https://bsky.app/profile/' . (string) $dmBskyConvo['peer_did'], 'dms')
+                : '?view=dms';
+            $dmBskyHandle = (string) ($dmBskyConvo['peer_handle'] ?? '');
+            $dmBskyCanSend = (int) ($dmBskyConvo['peer_chat_disabled'] ?? 0) !== 1;
+          ?>
+            <div class="dm-pane-header">
+              <a class="btn btn-ghost dm-back" href="?view=dms" aria-label="All conversations">←</a>
+              <a class="dm-peer" href="<?= h($dmBskyPeerHref) ?>">
+                <?= admin_bsky_dm_avatar_html((string) ($dmBskyConvo['peer_avatar'] ?? ''), 'dm-peer-avatar') ?>
+                <span class="dm-peer-copy">
+                  <span class="who"><?= h(admin_bsky_dm_peer_name($dmBskyConvo)) ?></span>
+                  <span class="meta"><?= h($dmBskyHandle !== '' ? '@' . $dmBskyHandle : '') ?></span>
+                </span>
+              </a>
+              <span class="dm-peer-chip dm-net-chip--bsky">Bluesky</span>
+            </div>
+            <?php if ((string) ($dmBskyConvo['status'] ?? '') === 'request'): ?>
+              <div class="dm-bsky-note meta" role="note">Message request. Replying accepts it on Bluesky.</div>
+            <?php endif; ?>
+            <div id="dm-thread" class="dm-thread" role="log" aria-label="Messages" data-dm-last-rev="<?= h(admin_bsky_dm_last_rev($dmBskyRows)) ?>">
+              <?php if (!$dmBskyRows): ?>
+                <div class="empty dm-thread-empty">No messages yet. Say hi below.</div>
+              <?php endif; ?>
+              <?= admin_bsky_dm_message_rows_html($dmBskyRows, $dmBskyOwnDid, $dmBskyConvo) ?>
+              <div id="dm-message-last" class="dm-thread-end" aria-hidden="true"></div>
+            </div>
+            <?php if ($dmBskyCanSend): ?>
+            <form class="composer dm-reply-form" method="post" action="?view=dms&amp;bsky=<?= urlencode($dmBskyConvoId) ?>" data-dm-form="reply">
+              <input type="hidden" name="action" value="bsky_dm_send">
+              <input type="hidden" name="convo" value="<?= h($dmBskyConvoId) ?>">
+              <div class="dm-compose-row">
+                <textarea name="content" maxlength="<?= (int) AP_BSKY_CHAT_TEXT_MAX ?>" rows="1" aria-label="Message to <?= h($dmBskyHandle !== '' ? '@' . $dmBskyHandle : 'this person') ?>" placeholder="Message"></textarea>
+                <button class="btn btn-primary dm-send" type="submit">Send</button>
+              </div>
+              <div class="dm-compose-hint meta">
+                <span class="dm-form-status" role="status" aria-live="polite">Bluesky DM, text only</span>
+                <span class="dm-enter-hint" hidden>Enter to send, Shift+Enter for a new line</span>
+              </div>
+            </form>
+            <?php else: ?>
+              <div class="empty" style="margin-top:1rem">This person isn’t accepting DMs on Bluesky right now.</div>
+            <?php endif; ?>
+        <?php elseif ($dmPeer === ''): ?>
             <div class="dm-pane-header">
               <a class="btn btn-ghost dm-back" href="?view=dms" aria-label="All conversations">←</a>
               <div class="dm-pane-title">New message</div>
@@ -33232,10 +33556,10 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
               <label class="dm-label" for="dm-to">To</label>
               <div class="dm-picker">
                 <input id="dm-to" name="to" type="text" required autocomplete="off" spellcheck="false" value="<?= h($dmToPrefill) ?>"
-                       placeholder="Name, @user, or @user@server" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="dm-picker-list">
+                       placeholder="<?= $dmBskyOn ? 'Name, @user, @user@server, or @handle.bsky.social' : 'Name, @user, or @user@server' ?>" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="dm-picker-list">
                 <ul class="dm-picker-list" id="dm-picker-list" role="listbox" aria-label="Suggested people" hidden></ul>
               </div>
-              <div class="meta dm-picker-hint">Search people you follow, past conversations, and VAAK accounts. Messages between VAAK accounts never leave this server.</div>
+              <div class="meta dm-picker-hint">Search people you follow, past conversations, and VAAK accounts. Messages between VAAK accounts never leave this server.<?= $dmBskyOn ? ' For Bluesky, type their handle (like @name.bsky.social). Bluesky DMs are text only.' : '' ?></div>
               <label class="dm-label" for="dm-new-content">Message</label>
               <textarea id="dm-new-content" name="content" maxlength="2000" rows="3" placeholder="Private message or attachment…"></textarea>
               <div class="dm-extras" data-dm-extras>
@@ -33513,6 +33837,9 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
           const workspace = document.getElementById('dm-workspace');
           if (!workspace) return;
           const peer = workspace.getAttribute('data-dm-peer') || '';
+          // Bluesky conversation id when a Bluesky thread is open; its cursor is a rev string.
+          const bskyConvo = workspace.getAttribute('data-dm-bsky') || '';
+          const bskyOn = workspace.getAttribute('data-dm-bsky-on') === '1';
           const thread = document.getElementById('dm-thread');
           const endMarker = document.getElementById('dm-message-last');
           const coarse = window.matchMedia && window.matchMedia('(pointer: coarse)').matches;
@@ -33604,7 +33931,9 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
 
           // ---- live thread ----
           let lastId = thread ? (parseInt(thread.getAttribute('data-dm-last-id'), 10) || 0) : 0;
+          let lastRev = thread ? (thread.getAttribute('data-dm-last-rev') || '') : '';
           let fetching = null;
+          const cssId = function (v) { return (window.CSS && CSS.escape) ? CSS.escape(v) : String(v).replace(/["\\]/g, '\\$&'); };
           function appendRows(html) {
             if (!thread || !endMarker || !html) return { added: 0, incoming: 0 };
             const tpl = document.createElement('template');
@@ -33614,7 +33943,7 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
             let lastInObject = '';
             Array.from(tpl.content.querySelectorAll('.dm-msg')).forEach(function (row) {
               const id = row.getAttribute('data-dm-id');
-              if (id && thread.querySelector('.dm-msg[data-dm-id="' + id + '"]')) return;
+              if (id && thread.querySelector('.dm-msg[data-dm-id="' + cssId(id) + '"]')) return;
               thread.insertBefore(row, endMarker);
               added += 1;
               if (row.getAttribute('data-dm-dir') === 'in') {
@@ -33644,17 +33973,20 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
             return { added: added, incoming: incoming };
           }
           function fetchNew() {
-            if (!thread || !peer) return Promise.resolve();
+            if (!thread || (!peer && !bskyConvo)) return Promise.resolve();
             if (fetching) return fetching;
             const wasNear = nearBottom();
             const read = document.visibilityState === 'visible' ? '1' : '0';
-            const url = '?ajax=dm_thread&peer=' + encodeURIComponent(peer) + '&after=' + lastId + '&read=' + read;
+            const url = bskyConvo
+              ? '?ajax=bsky_dm_thread&convo=' + encodeURIComponent(bskyConvo) + '&after=' + encodeURIComponent(lastRev) + '&read=' + read
+              : '?ajax=dm_thread&peer=' + encodeURIComponent(peer) + '&after=' + lastId + '&read=' + read;
             fetching = fetch(url, { credentials: 'same-origin', headers: { 'Accept': 'application/json' }, cache: 'no-store' })
               .then(function (res) { return res.ok ? res.json() : null; })
               .then(function (data) {
                 if (!data || !data.ok) return;
                 const next = parseInt(data.last_id, 10) || 0;
                 if (next > lastId) lastId = next;
+                if (typeof data.last_rev === 'string' && data.last_rev > lastRev) lastRev = data.last_rev;
                 const result = appendRows(data.html || '');
                 if (!result.added) return;
                 if (wasNear) {
@@ -33675,12 +34007,20 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
             if (!list) return;
             if (listTimer) window.clearTimeout(listTimer);
             listTimer = window.setTimeout(function () {
-              fetch('?ajax=dm_list&peer=' + encodeURIComponent(peer), { credentials: 'same-origin', headers: { 'Accept': 'application/json' }, cache: 'no-store' })
+              fetch('?ajax=dm_list&peer=' + encodeURIComponent(peer) + '&bsky=' + encodeURIComponent(bskyConvo), { credentials: 'same-origin', headers: { 'Accept': 'application/json' }, cache: 'no-store' })
                 .then(function (res) { return res.ok ? res.json() : null; })
                 .then(function (data) {
                   if (!data || !data.ok || typeof data.html !== 'string') return;
                   list.innerHTML = data.html;
                   applyFilter();
+                  if (data.bsky_scope === false && !document.getElementById('dm-bsky-scope')) {
+                    const note = document.createElement('div');
+                    note.className = 'dm-bsky-scope meta';
+                    note.id = 'dm-bsky-scope';
+                    note.setAttribute('role', 'note');
+                    note.textContent = 'Your Bluesky connection can’t read DMs. Reconnect Bluesky in ATmosphere with an app password that allows DMs.';
+                    list.parentNode.insertBefore(note, list);
+                  }
                   const badge = document.getElementById('dm-sidebar-unread');
                   if (badge) {
                     const n = parseInt(data.unread, 10) || 0;
@@ -33698,10 +34038,27 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
           function schedulePoll() {
             if (pollTimer) window.clearTimeout(pollTimer);
             pollTimer = 0;
-            if (!peer || document.visibilityState !== 'visible') return;
+            if ((!peer && !bskyConvo) || document.visibilityState !== 'visible') return;
             pollTimer = window.setTimeout(function () {
               fetchNew().then(schedulePoll);
             }, 15000);
+          }
+          // Bluesky has no push into VAAK, so while this screen is visible the
+          // list asks every 30 s (the server refreshes from Bluesky at most every 4 s).
+          let bskyListTimer = 0;
+          function scheduleBskyList() {
+            if (bskyListTimer) window.clearTimeout(bskyListTimer);
+            bskyListTimer = 0;
+            if (!bskyOn || document.visibilityState !== 'visible') return;
+            bskyListTimer = window.setTimeout(function () {
+              refreshList();
+              scheduleBskyList();
+            }, 30000);
+          }
+          if (bskyOn) {
+            refreshList();
+            scheduleBskyList();
+            document.addEventListener('visibilitychange', scheduleBskyList);
           }
           document.addEventListener('visibilitychange', function () {
             if (document.visibilityState === 'visible') {
@@ -33869,7 +34226,7 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
                 name.textContent = p.name || p.handle;
                 const handle = document.createElement('span');
                 handle.className = 'meta';
-                handle.textContent = (p.handle || p.actor_id) + (p.local ? ' · on VAAK' : '');
+                handle.textContent = (p.handle || p.actor_id) + (p.local ? ' · on VAAK' : (p.network === 'bluesky' ? ' · Bluesky' : ''));
                 copy.appendChild(name);
                 copy.appendChild(handle);
                 li.appendChild(av);

@@ -223,7 +223,7 @@ $inbox = (string) file_get_contents($root . '/api/ap-inbox.php');
 $send = substr($inbox, (int) strpos($inbox, 'function ap_dm_send('));
 dm_ws_check(strpos($send, 'ap_dm_local_recipient($peer)') < strpos($send, 'ap_fetch_actor_doc($peer)'), 'local recipients are found before any actor fetch');
 dm_ws_check(str_contains($send, 'ap_dm_deliver_local($localPeerUser'), 'local recipients get a direct copy');
-dm_ws_check(str_contains($admin, "in_array((string) \$_GET['ajax'], ['dm_thread', 'dm_list', 'dm_people'], true)"), 'DM ajax routes exist');
+dm_ws_check(str_contains($admin, "in_array((string) \$_GET['ajax'], ['dm_thread', 'dm_list', 'dm_people', 'bsky_dm_thread'], true)"), 'DM ajax routes exist');
 dm_ws_check(str_contains($admin, "(\$_SERVER['HTTP_X_VAAK_DM'] ?? '') === '1'"), 'fetch sends get a JSON answer');
 $start = strpos($admin, "<?php elseif (\$view === 'dms'): ?>");
 $end = strpos($admin, "<?php elseif (\$view === 'report'): ?>", (int) $start);

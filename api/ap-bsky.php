@@ -1914,7 +1914,8 @@ function ap_bsky_xrpc(
     ?array $query = null,
     ?array $jsonBody = null,
     ?string $bearer = null,
-    int $timeoutSec = AP_BSKY_DEFAULT_TIMEOUT
+    int $timeoutSec = AP_BSKY_DEFAULT_TIMEOUT,
+    array $extraHeaders = []
 ): array {
     if (ap_bsky_budget_exceeded()) {
         return ['ok' => false, 'error' => 'Bluesky budget exceeded', 'status' => 0];
@@ -1950,6 +1951,14 @@ function ap_bsky_xrpc(
     ];
     if ($bearer !== null && $bearer !== '') {
         $headers[] = 'Authorization: Bearer ' . $bearer;
+    }
+    // Extra headers (e.g. atproto-proxy for chat.bsky.*). Never let one smuggle a second header line.
+    foreach ($extraHeaders as $extra) {
+        $extra = (string) $extra;
+        if ($extra === '' || preg_match('/[\r\n]/', $extra) || !preg_match('/^[A-Za-z0-9-]+:\s?\S/', $extra)) {
+            return ['ok' => false, 'error' => 'Invalid request header'];
+        }
+        $headers[] = $extra;
     }
     $payload = null;
     if ($method !== 'GET' && is_array($jsonBody)) {

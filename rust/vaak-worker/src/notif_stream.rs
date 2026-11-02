@@ -7,8 +7,9 @@
 //!
 //! The stream never carries notification content. It sends `event: notif`
 //! when the owner's notification fingerprint (newest mention row, read
-//! marker, unread DMs, pending Phyrian requests) moves, and the page then
-//! runs its normal `?ajax=notif_unread` poll. Several tabs of one owner share
+//! marker, unread DMs including cached Bluesky DMs, pending Phyrian
+//! requests) moves, and the page then runs its normal `?ajax=notif_unread`
+//! poll. Several tabs of one owner share
 //! one fingerprint query per [`FP_TTL`].
 //!
 //! Auth: the page gets a random token from PHP, which stores
@@ -140,7 +141,21 @@ async fn read_fingerprint(cfg: &Config, owner: i64) -> Result<String> {
         Ok(row) => row.get(0),
         Err(_) => 0,
     };
-    Ok(format!("{mention}:{marker}:{dm_count}:{dm_max}:{phyrian}"))
+    // Bluesky DM cache (api/ap-bsky-chat.php). PHP refreshes it in the
+    // background after a badge poll; this lets the badge follow within one tick.
+    let bsky: String = match db
+        .query_one(
+            "SELECT CASE WHEN to_regclass('public.bsky_chat_convos') IS NULL THEN ''
+                         ELSE (SELECT COALESCE(sum(unread_count), 0)::text || '/' || COALESCE(max(rev), '')
+                                 FROM bsky_chat_convos WHERE owner_user_id = $1::bigint AND muted = 0 AND unread_count > 0) END",
+            &[&owner],
+        )
+        .await
+    {
+        Ok(row) => row.get::<_, Option<String>>(0).unwrap_or_default(),
+        Err(_) => String::new(),
+    };
+    Ok(format!("{mention}:{marker}:{dm_count}:{dm_max}:{phyrian}:{bsky}"))
 }
 
 async fn fingerprint(cfg: &Config, owner: i64) -> Option<String> {
