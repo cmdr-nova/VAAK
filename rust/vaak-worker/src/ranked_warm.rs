@@ -68,6 +68,11 @@ fn env_flag_default_true(name: &str) -> bool {
     }
 }
 
+/// `VAAK_HOME_BURST_SPREAD=0` turns author burst spreading off.
+fn burst_spread_enabled() -> bool {
+    env_flag_default_true("VAAK_HOME_BURST_SPREAD")
+}
+
 fn native_home_enabled() -> bool {
     env_flag_default_true("VAAK_RANKED_NATIVE_HOME")
 }
@@ -337,9 +342,8 @@ async fn load_followed_tags(db: &Client, owner: i64) -> Vec<String> {
             .ok()
             .flatten()
             .unwrap_or_default()
-            .trim()
-            .trim_start_matches('#')
-            .to_ascii_lowercase();
+            .to_string();
+        let tag = crate::hashtags::normalize_name(&tag);
         if !tag.is_empty() && seen.insert(tag.clone()) {
             tags.push(tag);
         }
@@ -619,13 +623,15 @@ const FOLLOWED_TAG_INDEXED_SQL: &str = "WITH hits AS (
      LIMIT 600";
 
 /// `htag_a | htag_b` for the tags [`extract_hashtags`] can ever match
-/// (ASCII letters, digits and `_`, 2 to 64 long). None when no tag qualifies.
+/// (Unicode letters, numbers and `_`, 2 to 64 long). None when no tag qualifies.
 fn followed_tag_tsquery(tags: &[String]) -> Option<String> {
     let mut parts: Vec<String> = Vec::new();
     for tag in tags {
-        let tag = tag.trim().trim_start_matches('#').to_ascii_lowercase();
-        if !(2..=64).contains(&tag.len())
-            || !tag.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        // Letters, numbers and `_` only, so nothing here can be a tsquery
+        // operator. `htag_café` parses as the phrase `htag <-> café`, the same
+        // way the indexer's `htag_café` token was parsed into the tsvector.
+        let tag = crate::hashtags::normalize_name(tag);
+        if !(2..=64).contains(&tag.chars().count())
             || tag.trim_matches('_').is_empty()
         {
             continue;
@@ -1919,35 +1925,7 @@ fn strip_tags_lower(text: &str) -> String {
 }
 
 fn extract_hashtags(text: &str) -> Vec<String> {
-    let plain = strip_tags_lower(text);
-    let mut tags = Vec::new();
-    let mut seen = HashSet::new();
-    let bytes = plain.as_bytes();
-    let mut i = 0usize;
-    while i < bytes.len() {
-        if bytes[i] == b'#' {
-            let start = i + 1;
-            let mut end = start;
-            while end < bytes.len() {
-                let c = bytes[end] as char;
-                if c.is_ascii_alphanumeric() || c == '_' {
-                    end += 1;
-                } else {
-                    break;
-                }
-            }
-            if end > start {
-                let tag = plain[start..end].to_string();
-                if (2..=64).contains(&tag.len()) && seen.insert(tag.clone()) {
-                    tags.push(tag);
-                }
-                i = end;
-                continue;
-            }
-        }
-        i += 1;
-    }
-    tags
+    crate::hashtags::extract(text)
 }
 
 /// Letters, numbers, and underscores keep going as one token.
@@ -2394,26 +2372,43 @@ async fn load_favourite_actor_weights(db: &Client, owner: i64) -> HashMap<String
     weights
 }
 
+/// Passive signals (one row per post seen, clicked or dwelt on) share
+/// `ap_user_signals` with likes, boosts and replies. Read them with separate
+/// caps, the way Twitter's user-signal-service caps each signal type, so a
+/// long scroll session cannot push weeks of explicit actions out of a single
+/// newest-N window. Explicit rows keep the 90-day retention window; passive
+/// rows are weighted at -0.03..0.3 with the same 14-day decay, so 14 days
+/// covers nearly all of their effect.
+const SIGNAL_PASSIVE_KINDS: [&str; 3] = ["impression", "click", "dwell"];
+const SIGNAL_EXPLICIT_DAYS: i64 = 90;
+const SIGNAL_PASSIVE_DAYS: i64 = 14;
+const SIGNAL_ACTOR_WEIGHTS_SQL: &str = "(SELECT signal_type, weight::float8, metadata_json, created_at::text
+        FROM ap_user_signals
+        WHERE owner_user_id = $1 AND created_at >= $2
+          AND NOT (lower(signal_type) = ANY($4::text[]))
+        ORDER BY id DESC LIMIT 2000)
+     UNION ALL
+     (SELECT signal_type, weight::float8, metadata_json, created_at::text
+        FROM ap_user_signals
+        WHERE owner_user_id = $1 AND created_at >= $3
+          AND lower(signal_type) = ANY($4::text[])
+        ORDER BY id DESC LIMIT 500)";
+
 async fn load_signal_actor_weights(db: &Client, owner: i64) -> HashMap<String, f64> {
     if owner < 1 {
         return HashMap::new();
     }
-    // Keep more of the durable interaction history available to ranking while
-    // retaining a hard row bound so a very active account cannot make rebuilds
-    // unbounded. The database retention window is longer than the old 45-day
-    // native read window.
-    let since = chrono::Utc::now() - chrono::Duration::days(90);
-    let since_s = since.to_rfc3339();
+    let since_s = (chrono::Utc::now() - chrono::Duration::days(SIGNAL_EXPLICIT_DAYS)).to_rfc3339();
+    let passive_since_s =
+        (chrono::Utc::now() - chrono::Duration::days(SIGNAL_PASSIVE_DAYS)).to_rfc3339();
+    let passive: Vec<&str> = SIGNAL_PASSIVE_KINDS.to_vec();
     let rows = db
-        .query(
-            "SELECT signal_type, weight, metadata_json, created_at
-             FROM ap_user_signals
-             WHERE owner_user_id = $1 AND created_at >= $2
-             ORDER BY id DESC LIMIT 2000",
-            &[&owner, &since_s],
-        )
+        .query(SIGNAL_ACTOR_WEIGHTS_SQL, &[&owner, &since_s, &passive_since_s, &passive])
         .await
-        .unwrap_or_default();
+        .unwrap_or_else(|e| {
+            tracing::debug!(error = %e, owner, "signal actor weights unavailable");
+            Vec::new()
+        });
     let kind_weight = |kind: &str| -> f64 {
         match kind {
             "like" => 1.4,
@@ -3046,6 +3041,110 @@ fn apply_favourite_rank(
     }
 }
 
+/// Author burst spreading, adapted from the author-diversity discount in
+/// Twitter's home-mixer (`(1 - floor) * decay^n + floor`, decay 0.5, floor
+/// 0.25). Home is ordered by time, so the multiplier becomes a backwards time
+/// shift of up to [`BURST_MAX_SHIFT_SECS`].
+///
+/// An author's posts less than [`BURST_CLUSTER_GAP_SECS`] apart form one
+/// cluster and move together, so a self-thread posted in one go stays
+/// grouped. For each cluster, `n` is how many newer clusters the same author
+/// has within [`BURST_WINDOW_SECS`]: the newest stays put and earlier ones in
+/// the burst step back, which keeps the author's own order. Posts older than
+/// 48 hours, posts with no author and the owner's own posts are untouched.
+const BURST_CLUSTER_GAP_SECS: i64 = 5 * 60;
+const BURST_WINDOW_SECS: i64 = 3 * 3600;
+const BURST_MAX_SHIFT_SECS: f64 = 2.0 * 3600.0;
+const BURST_DECAY: f64 = 0.5;
+const BURST_FLOOR: f64 = 0.25;
+
+fn burst_shift_secs(n: usize) -> i64 {
+    if n == 0 {
+        return 0;
+    }
+    let mult = (1.0 - BURST_FLOOR) * BURST_DECAY.powi(n.min(32) as i32) + BURST_FLOOR;
+    ((1.0 - mult) * BURST_MAX_SHIFT_SECS).round() as i64
+}
+
+/// `entries[i] = (author key, sort)`. Returns how many seconds to subtract
+/// from each entry's sort. Empty author keys are never shifted.
+fn burst_shifts(entries: &[(String, i64)], exempt: &HashSet<String>, now: i64) -> Vec<i64> {
+    let mut shifts = vec![0i64; entries.len()];
+    let mut by_author: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (i, (author, sort)) in entries.iter().enumerate() {
+        if author.is_empty() || exempt.contains(author) || *sort < now - 172_800 {
+            continue;
+        }
+        by_author.entry(author.as_str()).or_default().push(i);
+    }
+    for idxs in by_author.values_mut() {
+        if idxs.len() < 2 {
+            continue;
+        }
+        // Newest first.
+        idxs.sort_by(|a, b| entries[*b].1.cmp(&entries[*a].1));
+        // Clusters: (newest sort in cluster, member indexes).
+        let mut clusters: Vec<(i64, Vec<usize>)> = Vec::new();
+        let mut last_sort = i64::MAX;
+        for &i in idxs.iter() {
+            let sort = entries[i].1;
+            match clusters.last_mut() {
+                Some((_, members)) if last_sort - sort <= BURST_CLUSTER_GAP_SECS => members.push(i),
+                _ => clusters.push((sort, vec![i])),
+            }
+            last_sort = sort;
+        }
+        for c in 0..clusters.len() {
+            let start = clusters[c].0;
+            let n = clusters[..c]
+                .iter()
+                .filter(|(newer, _)| newer - start <= BURST_WINDOW_SECS)
+                .count();
+            let shift = burst_shift_secs(n);
+            if shift > 0 {
+                for &i in &clusters[c].1 {
+                    shifts[i] = shift;
+                }
+            }
+        }
+    }
+    shifts
+}
+
+fn norm_author(actor: &str) -> String {
+    actor.trim().trim_end_matches('/').to_ascii_lowercase()
+}
+
+fn apply_burst_spread(timeline: &mut [TimelineItem], self_actor: &str) {
+    let now = chrono::Utc::now().timestamp();
+    let exempt: HashSet<String> = [norm_author(self_actor)].into_iter().filter(|a| !a.is_empty()).collect();
+    let entries: Vec<(String, i64)> = timeline
+        .iter()
+        .map(|it| {
+            let author = if it.kind == "boost" {
+                String::new()
+            } else if !it.pref_actor.is_empty() {
+                norm_author(&it.pref_actor)
+            } else {
+                norm_author(&it.actor_id)
+            };
+            (author, it.sort)
+        })
+        .collect();
+    for (item, shift) in timeline.iter_mut().zip(burst_shifts(&entries, &exempt, now)) {
+        item.sort -= shift;
+    }
+}
+
+fn apply_bsky_burst_spread(keys: &mut [BskyKey], own_did: Option<&str>) {
+    let now = chrono::Utc::now().timestamp();
+    let exempt: HashSet<String> = own_did.map(norm_author).into_iter().filter(|a| !a.is_empty()).collect();
+    let entries: Vec<(String, i64)> = keys.iter().map(|k| (norm_author(&k.author_did), k.sort)).collect();
+    for (key, shift) in keys.iter_mut().zip(burst_shifts(&entries, &exempt, now)) {
+        key.sort -= shift;
+    }
+}
+
 /// Native Home ranked rebuild (no PHP).
 pub async fn warm_home_native(cfg: &Config, owner_user_id: i64) -> Result<String> {
     let started = Instant::now();
@@ -3120,6 +3219,9 @@ pub async fn warm_home_native(cfg: &Config, owner_user_id: i64) -> Result<String
             }
         }
         apply_favourite_rank(&mut timeline, &actor_weights, &tag_weights);
+        if burst_spread_enabled() {
+            apply_burst_spread(&mut timeline, &actor_id);
+        }
     }
 
     // Remember which cards are deprioritized before ranking drops the actor.
@@ -3207,6 +3309,9 @@ pub async fn warm_home_native(cfg: &Config, owner_user_id: i64) -> Result<String
                 );
             }
         }
+    }
+    if algorithm_on && burst_spread_enabled() {
+        apply_bsky_burst_spread(&mut bsky, own_did.as_deref());
     }
     bsky.sort_by(|a, b| b.sort.cmp(&a.sort).then(b.indexed_at.cmp(&a.indexed_at)));
     collapse_repeated_external_posts(&mut bsky);
@@ -4566,9 +4671,13 @@ mod followed_tag_tests {
 
     #[test]
     fn tsquery_keeps_only_tags_the_matcher_can_see() {
-        let tags: Vec<String> = ["Cats", "#cats", "my_tag", "x", "café", "___", "a b", "dogs|x"]
+        let tags: Vec<String> = ["Cats", "#cats", "my_tag", "x", "Café", "日本語", "___", "a b", "dogs|x", "!&"]
             .iter().map(|s| s.to_string()).collect();
-        assert_eq!(followed_tag_tsquery(&tags).as_deref(), Some("htag_cats | htag_my_tag"));
+        // Operators and spaces are stripped like PHP ap_masto_normalize_tag_name.
+        assert_eq!(
+            followed_tag_tsquery(&tags).as_deref(),
+            Some("htag_cats | htag_my_tag | htag_café | htag_日本語 | htag_ab | htag_dogsx")
+        );
         assert_eq!(followed_tag_tsquery(&["é".to_string()]), None);
     }
 
@@ -4609,5 +4718,155 @@ mod followed_tag_tests {
         assert_eq!(items.len(), 1, "the tagged post is found through the index");
         let scan = db.query(FOLLOWED_TAG_SCAN_SQL, &[&(now - chrono::Duration::days(14)).to_rfc3339()]).await.unwrap();
         assert!(scan.iter().all(|r| r.get::<_, i64>(0) != 1), "the old scan missed it");
+    }
+
+    /// Non-ASCII followed tags used to be skipped by the tsquery builder and
+    /// cut short by the matcher (`#café` read as `caf`), so they never reached Home.
+    #[tokio::test]
+    async fn unicode_followed_tags_reach_home() {
+        let Ok(url) = std::env::var("LIBRARY_FIXTURE_DB") else { return };
+        let db = crate::db::connect(&url).await.unwrap();
+        db.batch_execute(
+            "CREATE TEMP TABLE events (id BIGINT PRIMARY KEY, type TEXT, actor_id TEXT, summary TEXT,
+                media_urls TEXT, created_at TEXT, visibility TEXT, object_id TEXT, target_actor TEXT,
+                action_taken TEXT);
+             CREATE TEMP TABLE ap_search_docs (id BIGSERIAL PRIMARY KEY, source TEXT, source_pk BIGINT,
+                object_id TEXT, created_at TEXT, body TEXT,
+                body_tsv tsvector GENERATED ALWAYS AS (to_tsvector('simple', body)) STORED);",
+        ).await.unwrap();
+        let ts = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+        // Bodies as ap_search_fts_normalize_body writes them: text plus htag_<mb_strtolower(tag)>.
+        let rows = [
+            (1i64, "Morning <a>#Café</a>", "Morning #Café htag_café"),
+            (2, "今日は #日本語", "今日は #日本語 htag_日本語"),
+            (3, "Just #cafe", "Just #cafe htag_cafe"),
+        ];
+        for (id, summary, body) in rows {
+            db.execute(
+                "INSERT INTO events VALUES ($1,'Create','https://r.test/users/a',$2,'[]',$3,'public',$4,'','log')",
+                &[&id, &summary, &ts, &format!("https://r.test/n/{id}")],
+            ).await.unwrap();
+            db.execute(
+                "INSERT INTO ap_search_docs (source,source_pk,object_id,created_at,body) VALUES ('event',$1,$2,$3,$4)",
+                &[&id, &format!("https://r.test/n/{id}"), &ts, &body],
+            ).await.unwrap();
+        }
+        let hidden = hidden::HiddenSets::default();
+        let tags = ["café".to_string(), "日本語".to_string()];
+        let mut ids: Vec<String> = fetch_followed_tag_events(&db, &tags, &hidden)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|it| it.object_id)
+            .collect();
+        ids.sort();
+        assert_eq!(ids, vec!["https://r.test/n/1", "https://r.test/n/2"], "#cafe is a different tag");
+    }
+}
+
+#[cfg(test)]
+mod signal_window_tests {
+    use super::*;
+
+    /// Runs where a disposable fixture database is configured; skipped otherwise.
+    #[tokio::test]
+    async fn impressions_do_not_push_likes_out_of_the_window() {
+        let Ok(url) = std::env::var("LIBRARY_FIXTURE_DB") else { return };
+        let db = crate::db::connect(&url).await.unwrap();
+        db.batch_execute(
+            "CREATE TEMP TABLE ap_user_signals (id BIGSERIAL PRIMARY KEY, owner_user_id BIGINT NOT NULL,
+                platform TEXT NOT NULL, signal_type TEXT NOT NULL, target_key TEXT NOT NULL,
+                weight REAL NOT NULL DEFAULT 1, metadata_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL);",
+        ).await.unwrap();
+        let now = chrono::Utc::now();
+        // Older likes first (lower ids), then a long scroll session of impressions.
+        let liked = (now - chrono::Duration::days(3)).to_rfc3339();
+        for i in 0..5i64 {
+            db.execute(
+                "INSERT INTO ap_user_signals (owner_user_id,platform,signal_type,target_key,weight,metadata_json,created_at)
+                 VALUES (7,'fedi','like',$1,1,'{\"target_actor\":\"https://r.test/users/fav\"}',$2)",
+                &[&format!("https://r.test/n/{i}"), &liked],
+            ).await.unwrap();
+        }
+        let seen = (now - chrono::Duration::hours(1)).to_rfc3339();
+        db.execute(
+            "INSERT INTO ap_user_signals (owner_user_id,platform,signal_type,target_key,weight,metadata_json,created_at)
+             SELECT 7,'fedi','impression','https://r.test/s/' || g,1,'{\"target_actor\":\"https://r.test/users/other\"}',$1
+             FROM generate_series(1,2500) g",
+            &[&seen],
+        ).await.unwrap();
+        let weights = load_signal_actor_weights(&db, 7).await;
+        let fav = *weights.get("https://r.test/users/fav").unwrap_or(&0.0);
+        assert!(fav > 5.0, "five likes still count after 2500 newer impressions: {fav}");
+        let other = *weights.get("https://r.test/users/other").unwrap_or(&0.0);
+        // Passive rows are capped at 500: 500 x -0.03 ~= -15, clamped to -3.
+        assert!(other < 0.0 && other >= -3.0, "impressions still add fatigue: {other}");
+    }
+}
+
+#[cfg(test)]
+mod burst_spread_tests {
+    use super::*;
+
+    fn e(author: &str, sort: i64) -> (String, i64) {
+        (author.to_string(), sort)
+    }
+
+    #[test]
+    fn shift_curve_matches_decay_and_floor() {
+        assert_eq!(burst_shift_secs(0), 0);
+        assert_eq!(burst_shift_secs(1), 2700); // x0.625 -> 45 min
+        assert_eq!(burst_shift_secs(2), 4050); // x0.4375 -> 67.5 min
+        assert!(burst_shift_secs(40) <= 5400 && burst_shift_secs(40) >= 5399); // floor 0.25 -> 90 min
+    }
+
+    #[test]
+    fn newest_stays_and_earlier_posts_in_a_burst_step_back() {
+        let now = 1_000_000;
+        // Four separate posts 20 minutes apart, plus another author.
+        let entries = vec![
+            e("a", now - 60),
+            e("a", now - 60 - 1200),
+            e("a", now - 60 - 2400),
+            e("a", now - 60 - 3600),
+            e("b", now - 600),
+        ];
+        let shifts = burst_shifts(&entries, &HashSet::new(), now);
+        assert_eq!(shifts, vec![0, 2700, 4050, burst_shift_secs(3), 0]);
+        // The author's own order is kept.
+        let sorted: Vec<i64> = entries.iter().zip(&shifts).map(|((_, s), d)| s - d).collect();
+        assert!(sorted[0] > sorted[1] && sorted[1] > sorted[2] && sorted[2] > sorted[3]);
+    }
+
+    #[test]
+    fn a_thread_posted_in_one_go_moves_together() {
+        let now = 1_000_000;
+        // Newer standalone post, then a 3-post thread a bit earlier, 1 minute apart.
+        let entries = vec![
+            e("a", now - 100),
+            e("a", now - 2000),
+            e("a", now - 2060),
+            e("a", now - 2120),
+        ];
+        let shifts = burst_shifts(&entries, &HashSet::new(), now);
+        assert_eq!(shifts, vec![0, 2700, 2700, 2700]);
+    }
+
+    #[test]
+    fn spaced_out_posts_self_and_old_posts_are_untouched() {
+        let now = 1_000_000;
+        let entries = vec![
+            e("a", now - 60),
+            e("a", now - 60 - 4 * 3600), // outside the 3 h window
+            e("me", now - 60),
+            e("me", now - 120 - 600),
+            e("c", now - 200_000),
+            e("c", now - 200_100),
+            e("", now - 10),
+            e("", now - 20),
+        ];
+        let exempt: HashSet<String> = ["me".to_string()].into_iter().collect();
+        assert_eq!(burst_shifts(&entries, &exempt, now), vec![0; 8]);
     }
 }

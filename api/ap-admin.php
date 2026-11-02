@@ -9256,13 +9256,27 @@ function admin_home_signal_actor_weights(int $ownerUserId): array
         if (is_array($cached)) return $cached;
     }
     try {
-        $st = ap_db()->prepare(
+        // Passive rows (one per post seen) share this table with likes and
+        // boosts. Read them under their own cap so a long scroll session
+        // cannot push explicit actions out of a single newest-N window.
+        // Same split as the Rust rebuild (SIGNAL_ACTOR_WEIGHTS_SQL).
+        $explicit = ap_db()->prepare(
             "SELECT signal_type, weight, metadata_json, created_at
              FROM ap_user_signals
              WHERE owner_user_id = ? AND created_at >= ?
+               AND signal_type NOT IN ('impression', 'click', 'dwell')
              ORDER BY id DESC LIMIT 500"
         );
-        $st->execute([$ownerUserId, gmdate('c', time() - 45 * 86400)]);
+        $explicit->execute([$ownerUserId, gmdate('c', time() - 45 * 86400)]);
+        $passive = ap_db()->prepare(
+            "SELECT signal_type, weight, metadata_json, created_at
+             FROM ap_user_signals
+             WHERE owner_user_id = ? AND created_at >= ?
+               AND signal_type IN ('impression', 'click', 'dwell')
+             ORDER BY id DESC LIMIT 200"
+        );
+        $passive->execute([$ownerUserId, gmdate('c', time() - 14 * 86400)]);
+        $signalRows = array_merge($explicit->fetchAll() ?: [], $passive->fetchAll() ?: []);
         $weights = [];
         $kindWeight = [
             'like' => 1.4,
@@ -9278,7 +9292,7 @@ function admin_home_signal_actor_weights(int $ownerUserId): array
             'dwell' => 0.12,
         ];
         $now = time();
-        foreach ($st->fetchAll() ?: [] as $row) {
+        foreach ($signalRows as $row) {
             $base = (float) ($row['weight'] ?? 0);
             if ($base <= 0) continue;
             $meta = json_decode((string) ($row['metadata_json'] ?? '{}'), true);

@@ -288,38 +288,9 @@ fn strip_tags_lower(text: &str) -> String {
     out.to_ascii_lowercase()
 }
 
-/// Same token rules as the live favourite-tag extractor: a `#` run of 2–64
-/// ASCII letters, digits, or underscores, lowercased, duplicates dropped.
+/// Same token rules as Home ranking: see [`crate::hashtags::extract`].
 fn extract_hashtags(text: &str) -> Vec<String> {
-    let plain = strip_tags_lower(text);
-    let mut tags = Vec::new();
-    let mut seen = HashSet::new();
-    let bytes = plain.as_bytes();
-    let mut i = 0usize;
-    while i < bytes.len() {
-        if bytes[i] == b'#' {
-            let start = i + 1;
-            let mut end = start;
-            while end < bytes.len() {
-                let c = bytes[end];
-                if c.is_ascii_alphanumeric() || c == b'_' {
-                    end += 1;
-                } else {
-                    break;
-                }
-            }
-            if end > start {
-                let tag = plain[start..end].to_string();
-                if (2..=64).contains(&tag.len()) && seen.insert(tag.clone()) {
-                    tags.push(tag);
-                }
-                i = end;
-                continue;
-            }
-        }
-        i += 1;
-    }
-    tags
+    crate::hashtags::extract(text)
 }
 
 fn normalize_tag(raw: &str) -> Option<String> {
