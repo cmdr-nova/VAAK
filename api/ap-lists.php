@@ -591,13 +591,20 @@ function ap_list_add_account(int $listId, string $actorId, bool $followIfNeeded 
         return ['ok' => false, 'error' => 'Record not found'];
     }
     if (($list['bsky_list_source'] ?? '') === 'subscription') return ['ok' => false, 'error' => 'This Bluesky list belongs to another account; unsubscribe or manage its members on Bluesky.'];
+    $isModeration = ($list['list_kind'] ?? 'curation') === 'moderation';
     $actorId = rtrim(trim($actorId), '/');
-    if ($actorId === '' || !str_starts_with($actorId, 'https://')) {
+    $isNostr = ap_list_is_nostr_ref($actorId);
+    if ($isNostr && !$isModeration) {
+        return ['ok' => false, 'error' => 'Nostr accounts can only go on moderation lists.'];
+    }
+    if ($actorId === '' || (!$isNostr && !str_starts_with($actorId, 'https://'))) {
         return ['ok' => false, 'error' => 'Invalid actor URL'];
     }
-    $bskyDid = function_exists('ap_bsky_resolve_target_did') ? ap_bsky_resolve_target_did($actorId, $ownerUserId) : null;
+    $bskyDid = (!$isNostr && function_exists('ap_bsky_resolve_target_did')) ? ap_bsky_resolve_target_did($actorId, $ownerUserId) : null;
     $isBsky = $bskyDid !== null;
-    if ($isBsky && ($list['bsky_list_uri'] ?? '') === '' && ($list['bsky_list_source'] ?? '') !== 'bsky') {
+    // Moderation lists apply inside VAAK for every network, so a Bluesky
+    // account may sit on a VAAK-only moderation list (enforced locally).
+    if ($isBsky && !$isModeration && ($list['bsky_list_uri'] ?? '') === '' && ($list['bsky_list_source'] ?? '') !== 'bsky') {
         return ['ok' => false, 'error' => 'This list is not linked to Bluesky; connect Bluesky and create a synchronized list first.'];
     }
     $actorId = $isBsky ? 'https://bsky.app/profile/' . rawurlencode($bskyDid) : $actorId;
@@ -616,7 +623,8 @@ function ap_list_add_account(int $listId, string $actorId, bool $followIfNeeded 
         $remoteItemUri = (string) ($remote['uri'] ?? '');
     }
     $followed = false;
-    if (!$isBsky && !ap_actor_is_followed($actorId)) {
+    // Moderation lists mute/block their members; nobody has to be followed.
+    if (!$isBsky && !$isNostr && !$isModeration && !ap_actor_is_followed($actorId)) {
         if (!$followIfNeeded) {
             return ['ok' => false, 'error' => 'Account must be followed before adding to a list'];
         }
@@ -640,7 +648,8 @@ function ap_list_add_account(int $listId, string $actorId, bool $followIfNeeded 
         ap_db()->prepare(
             'INSERT INTO masto_list_accounts (list_id, actor_id, bsky_did, bsky_item_uri, added_at) VALUES (?, ?, ?, ?, ?)'
         )->execute([$listId, $actorId, $isBsky ? $bskyDid : null, $remoteItemUri !== '' ? $remoteItemUri : null, $now]);
-        if (!empty($list['bsky_list_uri']) && !empty($list['bsky_moderation_action']) && $list['bsky_moderation_action'] !== 'none') {
+        if (!empty($list['bsky_list_uri']) && !empty($list['bsky_moderation_action']) && $list['bsky_moderation_action'] !== 'none'
+            && function_exists('ap_bsky_refresh_hide_set')) {
             ap_bsky_refresh_hide_set($ownerUserId, true);
         }
         ap_db()->prepare('UPDATE masto_lists SET updated_at = ? WHERE id = ?')->execute([$now, $listId]);
@@ -671,6 +680,13 @@ function ap_list_remove_account(int $listId, string $actorId): array
         return ['ok' => false, 'error' => 'Invalid actor'];
     }
     try {
+        // Bluesky rows may be stored under another spelling of the same DID.
+        if (preg_match('~^https://bsky\.app/profile/(did(?::|%3A)[^/?#]+)$~i', $actorId, $didMatch)) {
+            $rowSt = ap_db()->prepare('SELECT actor_id FROM masto_list_accounts WHERE list_id = ? AND bsky_did = ? LIMIT 1');
+            $rowSt->execute([$listId, rawurldecode((string) $didMatch[1])]);
+            $stored = (string) ($rowSt->fetchColumn() ?: '');
+            if ($stored !== '') $actorId = rtrim($stored, '/');
+        }
         $st = ap_db()->prepare('SELECT bsky_item_uri FROM masto_list_accounts WHERE list_id = ? AND (actor_id = ? OR actor_id = ?) LIMIT 1');
         $st->execute([$listId, $actorId, $actorId . '/']);
         $itemUri = (string) ($st->fetchColumn() ?: '');
@@ -729,19 +745,195 @@ function ap_lists_moderation_action_for_actor(?string $actorId, ?int $ownerUserI
     if (!isset($GLOBALS['ap_moderation_list_cache']) || !array_key_exists($ownerUserId, $GLOBALS['ap_moderation_list_cache'])) {
         $GLOBALS['ap_moderation_list_cache'][$ownerUserId] = [];
         try {
-            $st = ap_db()->prepare("SELECT a.actor_id, l.bsky_moderation_action FROM masto_lists l INNER JOIN masto_list_accounts a ON a.list_id = l.id WHERE l.owner_user_id = ? AND l.list_kind = 'moderation'");
-            $st->execute([$ownerUserId]);
-            foreach ($st->fetchAll() ?: [] as $row) {
-                $key = rtrim(trim((string) ($row['actor_id'] ?? '')), '/');
-                $action = (string) ($row['bsky_moderation_action'] ?? 'none');
-                if ($key !== '' && in_array($action, ['mute', 'block'], true)
-                    && (!isset($GLOBALS['ap_moderation_list_cache'][$ownerUserId][$key]) || $action === 'block')) $GLOBALS['ap_moderation_list_cache'][$ownerUserId][$key] = $action;
+            foreach (ap_lists_moderation_members($ownerUserId) as $row) {
+                $action = (string) $row['action'];
+                $keys = [(string) $row['actor_id']];
+                if ((string) ($row['bsky_did'] ?? '') !== '') $keys[] = (string) $row['bsky_did'];
+                // Nostr notifications name the author https://njump.me/<npub>.
+                if (ap_list_is_nostr_ref($keys[0]) && function_exists('ap_nostr_npub')) {
+                    $npub = ap_nostr_npub(strtolower(substr($keys[0], 6)));
+                    if ($npub !== '') $keys[] = 'https://njump.me/' . $npub;
+                }
+                foreach ($keys as $key) {
+                    $refs = function_exists('ap_moderation_syntactic_refs') ? ap_moderation_syntactic_refs($key) : [$key];
+                    foreach ($refs as $ref) {
+                        $ref = rtrim((string) $ref, '/');
+                        if ($ref === '') continue;
+                        if (!isset($GLOBALS['ap_moderation_list_cache'][$ownerUserId][$ref]) || $action === 'block') {
+                            $GLOBALS['ap_moderation_list_cache'][$ownerUserId][$ref] = $action;
+                        }
+                    }
+                }
             }
         } catch (Throwable $e) {
             $GLOBALS['ap_moderation_list_cache'][$ownerUserId] = [];
         }
     }
-    return (string) ($GLOBALS['ap_moderation_list_cache'][$ownerUserId][$actorId] ?? 'none');
+    $map = $GLOBALS['ap_moderation_list_cache'][$ownerUserId];
+    if ($map === []) return 'none';
+    $best = 'none';
+    $refs = function_exists('ap_moderation_syntactic_refs') ? ap_moderation_syntactic_refs($actorId) : [$actorId];
+    foreach ($refs as $ref) {
+        $hit = (string) ($map[rtrim((string) $ref, '/')] ?? 'none');
+        if ($hit === 'block') return 'block';
+        if ($hit === 'mute') $best = 'mute';
+    }
+    return $best;
+}
+
+/**
+ * Members of this viewer's ACTIVE moderation lists (action mute or block),
+ * whatever their network: fediverse/local actors, Bluesky accounts (with or
+ * without a linked Bluesky list) and Nostr keys (`nostr:<hex>`). VAAK hides
+ * them for this viewer only; Rust reads the same rows (hidden.rs
+ * MOD_LIST_MEMBERS_SQL).
+ *
+ * @return list<array{actor_id:string,bsky_did:string,action:string}>
+ */
+function ap_lists_moderation_members(int $ownerUserId): array
+{
+    if ($ownerUserId < 1) return [];
+    $out = [];
+    $st = ap_db()->prepare("SELECT a.actor_id, a.bsky_did, l.bsky_moderation_action FROM masto_lists l INNER JOIN masto_list_accounts a ON a.list_id = l.id WHERE l.owner_user_id = ? AND l.list_kind = 'moderation' AND l.bsky_moderation_action IN ('mute', 'block')");
+    $st->execute([$ownerUserId]);
+    foreach ($st->fetchAll() ?: [] as $row) {
+        $actor = rtrim(trim((string) ($row['actor_id'] ?? '')), '/');
+        if ($actor === '') continue;
+        $did = trim((string) ($row['bsky_did'] ?? ''));
+        $out[] = ['actor_id' => $actor, 'bsky_did' => str_starts_with($did, 'did:') ? $did : '', 'action' => (string) $row['bsky_moderation_action']];
+    }
+    return $out;
+}
+
+/** Bluesky DIDs on this viewer's active moderation lists (for ap_bsky_hide_did_set). */
+function ap_lists_moderation_dids(int $ownerUserId): array
+{
+    $out = [];
+    try {
+        foreach (ap_lists_moderation_members($ownerUserId) as $row) {
+            $did = (string) $row['bsky_did'];
+            if ($did === '' && preg_match('~^https://bsky\.app/profile/(did:[^/?#]+)$~i', (string) $row['actor_id'], $m)) {
+                $did = rawurldecode((string) $m[1]);
+            }
+            if (str_starts_with($did, 'did:')) $out[$did] = true;
+        }
+    } catch (Throwable $e) {
+        return [];
+    }
+    return $out;
+}
+
+/** Nostr keys (lowercase hex) on this viewer's active moderation lists. */
+function ap_lists_moderation_nostr_keys(int $ownerUserId): array
+{
+    $out = [];
+    try {
+        foreach (ap_lists_moderation_members($ownerUserId) as $row) {
+            if (ap_list_is_nostr_ref((string) $row['actor_id'])) $out[strtolower(substr((string) $row['actor_id'], 6))] = true;
+        }
+    } catch (Throwable $e) {
+        return [];
+    }
+    return $out;
+}
+
+function ap_list_is_nostr_ref(string $ref): bool
+{
+    return preg_match('/^nostr:[0-9a-f]{64}$/i', trim($ref)) === 1;
+}
+
+/**
+ * Canonical list-member reference for a post author: Bluesky accounts become
+ * https://bsky.app/profile/<did>, Nostr keys nostr:<lowercase hex>, everyone
+ * else their https actor id.
+ *
+ * @return array{actor_id:string,network:string,bsky_did:string}|null
+ */
+function ap_list_member_ref(string $ref, int $ownerUserId): ?array
+{
+    $ref = rtrim(trim($ref), '/');
+    if ($ref === '') return null;
+    if (ap_list_is_nostr_ref($ref)) {
+        return ['actor_id' => 'nostr:' . strtolower(substr($ref, 6)), 'network' => 'nostr', 'bsky_did' => ''];
+    }
+    if (preg_match('~^(?:https://njump\.me/|nostr:)(npub1[02-9ac-hj-np-z]+)$~i', $ref, $m) && function_exists('ap_nostr_bech32_decode')) {
+        $decoded = ap_nostr_bech32_decode(strtolower($m[1]));
+        $bytes = is_array($decoded) && ($decoded[0] ?? '') === 'npub' ? (string) ($decoded[1] ?? '') : '';
+        return strlen($bytes) === 32 ? ['actor_id' => 'nostr:' . bin2hex($bytes), 'network' => 'nostr', 'bsky_did' => ''] : null;
+    }
+    $isBskyShaped = str_starts_with($ref, 'did:') || str_starts_with($ref, 'at://')
+        || preg_match('~^https://bsky\.app/profile/~i', $ref) === 1
+        || preg_match('~^https://bsky\.brid\.gy/ap/did:~i', $ref) === 1;
+    if ($isBskyShaped && function_exists('ap_bsky_resolve_target_did')) {
+        $did = ap_bsky_resolve_target_did($ref, $ownerUserId);
+        if (is_string($did) && str_starts_with($did, 'did:')) {
+            return ['actor_id' => 'https://bsky.app/profile/' . rawurlencode($did), 'network' => 'bluesky', 'bsky_did' => $did];
+        }
+        return null;
+    }
+    $actor = ap_list_resolve_actor_ref($ref);
+    if ($actor === null || !str_starts_with($actor, 'https://')) return null;
+    $local = function_exists('vaak_is_local_url') && vaak_is_local_url($actor);
+    return ['actor_id' => $actor, 'network' => $local ? 'local' : 'fediverse', 'bsky_did' => ''];
+}
+
+/**
+ * Lists the + picker offers for one author, with membership and whether the
+ * author can be added (and why not).
+ *
+ * @return array{ok:bool,error?:string,actor?:string,network?:string,lists?:list<array<string,mixed>>}
+ */
+function ap_list_picker_state(string $ref, int $ownerUserId): array
+{
+    if ($ownerUserId < 1) return ['ok' => false, 'error' => 'Not signed in'];
+    $member = ap_list_member_ref($ref, $ownerUserId);
+    if ($member === null) return ['ok' => false, 'error' => 'Could not identify this account.'];
+    $actor = $member['actor_id'];
+    $did = $member['bsky_did'];
+    $network = $member['network'];
+    $memberOf = [];
+    try {
+        $st = ap_db()->prepare('SELECT a.list_id FROM masto_list_accounts a INNER JOIN masto_lists l ON l.id = a.list_id WHERE l.owner_user_id = ? AND (a.actor_id = ? OR a.actor_id = ? OR (? <> \'\' AND a.bsky_did = ?))');
+        $st->execute([$ownerUserId, $actor, $actor . '/', $did, $did]);
+        foreach ($st->fetchAll(PDO::FETCH_COLUMN) ?: [] as $id) $memberOf[(int) $id] = true;
+    } catch (Throwable $e) {
+        return ['ok' => false, 'error' => 'Could not load your lists.'];
+    }
+    $lists = [];
+    foreach (ap_lists_all($ownerUserId) as $row) {
+        $id = (int) ($row['id'] ?? 0);
+        if ($id < 1) continue;
+        $kind = ($row['list_kind'] ?? 'curation') === 'moderation' ? 'moderation' : 'curation';
+        $source = (string) ($row['bsky_list_source'] ?? 'vaak');
+        $linked = !empty($row['bsky_list_uri']);
+        $action = $kind === 'moderation' ? (string) ($row['bsky_moderation_action'] ?? 'none') : 'none';
+        $reason = '';
+        if ($source === 'subscription') {
+            $reason = 'Someone else’s Bluesky list';
+        } elseif ($network === 'nostr' && $kind !== 'moderation') {
+            $reason = 'Nostr accounts go on moderation lists only';
+        } elseif ($network === 'bluesky' && $kind !== 'moderation' && !$linked && $source !== 'bsky') {
+            $reason = 'Not linked to Bluesky';
+        }
+        $where = $source === 'bsky' ? 'Bluesky' : ($linked ? 'VAAK + Bluesky' : 'VAAK');
+        if ($source === 'subscription') $where = 'Bluesky (subscribed)';
+        // Where this author's membership lands: Bluesky list records hold DIDs only.
+        $syncs = $network === 'bluesky' && $linked && $source !== 'subscription';
+        $lists[] = [
+            'id' => $id,
+            'title' => (string) ($row['title'] ?? ''),
+            'kind' => $kind,
+            'action' => in_array($action, ['mute', 'block'], true) ? $action : 'none',
+            'where' => $where,
+            'syncs_bluesky' => $syncs,
+            'member' => isset($memberOf[$id]),
+            'can_edit' => $reason === '',
+            'reason' => $reason,
+            'count' => (int) ($row['member_count'] ?? 0),
+        ];
+    }
+    usort($lists, static fn(array $a, array $b): int => [$a['kind'] === 'moderation' ? 1 : 0, mb_strtolower($a['title'])] <=> [$b['kind'] === 'moderation' ? 1 : 0, mb_strtolower($b['title'])]);
+    return ['ok' => true, 'actor' => $actor, 'network' => $network, 'lists' => $lists];
 }
 
 function ap_lists_moderation_cache_clear(?int $ownerUserId = null): void

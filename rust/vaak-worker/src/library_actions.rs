@@ -345,8 +345,10 @@ pub(crate) fn render_moderation_with_protocol_navigation(ctx: &FediActionContext
         }
         menu.push_str(&format!("<a class=\"menu-action\" href=\"/vaak/?view=moderation&amp;actor={}&amp;from={}\">Open in moderation panel</a>", query(actor), query(&ctx.return_view)));
     }
-    if menu.is_empty() { String::new() } else { if menu.is_empty(){return String::new()}
- format!("<details class=\"post-action-menu\"><summary class=\"icon-btn\" title=\"More actions\" aria-label=\"More actions\">⋯</summary><div class=\"post-action-menu__body\">{menu}</div></details>") }
+    if menu.is_empty() { return String::new(); }
+    // + Add to list on posts (PHP block_quick_actions with an object id).
+    let list_add = if actor.starts_with("https://") && !ctx.object_id.is_empty() { vaak_types::list_add_button_html(actor) } else { String::new() };
+    format!("{list_add}<details class=\"post-action-menu\"><summary class=\"icon-btn\" title=\"More actions\" aria-label=\"More actions\">⋯</summary><div class=\"post-action-menu__body\">{menu}</div></details>")
 }
 
 #[cfg(test)]

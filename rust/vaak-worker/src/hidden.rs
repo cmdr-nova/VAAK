@@ -604,10 +604,79 @@ pub async fn load_hidden_sets(db: &Client, owner_user_id: i64) -> Result<HiddenS
             if !phrase.is_empty() { sets.muted_phrases.push(phrase); }
         }
     }
+    if owner_user_id > 0 {
+        let members = load_moderation_list_members(db, owner_user_id).await;
+        blocked_actors.extend(apply_moderation_list_members(&mut sets, &members));
+    }
     if let Err(error) = load_bridged_blocks(db, &blocked_actors, &mut sets).await {
         tracing::warn!(%error, "bridged block handles skipped");
     }
     Ok(sets)
+}
+
+/// Members of the viewer's active moderation lists (`masto_lists.list_kind =
+/// 'moderation'` with action mute or block), any network: fediverse and local
+/// actors, Bluesky accounts (`bsky_did`) and Nostr keys (`nostr:<hex>`).
+/// PHP twin: ap_lists_moderation_members (api/ap-lists.php).
+pub const MOD_LIST_MEMBERS_SQL: &str = "SELECT a.actor_id, COALESCE(a.bsky_did, ''), l.bsky_moderation_action \
+     FROM masto_lists l JOIN masto_list_accounts a ON a.list_id = l.id \
+     WHERE l.owner_user_id::bigint = $1::bigint AND l.list_kind = 'moderation' AND l.bsky_moderation_action IN ('mute', 'block')";
+
+/// (actor_id, bsky_did, action) rows. Best effort: a schema without the
+/// cross-network list columns, or a failed read, applies nothing.
+pub async fn load_moderation_list_members(db: &Client, owner_user_id: i64) -> Vec<(String, String, String)> {
+    if owner_user_id < 1 {
+        return Vec::new();
+    }
+    match db.query(MOD_LIST_MEMBERS_SQL, &[&owner_user_id]).await {
+        Ok(rows) => rows
+            .iter()
+            .map(|row| {
+                let actor: Option<String> = row.get(0);
+                let did: Option<String> = row.get(1);
+                let action: Option<String> = row.get(2);
+                (actor.unwrap_or_default(), did.unwrap_or_default(), action.unwrap_or_default())
+            })
+            .collect(),
+        Err(error) => {
+            tracing::warn!(%error, "moderation list members skipped");
+            Vec::new()
+        }
+    }
+}
+
+/// A block-action list hides like a personal block, a mute-action list like a
+/// personal mute (a directly opened profile still shows its root author).
+/// Returns the blocked actors for the Bridgy handle expansion.
+fn apply_moderation_list_members(sets: &mut HiddenSets, rows: &[(String, String, String)]) -> Vec<String> {
+    let mut blocked = Vec::new();
+    for (actor, did, action) in rows {
+        let block = action.trim() == "block";
+        if !block && action.trim() != "mute" {
+            continue;
+        }
+        let mut forms = Vec::new();
+        let actor = norm_actor(actor);
+        if !actor.is_empty() {
+            forms.push(actor.clone());
+        }
+        let did = did.trim();
+        if did.starts_with("did:") {
+            forms.push(did.to_owned());
+            forms.push(format!("https://bsky.app/profile/{did}"));
+        }
+        for form in forms {
+            if block {
+                insert_actor_aliases(&mut sets.user_blocked_actors, &form);
+            } else {
+                insert_actor_aliases(&mut sets.muted_actors, &form);
+            }
+        }
+        if block && actor.starts_with("https://") {
+            blocked.push(actor);
+        }
+    }
+    blocked
 }
 
 /// Home, Local, Federated and profile timelines also obey the owner's
@@ -796,6 +865,8 @@ pub(crate) async fn load_canonical_library_hidden_sets(db:&Client,owner:i64)->Re
             _=>anyhow::bail!("unknown canonical moderation source"),
         }
     }
+    let members=load_moderation_list_members(db,owner).await;
+    apply_moderation_list_members(&mut sets,&members);
     Ok(sets)
 }
 
@@ -831,6 +902,9 @@ pub(crate) async fn load_search_hidden_sets(db:&Client,owner:i64)->Result<Hidden
             _=>anyhow::bail!("unknown Search moderation source"),
         }
     }
+    // Moderation lists act as personal mutes/blocks, so Search obeys them too.
+    let members=load_moderation_list_members(db,owner).await;
+    apply_moderation_list_members(&mut sets,&members);
     Ok(sets)
 }
 
@@ -1041,6 +1115,21 @@ pub async fn load_bsky_hide_dids(db: &Client, owner: i64) -> Result<HashSet<Stri
             .unwrap_or_default()
             .trim()
             .to_string();
+        if did.starts_with("did:") {
+            dids.insert(did);
+        }
+    }
+    // Bluesky accounts on an active VAAK moderation list (linked to Bluesky
+    // or not) drop out of notifications too.
+    for (actor, did, _) in load_moderation_list_members(db, owner).await {
+        let did = if did.trim().starts_with("did:") {
+            did.trim().to_owned()
+        } else {
+            match actor.get(..25) {
+                Some(prefix) if prefix.eq_ignore_ascii_case("https://bsky.app/profile/") => raw_percent_decode(actor[25..].trim_end_matches('/')),
+                _ => String::new(),
+            }
+        };
         if did.starts_with("did:") {
             dids.insert(did);
         }
@@ -2104,5 +2193,34 @@ mod home_reply_block_tests {
         assert!(!reply_target_hidden(&json!({"content": "not a reply"}), &hidden));
         let boost = json!({"reblog": reply("at://did:plc:listed/app.bsky.feed.post/1")});
         assert!(reply_target_hidden(&boost, &hidden));
+    }
+}
+
+#[cfg(test)]
+mod moderation_list_member_tests {
+    use super::*;
+
+    #[test]
+    fn block_and_mute_lists_hide_every_network() {
+        let mut sets = HiddenSets::default();
+        let rows = vec![
+            ("https://fedi.example/users/troll".to_string(), String::new(), "block".to_string()),
+            ("https://mkultra.monster/users/local_pest".to_string(), String::new(), "mute".to_string()),
+            ("https://bsky.app/profile/did%3Aplc%3Absky".to_string(), "did:plc:bsky".to_string(), "block".to_string()),
+            ("https://bsky.app/profile/did:plc:quiet".to_string(), String::new(), "mute".to_string()),
+            ("https://fedi.example/users/inactive".to_string(), String::new(), "none".to_string()),
+        ];
+        let blocked = apply_moderation_list_members(&mut sets, &rows);
+        assert!(sets.is_hidden("https://fedi.example/users/troll"));
+        assert!(sets.is_hidden("https://fedi.example/@troll"), "alias of a blocked actor");
+        assert!(sets.is_hidden("https://mkultra.monster/users/local_pest"));
+        assert!(sets.is_hidden("did:plc:bsky"));
+        assert!(sets.is_hidden("https://bsky.app/profile/did:plc:bsky"));
+        assert!(sets.is_hidden("did:plc:quiet"));
+        assert!(!sets.is_hidden("https://fedi.example/users/inactive"));
+        // A mute list keeps a directly opened profile's root author visible.
+        assert!(!sets.actor_hidden("https://mkultra.monster/users/local_pest", true));
+        assert!(sets.actor_hidden("https://fedi.example/users/troll", true));
+        assert!(blocked.contains(&"https://fedi.example/users/troll".to_string()));
     }
 }

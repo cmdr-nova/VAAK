@@ -11364,6 +11364,11 @@ function ap_bsky_hide_did_set(int $ownerUserId): array
     } catch (Throwable $e) {
         // empty
     }
+    // Bluesky accounts on an active VAAK moderation list hide here too, even
+    // before (or without) the Bluesky AppView reflecting a linked list.
+    if (function_exists('ap_lists_moderation_dids')) {
+        $out += ap_lists_moderation_dids($ownerUserId);
+    }
     $cache[$ownerUserId] = $out;
     return $out;
 }

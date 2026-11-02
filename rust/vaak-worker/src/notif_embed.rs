@@ -3265,6 +3265,9 @@ fn paint_lean_timeline_actions(status: &Value, from: &str, viewer_actor: &str) -
             let mod_menu =
                 paint_moderation_overflow(from_q, actor_ref, &link_uri, viewer_actor, status);
             if !mod_menu.is_empty() {
+                // + Add to list sits beside the ⋯ menu wherever personal
+                // moderation is offered (signed in, not your own post).
+                actions.push_str(&vaak_types::list_add_button_html(actor_ref));
                 actions.push_str(&mod_menu);
             } else {
                 actions.push_str(&crate::library::actions::read_only_overflow(&link_uri,from_q,&remote_object_href(&link_uri,url_hint)));
@@ -4485,6 +4488,10 @@ fn nostr_card_actions(status: &Value, action_base: &str, from_q: &str) -> String
         menu.push_str(&format!(
             "<button type=\"button\" class=\"menu-action nostr-admin-only\" data-nostr-vaak=\"nostr_block\" data-nostr-target=\"{author}\" style=\"color:var(--danger)\">Block on VAAK</button>"
         ));
+    }
+    if !mine && !author.is_empty() {
+        // Nostr keys can go on moderation lists (hidden in VAAK).
+        out.push_str(&vaak_types::list_add_button_html(&format!("nostr:{author}")));
     }
     if !menu.is_empty() {
         out.push_str(&format!(

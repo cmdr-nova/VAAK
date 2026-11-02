@@ -86,6 +86,7 @@ php_tests=(
   api/bin/nostr-smoke.php
   api/bin/home-bsky-index-smoke.php
   api/bin/home-signal-batch-smoke.php
+  api/bin/list-picker-moderation-smoke.php
   api/bin/inbox-signature-smoke.php
   api/bin/inbox-ownership-smoke.php
   api/bin/inbox-flood-smoke.php

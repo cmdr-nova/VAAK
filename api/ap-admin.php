@@ -3192,6 +3192,33 @@ $vaakAdminOnlyActions = [
         } else {
             $error = 'Unknown collection action.';
         }
+    } elseif ($action === 'list_picker_set') {
+        // + Add to list picker on posts (JSON only).
+        header('Content-Type: application/json; charset=utf-8');
+        header('Cache-Control: no-store');
+        $pickListId = (int) ($_POST['list_id'] ?? 0);
+        $pickMember = function_exists('ap_list_member_ref') ? ap_list_member_ref((string) ($_POST['actor'] ?? ''), $vaakOwnerId) : null;
+        if ($pickMember === null || $pickListId < 1) {
+            echo json_encode(['ok' => false, 'error' => 'Could not identify this account.'], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+            exit;
+        }
+        if (!empty($_POST['member'])) {
+            $pickRes = ap_list_add_account($pickListId, $pickMember['actor_id'], !empty($_POST['follow']));
+            if (empty($pickRes['ok']) && str_contains((string) ($pickRes['error'] ?? ''), 'must be followed')) {
+                $pickRes['needs_follow'] = true;
+            }
+        } else {
+            // Remove the stored spelling (Bluesky rows keep a DID URL).
+            $pickRes = ap_list_remove_account($pickListId, $pickMember['actor_id']);
+        }
+        $pickList = ap_list_by_id($pickListId);
+        echo json_encode($pickRes + [
+            'list_id' => $pickListId,
+            'title' => (string) ($pickList['title'] ?? ''),
+            'kind' => (string) ($pickList['list_kind'] ?? 'curation'),
+            'action' => (string) ($pickList['bsky_moderation_action'] ?? 'none'),
+        ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+        exit;
     } elseif (str_starts_with($action, 'list_')) {
         $view = (string) ($_POST['return_view'] ?? 'lists');
         if (!in_array($view, ['lists', 'mod_lists'], true)) $view = 'lists';
@@ -5707,6 +5734,19 @@ $vaakAdminOnlyActions = [
             $_GET['owner'] = (string) $phyReturnOwner;
         }
     }
+}
+
+// + Add to list picker: the viewer's lists and whether this author is on each.
+if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'list_picker') {
+    header('Content-Type: application/json; charset=utf-8');
+    header('Cache-Control: no-store');
+    echo json_encode(
+        function_exists('ap_list_picker_state')
+            ? ap_list_picker_state((string) ($_GET['actor'] ?? ''), (int) $vaakOwnerId)
+            : ['ok' => false, 'error' => 'Lists unavailable'],
+        JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE
+    );
+    exit;
 }
 
 // Bookmark folder list for one-tap picker (VAAK-only; not Mastodon API)
@@ -19774,6 +19814,23 @@ function admin_post_navigation_menu_html(string $openHref, string $remoteHref = 
 }
 
 /** Permission-aware actor actions used by posts, profiles, and DMs. */
+/**
+ * "Add to list" (+) button. Rust twin: vaak_types::list_add_button_html; keep
+ * the markup identical. Accepts an https actor, a Bluesky DID, or nostr:<hex>.
+ */
+function admin_list_add_button_html(string $actor): string
+{
+    $actor = rtrim(trim($actor), '/');
+    $ok = (str_starts_with($actor, 'nostr:') && preg_match('/^nostr:[0-9a-fA-F]{64}$/', $actor) === 1)
+        || (str_starts_with($actor, 'https://') && strlen($actor) > 8 && strpbrk($actor, "\"<> ") === false)
+        || (str_starts_with($actor, 'did:') && strlen($actor) > 4 && strpbrk($actor, "\"<> /") === false);
+    if (!$ok) {
+        return '';
+    }
+    $attr = str_replace(['&', '"', '<', '>'], ['&amp;', '&quot;', '&lt;', '&gt;'], $actor);
+    return '<button type="button" class="icon-btn list-add-btn" data-list-add="' . $attr . '" title="Add to list" aria-label="Add to list"><i class="ph ph-plus" aria-hidden="true"></i></button>';
+}
+
 function block_quick_actions(?string $actorId, ?string $host, string $returnView, int $ownerUserId = 0, bool $isAdmin = false, string $returnFrom = '', string $objectId = '', mixed $objectUrlHint = null, ?bool $protocolShowOpen = null): string
 {
     if (!empty($GLOBALS['vaak_guest_profile'])) {
@@ -19969,7 +20026,12 @@ function block_quick_actions(?string $actorId, ?string $host, string $returnView
     if ($menu === '') {
         return '';
     }
-    return '<details class="post-action-menu">'
+    // + Add to list beside the ⋯ menu on posts (an object id means a post card;
+    // profile headers and follow rows pass none).
+    $listAdd = ($objectId !== '' && $actorId !== '' && str_starts_with($actorId, 'https://'))
+        ? admin_list_add_button_html($actorId)
+        : '';
+    return $listAdd . '<details class="post-action-menu">'
         . '<summary class="icon-btn" title="More actions" aria-label="More actions">⋯</summary>'
         . '<div class="post-action-menu__body">' . $menu . '</div>'
         . '</details>';
@@ -31727,6 +31789,12 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       width: 100%; margin-top: .35rem; padding: .35rem .5rem;
       border-radius: 8px; border: 1px solid var(--border); background: #121212; color: var(--text);
     }
+    .list-pick-popover h5 { margin: .55rem 0 .15rem; font-size: .74rem; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+    .list-pick-popover label { flex-wrap: wrap; }
+    .list-pick-popover label.is-disabled { opacity: .55; cursor: not-allowed; }
+    .list-pick-popover .list-pick-title { flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; }
+    .list-pick-popover .list-pick-meta { flex-basis: 100%; padding-left: 1.6rem; font-size: .74rem; color: var(--muted); }
+    .list-pick-popover .tag { font-size: .7rem; }
     .ap-toast-stack {
       position: fixed; bottom: 1.4rem; left: 50%; transform: translateX(-50%);
       z-index: 12000; display: flex; flex-direction: column; gap: .45rem;
@@ -43146,6 +43214,126 @@ window.apAdminToast = function (msg, isErr) {
   });
   document.addEventListener('keydown', (ev) => {
     if (ev.key === 'Escape') closeFolderPopover();
+  });
+
+  // + Add to list: one picker for VAAK lists, Bluesky lists and moderation
+  // lists (?ajax=list_picker, POST list_picker_set). Shares the bookmark
+  // folder popover's slot, so only one of the two is ever open.
+  async function postListPick(fields) {
+    const fd = new FormData();
+    fd.set('action', 'list_picker_set');
+    fd.set('ajax', '1');
+    if (window.VAAK_CSRF) fd.set('csrf', window.VAAK_CSRF);
+    Object.keys(fields).forEach((k) => fd.set(k, fields[k]));
+    try {
+      const res = await fetch(window.location.pathname + (window.location.search || ''), {
+        method: 'POST',
+        body: fd,
+        credentials: 'same-origin',
+        headers: { 'Accept': 'application/json', 'X-Requested-With': 'XMLHttpRequest' }
+      });
+      return await res.json();
+    } catch (e) {
+      return null;
+    }
+  }
+  function listPickEsc(v) {
+    return String(v == null ? '' : v).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  }
+  async function openListPicker(anchorBtn, actor) {
+    closeFolderPopover();
+    const pop = document.createElement('div');
+    pop.className = 'bm-folder-popover list-pick-popover';
+    pop.setAttribute('role', 'dialog');
+    pop.setAttribute('aria-label', 'Add to list');
+    pop.innerHTML = '<h4>Add to list</h4><div class="meta">Loading lists…</div>';
+    document.body.appendChild(pop);
+    folderPopover = pop;
+    positionFolderPopover(pop, anchorBtn);
+    const reposition = () => { if (folderPopover === pop) positionFolderPopover(pop, anchorBtn); };
+    pop._vaakReposition = reposition;
+    window.addEventListener('scroll', reposition, true);
+    window.addEventListener('resize', reposition);
+    let data = null;
+    try {
+      const res = await fetch('?ajax=list_picker&actor=' + encodeURIComponent(actor), {
+        credentials: 'same-origin',
+        headers: { 'Accept': 'application/json' }
+      });
+      data = await res.json();
+    } catch (e) {
+      data = null;
+    }
+    if (folderPopover !== pop) return;
+    if (!data || !data.ok) {
+      pop.innerHTML = '<h4>Add to list</h4><div class="meta">' + listPickEsc((data && data.error) || 'Could not load your lists.') + '</div>';
+      positionFolderPopover(pop, anchorBtn);
+      return;
+    }
+    const canonical = String(data.actor || actor);
+    const lists = Array.isArray(data.lists) ? data.lists : [];
+    const row = (l) => {
+      const disabled = !l.can_edit;
+      let tag = '';
+      if (l.kind === 'moderation') {
+        tag = l.action === 'block' ? '<span class="tag" style="color:var(--danger)">blocks</span>'
+          : (l.action === 'mute' ? '<span class="tag">mutes</span>' : '<span class="tag">inactive</span>');
+      }
+      const meta = disabled ? l.reason : (l.where + (l.kind === 'moderation' && !l.syncs_bluesky && l.where !== 'VAAK' ? ' · applies in VAAK' : ''));
+      return '<label' + (disabled ? ' class="is-disabled" title="' + listPickEsc(l.reason) + '"' : '') + '>'
+        + '<input type="checkbox" data-list-id="' + Number(l.id) + '"' + (l.member ? ' checked' : '') + (disabled ? ' disabled' : '') + '>'
+        + '<span class="list-pick-title">' + listPickEsc(l.title || 'Untitled list') + '</span>' + tag
+        + '<span class="list-pick-meta">' + listPickEsc(meta) + '</span></label>';
+    };
+    const curation = lists.filter((l) => l.kind !== 'moderation');
+    const moderation = lists.filter((l) => l.kind === 'moderation');
+    let html = '<h4>Add to list</h4>';
+    if (!lists.length) {
+      html += '<div class="meta">You have no lists yet.</div>';
+    }
+    if (curation.length) html += '<h5>Lists</h5>' + curation.map(row).join('');
+    if (moderation.length) html += '<h5>Moderation lists</h5>' + moderation.map(row).join('');
+    html += '<div class="bm-folder-actions"><a class="btn btn-ghost" href="?view=lists">Manage lists</a>'
+      + '<a class="btn btn-ghost" href="?view=mod_lists">Mod lists</a></div>';
+    pop.innerHTML = html;
+    positionFolderPopover(pop, anchorBtn);
+    requestAnimationFrame(() => { if (folderPopover === pop) positionFolderPopover(pop, anchorBtn); });
+    pop.addEventListener('change', async (ev) => {
+      const input = ev.target;
+      if (!(input instanceof HTMLInputElement) || input.type !== 'checkbox') return;
+      const listId = input.getAttribute('data-list-id');
+      if (!listId) return;
+      const want = input.checked;
+      input.disabled = true;
+      let res = await postListPick({ list_id: listId, actor: canonical, member: want ? '1' : '0' });
+      if (want && res && !res.ok && res.needs_follow
+          && window.confirm('You need to follow this account to add them to “' + (res.title || 'this list') + '”. Follow and add?')) {
+        res = await postListPick({ list_id: listId, actor: canonical, member: '1', follow: '1' });
+      }
+      input.disabled = false;
+      if (!res || !res.ok) {
+        input.checked = !want;
+        window.apAdminToast((res && res.error) || 'List update failed.', true);
+        return;
+      }
+      const title = res.title || 'list';
+      let msg = want ? ('Added to “' + title + '”.') : ('Removed from “' + title + '”.');
+      if (want && res.kind === 'moderation' && (res.action === 'block' || res.action === 'mute')) {
+        msg += res.action === 'block' ? ' Blocked for you in VAAK.' : ' Muted for you in VAAK.';
+      }
+      if (want && res.followed) msg = 'Followed and a' + msg.slice(1);
+      window.apAdminToast(msg);
+    });
+  }
+  window.vaakOpenListPicker = openListPicker;
+  document.addEventListener('click', (ev) => {
+    const target = ev.target;
+    const btn = target && target.closest ? target.closest('button[data-list-add]') : null;
+    if (!btn) return;
+    ev.preventDefault();
+    ev.stopPropagation();
+    const actor = btn.getAttribute('data-list-add') || '';
+    if (actor) openListPicker(btn, actor);
   });
 
   function vaakFormatCompactCount(n) {
