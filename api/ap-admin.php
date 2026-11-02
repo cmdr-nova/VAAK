@@ -4164,6 +4164,26 @@ $vaakAdminOnlyActions = [
                 }
             }
         }
+        // Custom feed pages are not stored in bsky_posts. A post someone likes,
+        // reposts or bookmarks gets one cached copy (after the response) so
+        // Favourites, Bookmarks and Home can paint it later.
+        if (in_array($action, ['bsky_like', 'bsky_repost', 'bsky_bookmark'], true)
+            && str_starts_with($subject, 'at://')
+            && function_exists('ap_bsky_post_item_by_uri')
+            && function_exists('ap_bsky_post_preview_from_url')) {
+            $promoteUri = $subject;
+            $promoteOwner = (int) $vaakOwnerId;
+            register_shutdown_function(static function () use ($promoteUri, $promoteOwner): void {
+                try {
+                    $have = ap_bsky_post_item_by_uri($promoteUri);
+                    if (!is_array($have) || !is_array($have['post'] ?? null)) {
+                        ap_bsky_post_preview_from_url($promoteUri, $promoteOwner, true);
+                    }
+                } catch (Throwable $e) {
+                    // best effort; the action itself already went through
+                }
+            });
+        }
         if ($wantAjax && in_array($action, ['bsky_like', 'bsky_unlike', 'bsky_repost', 'bsky_unrepost', 'bsky_bookmark', 'bsky_unbookmark'], true)) {
             $queueKind = str_contains($action, 'like') ? 'like' : (str_contains($action, 'repost') ? 'boost' : 'bookmark');
             $desired = in_array($action, ['bsky_like', 'bsky_repost', 'bsky_bookmark'], true);
@@ -8611,12 +8631,7 @@ if (
     $shellTitles = ['home' => 'Home', 'local' => 'Local', 'feed' => 'Federation feed'];
     $title = $shellTitles[$view] ?? $view;
     echo '<div class="topbar topbar-timeline"><h1>' . h($title) . '</h1><div class="topbar-actions">';
-    echo '<nav class="timeline-tabs" aria-label="Timeline views">';
-    foreach (['home' => 'Home', 'local' => 'Local', 'feed' => 'Federated'] as $tabView => $tabLabel) {
-        $active = $view === $tabView ? ' active' : '';
-        echo '<a class="' . trim($active) . '" href="?view=' . h($tabView) . '" data-vaak-soft-nav="' . h($tabView) . '">' . h($tabLabel) . '</a>';
-    }
-    echo '</nav>';
+    echo admin_timeline_tabs_html($view);
     // Timeline reloads should reuse the warm ranked cache; the live poller and
     // background warmer handle freshness without forcing a cold rebuild.
     echo '<a class="btn btn-ghost" href="?view=' . h($view) . '" title="Reload this view">↻</a>';
@@ -24877,6 +24892,194 @@ if ($isPartial && $view === 'remote_profile') {
     }
 }
 
+/**
+ * Home / Local / Federated / Bluesky pill in the timeline top bar. The
+ * Bluesky entry only needs the instance flag; the view itself explains how
+ * to connect an account, so painting the pill costs no lookup.
+ */
+function admin_timeline_tabs_html(string $view): string
+{
+    $tabs = ['home' => 'Home', 'local' => 'Local', 'feed' => 'Federated'];
+    if (function_exists('ap_bsky_tab_enabled') && ap_bsky_tab_enabled()) {
+        $tabs['bluesky'] = 'Bluesky';
+    }
+    $html = '<nav class="timeline-tabs" aria-label="Timeline views">';
+    foreach ($tabs as $tabView => $tabLabel) {
+        $active = $view === $tabView ? ' class="active" aria-current="page"' : '';
+        $html .= '<a' . $active . ' href="?view=' . h($tabView) . '" data-vaak-soft-nav="' . h($tabView) . '"'
+            . ($tabView === 'bluesky' ? ' data-bsky-feed="following"' : '') . '>' . h($tabLabel) . '</a>';
+    }
+    return $html . '</nav>';
+}
+
+// Soft-nav shell for the Bluesky view (partial=1&shell=1). Same column as the
+// full page; custom feeds come from the Redis page cache when warm.
+if (isset($_GET['partial'], $_GET['shell'])
+    && (string) $_GET['partial'] === '1'
+    && (string) $_GET['shell'] === '1'
+    && $view === 'bluesky'
+) {
+    $GLOBALS['admin_bsky_gallery_repair_budget'] = 0;
+    if (function_exists('ap_auth_session_write_close')) {
+        ap_auth_session_write_close();
+    } elseif (session_status() === PHP_SESSION_ACTIVE) {
+        session_write_close();
+    }
+    header('Content-Type: text/html; charset=utf-8');
+    header('Cache-Control: no-store');
+    header('X-VAAK-View: bluesky');
+    $shellFeed = trim((string) ($_GET['feed'] ?? 'following'));
+    echo '<div class="topbar topbar-timeline"><h1>Bluesky</h1><div class="topbar-actions">';
+    echo admin_timeline_tabs_html('bluesky');
+    echo '<a class="btn btn-ghost" href="?view=bluesky&amp;feed=' . h(rawurlencode($shellFeed !== '' ? $shellFeed : 'following'))
+        . '&amp;_r=' . rawurlencode((string) time()) . '" title="Reload this view">↻</a>';
+    echo '</div></div>';
+    echo '<div class="feed timeline-feed">';
+    admin_render_bsky_view_body((int) $vaakOwnerId);
+    echo '</div>';
+    exit;
+}
+
+/**
+ * Bluesky view column: feed chips, first page, sentinel. Shared by the full
+ * page and the soft-nav shell (view=bluesky&partial=1&shell=1).
+ */
+function admin_render_bsky_view_body(int $vaakOwnerId): void
+{
+?>
+        <?php
+          if (!function_exists('ap_bsky_tab_enabled') || !ap_bsky_tab_enabled()):
+        ?>
+          <div class="empty">Bluesky tab is disabled on this instance.</div>
+        <?php
+          else:
+            $bskySess = ap_bsky_session_row($vaakOwnerId);
+            $bskyFeedKey = trim((string) ($_GET['feed'] ?? 'following'));
+            if ($bskyFeedKey === '') {
+                $bskyFeedKey = 'following';
+            }
+            $bskyCursor = trim((string) ($_GET['cursor'] ?? ''));
+            if (!is_array($bskySess)):
+        ?>
+          <div class="empty">
+            Connect a Bluesky / PDS account in
+            <a href="?view=atmosphere">ATmosphere settings</a>
+            to load your Bluesky home timeline here.
+            <div class="meta" style="margin-top:.75rem">This is separate from your ActivityPub feeds.</div>
+          </div>
+        <?php
+            else:
+              $prefsRaw = ap_bsky_get_preferences($vaakOwnerId);
+              $bskyPrefs = ap_bsky_parse_feed_prefs(
+                  !empty($prefsRaw['ok']) && is_array($prefsRaw['preferences'] ?? null)
+                      ? $prefsRaw['preferences']
+                      : []
+              );
+              // First paint: Following-only (limit 15). Saved-feed merge loads after paint.
+              if ($bskyFeedKey === 'following' || $bskyFeedKey === 'timeline') {
+                  $tl = ap_bsky_following_feed(
+                      $vaakOwnerId,
+                      15,
+                      $bskyCursor !== '' ? $bskyCursor : null,
+                      $bskyPrefs,
+                      false
+                  );
+              } else {
+                  // Redis-cached; blocks and mutes are already applied inside.
+                  $tl = ap_bsky_get_custom_feed($vaakOwnerId, $bskyFeedKey, 15, $bskyCursor !== '' ? $bskyCursor : null);
+                  if (!empty($tl['ok']) && is_array($tl['feed'] ?? null)) {
+                      $tl['feed'] = ap_bsky_filter_feed_items($tl['feed'], $bskyPrefs);
+                  }
+              }
+              if (empty($tl['ok'])):
+        ?>
+          <div class="empty">
+            Could not load Bluesky timeline: <?= h((string) ($tl['error'] ?? 'unknown error')) ?>
+            <div class="meta" style="margin-top:.75rem">
+              <?php if ($bskyFeedKey !== 'following' && $bskyFeedKey !== 'timeline'): ?>
+                This feed's server may be slow or down.
+                <a href="?view=bluesky&amp;feed=following" data-vaak-soft-nav="bluesky" data-bsky-feed="following">Back to Following</a>
+              <?php else: ?>
+                Try <a href="?view=profile">reconnecting</a> with a fresh app password.
+              <?php endif; ?>
+            </div>
+          </div>
+        <?php
+              else:
+                $feed = is_array($tl['feed'] ?? null) ? $tl['feed'] : [];
+                $nextCursor = is_string($tl['cursor'] ?? null) ? (string) $tl['cursor'] : '';
+                $pinnedTabs = is_array($bskyPrefs['pinned'] ?? null) ? $bskyPrefs['pinned'] : [];
+                $mergePending = !empty($tl['merge_pending']);
+        ?>
+          <div class="meta" style="margin:0 0 .65rem">
+            Bluesky for <b>@<?= h((string) ($bskySess['handle'] ?? '')) ?></b>
+            ·
+            <a href="https://bsky.app/profile/<?= h(rawurlencode((string) ($bskySess['handle'] ?? ''))) ?>" target="_blank" rel="noopener noreferrer">Open profile</a>
+          </div>
+          <?php if ($pinnedTabs !== []): ?>
+            <?php $feedLabels = function_exists('ap_bsky_feed_labels') ? ap_bsky_feed_labels($pinnedTabs) : []; ?>
+            <nav class="bsky-feed-tabs" aria-label="Bluesky feeds">
+              <?php foreach ($pinnedTabs as $tab): ?>
+                <?php
+                  $tType = (string) ($tab['type'] ?? '');
+                  $tVal = (string) ($tab['value'] ?? '');
+                  $tabKey = ($tType === 'timeline' || $tVal === 'following') ? 'following' : $tVal;
+                  if ($tabKey !== 'following' && !str_starts_with($tabKey, 'at://')) {
+                      continue; // pinned searches etc. have no feed to load here
+                  }
+                  $tabLabel = ($tabKey === 'following')
+                      ? 'Following'
+                      : (string) ($feedLabels[$tVal] ?? basename($tVal));
+                  $active = ($bskyFeedKey === $tabKey) || ($bskyFeedKey === 'timeline' && $tabKey === 'following');
+                ?>
+                <a class="btn <?= $active ? 'btn-primary' : 'btn-ghost' ?>" href="?view=bluesky&amp;feed=<?= h(rawurlencode($tabKey)) ?>" data-vaak-soft-nav="bluesky" data-bsky-feed="<?= h($tabKey) ?>"<?= $active ? ' aria-current="page"' : '' ?>><?= h($tabLabel) ?></a>
+              <?php endforeach; ?>
+            </nav>
+          <?php endif; ?>
+          <?php if ($feed === []): ?>
+            <div class="empty">
+              No posts in this Bluesky feed yet.
+              <div class="meta" style="margin-top:.75rem;line-height:1.45">
+                Follow people on
+                <a href="https://bsky.app" target="_blank" rel="noopener noreferrer">bsky.app</a>
+                as <code>@<?= h((string) ($bskySess['handle'] ?? '')) ?></code>, then refresh.
+              </div>
+            </div>
+          <?php else: ?>
+            <?php if (($tl['source'] ?? '') === 'author'): ?>
+              <div class="meta" style="margin:0 0 .85rem;line-height:1.4">
+                Home timeline is empty (no follows yet), so showing <b>your own posts</b> instead.
+              </div>
+            <?php endif; ?>
+            <div id="timeline-items"
+                 data-view="bluesky"
+                 data-feed="<?= h($bskyFeedKey) ?>"
+                 data-source="<?= h((string) ($tl['source'] ?? 'home')) ?>"
+                 data-cursor="<?= h($nextCursor) ?>"
+                 data-has-more="<?= $nextCursor !== '' ? '1' : '0' ?>"
+                 data-limit="20"
+                 data-offset="0"
+                 data-newest="0"
+                 data-merge-pending="<?= !empty($mergePending) ? '1' : '0' ?>">
+              <?php foreach ($feed as $item): ?>
+                <?php if (is_array($item)) {
+                    admin_render_bsky_feed_item($item, $bskyFeedKey);
+                } ?>
+              <?php endforeach; ?>
+            </div>
+            <div id="timeline-sentinel" class="meta" style="text-align:center;padding:1rem 0 2rem">
+              <?= $nextCursor !== '' ? 'Scroll for more…' : 'End of Bluesky feed' ?>
+            </div>
+          <?php endif; ?>
+        <?php
+              endif;
+            endif;
+          endif;
+        ?>
+
+<?php
+}
+
 // AJAX fragment for Bluesky tab infinite scroll (cursor-based) + deferred merge samples
 if ($isPartial && $view === 'bluesky') {
     $bskyPartialT0 = microtime(true);
@@ -24903,10 +25106,10 @@ if ($isPartial && $view === 'bluesky') {
             $bskySource
         );
     } else {
+        // Redis-cached; blocks and mutes are already applied inside.
         $tl = ap_bsky_get_custom_feed($vaakOwnerId, $bskyFeedKey, $bskyLimit, $bskyCursor !== '' ? $bskyCursor : null);
         if (!empty($tl['ok']) && is_array($tl['feed'] ?? null)) {
             $tl['feed'] = ap_bsky_filter_feed_items($tl['feed'], $prefs);
-            $tl['feed'] = ap_bsky_filter_hidden_authors($vaakOwnerId, $tl['feed']);
         }
     }
     $feed = (!empty($tl['ok']) && is_array($tl['feed'] ?? null)) ? $tl['feed'] : [];
@@ -31470,7 +31673,7 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
 <?php if (empty($GLOBALS['vaak_profile_shell']) && empty($GLOBALS['vaak_status_shell'])): ?>
   <section class="main">
 <?php endif; ?>
-    <div class="topbar<?= in_array($view, ['home', 'local', 'feed'], true) ? ' topbar-timeline' : '' ?>">
+    <div class="topbar<?= in_array($view, ['home', 'local', 'feed', 'bluesky'], true) ? ' topbar-timeline' : '' ?>">
       <?php
         $topTitle = view_title($view);
         if ($view === 'remote_profile') {
@@ -31485,12 +31688,8 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
         <?php if ($view === 'dms' || $view === 'blog'): ?>
           <a class="btn btn-ghost dm-back-top" href="?view=home" data-vaak-soft-nav="home">← Back to Home</a>
         <?php endif; ?>
-        <?php if (in_array($view, ['home', 'local', 'feed'], true)): ?>
-          <nav class="timeline-tabs" aria-label="Timeline views">
-            <a class="<?= $view === 'home' ? 'active' : '' ?>" href="?view=home" data-vaak-soft-nav="home">Home</a>
-            <a class="<?= $view === 'local' ? 'active' : '' ?>" href="?view=local" data-vaak-soft-nav="local">Local</a>
-            <a class="<?= $view === 'feed' ? 'active' : '' ?>" href="?view=feed" data-vaak-soft-nav="feed">Federated</a>
-          </nav>
+        <?php if (in_array($view, ['home', 'local', 'feed', 'bluesky'], true)): ?>
+          <?= admin_timeline_tabs_html($view) ?>
         <?php endif; ?>
         <?php if (in_array($view, ['home', 'local', 'feed', 'mentions', 'dms', 'favourites', 'bookmarks', 'outbox', 'queue', 'drafts', 'followers', 'following', 'blocks', 'profile', 'users'], true)): ?>
           <?php
@@ -35917,126 +36116,7 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
         <?php endif; ?>
 
       <?php elseif ($view === 'bluesky'): ?>
-        <?php
-          if (!function_exists('ap_bsky_tab_enabled') || !ap_bsky_tab_enabled()):
-        ?>
-          <div class="empty">Bluesky tab is disabled on this instance.</div>
-        <?php
-          else:
-            $bskySess = ap_bsky_session_row($vaakOwnerId);
-            $bskyFeedKey = trim((string) ($_GET['feed'] ?? 'following'));
-            if ($bskyFeedKey === '') {
-                $bskyFeedKey = 'following';
-            }
-            $bskyCursor = trim((string) ($_GET['cursor'] ?? ''));
-            if (!is_array($bskySess)):
-        ?>
-          <div class="empty">
-            Connect a Bluesky / PDS account in
-            <a href="?view=atmosphere">ATmosphere settings</a>
-            to load your Bluesky home timeline here.
-            <div class="meta" style="margin-top:.75rem">This is separate from your ActivityPub feeds.</div>
-          </div>
-        <?php
-            else:
-              $prefsRaw = ap_bsky_get_preferences($vaakOwnerId);
-              $bskyPrefs = ap_bsky_parse_feed_prefs(
-                  !empty($prefsRaw['ok']) && is_array($prefsRaw['preferences'] ?? null)
-                      ? $prefsRaw['preferences']
-                      : []
-              );
-              // First paint: Following-only (limit 15). Saved-feed merge loads after paint.
-              if ($bskyFeedKey === 'following' || $bskyFeedKey === 'timeline') {
-                  $tl = ap_bsky_following_feed(
-                      $vaakOwnerId,
-                      15,
-                      $bskyCursor !== '' ? $bskyCursor : null,
-                      $bskyPrefs,
-                      false
-                  );
-              } else {
-                  $tl = ap_bsky_get_custom_feed($vaakOwnerId, $bskyFeedKey, 15, $bskyCursor !== '' ? $bskyCursor : null);
-                  if (!empty($tl['ok']) && is_array($tl['feed'] ?? null)) {
-                      $tl['feed'] = ap_bsky_filter_feed_items($tl['feed'], $bskyPrefs);
-                      $tl['feed'] = ap_bsky_filter_hidden_authors($vaakOwnerId, $tl['feed']);
-                  }
-              }
-              if (empty($tl['ok'])):
-        ?>
-          <div class="empty">
-            Could not load Bluesky timeline: <?= h((string) ($tl['error'] ?? 'unknown error')) ?>
-            <div class="meta" style="margin-top:.75rem">
-              Try <a href="?view=profile">reconnecting</a> with a fresh app password.
-            </div>
-          </div>
-        <?php
-              else:
-                $feed = is_array($tl['feed'] ?? null) ? $tl['feed'] : [];
-                $nextCursor = is_string($tl['cursor'] ?? null) ? (string) $tl['cursor'] : '';
-                $pinnedTabs = is_array($bskyPrefs['pinned'] ?? null) ? $bskyPrefs['pinned'] : [];
-                $mergePending = !empty($tl['merge_pending']);
-        ?>
-          <div class="meta" style="margin:0 0 .65rem">
-            Bluesky for <b>@<?= h((string) ($bskySess['handle'] ?? '')) ?></b>
-            ·
-            <a href="https://bsky.app/profile/<?= h(rawurlencode((string) ($bskySess['handle'] ?? ''))) ?>" target="_blank" rel="noopener noreferrer">Open profile</a>
-          </div>
-          <?php if ($pinnedTabs !== []): ?>
-            <nav class="bsky-feed-tabs" aria-label="Bluesky feeds">
-              <?php foreach ($pinnedTabs as $tab): ?>
-                <?php
-                  $tType = (string) ($tab['type'] ?? '');
-                  $tVal = (string) ($tab['value'] ?? '');
-                  $tabKey = ($tType === 'timeline' || $tVal === 'following') ? 'following' : $tVal;
-                  $tabLabel = ($tabKey === 'following')
-                      ? 'Following'
-                      : (str_contains($tVal, '/') ? basename($tVal) : $tVal);
-                  $active = ($bskyFeedKey === $tabKey) || ($bskyFeedKey === 'following' && $tabKey === 'following');
-                ?>
-                <a class="btn <?= $active ? 'btn-primary' : 'btn-ghost' ?>" href="?view=bluesky&amp;feed=<?= h(rawurlencode($tabKey)) ?>"><?= h($tabLabel) ?></a>
-              <?php endforeach; ?>
-            </nav>
-          <?php endif; ?>
-          <?php if ($feed === []): ?>
-            <div class="empty">
-              No posts in this Bluesky feed yet.
-              <div class="meta" style="margin-top:.75rem;line-height:1.45">
-                Follow people on
-                <a href="https://bsky.app" target="_blank" rel="noopener noreferrer">bsky.app</a>
-                as <code>@<?= h((string) ($bskySess['handle'] ?? '')) ?></code>, then refresh.
-              </div>
-            </div>
-          <?php else: ?>
-            <?php if (($tl['source'] ?? '') === 'author'): ?>
-              <div class="meta" style="margin:0 0 .85rem;line-height:1.4">
-                Home timeline is empty (no follows yet), so showing <b>your own posts</b> instead.
-              </div>
-            <?php endif; ?>
-            <div id="timeline-items"
-                 data-view="bluesky"
-                 data-feed="<?= h($bskyFeedKey) ?>"
-                 data-source="<?= h((string) ($tl['source'] ?? 'home')) ?>"
-                 data-cursor="<?= h($nextCursor) ?>"
-                 data-has-more="<?= $nextCursor !== '' ? '1' : '0' ?>"
-                 data-limit="20"
-                 data-offset="0"
-                 data-newest="0"
-                 data-merge-pending="<?= !empty($mergePending) ? '1' : '0' ?>">
-              <?php foreach ($feed as $item): ?>
-                <?php if (is_array($item)) {
-                    admin_render_bsky_feed_item($item, $bskyFeedKey);
-                } ?>
-              <?php endforeach; ?>
-            </div>
-            <div id="timeline-sentinel" class="meta" style="text-align:center;padding:1rem 0 2rem">
-              <?= $nextCursor !== '' ? 'Scroll for more…' : 'End of Bluesky feed' ?>
-            </div>
-          <?php endif; ?>
-        <?php
-              endif;
-            endif;
-          endif;
-        ?>
+        <?php admin_render_bsky_view_body((int) $vaakOwnerId); ?>
 
       <?php elseif ($view === 'foryou'): ?>
         <?php
@@ -40217,6 +40297,7 @@ if (!empty($GLOBALS['vaak_profile_shell'])) {
     }
     if ((view === 'following' || view === 'followers') && extra.limit) p.set('limit', String(extra.limit));
     if (view === 'bookmarks' && extra.folder) p.set('folder', String(extra.folder));
+    if (view === 'bluesky' && extra.feed && extra.feed !== 'following') p.set('feed', String(extra.feed));
     if (view === 'search') {
       if (extra.q) p.set('q', String(extra.q));
       if (extra.type) p.set('type', String(extra.type));
@@ -40652,7 +40733,7 @@ if (!empty($GLOBALS['vaak_profile_shell'])) {
   let notifView = <?= json_encode($view === 'mentions') ?>;
   let dmView = <?= json_encode($view === 'dms') ?>;
   let notifBaseTitle = <?= json_encode('VAAK · ' . view_title($view)) ?>;
-  const canonicalViewTitles = <?= json_encode(array_combine($titleViews = ['home', 'local', 'feed', 'mentions', 'outbox', 'favourites', 'bookmarks', 'following', 'followers', 'search', 'status', 'remote_profile', 'rss', 'dms', 'blog'], array_map('view_title', $titleViews))) ?>;
+  const canonicalViewTitles = <?= json_encode(array_combine($titleViews = ['home', 'local', 'feed', 'bluesky', 'mentions', 'outbox', 'favourites', 'bookmarks', 'following', 'followers', 'search', 'status', 'remote_profile', 'rss', 'dms', 'blog'], array_map('view_title', $titleViews))) ?>;
   let titleNotifCount = 0;
   let titleDmCount = 0;
   function renderCurrentInboxTitle() {
@@ -44356,6 +44437,9 @@ window.vaakBootStatusThread();
     bskyCursor = items.dataset.cursor || '';
     bskyFeed = items.dataset.feed || 'following';
     bskySource = items.dataset.source || 'home';
+    if (isBskyTimeline && items.dataset.mergePending === '1') {
+      setTimeout(function () { try { loadBskyMergeSamples(); } catch (e) {} }, 400);
+    }
     if (status && !isNotifTimeline
         && /end of notifications/i.test(String(status.textContent || ''))) {
       status.textContent = hasMore ? 'Scroll for more…' : 'Loading…';
@@ -44471,6 +44555,12 @@ window.vaakBootStatusThread();
     // A short permalink has no ?view=. The later listener loads the post.
     if (typeof window.vaakShortStatusTarget === 'function' && window.vaakShortStatusTarget(u)) return;
     const next = u.searchParams.get('view') || 'home';
+    // Only swap in place when Home/Local/Federated is the live column. Back
+    // from Bluesky or Your posts belongs to the soft-nav popstate handler,
+    // which restores the parked column; swapping here too raced it.
+    const liveItems = document.getElementById('timeline-items');
+    const liveView = liveItems ? String(liveItems.dataset.view || '') : '';
+    if (!['home', 'local', 'feed'].includes(liveView)) return;
     if (['home', 'local', 'feed'].includes(next) && next !== viewName) {
       swapTimelineView(next, false);
     }
@@ -44494,12 +44584,13 @@ window.vaakBootStatusThread();
 // Soft-nav for primary left-rail / timeline destinations. Keeps rails + CSS;
 // swaps section.main. Falls back to full navigation when a shell or boot is missing.
 (function () {
-  const SOFT_VIEWS = new Set(['home', 'local', 'feed', 'mentions', 'outbox', 'favourites', 'bookmarks', 'following', 'followers', 'search', 'status']);
+  const SOFT_VIEWS = new Set(['home', 'local', 'feed', 'bluesky', 'mentions', 'outbox', 'favourites', 'bookmarks', 'following', 'followers', 'search', 'status']);
   const TL_TITLES = {
     home: 'Home', local: 'Local', feed: 'Federation feed',
     mentions: 'Notifications', outbox: 'Your posts',
     favourites: 'Favourites', bookmarks: 'Bookmarks',
-    following: 'Following', followers: 'Followers', search: 'Search', status: 'Post'
+    following: 'Following', followers: 'Followers', search: 'Search', status: 'Post',
+    bluesky: 'Bluesky'
   };
   let busy = false;
   let leaving = false;
@@ -44883,6 +44974,11 @@ window.vaakBootStatusThread();
       const folder = link.getAttribute('data-bm-folder')
         || linkUrl.searchParams.get('folder');
       if (folder) extra.folder = folder;
+    }
+    if (view === 'bluesky') {
+      extra.feed = link.getAttribute('data-bsky-feed')
+        || linkUrl.searchParams.get('feed')
+        || 'following';
     }
     if (view === 'search') {
       extra.q = link.getAttribute('data-search-q') || linkUrl.searchParams.get('q') || '';
@@ -45504,6 +45600,7 @@ window.vaakBootStatusThread();
         if (extra.limit) url += '&limit=' + encodeURIComponent(String(extra.limit));
       }
       if (view === 'bookmarks' && extra.folder) url += '&folder=' + encodeURIComponent(extra.folder);
+      if (view === 'bluesky' && extra.feed) url += '&feed=' + encodeURIComponent(extra.feed);
       if (view === 'search') {
         if (extra.q) url += '&q=' + encodeURIComponent(extra.q);
         if (extra.type) url += '&type=' + encodeURIComponent(extra.type);
@@ -45645,12 +45742,15 @@ window.vaakBootStatusThread();
         } else {
           bootLibraryView(view, main);
         }
-      } else if (['home', 'local', 'feed', 'outbox'].includes(view)) {
+      } else if (view === 'bluesky' && !main.querySelector('#timeline-items')) {
+        // Empty feed / error notice: nothing to scroll, the chips still work.
+        bindFeedTopBtn(main);
+      } else if (['home', 'local', 'feed', 'outbox', 'bluesky'].includes(view)) {
         if (typeof window.vaakBootTimeline === 'function') {
           const ok = window.vaakBootTimeline(view);
-          if (!ok && ['home', 'local', 'feed'].includes(view)) { hardNav(view, filter, extra); return; }
+          if (!ok && ['home', 'local', 'feed', 'bluesky'].includes(view)) { hardNav(view, filter, extra); return; }
           bindFeedTopBtn(main);
-        } else if (['home', 'local', 'feed'].includes(view)) {
+        } else if (['home', 'local', 'feed', 'bluesky'].includes(view)) {
           hardNav(view, filter, extra); return;
         } else {
           bindGenericScroll(view, main);
@@ -45793,6 +45893,7 @@ window.vaakBootStatusThread();
       if (u.searchParams.get('limit')) extra.limit = u.searchParams.get('limit');
     }
     if (view === 'bookmarks' && u.searchParams.get('folder')) extra.folder = u.searchParams.get('folder');
+    if (view === 'bluesky') extra.feed = u.searchParams.get('feed') || 'following';
     if (view === 'search') {
       extra.q = u.searchParams.get('q') || '';
       extra.type = u.searchParams.get('type') || '';
