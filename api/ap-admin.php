@@ -29565,6 +29565,11 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     }
     .dm-conversation-row:last-child { border-bottom: 0; }
     .dm-conversation-row:hover, .dm-conversation-row.is-active { background: var(--primary-dim); }
+    /* The DM screen is an app surface: rows, the thread header and buttons never get link underlines. */
+    .dm-workspace a.dm-conversation-row:hover, .dm-workspace a.dm-conversation-row:hover *,
+    .dm-workspace a.dm-peer:hover, .dm-workspace a.dm-peer:hover *,
+    .dm-workspace a.btn:hover { text-decoration: none; }
+    .dm-conversation-row:focus-visible, .dm-peer:focus-visible { outline: 2px solid var(--primary); outline-offset: -2px; }
     .dm-conversation-avatar { flex: 0 0 2.35rem; width: 2.35rem; height: 2.35rem; }
     .dm-conversation-avatar img { width: 100%; height: 100%; object-fit: cover; border-radius: 50%; }
     .dm-conversation-copy { display: flex; flex-direction: column; gap: .15rem; min-width: 0; flex: 1 1 auto; }
