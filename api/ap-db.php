@@ -18037,12 +18037,37 @@ function ap_dm_thread(string $peerActorId, int $limit = 100, ?int $ownerUserId =
     if ($peer !== '' && ap_is_blocked_actor($peer)) {
         return [];
     }
+    // Newest $limit rows, returned oldest first. ORDER BY id ASC LIMIT used
+    // to return the FIRST $limit rows, so a long thread hid its latest messages.
     $st = ap_db()->prepare(
         'SELECT * FROM direct_messages
          WHERE owner_user_id = ? AND deleted_at IS NULL AND peer_actor_id = ?
-         ORDER BY id ASC LIMIT ?'
+         ORDER BY id DESC LIMIT ?'
     );
     $st->execute([$ownerUserId, $peer, $limit]);
+    return array_reverse($st->fetchAll());
+}
+
+/**
+ * Messages in one thread newer than $afterId, oldest first. The DM screen
+ * polls this while it is open, so it reads only the new rows by index.
+ *
+ * @return list<array<string,mixed>>
+ */
+function ap_dm_thread_after(string $peerActorId, int $afterId, int $limit = 50, ?int $ownerUserId = null): array
+{
+    $ownerUserId = $ownerUserId ?? ap_db_default_owner_user_id();
+    $peer = ap_dm_peer_key($peerActorId);
+    $limit = max(1, min(100, $limit));
+    if ($peer === '' || ap_is_blocked_actor($peer)) {
+        return [];
+    }
+    $st = ap_db()->prepare(
+        'SELECT * FROM direct_messages
+         WHERE owner_user_id = ? AND deleted_at IS NULL AND peer_actor_id = ? AND id > ?
+         ORDER BY id ASC LIMIT ?'
+    );
+    $st->execute([$ownerUserId, $peer, max(0, $afterId), $limit]);
     return $st->fetchAll();
 }
 
