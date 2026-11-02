@@ -6794,7 +6794,7 @@ function ap_notification_is_local_note(string $uri): bool
 function ap_notification_target_object_id(string $objectId): string
 {
     $objectId = rtrim(trim($objectId), '/');
-    if (preg_match('/^(https:\/\/.+?)#(like|reblog|update|quote|bite|webmention)-[a-z0-9]+$/i', $objectId, $m)) {
+    if (preg_match('/^(https:\/\/.+?)#(like|reblog|update|quote|bite|webmention|zap)-[a-z0-9]+$/i', $objectId, $m)) {
         return rtrim($m[1], '/');
     }
     $stripped = preg_replace('/#announce-\d+$/', '', $objectId);

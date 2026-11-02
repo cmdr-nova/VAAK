@@ -15,7 +15,11 @@
 //! `ap_mention_store` (badge, cache invalidation, push), so the PHP and Rust
 //! notification lists both see them. Notes that notify, and the user's notes
 //! they point at, are kept in `nostr_events` so Reply and Like work from the
-//! notification card. Zaps (kind 9735) are not read yet.
+//! notification card.
+//!
+//! Zaps (NIP-57 kind 9735 receipts) notify as "zapped your post · N sats"
+//! when they check out (`zap::receipt`) and were signed by the user's own
+//! Lightning provider. The zapper (the zap request's key) is the notifier.
 
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
@@ -30,8 +34,9 @@ use super::bech32;
 use super::event::{self, Event};
 use super::relay::{self, Query};
 use super::sync::{self, Settings};
+use super::zap;
 
-const KINDS: [i64; 3] = [1, 6, 7];
+const KINDS: [i64; 4] = [1, 6, 7, zap::RECEIPT_KIND];
 /// How far back the first read for a newly linked key goes.
 const FIRST_LOOKBACK_SECS: i64 = 3 * 86_400;
 const OVERLAP_SECS: i64 = 900;
@@ -90,6 +95,13 @@ fn interaction_object_id(target: &str, actor: &str, kind: &str) -> String {
     format!("{target}#{kind}-{}", &hash[..12])
 }
 
+/// A zap's `object_id`: the zapped note plus the sats, unique per receipt
+/// (one person can zap a note twice). Notifications read the sats back.
+fn zap_object_id(target: &str, actor: &str, receipt_id: &str, sats: i64) -> String {
+    let hash = hex::encode(Sha256::digest(format!("{actor}|{target}|zap|{receipt_id}").as_bytes()));
+    format!("{target}#zap-{sats}s{}", &hash[..12])
+}
+
 fn iso(ts: i64) -> String {
     chrono::DateTime::from_timestamp(ts, 0)
         .unwrap_or_else(chrono::Utc::now)
@@ -119,6 +131,22 @@ fn mention_row(ev: &Event, target: &str, target_text: &str) -> Value {
         "type": if kind.is_empty() { "Note" } else { activity },
         "content": content.chars().take(2000).collect::<String>(),
         "in_reply_to": in_reply_to,
+        "created_at": iso(ev.created_at),
+    })
+}
+
+/// The `mentions` row for a checked zap receipt, typed like a like and
+/// carrying the zapped note's text.
+fn zap_row(ev: &Event, zap: &zap::Receipt, target_text: &str) -> Value {
+    let actor = actor_url(&zap.sender);
+    json!({
+        "activity_id": format!("nostr:{}", ev.id),
+        "actor_id": actor,
+        "object_id": zap_object_id(&note_url(&zap.target), &actor, &ev.id, zap.msats / 1000),
+        "activity_type": "Zap",
+        "type": "Zap",
+        "content": target_text.chars().take(2000).collect::<String>(),
+        "in_reply_to": "",
         "created_at": iso(ev.created_at),
     })
 }
@@ -221,6 +249,7 @@ pub async fn sync(db: &mut Client, s: &Settings, now: i64, deadline: Instant) ->
             1 => Some(ev.reply_info()).filter(|r| r.0).map(|r| r.1),
             6 => ev.repost_target().map(|t| t.0),
             7 => ev.reaction_target(),
+            zap::RECEIPT_KIND => ev.tags.iter().find(|t| t.first().map(String::as_str) == Some("e")).and_then(|t| t.get(1)).filter(|id| event::is_hex64(id)).cloned(),
             _ => None,
         };
         if let Some(t) = target.filter(|t| !wanted.contains(t)) {
@@ -260,14 +289,31 @@ pub async fn sync(db: &mut Client, s: &Settings, now: i64, deadline: Instant) ->
         }
     }
 
-    let mut staged: Vec<(i64, &Event, String, Value, bool)> = Vec::new();
+    let mut staged: Vec<(i64, &Event, String, String, Value, bool)> = Vec::new();
     let mut keep_targets: HashSet<String> = HashSet::new();
     for l in &links {
         let mine_events: Vec<&Event> = events.iter().filter(|ev| tags_key(ev, &l.pubkey)).collect();
         if mine_events.is_empty() {
             continue;
         }
-        let authors: Vec<String> = mine_events.iter().map(|ev| ev.pubkey.clone()).collect();
+        // A zap's notifier is the zapper; its receipt is signed by the
+        // user's Lightning provider, which must be the one their profile names.
+        let zaps: HashMap<&str, zap::Receipt> =
+            mine_events.iter().filter_map(|ev| zap::receipt(ev, &l.pubkey).map(|z| (ev.id.as_str(), z))).collect();
+        let provider = if zaps.is_empty() {
+            String::new()
+        } else {
+            match zap::pay_info_for(db, &l.pubkey, now, zap::RECEIPT_MAX_AGE_SECS).await {
+                Ok(Some((_, info))) if info.allows_nostr => info.zap_pubkey,
+                Ok(_) => String::new(),
+                Err(e) => {
+                    tracing::debug!(owner = l.owner, error = %format!("{e:#}"), "nostr zap provider check failed");
+                    String::new()
+                }
+            }
+        };
+        let actor_of = |ev: &Event| zaps.get(ev.id.as_str()).map(|z| z.sender.clone()).unwrap_or_else(|| ev.pubkey.clone());
+        let authors: Vec<String> = mine_events.iter().map(|ev| actor_of(ev)).collect();
         let followed: HashSet<String> = db
             .query("SELECT pubkey FROM nostr_follows WHERE owner_user_id = $1 AND pubkey = ANY($2)", &[&l.owner, &authors])
             .await
@@ -278,16 +324,27 @@ pub async fn sync(db: &mut Client, s: &Settings, now: i64, deadline: Instant) ->
         let hidden = super::moderation::hidden_keys(db, l.owner).await;
         let mine = |id: &str| targets.get(id).is_some_and(|(pk, _)| pk == &l.pubkey);
         for ev in mine_events {
-            if hidden.contains(&ev.pubkey) {
+            let actor = actor_of(ev);
+            if hidden.contains(&actor) {
+                continue;
+            }
+            let push = l.since_at > 0 && ev.created_at >= now - PUSH_WINDOW_SECS;
+            if ev.kind == zap::RECEIPT_KIND {
+                let Some(z) = zaps.get(ev.id.as_str()) else { continue };
+                if provider.is_empty() || ev.pubkey != provider || z.sender == l.pubkey || !mine(&z.target) {
+                    continue;
+                }
+                let text = targets.get(&z.target).map(|(_, c)| c.as_str()).unwrap_or("");
+                keep_targets.insert(z.target.clone());
+                staged.push((l.owner, ev, actor, z.target.clone(), zap_row(ev, z, text), push));
                 continue;
             }
             let Some(target) = notifies(ev, &l.pubkey, followed.contains(&ev.pubkey), &mine) else { continue };
             let text = targets.get(&target).map(|(_, c)| c.as_str()).unwrap_or("");
-            let push = l.since_at > 0 && ev.created_at >= now - PUSH_WINDOW_SECS;
             if mine(&target) {
                 keep_targets.insert(target.clone());
             }
-            staged.push((l.owner, ev, target.clone(), mention_row(ev, &target, text), push));
+            staged.push((l.owner, ev, actor, target.clone(), mention_row(ev, &target, text), push));
         }
     }
 
@@ -295,7 +352,7 @@ pub async fn sync(db: &mut Client, s: &Settings, now: i64, deadline: Instant) ->
     for ev in fetched.iter().filter(|ev| keep_targets.contains(&ev.id)) {
         store_note(&tx, ev, relay_of.get(&ev.id).map(String::as_str).unwrap_or(""), now).await?;
     }
-    for (owner, ev, target, row, push) in &staged {
+    for (owner, ev, actor, target, row, push) in &staged {
         if ev.kind == 1 {
             store_note(&tx, ev, relay_of.get(&ev.id).map(String::as_str).unwrap_or(""), now).await?;
         }
@@ -304,7 +361,7 @@ pub async fn sync(db: &mut Client, s: &Settings, now: i64, deadline: Instant) ->
             .execute(
                 "INSERT INTO nostr_notifs (owner_user_id, event_id, kind, actor, target_id, created_at, mention, push)
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT (owner_user_id, event_id) DO NOTHING",
-                &[owner, &ev.id, &kind, &ev.pubkey, target, &ev.created_at, row, push],
+                &[owner, &ev.id, &kind, actor, target, &ev.created_at, row, push],
             )
             .await
             .context("nostr notif stage")?;

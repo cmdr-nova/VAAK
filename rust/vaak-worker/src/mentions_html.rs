@@ -105,6 +105,27 @@ fn type_label(n_type: &str, status_uri: &str) -> String {
     }
 }
 
+/// Sats in a zap notification (`vaak_zap_sats`, 0 for anything else).
+fn zap_sats_of(n: &Value) -> i64 {
+    if n.get("type").and_then(Value::as_str) != Some("favourite") {
+        return 0;
+    }
+    n.get("vaak_zap_sats").and_then(Value::as_i64).filter(|s| *s > 0).unwrap_or(0)
+}
+
+/// "1 sat", "21 sats", "2,100 sats" (PHP `admin_zap_sats_label`).
+fn sats_label(sats: i64) -> String {
+    let digits = sats.to_string();
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    format!("{out} {}", if sats == 1 { "sat" } else { "sats" })
+}
+
 fn urlencoding_encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len() * 2);
     for b in s.bytes() {
@@ -147,7 +168,9 @@ fn notification_group_key(row: &Value) -> Option<String> {
     if status_key.is_empty() {
         return None;
     }
-    Some(format!("{n_type}:{status_key}"))
+    // Zaps stack apart from plain likes of the same post.
+    let kind = if zap_sats_of(row) > 0 { "zap" } else { n_type };
+    Some(format!("{kind}:{status_key}"))
 }
 
 fn account_identity_key(acct: &Value) -> String {
@@ -198,6 +221,8 @@ struct GroupedNotif {
     row: Value,
     count: usize,
     accounts: Vec<Value>,
+    /// All the sats in a zap stack, repeat zaps by one person included.
+    zap_sats: i64,
 }
 
 /// Collapse repeated favourite/reblog rows for the same status. Presentation
@@ -242,10 +267,12 @@ fn group_notification_rows_with_facts(rows: &[Value], facts: &GroupingFacts) -> 
                 row: row.clone(),
                 count: 1,
                 accounts,
+                zap_sats: zap_sats_of(row),
             });
             continue;
         }
         let idx = *index.get(&map_key).expect("index");
+        out[idx].zap_sats += zap_sats_of(row);
         let idents = seen_idents.entry(idx).or_default();
         if !idents.contains_key(&ident) {
             out[idx].count += 1;
@@ -316,10 +343,12 @@ fn profile_href_for(acct: &Value) -> String {
 
 fn paint_grouped_card(g: &GroupedNotif, viewer_actor: &str) -> String {
     let n_type = g.row.get("type").and_then(|v| v.as_str()).unwrap_or("favourite");
-    let label = if n_type == "reblog" {
-        "boosted your post"
+    let label = if g.zap_sats > 0 {
+        format!("zapped your post · {}", sats_label(g.zap_sats))
+    } else if n_type == "reblog" {
+        "boosted your post".to_string()
     } else {
-        "liked your post"
+        "liked your post".to_string()
     };
     let created = g.row.get("created_at").and_then(|v| v.as_str()).unwrap_or("");
     let when = relative_time(created);
@@ -356,7 +385,7 @@ fn paint_grouped_card(g: &GroupedNotif, viewer_actor: &str) -> String {
          <div class=\"meta\">{when}</div></div></div>{body}</article>",
         stack = stack,
         count = g.count,
-        label = esc(label),
+        label = esc(&label),
         when = esc(&when),
         body = body
     )
@@ -682,7 +711,8 @@ fn paint_notif_card_follows(n: &Value, viewer_actor: &str, following: &HashSet<S
         })
         .unwrap_or("")
         .trim_end_matches('/');
-    let label = type_label(n_type, status_uri);
+    let zap_sats = zap_sats_of(n);
+    let label = if zap_sats > 0 { format!("⚡ zapped your post · {}", sats_label(zap_sats)) } else { type_label(n_type, status_uri) };
 
     let profile_href = if actor_ref.starts_with("https://") {
         format!(
@@ -943,6 +973,7 @@ fn resolved_group_key(n: &Value, facts: &GroupingFacts) -> Option<String> {
     if !matches!(kind, "favourite" | "reblog") { return None; }
     let uri = status_uri_of(n);
     if uri.is_empty() { return None; }
+    let kind = if zap_sats_of(n) > 0 { "zap" } else { kind };
     Some(format!("{kind}:{}", facts.statuses.get(&uri).unwrap_or(&uri)))
 }
 fn unique_fact(map: &mut std::collections::HashMap<String, String>, key: String, value: String) -> Result<()> {

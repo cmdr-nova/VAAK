@@ -126,6 +126,7 @@ function vaak_migrate_deploy_sql_files(string $apiRoot): array
         '20261030_nostr_bunkers_postgres.sql',
         '20261102_bsky_chat_postgres.sql',
         '20261102_bsky_chat_reactions_postgres.sql',
+        '20261102_nostr_zaps_postgres.sql',
     ];
     $files = [];
     $migrations = $root . DIRECTORY_SEPARATOR . 'migrations' . DIRECTORY_SEPARATOR;

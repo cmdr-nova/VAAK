@@ -1206,14 +1206,20 @@ fn one_notification(item: &NotifInput, facts: &PageFacts, owner: &OwnerView) -> 
     };
     let actor = if item.actor_id.is_empty() { "-".to_string() } else { trim_slash(&item.actor_id) };
     let group_ref = json_string(&status, "id");
-    Some(json!({
+    let mut entity = json!({
         "id": item.id,
         "type": item.type_name,
         "group_key": group_key(&item.type_name, &actor, &group_ref),
         "created_at": created,
         "account": notification_account(item, facts, owner),
         "status": status
-    }))
+    });
+    // PHP ap_masto_notification_entity: a Nostr zap is a favourite with sats.
+    let zap_sats = if item.type_name == "favourite" { notif::zap_sats(&item.object_id) } else { 0 };
+    if zap_sats > 0 {
+        entity["vaak_zap_sats"] = json!(zap_sats);
+    }
+    Some(entity)
 }
 
 fn identity_of(actor: &str, facts: &PageFacts) -> Option<String> {

@@ -378,7 +378,7 @@ function ap_nostr_action(string $action, int $ownerUserId, bool $isAdmin, array 
     if ($action === 'nostr_prepare') {
         $purpose = (string) ($post['purpose'] ?? '');
         $target = strtolower(trim((string) ($post['target'] ?? '')));
-        if (!in_array($purpose, ['like', 'reply', 'repost', 'quote', 'delete', 'follow', 'unfollow', 'mute', 'unmute', 'report'], true) || !preg_match('/^[0-9a-f]{64}$/', $target)) {
+        if (!in_array($purpose, ['like', 'reply', 'repost', 'quote', 'delete', 'follow', 'unfollow', 'mute', 'unmute', 'report', 'zap'], true) || !preg_match('/^[0-9a-f]{64}$/', $target)) {
             return $fail(400, 'Unknown Nostr action.');
         }
         $path = '/shadow/nostr-prepare';
@@ -389,6 +389,19 @@ function ap_nostr_action(string $action, int $ownerUserId, bool $isAdmin, array 
                 return $fail(400, 'Pick a reason for the report.');
             }
             $payload['reason'] = $reason;
+        }
+        if ($purpose === 'zap') {
+            // NIP-57: the worker asks the author's Lightning wallet for an
+            // invoice; the viewer's own wallet pays it (nostr/zap.rs).
+            $sats = (string) ($post['zap_sats'] ?? '');
+            $comment = trim((string) ($post['zap_comment'] ?? ''));
+            if (!preg_match('/^[1-9][0-9]{0,6}$/', $sats) || (int) $sats > 1000000) {
+                return $fail(400, 'Pick an amount from 1 to 1,000,000 sats.');
+            }
+            if (mb_strlen($comment) > 280) {
+                return $fail(400, 'Keep the zap comment under 280 characters.');
+            }
+            $payload['zap'] = ['sats' => (int) $sats, 'comment' => $comment];
         }
     } elseif ($action === 'nostr_bunker_sign') {
         // No signer extension on this page (an iPhone Home Screen app):

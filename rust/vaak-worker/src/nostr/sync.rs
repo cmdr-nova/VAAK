@@ -223,6 +223,10 @@ pub(super) async fn upsert_meta(db: &Client, pubkey: &str, profile: Option<&Even
         )
         .await
         .context("nostr profile update")?;
+        // Best effort: a zap address problem never stops profile sync.
+        if let Err(e) = super::zap::store_addr(db, pubkey, &p.zap_url, ev.created_at).await {
+            tracing::debug!(pubkey, error = %format!("{e:#}"), "nostr zap address not stored");
+        }
     }
     if let Some(ev) = relays {
         let list = serde_json::to_value(ev.write_relays()).unwrap_or(Value::Array(Vec::new()));

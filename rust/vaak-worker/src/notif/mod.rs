@@ -316,7 +316,7 @@ pub(crate) fn mention_target_object_id(object_id: &str) -> String {
     let object_id = object_id.trim().trim_end_matches('/');
     static KIND: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let kind = KIND.get_or_init(|| {
-        regex::Regex::new(r"(?i)^(https://.+?)#(like|reblog|update|quote|bite|webmention)-[a-z0-9]+$").unwrap()
+        regex::Regex::new(r"(?i)^(https://.+?)#(like|reblog|update|quote|bite|webmention|zap)-[a-z0-9]+$").unwrap()
     });
     if let Some(caps) = kind.captures(object_id) {
         return caps[1].trim_end_matches('/').to_string();
@@ -468,6 +468,19 @@ pub(crate) fn is_nostr(activity_id: &str, actor_id: &str, object_id: &str) -> bo
     activity_id.starts_with("nostr:") || actor_id.starts_with("https://njump.me/") || object_id.starts_with("https://njump.me/")
 }
 
+/// Sats in a Nostr zap notification (0 otherwise); `nostr::notif` stores a
+/// zap's object_id as `{note}#zap-{sats}s{hash}` (PHP `ap_masto_mention_zap_sats`).
+pub(crate) fn zap_sats(object_id: &str) -> i64 {
+    static ZAP: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    if !object_id.starts_with("https://njump.me/") {
+        return 0;
+    }
+    ZAP.get_or_init(|| regex::Regex::new(r"#zap-([1-9][0-9]{0,14})s[a-f0-9]{12}$").unwrap())
+        .captures(object_id)
+        .and_then(|c| c[1].parse().ok())
+        .unwrap_or(0)
+}
+
 pub(crate) fn mention_notif_type(
     activity_type: &str,
     obj_type: &str,
@@ -499,7 +512,8 @@ pub(crate) fn mention_notif_type(
     // Nostr rows (nostr::notif) are typed the same way: they come from the
     // user's own linked key, never addressed to a VAAK note URL.
     if is_bsky || is_nostr(activity_id, actor, object_id) {
-        if activity == "like" || obj == "like" {
+        // A Nostr zap (NIP-57) is a like with sats (`zap_sats`).
+        if activity == "like" || obj == "like" || activity == "zap" || obj == "zap" {
             return Some("favourite");
         }
         if activity == "announce" || obj == "announce" {

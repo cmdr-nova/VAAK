@@ -135,7 +135,7 @@ fn clean_mention_text(raw:&str)->Result<String>{
 /// ap_masto_mention_target_object_id.
 fn mention_target_object_id(raw:&str)->String{
     let object=raw.trim_end_matches('/');
-    if let Some(c)=re!(r"(?i)^(https://.+?)#(like|reblog|update|quote|bite|webmention)-[a-z0-9]+$").captures(object){return c[1].trim_end_matches('/').to_owned()}
+    if let Some(c)=re!(r"(?i)^(https://.+?)#(like|reblog|update|quote|bite|webmention|zap)-[a-z0-9]+$").captures(object){return c[1].trim_end_matches('/').to_owned()}
     let value=crate::library::card::php_trim(object);
     let stripped=re!(r"#announce-\d+$").replace(value,"");
     if stripped==value{value.to_owned()}else{stripped.trim_end_matches('/').to_owned()}
