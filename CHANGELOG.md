@@ -12,6 +12,13 @@ anything else bumps the patch number.
 Releases up to **0.9.83** used a two-digit deploy counter (0.9.05, 0.9.83)
 and have no notes here; their tags and GitHub Releases are unchanged.
 
+## [0.16.0](https://github.com/cmdr-nova/VAAK/releases/tag/v0.16.0) - 2026-11-02
+
+### ✨ Features
+* Opt-in backfill of past Bluesky likes, reposts and bookmarks for Home ranking by @cmdr-nova in https://github.com/cmdr-nova/VAAK/pull/340
+
+**Full Changelog**: https://github.com/cmdr-nova/VAAK/compare/v0.15.0...v0.16.0
+
 ## [0.15.0](https://github.com/cmdr-nova/VAAK/releases/tag/v0.15.0) - 2026-11-02
 
 ### ✨ Features
