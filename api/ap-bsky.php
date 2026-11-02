@@ -1579,8 +1579,12 @@ function ap_bsky_get_bookmarks_for_uris(int $ownerUserId, array $objectIds, int 
  *
  * @return array{uri:string,cid:string}|null
  */
-function ap_bsky_resolve_strong_ref(string $ref, int $ownerUserId = 0): ?array
+function ap_bsky_resolve_strong_ref(string $ref, int $ownerUserId = 0, ?string &$failure = null): ?array
 {
+    // null: $ref has no Bluesky identity. 'cid_unavailable': it maps to an
+    // at:// post whose CID could not be read right now (retry later).
+    // 'not_found': the author's PDS says that post does not exist.
+    $failure = null;
     $ref = rtrim(trim($ref), '/');
     if ($ref === '') {
         return null;
@@ -1639,20 +1643,284 @@ function ap_bsky_resolve_strong_ref(string $ref, int $ownerUserId = 0): ?array
     if ($cid !== null && $cid !== '') {
         return ['uri' => $uri, 'cid' => $cid];
     }
-    $cid = ap_bsky_cid_for_uri($uri, $ownerUserId);
+    $notFound = false;
+    $cid = ap_bsky_cid_for_uri($uri, $ownerUserId, $notFound);
     if ($cid === null || $cid === '') {
+        $failure = $notFound ? 'not_found' : 'cid_unavailable';
         return null;
     }
     return ['uri' => $uri, 'cid' => $cid];
 }
 
-/**
- * CID for an at:// post. Cache first, then public AppView getPosts.
- * Do not use com.atproto.repo.getRecord on the viewer's PDS — that only
- * works for the viewer's own repo and is why quote-boost likes 503'd.
- */
-function ap_bsky_cid_for_uri(string $uri, int $ownerUserId = 0): ?string
+// ---------------------------------------------------------------------------
+// AppView-independent identity + record reads.
+//
+// A Bluesky AppView takedown or label hides an account's profile and posts at
+// api.bsky.app / public.api.bsky.app, but the account's PDS keeps serving its
+// repo and keeps accepting writes. Everything VAAK needs in order to *post*
+// (strongRef CIDs, reply roots, handle -> DID, "was this deleted?") can be read
+// from the DID document and the repo's own PDS, so these helpers never ask the
+// AppView. Callers try them first for VAAK's own accounts and fall back to
+// them when the AppView fails or omits a record.
+// ---------------------------------------------------------------------------
+
+/** Unauthenticated HTTPS GET for identity documents (guarded, size-capped). */
+function ap_bsky_identity_http_get(string $url, int $timeoutSec = 4): array
 {
+    if (ap_bsky_budget_exceeded()) {
+        return ['ok' => false, 'status' => 0, 'error' => 'Bluesky budget exceeded'];
+    }
+    $timeoutSec = ap_bsky_effective_timeout($timeoutSec);
+    if ($timeoutSec < 1 || !str_starts_with($url, 'https://')) {
+        return ['ok' => false, 'status' => 0, 'error' => 'Invalid identity URL'];
+    }
+    $ch = curl_init($url);
+    if ($ch === false) {
+        return ['ok' => false, 'status' => 0, 'error' => 'curl_init failed'];
+    }
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_PROTOCOLS => CURLPROTO_HTTPS,
+        CURLOPT_CONNECTTIMEOUT => min(AP_BSKY_CONNECT_TIMEOUT, $timeoutSec),
+        CURLOPT_TIMEOUT => $timeoutSec,
+        CURLOPT_MAXFILESIZE => 65536,
+        CURLOPT_HTTPHEADER => [
+            'Accept: application/json, text/plain',
+            'User-Agent: ' . vaak_user_agent('Bluesky'),
+        ],
+    ]);
+    $body = ap_net_curl_exec($ch, $url, 2, true);
+    $status = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+    if (!is_string($body) || strlen($body) > 65536) {
+        return ['ok' => false, 'status' => $status, 'error' => 'Identity fetch failed'];
+    }
+    return ['ok' => $status >= 200 && $status < 300, 'status' => $status, 'body' => $body];
+}
+
+/** did:plc / did:web (bare domain) only. */
+function ap_bsky_did_is_resolvable(string $did): bool
+{
+    return (bool) preg_match('/^did:plc:[a-z2-7]{24}$/', $did)
+        || (bool) preg_match('/^did:web:[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/i', $did);
+}
+
+/**
+ * The parts of a DID document VAAK uses: the atproto PDS endpoint and the
+ * at:// handles in alsoKnownAs. PLC directory for did:plc, /.well-known/did.json
+ * for did:web. Cached (6 h hit, 5 min miss) in Redis and per request.
+ *
+ * @return array{pds:string,handles:list<string>}|null
+ */
+function ap_bsky_did_document(string $did, int $timeoutSec = 4): ?array
+{
+    static $memo = [];
+    $did = trim($did);
+    if (!ap_bsky_did_is_resolvable($did)) {
+        return null;
+    }
+    if (array_key_exists($did, $memo)) {
+        return $memo[$did];
+    }
+    $key = 'vaak:bsky:diddoc:v1:' . $did;
+    if (function_exists('ap_redis_json_get')) {
+        $hit = ap_redis_json_get($key);
+        if (is_array($hit)) {
+            $doc = ($hit['pds'] ?? '') !== ''
+                ? ['pds' => (string) $hit['pds'], 'handles' => array_values(array_map('strval', (array) ($hit['handles'] ?? [])))]
+                : null;
+            return $memo[$did] = $doc;
+        }
+    }
+    $url = str_starts_with($did, 'did:plc:')
+        ? 'https://plc.directory/' . $did
+        : 'https://' . strtolower(substr($did, 8)) . '/.well-known/did.json';
+    $got = ap_bsky_identity_http_get($url, $timeoutSec);
+    $json = !empty($got['ok']) ? json_decode((string) ($got['body'] ?? ''), true) : null;
+    $doc = is_array($json) ? ap_bsky_parse_did_document($did, $json) : null;
+    // Only remember a miss the server actually answered (404, bad doc); a
+    // network blip should not pin "no PDS" for five minutes.
+    if (function_exists('ap_redis_json_set') && ($doc !== null || (int) ($got['status'] ?? 0) > 0)) {
+        ap_redis_json_set($key, $doc ?? ['pds' => ''], $doc !== null ? 21600 : 300);
+    }
+    return $memo[$did] = $doc;
+}
+
+/**
+ * @param array<string,mixed> $json
+ * @return array{pds:string,handles:list<string>}|null
+ */
+function ap_bsky_parse_did_document(string $did, array $json): ?array
+{
+    if ((string) ($json['id'] ?? '') !== $did) {
+        return null;
+    }
+    $pds = '';
+    foreach ((array) ($json['service'] ?? []) as $svc) {
+        if (!is_array($svc)) {
+            continue;
+        }
+        $id = (string) ($svc['id'] ?? '');
+        if (($id === '#atproto_pds' || $id === $did . '#atproto_pds')
+            && (string) ($svc['type'] ?? '') === 'AtprotoPersonalDataServer'
+            && is_string($svc['serviceEndpoint'] ?? null)) {
+            $pds = rtrim((string) $svc['serviceEndpoint'], '/');
+            break;
+        }
+    }
+    if (!preg_match('~^https://[a-z0-9.-]+(:\d+)?$~i', $pds)) {
+        return null;
+    }
+    $handles = [];
+    foreach ((array) ($json['alsoKnownAs'] ?? []) as $aka) {
+        if (is_string($aka) && str_starts_with($aka, 'at://')) {
+            $handles[] = strtolower(substr($aka, 5));
+        }
+    }
+    return ['pds' => $pds, 'handles' => $handles];
+}
+
+/** PDS base URL for a DID, from its DID document. Null when unknown. */
+function ap_bsky_did_pds_endpoint(string $did, int $timeoutSec = 4): ?string
+{
+    $doc = ap_bsky_did_document($did, $timeoutSec);
+    return is_array($doc) && $doc['pds'] !== '' ? $doc['pds'] : null;
+}
+
+/**
+ * Read one record straight from the repo's own PDS (unauthenticated; repo
+ * reads are public). `not_found` is true only when that PDS explicitly says
+ * RecordNotFound, which is the one answer that may be treated as "deleted".
+ *
+ * @return array{ok:bool,not_found?:bool,cid?:string,value?:array,error?:string,status?:int}
+ */
+function ap_bsky_get_record_direct(string $atUri, int $timeoutSec = 6): array
+{
+    if (!preg_match('#^at://(did:[a-z0-9]+:[A-Za-z0-9._:%-]+)/([a-z0-9.-]+)/([A-Za-z0-9._~:-]{1,512})$#i', trim($atUri), $m)) {
+        return ['ok' => false, 'error' => 'Not an at:// record URI'];
+    }
+    $pds = ap_bsky_did_pds_endpoint($m[1]);
+    if ($pds === null) {
+        return ['ok' => false, 'error' => 'PDS unknown for ' . $m[1]];
+    }
+    $got = ap_bsky_xrpc($pds, 'com.atproto.repo.getRecord', 'GET', [
+        'repo' => $m[1],
+        'collection' => $m[2],
+        'rkey' => $m[3],
+    ], null, null, $timeoutSec);
+    $cid = trim((string) ($got['json']['cid'] ?? ''));
+    if (!empty($got['ok']) && $cid !== '') {
+        $value = is_array($got['json']['value'] ?? null) ? $got['json']['value'] : [];
+        return ['ok' => true, 'cid' => $cid, 'value' => $value, 'status' => (int) ($got['status'] ?? 200)];
+    }
+    $code = is_array($got['json'] ?? null) ? (string) ($got['json']['error'] ?? '') : '';
+    $status = (int) ($got['status'] ?? 0);
+    return [
+        'ok' => false,
+        'not_found' => $status === 400 && strcasecmp($code, 'RecordNotFound') === 0,
+        'error' => (string) ($got['error'] ?? 'getRecord failed'),
+        'status' => $status,
+    ];
+}
+
+/**
+ * DIDs of every connected VAAK Bluesky session (per request).
+ *
+ * @return array<string,int> did => owner_user_id
+ */
+function ap_bsky_session_dids(): array
+{
+    static $memo = null;
+    if (is_array($memo)) {
+        return $memo;
+    }
+    $memo = [];
+    try {
+        foreach (ap_db()->query('SELECT owner_user_id, did, handle FROM bsky_sessions')->fetchAll(PDO::FETCH_ASSOC) ?: [] as $r) {
+            $did = trim((string) ($r['did'] ?? ''));
+            if (str_starts_with($did, 'did:')) {
+                $memo[$did] = (int) ($r['owner_user_id'] ?? 0);
+            }
+        }
+    } catch (Throwable $e) {
+        // No sessions table yet.
+    }
+    return $memo;
+}
+
+/** DID in an at:// URI when it belongs to a connected VAAK account. */
+function ap_bsky_uri_is_session_repo(string $atUri): bool
+{
+    if (!preg_match('~^at://(did:[^/]+)/~', trim($atUri), $m)) {
+        return false;
+    }
+    return isset(ap_bsky_session_dids()[$m[1]]);
+}
+
+/** @return list<string> TXT values for $name (empty on any DNS failure). */
+function ap_bsky_dns_txt(string $name): array
+{
+    $out = [];
+    $txt = @dns_get_record($name, DNS_TXT);
+    foreach (is_array($txt) ? $txt : [] as $rec) {
+        if (is_array($rec) && isset($rec['txt'])) {
+            $out[] = (string) $rec['txt'];
+        }
+    }
+    return $out;
+}
+
+/**
+ * Handle -> DID without the AppView: DNS TXT _atproto.<handle>, then
+ * https://<handle>/.well-known/atproto-did, then a check that the DID document
+ * claims the handle back (so a stray TXT record cannot hijack a mention).
+ */
+function ap_bsky_resolve_handle_direct(string $handle, int $timeoutSec = 3): ?string
+{
+    $handle = strtolower(ltrim(trim($handle), '@'));
+    if (!preg_match('/^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/', $handle)
+        || strlen($handle) > 253) {
+        return null;
+    }
+    $did = null;
+    foreach (ap_bsky_dns_txt('_atproto.' . $handle) as $val) {
+        $val = trim($val);
+        if (str_starts_with($val, 'did=') && ap_bsky_did_is_resolvable(substr($val, 4))) {
+            $did = substr($val, 4);
+            break;
+        }
+    }
+    if ($did === null) {
+        $got = ap_bsky_identity_http_get('https://' . $handle . '/.well-known/atproto-did', $timeoutSec);
+        $val = !empty($got['ok']) ? trim((string) ($got['body'] ?? '')) : '';
+        if (ap_bsky_did_is_resolvable($val)) {
+            $did = $val;
+        }
+    }
+    if ($did === null) {
+        return null;
+    }
+    $doc = ap_bsky_did_document($did);
+    if (!is_array($doc) || !in_array($handle, $doc['handles'], true)) {
+        return null;
+    }
+    return $did;
+}
+
+/**
+ * CID for an at:// post. Cache first, then the network.
+ *
+ * Posts in a connected VAAK account's repo are read straight from that
+ * repo's PDS first, so an AppView takedown or label on the account (which
+ * hides its posts from getPosts) never stops replies, quotes, likes or
+ * reposts that need a strongRef. Other posts ask the public AppView first
+ * (one cheap call) and fall back to the author's PDS.
+ *
+ * $notFound is set when the author's PDS said the record does not exist.
+ */
+function ap_bsky_cid_for_uri(string $uri, int $ownerUserId = 0, ?bool &$notFound = null): ?string
+{
+    $notFound = false;
     $uri = trim($uri);
     if (!str_starts_with($uri, 'at://')) {
         return null;
@@ -1673,27 +1941,41 @@ function ap_bsky_cid_for_uri(string $uri, int $ownerUserId = 0): ?string
     if (is_array($map) && trim((string) ($map['bsky_cid'] ?? '')) !== '') {
         return (string) $map['bsky_cid'];
     }
-    $got = ap_bsky_xrpc(AP_BSKY_PUBLIC_API, 'app.bsky.feed.getPosts', 'GET', [
-        'uris' => $uri,
-    ], null, null, 8);
     $cid = '';
-    if (!empty($got['ok']) && is_array($got['json']['posts'][0] ?? null)) {
-        $cid = trim((string) ($got['json']['posts'][0]['cid'] ?? ''));
+    $direct = null;
+    $ownRepo = ap_bsky_uri_is_session_repo($uri);
+    if ($ownRepo) {
+        $direct = ap_bsky_get_record_direct($uri, 6);
+        $cid = !empty($direct['ok']) ? (string) $direct['cid'] : '';
     }
-    if ($cid === '' && $ownerUserId > 0 && preg_match('~^at://([^/]+)/([^/]+)/([^/]+)$~', $uri, $m)) {
-        $tok = ap_bsky_access_token($ownerUserId, false);
-        if (empty($tok['ok'])) {
-            $tok = ap_bsky_access_token($ownerUserId, true);
+    if ($cid === '' && empty($direct['not_found'])) {
+        $got = ap_bsky_xrpc(AP_BSKY_PUBLIC_API, 'app.bsky.feed.getPosts', 'GET', [
+            'uris' => $uri,
+        ], null, null, $ownRepo ? 4 : 8);
+        if (!empty($got['ok']) && is_array($got['json']['posts'][0] ?? null)) {
+            $cid = trim((string) ($got['json']['posts'][0]['cid'] ?? ''));
         }
-        $bearer = !empty($tok['ok']) ? (string) $tok['access'] : null;
+    }
+    if ($cid === '' && $direct === null) {
+        // AppView failed or hides the post (takedown / label): ask its PDS.
+        $direct = ap_bsky_get_record_direct($uri, 6);
+        $cid = !empty($direct['ok']) ? (string) $direct['cid'] : '';
+    }
+    if ($cid === '' && empty($direct['not_found']) && $ownerUserId > 0
+        && preg_match('~^at://([^/]+)/([^/]+)/([^/]+)$~', $uri, $m)) {
+        // Last resort when the DID document could not be read: the viewer's
+        // own PDS (its access token goes to that PDS only, never the AppView),
+        // then the public AppView's unauthenticated getRecord.
         $row = ap_bsky_session_row($ownerUserId);
         $pds = rtrim((string) ($row['pds_host'] ?? AP_BSKY_DEFAULT_PDS), '/');
-        foreach (array_unique(array_merge([AP_BSKY_PUBLIC_API], ap_bsky_feed_hosts($pds))) as $host) {
+        $tok = ap_bsky_access_token($ownerUserId, false);
+        $bearer = !empty($tok['ok']) ? (string) $tok['access'] : null;
+        foreach (array_unique([$pds, AP_BSKY_PUBLIC_API]) as $host) {
             $rec = ap_bsky_xrpc($host, 'com.atproto.repo.getRecord', 'GET', [
                 'repo' => $m[1],
                 'collection' => $m[2],
                 'rkey' => $m[3],
-            ], null, $bearer, 6);
+            ], null, $host === $pds ? $bearer : null, 6);
             $cid = trim((string) ($rec['json']['cid'] ?? ''));
             if ($cid !== '') {
                 break;
@@ -1701,6 +1983,7 @@ function ap_bsky_cid_for_uri(string $uri, int $ownerUserId = 0): ?string
         }
     }
     if ($cid === '') {
+        $notFound = !empty($direct['not_found']);
         return null;
     }
     ap_bsky_post_link_upsert($uri, $cid);
@@ -1790,8 +2073,11 @@ function ap_bsky_self_thread_tip_ref(array $parent, int $ownerUserId): array
  * @param array{uri:string,cid:string} $parent
  * @return array{root:array{uri:string,cid:string},parent:array{uri:string,cid:string}}
  */
-function ap_bsky_reply_ref_for_parent(array $parent, int $ownerUserId): array
+function ap_bsky_reply_ref_for_parent(array $parent, int $ownerUserId, ?bool &$unverified = null): array
 {
+    // Set when the parent record could not be read anywhere, so its thread
+    // root is a guess (root = parent). Callers should retry later.
+    $unverified = false;
     $parentUri = (string) ($parent['uri'] ?? '');
     $parentCid = (string) ($parent['cid'] ?? '');
     $parentRef = ['uri' => $parentUri, 'cid' => $parentCid];
@@ -1801,27 +2087,31 @@ function ap_bsky_reply_ref_for_parent(array $parent, int $ownerUserId): array
     if (!preg_match('~^at://([^/]+)/([^/]+)/([^/]+)$~', $parentUri, $m)) {
         return ['root' => $parentRef, 'parent' => $parentRef];
     }
-    $tok = ap_bsky_access_token($ownerUserId, false);
-    if (empty($tok['ok'])) {
-        $tok = ap_bsky_access_token($ownerUserId, true);
-    }
-    if (empty($tok['ok'])) {
-        return ['root' => $parentRef, 'parent' => $parentRef];
-    }
-    $row = ap_bsky_session_row($ownerUserId);
-    $pds = rtrim((string) ($row['pds_host'] ?? AP_BSKY_DEFAULT_PDS), '/');
-    $got = null;
-    foreach (array_merge([$pds], ap_bsky_feed_hosts($pds)) as $host) {
-        $got = ap_bsky_xrpc($host, 'com.atproto.repo.getRecord', 'GET', [
-            'repo' => $m[1],
-            'collection' => $m[2],
-            'rkey' => $m[3],
-        ], null, (string) $tok['access'], 12);
-        if (!empty($got['ok'])) {
-            break;
+    // The parent record lives in its author's repo: read it from that PDS
+    // (no AppView, no token), so threading survives AppView takedowns.
+    $got = ap_bsky_get_record_direct($parentUri, 8);
+    if (empty($got['ok'])) {
+        $row = ap_bsky_session_row($ownerUserId);
+        $pds = rtrim((string) ($row['pds_host'] ?? AP_BSKY_DEFAULT_PDS), '/');
+        $tok = ap_bsky_access_token($ownerUserId, false);
+        $bearer = !empty($tok['ok']) ? (string) $tok['access'] : null;
+        foreach (array_unique(array_merge([$pds], ap_bsky_feed_hosts($pds))) as $host) {
+            // The access token is for the account's PDS only.
+            $got = ap_bsky_xrpc($host, 'com.atproto.repo.getRecord', 'GET', [
+                'repo' => $m[1],
+                'collection' => $m[2],
+                'rkey' => $m[3],
+            ], null, $host === $pds ? $bearer : null, 8);
+            if (!empty($got['ok'])) {
+                $got['value'] = is_array($got['json']['value'] ?? null) ? $got['json']['value'] : null;
+                break;
+            }
         }
     }
-    $value = is_array($got['json']['value'] ?? null) ? $got['json']['value'] : null;
+    $value = is_array($got['value'] ?? null) ? $got['value'] : null;
+    if (empty($got['ok'])) {
+        $unverified = true;
+    }
     $reply = is_array($value['reply'] ?? null) ? $value['reply'] : null;
     $root = is_array($reply['root'] ?? null) ? $reply['root'] : null;
     $rootUri = is_array($root) ? (string) ($root['uri'] ?? '') : '';
@@ -1887,7 +2177,11 @@ function ap_bsky_account_xrpc(int $ownerUserId, string $nsid, string $method = '
     }
     $pds = rtrim((string) ($session['pds_host'] ?? AP_BSKY_DEFAULT_PDS), '/');
     $last = ['ok' => false, 'error' => $nsid . ' failed'];
-    foreach (ap_bsky_feed_hosts($pds) as $host) {
+    // com.atproto.* (createRecord, putRecord, deleteRecord, ...) is the PDS's
+    // own API: never hand those, or the account's token, to the AppView.
+    // app.bsky.* reads may fall back to the public AppView.
+    $hosts = str_starts_with($nsid, 'com.atproto.') ? [$pds] : ap_bsky_feed_hosts($pds);
+    foreach ($hosts as $host) {
         $last = ap_bsky_xrpc($host, $nsid, $method, $query, $body, (string) $token['access'], 15);
         if (($last['status'] ?? 0) === 401) {
             $token = ap_bsky_access_token($ownerUserId, true);
@@ -6507,7 +6801,20 @@ function ap_bsky_purge_missing_uris(array $uris, ?int $ownerUserId = null): int
             continue;
         }
         foreach ($chunk as $uri) {
-            if (!isset($found[$uri]) && ap_bsky_tombstone_uri($uri, $ownerUserId)) {
+            if (isset($found[$uri])) {
+                continue;
+            }
+            // A VAAK account's own posts vanish from the AppView when Bluesky
+            // takes the account down or labels it. Keep them cached (thread
+            // tips, profile tabs, reply CIDs) unless their PDS confirms the
+            // delete.
+            if (ap_bsky_uri_is_session_repo($uri)) {
+                $probe = ap_bsky_get_record_direct($uri, 4);
+                if (empty($probe['not_found'])) {
+                    continue;
+                }
+            }
+            if (ap_bsky_tombstone_uri($uri, $ownerUserId)) {
                 $tombstoned++;
             }
         }
@@ -9443,6 +9750,17 @@ function ap_bsky_resolve_handle_did(string $handle, int $ownerUserId = 0): ?stri
     if ($handle === '') {
         return null;
     }
+    // VAAK's own connected accounts: no network at all.
+    try {
+        $st = ap_db()->prepare('SELECT did FROM bsky_sessions WHERE lower(handle) = lower(?) LIMIT 1');
+        $st->execute([$handle]);
+        $own = trim((string) ($st->fetchColumn() ?: ''));
+        if (str_starts_with($own, 'did:')) {
+            return $own;
+        }
+    } catch (Throwable $e) {
+        // fall through to the network
+    }
     $tok = null;
     $pds = AP_BSKY_PUBLIC_API;
     if ($ownerUserId > 0) {
@@ -9456,18 +9774,30 @@ function ap_bsky_resolve_handle_did(string $handle, int $ownerUserId = 0): ?stri
         }
     }
     $bearer = (!empty($tok['ok'])) ? (string) $tok['access'] : null;
+    // "Unable to resolve handle" means a server looked and found nothing;
+    // anything else (timeout, 5xx, a takedown error) is not an answer.
+    $answered = false;
     foreach (array_unique([$pds, AP_BSKY_PUBLIC_API]) as $host) {
-        $r = ap_bsky_xrpc($host, 'com.atproto.identity.resolveHandle', 'GET', ['handle' => $handle], null, $bearer, 8);
+        // The account's token goes to its own PDS only.
+        $hostBearer = ($host === $pds && $host !== AP_BSKY_PUBLIC_API) ? $bearer : null;
+        $r = ap_bsky_xrpc($host, 'com.atproto.identity.resolveHandle', 'GET', ['handle' => $handle], null, $hostBearer, 8);
         if (!empty($r['ok']) && !empty($r['json']['did']) && is_string($r['json']['did'])) {
             return (string) $r['json']['did'];
         }
+        $answered = $answered || ((int) ($r['status'] ?? 0) === 400
+            && stripos((string) ($r['error'] ?? ''), 'unable to resolve handle') !== false);
         // Fallback: getProfile
-        $r = ap_bsky_xrpc($host, 'app.bsky.actor.getProfile', 'GET', ['actor' => $handle], null, $bearer, 8);
+        $r = ap_bsky_xrpc($host, 'app.bsky.actor.getProfile', 'GET', ['actor' => $handle], null, $hostBearer, 8);
         if (!empty($r['ok']) && !empty($r['json']['did']) && is_string($r['json']['did'])) {
             return (string) $r['json']['did'];
         }
     }
-    return null;
+    if ($answered) {
+        return null;
+    }
+    // AppView and PDS unreachable: resolve the handle the way the protocol
+    // defines it (DNS TXT / .well-known), checked against the DID document.
+    return ap_bsky_resolve_handle_direct($handle);
 }
 
 function ap_bsky_graph_sync_upsert(
@@ -13127,7 +13457,18 @@ function ap_bsky_crosspost_status_inner(
                 'error' => 'Reply parent is not a Bluesky post',
             ];
         }
-        $parent = ap_bsky_resolve_strong_ref($inReplyTo, $ownerUserId);
+        $parentFailure = null;
+        $parent = ap_bsky_resolve_strong_ref($inReplyTo, $ownerUserId, $parentFailure);
+        if ($parent === null && $parentFailure === 'cid_unavailable') {
+            // The parent IS a Bluesky post; only its CID lookup failed (AppView
+            // and PDS both unreachable). Retry instead of dropping the reply
+            // as Fediverse-only for good.
+            return [
+                'ok' => false,
+                'deferred' => true,
+                'error' => 'Reply parent record unavailable',
+            ];
+        }
         if ($parent === null && ap_bsky_local_parent_mirror_pending($inReplyTo)) {
             return [
                 'ok' => false,
@@ -13146,11 +13487,29 @@ function ap_bsky_crosspost_status_inner(
         }
         // Self-reply to our own split OP: nest under the tip segment, not a root sibling.
         $parent = ap_bsky_self_thread_tip_ref($parent, $ownerUserId);
-        $replyRef = ap_bsky_reply_ref_for_parent($parent, $ownerUserId);
+        $rootUnverified = false;
+        $replyRef = ap_bsky_reply_ref_for_parent($parent, $ownerUserId, $rootUnverified);
+        if ($rootUnverified) {
+            // Posting with root = parent would break the thread on Bluesky if
+            // the parent is itself a reply. Wait until its record is readable.
+            return [
+                'ok' => false,
+                'deferred' => true,
+                'error' => 'Reply thread root unavailable',
+            ];
+        }
     }
     $quoteRef = null;
     if (is_string($quoteObjectId) && $quoteObjectId !== '') {
-        $quoteRef = ap_bsky_resolve_strong_ref($quoteObjectId, $ownerUserId);
+        $quoteFailure = null;
+        $quoteRef = ap_bsky_resolve_strong_ref($quoteObjectId, $ownerUserId, $quoteFailure);
+        if ($quoteRef === null && $quoteFailure === 'cid_unavailable') {
+            return [
+                'ok' => false,
+                'deferred' => true,
+                'error' => 'Quote target record unavailable',
+            ];
+        }
         if ($quoteRef === null) {
             // Do not turn a native Fediverse quote into a Bluesky text post
             // containing only a link. A quote mirrors only when its target has
@@ -13733,37 +14092,18 @@ function ap_bsky_reconcile_deleted_crossposts(int $ownerUserId, int $limit = 15)
         if (!str_starts_with($uri, 'at://') || !str_starts_with($noteId, 'https://')) {
             continue;
         }
-        $out['checked']++;
-        $got = ap_bsky_xrpc(AP_BSKY_PUBLIC_API, 'app.bsky.feed.getPosts', 'GET', [
-            'uris' => $uri,
-        ], null, null, 6);
-        $posts = is_array($got['json']['posts'] ?? null) ? $got['json']['posts'] : [];
-        $stillThere = false;
-        foreach ($posts as $p) {
-            if (is_array($p) && trim((string) ($p['uri'] ?? '')) === $uri) {
-                $stillThere = true;
-                break;
-            }
-        }
-        // Also treat explicit NotFound from getRecord as gone.
-        if ($stillThere) {
+        if (!preg_match('~^at://did:[^/]+/app\.bsky\.feed\.post/[^/]+$~', $uri)) {
             continue;
         }
-        // Confirm via PDS getRecord when possible (public AppView can lag).
-        if (preg_match('~^at://([^/]+)/(app\.bsky\.feed\.post)/([^/]+)$~', $uri, $m)) {
-            $tok = ap_bsky_access_token($ownerUserId, false);
-            if (!empty($tok['ok'])) {
-                $sess = ap_bsky_session_row($ownerUserId);
-                $pds = rtrim((string) ($sess['pds_host'] ?? AP_BSKY_DEFAULT_PDS), '/');
-                $rec = ap_bsky_xrpc($pds, 'com.atproto.repo.getRecord', 'GET', [
-                    'repo' => $m[1],
-                    'collection' => $m[2],
-                    'rkey' => $m[3],
-                ], null, (string) $tok['access'], 6);
-                if (!empty($rec['ok'])) {
-                    continue; // still on PDS
-                }
-            }
+        $out['checked']++;
+        // Ask the repo's own PDS, never the AppView. An AppView takedown or
+        // label hides every post of the account from getPosts, and treating
+        // that as "deleted on Bluesky" would delete the VAAK posts and
+        // federate Deletes. Only an explicit RecordNotFound from the PDS that
+        // hosts the repo counts; timeouts and unknown PDS keep the post.
+        $probe = ap_bsky_get_record_direct($uri, 6);
+        if (empty($probe['not_found'])) {
+            continue;
         }
         try {
             $lst = ap_db()->prepare(
