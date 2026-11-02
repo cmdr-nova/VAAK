@@ -133,6 +133,7 @@ try {
             // One saved feed per owner per 15 min (gate in Redis), so Home's
             // Bluesky recommendations also draw on feeds nobody opened.
             $feedExtra = 0;
+            $feedPicks = 0;
             $savedUris = [];
             if ($feedSample) {
                 $sample = ap_bsky_feed_sample_tick($uid, $dryRun);
@@ -140,6 +141,7 @@ try {
                     $savedUris[] = (string) $sample['feed'];
                 }
                 $feedExtra = (int) ($sample['posts'] ?? 0);
+                $feedPicks = (int) ($sample['picks'] ?? 0);
                 if (($sample['reason'] ?? '') !== '' && ($sample['reason'] ?? '') !== 'recent') {
                     fwrite(STDOUT, sprintf(
                         "[%s] bsky_tl_warm user=%d feed_sample %s%s\n",
@@ -176,13 +178,14 @@ try {
             }
             $upserted += $n + $feedExtra;
             fwrite(STDOUT, sprintf(
-                "[%s] bsky_tl_warm user=%d source=%s following=%d feeds=%d saved_feeds=%d%s\n",
+                "[%s] bsky_tl_warm user=%d source=%s following=%d feeds=%d saved_feeds=%d%s%s\n",
                 gmdate('c'),
                 $uid,
                 $source,
                 $n,
                 $feedExtra,
                 count($savedUris),
+                $feedPicks > 0 ? ' home_picks=' . $feedPicks : '',
                 $dryRun ? ' dry-run' : ''
             ));
         } catch (Throwable $e) {

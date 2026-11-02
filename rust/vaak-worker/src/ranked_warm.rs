@@ -1292,6 +1292,37 @@ async fn apply_nostr_toxicity_downrank(db: &Client, owner: i64, keys: &mut Vec<c
 }
 
 const BSKY_RECOMMENDATION_MAX: usize = 4;
+/// Of those slots, how many may go to posts the background sampler pulled
+/// from the owner's saved feeds (PHP ap_bsky_feed_sample_tick).
+const BSKY_FEED_PICK_MAX: usize = 2;
+/// A sampled feed post counts as if the owner had a light affinity for it, so
+/// strangers from a feed they chose clear the 1.5 bar on their own.
+const BSKY_FEED_PICK_SCORE: f64 = 1.5;
+
+/// AT-URIs the background sampler took from the owner's saved feeds
+/// (`vaak:bsky:feedpicks:v1:{owner}`, written by PHP). Empty on any miss.
+async fn load_bsky_feed_picks(cfg: &Config, owner: i64) -> HashSet<String> {
+    let Ok(mut redis) = redis_util::connect(&cfg.redis_url).await else {
+        return HashSet::new();
+    };
+    let key = format!("vaak:bsky:feedpicks:v1:{owner}");
+    let doc = redis_util::json_get(&mut redis, &key).await.ok().flatten();
+    feed_picks_from_doc(doc.as_ref())
+}
+
+fn feed_picks_from_doc(doc: Option<&Value>) -> HashSet<String> {
+    doc.and_then(|d| d.get("items"))
+        .and_then(|v| v.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|it| it.get("uri").and_then(|u| u.as_str()))
+                .filter(|u| u.starts_with("at://did:") && u.contains("/app.bsky.feed.post/"))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
 
 /// Bluesky posts the owner has seen in their Bluesky feeds from accounts they
 /// don't follow, scored like fediverse recommendations: author and hashtag
@@ -1304,8 +1335,9 @@ async fn fetch_bsky_recommendation_keys(
     deprioritized: &HashSet<String>,
     actor_weights: &HashMap<String, f64>,
     tag_weights: &HashMap<String, i32>,
+    feed_picks: &HashSet<String>,
 ) -> Result<Vec<BskyKey>> {
-    if owner < 1 || (actor_weights.is_empty() && tag_weights.is_empty()) {
+    if owner < 1 || (actor_weights.is_empty() && tag_weights.is_empty() && feed_picks.is_empty()) {
         return Ok(Vec::new());
     }
     let sql = format!(
@@ -1328,12 +1360,42 @@ async fn fetch_bsky_recommendation_keys(
          ORDER BY p.indexed_at DESC, p.updated_at DESC
          LIMIT 160"
     );
-    let rows = db
+    let mut rows = db
         .query(&sql, &[&owner])
         .await
         .context("select bsky recommendation keys")?;
+    if !feed_picks.is_empty() {
+        // Sampled feed posts may be older than the newest 160 observations.
+        let picks: Vec<String> = feed_picks.iter().cloned().collect();
+        let pick_sql = format!(
+            "SELECT p.bsky_uri, COALESCE(l.fediverse_id, ''), COALESCE(p.author_did, ''),
+                    COALESCE(p.author_handle, ''), COALESCE(p.text, ''),
+                    COALESCE(p.indexed_at::text, ''), {BSKY_EXTERNAL_HINT_SQL}
+             FROM bsky_posts p
+             LEFT JOIN bsky_post_links l ON l.bsky_uri = p.bsky_uri
+             WHERE p.bsky_uri = ANY($2::text[])
+               AND NOT EXISTS (
+                 SELECT 1 FROM bsky_graph_sync g
+                 WHERE g.owner_user_id = $1::bigint AND g.kind = 'follow' AND g.target_did = p.author_did
+               )
+               AND p.text IS NOT NULL
+               AND COALESCE(p.reply_parent, '') = ''
+               AND p.indexed_at::timestamptz >= NOW() - INTERVAL '7 days'"
+        );
+        match db.query(&pick_sql, &[&owner, &picks]).await {
+            Ok(extra) => rows.extend(extra),
+            Err(e) => tracing::debug!(owner, error = %e, "bsky feed picks unavailable"),
+        }
+        // One recency order across both sets, newest first.
+        rows.sort_by(|a, b| {
+            let at = |r: &tokio_postgres::Row| parse_ts(&r.try_get::<_, String>(5).unwrap_or_default());
+            at(b).cmp(&at(a))
+        });
+    }
     let muted = load_muted_phrases(db, owner).await;
     let mut seen_authors = HashSet::new();
+    let mut seen_uris = HashSet::new();
+    let mut picked_from_feeds = 0usize;
     let mut out = Vec::new();
     for row in rows {
         if out.len() >= BSKY_RECOMMENDATION_MAX {
@@ -1342,6 +1404,9 @@ async fn fetch_bsky_recommendation_keys(
         let Some(mut key) = bsky_key_from_row(&row)? else {
             continue;
         };
+        if !seen_uris.insert(key.uri.clone()) {
+            continue;
+        }
         if exclude_did.is_some_and(|did| key.author_did == did)
             || bsky_author_hidden(hidden, &key.author_did, &key.author_handle)
             || bsky_author_keys(&key).iter().any(|k| deprioritized.contains(k))
@@ -1354,8 +1419,18 @@ async fn fetch_bsky_recommendation_keys(
         for tag in extract_hashtags(&key.text) {
             score += tag_weights.get(&tag).copied().unwrap_or(0) as f64 * 0.5;
         }
+        let from_feed = score < 1.5 && feed_picks.contains(&key.uri);
+        if from_feed {
+            if picked_from_feeds >= BSKY_FEED_PICK_MAX {
+                continue;
+            }
+            score += BSKY_FEED_PICK_SCORE;
+        }
         if score < 1.5 {
             continue;
+        }
+        if from_feed {
+            picked_from_feeds += 1;
         }
         key.sort = key.indexed_at + recommendation_bump(score);
         seen_authors.insert(key.author_did.clone());
@@ -3303,6 +3378,7 @@ pub async fn warm_home_native(cfg: &Config, owner_user_id: i64) -> Result<String
     }
     if algorithm_on {
         let existing: HashSet<String> = bsky.iter().map(|row| row.uri.clone()).collect();
+        let feed_picks = load_bsky_feed_picks(cfg, owner_user_id).await;
         match fetch_bsky_recommendation_keys(
             &db,
             owner_user_id,
@@ -3311,6 +3387,7 @@ pub async fn warm_home_native(cfg: &Config, owner_user_id: i64) -> Result<String
             &deprioritized,
             &actor_weights,
             &tag_weights,
+            &feed_picks,
         )
         .await
         {
@@ -4920,5 +4997,26 @@ mod signal_at_uri_tests {
         for bad in ["", "https://r.test/n/1", "at://did:plc:abc", "at://alice.bsky.social/app.bsky.feed.post/x", "at://did:plc:a b/x/y"] {
             assert_eq!(signal_did_from_at_uri(bad), "", "{bad}");
         }
+    }
+}
+
+#[cfg(test)]
+mod feed_pick_tests {
+    use super::feed_picks_from_doc;
+    use serde_json::json;
+
+    #[test]
+    fn reads_post_uris_only() {
+        let doc = json!({"items": [
+            {"uri": "at://did:plc:a/app.bsky.feed.post/1", "feed": "at://did:plc:f/app.bsky.feed.generator/x"},
+            {"uri": "at://did:plc:a/app.bsky.feed.like/2"},
+            {"uri": "https://example.com/x"},
+            {"nope": 1}
+        ]});
+        let got = feed_picks_from_doc(Some(&doc));
+        assert_eq!(got.len(), 1);
+        assert!(got.contains("at://did:plc:a/app.bsky.feed.post/1"));
+        assert!(feed_picks_from_doc(None).is_empty());
+        assert!(feed_picks_from_doc(Some(&json!({"items": "x"}))).is_empty());
     }
 }
