@@ -41,13 +41,19 @@ function ap_bsky_resolve_target_did(string $ref, int $owner = 0): ?string
     return null;
 }
 function ap_resolve_actor_ref(string $ref): ?string { return null; }
+// Adding or removing anyone must never reload the Bluesky hide set inline.
+function ap_bsky_refresh_hide_set(int $owner, bool $force = false): array { throw new RuntimeException('hide-set reload inside a list edit'); }
+function ap_bsky_add_graph_list_member(int $owner, string $list, string $did): array { $GLOBALS['pds_writes'][] = $did; return ['ok' => true, 'uri' => 'at://did:plc:me/app.bsky.graph.listitem/' . count($GLOBALS['pds_writes'])]; }
+function ap_bsky_delete_graph_list_member(int $owner, string $uri): array { $GLOBALS['pds_deletes'][] = $uri; return ['ok' => true]; }
+$GLOBALS['pds_writes'] = [];
+$GLOBALS['pds_deletes'] = [];
 
 reference_load($api . '/ap-db.php', ['ap_moderation_syntactic_refs', 'ap_moderation_path_segment_forms']);
 reference_load($api . '/ap-lists.php', [
     'ap_list_owner_user_id', 'ap_lists_all', 'ap_list_by_id', 'ap_list_accounts', 'ap_list_add_account', 'ap_list_remove_account',
     'ap_lists_moderation_action_for_actor', 'ap_lists_moderation_members', 'ap_lists_moderation_dids',
     'ap_lists_moderation_nostr_keys', 'ap_list_is_nostr_ref', 'ap_list_member_ref', 'ap_list_picker_state',
-    'ap_lists_moderation_cache_clear', 'ap_list_resolve_actor_ref',
+    'ap_lists_moderation_cache_clear', 'ap_list_resolve_actor_ref', 'ap_list_bsky_hide_set_mark_stale',
 ]);
 
 $checks = 0;
@@ -121,6 +127,24 @@ foreach ($nostrState['lists'] as $row) {
 $bskyState = ap_list_picker_state('https://bsky.app/profile/pest.bsky.social', 1);
 lp_check($bskyState['actor'] === 'https://bsky.app/profile/' . rawurlencode('did:plc:pest'), 'Bluesky handle canonicalized to DID');
 lp_check(empty(ap_list_picker_state('javascript:alert(1)', 1)['ok']), 'junk refused');
+
+// A Bluesky-linked active block list: non-Bluesky members stay VAAK-side with
+// no PDS call; Bluesky members are written to the PDS. Neither reloads the
+// Bluesky hide set inside the request.
+$db->prepare('INSERT INTO masto_lists (owner_user_id, title, list_kind, bsky_moderation_action, bsky_list_source, bsky_list_uri, created_at, updated_at) VALUES (1, ?, ?, ?, ?, ?, ?, ?)')
+    ->execute(['Linked blocks', 'moderation', 'block', 'vaak', 'at://did:plc:me/app.bsky.graph.list/linked', gmdate('c'), gmdate('c')]);
+$linked = (int) $db->lastInsertId();
+lp_check(!empty(ap_list_add_account($linked, 'https://fedi.example/users/linkedtroll')['ok']), 'fediverse account joins linked block list');
+lp_check(!empty(ap_list_add_account($linked, 'https://mkultra.monster/users/linkedpest')['ok']), 'local account joins linked block list');
+lp_check($GLOBALS['pds_writes'] === [], 'non-Bluesky members never contact the PDS');
+lp_check(ap_lists_moderation_action_for_actor('https://fedi.example/users/linkedtroll') === 'block', 'fediverse member blocked VAAK-side');
+lp_check(count(ap_list_accounts($linked)) === 2, 'members listed VAAK-side');
+lp_check(!empty(ap_list_add_account($linked, 'https://bsky.app/profile/did:plc:linkedbsky')['ok']), 'Bluesky member joins linked block list');
+lp_check($GLOBALS['pds_writes'] === ['did:plc:linkedbsky'], 'Bluesky member written to the PDS once');
+lp_check(!empty(ap_list_remove_account($linked, 'https://fedi.example/users/linkedtroll')['ok']), 'remove fediverse member');
+lp_check($GLOBALS['pds_deletes'] === [], 'removing a non-Bluesky member never contacts the PDS');
+lp_check(!empty(ap_list_remove_account($linked, 'https://bsky.app/profile/did:plc:linkedbsky')['ok']), 'remove Bluesky member');
+lp_check(count($GLOBALS['pds_deletes']) === 1, 'Bluesky member deleted from the PDS');
 
 // Removal lifts the block.
 lp_check(!empty(ap_list_remove_account($blocks, $troll)['ok']), 'remove troll');

@@ -3202,14 +3202,19 @@ $vaakAdminOnlyActions = [
             echo json_encode(['ok' => false, 'error' => 'Could not identify this account.'], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
             exit;
         }
-        if (!empty($_POST['member'])) {
-            $pickRes = ap_list_add_account($pickListId, $pickMember['actor_id'], !empty($_POST['follow']));
-            if (empty($pickRes['ok']) && str_contains((string) ($pickRes['error'] ?? ''), 'must be followed')) {
-                $pickRes['needs_follow'] = true;
+        try {
+            if (!empty($_POST['member'])) {
+                $pickRes = ap_list_add_account($pickListId, $pickMember['actor_id'], !empty($_POST['follow']));
+                if (empty($pickRes['ok']) && str_contains((string) ($pickRes['error'] ?? ''), 'must be followed')) {
+                    $pickRes['needs_follow'] = true;
+                }
+            } else {
+                // Remove the stored spelling (Bluesky rows keep a DID URL).
+                $pickRes = ap_list_remove_account($pickListId, $pickMember['actor_id']);
             }
-        } else {
-            // Remove the stored spelling (Bluesky rows keep a DID URL).
-            $pickRes = ap_list_remove_account($pickListId, $pickMember['actor_id']);
+        } catch (Throwable $e) {
+            error_log('[ap-lists] list_picker_set: ' . get_class($e) . ': ' . $e->getMessage());
+            $pickRes = ['ok' => false, 'error' => 'Could not update the list (server error).'];
         }
         $pickList = ap_list_by_id($pickListId);
         echo json_encode($pickRes + [
@@ -43504,9 +43509,14 @@ window.apAdminToast = function (msg, isErr) {
         credentials: 'same-origin',
         headers: { 'Accept': 'application/json', 'X-Requested-With': 'XMLHttpRequest' }
       });
-      return await res.json();
+      const text = await res.text();
+      try {
+        return JSON.parse(text);
+      } catch (e) {
+        return { ok: false, error: 'List update failed (HTTP ' + res.status + '). Try again in a moment.' };
+      }
     } catch (e) {
-      return null;
+      return { ok: false, error: 'List update failed: no connection to VAAK.' };
     }
   }
   function listPickEsc(v) {
@@ -43595,6 +43605,8 @@ window.apAdminToast = function (msg, isErr) {
       }
       if (want && res.followed) msg = 'Followed and a' + msg.slice(1);
       window.apAdminToast(msg);
+      // Done: close the picker once the change saved (a failure keeps it open).
+      if (folderPopover === pop) closeFolderPopover();
     });
   }
   window.vaakOpenListPicker = openListPicker;
