@@ -1,0 +1,65 @@
+# Label pull requests so GitHub's generated release notes (.github/release.yml)
+# can group them, and so the deploy's auto bump can tell features from fixes.
+#
+# - Area labels (bluesky, federation, nostr, rust, deploy, documentation) come
+#   from paths in .github/labeler.yml.
+# - A type label (enhancement, bug, performance) is guessed from the title when
+#   a PR opens without one. Change it by hand whenever the guess is wrong; this
+#   workflow never removes a label.
+#
+# pull_request_target runs with the base branch's workflow and never checks
+# out or runs PR code, so it can label PRs from forks too.
+name: PR labels
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  label:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Area labels from changed paths
+        uses: actions/labeler@v5
+        with:
+          sync-labels: false
+
+      - name: Type label from the title
+        if: github.event.action != 'synchronize'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            const { data: labels } = await github.rest.issues.listLabelsOnIssue({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: pr.number,
+            });
+            const have = new Set(labels.map((l) => l.name));
+            // Any of these already files the PR in a release-notes group.
+            const typed = ['breaking', 'security', 'enhancement', 'bug', 'performance',
+              'dependencies', 'github_actions', 'documentation', 'deploy', 'skip-changelog'];
+            if (typed.some((name) => have.has(name))) {
+              core.info('PR already has a type label');
+              return;
+            }
+            const title = pr.title || '';
+            let type = 'enhancement';
+            if (/^(fix|stop|restore|repair|revert|hotfix)\b/i.test(title)
+                || /\b(fix|fixes|fixed|bug|broken|crash|regression)\b/i.test(title)) {
+              type = 'bug';
+            } else if (/\b(speed up|faster|slow|performance|efficien\w*)\b/i.test(title)) {
+              type = 'performance';
+            }
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: pr.number,
+              labels: [type],
+            });
+            core.info(`added ${type}`);

@@ -6,52 +6,42 @@ Nothing in this workflow publishes the Jekyll blog. `NovaLandia/update_site.sh` 
 
 `/srv/mkultra/html/api` and `/srv/mkultra/html/vaak` stay **real directories**. Activation rsyncs into those directories only, refuses any other destination, and checks that both directories still exist afterwards. rsync of `release/api/` into `html/api/` deletes files inside the directory. It does not remove the directory.
 
-The counter in this checkout is **alpha 0.8.46** (`api/ap-version.php`, dated 2026-10-13). That release commit is on `main` and was not activated. **0.8.35** is an older note at `docs/RELEASE-0.8.35.md`, not the constant the app reads.
-
 The production host is the documented machine (bots, Bluesky feeds, the Jekyll site, and VAAK). Web roots are `/srv/mkultra/html/api` and `/srv/mkultra/html/vaak`. The worker path is `/usr/local/bin/vaak-worker`. The app env file is `/etc/mkultra/vaak.env`. PHP-FPM is `php8.3-fpm.service`. The host is Ubuntu 24.04.4 LTS, x86_64, glibc 2.39. The workflow still builds the binary inside `debian:bookworm-slim` (glibc 2.36), which that host can run.
 
-## Version counter
+## Versions and releases
 
 `api/ap-version.php` is the only version source. It holds `VAAK_CHANNEL`, `VAAK_VERSION`, and `VAAK_VERSION_DATE`.
 
 The login and registration page is `vaak/index.php` (`/vaak/` and `/vaak/?mode=register`). Both modes render `vaak_version_label()` from that file. The signed-in shell in `api/ap-admin.php` does the same. Do not hardcode a version on those pages.
 
-The counter is not semver. Each deploy that asks for `version_bump=increment` adds 1 to the last component and always writes it as two digits:
+Versions follow [SemVer](https://semver.org): `MAJOR.MINOR.PATCH`, no leading zeros. Every production deploy is a release. The `version_bump` input picks the step:
 
-| Current | Next |
-| --- | --- |
-| 0.8.45 | 0.8.46 |
-| 0.8.09 | 0.8.10 |
-| 0.8.99 | 0.9.00 |
-| 0.9.99 | 0.10.00 |
-| 0.99.99 | 1.0.00 |
+| `version_bump` | 0.10.3 becomes | When |
+| --- | --- | --- |
+| `auto` (default) | 0.11.0 or 0.10.4 | minor if a merged PR is labeled `enhancement` or `breaking`, otherwise patch |
+| `patch` | 0.10.4 | force a patch release |
+| `minor` | 0.11.0 | force a minor release |
+| `major` | 1.0.0 | only ever by hand |
+| `none` | 0.10.3 | ship the version already in the tree, no new commit |
 
-`0.99.99` rolls the same way one place to the left: the middle component resets and the first component increments. `deploy/bump_version.py` is the implementation. `deploy/test_bump_version.py` locks the table above.
+Releases up to 0.9.83 used a two-digit counter (0.9.05). Those numbers still parse, so old commits and rollbacks keep working, but new numbers never have leading zeros. `deploy/bump_version.py` is the implementation and `deploy/test_bump_version.py` locks it.
 
-The bump updates only the live surfaces:
+### Release notes
+
+Notes come from GitHub's generated release notes: the PRs merged since the previous tag, grouped by label using `.github/release.yml` (Breaking changes, Security, Features, Fixes, Performance, Maintenance, Other). `.github/workflows/pr-labels.yml` labels PRs by path and guesses a type label from the title when a PR opens without one; fix the label by hand when the guess is wrong, and add `skip-changelog` to leave a PR out. `auto` reads the same groups (`deploy/release_notes.py`).
+
+The bump writes:
 
 - `api/ap-version.php`
 - the current-release, notes, and status lines in `README.md`
 - the deployed-release line in `rust/README.md`
-- a new `docs/RELEASE-<version>.md` (older release notes are left as history)
+- a new section at the top of `CHANGELOG.md` holding those notes (older sections are never rewritten)
 
-Choose `version_bump=none` when that commit already contains the counter you want to ship. The workflow then does not make another commit.
+GitHub does not run CI on a commit this workflow pushes with its own token. The deploy does not wait for checks on that commit. The guard job has already required a green check on the parent. Before activation, the new commit must have that parent, a version that is one patch, minor, or major step ahead, and a diff that only touches the files above. `deploy/release_commit.py` checks the file list and that the bytes match what `deploy/bump_version.py` would write with the notes in the new `CHANGELOG.md` section (so the CHANGELOG can only gain that one section).
 
-GitHub does not run CI on a commit this workflow pushes with its own token. The deploy does not wait for checks on that commit. The guard job has already required a green check on the parent. Before activation, the new commit must have that parent and a diff that only touches the version files above. `deploy/release_commit.py` checks the file list and that the bytes match what `deploy/bump_version.py` would write.
+If `main` is already that release commit, or later commits did not change the app, a bumping run does not take the next number while the server's live version is still lower. It ships the version already in the tree. The live number is read from `/srv/mkultra/html/api/ap-version.php` on the production host. An equal or newer server stops the run instead of inventing the next number. `version_bump=none` still deploys the commit you named, including a redeploy of the version that is already live.
 
-If `main` is already that release commit, or later commits did not change the app, `version_bump=increment` does not take the next number while the server's live version is still lower. It ships the counter already in the tree. The live number is read from `/srv/mkultra/html/api/ap-version.php` on the production host. An equal or newer server stops the run instead of inventing the next number. `version_bump=none` still deploys the commit you named, including a redeploy of the version that is already live.
-
-### Shipping 0.8.46
-
-`828be543b3b53bf3ef81a1b05e2bbda9f24e2eb8` is already "Release VAAK alpha 0.8.46" and was not activated. Merge the workflow fix, wait until the checks on that merge are green, then run **Deploy production** from `main`:
-
-- `action`: deploy
-- `sha`: leave empty
-- `version_bump`: increment
-
-Leave `sha` empty so the run uses the new tip of `main`. Do not paste `828be54` after the merge; `main` will have moved, and the workflow only deploys the current tip. The app files are still 0.8.46. If the server is on an older counter, the run activates 0.8.46 and does not commit 0.8.47. `version_bump=none` ships that same tree even when 0.8.46 is already live.
-
-After a successful activate, the workflow pushes an annotated tag `v<version>` and opens a GitHub Release whose notes are that release file. The tag is created only after the health check passes. If a later step fails after the version commit is already on `main`, run the workflow again with `sha` empty. Do not increment again until that counter has actually gone live.
+After a successful activate, the workflow pushes an annotated tag `v<version>` and opens a GitHub Release whose notes are that version's `CHANGELOG.md` section (or GitHub's generated notes when the tree has no section, e.g. a `none` redeploy of an old release). The tag is created only after the health check passes. If a later step fails after the version commit is already on `main`, run the workflow again with `sha` empty and `version_bump=auto`: the release commit is reused, not bumped again.
 
 NodeInfo `software.version` stays `1.0.0`, and the Mastodon instance `version` stays `4.5.0 (compatible; vaak)`. Those strings are client-compatibility markers, not this counter.
 
@@ -62,7 +52,7 @@ NodeInfo `software.version` stays `1.0.0`, and the Mastodon instance `version` s
 3. Actions → Deploy production → Run workflow, from `main`.
    - `action=deploy`
    - `sha` empty for the current tip of `main`. A full SHA has to be that same tip.
-   - `version_bump=increment` (default) or `none`
+   - `version_bump=auto` (default), or `patch`, `minor`, `major`, `none` (see the table above)
 4. The guard job checks CI on the source commit. The build job compiles `vaak-worker` from that CI-green commit and uploads the binary. Approve the `production` environment prompt. The self-hosted job then either publishes a version commit (parent already green, diff limited to the version files, no CI wait) or, when that version is already on `main` and the server is still older, ships it as-is. It then activates the release locally.
 5. The guard job's summary shows the commit and the version it intends to ship. CI must report at least one successful check on the source commit other than the jobs in this workflow. A pending or failed check blocks the deploy. A normal commit with no other checks is refused. A version-only release commit is accepted when its parent has that green CI.
 

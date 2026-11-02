@@ -20,15 +20,19 @@ on:
         default: ""
       version_bump:
         description: >
-          increment advances the VAAK counter (0.8.45 to 0.8.46, 0.8.99 to 0.9.00)
-          and commits it. none ships the version already in api/ap-version.php.
+          SemVer step for this release. auto picks minor when a merged PR is
+          labeled enhancement or breaking, otherwise patch. none ships the
+          version already in api/ap-version.php.
         type: choice
         options:
-          - increment
+          - auto
+          - patch
+          - minor
+          - major
           - none
-        default: increment
+        default: auto
       rollback_to:
-        description: Git SHA or version (0.8.45) of a release directory already on the server
+        description: Git SHA or version (0.10.3, or an old one like 0.9.05) of a release directory already on the server
         required: false
         default: ""
 
@@ -53,6 +57,7 @@ jobs:
       next_version: ${{ steps.resolve.outputs.next_version }}
       reuse: ${{ steps.resolve.outputs.reuse }}
       kind: ${{ steps.resolve.outputs.kind }}
+      bump: ${{ steps.resolve.outputs.bump }}
     steps:
       - name: Fetch main
         uses: actions/checkout@v7
@@ -82,11 +87,23 @@ jobs:
           python3 deploy/test_require_green_ci.py
           python3 deploy/test_release_commit.py
           python3 deploy/test_restart_plan.py
+          python3 deploy/test_release_notes.py
+          # auto becomes patch or minor from the labels of the PRs merged
+          # since the current version's tag (GitHub generated notes).
+          BUMP="${VERSION_BUMP}"
+          if [[ "${BUMP}" == "auto" ]]; then
+            CURRENT="$(git show "${SHA}:api/ap-version.php" | python3 -c 'import sys; sys.path.insert(0, "deploy"); from bump_version import parse_version_file; print(parse_version_file(sys.stdin.read())[0])')"
+            NEXT_PATCH="$(python3 -c 'import sys; sys.path.insert(0, "deploy"); from bump_version import bump; print(bump(sys.argv[1], "patch"))' "${CURRENT}")"
+            python3 deploy/release_notes.py generate --tag "v${NEXT_PATCH}" --target "${SHA}" --previous "v${CURRENT}" --output "${RUNNER_TEMP}/auto-notes.md"
+            BUMP="$(python3 deploy/release_notes.py level --notes "${RUNNER_TEMP}/auto-notes.md")"
+          fi
+          [[ "${BUMP}" =~ ^(patch|minor|major|none)$ ]]
+          echo "bump=${BUMP}" >> "${GITHUB_OUTPUT}"
           # Plan writes sha, source_sha, version, next_version, reuse, and kind.
           # source_sha is the commit whose CI must be green. A version-only
           # release commit uses its parent: GitHub never starts workflows for
           # the GITHUB_TOKEN push that created it.
-          PLAN="$(python3 deploy/release_commit.py plan --sha "${SHA}" --version-bump "${VERSION_BUMP}" --github-output "${GITHUB_OUTPUT}")"
+          PLAN="$(python3 deploy/release_commit.py plan --sha "${SHA}" --version-bump "${BUMP}" --github-output "${GITHUB_OUTPUT}")"
           printf '%s\n' "${PLAN}"
           eval "${PLAN}"
           python3 deploy/require_green_ci.py --sha "${source_sha}"
@@ -105,8 +122,8 @@ jobs:
             else
               echo "CI on \`${source_sha}\` is green."
             fi
-            echo "Counter in that commit: \`${version}\`. This run ships \`${next_version}\` (\`${VERSION_BUMP}\`)."
-            if [[ "${reuse}" == "true" && "${VERSION_BUMP}" == "increment" ]]; then
+            echo "Version in that commit: \`${version}\`. This run ships \`${next_version}\` (\`${BUMP}\`, asked for \`${VERSION_BUMP}\`)."
+            if [[ "${reuse}" == "true" && "${BUMP}" != "none" ]]; then
               echo "The activate job reads the live version on the server and continues only when that number is still lower."
             fi
           } >> "${GITHUB_STEP_SUMMARY}"
@@ -179,7 +196,8 @@ jobs:
           SOURCE_SHA: ${{ needs.vaak-deploy-guard.outputs.source_sha }}
           KIND: ${{ needs.vaak-deploy-guard.outputs.kind }}
           REUSE: ${{ needs.vaak-deploy-guard.outputs.reuse }}
-          VERSION_BUMP: ${{ inputs.version_bump }}
+          # patch, minor, major, or none: the guard already resolved auto.
+          VERSION_BUMP: ${{ needs.vaak-deploy-guard.outputs.bump }}
           GH_TOKEN: ${{ github.token }}
           GITHUB_TOKEN: ${{ github.token }}
         run: |
@@ -191,6 +209,7 @@ jobs:
           }
           [[ "${REUSE}" == "true" || "${REUSE}" == "false" ]]
           [[ "${KIND}" == "version-only" || "${KIND}" == "reuse-tree" || "${KIND}" == "ci-required" ]]
+          [[ "${VERSION_BUMP}" =~ ^(patch|minor|major|none)$ ]]
           git checkout --detach "${DEPLOY_SHA}"
           python3 deploy/release_commit.py plan \
             --sha "${DEPLOY_SHA}" \
@@ -207,7 +226,7 @@ jobs:
             fi
             python3 deploy/require_green_ci.py --sha "${SOURCE_SHA}"
             VERSION="$(python3 deploy/bump_version.py --print-current)"
-            if [[ "${VERSION_BUMP}" == "increment" ]]; then
+            if [[ "${VERSION_BUMP}" != "none" ]]; then
               HTML_API="${VAAK_HTML_API:-/srv/mkultra/html/api}"
               PHP="${VAAK_PHP:-/usr/bin/php}"
               LIVE="$("${PHP}" -r 'require $argv[1]; echo VAAK_VERSION;' "${HTML_API}/ap-version.php")"
@@ -215,13 +234,18 @@ jobs:
             fi
             SHA="${DEPLOY_SHA}"
             echo "shipping ${VERSION} at ${SHA} without a new commit (${KIND})"
-          elif [[ "${VERSION_BUMP}" == "increment" ]]; then
+          elif [[ "${VERSION_BUMP}" != "none" ]]; then
             python3 deploy/require_green_ci.py --sha "${SOURCE_SHA}"
             DATE="$(date -u +%F)"
-            VERSION="$(python3 deploy/bump_version.py --increment --date "${DATE}" --commit "${SOURCE_SHA}")"
+            CURRENT="$(python3 deploy/bump_version.py --print-current)"
+            NEXT="$(python3 deploy/bump_version.py --print-next "${VERSION_BUMP}")"
+            NOTES="${RUNNER_TEMP}/vaak-release-notes.md"
+            python3 deploy/release_notes.py generate --tag "v${NEXT}" --target "${SOURCE_SHA}" --previous "v${CURRENT}" --output "${NOTES}"
+            VERSION="$(python3 deploy/bump_version.py --bump "${VERSION_BUMP}" --date "${DATE}" --notes-file "${NOTES}")"
+            [[ "${VERSION}" == "${NEXT}" ]]
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add api/ap-version.php README.md rust/README.md "docs/RELEASE-${VERSION}.md"
+            git add api/ap-version.php README.md rust/README.md CHANGELOG.md
             git diff --cached --quiet && { echo "version bump produced no changes" >&2; exit 1; }
             git commit -m "Release VAAK alpha ${VERSION}"
             NEW="$(git rev-parse HEAD)"
@@ -238,7 +262,7 @@ jobs:
             SHA="${DEPLOY_SHA}"
             echo "shipping ${VERSION} at ${SHA} with version_bump=none"
           fi
-          [[ "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]{2}$ ]]
+          [[ "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
           [[ "${SHA}" =~ ^[0-9a-f]{40}$ ]]
           {
             echo "version=${VERSION}"
@@ -318,11 +342,19 @@ jobs:
           fi
           if gh release view "v${VERSION}" >/dev/null 2>&1; then
             echo "GitHub release v${VERSION} already exists"
-          else
+          elif python3 deploy/bump_version.py --print-notes "${VERSION}" > "${RUNNER_TEMP}/notes.md"; then
+            # Same text as this version's CHANGELOG.md section.
             gh release create "v${VERSION}" \
               --target "${RELEASE_SHA}" \
               --title "VAAK alpha ${VERSION}" \
-              --notes-file "docs/RELEASE-${VERSION}.md"
+              --notes-file "${RUNNER_TEMP}/notes.md"
+          else
+            # No CHANGELOG section (a none redeploy of a release from before
+            # CHANGELOG.md): let GitHub generate the notes.
+            gh release create "v${VERSION}" \
+              --target "${RELEASE_SHA}" \
+              --title "VAAK alpha ${VERSION}" \
+              --generate-notes
           fi
 
   vaak-deploy-rollback:
@@ -346,8 +378,8 @@ jobs:
           [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]
           [[ "${GITHUB_REPOSITORY}" == "cmdr-nova/VAAK" ]]
           [[ "${GITHUB_REF}" == "refs/heads/main" ]]
-          [[ "${ROLLBACK_TO}" =~ ^([0-9a-f]{40}|legacy-[0-9]{8}T[0-9]{6}Z|[0-9]+\.[0-9]+\.[0-9]{2}|v[0-9]+\.[0-9]+\.[0-9]{2})$ ]] || {
-            echo "rollback_to must be a git sha or a version such as 0.8.45" >&2
+          [[ "${ROLLBACK_TO}" =~ ^([0-9a-f]{40}|legacy-[0-9]{8}T[0-9]{6}Z|v?[0-9]+\.[0-9]+\.[0-9]+)$ ]] || {
+            echo "rollback_to must be a git sha or a version such as 0.10.3" >&2
             exit 1
           }
           unset VAAK_RESTART_JETSTREAM VAAK_RESTART_SHADOW
