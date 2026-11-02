@@ -164,6 +164,14 @@ function ap_vaak_boot_pretty_profile(string $actorKey): void
     $userRow = function_exists('ap_local_user_by_username')
         ? ap_local_user_by_username($actorKey)
         : null;
+    if (!is_array($userRow) && $actorKey !== 'cmdr_nova' && function_exists('ap_local_banned_user_by_username')) {
+        $bannedRow = ap_local_banned_user_by_username($actorKey);
+        if (is_array($bannedRow)) {
+            require_once __DIR__ . '/ap-banned-account.php';
+            ap_user_serve_banned($bannedRow, '');
+            exit;
+        }
+    }
     if (!is_array($userRow) && $actorKey !== 'cmdr_nova') {
         // cmdr_nova is always local even if lookup shape differs
         http_response_code(404);
