@@ -12,6 +12,15 @@ anything else bumps the patch number.
 Releases up to **0.9.83** used a two-digit deploy counter (0.9.05, 0.9.83)
 and have no notes here; their tags and GitHub Releases are unchanged.
 
+## [0.18.0](https://github.com/cmdr-nova/VAAK/releases/tag/v0.18.0) - 2026-11-02
+
+### ✨ Features
+* Close the zap pay panel once paid; drop the stuck Saving pill by @cmdr-nova in https://github.com/cmdr-nova/VAAK/pull/342
+* Notifications: paint grouped like/boost stacks in Rust instead of PHP by @cmdr-nova in https://github.com/cmdr-nova/VAAK/pull/343
+* Remove "Bluesky for @handle · Open profile" line from Bluesky feed view by @cmdr-nova in https://github.com/cmdr-nova/VAAK/pull/344
+
+**Full Changelog**: https://github.com/cmdr-nova/VAAK/compare/v0.17.0...v0.18.0
+
 ## [0.17.0](https://github.com/cmdr-nova/VAAK/releases/tag/v0.17.0) - 2026-11-02
 
 ### ✨ Features
