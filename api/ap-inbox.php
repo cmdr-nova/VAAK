@@ -49,17 +49,13 @@ require_once __DIR__ . '/ap-db.php';
 require_once __DIR__ . '/ap-asks.php';
 require_once __DIR__ . '/ap-fanout-host.php';
 
-/** Outbound HTTP User-Agent for federation fingerprints (software name: vaak). */
+/** Outbound HTTP User-Agent for federation fetches and deliveries (see vaak_user_agent()). */
 function ap_http_user_agent(?string $actorId = null): string
 {
-    $actor = $actorId;
-    if ($actor === null || $actor === '') {
-        $actor = function_exists('ap_local_actor_id') ? ap_local_actor_id() : '';
+    if (!function_exists('vaak_user_agent')) {
+        require_once __DIR__ . '/ap-version.php';
     }
-    if ($actor === '' || !str_starts_with($actor, 'https://')) {
-        $actor = defined('LOCAL_ACTOR') ? (string) LOCAL_ACTOR : 'https://mkultra.monster/users/cmdr_nova';
-    }
-    return 'vaak/1.0 (+' . rtrim($actor, '/') . ')';
+    return vaak_user_agent();
 }
 
 if (!defined('AP_INBOX_LIB_ONLY')) {
@@ -3608,7 +3604,7 @@ function ap_misskey_note_as2_from_url(string $url): ?array
         CURLOPT_HTTPHEADER => [
             'Content-Type: application/json',
             'Accept: application/json',
-            'User-Agent: VAAK/1.0 (+https://mkultra.monster/vaak)',
+            'User-Agent: ' . ap_http_user_agent(),
         ],
         CURLOPT_POSTFIELDS => $payload,
         CURLOPT_CONNECTTIMEOUT => 3,

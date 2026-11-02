@@ -24,6 +24,21 @@ function vaak_version_label(): string
     return 'VAAK ' . VAAK_CHANNEL . ' ' . VAAK_VERSION . ' · ' . VAAK_VERSION_DATE;
 }
 
+/** Public homepage remote admins can open to learn what VAAK is. */
+const VAAK_HOMEPAGE = 'https://github.com/cmdr-nova/VAAK';
+
+/**
+ * Outbound HTTP User-Agent, e.g. "VAAK/0.9.83 (mkultra.monster; +https://github.com/cmdr-nova/VAAK)"
+ * or "VAAK-Bluesky/0.9.83 (...)" when $component is given. Remote admins see this in their
+ * logs, so it names the instance and links somewhere that explains the software.
+ */
+function vaak_user_agent(string $component = ''): string
+{
+    $component = preg_replace('/[^A-Za-z0-9-]/', '', $component) ?? '';
+    $name = $component === '' ? 'VAAK' : 'VAAK-' . $component;
+    return $name . '/' . VAAK_VERSION . ' (mkultra.monster; +' . VAAK_HOMEPAGE . ')';
+}
+
 /** Short channel word for badges: "alpha" */
 function vaak_version_channel(): string
 {

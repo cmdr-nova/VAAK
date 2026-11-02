@@ -127,7 +127,7 @@ pub async fn enqueue_thin_scan(cfg: &Config, owner: i64, limit: usize) -> Result
 pub async fn process_job(cfg: &Config, job: &WarmJob) -> Result<bool> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
-        .user_agent("vaak-worker-live/0.1 (thin-media-warm)")
+        .user_agent("VAAK-worker (thin-media-warm; mkultra.monster; +https://github.com/cmdr-nova/VAAK)")
         .build()?;
     let base = cfg.bsky_public_api.trim_end_matches('/');
     let url = format!("{base}/xrpc/app.bsky.feed.getPosts");
@@ -434,7 +434,7 @@ pub async fn label_recheck_once(cfg: &Config) -> Result<usize> {
     }
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
-        .user_agent("vaak-worker-live/0.1 (label-recheck)")
+        .user_agent("VAAK-worker (label-recheck; mkultra.monster; +https://github.com/cmdr-nova/VAAK)")
         .build()?;
     let url = format!("{}/xrpc/app.bsky.feed.getPosts", cfg.bsky_public_api.trim_end_matches('/'));
     let mut updated = 0usize;

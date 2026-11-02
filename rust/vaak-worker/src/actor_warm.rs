@@ -231,7 +231,7 @@ pub async fn process_batch(cfg: &Config, jobs: &[WarmJob]) -> Result<(usize, usi
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(12))
-        .user_agent("vaak-worker-live/0.1 (actor-warm)")
+        .user_agent("VAAK-worker (actor-warm; mkultra.monster; +https://github.com/cmdr-nova/VAAK)")
         .build()?;
     let base = cfg.bsky_public_api.trim_end_matches('/');
 

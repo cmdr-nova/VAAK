@@ -5,6 +5,8 @@
  */
 declare(strict_types=1);
 
+require_once __DIR__ . '/ap-version.php';
+
 require_once __DIR__ . '/ap-net-guard.php';
 
 function ap_r2_config(): ?array
@@ -978,7 +980,7 @@ function ap_remote_media_http_get(string $url, float $timeoutSec, int $maxBytes,
         CURLOPT_TIMEOUT_MS => (int) ($timeoutSec * 1000),
         CURLOPT_HTTPHEADER => [
             'Accept: ' . $accept,
-            'User-Agent: mkultra-ap-media/1.0 (+https://mkultra.monster/users/cmdr_nova)',
+            'User-Agent: ' . vaak_user_agent('Media'),
         ],
         CURLOPT_WRITEFUNCTION => static function ($ch, string $data) use (&$buf, $maxBytes): int {
             $buf .= $data;

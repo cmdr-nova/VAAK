@@ -10035,7 +10035,7 @@ function admin_downranked_appview_get(string $nsid, string $param, array $values
         CURLOPT_TIMEOUT => $timeoutSec,
         CURLOPT_HTTPHEADER => [
             'Accept: application/json',
-            'User-Agent: VAAK-Bluesky/1.0 (+https://mkultra.monster/vaak)',
+            'User-Agent: ' . vaak_user_agent('Bluesky'),
         ],
     ]);
     $body = curl_exec($ch);
