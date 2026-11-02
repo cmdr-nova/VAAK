@@ -68,6 +68,11 @@ fn env_flag_default_true(name: &str) -> bool {
     }
 }
 
+/// `VAAK_HOME_BURST_SPREAD=0` turns author burst spreading off.
+fn burst_spread_enabled() -> bool {
+    env_flag_default_true("VAAK_HOME_BURST_SPREAD")
+}
+
 fn native_home_enabled() -> bool {
     env_flag_default_true("VAAK_RANKED_NATIVE_HOME")
 }
@@ -3036,6 +3041,110 @@ fn apply_favourite_rank(
     }
 }
 
+/// Author burst spreading, adapted from the author-diversity discount in
+/// Twitter's home-mixer (`(1 - floor) * decay^n + floor`, decay 0.5, floor
+/// 0.25). Home is ordered by time, so the multiplier becomes a backwards time
+/// shift of up to [`BURST_MAX_SHIFT_SECS`].
+///
+/// An author's posts less than [`BURST_CLUSTER_GAP_SECS`] apart form one
+/// cluster and move together, so a self-thread posted in one go stays
+/// grouped. For each cluster, `n` is how many newer clusters the same author
+/// has within [`BURST_WINDOW_SECS`]: the newest stays put and earlier ones in
+/// the burst step back, which keeps the author's own order. Posts older than
+/// 48 hours, posts with no author and the owner's own posts are untouched.
+const BURST_CLUSTER_GAP_SECS: i64 = 5 * 60;
+const BURST_WINDOW_SECS: i64 = 3 * 3600;
+const BURST_MAX_SHIFT_SECS: f64 = 2.0 * 3600.0;
+const BURST_DECAY: f64 = 0.5;
+const BURST_FLOOR: f64 = 0.25;
+
+fn burst_shift_secs(n: usize) -> i64 {
+    if n == 0 {
+        return 0;
+    }
+    let mult = (1.0 - BURST_FLOOR) * BURST_DECAY.powi(n.min(32) as i32) + BURST_FLOOR;
+    ((1.0 - mult) * BURST_MAX_SHIFT_SECS).round() as i64
+}
+
+/// `entries[i] = (author key, sort)`. Returns how many seconds to subtract
+/// from each entry's sort. Empty author keys are never shifted.
+fn burst_shifts(entries: &[(String, i64)], exempt: &HashSet<String>, now: i64) -> Vec<i64> {
+    let mut shifts = vec![0i64; entries.len()];
+    let mut by_author: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (i, (author, sort)) in entries.iter().enumerate() {
+        if author.is_empty() || exempt.contains(author) || *sort < now - 172_800 {
+            continue;
+        }
+        by_author.entry(author.as_str()).or_default().push(i);
+    }
+    for idxs in by_author.values_mut() {
+        if idxs.len() < 2 {
+            continue;
+        }
+        // Newest first.
+        idxs.sort_by(|a, b| entries[*b].1.cmp(&entries[*a].1));
+        // Clusters: (newest sort in cluster, member indexes).
+        let mut clusters: Vec<(i64, Vec<usize>)> = Vec::new();
+        let mut last_sort = i64::MAX;
+        for &i in idxs.iter() {
+            let sort = entries[i].1;
+            match clusters.last_mut() {
+                Some((_, members)) if last_sort - sort <= BURST_CLUSTER_GAP_SECS => members.push(i),
+                _ => clusters.push((sort, vec![i])),
+            }
+            last_sort = sort;
+        }
+        for c in 0..clusters.len() {
+            let start = clusters[c].0;
+            let n = clusters[..c]
+                .iter()
+                .filter(|(newer, _)| newer - start <= BURST_WINDOW_SECS)
+                .count();
+            let shift = burst_shift_secs(n);
+            if shift > 0 {
+                for &i in &clusters[c].1 {
+                    shifts[i] = shift;
+                }
+            }
+        }
+    }
+    shifts
+}
+
+fn norm_author(actor: &str) -> String {
+    actor.trim().trim_end_matches('/').to_ascii_lowercase()
+}
+
+fn apply_burst_spread(timeline: &mut [TimelineItem], self_actor: &str) {
+    let now = chrono::Utc::now().timestamp();
+    let exempt: HashSet<String> = [norm_author(self_actor)].into_iter().filter(|a| !a.is_empty()).collect();
+    let entries: Vec<(String, i64)> = timeline
+        .iter()
+        .map(|it| {
+            let author = if it.kind == "boost" {
+                String::new()
+            } else if !it.pref_actor.is_empty() {
+                norm_author(&it.pref_actor)
+            } else {
+                norm_author(&it.actor_id)
+            };
+            (author, it.sort)
+        })
+        .collect();
+    for (item, shift) in timeline.iter_mut().zip(burst_shifts(&entries, &exempt, now)) {
+        item.sort -= shift;
+    }
+}
+
+fn apply_bsky_burst_spread(keys: &mut [BskyKey], own_did: Option<&str>) {
+    let now = chrono::Utc::now().timestamp();
+    let exempt: HashSet<String> = own_did.map(norm_author).into_iter().filter(|a| !a.is_empty()).collect();
+    let entries: Vec<(String, i64)> = keys.iter().map(|k| (norm_author(&k.author_did), k.sort)).collect();
+    for (key, shift) in keys.iter_mut().zip(burst_shifts(&entries, &exempt, now)) {
+        key.sort -= shift;
+    }
+}
+
 /// Native Home ranked rebuild (no PHP).
 pub async fn warm_home_native(cfg: &Config, owner_user_id: i64) -> Result<String> {
     let started = Instant::now();
@@ -3110,6 +3219,9 @@ pub async fn warm_home_native(cfg: &Config, owner_user_id: i64) -> Result<String
             }
         }
         apply_favourite_rank(&mut timeline, &actor_weights, &tag_weights);
+        if burst_spread_enabled() {
+            apply_burst_spread(&mut timeline, &actor_id);
+        }
     }
 
     // Remember which cards are deprioritized before ranking drops the actor.
@@ -3197,6 +3309,9 @@ pub async fn warm_home_native(cfg: &Config, owner_user_id: i64) -> Result<String
                 );
             }
         }
+    }
+    if algorithm_on && burst_spread_enabled() {
+        apply_bsky_burst_spread(&mut bsky, own_did.as_deref());
     }
     bsky.sort_by(|a, b| b.sort.cmp(&a.sort).then(b.indexed_at.cmp(&a.indexed_at)));
     collapse_repeated_external_posts(&mut bsky);
@@ -4687,5 +4802,71 @@ mod signal_window_tests {
         let other = *weights.get("https://r.test/users/other").unwrap_or(&0.0);
         // Passive rows are capped at 500: 500 x -0.03 ~= -15, clamped to -3.
         assert!(other < 0.0 && other >= -3.0, "impressions still add fatigue: {other}");
+    }
+}
+
+#[cfg(test)]
+mod burst_spread_tests {
+    use super::*;
+
+    fn e(author: &str, sort: i64) -> (String, i64) {
+        (author.to_string(), sort)
+    }
+
+    #[test]
+    fn shift_curve_matches_decay_and_floor() {
+        assert_eq!(burst_shift_secs(0), 0);
+        assert_eq!(burst_shift_secs(1), 2700); // x0.625 -> 45 min
+        assert_eq!(burst_shift_secs(2), 4050); // x0.4375 -> 67.5 min
+        assert!(burst_shift_secs(40) <= 5400 && burst_shift_secs(40) >= 5399); // floor 0.25 -> 90 min
+    }
+
+    #[test]
+    fn newest_stays_and_earlier_posts_in_a_burst_step_back() {
+        let now = 1_000_000;
+        // Four separate posts 20 minutes apart, plus another author.
+        let entries = vec![
+            e("a", now - 60),
+            e("a", now - 60 - 1200),
+            e("a", now - 60 - 2400),
+            e("a", now - 60 - 3600),
+            e("b", now - 600),
+        ];
+        let shifts = burst_shifts(&entries, &HashSet::new(), now);
+        assert_eq!(shifts, vec![0, 2700, 4050, burst_shift_secs(3), 0]);
+        // The author's own order is kept.
+        let sorted: Vec<i64> = entries.iter().zip(&shifts).map(|((_, s), d)| s - d).collect();
+        assert!(sorted[0] > sorted[1] && sorted[1] > sorted[2] && sorted[2] > sorted[3]);
+    }
+
+    #[test]
+    fn a_thread_posted_in_one_go_moves_together() {
+        let now = 1_000_000;
+        // Newer standalone post, then a 3-post thread a bit earlier, 1 minute apart.
+        let entries = vec![
+            e("a", now - 100),
+            e("a", now - 2000),
+            e("a", now - 2060),
+            e("a", now - 2120),
+        ];
+        let shifts = burst_shifts(&entries, &HashSet::new(), now);
+        assert_eq!(shifts, vec![0, 2700, 2700, 2700]);
+    }
+
+    #[test]
+    fn spaced_out_posts_self_and_old_posts_are_untouched() {
+        let now = 1_000_000;
+        let entries = vec![
+            e("a", now - 60),
+            e("a", now - 60 - 4 * 3600), // outside the 3 h window
+            e("me", now - 60),
+            e("me", now - 120 - 600),
+            e("c", now - 200_000),
+            e("c", now - 200_100),
+            e("", now - 10),
+            e("", now - 20),
+        ];
+        let exempt: HashSet<String> = ["me".to_string()].into_iter().collect();
+        assert_eq!(burst_shifts(&entries, &exempt, now), vec![0; 8]);
     }
 }
