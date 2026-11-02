@@ -648,9 +648,8 @@ function ap_list_add_account(int $listId, string $actorId, bool $followIfNeeded 
         ap_db()->prepare(
             'INSERT INTO masto_list_accounts (list_id, actor_id, bsky_did, bsky_item_uri, added_at) VALUES (?, ?, ?, ?, ?)'
         )->execute([$listId, $actorId, $isBsky ? $bskyDid : null, $remoteItemUri !== '' ? $remoteItemUri : null, $now]);
-        if (!empty($list['bsky_list_uri']) && !empty($list['bsky_moderation_action']) && $list['bsky_moderation_action'] !== 'none'
-            && function_exists('ap_bsky_refresh_hide_set')) {
-            ap_bsky_refresh_hide_set($ownerUserId, true);
+        if ($isBsky && !empty($list['bsky_list_uri']) && in_array((string) ($list['bsky_moderation_action'] ?? 'none'), ['mute', 'block'], true)) {
+            ap_list_bsky_hide_set_mark_stale($ownerUserId);
         }
         ap_db()->prepare('UPDATE masto_lists SET updated_at = ? WHERE id = ?')->execute([$now, $listId]);
         ap_lists_moderation_cache_clear($ownerUserId);
@@ -687,9 +686,11 @@ function ap_list_remove_account(int $listId, string $actorId): array
             $stored = (string) ($rowSt->fetchColumn() ?: '');
             if ($stored !== '') $actorId = rtrim($stored, '/');
         }
-        $st = ap_db()->prepare('SELECT bsky_item_uri FROM masto_list_accounts WHERE list_id = ? AND (actor_id = ? OR actor_id = ?) LIMIT 1');
+        $st = ap_db()->prepare('SELECT bsky_item_uri, bsky_did FROM masto_list_accounts WHERE list_id = ? AND (actor_id = ? OR actor_id = ?) LIMIT 1');
         $st->execute([$listId, $actorId, $actorId . '/']);
-        $itemUri = (string) ($st->fetchColumn() ?: '');
+        $memberRow = $st->fetch() ?: [];
+        $itemUri = (string) ($memberRow['bsky_item_uri'] ?? '');
+        $memberIsBsky = str_starts_with((string) ($memberRow['bsky_did'] ?? ''), 'did:');
         if ($itemUri !== '' && !empty($list['bsky_list_uri'])) {
             $remote = ap_bsky_delete_graph_list_member($ownerUserId, $itemUri);
             if (empty($remote['ok'])) return ['ok' => false, 'error' => 'Could not remove member from Bluesky: ' . (string) ($remote['error'] ?? '')];
@@ -699,15 +700,30 @@ function ap_list_remove_account(int $listId, string $actorId): array
         )->execute([$listId, $actorId, $actorId . '/']);
         ap_db()->prepare('UPDATE masto_lists SET updated_at = ? WHERE id = ?')->execute([ap_db_now(), $listId]);
         ap_lists_moderation_cache_clear($ownerUserId);
-        if (($list['list_kind'] ?? '') === 'moderation' && in_array((string) ($list['bsky_moderation_action'] ?? 'none'), ['mute', 'block'], true)
-            && !empty($list['bsky_list_uri']) && function_exists('ap_bsky_refresh_hide_set')) {
-            ap_bsky_refresh_hide_set($ownerUserId, true);
-            if (function_exists('ap_bsky_hide_did_set_clear_cache')) ap_bsky_hide_did_set_clear_cache($ownerUserId);
+        if ($memberIsBsky && ($list['list_kind'] ?? '') === 'moderation' && in_array((string) ($list['bsky_moderation_action'] ?? 'none'), ['mute', 'block'], true)
+            && !empty($list['bsky_list_uri'])) {
+            ap_list_bsky_hide_set_mark_stale($ownerUserId);
         }
         return ['ok' => true];
     } catch (Throwable $e) {
         return ['ok' => false, 'error' => 'Could not remove account'];
     }
+}
+
+/**
+ * A Bluesky member joined or left a linked, active moderation list. VAAK
+ * already applies the change itself (ap_bsky_hide_did_set reads the list
+ * rows), so never reload the whole Bluesky hide set inside the request: that
+ * pages through every subscribed list on the AppView and can outlast the web
+ * timeout. Drop the 15-minute freshness stamp instead, so the next
+ * notification poll refreshes it in the background. Non-Bluesky members never
+ * touch Bluesky at all.
+ */
+function ap_list_bsky_hide_set_mark_stale(int $ownerUserId): void
+{
+    if ($ownerUserId < 1) return;
+    @unlink(sys_get_temp_dir() . '/vaak-bsky-hide-' . $ownerUserId . '.json');
+    if (function_exists('ap_bsky_hide_did_set_clear_cache')) ap_bsky_hide_did_set_clear_cache($ownerUserId);
 }
 
 /**
