@@ -13,6 +13,11 @@
 //! (WebLN in the browser, or a QR code / `lightning:` link). VAAK never holds
 //! a key, a wallet secret or any money.
 //!
+//! Paid yet? `publish` keeps a short-lived watch on each invoice (Redis,
+//! act::zap_status). The pay panel asks until it hears yes: from the
+//! provider's LUD-21 `verify` URL when it gave one, otherwise from the
+//! provider-signed receipt for that exact invoice on the receipt relays.
+//!
 //! Receiving: once paid, the provider publishes a kind 9735 receipt that
 //! tags the recipient. `notif` reads those for linked keys. A receipt counts
 //! only when the recipient's provider signed it (its LNURL `nostrPubkey`),
@@ -308,7 +313,15 @@ pub async fn fetch_pay_info(pay_url: &str) -> Result<PayInfo> {
 
 /// Ask the provider for an invoice for `request` (a signed 9734). The
 /// invoice must be for exactly `msats`.
-pub async fn fetch_invoice(callback: &str, msats: i64, request: &Event, pay_url: &str) -> Result<String> {
+/// What a provider's callback answered: the invoice, and its LUD-21
+/// `verify` URL when the provider offers one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Invoice {
+    pub pr: String,
+    pub verify: Option<String>,
+}
+
+pub async fn fetch_invoice(callback: &str, msats: i64, request: &Event, pay_url: &str) -> Result<Invoice> {
     let mut url = reqwest::Url::parse(callback).context("callback")?;
     url.query_pairs_mut()
         .append_pair("amount", &msats.to_string())
@@ -322,7 +335,58 @@ pub async fn fetch_invoice(callback: &str, msats: i64, request: &Event, pay_url:
     if bolt11_msats(&pr) != Some(msats) {
         bail!("the invoice is for a different amount");
     }
-    Ok(pr)
+    let verify = v.get("verify").and_then(Value::as_str).and_then(https_url);
+    Ok(Invoice { pr, verify })
+}
+
+/// A zap invoice the payer's browser waits on, so the pay panel can close
+/// itself once the sats arrive (act::zap_status).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Watch {
+    pub note: String,
+    pub invoice: String,
+    /// The provider key that signs its receipts.
+    pub zap_pubkey: String,
+    pub verify: Option<String>,
+    /// The relays the zap request asked receipts to go to.
+    pub relays: Vec<String>,
+    pub since: i64,
+}
+
+/// A receipt for exactly this invoice, signed by the provider.
+pub fn receipt_pays(ev: &Event, invoice: &str, zap_pubkey: &str) -> bool {
+    ev.kind == RECEIPT_KIND
+        && !zap_pubkey.is_empty()
+        && ev.pubkey == zap_pubkey
+        && first_tag(ev, "bolt11").is_some_and(|b| b.trim().eq_ignore_ascii_case(invoice.trim()))
+        && ev.verify().is_ok()
+}
+
+const WATCH_RELAYS: usize = 4;
+const WATCH_DEADLINE: Duration = Duration::from_secs(5);
+
+/// Whether the watched invoice was paid: the provider's LUD-21 verify URL
+/// says settled, or its receipt for this invoice is on a receipt relay.
+pub async fn watch_paid(w: &Watch) -> bool {
+    if let Some(url) = w.verify.as_deref().and_then(|v| reqwest::Url::parse(v).ok()) {
+        if let Ok(ans) = get_json(&url).await {
+            if ans.get("settled").and_then(Value::as_bool) == Some(true) {
+                return true;
+            }
+        }
+    }
+    if w.zap_pubkey.is_empty() || w.relays.is_empty() {
+        return false;
+    }
+    let deadline = tokio::time::Instant::now() + WATCH_DEADLINE;
+    let queries = [super::relay::Query::zap_receipts(&w.note, w.since - 120)];
+    let fetches = w.relays.iter().take(WATCH_RELAYS).map(|r| super::relay::fetch(r, &queries, deadline));
+    futures_util::future::join_all(fetches)
+        .await
+        .into_iter()
+        .flatten()
+        .flat_map(|r| r.events)
+        .any(|ev| receipt_pays(&ev, &w.invoice, &w.zap_pubkey))
 }
 
 pub async fn ready(db: &Client) -> bool {
@@ -431,6 +495,21 @@ pub async fn sats_by_note(db: &Client, owner: i64, notes: &[String]) -> std::col
 mod tests {
     use super::*;
     use crate::nostr::event::tests::signed;
+
+    #[test]
+    fn a_watched_invoice_is_paid_only_by_its_providers_receipt() {
+        let provider = signed(9, 100, RECEIPT_KIND, vec![vec!["bolt11".into(), "LNBC210N1ABC".into()]], "");
+        let key = provider.pubkey.clone();
+        assert!(receipt_pays(&provider, "lnbc210n1abc", &key), "same invoice, any case");
+        assert!(!receipt_pays(&provider, "lnbc210n1other", &key), "another invoice");
+        assert!(!receipt_pays(&provider, "lnbc210n1abc", &"aa".repeat(32)), "signed by someone else");
+        assert!(!receipt_pays(&provider, "lnbc210n1abc", ""), "no provider key");
+        let mut forged = provider.clone();
+        forged.tags = vec![vec!["bolt11".into(), "lnbc210n1zzz".into()]];
+        assert!(!receipt_pays(&forged, "lnbc210n1zzz", &key), "tampered receipt");
+        let note = signed(9, 100, 1, vec![vec!["bolt11".into(), "lnbc210n1abc".into()]], "");
+        assert!(!receipt_pays(&note, "lnbc210n1abc", &key), "not a receipt");
+    }
 
     #[test]
     fn lightning_addresses_become_pay_urls() {

@@ -150,6 +150,8 @@ pub struct Query {
     pub ids: Vec<String>,
     /// Set for a `#p` lookup: events from anyone that tag this key.
     pub tagged: String,
+    /// Set for an `#e` lookup: events from anyone that tag this note.
+    pub note: String,
 }
 
 impl Query {
@@ -158,7 +160,7 @@ impl Query {
         if let Some(since) = since {
             filter["since"] = json!(since);
         }
-        Self { filter, authors, kinds, ids: Vec::new(), tagged: String::new() }
+        Self { filter, authors, kinds, ids: Vec::new(), tagged: String::new(), note: String::new() }
     }
 
     /// Only events at or before `until` (paging back through history).
@@ -170,16 +172,27 @@ impl Query {
     /// Events of `kinds` from anyone that tag `pubkey` (notifications).
     pub fn tagging(pubkey: &str, kinds: Vec<i64>, since: i64, limit: i64) -> Self {
         let filter = json!({"#p": [pubkey], "kinds": kinds, "since": since, "limit": limit});
-        Self { filter, authors: Vec::new(), kinds, ids: Vec::new(), tagged: pubkey.to_string() }
+        Self { filter, authors: Vec::new(), kinds, ids: Vec::new(), tagged: pubkey.to_string(), note: String::new() }
     }
 
     /// Fetch these events by id (reposted notes VAAK hasn't stored).
     pub fn by_ids(ids: Vec<String>, kinds: Vec<i64>) -> Self {
         let filter = json!({"ids": ids, "kinds": kinds, "limit": ids.len().max(1)});
-        Self { filter, authors: Vec::new(), kinds, ids, tagged: String::new() }
+        Self { filter, authors: Vec::new(), kinds, ids, tagged: String::new(), note: String::new() }
+    }
+
+    /// Zap receipts (kind 9735) for `note`, from anyone.
+    pub fn zap_receipts(note: &str, since: i64) -> Self {
+        let kinds = vec![9735];
+        let filter = json!({"#e": [note], "kinds": kinds, "since": since, "limit": 50});
+        Self { filter, authors: Vec::new(), kinds, ids: Vec::new(), tagged: String::new(), note: note.to_string() }
     }
 
     fn wants(&self, ev: &Event) -> bool {
+        if !self.note.is_empty() {
+            return self.kinds.contains(&ev.kind)
+                && ev.tags.iter().any(|t| t.first().map(String::as_str) == Some("e") && t.get(1) == Some(&self.note));
+        }
         if !self.tagged.is_empty() {
             return self.kinds.contains(&ev.kind)
                 && ev.tags.iter().any(|t| t.first().map(String::as_str) == Some("p") && t.get(1) == Some(&self.tagged));

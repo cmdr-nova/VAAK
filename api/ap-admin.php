@@ -1085,7 +1085,7 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
     // Nostr like/reply/follow from Home cards: JSON in and out, signed by the
     // browser's signer extension (ap_nostr_action, nostr/act.rs).
     $nostrModeration = in_array($action, ['nostr_hide', 'nostr_unhide', 'nostr_block', 'nostr_unblock'], true);
-    if ($action === 'nostr_prepare' || $action === 'nostr_publish' || $action === 'nostr_bunker_sign' || $nostrModeration) {
+    if ($action === 'nostr_prepare' || $action === 'nostr_publish' || $action === 'nostr_bunker_sign' || $action === 'nostr_zap_status' || $nostrModeration) {
         require_once __DIR__ . '/ap-nostr.php';
         $nostrReply = $nostrModeration
             ? ap_nostr_moderation_action($action, (int) admin_owner_user_id(), !empty($vaakIsAdmin), $_POST)
@@ -53799,6 +53799,8 @@ if (VIEW === 'analytics') loadAnalytics();
     if (menu) menu.open = false;
     const form = document.createElement('form');
     form.className = 'nostr-report';
+    // In-place JSON work: keeps the page-level Saving… pill away.
+    form.setAttribute('data-ajax-submit', '1');
     const pick = document.createElement('select');
     pick.setAttribute('aria-label', 'Why are you reporting this?');
     REPORT_TYPES.forEach(function (t) {
@@ -53872,13 +53874,39 @@ if (VIEW === 'analytics') loadAnalytics();
     }
   }
 
+  function zapDone(el, sats) {
+    const done = document.createElement('div');
+    done.className = 'meta nostr-reply-done';
+    done.textContent = '⚡ Zapped ' + satsText(sats) + '.';
+    el.replaceWith(done);
+  }
+
+  // Ask VAAK whether the invoice was paid (the provider's verify URL or its
+  // zap receipt on Nostr) until it is, the panel is closed, or 10 minutes
+  // pass. One question at a time; a hidden tab doesn't ask.
+  async function watchPaid(panel, watch, sats) {
+    const until = Date.now() + 10 * 60 * 1000;
+    let wait = 3000;
+    while (panel.isConnected && Date.now() < until) {
+      await new Promise(function (r) { setTimeout(r, wait); });
+      wait = Math.min(wait + 1000, 8000);
+      if (!panel.isConnected) return;
+      if (document.hidden) continue;
+      const res = await post({ action: 'nostr_zap_status', watch: watch });
+      if (!panel.isConnected) return;
+      if (res && res.ok && res.paid) { zapDone(panel, sats); return; }
+      if (res && res.expired) return;
+    }
+  }
+
   async function showInvoice(form, res) {
     const invoice = String(res.invoice || '');
     const panel = document.createElement('div');
     panel.className = 'nostr-zap-pay';
     const head = document.createElement('div');
     head.className = 'meta';
-    head.textContent = 'Pay ' + satsText(res.sats) + ' with any Lightning wallet. The zap shows on Nostr once it is paid.';
+    head.textContent = 'Pay ' + satsText(res.sats) + ' with any Lightning wallet. The zap shows on Nostr once it is paid'
+      + (res.watch ? ', and this closes by itself.' : '.');
     const qrBox = document.createElement('div');
     qrBox.className = 'nostr-zap-qr';
     qrBox.hidden = true;
@@ -53903,6 +53931,7 @@ if (VIEW === 'analytics') loadAnalytics();
     row.append(open, copy, close);
     panel.append(head, qrBox, row);
     form.replaceWith(panel);
+    if (res.watch) watchPaid(panel, String(res.watch), res.sats);
     if (await loadQr()) {
       try {
         const qr = window.qrcode(0, 'L');
@@ -53921,6 +53950,8 @@ if (VIEW === 'analytics') loadAnalytics();
     if (open) { open.remove(); return; }
     const form = document.createElement('form');
     form.className = 'nostr-zap';
+    // In-place JSON work: keeps the page-level Saving… pill away.
+    form.setAttribute('data-ajax-submit', '1');
     const amounts = document.createElement('div');
     amounts.className = 'nostr-zap-row';
     const custom = document.createElement('input');
@@ -53976,10 +54007,7 @@ if (VIEW === 'analytics') loadAnalytics();
       send.disabled = false;
       if (!res || !res.invoice) return;
       if (await payWithWebln(String(res.invoice))) {
-        const done = document.createElement('div');
-        done.className = 'meta nostr-reply-done';
-        done.textContent = '⚡ Zapped ' + satsText(res.sats) + '.';
-        form.replaceWith(done);
+        zapDone(form, res.sats);
         return;
       }
       await showInvoice(form, res);
@@ -54015,6 +54043,8 @@ if (VIEW === 'analytics') loadAnalytics();
     const quote = mode === 'quote';
     const form = document.createElement('form');
     form.className = 'nostr-reply';
+    // In-place JSON work: keeps the page-level Saving… pill away.
+    form.setAttribute('data-ajax-submit', '1');
     form.dataset.mode = mode;
     const box = document.createElement('textarea');
     box.rows = 3;

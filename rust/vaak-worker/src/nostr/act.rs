@@ -70,6 +70,9 @@ pub struct ZapPlan {
     /// For a Lightning address edit: whether that wallet takes Nostr zaps.
     #[serde(default)]
     pub allows_nostr: bool,
+    /// The provider key that signs its receipts (a zap's pay panel watch).
+    #[serde(default)]
+    pub zap_pubkey: String,
 }
 
 /// What the zap picker sent: an amount and an optional comment.
@@ -89,6 +92,13 @@ fn refuse(message: &str) -> Result<Value> {
 
 pub(super) fn pending_key(owner: i64, nonce: &str) -> String {
     format!("vaak:nostr:pending:{owner}:{nonce}")
+}
+
+/// How long a zap's pay panel can ask whether its invoice was paid.
+const ZAP_WATCH_TTL_SECS: u64 = 900;
+
+fn zap_watch_key(owner: i64, watch: &str) -> String {
+    format!("vaak:nostr:zapwatch:{owner}:{watch}")
 }
 
 fn tag(parts: &[&str]) -> Vec<String> {
@@ -621,7 +631,7 @@ pub async fn prepare(
                 };
                 match super::zap::fetch_pay_info(&pay_url).await {
                     Ok(info) => {
-                        plan = Some(ZapPlan { pay_url, callback: info.callback, msats: 0, allows_nostr: info.allows_nostr });
+                        plan = Some(ZapPlan { pay_url, callback: info.callback, msats: 0, allows_nostr: info.allows_nostr, zap_pubkey: String::new() });
                     }
                     Err(e) => {
                         tracing::info!(owner, error = %format!("{e:#}"), "nostr lightning address check failed");
@@ -776,8 +786,28 @@ async fn zap_pending(
         suffix: None,
         base: None,
         relays: receipt_relays,
-        zap: Some(ZapPlan { pay_url, callback: info.callback, msats, allows_nostr: true }),
+        zap: Some(ZapPlan { pay_url, callback: info.callback, msats, allows_nostr: true, zap_pubkey: info.zap_pubkey }),
     }))
+}
+
+/// The pay panel asking whether its zap invoice was paid yet. A paid watch
+/// is dropped, so a second answer is `expired` (the panel already closed).
+pub async fn zap_status(cfg: &Config, owner: i64, watch: &str) -> Result<Value> {
+    let watch: String = watch.chars().filter(char::is_ascii_hexdigit).take(32).collect();
+    if watch.len() != 32 {
+        return refuse("Unknown zap.");
+    }
+    let mut redis = crate::redis_util::connect(&cfg.redis_url).await?;
+    let key = zap_watch_key(owner, &watch);
+    let raw: Option<String> = redis::cmd("GET").arg(&key).query_async(&mut redis).await.context("zap watch read")?;
+    let Some(w) = raw.and_then(|r| serde_json::from_str::<super::zap::Watch>(&r).ok()) else {
+        return Ok(json!({"ok": true, "paid": false, "expired": true}));
+    };
+    let paid = super::zap::watch_paid(&w).await;
+    if paid {
+        let _: redis::RedisResult<()> = redis::cmd("DEL").arg(&key).query_async(&mut redis).await;
+    }
+    Ok(json!({"ok": true, "paid": paid}))
 }
 
 pub async fn publish(cfg: &Config, owner: i64, nonce: &str, signed: &Value) -> Result<Value> {
@@ -810,8 +840,38 @@ pub async fn publish(cfg: &Config, owner: i64, nonce: &str, signed: &Value) -> R
     if let Some(plan) = pending.zap.as_ref().filter(|_| pending.purpose == "zap") {
         return match super::zap::fetch_invoice(&plan.callback, plan.msats, &ev, &plan.pay_url).await {
             Ok(invoice) => {
-                tracing::info!(owner, sats = plan.msats / 1000, "nostr zap invoice");
-                Ok(json!({"ok": true, "purpose": "zap", "target": pending.target, "invoice": invoice, "sats": plan.msats / 1000}))
+                tracing::info!(owner, sats = plan.msats / 1000, verify = invoice.verify.is_some(), "nostr zap invoice");
+                let receipt_relays: Vec<String> = ev
+                    .tags
+                    .iter()
+                    .find(|t| t.first().map(String::as_str) == Some("relays"))
+                    .map(|t| t.iter().skip(1).cloned().collect())
+                    .unwrap_or_default();
+                let watch = super::zap::Watch {
+                    note: pending.target.clone(),
+                    invoice: invoice.pr.clone(),
+                    zap_pubkey: plan.zap_pubkey.clone(),
+                    verify: invoice.verify.clone(),
+                    relays: receipt_relays,
+                    since: now,
+                };
+                let token = uuid::Uuid::new_v4().simple().to_string();
+                let stored: redis::RedisResult<()> = redis::cmd("SET")
+                    .arg(zap_watch_key(owner, &token))
+                    .arg(serde_json::to_string(&watch)?)
+                    .arg("EX")
+                    .arg(ZAP_WATCH_TTL_SECS)
+                    .query_async(&mut redis)
+                    .await;
+                let can_watch = stored.is_ok() && (watch.verify.is_some() || !watch.zap_pubkey.is_empty());
+                Ok(json!({
+                    "ok": true,
+                    "purpose": "zap",
+                    "target": pending.target,
+                    "invoice": invoice.pr,
+                    "sats": plan.msats / 1000,
+                    "watch": if can_watch { token } else { String::new() },
+                }))
             }
             Err(e) => {
                 let why: String = format!("{e:#}").chars().take(200).collect();
