@@ -12,6 +12,15 @@ anything else bumps the patch number.
 Releases up to **0.9.83** used a two-digit deploy counter (0.9.05, 0.9.83)
 and have no notes here; their tags and GitHub Releases are unchanged.
 
+## [0.13.0](https://github.com/cmdr-nova/VAAK/releases/tag/v0.13.0) - 2026-11-02
+
+### ✨ Features
+* Keep the selected Home feed chip in view by @cmdr-nova in https://github.com/cmdr-nova/VAAK/pull/334
+* Open and edit Library > Feeds without a page reload by @cmdr-nova in https://github.com/cmdr-nova/VAAK/pull/335
+* Switch DM conversations and actions without a page load by @cmdr-nova in https://github.com/cmdr-nova/VAAK/pull/336
+
+**Full Changelog**: https://github.com/cmdr-nova/VAAK/compare/v0.12.0...v0.13.0
+
 ## [0.12.0](https://github.com/cmdr-nova/VAAK/releases/tag/v0.12.0) - 2026-11-02
 
 ### ✨ Features
