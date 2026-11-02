@@ -2203,23 +2203,42 @@ function ap_inbox_spool_process(array $row): array
         return ['state' => 'dropped', 'result' => 'actor_mismatch'];
     }
     if (!ap_inbox_actor_matches_key($keyId, $claimedActor)) {
-        // Only an accepted relay's forwarded Create or Announce, as in ap_inbox_main.
+        // Same three outcomes as ap_inbox_main: an accepted relay's or a
+        // followed account's forwarded Create/Announce, else the actor's own
+        // copy from its server, else dropped (PHP answered 401).
         if (!function_exists('ap_relay_is_accepted_key')) {
             require_once __DIR__ . '/ap-relays.php';
         }
-        $relayOk = in_array($type, ['Create', 'Announce'], true)
-            && function_exists('ap_relay_is_accepted_key') && ap_relay_is_accepted_key($keyId);
-        if (!$relayOk) {
-            return ['state' => 'dropped', 'result' => 'actor_mismatch'];
-        }
-        ap_log(sprintf('relay_forward via=rust_spool type=%s keyId=%s actor=%s', $type, ap_short($keyId), ap_short($claimedActor)));
-        // The relay vouches for delivery, not for the post.
-        if ($type === 'Create') {
-            $refetched = ap_inbox_refetch_forwarded_create($json);
-            if ($refetched === null) {
-                return ['state' => 'dropped', 'result' => 'forward_dropped'];
+        $forwardable = in_array($type, ['Create', 'Announce'], true);
+        $relayOk = $forwardable && function_exists('ap_relay_is_accepted_key') && ap_relay_is_accepted_key($keyId);
+        $followFwd = $forwardable && !$relayOk && ap_inbox_signer_is_followed($keyId);
+        if ($relayOk || $followFwd) {
+            ap_log(sprintf(
+                '%s via=rust_spool type=%s keyId=%s actor=%s',
+                $relayOk ? 'relay_forward' : 'follow_forward',
+                $type,
+                ap_short($keyId),
+                ap_short($claimedActor)
+            ));
+            // The forwarder vouches for delivery, not for the post.
+            if ($type === 'Create') {
+                $refetched = ap_inbox_refetch_forwarded_create($json);
+                if ($refetched === null) {
+                    return ['state' => 'dropped', 'result' => 'forward_dropped'];
+                }
+                $json = $refetched;
             }
-            $json = $refetched;
+        } else {
+            $recovered = ap_inbox_recover_unverified($json);
+            if ($recovered === null) {
+                ap_log(sprintf('actor_key_mismatch via=rust_spool type=%s keyId=%s actor=%s', $type, ap_short($keyId), ap_short($claimedActor)));
+                return ['state' => 'dropped', 'result' => 'actor_mismatch'];
+            }
+            $json = $recovered;
+            if (isset($json['type']) && is_string($json['type'])) {
+                $type = preg_replace('/[^A-Za-z0-9._-]/', '', $json['type']) ?: 'unknown';
+            }
+            ap_log(sprintf('origin_accept reason=actor_mismatch via=rust_spool type=%s keyId=%s actor=%s', $type, ap_short($keyId), ap_short($claimedActor)));
         }
     }
     ap_log(sprintf(
