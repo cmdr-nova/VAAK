@@ -53,7 +53,7 @@ function ap_bsky_xrpc(string $base, string $nsid, string $method = 'GET', ?array
 reference_load($api . '/ap-bsky.php', [
     'ap_bsky_budget_begin', 'ap_bsky_budget_clear', 'ap_bsky_budget_remaining', 'ap_bsky_budget_exceeded', 'ap_bsky_effective_timeout',
     'ap_bsky_is_profile_ref', 'ap_bsky_get_profile', 'ap_bsky_actor_refresh_migrate', 'ap_bsky_actor_profile_cache_get',
-    'ap_bsky_actor_profile_cache_upsert', 'ap_bsky_get_author_feed', 'ap_bsky_actor_profile_cold_fill',
+    'ap_bsky_actor_profile_cache_upsert', 'ap_bsky_get_author_feed', 'ap_bsky_actor_profile_cold_fill', 'ap_bsky_actor_viewer_cache_update',
 ]);
 
 $checks = 0;
@@ -103,6 +103,17 @@ ap_bsky_actor_profile_cold_fill(1, 'https://bsky.app/profile/outer.test', false)
 cold_check(($GLOBALS['ap_bsky_budget_deadline'] ?? null) === $outer, 'outer budget restored');
 cold_check(max(array_column($GLOBALS['calls'], 'timeout')) <= 2, 'outer budget caps the fill');
 unset($GLOBALS['ap_bsky_budget_deadline']);
+
+// A follow made later updates the handle-keyed viewer row too, and clears
+// the owner's Redis profile cache, so the profile page shows Following.
+$GLOBALS['profile_reply'] = ['ok' => true, 'json' => ['did' => 'did:plc:later', 'handle' => 'later.test', 'viewer' => []]];
+$laterRef = 'https://bsky.app/profile/later.test';
+ap_bsky_actor_profile_cold_fill(1, $laterRef, false);
+cold_check((ap_bsky_actor_profile_cache_get($laterRef, 1)['viewer']['following'] ?? '') === '', 'not following before');
+ap_bsky_actor_viewer_cache_update(1, 'did:plc:later', 'at://did:plc:owner/app.bsky.graph.follow/y');
+cold_check((ap_bsky_actor_profile_cache_get($laterRef, 1)['viewer']['following'] ?? '') === 'at://did:plc:owner/app.bsky.graph.follow/y', 'handle-keyed viewer row follows after a follow');
+ap_bsky_actor_viewer_cache_update(1, 'did:plc:later', null);
+cold_check((ap_bsky_actor_profile_cache_get($laterRef, 1)['viewer']['following'] ?? '') === '', 'unfollow clears it again');
 
 // Kill switch and non-Bluesky refs.
 $GLOBALS['calls'] = [];

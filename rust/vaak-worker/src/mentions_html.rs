@@ -564,7 +564,24 @@ async fn load_viewer_follows_on(
             None
         }
     };
-    let (ap_rows, graph_rows, viewer_rows) = tokio::join!(ap_follows, graph, viewers);
+    // Bluesky follow notifications name the follower by handle URL
+    // (https://bsky.app/profile/<handle>), while the graph only stores DIDs.
+    // Map followed DIDs to their cached handles so Follow back hides.
+    let handles = async {
+        if owner_user_id > 0 {
+            db.query(
+                "SELECT p.profile_json::jsonb->>'handle' FROM bsky_graph_sync g \
+                 JOIN bsky_actor_profiles p ON p.actor_ref = g.target_did \
+                 WHERE g.owner_user_id = $1 AND g.kind = 'follow'",
+                &[&owner_user_id],
+            )
+            .await
+            .ok()
+        } else {
+            None
+        }
+    };
+    let (ap_rows, graph_rows, viewer_rows, handle_rows) = tokio::join!(ap_follows, graph, viewers, handles);
     if let Some(rows) = ap_rows {
         for row in rows {
             let aid: String = row
@@ -595,7 +612,30 @@ async fn load_viewer_follows_on(
             remember_follow(&mut set, &actor_ref);
         }
     }
+    if let Some(rows) = handle_rows {
+        for row in rows {
+            let handle: String = row
+                .try_get::<_, Option<String>>(0)
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            remember_bsky_handle(&mut set, &handle);
+        }
+    }
     set
+}
+
+/// A followed Bluesky account's handle, as the profile URL follow events use.
+fn remember_bsky_handle(set: &mut HashSet<String>, handle: &str) {
+    let handle = handle.trim().trim_start_matches('@');
+    if handle.is_empty()
+        || handle.starts_with("did:")
+        || !handle.contains('.')
+        || !handle.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+    {
+        return;
+    }
+    remember_follow(set, &format!("https://bsky.app/profile/{handle}"));
 }
 
 fn paint_notif_card(n: &Value, viewer_actor: &str) -> String {
