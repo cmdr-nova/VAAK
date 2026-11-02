@@ -9499,6 +9499,76 @@ function ap_dm_build_activity(
 }
 
 /**
+ * The VAAK account a DM is addressed to, when it lives on this server.
+ * null = remote actor (deliver over ActivityPub); false = a local account that
+ * cannot receive (disabled or missing).
+ *
+ * @return array{id:int,actor_id:string}|false|null
+ */
+function ap_dm_local_recipient(string $peer): array|false|null
+{
+    $peer = rtrim(trim($peer), '/');
+    if (!preg_match('#^https://mkultra\.monster/users/[A-Za-z0-9_]+$#', $peer)) {
+        return null;
+    }
+    try {
+        $st = ap_db()->prepare('SELECT id, actor_id, disabled_at FROM ap_users WHERE actor_id = ? OR actor_id = ? LIMIT 1');
+        $st->execute([$peer, $peer . '/']);
+        $row = $st->fetch();
+    } catch (Throwable $e) {
+        error_log('[ap-dm] local recipient lookup: ' . $e->getMessage());
+        return false;
+    }
+    if (!is_array($row)) {
+        // A local-looking URL with no account (e.g. the legacy site actor):
+        // let the normal federation path decide.
+        return null;
+    }
+    if (!empty($row['disabled_at']) || (int) ($row['id'] ?? 0) < 1) {
+        return false;
+    }
+    return ['id' => (int) $row['id'], 'actor_id' => rtrim((string) $row['actor_id'], '/')];
+}
+
+/**
+ * Store the recipient's copy of a local-to-local DM. A recipient who blocked
+ * the sender silently gets nothing, the same as a remote server dropping it.
+ *
+ * @param array{id:int,actor_id:string} $recipient
+ * @param array<string,mixed> $message
+ */
+function ap_dm_deliver_local(array $recipient, string $senderActorId, array $message): bool
+{
+    $recipientId = (int) ($recipient['id'] ?? 0);
+    $senderActorId = rtrim($senderActorId, '/');
+    if ($recipientId < 1 || $senderActorId === '') {
+        return false;
+    }
+    if (function_exists('ap_user_block_find') && ap_user_block_find($senderActorId, null, $recipientId) !== null) {
+        ap_log('dm_send local dropped: recipient blocks sender');
+        return true;
+    }
+    $res = ap_dm_store([
+        'activity_id' => (string) ($message['activity_id'] ?? ''),
+        'object_id' => (string) ($message['object_id'] ?? ''),
+        'peer_actor_id' => $senderActorId,
+        'direction' => 'in',
+        'content' => $message['content'] ?? null,
+        'in_reply_to' => $message['in_reply_to'] ?? null,
+        'media_urls' => $message['media_urls'] ?? [],
+        'attachments' => $message['attachments'] ?? null,
+        'created_at' => (string) ($message['created_at'] ?? gmdate('c')),
+        'owner_user_id' => $recipientId,
+        'owner_actor_id' => (string) ($recipient['actor_id'] ?? ''),
+    ]);
+    if (empty($res['ok'])) {
+        error_log('[ap-dm] local delivery: ' . (string) ($res['error'] ?? 'store failed'));
+        return false;
+    }
+    return true;
+}
+
+/**
  * Send a direct message (no public audience). Stored only in direct_messages.
  * Media stays unattached to any status so it is not listed on a profile.
  *
@@ -9559,16 +9629,25 @@ function ap_dm_send(
         return ['ok' => false, 'error' => 'DM rate limit reached — try again later'];
     }
 
-    $doc = ap_fetch_actor_doc($peer);
-    if (!is_array($doc)) {
-        return ['ok' => false, 'error' => 'Could not fetch recipient actor'];
+    // A VAAK account on this server gets the message straight into its own
+    // inbox table: no signed HTTP round trip to ourselves, no federation.
+    $localPeerUser = ap_dm_local_recipient($peer);
+    if ($localPeerUser === false) {
+        return ['ok' => false, 'error' => 'That account is not accepting messages'];
     }
-    $inbox = ap_resolve_personal_inbox_from_actor_doc($doc) ?: ap_resolve_inbox_from_actor_doc($doc);
-    if (!$inbox || !str_starts_with($inbox, 'https://')) {
-        return ['ok' => false, 'error' => 'Recipient has no inbox'];
-    }
-    if (ap_is_blocked_inbox($inbox)) {
-        return ['ok' => false, 'error' => 'Recipient inbox is blocked'];
+    $inbox = '';
+    if ($localPeerUser === null) {
+        $doc = ap_fetch_actor_doc($peer);
+        if (!is_array($doc)) {
+            return ['ok' => false, 'error' => 'Could not fetch recipient actor'];
+        }
+        $inbox = ap_resolve_personal_inbox_from_actor_doc($doc) ?: ap_resolve_inbox_from_actor_doc($doc);
+        if (!$inbox || !str_starts_with($inbox, 'https://')) {
+            return ['ok' => false, 'error' => 'Recipient has no inbox'];
+        }
+        if (ap_is_blocked_inbox($inbox)) {
+            return ['ok' => false, 'error' => 'Recipient inbox is blocked'];
+        }
     }
 
     $rows = [];
@@ -9654,8 +9733,21 @@ function ap_dm_send(
         return ['ok' => false, 'error' => $stored['error'] ?? 'Could not store DM'];
     }
 
-    $delivered = ap_deliver_signed_json($inbox, $create, ap_local_key_id(), ap_local_priv_path(), 8.0) ? 1 : 0;
-    ap_log('dm_send peer=' . ap_short($peer) . " note=$noteId delivered=$delivered");
+    if (is_array($localPeerUser)) {
+        $delivered = ap_dm_deliver_local($localPeerUser, $actor, [
+            'activity_id' => $createId,
+            'object_id' => $noteId,
+            'content' => $content,
+            'in_reply_to' => $inReplyTo !== '' ? $inReplyTo : null,
+            'media_urls' => $mediaUrls,
+            'attachments' => $storedAttachments,
+            'created_at' => $published,
+        ]) ? 1 : 0;
+        ap_log('dm_send local peer=' . ap_short($peer) . " note=$noteId delivered=$delivered");
+    } else {
+        $delivered = ap_deliver_signed_json($inbox, $create, ap_local_key_id(), ap_local_priv_path(), 8.0) ? 1 : 0;
+        ap_log('dm_send peer=' . ap_short($peer) . " note=$noteId delivered=$delivered");
+    }
 
     return [
         'ok' => true,

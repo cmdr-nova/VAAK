@@ -5102,6 +5102,25 @@ $vaakAdminOnlyActions = [
                 $error = $res['error'] ?? 'DM failed.';
             }
         }
+        // The DM screen sends with fetch and appends the message itself.
+        if (($_SERVER['HTTP_X_VAAK_DM'] ?? '') === '1') {
+            header('Content-Type: application/json; charset=utf-8');
+            header('Cache-Control: no-store');
+            if ($error !== null && $error !== '') {
+                http_response_code(422);
+                echo json_encode(['ok' => false, 'error' => (string) $error], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+            } else {
+                $sentPeer = (string) ($res['peer'] ?? $to);
+                echo json_encode([
+                    'ok' => true,
+                    'id' => (int) ($res['id'] ?? 0),
+                    'peer' => $sentPeer,
+                    'delivered' => (int) ($res['delivered'] ?? 0),
+                    'href' => '?view=dms&peer=' . rawurlencode($sentPeer),
+                ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+            }
+            exit;
+        }
     } elseif ($action === 'dm_mark_read') {
         $view = 'dms';
         $peer = trim((string) ($_POST['peer'] ?? ''));
@@ -6893,6 +6912,64 @@ if (isset($_GET['partial'], $_GET['shell'])
         . admin_scroll_loading_html() . '</div></div>';
     echo '</div>';
     echo '<button type="button" class="feed-top-btn" id="feed-top-btn" title="Back to top" aria-label="Back to top">↑</button>';
+    exit;
+}
+
+// DM screen: new rows for the open thread (polled only while that screen is
+// open and visible), the conversation rail, and the "New message" picker.
+if (isset($_GET['ajax']) && in_array((string) $_GET['ajax'], ['dm_thread', 'dm_list', 'dm_people'], true)) {
+    $dmAjax = (string) $_GET['ajax'];
+    $dmMarkRead = $dmAjax === 'dm_thread' && (string) ($_GET['read'] ?? '') === '1';
+    // Read-only for the session: release its lock so polls never queue
+    // behind a slow page load in another tab.
+    if (function_exists('ap_auth_session_write_close')) {
+        ap_auth_session_write_close();
+    } elseif (session_status() === PHP_SESSION_ACTIVE) {
+        session_write_close();
+    }
+    header('Content-Type: application/json; charset=utf-8');
+    header('Cache-Control: no-store');
+    if (!empty($GLOBALS['vaak_guest_profile']) || admin_owner_user_id() < 1) {
+        http_response_code(401);
+        echo json_encode(['ok' => false, 'error' => 'Sign in to read messages.']);
+        exit;
+    }
+    $dmOut = ['ok' => true];
+    try {
+        if ($dmAjax === 'dm_people') {
+            $dmOut['people'] = admin_dm_people_search((string) ($_GET['q'] ?? ''), 8);
+        } elseif ($dmAjax === 'dm_list') {
+            $dmActive = rtrim(trim((string) ($_GET['peer'] ?? '')), '/');
+            $dmOut['html'] = admin_dm_conversation_list_html(ap_dm_conversations(60), $dmActive);
+            $dmOut['unread'] = ap_dm_unread_count();
+        } else {
+            $dmPeerAjax = rtrim(trim((string) ($_GET['peer'] ?? '')), '/');
+            $dmAfter = max(0, (int) ($_GET['after'] ?? 0));
+            if ($dmPeerAjax === '' || !str_starts_with($dmPeerAjax, 'https://')) {
+                http_response_code(400);
+                $dmOut = ['ok' => false, 'error' => 'Missing conversation'];
+            } else {
+                $dmRows = ap_dm_thread_after($dmPeerAjax, $dmAfter, 50);
+                $dmLastId = $dmAfter;
+                foreach ($dmRows as $dmRow) {
+                    $dmLastId = max($dmLastId, (int) ($dmRow['id'] ?? 0));
+                }
+                $dmOut['html'] = $dmRows !== []
+                    ? admin_dm_message_rows_html($dmRows, admin_dm_reply_contexts_html($dmRows, 'dms'))
+                    : '';
+                $dmOut['last_id'] = $dmLastId;
+                $dmOut['count'] = count($dmRows);
+                if ($dmMarkRead && $dmRows !== []) {
+                    ap_dm_mark_peer_read($dmPeerAjax);
+                }
+            }
+        }
+    } catch (Throwable $e) {
+        error_log('[ap-admin] dm ajax ' . $dmAjax . ': ' . $e->getMessage());
+        http_response_code(500);
+        $dmOut = ['ok' => false, 'error' => 'Messages are busy, try again in a moment.'];
+    }
+    echo json_encode($dmOut, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
     exit;
 }
 
@@ -17175,19 +17252,148 @@ function admin_dm_conversation_list_html(array $conversations, string $activePee
                 ? 'Attachment'
                 : 'Media or link';
         }
+        if (($last['direction'] ?? '') === 'out') {
+            $preview = 'You: ' . $preview;
+        }
         $preview = function_exists('mb_strimwidth')
             ? mb_strimwidth($preview, 0, 96, '…', 'UTF-8')
             : substr($preview, 0, 93) . (strlen($preview) > 93 ? '...' : '');
-        $html .= '<a class="dm-conversation-row' . ($peer === $activePeer ? ' is-active' : '') . ($unread > 0 ? ' is-unread' : '') . '" href="?view=dms&amp;peer=' . rawurlencode($peer) . '">';
+        $handle = actor_handle($peer);
+        $search = strtolower(trim(actor_display_name($peer) . ' ' . $handle));
+        $lastAt = (string) ($last['created_at'] ?? '');
+        $html .= '<a class="dm-conversation-row' . ($peer === $activePeer ? ' is-active' : '') . ($unread > 0 ? ' is-unread' : '') . '" href="?view=dms&amp;peer=' . rawurlencode($peer) . '"'
+            . ' data-dm-peer="' . h($peer) . '" data-dm-search="' . h($search) . '"'
+            . ($peer === $activePeer ? ' aria-current="page"' : '') . '>';
         $html .= '<span class="dm-conversation-avatar">' . admin_avatar_img($peer) . '</span>';
-        $html .= '<span class="dm-conversation-copy"><span class="dm-conversation-name">' . actor_display_name_html($peer) . '</span>';
-        $html .= '<span class="dm-conversation-preview">' . h($preview) . '</span></span>';
+        $html .= '<span class="dm-conversation-copy"><span class="dm-conversation-top"><span class="dm-conversation-name">' . actor_display_name_html($peer) . '</span>';
+        if ($lastAt !== '') {
+            $html .= '<time class="dm-conversation-time" datetime="' . h($lastAt) . '">' . h(relative_time($lastAt)) . '</time>';
+        }
+        $html .= '</span><span class="dm-conversation-preview">' . h($preview) . '</span></span>';
         if ($unread > 0) {
             $html .= '<span class="nav-badge dm-conversation-badge">' . ($unread > 99 ? '99+' : (string) $unread) . '</span>';
         }
         $html .= '</a>';
     }
     return $html !== '' ? $html : admin_mascot_empty('No direct messages yet.');
+}
+
+/**
+ * Chat rows for one DM thread, oldest first. The page script groups runs from
+ * the same sender and adds day separators; without it every row keeps its own
+ * avatar and time.
+ *
+ * @param list<array<string,mixed>> $thread chronological rows
+ * @param array<int|string,string> $dmReplyContexts from admin_dm_reply_contexts_html, keyed like $thread
+ */
+function admin_dm_message_rows_html(array $thread, array $dmReplyContexts): string
+{
+    $html = '';
+    foreach ($thread as $dmIndex => $m) {
+        if (!is_array($m)) {
+            continue;
+        }
+        $isOut = ($m['direction'] ?? '') === 'out';
+        $dmReplyContext = $dmReplyContexts[$dmIndex] ?? '';
+        $created = (string) ($m['created_at'] ?? '');
+        $ts = $created !== '' ? strtotime($created) : false;
+        $iso = $ts !== false ? gmdate('c', $ts) : '';
+        $html .= '<div class="dm-msg ' . ($isOut ? 'dm-msg--out' : 'dm-msg--in') . '"'
+            . ' data-dm-id="' . (int) ($m['id'] ?? 0) . '" data-dm-dir="' . ($isOut ? 'out' : 'in') . '"'
+            . ' data-dm-object="' . h((string) ($m['object_id'] ?? '')) . '"'
+            . ($iso !== '' ? ' data-dm-ts="' . h($iso) . '"' : '') . '>';
+        if (!$isOut) {
+            $html .= '<span class="dm-msg-av">' . admin_avatar_img((string) ($m['peer_actor_id'] ?? ''), 'dm-msg-avatar', false) . '</span>';
+        }
+        $html .= '<div class="dm-msg-body">'
+            . $dmReplyContext
+            . admin_dm_thread_message_html($m, $isOut)
+            . '<div class="dm-msg-meta"><time' . ($iso !== '' ? ' datetime="' . h($iso) . '"' : '') . '>'
+            . h(relative_time($created)) . '</time></div>'
+            . '</div></div>';
+    }
+    return $html;
+}
+
+/**
+ * People to start a DM with: your conversations, accounts you follow, and
+ * local users. Bounded and indexed so typing in the picker stays cheap.
+ *
+ * @return list<array{actor_id:string,name:string,handle:string,avatar:string,local:bool}>
+ */
+function admin_dm_people_search(string $q, int $limit = 8): array
+{
+    $q = strtolower(trim(ltrim(trim($q), '@')));
+    if ($q === '' || strlen($q) > 120) {
+        return [];
+    }
+    $limit = max(1, min(12, $limit));
+    $owner = admin_owner_user_id();
+    $self = rtrim(vaak_actor_id(), '/');
+    $like = '%' . strtr($q, ['\\' => '\\\\', '%' => '\%', '_' => '\_']) . '%';
+    $ids = [];
+    $db = ap_db();
+    try {
+        $st = $db->prepare(
+            "SELECT u.actor_id FROM ap_users u
+             WHERE u.disabled_at IS NULL
+               AND (LOWER(u.actor_key) LIKE ? ESCAPE '\\' OR LOWER(u.username) LIKE ? ESCAPE '\\')
+             ORDER BY u.id ASC LIMIT ?"
+        );
+        $st->execute([$like, $like, $limit]);
+        foreach ($st->fetchAll() as $row) {
+            $ids[rtrim((string) ($row['actor_id'] ?? ''), '/')] = true;
+        }
+    } catch (Throwable $e) {
+        error_log('[ap-admin] dm people (local): ' . $e->getMessage());
+    }
+    try {
+        $st = $db->prepare(
+            "SELECT p.actor_id FROM (
+                SELECT peer_actor_id AS actor_id FROM direct_messages
+                 WHERE owner_user_id = ? AND deleted_at IS NULL
+                 GROUP BY peer_actor_id
+                UNION
+                SELECT actor_id FROM following WHERE owner_actor_id = ? OR owner_actor_id = ?
+             ) p
+             LEFT JOIN remote_actors r ON r.actor_id = p.actor_id
+             WHERE LOWER(p.actor_id) LIKE ? ESCAPE '\\'
+                OR LOWER(COALESCE(r.username, '')) LIKE ? ESCAPE '\\'
+                OR LOWER(COALESCE(r.display_name, '')) LIKE ? ESCAPE '\\'
+             LIMIT ?"
+        );
+        $st->execute([$owner, $self, $self . '/', $like, $like, $like, $limit * 2]);
+        foreach ($st->fetchAll() as $row) {
+            $ids[rtrim((string) ($row['actor_id'] ?? ''), '/')] = true;
+        }
+    } catch (Throwable $e) {
+        error_log('[ap-admin] dm people (remote): ' . $e->getMessage());
+    }
+    $out = [];
+    foreach (array_keys($ids) as $actorId) {
+        if ($actorId === '' || $actorId === $self || !str_starts_with($actorId, 'https://')) {
+            continue;
+        }
+        $lower = strtolower($actorId);
+        // Bluesky accounts are not reachable over ActivityPub DMs.
+        if (str_contains($lower, 'bsky.app') || str_starts_with($lower, 'https://bsky.') || str_contains($lower, 'bsky.brid.gy')) {
+            continue;
+        }
+        if (function_exists('ap_is_blocked_actor') && ap_is_blocked_actor($actorId)) {
+            continue;
+        }
+        $out[] = [
+            'actor_id' => $actorId,
+            'name' => actor_display_name($actorId),
+            'handle' => actor_handle($actorId),
+            'avatar' => admin_avatar_img($actorId, 'dm-pick-avatar', false),
+            'local' => admin_local_actor_key_from_id($actorId) !== null,
+        ];
+        if (count($out) >= $limit) {
+            break;
+        }
+    }
+    return $out;
 }
 
 /**
@@ -28786,9 +28992,13 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     .dm-bubble > :last-child { margin-bottom: 0; }
     .dm-bubble ul,.dm-bubble ol { margin: .4rem 0 .2rem 1.1rem; padding: 0; text-indent: 0; }
     .dm-bubble.dm-out {
-      background: color-mix(in srgb, var(--primary) 8%, transparent);
-      border-color: color-mix(in srgb, var(--primary) 28%, var(--border));
+      background: var(--primary);
+      border-color: var(--primary);
+      color: #0b0b0b;
     }
+    .dm-bubble.dm-out a { color: inherit; }
+    .dm-bubble.dm-out .meta { color: rgba(0,0,0,.62); }
+    .dm-bubble.dm-out .dm-actions { border-top-color: rgba(0,0,0,.25); }
     .dm-bubble.dm-in {
       background: var(--panel-2);
     }
@@ -28874,6 +29084,94 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       padding: 0 .25rem .25rem 0;
     }
     .dm-pane > .composer { margin-bottom: 0; }
+    /* Chat rows: incoming left with avatar, outgoing right. JS adds
+       is-grouped-prev/next so a run from one sender reads as one block. */
+    .dm-thread { gap: 0; padding: .25rem .25rem .5rem 0; }
+    .dm-msg { display: flex; align-items: flex-end; gap: .5rem; max-width: min(78%, 40rem); margin-top: .7rem; }
+    .dm-msg.is-grouped-prev { margin-top: .18rem; }
+    .dm-msg--out { align-self: flex-end; flex-direction: row-reverse; }
+    .dm-msg--in { align-self: flex-start; }
+    .dm-msg-av { flex: 0 0 2rem; width: 2rem; height: 2rem; }
+    .dm-msg-av img { width: 2rem; height: 2rem; border-radius: 50%; object-fit: cover; display: block; }
+    .dm-msg.is-grouped-next .dm-msg-av { visibility: hidden; }
+    .dm-msg-body { min-width: 0; display: flex; flex-direction: column; }
+    .dm-msg--out .dm-msg-body { align-items: flex-end; }
+    .dm-msg--in .dm-msg-body { align-items: flex-start; }
+    .dm-msg .dm-bubble { margin: 0; border-radius: 18px; padding: .55rem .85rem; max-width: 100%; }
+    .dm-msg--out .dm-bubble { border-bottom-right-radius: 6px; }
+    .dm-msg--in .dm-bubble { border-bottom-left-radius: 6px; }
+    .dm-msg--out.is-grouped-next .dm-bubble { border-bottom-right-radius: 18px; border-top-right-radius: 6px; }
+    .dm-msg--in.is-grouped-next .dm-bubble { border-bottom-left-radius: 18px; border-top-left-radius: 6px; }
+    .dm-msg-body .cw-gate, .dm-msg-body .media-row, .dm-msg-body .dm-file-list { max-width: 100%; margin-top: .3rem; }
+    .dm-msg-meta { color: var(--muted); font-size: .72rem; margin: .2rem .35rem 0; font-variant-numeric: tabular-nums; }
+    .dm-msg.is-grouped-next .dm-msg-meta { display: none; }
+    .dm-day {
+      align-self: center; margin: 1rem 0 .2rem; padding: .15rem .65rem; border-radius: 999px;
+      background: var(--panel-2); color: var(--muted); font-size: .74rem; font-weight: 600;
+    }
+    .dm-thread-end { flex: 0 0 1px; }
+    .dm-thread-empty { align-self: center; margin: auto 0; }
+    .dm-jump { align-self: center; margin: -2.75rem auto .5rem; position: relative; z-index: 2; box-shadow: 0 4px 14px rgba(0,0,0,.4); }
+    .dm-jump[hidden] { display: none; }
+    .dm-sidebar { display: flex; flex-direction: column; min-height: 0; }
+    body.dm-fullscreen .dm-sidebar { height: 100%; }
+    .dm-sidebar-head { display: flex; align-items: center; justify-content: space-between; gap: .5rem; padding: .6rem .7rem .6rem .85rem; border-bottom: 1px solid var(--border); }
+    .dm-sidebar-head .dm-sidebar-title { padding: 0; border: 0; display: flex; align-items: center; gap: .4rem; }
+    .dm-sidebar-head .dm-sidebar-title .nav-badge[hidden] { display: none; }
+    .dm-new-btn { padding: .35rem .8rem; font-size: .85rem; white-space: nowrap; }
+    .dm-sidebar-search { padding: .55rem .7rem; border-bottom: 1px solid color-mix(in srgb, var(--border) 60%, transparent); }
+    .dm-sidebar-search input {
+      width: 100%; margin: 0; box-sizing: border-box; background: #0c0c0c; color: var(--text);
+      border: 1px solid var(--border); border-radius: 10px; padding: .5rem .7rem; font: inherit; font-size: .88rem;
+    }
+    .dm-conversation-list { flex: 1 1 auto; min-height: 0; overflow-y: auto; overscroll-behavior: contain; }
+    .dm-conversation-row[hidden] { display: none; }
+    .dm-conversation-top { display: flex; align-items: baseline; justify-content: space-between; gap: .4rem; min-width: 0; }
+    .dm-conversation-time { flex: 0 0 auto; color: var(--muted); font-size: .72rem; font-variant-numeric: tabular-nums; }
+    .dm-conversation-row.is-unread .dm-conversation-name { color: var(--text); }
+    .dm-conversation-row.is-active { box-shadow: inset 3px 0 0 var(--primary); }
+    .dm-filter-empty { padding: .9rem; }
+    .dm-pane-header { display: flex; align-items: center; gap: .6rem; padding-bottom: .65rem; margin-bottom: .25rem; border-bottom: 1px solid var(--border); flex: 0 0 auto; }
+    .dm-pane-title { font-weight: 700; font-size: 1.05rem; }
+    .dm-back { display: none; padding: .3rem .65rem; }
+    .dm-peer { display: flex; align-items: center; gap: .6rem; min-width: 0; flex: 1 1 auto; color: inherit; text-decoration: none; }
+    .dm-peer:hover .who { text-decoration: underline; }
+    .dm-peer img { width: 2.4rem; height: 2.4rem; border-radius: 50%; object-fit: cover; flex: 0 0 2.4rem; }
+    .dm-peer-copy { display: flex; flex-direction: column; min-width: 0; }
+    .dm-peer-copy .who, .dm-peer-copy .meta { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .dm-peer-chip { flex: 0 0 auto; font-size: .72rem; font-weight: 600; padding: .12rem .55rem; border-radius: 999px; background: var(--primary-dim); color: var(--primary); }
+    .dm-pane .dm-reply-form { padding: .6rem 0 0; margin: 0; border: 0; border-top: 1px solid var(--border); border-radius: 0; background: none; box-shadow: none; }
+    .dm-compose-row { display: flex; align-items: flex-end; gap: .45rem; }
+    .dm-reply-form .dm-compose-row textarea {
+      flex: 1 1 auto; width: auto; min-height: 2.6rem; height: 2.6rem; max-height: 180px; margin: 0; resize: none;
+      border-radius: 20px; padding: .6rem .95rem; line-height: 1.4;
+    }
+    .dm-compose-row .btn { flex: 0 0 auto; min-height: 2.6rem; border-radius: 999px; }
+    .dm-extras-toggle { min-width: 2.6rem; font-size: 1.1rem; padding-inline: .7rem; }
+    .dm-extras-toggle.is-active { color: var(--primary); border-color: var(--primary); }
+    .dm-extras { margin-bottom: .45rem; }
+    .dm-extras[hidden] { display: none; }
+    .dm-compose-hint { display: flex; justify-content: space-between; gap: .75rem; flex-wrap: wrap; margin: .35rem .4rem 0; font-size: .74rem; }
+    .dm-form-status.is-error { color: var(--danger, #ff6b6b); }
+    .dm-pane .dm-new-form { display: flex; flex-direction: column; gap: .35rem; padding: .5rem 0 0; margin: 0; border: 0; background: none; box-shadow: none; }
+    .dm-new-form .composer-actions { margin-top: .25rem; }
+    .dm-new-form .dm-extras-toggle { font-size: .85rem; margin-right: auto; }
+    .dm-label { font-weight: 600; font-size: .85rem; margin-top: .35rem; }
+    .dm-picker { position: relative; }
+    .dm-picker input { width: 100%; margin: 0; }
+    .dm-picker-hint { font-size: .78rem; }
+    .dm-picker-list {
+      position: absolute; left: 0; right: 0; top: calc(100% + 4px); z-index: 30; margin: 0; padding: .25rem;
+      list-style: none; background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+      box-shadow: 0 10px 30px rgba(0,0,0,.45); max-height: 18rem; overflow-y: auto;
+    }
+    .dm-picker-list[hidden] { display: none; }
+    .dm-pick { display: flex; align-items: center; gap: .6rem; padding: .45rem .55rem; border-radius: 9px; cursor: pointer; }
+    .dm-pick.is-active, .dm-pick:hover { background: var(--primary-dim); }
+    .dm-pick-av img { width: 2rem; height: 2rem; border-radius: 50%; object-fit: cover; display: block; }
+    .dm-pick-copy { display: flex; flex-direction: column; min-width: 0; }
+    .dm-pick-copy > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .dm-pick-name { font-weight: 600; }
     body.dm-fullscreen .shell {
       max-width: none;
       grid-template-columns: minmax(0, 1fr);
@@ -28939,28 +29237,20 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     .dm-back-top { margin-right: auto; }
     @media (max-width: 760px), (max-width: 950px) and (max-height: 520px) {
       body.dm-fullscreen .feed { padding-inline: .65rem; padding-bottom: .5rem; }
-      .dm-workspace { grid-template-columns: 1fr; }
-      body.dm-fullscreen .dm-workspace { height: auto; min-height: 0; }
-      .dm-sidebar { max-height: min(40dvh, 18rem); overflow-y: auto; }
-      .dm-pane { padding: .65rem; }
-      .dm-pane .dm-thread { min-height: 12rem; max-height: 52dvh; }
-      /* Conversation open: hide the list so the thread can use the viewport. */
-      body.dm-fullscreen.dm-peer-open .dm-sidebar { display: none; }
-      body.dm-fullscreen.dm-peer-open .dm-workspace {
+      /* Phone: the list OR a conversation fills the screen, never both. */
+      .dm-workspace, body.dm-fullscreen .dm-workspace { grid-template-columns: 1fr; }
+      body.dm-fullscreen .dm-workspace {
         height: calc(100dvh - 7.25rem - env(safe-area-inset-bottom, 0px));
         min-height: 18rem;
       }
-      body.dm-fullscreen.dm-peer-open .dm-pane {
-        height: 100%;
-        min-height: 0;
-        display: flex;
-        flex-direction: column;
-      }
-      body.dm-fullscreen.dm-peer-open .dm-pane .dm-thread {
-        flex: 1 1 auto;
-        min-height: 0;
-        max-height: none;
-      }
+      .dm-workspace:not(.is-peer-open):not(.is-compose-open) .dm-pane { display: none; }
+      .dm-workspace.is-peer-open .dm-sidebar,
+      .dm-workspace.is-compose-open .dm-sidebar { display: none; }
+      .dm-back { display: inline-flex; }
+      .dm-pane { padding: .65rem; height: 100%; min-height: 0; }
+      .dm-pane .dm-thread { flex: 1 1 auto; min-height: 0; max-height: none; }
+      .dm-msg { max-width: 88%; }
+      .dm-compose-hint .dm-enter-hint { display: none; }
     }
     .link-card {
       display: flex; gap: .75rem; margin: .65rem 0 0; padding: 0;
@@ -32553,39 +32843,54 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
           }
           $dmPeerBlocked = $dmPeer !== '' && function_exists('ap_is_blocked_actor')
               && ap_is_blocked_actor($dmPeer);
+          $dmComposeNew = $dmPeer === '' && (string) ($_GET['new'] ?? '') === '1';
+          $dmToPrefill = $dmPeer === '' ? trim((string) ($_GET['to'] ?? '')) : '';
           $dmConversations = ap_dm_conversations(60);
           $dmUnread = ap_dm_unread_count();
         ?>
-        <?php if ($dmPeer === ''): ?>
-          <div class="dm-workspace">
-            <aside class="dm-sidebar" aria-label="Direct message conversations">
-              <div class="dm-sidebar-title">Messages<?php if ($dmUnread > 0): ?> <span class="nav-badge dm-conversation-badge"><?= $dmUnread > 99 ? '99+' : (string) (int) $dmUnread ?></span><?php endif; ?></div>
-              <?= admin_dm_conversation_list_html($dmConversations) ?>
-            </aside>
-            <section class="dm-pane">
-          <?php if ($dmUnread > 0): ?>
-            <div class="meta" style="margin-bottom:.75rem">You have <?= $dmUnread > 99 ? '99+' : (string) (int) $dmUnread ?> unread <?= $dmUnread === 1 ? 'message' : 'messages' ?>.</div>
-          <?php endif; ?>
-          <form class="composer" method="post" action="?view=dms" enctype="multipart/form-data" style="margin-bottom:1rem">
-            <input type="hidden" name="action" value="dm_send">
-            <div class="meta" style="margin-bottom:.5rem">New direct message</div>
-            <input name="to" type="text" required placeholder="@user@instance or https://…/users/…">
-            <textarea name="content" maxlength="2000" placeholder="Private message or attachment…" style="margin-top:.5rem"></textarea>
-            <?= admin_dm_composer_fields_html() ?>
-            <div class="composer-actions">
-              <span class="meta"></span>
-              <button class="btn btn-primary" type="submit">Send DM</button>
+        <div class="dm-workspace<?= $dmPeer !== '' ? ' is-peer-open' : '' ?><?= $dmComposeNew ? ' is-compose-open' : '' ?>" id="dm-workspace" data-dm-peer="<?= h($dmPeer) ?>">
+          <aside class="dm-sidebar" aria-label="Direct message conversations">
+            <div class="dm-sidebar-head">
+              <div class="dm-sidebar-title">Messages <span class="nav-badge dm-conversation-badge" id="dm-sidebar-unread"<?= $dmUnread > 0 ? '' : ' hidden' ?>><?= $dmUnread > 99 ? '99+' : (string) (int) $dmUnread ?></span></div>
+              <a class="btn btn-primary dm-new-btn" href="?view=dms&amp;new=1">New message</a>
             </div>
-          </form>
-            </section>
-          </div>
-        <?php else: ?>
-          <div class="dm-workspace">
-            <aside class="dm-sidebar" aria-label="Direct message conversations">
-              <div class="dm-sidebar-title">Messages</div>
+            <?php if ($dmConversations !== []): ?>
+              <div class="dm-sidebar-search">
+                <input id="dm-conversation-filter" type="search" placeholder="Search conversations" aria-label="Search conversations" autocomplete="off">
+              </div>
+            <?php endif; ?>
+            <div class="dm-conversation-list" id="dm-conversation-list">
               <?= admin_dm_conversation_list_html($dmConversations, $dmPeer) ?>
-            </aside>
-            <section class="dm-pane">
+            </div>
+            <div class="meta dm-filter-empty" id="dm-filter-empty" hidden>No conversations match.</div>
+          </aside>
+          <section class="dm-pane">
+        <?php if ($dmPeer === ''): ?>
+            <div class="dm-pane-header">
+              <a class="btn btn-ghost dm-back" href="?view=dms" aria-label="All conversations">←</a>
+              <div class="dm-pane-title">New message</div>
+            </div>
+            <form class="composer dm-new-form" method="post" action="?view=dms" enctype="multipart/form-data" data-dm-form="new">
+              <input type="hidden" name="action" value="dm_send">
+              <label class="dm-label" for="dm-to">To</label>
+              <div class="dm-picker">
+                <input id="dm-to" name="to" type="text" required autocomplete="off" spellcheck="false" value="<?= h($dmToPrefill) ?>"
+                       placeholder="Name, @user, or @user@server" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="dm-picker-list">
+                <ul class="dm-picker-list" id="dm-picker-list" role="listbox" aria-label="Suggested people" hidden></ul>
+              </div>
+              <div class="meta dm-picker-hint">Search people you follow, past conversations, and VAAK accounts. Messages between VAAK accounts never leave this server.</div>
+              <label class="dm-label" for="dm-new-content">Message</label>
+              <textarea id="dm-new-content" name="content" maxlength="2000" rows="3" placeholder="Private message or attachment…"></textarea>
+              <div class="dm-extras" data-dm-extras>
+                <?= admin_dm_composer_fields_html() ?>
+              </div>
+              <div class="composer-actions">
+                <button class="btn btn-ghost dm-extras-toggle" type="button" data-dm-extras-toggle aria-expanded="true" hidden>＋ Attachment or warning</button>
+                <span class="meta dm-form-status" role="status" aria-live="polite"></span>
+                <button class="btn btn-primary" type="submit">Send</button>
+              </div>
+            </form>
+        <?php else: ?>
           <?php
             $thread = $dmPeerBlocked ? [] : ap_dm_thread($dmPeer, 200);
             // Mark read after load so a lock/failure can't blank the thread
@@ -32596,121 +32901,63 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
                     error_log('[ap-admin] dm mark read: ' . $e->getMessage());
                 }
             }
-          ?>
-          <div class="dm-pane-header" style="margin-bottom:.75rem;display:flex;flex-wrap:wrap;gap:.5rem;align-items:center">
-            <div class="page-back"><a class="btn btn-ghost" href="?view=dms">← All conversations</a></div>
-            <?= admin_avatar_img($dmPeer) ?>
-            <div>
-              <div class="who"><?= actor_display_name_html($dmPeer) ?></div>
-              <div class="meta"><?= h(actor_handle($dmPeer)) ?></div>
-            </div>
-          </div>
-          <?php if ($dmPeerBlocked): ?>
-            <div class="empty" style="margin-top:1rem">This conversation is unavailable because this account is blocked. Unblock the account before exchanging messages.</div>
-          <?php endif; ?>
-          <div id="dm-thread" class="dm-thread">
-          <?php if (!$thread): ?>
-            <div class="empty">Empty thread — no stored messages for this peer.</div>
-          <?php endif; ?>
-          <?php $dmReplyContexts = $thread ? admin_dm_reply_contexts_html($thread, 'dms') : []; ?>
-          <?php foreach ($thread as $dmIndex => $m): ?>
-            <?php
-              $isOut = ($m['direction'] ?? '') === 'out';
-              $dmReplyContext = $dmReplyContexts[$dmIndex] ?? '';
-            ?>
-            <article class="tweet"<?= $dmIndex === count($thread) - 1 ? ' id="dm-message-last"' : '' ?>>
-              <div class="tweet-hd">
-                <?= admin_avatar_img($isOut ? vaak_actor_id() : (string) ($m['peer_actor_id'] ?? '')) ?>
-                <div class="tweet-hd-main">
-                  <div>
-                    <span class="who"><?= $isOut ? h('@' . vaak_actor_key()) : actor_display_name_html((string) ($m['peer_actor_id'] ?? '')) ?></span>
-                    <span class="meta"> · <?= $isOut ? 'You' : 'Them' ?> · <?= h(relative_time((string) ($m['created_at'] ?? ''))) ?></span>
-                  </div>
-                </div>
-              </div>
-              <?= $dmReplyContext ?>
-              <?= admin_dm_thread_message_html($m, $isOut) ?>
-            </article>
-          <?php endforeach; ?>
-          </div>
-          <?php if (!$dmPeerBlocked): ?><form class="composer" method="post" action="?view=dms&amp;peer=<?= urlencode($dmPeer) ?>" enctype="multipart/form-data" style="margin-top:1rem">
-            <input type="hidden" name="action" value="dm_reply">
-            <input type="hidden" name="to" value="<?= h($dmPeer) ?>">
-            <input type="hidden" name="peer" value="<?= h($dmPeer) ?>">
-            <?php
-              $lastIn = null;
-              for ($i = count($thread) - 1; $i >= 0; $i--) {
-                  if (($thread[$i]['direction'] ?? '') === 'in') {
-                      $lastIn = $thread[$i];
-                      break;
-                  }
-              }
-            ?>
-            <?php if ($lastIn): ?>
-              <input type="hidden" name="in_reply_to" value="<?= h((string) $lastIn['object_id']) ?>">
-            <?php endif; ?>
-            <textarea name="content" maxlength="2000" placeholder="Reply privately, with text or an attachment…"></textarea>
-            <?= admin_dm_composer_fields_html() ?>
-            <div class="composer-actions">
-              <span class="meta">Stays direct — not public</span>
-              <button class="btn btn-primary" type="submit">Reply</button>
-            </div>
-          </form>
-          <?php endif; ?>
-            <script>
-          (function () {
-            const thread = document.getElementById('dm-thread');
-            if (!thread) return;
-            let stickToBottom = true;
-            function nearBottom() {
-              return (thread.scrollHeight - thread.scrollTop - thread.clientHeight) < 80;
-            }
-            function focusLatestDm() {
-              if (!stickToBottom) return;
-              const last = document.getElementById('dm-message-last');
-              if (last && typeof last.scrollIntoView === 'function') {
-                try {
-                  last.scrollIntoView({ block: 'end', inline: 'nearest', behavior: 'instant' });
-                } catch (e) {
-                  last.scrollIntoView(false);
+            $dmLastId = 0;
+            $lastIn = null;
+            foreach ($thread as $dmRow) {
+                $dmLastId = max($dmLastId, (int) ($dmRow['id'] ?? 0));
+                if (($dmRow['direction'] ?? '') === 'in') {
+                    $lastIn = $dmRow;
                 }
-              }
-              thread.scrollTop = thread.scrollHeight;
             }
-            function scheduleFocus() {
-              requestAnimationFrame(function () {
-                focusLatestDm();
-                requestAnimationFrame(focusLatestDm);
-              });
-            }
-            thread.addEventListener('scroll', function () {
-              stickToBottom = nearBottom();
-            }, { passive: true });
-            [0, 50, 150, 400, 900].forEach(function (delay) {
-              window.setTimeout(scheduleFocus, delay);
-            });
-            window.addEventListener('load', scheduleFocus, { once: true });
-            if (typeof ResizeObserver === 'function') {
-              let roTimer = 0;
-              const ro = new ResizeObserver(function () {
-                if (!stickToBottom) return;
-                if (roTimer) window.clearTimeout(roTimer);
-                roTimer = window.setTimeout(focusLatestDm, 30);
-              });
-              ro.observe(thread);
-              window.setTimeout(function () { try { ro.disconnect(); } catch (e) {} }, 4000);
-            }
-            document.querySelectorAll('#dm-thread img').forEach(function (img) {
-              if (img.complete) return;
-              img.addEventListener('load', function () {
-                if (stickToBottom) focusLatestDm();
-              }, { once: true });
-            });
-          })();
-          </script>
-            </section>
-          </div>
+            $dmPeerLocal = admin_local_actor_key_from_id($dmPeer) !== null;
+          ?>
+            <div class="dm-pane-header">
+              <a class="btn btn-ghost dm-back" href="?view=dms" aria-label="All conversations">←</a>
+              <a class="dm-peer" href="<?= h(admin_profile_app_href($dmPeer, 'dms')) ?>">
+                <?= admin_avatar_img($dmPeer, 'dm-peer-avatar', false) ?>
+                <span class="dm-peer-copy">
+                  <span class="who"><?= actor_display_name_html($dmPeer) ?></span>
+                  <span class="meta"><?= h(actor_handle($dmPeer)) ?></span>
+                </span>
+              </a>
+              <span class="dm-peer-chip"><?= $dmPeerLocal ? 'On VAAK' : 'Fediverse' ?></span>
+            </div>
+            <?php if ($dmPeerBlocked): ?>
+              <div class="empty" style="margin-top:1rem">This conversation is unavailable because this account is blocked. Unblock the account before exchanging messages.</div>
+            <?php endif; ?>
+            <div id="dm-thread" class="dm-thread" role="log" aria-label="Messages" data-dm-last-id="<?= (int) $dmLastId ?>">
+              <?php if (!$thread && !$dmPeerBlocked): ?>
+                <div class="empty dm-thread-empty">No messages yet. Say hi below.</div>
+              <?php endif; ?>
+              <?php $dmReplyContexts = $thread ? admin_dm_reply_contexts_html($thread, 'dms') : []; ?>
+              <?= admin_dm_message_rows_html($thread, $dmReplyContexts) ?>
+              <div id="dm-message-last" class="dm-thread-end" aria-hidden="true"></div>
+            </div>
+            <?php if (!$dmPeerBlocked): ?>
+            <form class="composer dm-reply-form" method="post" action="?view=dms&amp;peer=<?= urlencode($dmPeer) ?>" enctype="multipart/form-data" data-dm-form="reply">
+              <input type="hidden" name="action" value="dm_reply">
+              <input type="hidden" name="to" value="<?= h($dmPeer) ?>">
+              <input type="hidden" name="peer" value="<?= h($dmPeer) ?>">
+              <?php if ($lastIn): ?>
+                <input type="hidden" name="in_reply_to" value="<?= h((string) $lastIn['object_id']) ?>">
+              <?php endif; ?>
+              <div class="dm-extras" data-dm-extras>
+                <?= admin_dm_composer_fields_html() ?>
+              </div>
+              <div class="dm-compose-row">
+                <button class="btn btn-ghost dm-extras-toggle" type="button" data-dm-extras-toggle aria-expanded="true" aria-label="Attachment or content warning" title="Attachment or content warning" hidden>＋</button>
+                <textarea name="content" maxlength="2000" rows="1" aria-label="Message to <?= h(actor_handle($dmPeer)) ?>" placeholder="Message"></textarea>
+                <button class="btn btn-primary dm-send" type="submit">Send</button>
+              </div>
+              <div class="dm-compose-hint meta">
+                <span class="dm-form-status" role="status" aria-live="polite"><?= $dmPeerLocal ? 'Stays on this server, only they can see it' : 'Stays direct, only they can see it' ?></span>
+                <span class="dm-enter-hint" hidden>Enter to send, Shift+Enter for a new line</span>
+              </div>
+            </form>
+            <?php endif; ?>
         <?php endif; ?>
+          </section>
+        </div>
         <script>
         (function () {
           document.querySelectorAll('form.composer .dm-media-input').forEach(function (input) {
@@ -32769,6 +33016,7 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
                 row.appendChild(remove);
                 slot.appendChild(row);
               });
+              form.dispatchEvent(new CustomEvent('vaak:dm-files', { detail: { count: dt.files.length } }));
             }
             function dmLive() {
               let live = form.querySelector('.dm-media-live');
@@ -32827,6 +33075,16 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
             input.addEventListener('change', function () {
               if (syncing) return;
               addDmFiles(Array.from(input.files || []));
+            });
+            // A message sent without a page load resets the form; drop the
+            // kept file list and alt texts with it.
+            form.addEventListener('reset', function () {
+              dt.items.clear();
+              dmAlts.length = 0;
+              syncing = true;
+              input.files = dt.files;
+              syncing = false;
+              render();
             });
             // Same clipboard rule as the post composer: images attach, text pastes through.
             form.addEventListener('paste', function (event) {
@@ -32888,6 +33146,423 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
               addDmFiles(Array.from((event.dataTransfer && event.dataTransfer.files) || []));
             });
           });
+        })();
+        </script>
+        <script>
+        (function () {
+          // DM screen: chat grouping, live thread, send without a page load,
+          // conversation search, and the New message picker. Only runs on this
+          // screen, so nothing here polls once you leave it.
+          const workspace = document.getElementById('dm-workspace');
+          if (!workspace) return;
+          const peer = workspace.getAttribute('data-dm-peer') || '';
+          const thread = document.getElementById('dm-thread');
+          const endMarker = document.getElementById('dm-message-last');
+          const coarse = window.matchMedia && window.matchMedia('(pointer: coarse)').matches;
+          const toast = function (msg, isErr) { if (window.apAdminToast) window.apAdminToast(msg, !!isErr); };
+
+          // ---- grouping, day separators, local times ----
+          function dayKey(d) { return d.getFullYear() + '-' + (d.getMonth() + 1) + '-' + d.getDate(); }
+          function dayLabel(d) {
+            const now = new Date();
+            const y = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1);
+            if (dayKey(d) === dayKey(now)) return 'Today';
+            if (dayKey(d) === dayKey(y)) return 'Yesterday';
+            const opts = { weekday: 'short', month: 'short', day: 'numeric' };
+            if (d.getFullYear() !== now.getFullYear()) opts.year = 'numeric';
+            return d.toLocaleDateString(undefined, opts);
+          }
+          function regroup() {
+            if (!thread) return;
+            thread.querySelectorAll('.dm-day').forEach(function (el) { el.remove(); });
+            const rows = Array.from(thread.querySelectorAll('.dm-msg'));
+            let prevDay = '';
+            rows.forEach(function (row, i) {
+              const ts = row.getAttribute('data-dm-ts');
+              const d = ts ? new Date(ts) : null;
+              const valid = d && !isNaN(d.getTime());
+              const key = valid ? dayKey(d) : prevDay;
+              if (valid && key !== prevDay) {
+                const sep = document.createElement('div');
+                sep.className = 'dm-day';
+                sep.setAttribute('role', 'separator');
+                sep.textContent = dayLabel(d);
+                row.parentNode.insertBefore(sep, row);
+              }
+              const time = row.querySelector('.dm-msg-meta time');
+              if (time && valid && !time.dataset.local) {
+                time.textContent = d.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' });
+                time.title = d.toLocaleString();
+                time.dataset.local = '1';
+              }
+              const prev = rows[i - 1];
+              const next = rows[i + 1];
+              const dir = row.getAttribute('data-dm-dir');
+              const sameAsPrev = prev && prev.getAttribute('data-dm-dir') === dir
+                && (!valid || dayKey(new Date(prev.getAttribute('data-dm-ts') || 0)) === key);
+              const sameAsNext = next && next.getAttribute('data-dm-dir') === dir
+                && (!valid || dayKey(new Date(next.getAttribute('data-dm-ts') || 0)) === key);
+              row.classList.toggle('is-grouped-prev', !!sameAsPrev);
+              row.classList.toggle('is-grouped-next', !!sameAsNext);
+              prevDay = key;
+            });
+          }
+
+          // ---- scroll to latest ----
+          let stickToBottom = true;
+          function nearBottom() {
+            return !thread || (thread.scrollHeight - thread.scrollTop - thread.clientHeight) < 80;
+          }
+          function focusLatestDm() {
+            if (!thread || !stickToBottom) return;
+            thread.scrollTop = thread.scrollHeight;
+          }
+          function scheduleFocus() {
+            requestAnimationFrame(function () {
+              focusLatestDm();
+              requestAnimationFrame(focusLatestDm);
+            });
+          }
+          const jump = document.createElement('button');
+          jump.type = 'button';
+          jump.className = 'btn btn-primary dm-jump';
+          jump.textContent = '↓ New message';
+          jump.hidden = true;
+          jump.addEventListener('click', function () {
+            stickToBottom = true;
+            jump.hidden = true;
+            focusLatestDm();
+          });
+          if (thread) {
+            thread.parentNode.insertBefore(jump, thread.nextSibling);
+            thread.addEventListener('scroll', function () {
+              stickToBottom = nearBottom();
+              if (stickToBottom) jump.hidden = true;
+            }, { passive: true });
+            regroup();
+            [0, 50, 150, 400, 900].forEach(function (delay) { window.setTimeout(scheduleFocus, delay); });
+            window.addEventListener('load', scheduleFocus, { once: true });
+            thread.addEventListener('load', function () { if (stickToBottom) focusLatestDm(); }, true);
+          }
+
+          // ---- live thread ----
+          let lastId = thread ? (parseInt(thread.getAttribute('data-dm-last-id'), 10) || 0) : 0;
+          let fetching = null;
+          function appendRows(html) {
+            if (!thread || !endMarker || !html) return { added: 0, incoming: 0 };
+            const tpl = document.createElement('template');
+            tpl.innerHTML = html;
+            let added = 0;
+            let incoming = 0;
+            let lastInObject = '';
+            Array.from(tpl.content.querySelectorAll('.dm-msg')).forEach(function (row) {
+              const id = row.getAttribute('data-dm-id');
+              if (id && thread.querySelector('.dm-msg[data-dm-id="' + id + '"]')) return;
+              thread.insertBefore(row, endMarker);
+              added += 1;
+              if (row.getAttribute('data-dm-dir') === 'in') {
+                incoming += 1;
+                lastInObject = row.getAttribute('data-dm-object') || lastInObject;
+              }
+            });
+            if (added) {
+              const empty = thread.querySelector('.dm-thread-empty');
+              if (empty) empty.remove();
+              regroup();
+            }
+            if (lastInObject) {
+              const form = document.querySelector('form[data-dm-form="reply"]');
+              if (form) {
+                let field = form.querySelector('input[name="in_reply_to"]');
+                if (!field) {
+                  field = document.createElement('input');
+                  field.type = 'hidden';
+                  field.name = 'in_reply_to';
+                  form.appendChild(field);
+                }
+                field.value = lastInObject;
+                field.defaultValue = lastInObject;
+              }
+            }
+            return { added: added, incoming: incoming };
+          }
+          function fetchNew() {
+            if (!thread || !peer) return Promise.resolve();
+            if (fetching) return fetching;
+            const wasNear = nearBottom();
+            const read = document.visibilityState === 'visible' ? '1' : '0';
+            const url = '?ajax=dm_thread&peer=' + encodeURIComponent(peer) + '&after=' + lastId + '&read=' + read;
+            fetching = fetch(url, { credentials: 'same-origin', headers: { 'Accept': 'application/json' }, cache: 'no-store' })
+              .then(function (res) { return res.ok ? res.json() : null; })
+              .then(function (data) {
+                if (!data || !data.ok) return;
+                const next = parseInt(data.last_id, 10) || 0;
+                if (next > lastId) lastId = next;
+                const result = appendRows(data.html || '');
+                if (!result.added) return;
+                if (wasNear) {
+                  stickToBottom = true;
+                  scheduleFocus();
+                } else if (result.incoming) {
+                  jump.hidden = false;
+                }
+                if (result.incoming && read === '1' && typeof window.vaakPollNotif === 'function') window.vaakPollNotif();
+              })
+              .catch(function () {})
+              .finally(function () { fetching = null; });
+            return fetching;
+          }
+          let listTimer = 0;
+          function refreshList() {
+            const list = document.getElementById('dm-conversation-list');
+            if (!list) return;
+            if (listTimer) window.clearTimeout(listTimer);
+            listTimer = window.setTimeout(function () {
+              fetch('?ajax=dm_list&peer=' + encodeURIComponent(peer), { credentials: 'same-origin', headers: { 'Accept': 'application/json' }, cache: 'no-store' })
+                .then(function (res) { return res.ok ? res.json() : null; })
+                .then(function (data) {
+                  if (!data || !data.ok || typeof data.html !== 'string') return;
+                  list.innerHTML = data.html;
+                  applyFilter();
+                  const badge = document.getElementById('dm-sidebar-unread');
+                  if (badge) {
+                    const n = parseInt(data.unread, 10) || 0;
+                    badge.hidden = n < 1;
+                    badge.textContent = n > 99 ? '99+' : String(n);
+                  }
+                })
+                .catch(function () {});
+            }, 400);
+          }
+          window.addEventListener('vaak:dm-activity', function () {
+            fetchNew().then(refreshList);
+          });
+          let pollTimer = 0;
+          function schedulePoll() {
+            if (pollTimer) window.clearTimeout(pollTimer);
+            pollTimer = 0;
+            if (!peer || document.visibilityState !== 'visible') return;
+            pollTimer = window.setTimeout(function () {
+              fetchNew().then(schedulePoll);
+            }, 15000);
+          }
+          document.addEventListener('visibilitychange', function () {
+            if (document.visibilityState === 'visible') {
+              fetchNew().then(refreshList);
+            }
+            schedulePoll();
+          });
+          schedulePoll();
+
+          // ---- conversation search ----
+          const filterInput = document.getElementById('dm-conversation-filter');
+          function applyFilter() {
+            const list = document.getElementById('dm-conversation-list');
+            const empty = document.getElementById('dm-filter-empty');
+            if (!list || !filterInput) return;
+            const q = filterInput.value.trim().toLowerCase();
+            let shown = 0;
+            list.querySelectorAll('.dm-conversation-row').forEach(function (row) {
+              const hay = row.getAttribute('data-dm-search') || row.textContent.toLowerCase();
+              const hit = !q || hay.indexOf(q) !== -1;
+              row.hidden = !hit;
+              if (hit) shown += 1;
+            });
+            if (empty) empty.hidden = shown > 0 || !q;
+          }
+          if (filterInput) filterInput.addEventListener('input', applyFilter);
+
+          // ---- composers ----
+          document.querySelectorAll('form[data-dm-form]').forEach(function (form) {
+            const kind = form.getAttribute('data-dm-form');
+            const textarea = form.querySelector('textarea[name="content"]');
+            const extras = form.querySelector('[data-dm-extras]');
+            const toggle = form.querySelector('[data-dm-extras-toggle]');
+            const status = form.querySelector('.dm-form-status');
+            const statusDefault = status ? status.textContent : '';
+            const submit = form.querySelector('button[type="submit"]');
+            const enterHint = form.querySelector('.dm-enter-hint');
+            function setExtras(open) {
+              if (!extras || !toggle) return;
+              extras.hidden = !open;
+              toggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+              toggle.classList.toggle('is-active', open);
+            }
+            if (extras && toggle) {
+              toggle.hidden = false;
+              setExtras(false);
+              toggle.addEventListener('click', function () { setExtras(extras.hidden); });
+              form.addEventListener('vaak:dm-files', function (event) {
+                if (event.detail && event.detail.count > 0) setExtras(true);
+              });
+            }
+            function autosize() {
+              if (!textarea || kind !== 'reply') return;
+              textarea.style.height = 'auto';
+              textarea.style.height = Math.min(textarea.scrollHeight + 2, 180) + 'px';
+            }
+            if (textarea) {
+              textarea.addEventListener('input', autosize);
+              if (!coarse && enterHint) enterHint.hidden = false;
+              textarea.addEventListener('keydown', function (event) {
+                if (event.key !== 'Enter' || event.shiftKey || event.isComposing || coarse || kind !== 'reply') return;
+                event.preventDefault();
+                if (typeof form.requestSubmit === 'function') form.requestSubmit();
+                else form.dispatchEvent(new Event('submit', { cancelable: true }));
+              });
+            }
+            function setStatus(text, isErr) {
+              if (!status) return;
+              status.textContent = text;
+              status.classList.toggle('is-error', !!isErr);
+            }
+            form.addEventListener('submit', function (event) {
+              if (typeof FormData !== 'function' || typeof fetch !== 'function') return;
+              event.preventDefault();
+              if (form.dataset.dmSending === '1') return;
+              const fd = new FormData(form);
+              const text = String(fd.get('content') || '').trim();
+              const files = form.querySelector('.dm-media-input');
+              const hasFiles = files && files.files && files.files.length > 0;
+              if (!text && !hasFiles) {
+                setStatus('Type a message or add an attachment.', true);
+                if (textarea) textarea.focus();
+                return;
+              }
+              if (typeof window.vaakCsrfApply === 'function') window.vaakCsrfApply(fd);
+              form.dataset.dmSending = '1';
+              if (submit) submit.disabled = true;
+              setStatus(hasFiles ? 'Uploading and sending…' : 'Sending…', false);
+              fetch(form.getAttribute('action') || '?view=dms', {
+                method: 'POST',
+                body: fd,
+                credentials: 'same-origin',
+                headers: { 'Accept': 'application/json', 'X-VAAK-DM': '1', 'X-VAAK-CSRF': window.VAAK_CSRF || '' },
+              })
+                .then(function (res) {
+                  return res.json().catch(function () { return { ok: false, error: 'Could not send (HTTP ' + res.status + ').' }; });
+                })
+                .then(function (data) {
+                  if (!data || !data.ok) {
+                    const msg = (data && data.error) || 'Could not send that message.';
+                    setStatus(msg, true);
+                    toast(msg, true);
+                    return;
+                  }
+                  if (kind === 'new') {
+                    window.location.assign(data.href || ('?view=dms&peer=' + encodeURIComponent(data.peer || '')));
+                    return;
+                  }
+                  form.reset();
+                  setExtras(false);
+                  autosize();
+                  setStatus(data.delivered ? statusDefault : 'Saved here, but their server did not accept it. Try again later if they do not reply.', !data.delivered);
+                  stickToBottom = true;
+                  fetchNew().then(refreshList);
+                  if (textarea && !coarse) textarea.focus();
+                })
+                .catch(function () {
+                  setStatus('Network error. Your message was not sent.', true);
+                })
+                .finally(function () {
+                  form.dataset.dmSending = '0';
+                  if (submit) submit.disabled = false;
+                });
+            });
+          });
+
+          // ---- New message picker ----
+          const to = document.getElementById('dm-to');
+          const pickList = document.getElementById('dm-picker-list');
+          if (to && pickList) {
+            let pickTimer = 0;
+            let pickSeq = 0;
+            let active = -1;
+            let people = [];
+            function closePicker() {
+              pickList.hidden = true;
+              to.setAttribute('aria-expanded', 'false');
+              to.removeAttribute('aria-activedescendant');
+              active = -1;
+            }
+            function choose(i) {
+              const p = people[i];
+              if (!p) return;
+              to.value = p.handle || p.actor_id;
+              to.dataset.actor = p.actor_id;
+              closePicker();
+              const content = document.getElementById('dm-new-content');
+              if (content) content.focus();
+            }
+            function paint() {
+              pickList.replaceChildren();
+              people.forEach(function (p, i) {
+                const li = document.createElement('li');
+                li.id = 'dm-pick-' + i;
+                li.className = 'dm-pick' + (i === active ? ' is-active' : '');
+                li.setAttribute('role', 'option');
+                li.setAttribute('aria-selected', i === active ? 'true' : 'false');
+                const av = document.createElement('span');
+                av.className = 'dm-pick-av';
+                av.innerHTML = p.avatar || '';
+                const copy = document.createElement('span');
+                copy.className = 'dm-pick-copy';
+                const name = document.createElement('span');
+                name.className = 'dm-pick-name';
+                name.textContent = p.name || p.handle;
+                const handle = document.createElement('span');
+                handle.className = 'meta';
+                handle.textContent = (p.handle || p.actor_id) + (p.local ? ' · on VAAK' : '');
+                copy.appendChild(name);
+                copy.appendChild(handle);
+                li.appendChild(av);
+                li.appendChild(copy);
+                li.addEventListener('mousedown', function (event) { event.preventDefault(); choose(i); });
+                pickList.appendChild(li);
+              });
+              const open = people.length > 0;
+              pickList.hidden = !open;
+              to.setAttribute('aria-expanded', open ? 'true' : 'false');
+              if (active >= 0) to.setAttribute('aria-activedescendant', 'dm-pick-' + active);
+              else to.removeAttribute('aria-activedescendant');
+            }
+            to.addEventListener('input', function () {
+              delete to.dataset.actor;
+              const q = to.value.trim();
+              if (pickTimer) window.clearTimeout(pickTimer);
+              if (q.replace(/^@/, '').length < 2 || /^https:\/\//.test(q)) { people = []; closePicker(); return; }
+              const seq = ++pickSeq;
+              pickTimer = window.setTimeout(function () {
+                fetch('?ajax=dm_people&q=' + encodeURIComponent(q), { credentials: 'same-origin', headers: { 'Accept': 'application/json' }, cache: 'no-store' })
+                  .then(function (res) { return res.ok ? res.json() : null; })
+                  .then(function (data) {
+                    if (seq !== pickSeq || !data || !Array.isArray(data.people)) return;
+                    people = data.people;
+                    active = people.length ? 0 : -1;
+                    paint();
+                  })
+                  .catch(function () {});
+              }, 250);
+            });
+            to.addEventListener('keydown', function (event) {
+              if (pickList.hidden || !people.length) return;
+              if (event.key === 'ArrowDown') { event.preventDefault(); active = (active + 1) % people.length; paint(); }
+              else if (event.key === 'ArrowUp') { event.preventDefault(); active = (active - 1 + people.length) % people.length; paint(); }
+              else if (event.key === 'Enter' && active >= 0) { event.preventDefault(); choose(active); }
+              else if (event.key === 'Escape') { closePicker(); }
+            });
+            to.addEventListener('blur', function () { window.setTimeout(closePicker, 120); });
+            // Send the exact account picked, not just the visible handle.
+            const newForm = to.form;
+            if (newForm) {
+              newForm.addEventListener('formdata', function (event) {
+                if (to.dataset.actor) event.formData.set('to', to.dataset.actor);
+              });
+            }
+            if (workspace.classList.contains('is-compose-open') || window.matchMedia('(min-width: 761px)').matches) {
+              if (!to.value) to.focus();
+            }
+          }
         })();
         </script>
 
@@ -40786,6 +41461,7 @@ if (!empty($GLOBALS['vaak_profile_shell'])) {
   // Track the newest unread tip so badge state remains stable across polls.
   let lastNotifEventId = <?= json_encode($notifLatestUnreadIdNav !== '' ? $notifLatestUnreadIdNav : $notifLatestIdNav) ?>;
   let lastDmEventId = <?= json_encode($dmLatestIdNav) ?>;
+  let dmActivityTip = '';
   let notifPollTimer = null;
   if (navigator.serviceWorker) {
     navigator.serviceWorker.addEventListener('message', (ev) => {
@@ -40823,6 +41499,11 @@ if (!empty($GLOBALS['vaak_profile_shell'])) {
     const d = dmView ? 0 : Math.max(0, parseInt(dmCount, 10) || 0);
     const notifEventId = snowflakeDigits((opts && opts.notifId) || '');
     const dmEventId = String((opts && opts.dmId) || '');
+    // The DM screen fetches only new rows when the unread DM tip moves.
+    if (dmView && dmEventId !== '' && dmEventId !== dmActivityTip && (parseInt(dmCount, 10) || 0) > 0) {
+      dmActivityTip = dmEventId;
+      try { window.dispatchEvent(new CustomEvent('vaak:dm-activity')); } catch (e) {}
+    }
     if (opts && opts.lastReadId != null && String(opts.lastReadId) !== '') {
       const lr = snowflakeDigits(opts.lastReadId);
       if (lr !== '0') lastReadNotifId = lr;
