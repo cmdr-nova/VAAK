@@ -26181,11 +26181,6 @@ function admin_render_bsky_view_body(int $vaakOwnerId): void
                 $nextCursor = is_string($tl['cursor'] ?? null) ? (string) $tl['cursor'] : '';
                 $mergePending = !empty($tl['merge_pending']);
         ?>
-          <div class="meta" style="margin:0 0 .65rem">
-            Bluesky for <b>@<?= h((string) ($bskySess['handle'] ?? '')) ?></b>
-            ·
-            <a href="https://bsky.app/profile/<?= h(rawurlencode((string) ($bskySess['handle'] ?? ''))) ?>" target="_blank" rel="noopener noreferrer">Open profile</a>
-          </div>
           <?php if ($feed === []): ?>
             <div class="empty">
               No posts in this Bluesky feed yet.
