@@ -28110,6 +28110,11 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
   <link rel="apple-touch-icon" href="/vaak/apple-touch-icon.png?v=20260907">
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@phosphor-icons/web@2.1.1/src/regular/style.css">
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@phosphor-icons/web@2.1.1/src/fill/style.css">
+  <?php /* Full page loads (admin, settings and the other views outside soft
+     nav) used to show a blank window while the center column was still being
+     built. Hold the first paint until the shell is parsed (marker below,
+     right after .feed opens), and swap documents without a flash. */ ?>
+  <link rel="expect" href="#vaak-shell-ready" blocking="render">
   <script>
     (function () {
       const key = 'vaak-accent-<?= h((string) $vaakActorKey) ?>';
@@ -31072,6 +31077,20 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     .vaak-soft-loading .vaak-spinner {
       width: 1.55rem; height: 1.55rem; border-width: 2.5px;
     }
+    /* Cross-document navigations keep the old page on screen until the new
+       shell can paint, then swap instantly (no crossfade). */
+    @view-transition { navigation: auto; }
+    ::view-transition-group(*), ::view-transition-old(*), ::view-transition-new(*) { animation: none; }
+    /* Center-column placeholder for full page loads. It shows only while the
+       view's own markup has not streamed in yet: any element after it hides it
+       (:has, since Blink only matches :last-child once the parent is closed). */
+    .vaak-page-pending {
+      min-height: 42vh; display: flex; align-items: center; justify-content: center;
+      color: var(--primary); opacity: 0; animation: vaak-page-pending-in 0s linear .2s forwards;
+    }
+    .vaak-page-pending .vaak-spinner { width: 1.55rem; height: 1.55rem; border-width: 2.5px; }
+    .vaak-page-pending:has(~ *) { display: none; }
+    @keyframes vaak-page-pending-in { to { opacity: 1; } }
     .timeline-status-loading { display: inline-flex; align-items: center; justify-content: center; gap: .45rem; }
     @media (prefers-reduced-motion: reduce) {
       .vaak-spinner { animation-duration: 1.4s; }
@@ -31510,6 +31529,19 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
     </script>
 
     <div class="feed<?= in_array($view, ['guestbook','support','analytics'], true) ? ' wide-feed' : '' ?><?= in_array($view, ['home', 'local', 'feed', 'bluesky', 'mentions', 'favourites', 'bookmarks'], true) ? ' timeline-feed' : '' ?><?= $view === 'remote_profile' ? ' remote-profile-feed' : '' ?>">
+      <?php if (empty($GLOBALS['vaak_profile_shell']) && empty($GLOBALS['vaak_status_shell'])): ?>
+        <div class="vaak-page-pending" id="vaak-shell-ready" role="status" aria-label="Loading"><span class="vaak-spinner" aria-hidden="true"></span></div>
+        <?php
+          // Send the shell (sidebars, top bar, placeholder) now so the browser
+          // paints it while this view's own data loads. Only when headers have
+          // already gone out with the head, so nothing below can lose a header,
+          // and only through PHP's own buffer (a capture buffer keeps its bytes).
+          if (headers_sent() && ob_get_level() <= 1) {
+              if (ob_get_level() === 1) @ob_flush();
+              @flush();
+          }
+        ?>
+      <?php endif; ?>
       <?php if (in_array($view, ['home', 'local', 'feed'], true) && !$autoOpenComposer): ?>
         <?php $GLOBALS['admin_compose_panel_inline'] = true; ?>
         <div class="compose-inline-slot" id="compose-inline-slot">
@@ -50697,6 +50729,9 @@ if (VIEW === 'analytics') loadAnalytics();
     }
     window.vaakShowLoading(loadingText);
   }, true);
+  // The full-page placeholder (hidden by CSS once the view streamed in) has
+  // done its job by the time this end-of-body script runs.
+  document.querySelectorAll('.vaak-page-pending').forEach(function (el) { el.remove(); });
   window.addEventListener('pageshow', function () {
     window.__vaakNavigationPending = false;
     window.vaakHideLoading();
