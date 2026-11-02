@@ -46674,7 +46674,33 @@ window.vaakBootStatusThread();
       if (on) a.setAttribute('aria-current', 'page'); else a.removeAttribute('aria-current');
     });
     slot.hidden = false;
+    revealActiveChip(slot);
   }
+  // Each switch paints a fresh chip row scrolled to the start, so a feed far
+  // down a long row ended up selected but off screen. Bring it into view
+  // (row only: the page itself never scrolls for this).
+  function revealActiveChip(slot) {
+    const row = slot.querySelector('.bsky-feed-tabs');
+    const chip = row && row.querySelector('a[aria-current="page"]');
+    if (!row || !chip) return;
+    const fit = () => {
+      if (row.scrollWidth <= row.clientWidth + 1) return;
+      if (lastRowLeft > 0 && row.scrollLeft === 0) row.scrollLeft = lastRowLeft;
+      const left = chip.offsetLeft - row.offsetLeft;
+      const right = left + chip.offsetWidth;
+      if (left >= row.scrollLeft && right <= row.scrollLeft + row.clientWidth) return;
+      row.scrollLeft = Math.max(0, left - (row.clientWidth - chip.offsetWidth) / 2);
+    };
+    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(fit); else fit();
+  }
+  // Where the row was scrolled when a chip was tapped, so the next row opens
+  // at the same spot instead of jumping back to VAAK.
+  let lastRowLeft = 0;
+  document.addEventListener('click', (ev) => {
+    const a = ev.target && ev.target.closest ? ev.target.closest('.bsky-feed-tabs a[data-chip]') : null;
+    const row = a && a.closest('.bsky-feed-tabs');
+    if (row) lastRowLeft = row.scrollLeft;
+  }, true);
   window.vaakSyncBskyChips = function (viewHint) {
     const slots = document.querySelectorAll('section.main [data-bsky-home-chips]');
     if (!slots.length) return;
@@ -47669,8 +47695,17 @@ window.vaakBootStatusThread();
       const on = a.dataset.chip === active;
       a.classList.toggle('btn-primary', on);
       a.classList.toggle('btn-ghost', !on);
+      if (on) a.setAttribute('aria-current', 'page'); else a.removeAttribute('aria-current');
     });
     feed.appendChild(chips);
+    // Keep the row where the viewer left it while the posts load.
+    const oldRow = slot.querySelector('.bsky-feed-tabs');
+    const newRow = chips.querySelector('.bsky-feed-tabs');
+    const keepLeft = oldRow ? oldRow.scrollLeft : 0;
+    if (newRow && keepLeft > 0) {
+      const apply = () => { newRow.scrollLeft = keepLeft; };
+      if (typeof requestAnimationFrame === 'function') requestAnimationFrame(apply); else apply();
+    }
     const skeleton = document.createElement('div');
     skeleton.className = 'timeline-skeleton';
     skeleton.setAttribute('data-soft-loading', '1');
