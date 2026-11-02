@@ -58,6 +58,7 @@ php_tests=(
   api/bin/bsky-notif-subject-backfill-smoke.php
   api/bin/bsky-own-repost-profile-smoke.php
   api/bin/bsky-follow-carry-smoke.php
+  api/bin/bsky-profile-cold-fill-smoke.php
   api/bin/remote-poll-smoke.php
   api/bin/reply-preview-smoke.php
   api/bin/remote-emoji-smoke.php
