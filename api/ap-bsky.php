@@ -7637,13 +7637,57 @@ function ap_bsky_saved_feeds_edit(int $ownerUserId, string $op, string $feedUri)
     return ['ok' => true];
 }
 
-/**
- * The account's saved feeds in Bluesky's order, from cached preferences.
- *
- * @return array{ok:bool,error?:string,items?:list<array{type:string,value:string,pinned:bool}>}
- */
 /** Seconds between background samples of one owner's saved feeds. */
 const AP_BSKY_FEED_SAMPLE_EVERY = 900;
+
+/** Sampled feed posts kept as Home recommendation picks (newest first). */
+const AP_BSKY_FEED_PICKS_KEEP = 40;
+
+/** Seconds a sampled feed pick stays eligible for Home. */
+const AP_BSKY_FEED_PICKS_TTL = 3 * 86400;
+
+/**
+ * Pure merge behind the feed-picks Redis doc that the Rust Home ranker reads
+ * (vaak:bsky:feedpicks:v1:{owner}). Adds the top-level posts of one sampled
+ * feed page in front of the existing picks, drops replies, duplicates and
+ * picks older than AP_BSKY_FEED_PICKS_TTL, and keeps AP_BSKY_FEED_PICKS_KEEP.
+ *
+ * @param array<string,mixed>|null $doc
+ * @param list<array<string,mixed>> $feedItems getFeed / getListFeed items
+ * @return array{items:list<array{uri:string,feed:string,at:int}>}
+ */
+function ap_bsky_feed_picks_merge(?array $doc, array $feedItems, string $feedUri, int $now): array
+{
+    $fresh = [];
+    foreach ($feedItems as $item) {
+        if (!is_array($item) || isset($item['reply']) || isset($item['reason'])) {
+            continue;
+        }
+        $post = is_array($item['post'] ?? null) ? $item['post'] : [];
+        $uri = (string) ($post['uri'] ?? '');
+        $record = is_array($post['record'] ?? null) ? $post['record'] : [];
+        if (isset($record['reply']) || !preg_match('#^at://did:[^/]+/app\.bsky\.feed\.post/#', $uri)) {
+            continue;
+        }
+        $fresh[] = ['uri' => $uri, 'feed' => $feedUri, 'at' => $now];
+    }
+    $old = is_array($doc['items'] ?? null) ? $doc['items'] : [];
+    $out = [];
+    $seen = [];
+    foreach (array_merge($fresh, $old) as $pick) {
+        $uri = is_array($pick) ? (string) ($pick['uri'] ?? '') : '';
+        $at = is_array($pick) ? (int) ($pick['at'] ?? 0) : 0;
+        if ($uri === '' || isset($seen[$uri]) || $at < $now - AP_BSKY_FEED_PICKS_TTL) {
+            continue;
+        }
+        $seen[$uri] = true;
+        $out[] = ['uri' => $uri, 'feed' => (string) ($pick['feed'] ?? ''), 'at' => $at];
+        if (count($out) >= AP_BSKY_FEED_PICKS_KEEP) {
+            break;
+        }
+    }
+    return ['items' => $out];
+}
 
 /**
  * Next saved feed to sample, round-robin over every saved feed and list
@@ -7674,7 +7718,7 @@ function ap_bsky_feed_sample_pick(array $items, int $turn): ?string
  * is where Home's Bluesky recommendations come from. Off with
  * VAAK_BSKY_FEED_SAMPLE=0, and skipped entirely without Redis (no gate).
  *
- * @return array{sampled:bool,feed?:string,posts?:int,cache?:string,reason?:string}
+ * @return array{sampled:bool,feed?:string,posts?:int,picks?:int,cache?:string,reason?:string}
  */
 function ap_bsky_feed_sample_tick(int $ownerUserId, bool $dryRun = false): array
 {
@@ -7708,7 +7752,17 @@ function ap_bsky_feed_sample_tick(int $ownerUserId, bool $dryRun = false): array
         $redis->set($gateKey, '1', ['ex' => AP_BSKY_FEED_SAMPLE_EVERY]);
         $redis->set($turnKey, (string) ($turn + 1), ['ex' => 30 * 86400]);
         $got = ap_bsky_get_custom_feed($ownerUserId, $uri, AP_BSKY_CUSTOM_FEED_INDEX_HEAD, null);
+        $picks = 0;
+        if (!empty($got['ok']) && is_array($got['feed'] ?? null) && function_exists('ap_redis_json_set')) {
+            // Home's Bluesky recommendations only take strangers' posts that
+            // clear an affinity bar; these picks let a couple through anyway.
+            $picksKey = 'vaak:bsky:feedpicks:v1:' . $ownerUserId;
+            $doc = ap_bsky_feed_picks_merge(ap_redis_json_get($picksKey), array_values($got['feed']), $uri, time());
+            ap_redis_json_set($picksKey, $doc, AP_BSKY_FEED_PICKS_TTL);
+            $picks = count($doc['items']);
+        }
         return [
+            'picks' => $picks,
             'sampled' => !empty($got['ok']),
             'feed' => $uri,
             'posts' => is_array($got['feed'] ?? null) ? count($got['feed']) : 0,
@@ -7720,6 +7774,11 @@ function ap_bsky_feed_sample_tick(int $ownerUserId, bool $dryRun = false): array
     }
 }
 
+/**
+ * The account's saved feeds in Bluesky's order, from cached preferences.
+ *
+ * @return array{ok:bool,error?:string,items?:list<array{type:string,value:string,pinned:bool}>}
+ */
 function ap_bsky_saved_feed_list(int $ownerUserId): array
 {
     $raw = ap_bsky_get_preferences($ownerUserId);

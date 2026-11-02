@@ -62,6 +62,29 @@ $check(ap_bsky_feed_sample_pick($items, 0) === $fa && ap_bsky_feed_sample_pick($
 $check(ap_bsky_feed_sample_pick([['type' => 'timeline', 'value' => 'following']], 3) === null, 'sampler has nothing to do with only Following');
 $check(ap_bsky_feed_sample_pick([['value' => "at://did:plc:abc/app.bsky.feed.generator/a\n"]], 0) === null, 'sampler refuses invalid URIs');
 
+// Sampled feed posts become Home picks: top-level posts only, newest first, capped.
+$now = 1_800_000_000;
+$post = static fn (string $rk, array $extra = []): array => array_merge(['post' => ['uri' => "at://did:plc:xyz/app.bsky.feed.post/{$rk}", 'record' => []]], $extra);
+$doc = ap_bsky_feed_picks_merge(null, [
+    $post('p1'),
+    $post('p2', ['reply' => ['parent' => []]]),
+    $post('p3', ['reason' => ['$type' => 'app.bsky.feed.defs#reasonRepost']]),
+    ['post' => ['uri' => 'at://did:plc:xyz/app.bsky.feed.post/p4', 'record' => ['reply' => []]]],
+    ['post' => ['uri' => 'https://example.com/p5']],
+    $post('p1'),
+], $fa, $now);
+$check(array_column($doc['items'], 'uri') === ['at://did:plc:xyz/app.bsky.feed.post/p1'] && $doc['items'][0]['feed'] === $fa,
+    'feed picks keep top-level posts once and drop replies, reposts and non-post URIs');
+$old = ['items' => [['uri' => 'at://did:plc:xyz/app.bsky.feed.post/old', 'feed' => $fb, 'at' => $now - AP_BSKY_FEED_PICKS_TTL - 1], ['uri' => 'at://did:plc:xyz/app.bsky.feed.post/p1', 'feed' => $fb, 'at' => $now - 60], ['uri' => 'at://did:plc:xyz/app.bsky.feed.post/kept', 'feed' => $fb, 'at' => $now - 60]]];
+$doc = ap_bsky_feed_picks_merge($old, [$post('p1'), $post('p6')], $fa, $now);
+$check(array_column($doc['items'], 'uri') === ['at://did:plc:xyz/app.bsky.feed.post/p1', 'at://did:plc:xyz/app.bsky.feed.post/p6', 'at://did:plc:xyz/app.bsky.feed.post/kept'],
+    'feed picks put fresh posts first, dedupe against old picks and expire stale ones');
+$many = [];
+for ($i = 0; $i < AP_BSKY_FEED_PICKS_KEEP + 10; $i++) {
+    $many[] = $post('m' . $i);
+}
+$check(count(ap_bsky_feed_picks_merge(null, $many, $fa, $now)['items']) === AP_BSKY_FEED_PICKS_KEEP, 'feed picks are capped');
+
 if ($failures !== []) {
     fwrite(STDERR, "bsky-feed-pin-uri-smoke FAILED: " . implode('; ', $failures) . "\n");
     exit(1);
