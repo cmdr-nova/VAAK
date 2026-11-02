@@ -2981,6 +2981,14 @@ $vaakAdminOnlyActions = [
                 $error = $result['error'] ?? 'Could not unfollow hashtag.';
             }
         }
+        // Search tag chips follow in place: answer with JSON instead of painting Tags.
+        if (!empty($_POST['ajax'])) {
+            header('Content-Type: application/json; charset=utf-8');
+            header('Cache-Control: no-store');
+            echo json_encode(['ok' => $error === null || $error === '', 'error' => (string) ($error ?? ''),
+                'name' => (string) ($result['tag']['name'] ?? $tagName)]);
+            exit;
+        }
     } elseif ($action === 'suggestion_follow' || $action === 'suggestion_dismiss') {
         $view = preg_replace('/[^a-z_]/', '', (string) ($_POST['return_view'] ?? 'home')) ?: 'home';
         $actor = trim((string) ($_POST['actor_id'] ?? ''));
@@ -7978,41 +7986,12 @@ if (isset($_GET['partial'], $_GET['shell'])
     if ($view === 'search') {
         // Reuse the full search body by capturing the same branch via include flag.
         $GLOBALS['vaak_soft_nav_search_shell'] = true;
-        // Inline a lightweight empty/search shell; full results still soft-nav with q=.
-        $sq = trim((string) ($_GET['q'] ?? ''));
-        $stype = preg_replace('/[^a-z]/', '', (string) ($_GET['type'] ?? '')) ?: '';
-        $sresolve = !isset($_GET['q']) || !empty($_GET['resolve']);
-        echo '<form class="composer" method="get" action="?view=search" style="margin:0 0 1rem">';
-        echo '<input type="hidden" name="view" value="search">';
-        echo '<input name="q" type="search" value="' . h($sq) . '" required placeholder="text · #tag · @user@instance · or https://…/post URL" autofocus>';
-        echo '<div style="display:flex;flex-wrap:wrap;gap:.75rem;align-items:center;margin:.6rem 0">';
-        echo '<label class="meta"><input type="radio" name="type" value=""' . ($stype === '' ? ' checked' : '') . '> All</label>';
-        echo '<label class="meta"><input type="radio" name="type" value="accounts"' . ($stype === 'accounts' ? ' checked' : '') . '> Accounts</label>';
-        echo '<label class="meta"><input type="radio" name="type" value="hashtags"' . ($stype === 'hashtags' ? ' checked' : '') . '> Hashtags</label>';
-        echo '<label class="meta"><input type="radio" name="type" value="statuses"' . ($stype === 'statuses' ? ' checked' : '') . '> Posts</label>';
-        echo '<label class="meta"><input type="checkbox" name="resolve" value="1"' . ($sresolve ? ' checked' : '') . '> Resolve remote</label>';
-        echo '</div><div class="composer-actions"><span class="meta"><a href="?view=tags">Hashtags</a></span>';
-        echo '<button class="btn btn-primary" type="submit">Search / Open</button></div></form>';
-        if ($sq === '') {
-            echo '<div class="empty">Search posts, tags, or accounts — or paste a remote post URL above.</div>';
-        } else {
-            // Same collector as the full page: local accounts stay local, and
-            // mutes/blocks are applied after the shared cache read.
-            $searchLimit = 20;
-            $sresults = admin_search_run($sq, $stype, $sresolve, $searchLimit, 0);
-            $searchMore = is_array($sresults['has_more'] ?? null) ? $sresults['has_more'] : [];
-            $acctN = count($sresults['accounts'] ?? []);
-            $tagN = count($sresults['hashtags'] ?? []);
-            $stN = count($sresults['statuses'] ?? []);
-            if ($acctN + $tagN + $stN === 0) {
-                echo '<div class="empty">No results for “' . h($sq) . '”.</div>';
-            } else {
-                echo '<div class="search-results-feed">';
-                admin_search_render_summary($sq, $sresults, $searchMore);
-                admin_search_render_sections($sresults, $sq, $stype, $sresolve, $searchLimit, $followingIds);
-                echo '</div>';
-            }
-        }
+        admin_search_render_page(
+            trim((string) ($_GET['q'] ?? '')),
+            preg_replace('/[^a-z]/', '', (string) ($_GET['type'] ?? '')) ?: '',
+            !isset($_GET['q']) || !empty($_GET['resolve']),
+            $followingIds
+        );
     } elseif ($view === 'followers' || $view === 'following') {
         $rowsSrc = $view === 'followers' ? $followers : $following;
         $followNet = $shellNet;
@@ -13878,9 +13857,6 @@ function admin_search_render_account(array $acc, array $followingIds, ?bool $fol
     $profileHref = $localKey !== '' && function_exists('ap_vaak_pretty_profile_path')
         ? ap_vaak_pretty_profile_path($localKey, ['from' => 'search'])
         : ('?view=remote_profile&actor=' . urlencode($followTarget) . '&from=search');
-    $shownAddress = $localKey !== ''
-        ? ('https://mkultra.monster/vaak/users/' . rawurlencode($localKey))
-        : ($followTarget !== '' ? $followTarget : $actorUrl);
     $already = $followingOverride ?? ($followTarget !== '' && admin_is_following(
         $followingIds,
         $followTarget,
@@ -13900,37 +13876,116 @@ function admin_search_render_account(array $acc, array $followingIds, ?bool $fol
         $rel = ap_masto_relationship_for_account_id((string) $acc['id']);
         $already = !empty($rel['following']);
     }
-    echo '<article class="tweet"><div class="tweet-hd"><div class="who">';
-    echo admin_emoji_html((string) ($acc['display_name'] ?: $acc['username'] ?? ''), $followTarget !== '' ? $followTarget : null);
-    echo ' <span class="meta">@' . h($acctStr) . '</span>';
-    if ($isMe) {
-        echo ' <span class="tag">me</span>';
-    } elseif ($already) {
-        echo ' ' . admin_rel_badge('following');
-    }
-    echo '</div></div><div class="mono">' . h($shownAddress) . '</div><div class="tweet-actions">';
-    if ($isMe) {
-        echo '<span class="tag">me</span> <a href="' . h($profileHref) . '">Your profile</a>';
-    } elseif ($followTarget !== '') {
-        echo '<a href="' . h($profileHref) . '">Profile</a> ';
-        if (!$already) {
-            echo '<form method="post" action="?view=search" style="display:inline">'
-                . '<input type="hidden" name="action" value="follow_remote">'
-                . '<input type="hidden" name="return_view" value="search">'
-                . '<input type="hidden" name="actor_id" value="' . h($followTarget) . '">'
-                . '<button class="btn btn-primary" type="submit" style="padding:.35rem .9rem;font-size:.85rem">Follow</button>'
-                . '</form> ';
-        } else {
-            echo '<span class="tag">following</span> ';
-        }
-        $openUrl = $actorUrl !== '' ? $actorUrl : $followTarget;
-        echo '<a href="' . h($openUrl) . '" target="_blank" rel="noopener noreferrer">'
-            . h(admin_open_profile_label($followTarget !== '' ? $followTarget : $actorUrl)) . '</a>';
-    }
-    echo '</div></article>';
+    $openUrl = $actorUrl !== '' ? $actorUrl : $followTarget;
+    echo admin_search_account_row_html(
+        $acc,
+        admin_emoji_html((string) ($acc['display_name'] ?: $acc['username'] ?? ''), $followTarget !== '' ? $followTarget : null),
+        $acctStr,
+        $followTarget,
+        $openUrl,
+        $profileHref,
+        admin_open_profile_label($followTarget !== '' ? $followTarget : $actorUrl),
+        $isMe,
+        (bool) $already
+    );
 }
 
-/** @param array<string,mixed> $tag */
+/**
+ * Search account bio: tags become spaces, whitespace collapses, long text is
+ * cut at 200 characters. Entities stay as written; only < > " are escaped.
+ * Rust search_render::bio is the same function.
+ *
+ * @param array<string,mixed> $acc
+ */
+function admin_search_account_bio(array $acc): string
+{
+    $note = $acc['note'] ?? '';
+    if (!is_string($note)) {
+        return '';
+    }
+    $text = (string) preg_replace('/<[^>]*>/', ' ', $note);
+    $text = trim((string) preg_replace('/[ \t\r\n\f\v]+/', ' ', $text), ' ');
+    if (mb_strlen($text, 'UTF-8') > 200) {
+        $text = mb_substr($text, 0, 200, 'UTF-8');
+        $text = rtrim((string) preg_replace('/&[#A-Za-z0-9]*$/', '', $text), ' ') . '…';
+    }
+    return str_replace(['<', '>', '"'], ['&lt;', '&gt;', '&quot;'], $text);
+}
+
+/** "1 follower", "950 followers", "1.2k followers", "3M followers". Tenths are floored. */
+function admin_search_followers_label(mixed $count): string
+{
+    $n = is_int($count) ? $count : ((is_string($count) && $count !== '' && ctype_digit($count)) ? (int) $count : 0);
+    if ($n < 1) {
+        return '';
+    }
+    if ($n < 1000) {
+        $short = (string) $n;
+    } else {
+        $unit = $n < 1000000 ? 'k' : 'M';
+        $tenths = intdiv($n, $n < 1000000 ? 100 : 100000);
+        $short = intdiv($tenths, 10) . ($tenths % 10 !== 0 ? '.' . ($tenths % 10) : '') . $unit;
+    }
+    return $short . ($n === 1 ? ' follower' : ' followers');
+}
+
+/**
+ * One Search account row. Rust search_render::account paints the same bytes.
+ *
+ * @param array<string,mixed> $acc
+ */
+function admin_search_account_row_html(array $acc, string $displayHtml, string $acct, string $target, string $openUrl,
+    string $profileHref, string $openLabel, bool $isMe, bool $following): string
+{
+    $avatar = 'https://mkultra.monster/img/avatar/default.webp';
+    foreach (['avatar', 'avatar_static'] as $key) {
+        $url = $acc[$key] ?? '';
+        if (is_string($url) && str_starts_with(trim($url), 'https://')) {
+            $avatar = trim($url);
+            break;
+        }
+    }
+    $isBsky = str_contains($target, 'bsky.app/profile/') || str_contains($openUrl, 'bsky.app/profile/') || str_starts_with($target, 'did:');
+    $html = '<article class="search-account">'
+        . '<a class="search-account-av" href="' . h($profileHref) . '" tabindex="-1" aria-hidden="true">'
+        . '<img src="' . h($avatar) . '" alt="" width="44" height="44" loading="lazy" decoding="async" referrerpolicy="no-referrer"'
+        . ' onerror="this.onerror=null;this.src=\'https://mkultra.monster/img/avatar/default.webp\'">'
+        . '<span class="search-net search-net-' . ($isBsky ? 'bsky' : 'fedi') . '" title="' . ($isBsky ? 'Bluesky' : 'Fediverse') . '"></span></a>'
+        . '<div class="search-account-who"><div class="search-account-name"><a href="' . h($profileHref) . '">' . $displayHtml
+        . (($acc['bot'] ?? null) === true ? ' 🤖' : '') . '</a>';
+    if ($isMe) {
+        $html .= ' <span class="tag">me</span>';
+    }
+    $followers = admin_search_followers_label($acc['followers_count'] ?? null);
+    $html .= '</div><div class="search-account-handle">@' . h($acct) . ($followers !== '' ? ' · ' . $followers : '') . '</div>';
+    $bio = admin_search_account_bio($acc);
+    if ($bio !== '') {
+        $html .= '<div class="search-account-bio">' . $bio . '</div>';
+    }
+    $html .= '</div><div class="search-account-act">';
+    if ($isMe) {
+        $html .= '<a class="btn btn-ghost btn-compact" href="' . h($profileHref) . '">Your profile</a>';
+    } elseif ($target !== '') {
+        $locked = ($acc['locked'] ?? null) === true;
+        $html .= '<form method="post" action="?view=search"' . ($locked ? ' data-follow-locked="1"' : '') . '>'
+            . '<input type="hidden" name="action" value="' . ($following ? 'unfollow_remote' : 'follow_remote') . '">'
+            . '<input type="hidden" name="return_view" value="search">'
+            . '<input type="hidden" name="actor_id" value="' . h($target) . '">'
+            . ($following
+                ? '<button class="btn btn-ghost btn-compact btn-following" type="submit" title="Following — click to unfollow">Following</button>'
+                : '<button class="btn btn-primary btn-compact" type="submit">Follow</button>')
+            . '</form>'
+            . '<a class="search-account-open" href="' . h($openUrl) . '" target="_blank" rel="noopener noreferrer" title="' . h($openLabel)
+            . '" aria-label="' . h($openLabel) . '">↗</a>';
+    }
+    return $html . '</div></article>';
+}
+
+/**
+ * One Search tag chip. Rust search_render::hashtag paints the same bytes.
+ *
+ * @param array<string,mixed> $tag
+ */
 function admin_search_render_hashtag(array $tag): void
 {
     $tname = (string) ($tag['name'] ?? '');
@@ -13938,25 +13993,216 @@ function admin_search_render_hashtag(array $tag): void
         return;
     }
     $tfollowing = !empty($tag['following']);
-    echo '<article class="tweet"><div class="tweet-hd"><div class="who">#' . h($tname) . '</div>';
-    if ($tfollowing) {
-        echo '<span class="tag">following</span>';
-    }
-    echo '</div><div class="tweet-actions">';
-    echo '<a href="?view=search&amp;q=' . h(urlencode('#' . $tname))
+    echo '<div class="search-tag' . ($tfollowing ? ' is-following' : '') . '">'
+        . '<a class="search-tag-link" href="?view=search&amp;q=' . h(urlencode('#' . $tname))
         . '&amp;type=statuses" data-vaak-soft-nav="search" data-search-q="' . h('#' . $tname)
-        . '" data-search-type="statuses">View posts</a> ';
-    if (!$tfollowing) {
-        echo '<form method="post" action="?view=tags" style="display:inline">'
+        . '" data-search-type="statuses">#' . h($tname) . '</a>';
+    if ($tfollowing) {
+        echo '<a class="search-tag-state" href="?view=tags" title="You follow this tag. Manage followed tags">following</a>';
+    } else {
+        echo '<form method="post" action="?view=tags" data-search-tag-follow>'
             . '<input type="hidden" name="action" value="follow_tag">'
             . '<input type="hidden" name="return_view" value="tags">'
             . '<input type="hidden" name="tag" value="' . h($tname) . '">'
-            . '<button class="btn btn-primary" type="submit" style="padding:.35rem .9rem;font-size:.85rem">Follow</button>'
+            . '<button class="search-tag-follow" type="submit" title="Follow #' . h($tname) . '" aria-label="Follow #' . h($tname) . '">+</button>'
             . '</form>';
-    } else {
-        echo '<a class="btn btn-ghost" href="?view=tags" style="padding:.35rem .9rem;font-size:.85rem">Manage</a>';
     }
-    echo '</div></article>';
+    echo '</div>';
+}
+
+/** Search URL for a tab or chip; the soft-nav reads the same q/type/resolve. */
+function admin_search_href(string $q, string $type, bool $resolve): string
+{
+    $href = '?view=search';
+    if ($q !== '') {
+        $href .= '&q=' . rawurlencode($q);
+    }
+    if ($type !== '') {
+        $href .= '&type=' . rawurlencode($type);
+    }
+    return $href . ($resolve ? '&resolve=1' : '');
+}
+
+/**
+ * Sticky Search header: box, live hint, remote switch, and tabs with counts.
+ *
+ * @param array<string,mixed>|null $sresults
+ */
+function admin_search_render_head(string $sq, string $stype, bool $sresolve, ?array $sresults): void
+{
+    $more = is_array($sresults['has_more'] ?? null) ? $sresults['has_more'] : [];
+    echo '<div class="search-head">';
+    echo '<form class="search-form" method="get" action="?view=search" role="search">'
+        . '<input type="hidden" name="view" value="search">'
+        . '<input type="hidden" name="type" value="' . h($stype) . '" data-search-type-input>'
+        . '<div class="search-box"><span class="search-box-icon" aria-hidden="true">⌕</span>'
+        . '<input name="q" type="search" value="' . h($sq) . '" required autocomplete="off" autocapitalize="off" spellcheck="false" enterkeyhint="search"'
+        . ' placeholder="People, #tags, posts, or paste a link" aria-label="Search"' . ($sq === '' ? ' autofocus' : '') . '>'
+        . '<button type="button" class="search-clear" data-search-clear aria-label="Clear search"' . ($sq === '' ? ' hidden' : '') . '>✕</button>'
+        . '<button class="btn btn-primary search-go" type="submit">Search</button></div>'
+        . '<div class="search-intent-row"><div class="search-intent" data-search-intent aria-live="polite"></div>'
+        . '<label class="search-remote" title="When on, VAAK fetches @user@server handles and links it has not seen yet">'
+        . '<input type="checkbox" name="resolve" value="1" data-search-resolve' . ($sresolve ? ' checked' : '') . '>'
+        . '<span class="search-switch" aria-hidden="true"></span><span>Look up remote</span></label></div>'
+        . '</form>';
+    echo '<nav class="search-tabs" aria-label="Search results">';
+    foreach (['' => 'Top', 'accounts' => 'People', 'hashtags' => 'Tags', 'statuses' => 'Posts'] as $type => $label) {
+        $count = '';
+        if ($type !== '' && $sq !== '' && is_array($sresults) && ($stype === '' || $stype === $type)) {
+            $n = count(is_array($sresults[$type] ?? null) ? $sresults[$type] : []);
+            $count = '<span class="search-tab-n">' . $n . (!empty($more[$type]) ? '+' : '') . '</span>';
+        }
+        $on = $stype === $type;
+        echo '<a class="search-tab' . ($on ? ' is-active' : '') . '"' . ($on ? ' aria-current="page"' : '')
+            . ' href="' . h(admin_search_href($sq, $type, $sresolve)) . '" data-vaak-soft-nav="search" data-search-q="' . h($sq)
+            . '" data-search-type="' . h($type) . '">' . h($label) . $count . '</a>';
+    }
+    echo '</nav></div>';
+}
+
+/** Trending tag names for the empty Search page: cached trends only, same filters as the sidebar. */
+function admin_search_trending_tag_names(int $limit = 8): array
+{
+    try {
+        if (!admin_trends_display_state()['enabled'] || !function_exists('ap_masto_trends_cache_read')) {
+            return [];
+        }
+        $viewerId = admin_owner_user_id();
+        $row = ap_masto_trends_cache_read('tags', 1, true, $viewerId);
+        if (!is_array($row) || !is_array($row['items'] ?? null)) {
+            return [];
+        }
+        $refs = admin_trend_downrank_ref_set($viewerId);
+        $names = [];
+        foreach ($row['items'] as $item) {
+            $name = is_array($item) ? trim((string) ($item['name'] ?? '')) : '';
+            if ($name === '' || preg_match('/^[\p{N}_]+$/u', $name) === 1
+                || ap_masto_trend_item_hidden($item, $viewerId, [], false)
+                || admin_trend_status_is_downranked($item, $refs)) {
+                continue;
+            }
+            $names[] = $name;
+            if (count($names) >= $limit) {
+                break;
+            }
+        }
+        return $names;
+    } catch (Throwable $e) {
+        return [];
+    }
+}
+
+/** Search with no query: recent searches (browser only), trending tags, and examples. */
+function admin_search_render_start(bool $sresolve): void
+{
+    echo '<div class="search-start">';
+    echo '<section class="search-recent" data-search-recent hidden><div class="search-sec-hd"><h3>Recent</h3>'
+        . '<button type="button" class="search-sec-link" data-search-recent-clear>Clear all</button></div>'
+        . '<div class="search-chips" data-search-recent-list></div></section>';
+    $trending = admin_search_trending_tag_names();
+    if ($trending !== []) {
+        echo '<section><div class="search-sec-hd"><h3>Trending tags</h3></div><div class="search-chips">';
+        foreach ($trending as $name) {
+            echo '<a class="search-chip" href="' . h(admin_search_href('#' . $name, 'statuses', $sresolve))
+                . '" data-vaak-soft-nav="search" data-search-q="' . h('#' . $name) . '" data-search-type="statuses">#' . h($name) . '</a>';
+        }
+        echo '</div></section>';
+    }
+    echo '<section><div class="search-sec-hd"><h3>Try</h3></div><div class="search-tips">'
+        . '<button type="button" class="search-tip" data-search-fill="@"><b>Find someone anywhere</b><code>@user@server</code>'
+        . '<span>VAAK looks them up even if nobody here follows them yet.</span></button>'
+        . '<button type="button" class="search-tip" data-search-fill="#"><b>Browse a tag</b><code>#tag</code>'
+        . '<span>Recent posts from the fediverse and Bluesky.</span></button>'
+        . '<button type="button" class="search-tip" data-search-fill="https://"><b>Open a post link</b><code>https://…</code>'
+        . '<span>Paste any public post URL to read and reply to it here, even old ones.</span></button>'
+        . '</div></section></div>';
+}
+
+function admin_search_render_no_results(string $sq, bool $sresolve): void
+{
+    $bare = ltrim($sq, '@#');
+    $hostHint = preg_replace('#^https?://#i', '', ltrim($sq, '@'));
+    $hostHint = preg_replace('#/.*$#', '', (string) $hostHint);
+    $looksLikeHost = is_string($hostHint)
+        && (bool) preg_match('/^[A-Za-z0-9.-]+\.[A-Za-z]{2,}$/', $hostHint)
+        && !str_contains($hostHint, '@');
+    $isHandle = (bool) preg_match('/^@?[A-Za-z0-9_.\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$/', $sq);
+    echo '<div class="search-state"><span class="search-state-mark" aria-hidden="true">∅</span>'
+        . '<b>Nothing for “' . h($sq) . '”</b>';
+    if ($isHandle && !$sresolve) {
+        echo '<span>Look up remote is off, so only people VAAK already knows were searched.</span>'
+            . '<a class="btn btn-primary btn-compact" href="' . h(admin_search_href($sq, 'accounts', true))
+            . '" data-vaak-soft-nav="search" data-search-q="' . h($sq) . '" data-search-type="accounts">Search again with remote lookup</a>';
+    } elseif ($looksLikeHost) {
+        $host = mb_strtolower((string) $hostHint);
+        echo '<span>No people from <code>' . h($host) . '</code> are cached yet. Search only knows accounts that already federated here'
+            . ' (follows, mentions, relays). Try one person: <code>@someone@' . h($host) . '</code>.</span>';
+    } elseif (str_starts_with($sq, '#')) {
+        echo '<span>No recent posts or tags match. <a href="?view=tags">Follow the hashtag</a> to catch future posts on Home.</span>';
+    } else {
+        echo '<span>Search covers what VAAK has seen: people who federated here, followed tags and recent posts.'
+            . ' For someone new, use their full handle.</span>';
+        if ($bare !== '' && preg_match('/^[A-Za-z0-9_]{1,30}$/', $bare)) {
+            echo '<div class="search-chips">'
+                . '<a class="search-chip" href="' . h(admin_search_href('#' . $bare, 'statuses', $sresolve)) . '" data-vaak-soft-nav="search" data-search-q="'
+                . h('#' . $bare) . '" data-search-type="statuses">#' . h($bare) . '</a>'
+                . '<a class="search-chip" href="' . h(admin_search_href('@' . $bare . '@mastodon.social', 'accounts', true)) . '" data-vaak-soft-nav="search" data-search-q="'
+                . h('@' . $bare . '@mastodon.social') . '" data-search-type="accounts">@' . h($bare) . '@mastodon.social</a></div>';
+        }
+    }
+    echo '</div>';
+}
+
+/**
+ * The whole Search body, shared by the full page and the soft-nav shell.
+ *
+ * @param array<string,mixed> $followingIds
+ */
+function admin_search_render_page(string $sq, string $stype, bool $sresolve, array $followingIds): void
+{
+    $searchLimit = 20;
+    $sresults = $sq === '' ? null : admin_search_run($sq, $stype, $sresolve, $searchLimit, 0);
+    admin_search_render_head($sq, $stype, $sresolve, $sresults);
+    if ($sq === '' || !is_array($sresults)) {
+        admin_search_render_start($sresolve);
+        return;
+    }
+    $acctN = count($sresults['accounts'] ?? []);
+    $tagN = count($sresults['hashtags'] ?? []);
+    $stN = count($sresults['statuses'] ?? []);
+    $shown = match ($stype) {
+        'accounts' => $acctN,
+        'hashtags' => $tagN,
+        'statuses' => $stN,
+        default => $acctN + $tagN + $stN,
+    };
+    echo '<div class="search-results-feed' . ($stype === '' ? ' is-top' : '') . '" data-search-results="' . h($sq) . '">';
+    if ($shown === 0) {
+        if ($stype !== '' && $acctN + $tagN + $stN === 0) {
+            admin_search_render_no_results($sq, $sresolve);
+        } elseif ($stype !== '') {
+            $what = ['accounts' => 'people', 'hashtags' => 'tags', 'statuses' => 'posts'][$stype] ?? 'results';
+            echo '<div class="search-state"><b>No ' . h($what) . ' for “' . h($sq) . '”</b>'
+                . '<a href="' . h(admin_search_href($sq, '', $sresolve)) . '" data-vaak-soft-nav="search" data-search-q="' . h($sq)
+                . '" data-search-type="">Show all results</a></div>';
+        } else {
+            admin_search_render_no_results($sq, $sresolve);
+        }
+    } else {
+        admin_search_render_sections($sresults, $sq, $stype, $sresolve, $searchLimit, $followingIds);
+    }
+    echo '</div>';
+}
+
+/** Section heading with an optional jump to that section's own tab. */
+function admin_search_section_head(string $title, string $sq, string $stype, bool $sresolve, string $section, string $jump): void
+{
+    echo '<div class="search-sec-hd"><h3>' . h($title) . '</h3>';
+    if ($stype === '' && $jump !== '') {
+        echo '<a class="search-sec-link" href="' . h(admin_search_href($sq, $section, $sresolve)) . '" data-vaak-soft-nav="search" data-search-q="'
+            . h($sq) . '" data-search-type="' . h($section) . '">' . h($jump) . '</a>';
+    }
+    echo '</div>';
 }
 
 /**
@@ -13981,8 +14227,12 @@ function admin_search_render_sections(array $sresults, string $sq, string $stype
     );
     if (($stype === '' || $stype === 'accounts') && $accounts !== []) {
         $acctMore = !empty($more['accounts']);
-        echo '<h3 style="font-size:.95rem;color:var(--muted);margin:1rem 0 .5rem">Accounts</h3>';
-        admin_search_open_list('accounts', $sq, $sresolve, count($accounts), $limit, $acctMore);
+        $acctCapped = $stype === '' && ($acctMore || count($accounts) > 3);
+        echo '<section class="search-section search-section-accounts">';
+        admin_search_section_head('People', $sq, $stype, $sresolve, 'accounts',
+            $acctCapped ? 'See all ' . count($accounts) . ($acctMore ? '+' : '') . ' →' : '');
+        // Top shows three people; the People tab scrolls through the rest.
+        admin_search_open_list('accounts', $sq, $sresolve, count($accounts), $limit, $acctMore && !$acctCapped);
         if ($native !== null) {
             echo $native['accounts'];
         } else {
@@ -13995,12 +14245,13 @@ function admin_search_render_sections(array $sresults, string $sq, string $stype
                 }
             }
         }
-        admin_search_sentinel($acctMore);
-        echo '</div>';
+        admin_search_sentinel($acctMore && !$acctCapped);
+        echo '</div></section>';
     }
     if (($stype === '' || $stype === 'hashtags') && $tags !== []) {
         $tagMore = !empty($more['hashtags']);
-        echo '<h3 style="font-size:.95rem;color:var(--muted);margin:1rem 0 .5rem">Hashtags</h3>';
+        echo '<section class="search-section search-section-hashtags"><div class="search-sec-hd"><h3>Tags</h3>'
+            . ($stype === 'hashtags' ? '<a class="search-sec-link" href="?view=tags">Manage followed tags</a>' : '') . '</div>';
         admin_search_open_list('hashtags', $sq, $sresolve, count($tags), $limit, $tagMore);
         if ($native !== null) {
             echo $native['hashtags'];
@@ -14012,12 +14263,12 @@ function admin_search_render_sections(array $sresults, string $sq, string $stype
             }
         }
         admin_search_sentinel($tagMore);
-        echo '</div>';
+        echo '</div></section>';
     }
     if (($stype === '' || $stype === 'statuses') && $statuses !== []) {
         $stMore = !empty($more['statuses']);
-        echo '<h3 style="font-size:.95rem;color:var(--muted);margin:1rem 0 .5rem">Posts</h3>';
-        echo '<div class="meta" style="margin:0 0 .75rem">Open a post for the full thread · reply / boost / like / quote from the card or detail view</div>';
+        echo '<section class="search-section search-section-statuses">';
+        admin_search_section_head('Posts', $sq, $stype, $sresolve, 'statuses', ($accounts !== [] || $tags !== []) ? 'Only posts →' : '');
         admin_search_open_list('statuses', $sq, $sresolve, count($statuses), $limit, $stMore);
         if ($native !== null) {
             echo $native['statuses'];
@@ -14029,7 +14280,7 @@ function admin_search_render_sections(array $sresults, string $sq, string $stype
             }
         }
         admin_search_sentinel($stMore);
-        echo '</div>';
+        echo '</div></section>';
     }
 }
 
@@ -29301,6 +29552,112 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     .search-results-feed [data-search-list] > .tweet { margin: 0; }
     .search-results-feed [data-search-list] { display: flex; flex-direction: column; gap: .7rem; }
     .search-results-feed .search-results-meta { margin: 0 0 .2rem; }
+    /* Search page: sticky box + tabs, people rows, tag chips, start page. */
+    .search-head { --search-bsky: #4aa8ff; position: sticky; top: 0; z-index: 6; margin: 0 0 1rem;
+      background: color-mix(in srgb, var(--bg) 94%, transparent); backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px);
+      border-bottom: 1px solid var(--border); padding-top: .2rem; }
+    .search-form { margin: 0; }
+    .search-box { display: flex; align-items: center; gap: .45rem; background: var(--panel-2); border: 1px solid var(--border);
+      border-radius: 999px; padding: 0 .35rem 0 .95rem; transition: border-color .15s, box-shadow .15s; }
+    .search-box:focus-within { border-color: var(--primary); box-shadow: 0 0 0 3px var(--primary-dim); }
+    .search-box-icon { color: var(--muted); font-size: 1.05rem; line-height: 1; }
+    .search-box input[name="q"] { flex: 1 1 auto; min-width: 0; width: auto; background: none; border: 0; box-shadow: none; outline: none;
+      color: var(--text); font: inherit; font-size: 1rem; padding: .66rem 0; margin: 0; border-radius: 0; }
+    .search-box input[name="q"]::-webkit-search-cancel-button { display: none; }
+    .search-clear { flex: 0 0 auto; width: 2rem; height: 2rem; border: 0; border-radius: 50%; background: none; color: var(--muted); cursor: pointer; font-size: .95rem; }
+    .search-clear:hover { background: var(--border); color: var(--text); }
+    .search-box .search-go { flex: 0 0 auto; border-radius: 999px; min-height: 2.2rem; padding: .35rem 1rem; }
+    .search-intent-row { display: flex; align-items: center; justify-content: space-between; gap: .75rem; padding: .45rem .3rem 0; min-height: 2rem; }
+    .search-intent { flex: 1 1 auto; min-width: 0; color: var(--muted); font-size: .82rem; line-height: 1.35; }
+    .search-intent b { color: var(--text); }
+    .search-intent-chip { display: inline-block; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .7rem; padding: .05rem .5rem;
+      border-radius: 999px; background: var(--primary-dim); color: var(--primary); vertical-align: 1px; }
+    .search-intent-chip.is-bsky { background: rgba(74,168,255,.16); color: var(--search-bsky); }
+    .search-remote { flex: 0 0 auto; display: inline-flex; align-items: center; gap: .45rem; font-size: .8rem; color: var(--muted); cursor: pointer; user-select: none; white-space: nowrap; }
+    .search-remote input { position: absolute; opacity: 0; width: 1px; height: 1px; pointer-events: none; }
+    .search-switch { position: relative; width: 30px; height: 17px; border-radius: 999px; background: var(--border); transition: background .15s; }
+    .search-switch::after { content: ""; position: absolute; top: 2px; left: 2px; width: 13px; height: 13px; border-radius: 50%; background: var(--text); transition: transform .15s; }
+    .search-remote input:checked + .search-switch { background: var(--primary); }
+    .search-remote input:checked + .search-switch::after { transform: translateX(13px); background: #0b0b0b; }
+    .search-remote input:focus-visible + .search-switch { outline: 2px solid var(--primary); outline-offset: 2px; }
+    .search-tabs { display: flex; gap: .15rem; overflow-x: auto; scrollbar-width: none; margin-top: .2rem; }
+    .search-tabs::-webkit-scrollbar { display: none; }
+    .search-tab { flex: 0 0 auto; color: var(--muted); text-decoration: none; padding: .6rem .8rem .65rem; border-bottom: 2px solid transparent; font-size: .92rem; white-space: nowrap; }
+    .search-tab:hover { color: var(--text); }
+    .search-tab.is-active { color: var(--text); font-weight: 600; border-bottom-color: var(--primary); }
+    .search-tab-n { margin-left: .3rem; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .72rem; color: var(--muted); }
+    .search-tab.is-active .search-tab-n { color: var(--primary); }
+    .search-results-feed { gap: 1.3rem; }
+    .search-section { display: flex; flex-direction: column; min-width: 0; }
+    .search-sec-hd { display: flex; align-items: baseline; justify-content: space-between; gap: .75rem; margin: 0 0 .5rem; }
+    .search-sec-hd h3 { margin: 0; font-size: .78rem; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); font-weight: 600; }
+    .search-sec-link { background: none; border: 0; padding: 0; color: var(--primary); font: inherit; font-size: .84rem; cursor: pointer; text-decoration: none; white-space: nowrap; }
+    .search-sec-link:hover { text-decoration: underline; }
+    .search-section-accounts [data-search-list] { gap: 0; border: 1px solid var(--border); border-radius: 12px; overflow: hidden; background: var(--panel); }
+    .search-results-feed.is-top .search-section-accounts [data-search-list] > .search-account:nth-of-type(n+4) { display: none; }
+    .search-account { display: flex; align-items: center; gap: .75rem; padding: .75rem .85rem; min-width: 0; }
+    .search-account + .search-account { border-top: 1px solid var(--border); }
+    .search-account:hover { background: var(--panel-2); }
+    .search-account-av { position: relative; flex: 0 0 44px; width: 44px; height: 44px; }
+    .search-account-av img { width: 44px; height: 44px; border-radius: 50%; object-fit: cover; display: block; background: var(--panel-2); }
+    .search-net { position: absolute; right: -2px; bottom: -2px; width: 15px; height: 15px; border-radius: 50%; border: 2px solid var(--panel); background: var(--primary); }
+    .search-net-bsky { background: var(--search-bsky, #4aa8ff); }
+    .search-account-who { flex: 1 1 auto; min-width: 0; }
+    .search-account-name { display: flex; align-items: center; gap: .35rem; min-width: 0; font-weight: 600; }
+    .search-account-name a { color: var(--text); text-decoration: none; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+    .search-account-name a:hover { text-decoration: underline; }
+    .search-account-handle { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .76rem; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .search-account-bio { margin-top: .15rem; font-size: .84rem; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .search-account-act { flex: 0 0 auto; display: flex; align-items: center; gap: .35rem; }
+    .search-account-act form { margin: 0; display: inline; }
+    .search-account-act .btn-following { background: transparent; border: 1px solid var(--border); color: var(--text); }
+    .search-account-act .btn-following:hover { border-color: var(--danger); color: var(--danger); }
+    .search-account-open { color: var(--muted); text-decoration: none; width: 2rem; height: 2rem; display: inline-grid; place-items: center; border-radius: 50%; }
+    .search-account-open:hover { color: var(--primary); background: var(--panel-2); }
+    .search-section-hashtags [data-search-list] { flex-direction: row; flex-wrap: wrap; gap: .45rem; }
+    .search-section-hashtags [data-search-sentinel] { flex-basis: 100%; }
+    .search-tag { display: inline-flex; align-items: center; background: var(--panel-2); border: 1px solid var(--border); border-radius: 999px; overflow: hidden; max-width: 100%; }
+    .search-tag:hover { border-color: var(--primary); }
+    .search-tag.is-following { border-color: var(--primary); }
+    .search-tag-link { color: var(--text); text-decoration: none; padding: .32rem .7rem .32rem .8rem; font-size: .88rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .search-tag.is-following .search-tag-link { color: var(--primary); }
+    .search-tag form { margin: 0; display: inline-flex; }
+    .search-tag-follow { border: 0; border-left: 1px solid var(--border); background: none; color: var(--muted); cursor: pointer; padding: .32rem .65rem; font: inherit; font-weight: 700; }
+    .search-tag-follow:hover { color: #0b0b0b; background: var(--primary); }
+    .search-tag-state { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .7rem; color: var(--muted); text-decoration: none; padding: 0 .75rem 0 0; }
+    .search-section-statuses [data-search-list] > .tweet { margin: 0; }
+    mark.search-hit { background: var(--primary-dim); color: inherit; border-radius: 3px; padding: 0 .08rem; box-shadow: inset 0 -1px 0 var(--primary); }
+    .search-start { display: flex; flex-direction: column; gap: 1.3rem; }
+    .search-chips { display: flex; flex-wrap: wrap; gap: .45rem; }
+    .search-chip { display: inline-flex; align-items: center; gap: .2rem; background: var(--panel-2); border: 1px solid var(--border); border-radius: 999px;
+      padding: .32rem .8rem; font-size: .88rem; color: var(--text); text-decoration: none; max-width: 100%; }
+    .search-chip:hover { border-color: var(--primary); }
+    .search-chip-recent { padding-right: .3rem; }
+    .search-chip-recent a { color: var(--text); text-decoration: none; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .search-chip-x { border: 0; background: none; color: var(--muted); cursor: pointer; width: 1.5rem; height: 1.5rem; border-radius: 50%; font-size: .75rem; }
+    .search-chip-x:hover { color: var(--text); background: var(--border); }
+    .search-tips { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: .55rem; }
+    .search-tip { display: flex; flex-direction: column; align-items: flex-start; justify-content: flex-start; text-align: left; background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: .75rem .85rem; cursor: pointer; color: var(--text); font: inherit; }
+    .search-tip:hover { border-color: var(--primary); }
+    .search-tip b { display: block; font-size: .88rem; }
+    .search-tip code { display: inline-block; margin-top: .25rem; color: var(--primary); }
+    .search-tip span { display: block; margin-top: .25rem; color: var(--muted); font-size: .8rem; line-height: 1.35; }
+    .search-state { display: flex; flex-direction: column; align-items: center; gap: .6rem; text-align: center; padding: 2rem 1rem; color: var(--muted); }
+    .search-state b { color: var(--text); font-size: 1rem; }
+    .search-state > span { max-width: 46ch; line-height: 1.45; }
+    .search-state .search-chips { justify-content: center; }
+    .search-state-mark { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 2rem; color: var(--primary); line-height: 1; }
+    @media (max-width: 700px), (max-width: 950px) and (max-height: 520px) {
+      /* The page itself scrolls on phones under the sticky topbar; keep the head in flow. */
+      .search-head { position: static; backdrop-filter: none; -webkit-backdrop-filter: none; background: transparent; }
+      .search-remote span:last-child { font-size: .76rem; }
+      .search-account { align-items: flex-start; }
+      .search-account-act { align-self: center; }
+      .search-account-handle { white-space: normal; overflow-wrap: anywhere; }
+      .search-account-bio { white-space: normal; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+      .search-account-open { display: none; }
+      .search-box input[name="q"] { font-size: 16px; }
+    }
     /* Phones (incl. landscape): short height catches ~844×390 class viewports that
    otherwise fall into the 72px tablet icon-rail and look “squished right”. */
 @media (max-width: 700px), (max-width: 950px) and (max-height: 520px) {
@@ -36108,67 +36465,13 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
       <?php elseif ($view === 'search'): ?>
         <?php
           require_once __DIR__ . '/ap-masto-entities.php';
-          $sq = trim((string) ($_GET['q'] ?? ''));
-          $stype = preg_replace('/[^a-z]/', '', (string) ($_GET['type'] ?? '')) ?: '';
-          $sresolve = !isset($_GET['q']) || !empty($_GET['resolve']);
-          $searchLimit = 20;
-          $sresults = admin_search_run($sq, $stype, $sresolve, $searchLimit, 0);
-          $searchMore = is_array($sresults['has_more'] ?? null) ? $sresults['has_more'] : [];
+          admin_search_render_page(
+              trim((string) ($_GET['q'] ?? '')),
+              preg_replace('/[^a-z]/', '', (string) ($_GET['type'] ?? '')) ?: '',
+              !isset($_GET['q']) || !empty($_GET['resolve']),
+              $followingIds
+          );
         ?>
-        <form class="composer" method="get" action="?view=search" style="margin:0 0 1rem">
-          <input type="hidden" name="view" value="search">
-          <input name="q" type="search" value="<?= h($sq) ?>" required
-                 placeholder="text · #tag · @user@instance · or https://…/post URL" autofocus>
-          <div class="meta" style="margin:.45rem 0 .15rem;line-height:1.4">
-            Paste a public post link (Mastodon/Akkoma/etc.) to <b>fetch it into VAAK</b> and open the thread —
-            even if it was published before this instance existed.
-          </div>
-          <div style="display:flex;flex-wrap:wrap;gap:.75rem;align-items:center;margin:.6rem 0">
-            <label class="meta"><input type="radio" name="type" value="" <?= $stype === '' ? 'checked' : '' ?>> All</label>
-            <label class="meta"><input type="radio" name="type" value="accounts" <?= $stype === 'accounts' ? 'checked' : '' ?>> Accounts</label>
-            <label class="meta"><input type="radio" name="type" value="hashtags" <?= $stype === 'hashtags' ? 'checked' : '' ?>> Hashtags</label>
-            <label class="meta"><input type="radio" name="type" value="statuses" <?= $stype === 'statuses' ? 'checked' : '' ?>> Posts</label>
-            <label class="meta"><input type="checkbox" name="resolve" value="1" <?= $sresolve ? 'checked' : '' ?>> Resolve remote</label>
-          </div>
-          <div class="composer-actions">
-            <span class="meta"><a href="?view=tags">Hashtags</a></span>
-            <button class="btn btn-primary" type="submit">Search / Open</button>
-          </div>
-        </form>
-        <?php if ($sq === ''): ?>
-          <div class="empty">Search posts, tags, or accounts — or paste a remote post URL above.</div>
-        <?php else: ?>
-          <div class="search-results-feed">
-          <?php if ($sresults['accounts'] || $sresults['hashtags'] || $sresults['statuses']): ?>
-            <?php admin_search_render_summary($sq, $sresults, $searchMore); ?>
-            <?php admin_search_render_sections($sresults, $sq, $stype, $sresolve, $searchLimit, $followingIds); ?>
-          <?php endif; ?>
-          <?php if (!$sresults['accounts'] && !$sresults['hashtags'] && !$sresults['statuses']): ?>
-            <?php
-              $sqHostHint = preg_replace('#^https?://#i', '', ltrim($sq, '@'));
-              $sqHostHint = preg_replace('#/.*$#', '', (string) $sqHostHint);
-              $looksLikeHost = is_string($sqHostHint)
-                && (bool) preg_match('/^[A-Za-z0-9.-]+\.[A-Za-z]{2,}$/', $sqHostHint)
-                && !str_contains($sqHostHint, '@');
-            ?>
-            <div class="empty">
-              <?php if ($looksLikeHost): ?>
-                No people from <code><?= h(mb_strtolower($sqHostHint)) ?></code> in the local cache yet.
-                This isn’t a live instance directory — we only know accounts that already federated
-                (follows, mentions, relays). Try a specific person:
-                <code>@someone@<?= h(mb_strtolower($sqHostHint)) ?></code> with resolve enabled.
-              <?php elseif (str_starts_with($sq, '#')): ?>
-                No posts or tags matching <code><?= h($sq) ?></code> in recent federation traffic.
-                <a href="?view=tags">Follow hashtags</a> to catch future posts on Home, or try another tag.
-              <?php else: ?>
-                No matches in the local federation cache.
-                For remote people use the full <code>@user@host</code> with resolve enabled
-                (example: <code>@gargron@mastodon.social</code>).
-              <?php endif; ?>
-            </div>
-          <?php endif; ?>
-          </div>
-        <?php endif; ?>
 
       <?php elseif ($view === 'followers'): ?>
         <?php
@@ -45691,7 +45994,7 @@ window.vaakBootStatusThread();
     const q = qInput ? String(qInput.value || '').trim() : '';
     if (/^https:\/\//i.test(q)) return;
     ev.preventDefault();
-    const typeEl = form.querySelector('input[name="type"]:checked');
+    const typeEl = form.querySelector('input[name="type"]:checked, input[type="hidden"][name="type"]');
     const resolveEl = form.querySelector('input[name="resolve"]');
     const extra = {};
     if (q) extra.q = q;
@@ -46083,8 +46386,196 @@ window.vaakBootStatusThread();
     window.vaakBootPhyrianSync(document);
   }
 
+  // ---- Search page chrome: hint, clear, remote switch, recents, tag follow, highlight.
+  // All client side; nothing here asks the server for anything new.
+  const SEARCH_RECENT_KEY = 'vaak.search.recent.v1';
+  function searchRecentRead() {
+    try {
+      const raw = JSON.parse(window.localStorage.getItem(SEARCH_RECENT_KEY) || '[]');
+      return Array.isArray(raw) ? raw.filter((v) => typeof v === 'string' && v.trim()).slice(0, 8) : [];
+    } catch (e) { return []; }
+  }
+  function searchRecentWrite(list) {
+    try { window.localStorage.setItem(SEARCH_RECENT_KEY, JSON.stringify(list.slice(0, 8))); } catch (e) {}
+  }
+  function searchEsc(value) {
+    return String(value).replace(/[&<>"']/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]));
+  }
+  function searchIntentHtml(raw, resolve) {
+    const v = String(raw || '').trim();
+    if (!v) return '';
+    const chip = (label, cls) => '<span class="search-intent-chip' + (cls ? ' ' + cls : '') + '">' + label + '</span> ';
+    if (v === '@') return 'Type a name, or a full handle like @user@server.';
+    if (v === '#') return 'Type a tag name.';
+    if (/^https?:\/\/$/i.test(v)) return 'Paste a post or profile link.';
+    if (/^https?:\/\//i.test(v)) {
+      return chip('link') + (resolve ? 'Post or profile link. Search opens it here, fetching it if needed.' : 'Post or profile link. Remote lookup is off, so only posts VAAK already has.');
+    }
+    const handle = v.match(/^@?([A-Za-z0-9_.-]+)@([A-Za-z0-9.-]+\.[A-Za-z]{2,})$/);
+    if (handle) {
+      return chip('handle') + (resolve
+        ? 'Looks up <b>@' + searchEsc(handle[1]) + '</b> on ' + searchEsc(handle[2]) + '.'
+        : 'Only people VAAK already knows. Turn on Look up remote to fetch them.');
+    }
+    if (v.startsWith('#')) return chip('tag') + 'Posts and tags matching ' + searchEsc(v) + '.';
+    if (/^@?[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$/.test(v)) return chip('Bluesky', 'is-bsky') + 'Looks like a Bluesky handle or a server name.';
+    if (v.startsWith('@')) return chip('person') + 'People named ' + searchEsc(v.slice(1)) + '.';
+    return 'People, tags and posts. Press Enter to search.';
+  }
+  function paintSearchIntent(form) {
+    if (!form) return;
+    const input = form.querySelector('input[name="q"]');
+    const out = form.querySelector('[data-search-intent]');
+    const resolve = form.querySelector('[data-search-resolve]');
+    const clear = form.querySelector('[data-search-clear]');
+    if (out) out.innerHTML = searchIntentHtml(input ? input.value : '', !resolve || resolve.checked);
+    if (clear) clear.hidden = !(input && input.value);
+  }
+  function paintSearchRecent(root) {
+    const box = root.querySelector('[data-search-recent]');
+    const list = box ? box.querySelector('[data-search-recent-list]') : null;
+    if (!box || !list) return;
+    const items = searchRecentRead();
+    box.hidden = items.length === 0;
+    list.innerHTML = items.map((q, i) => {
+      const type = q.startsWith('#') ? 'statuses' : '';
+      const href = '?view=search&q=' + encodeURIComponent(q) + (type ? '&type=' + type : '') + '&resolve=1';
+      return '<span class="search-chip search-chip-recent"><a href="' + searchEsc(href) + '" data-vaak-soft-nav="search" data-search-q="'
+        + searchEsc(q) + '" data-search-type="' + type + '">' + searchEsc(q) + '</a>'
+        + '<button type="button" class="search-chip-x" data-search-recent-remove="' + i + '" aria-label="Remove ' + searchEsc(q) + '">✕</button></span>';
+    }).join('');
+  }
+  function highlightSearchTerms(scope) {
+    const results = scope && scope.closest ? (scope.closest('[data-search-results]') || scope.querySelector('[data-search-results]')) : null;
+    if (!results) return;
+    const q = String(results.getAttribute('data-search-results') || '').trim();
+    if (!q || /^https?:\/\//i.test(q) || /^@?[^@\s]+@[^@\s]+$/.test(q)) return;
+    const words = q.replace(/^[#@]/, '').split(/\s+/).map((w) => w.replace(/^[#@]/, '')).filter((w) => w.length >= 2).slice(0, 6);
+    if (!words.length) return;
+    const re = new RegExp('(' + words.map((w) => w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|') + ')', 'gi');
+    scope.querySelectorAll('.search-section-statuses .feed-body:not([data-search-marked])').forEach((body) => {
+      body.dataset.searchMarked = '1';
+      const walker = document.createTreeWalker(body, NodeFilter.SHOW_TEXT);
+      const nodes = [];
+      while (walker.nextNode()) nodes.push(walker.currentNode);
+      nodes.slice(0, 400).forEach((node) => {
+        const text = node.nodeValue;
+        re.lastIndex = 0;
+        if (!text || !re.test(text)) return;
+        const frag = document.createDocumentFragment();
+        let last = 0;
+        text.replace(re, (match, _g, offset) => {
+          if (offset > last) frag.appendChild(document.createTextNode(text.slice(last, offset)));
+          const mark = document.createElement('mark');
+          mark.className = 'search-hit';
+          mark.textContent = match;
+          frag.appendChild(mark);
+          last = offset + match.length;
+          return match;
+        });
+        if (last < text.length) frag.appendChild(document.createTextNode(text.slice(last)));
+        node.parentNode.replaceChild(frag, node);
+      });
+    });
+  }
+  function bootSearchChrome(root) {
+    const head = root.querySelector('.search-head');
+    if (!head) return;
+    paintSearchIntent(head.querySelector('form'));
+    paintSearchRecent(root);
+    const results = root.querySelector('[data-search-results]');
+    if (results) {
+      const q = String(results.getAttribute('data-search-results') || '').trim();
+      if (q && !/^https?:\/\//i.test(q)) searchRecentWrite([q].concat(searchRecentRead().filter((v) => v !== q)));
+      highlightSearchTerms(results);
+    }
+  }
+  if (!window.__vaakSearchChromeBound) {
+    window.__vaakSearchChromeBound = true;
+    document.addEventListener('input', (ev) => {
+      const input = ev.target;
+      if (!input || input.name !== 'q' || !input.closest) return;
+      paintSearchIntent(input.closest('.search-form'));
+    });
+    document.addEventListener('change', (ev) => {
+      const box = ev.target;
+      if (!box || !box.matches || !box.matches('[data-search-resolve]')) return;
+      const form = box.closest('.search-form');
+      paintSearchIntent(form);
+      const input = form ? form.querySelector('input[name="q"]') : null;
+      if (form && input && input.value.trim() && typeof form.requestSubmit === 'function') form.requestSubmit();
+    });
+    document.addEventListener('click', (ev) => {
+      const t = ev.target && ev.target.closest ? ev.target : null;
+      if (!t) return;
+      const clear = t.closest('[data-search-clear]');
+      if (clear) {
+        const form = clear.closest('.search-form');
+        const input = form ? form.querySelector('input[name="q"]') : null;
+        if (input) { input.value = ''; input.focus(); }
+        paintSearchIntent(form);
+        return;
+      }
+      const fill = t.closest('[data-search-fill]');
+      if (fill) {
+        const input = document.querySelector('.search-form input[name="q"]');
+        if (!input) return;
+        input.value = fill.getAttribute('data-search-fill') || '';
+        input.focus();
+        try { input.setSelectionRange(input.value.length, input.value.length); } catch (e) {}
+        paintSearchIntent(input.closest('.search-form'));
+        return;
+      }
+      const remove = t.closest('[data-search-recent-remove]');
+      if (remove) {
+        ev.preventDefault();
+        const list = searchRecentRead();
+        list.splice(parseInt(remove.getAttribute('data-search-recent-remove'), 10) || 0, 1);
+        searchRecentWrite(list);
+        const root = remove.closest('.search-start');
+        if (root) paintSearchRecent(root.parentNode || document);
+        return;
+      }
+      const wipe = t.closest('[data-search-recent-clear]');
+      if (wipe) {
+        searchRecentWrite([]);
+        const root = wipe.closest('.search-start');
+        if (root) paintSearchRecent(root.parentNode || document);
+      }
+    });
+    // Tag chips follow in place (follow_tag answers JSON when ajax=1).
+    document.addEventListener('submit', async (ev) => {
+      const form = ev.target;
+      if (!(form instanceof HTMLFormElement) || !form.hasAttribute('data-search-tag-follow')) return;
+      ev.preventDefault();
+      if (form.dataset.busy === '1') return;
+      form.dataset.busy = '1';
+      const fd = new FormData(form);
+      fd.set('ajax', '1');
+      if (window.VAAK_CSRF) fd.set('csrf', window.VAAK_CSRF);
+      try {
+        const res = await fetch(form.getAttribute('action') || '?view=tags', { method: 'POST', body: fd, credentials: 'same-origin',
+          headers: { Accept: 'application/json', 'X-Requested-With': 'XMLHttpRequest' } });
+        const data = await res.json().catch(() => null);
+        if (!data || !data.ok) throw new Error((data && data.error) || 'Could not follow that tag.');
+        const chip = form.closest('.search-tag');
+        if (chip) chip.classList.add('is-following');
+        const state = document.createElement('a');
+        state.className = 'search-tag-state';
+        state.href = '?view=tags';
+        state.title = 'You follow this tag. Manage followed tags';
+        state.textContent = 'following';
+        form.replaceWith(state);
+      } catch (e) {
+        form.dataset.busy = '0';
+        if (typeof window.apAdminToast === 'function') window.apAdminToast((e && e.message) || 'Could not follow that tag.', true);
+      }
+    });
+  }
+
   window.vaakBootSearch = function (main) {
     const root = main || document.querySelector('section.main');
+    if (root) bootSearchChrome(root);
     const lists = root ? root.querySelectorAll('[data-search-list]') : [];
     lists.forEach((list) => {
       if (!list || list.dataset.bound === '1') return;
@@ -46120,7 +46611,7 @@ window.vaakBootStatusThread();
           holder.innerHTML = await res.text();
           const next = holder.querySelector('[data-search-fragment]');
           if (!next) throw new Error('empty');
-          const cards = next.querySelectorAll(':scope > article.tweet');
+          const cards = next.querySelectorAll(':scope > article.tweet, :scope > article.search-account, :scope > .search-tag');
           clearLibraryLoading(sentinel, '');
           if (cards.length === 0) {
             const rawNextOffset = next.dataset.offset || '';
@@ -46136,6 +46627,7 @@ window.vaakBootStatusThread();
             list.dataset.offset = next.dataset.offset || String(offset + cards.length);
             list.dataset.hasMore = next.dataset.hasMore || res.headers.get('X-Has-More') || '0';
             if (typeof window.novaEnhanceTweetFolds === 'function') window.novaEnhanceTweetFolds(list);
+            highlightSearchTerms(list);
           }
           const hasMore = list.dataset.hasMore === '1';
           clearLibraryLoading(sentinel, hasMore ? 'Scroll for more…' : 'End of results');
@@ -46217,7 +46709,7 @@ window.vaakBootStatusThread();
   if (document.querySelector('[data-follow-list]')) {
     window.vaakBootFollowList(document.querySelector('section.main'));
   }
-  if (document.querySelector('[data-search-list]')) {
+  if (document.querySelector('[data-search-list], .search-head')) {
     window.vaakBootSearch(document.querySelector('section.main'));
   }
 })();
