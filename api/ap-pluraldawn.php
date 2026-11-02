@@ -10,6 +10,8 @@
  */
 declare(strict_types=1);
 
+require_once __DIR__ . '/ap-version.php';
+
 /** @return list<array{id:string,name:string,indicators:list<string>,avatar:string,font:string}> */
 function ap_pluraldawn_members_from_image(string $bytes): array
 {
@@ -613,7 +615,7 @@ function ap_pluraldawn_fetch_image(string $url): ?string
             CURLOPT_FOLLOWLOCATION => false,
             CURLOPT_TIMEOUT => 4,
             CURLOPT_CONNECTTIMEOUT => 2,
-            CURLOPT_USERAGENT => 'VAAK-pluraldawn/1 (+https://mkultra.monster/vaak/)',
+            CURLOPT_USERAGENT => vaak_user_agent('pluraldawn'),
             CURLOPT_HTTPHEADER => ['Accept: image/png, image/webp, */*'],
             CURLOPT_PROTOCOLS => CURLPROTO_HTTPS,
             CURLOPT_HEADERFUNCTION => static function ($ch, string $header) use (&$status, &$location): int {

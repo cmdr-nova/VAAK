@@ -63,7 +63,7 @@ pub async fn dry_run(cfg: &Config, limit: usize, fetch: bool) -> Result<ThinRepa
         Some(
             reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(8))
-                .user_agent("vaak-worker-shadow/0.1 (thin-media dry-run)")
+                .user_agent("VAAK-worker (thin-media dry-run; mkultra.monster; +https://github.com/cmdr-nova/VAAK)")
                 .build()
                 .context("build reqwest")?,
         )

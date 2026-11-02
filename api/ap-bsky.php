@@ -8,6 +8,8 @@
  */
 declare(strict_types=1);
 
+require_once __DIR__ . '/ap-version.php';
+
 require_once __DIR__ . '/ap-bsky-urls.php';
 require_once __DIR__ . '/ap-net-guard.php';
 
@@ -1944,7 +1946,7 @@ function ap_bsky_xrpc(
     }
     $headers = [
         'Accept: application/json',
-        'User-Agent: VAAK-Bluesky/1.0 (+https://mkultra.monster/vaak)',
+        'User-Agent: ' . vaak_user_agent('Bluesky'),
     ];
     if ($bearer !== null && $bearer !== '') {
         $headers[] = 'Authorization: Bearer ' . $bearer;
@@ -2701,7 +2703,7 @@ function ap_bsky_access_token(int $ownerUserId, bool $forceRefresh = false, int 
         CURLOPT_HTTPHEADER => [
             'Authorization: Bearer ' . $refresh,
             'Accept: application/json',
-            'User-Agent: VAAK-Bluesky/1.0 (+https://mkultra.monster/vaak)',
+            'User-Agent: ' . vaak_user_agent('Bluesky'),
             'Content-Length: 0',
         ],
     ]);
@@ -8630,7 +8632,7 @@ function ap_bsky_favourites_refresh_worker(int $ownerUserId, int $limit = 200): 
             CURLOPT_CONNECTTIMEOUT => 4,
             CURLOPT_HTTPHEADER => [
                 'Accept: application/json',
-                'User-Agent: VAAK-Bluesky/1.0 (+https://mkultra.monster/vaak)',
+                'User-Agent: ' . vaak_user_agent('Bluesky'),
             ],
         ]);
         $body = curl_exec($ch);
@@ -11404,7 +11406,7 @@ function ap_bsky_fetch_image_bytes(string $url): array
         CURLOPT_FOLLOWLOCATION => false,
         CURLOPT_CONNECTTIMEOUT => min(AP_BSKY_CONNECT_TIMEOUT, $dlTimeout),
         CURLOPT_TIMEOUT => $dlTimeout,
-        CURLOPT_USERAGENT => 'VAAK-Bluesky/1.0 (+https://mkultra.monster/vaak)',
+        CURLOPT_USERAGENT => vaak_user_agent('Bluesky'),
     ]);
     $bytes = curl_exec($ch);
     $status = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
@@ -11522,7 +11524,7 @@ function ap_bsky_upload_blob(string $pdsHost, string $accessJwt, string $bytes, 
             'Authorization: Bearer ' . $accessJwt,
             'Content-Type: ' . $mime,
             'Accept: application/json',
-            'User-Agent: VAAK-Bluesky/1.0 (+https://mkultra.monster/vaak)',
+            'User-Agent: ' . vaak_user_agent('Bluesky'),
         ],
         CURLOPT_POSTFIELDS => $bytes,
         CURLOPT_HEADERFUNCTION => static function ($ch, string $line) use (&$respHeaders): int {
@@ -11572,7 +11574,7 @@ function ap_bsky_fetch_video_bytes(string $url, string $hintMime = ''): array
         CURLOPT_FOLLOWLOCATION => false,
         CURLOPT_CONNECTTIMEOUT => 10,
         CURLOPT_TIMEOUT => 120,
-        CURLOPT_USERAGENT => 'VAAK-Bluesky/1.0 (+https://mkultra.monster/vaak)',
+        CURLOPT_USERAGENT => vaak_user_agent('Bluesky'),
         CURLOPT_ENCODING => 'identity',
     ]);
     $bytes = curl_exec($ch);
@@ -11762,7 +11764,7 @@ function ap_bsky_upload_video(
             'Content-Type: ' . $contentType,
             'Content-Length: ' . (string) strlen($bytes),
             'Accept: application/json',
-            'User-Agent: VAAK-Bluesky/1.0 (+https://mkultra.monster/vaak)',
+            'User-Agent: ' . vaak_user_agent('Bluesky'),
         ],
         CURLOPT_POSTFIELDS => $bytes,
         CURLOPT_HEADERFUNCTION => static function ($ch, string $line) use (&$respHeaders): int {

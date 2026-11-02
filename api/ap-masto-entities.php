@@ -2167,6 +2167,9 @@ function ap_masto_instance_v1(): array
         ? ap_masto_account_from_user($contactUser)
         : ap_masto_account_by_id('1') ?? ap_masto_account();
     $userCount = function_exists('ap_db_enabled_user_count') ? ap_db_enabled_user_count() : 1;
+    if (!defined('VAAK_VERSION')) {
+        require_once __DIR__ . '/ap-version.php';
+    }
     return [
         'uri' => 'mkultra.monster',
         'title' => 'NovaLandia',
@@ -2174,7 +2177,7 @@ function ap_masto_instance_v1(): array
         'description' => $description,
         'email' => 'cmdr-nova@mkultra.monster',
         // 4.5 + api_versions.mastodon≥7 → Ice Cubes uses native quote cards (Status.quote)
-        'version' => '4.5.0 (compatible; vaak)',
+        'version' => '4.5.0 (compatible; VAAK ' . VAAK_VERSION . ')',
         'urls' => (object) [
             'privacy_policy' => 'https://mkultra.monster/vaak/privacy/',
         ],

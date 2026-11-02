@@ -19,6 +19,8 @@
  */
 declare(strict_types=1);
 
+require_once __DIR__ . '/ap-version.php';
+
 const AP_LISTENBRAINZ_API = 'https://api.listenbrainz.org';
 /** A playing-now snapshot older than this (seconds) is shown as "Last played". */
 const AP_LISTENBRAINZ_PLAYING_FRESH = 600;
@@ -366,7 +368,7 @@ function ap_listenbrainz_http_get(string $path): array
         CURLOPT_TIMEOUT => 6,
         CURLOPT_MAXFILESIZE => 262144,
         CURLOPT_PROTOCOLS => CURLPROTO_HTTPS,
-        CURLOPT_USERAGENT => 'VAAK/1.0 ( https://mkultra.monster/vaak/ )',
+        CURLOPT_USERAGENT => vaak_user_agent('ListenBrainz'),
         CURLOPT_HTTPHEADER => ['Accept: application/json'],
         CURLOPT_HEADERFUNCTION => static function ($handle, string $line) use (&$resetIn): int {
             if (stripos($line, 'x-ratelimit-reset-in:') === 0) {

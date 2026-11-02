@@ -5,6 +5,8 @@
  */
 declare(strict_types=1);
 
+require_once __DIR__ . '/ap-version.php';
+
 require_once __DIR__ . '/ap-redis.php';
 require_once __DIR__ . '/ap-net-guard.php';
 require_once __DIR__ . '/ap-public-doc.php';
@@ -11758,7 +11760,7 @@ function ap_bsky_public_profile_counts(string $handle, int $ttlSec = 120, bool $
         CURLOPT_TIMEOUT => 6,
         CURLOPT_HTTPHEADER => [
             'Accept: application/json',
-            'User-Agent: VAAK-Bluesky/1.0 (+https://mkultra.monster/vaak)',
+            'User-Agent: ' . vaak_user_agent('Bluesky'),
         ],
     ]);
     $body = curl_exec($ch);

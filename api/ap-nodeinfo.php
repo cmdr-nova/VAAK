@@ -34,6 +34,8 @@ if ($uri === '/.well-known/nodeinfo') {
     exit;
 }
 
+require_once __DIR__ . '/ap-version.php';
+
 $is21 = str_ends_with($uri, '/2.1');
 $users = 1;
 $posts = 0;
@@ -55,7 +57,7 @@ $doc = [
     'version' => $is21 ? '2.1' : '2.0',
     'software' => [
         'name' => 'vaak',
-        'version' => '1.0.0',
+        'version' => VAAK_VERSION,
     ],
     'protocols' => ['activitypub'],
     'services' => [
@@ -73,13 +75,14 @@ $doc = [
     'openRegistrations' => false,
     'metadata' => [
         'nodeName' => 'NovaLandia',
-        'nodeDescription' => 'Invite-only ActivityPub / Mastodon-compatible instance (NovaLandia).',
+        'nodeDescription' => 'NovaLandia is an invite-only community on mkultra.monster running VAAK, '
+            . 'an independent fediverse (ActivityPub) and Bluesky app. About VAAK: ' . VAAK_HOMEPAGE,
     ],
 ];
 
 if ($is21) {
-    $doc['software']['repository'] = 'https://mkultra.monster/';
-    $doc['software']['homepage'] = 'https://mkultra.monster/';
+    $doc['software']['repository'] = VAAK_HOMEPAGE;
+    $doc['software']['homepage'] = VAAK_HOMEPAGE;
 }
 
 header('Content-Type: application/json; profile="http://nodeinfo.diaspora.software/ns/schema/'
