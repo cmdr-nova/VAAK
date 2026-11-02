@@ -19745,6 +19745,7 @@ function block_quick_actions(?string $actorId, ?string $host, string $returnView
         $menu .= '<a class="menu-action" href="?view=dms&amp;peer=' . h(rawurlencode($actorId)) . '">DM</a>';
     } elseif (!$isSelf && !is_array($personalBlock)
         && preg_match('~^https://bsky\.app/profile/([^/?#]+)$~i', $actorId, $bskyDmMatch)
+        && function_exists('ap_bsky_chat_ready_for')
         && ap_bsky_chat_ready_for($ownerUserId > 0 ? $ownerUserId : (function_exists('admin_owner_user_id') ? admin_owner_user_id() : 0))) {
         // Bluesky actors get a Bluesky DM (chat.bsky), never the fediverse composer.
         $menu .= '<a class="menu-action" href="?view=dms&amp;new=1&amp;to=' . h(rawurlencode('bsky:' . rawurldecode($bskyDmMatch[1]))) . '">DM on Bluesky</a>';
