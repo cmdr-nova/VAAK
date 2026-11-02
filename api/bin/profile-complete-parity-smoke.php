@@ -141,6 +141,20 @@ try {
         'bsky-repost-parity',
         '2026-10-27T12:00:00Z',
     ]);
+    // A local boost writes masto_reblogs too; signed-in Boosts page that history.
+    $pdo->prepare(
+        'INSERT INTO masto_reblogs (owner_user_id, owner_actor_id, status_id, boost_status_id, object_id, target_actor, announce_activity_id, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+    )->execute([
+        $ownerId,
+        $actor,
+        'local-boost-parity',
+        'local-boost-parity',
+        $notes['pin-public']['id'],
+        $actor,
+        $actor . '/announces/parity',
+        '2026-10-27T12:00:02Z',
+    ]);
 
     $phpPosts = $pdo->prepare(
         "SELECT id FROM outbox_notes WHERE id LIKE ? AND COALESCE(visibility,'public') = 'public' AND TRIM(COALESCE(in_reply_to, '')) = '' ORDER BY published DESC"
@@ -174,7 +188,7 @@ try {
     parity_check(in_array($notes['bsky-post']['id'], $mediaIds, true) && in_array($notes['media']['id'], $mediaIds, true), 'PHP media includes Bluesky and local attachments');
     parity_check(!in_array($notes['hidden-private']['id'], $postIds, true), 'PHP public posts omit a private note');
     parity_check($boostCount === 1, 'PHP boosts tab selects the Announce');
-    parity_check($boostTotal === 1, 'PHP boost count includes the Bluesky repost row');
+    parity_check($boostTotal === 2, 'PHP boost count includes the local boost and the Bluesky repost row');
     parity_check(array_column($pinRows, 'content_text') === ['PIN-PUBLIC', 'PIN-FOLLOWERS', 'PIN-DIRECT'], 'PHP pin selection keeps public, followers-only, and direct pins');
 
     $request = static function (string $path, array $body) use ($url, $secret): array {
@@ -248,7 +262,7 @@ try {
     parity_check($media['json']['page']['source_count'] === count($mediaIds), 'media count matches PHP');
     parity_check(str_contains($media['html'], 'BSKY-POST') && str_contains($media['html'], 'MEDIA-POST'), 'media tab shows both attachments');
     $boosts = $page('boosts', 0, $owner);
-    parity_check($boosts['json']['page']['source_count'] === $boostCount, 'boosts count matches the PHP Announce selection');
+    parity_check($boosts['json']['page']['source_count'] === $boostTotal, 'signed-in boosts page every masto_reblogs row');
     parity_check(str_contains($boosts['html'], 'PIN-PUBLIC') && !str_contains($boosts['html'], 'HIDDEN-PRIVATE'), 'boost card shows the public original only');
 
     $full = static function (array $viewer) use ($request, $key, $actor): string {
