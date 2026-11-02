@@ -43603,6 +43603,8 @@ window.apAdminToast = function (msg, isErr) {
       }
       if (want && res.followed) msg = 'Followed and a' + msg.slice(1);
       window.apAdminToast(msg);
+      // Done: close the picker once the change saved (a failure keeps it open).
+      if (folderPopover === pop) closeFolderPopover();
     });
   }
   window.vaakOpenListPicker = openListPicker;
