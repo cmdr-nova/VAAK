@@ -29952,6 +29952,8 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     .dm-workspace a.dm-conversation-row:hover, .dm-workspace a.dm-conversation-row:hover *,
     .dm-workspace a.dm-peer:hover, .dm-workspace a.dm-peer:hover *,
     .dm-workspace a.btn:hover { text-decoration: none; }
+    .dm-workspace.is-navigating { cursor: progress; }
+    .dm-workspace.is-navigating .dm-pane { opacity: .55; transition: opacity .12s ease; }
     .dm-conversation-row:focus-visible, .dm-peer:focus-visible { outline: 2px solid var(--primary); outline-offset: -2px; }
     .dm-conversation-avatar { flex: 0 0 2.35rem; width: 2.35rem; height: 2.35rem; }
     .dm-conversation-avatar img { width: 100%; height: 100%; object-fit: cover; border-radius: 50%; }
@@ -33978,13 +33980,13 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
               <details class="dm-convo-menu">
                 <summary class="btn btn-ghost" aria-label="Conversation options" title="Conversation options">⋯</summary>
                 <div class="dm-convo-menu-body">
-                  <form method="post" action="?view=dms&amp;bsky=<?= urlencode($dmBskyConvoId) ?>" data-dm-action>
+                  <form method="post" action="?view=dms&amp;bsky=<?= urlencode($dmBskyConvoId) ?>" data-dm-action data-ajax-submit="1">
                     <input type="hidden" name="action" value="bsky_dm_action">
                     <input type="hidden" name="convo" value="<?= h($dmBskyConvoId) ?>">
                     <input type="hidden" name="op" value="<?= $dmBskyMuted ? 'unmute' : 'mute' ?>">
                     <button class="menu-action" type="submit"><?= $dmBskyMuted ? 'Unmute conversation' : 'Mute conversation' ?></button>
                   </form>
-                  <form method="post" action="?view=dms" data-dm-action data-dm-confirm="Tap again to leave">
+                  <form method="post" action="?view=dms" data-dm-action data-ajax-submit="1" data-dm-confirm="Tap again to leave">
                     <input type="hidden" name="action" value="bsky_dm_action">
                     <input type="hidden" name="convo" value="<?= h($dmBskyConvoId) ?>">
                     <input type="hidden" name="op" value="leave">
@@ -33997,13 +33999,13 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
               <div class="dm-bsky-request" role="note">
                 <div><b><?= h(admin_bsky_dm_peer_name($dmBskyConvo)) ?></b> wants to message you on Bluesky. Accept to keep chatting, or decline to remove the request. Replying also accepts it.</div>
                 <div class="dm-bsky-request-actions">
-                  <form method="post" action="?view=dms&amp;bsky=<?= urlencode($dmBskyConvoId) ?>" data-dm-action>
+                  <form method="post" action="?view=dms&amp;bsky=<?= urlencode($dmBskyConvoId) ?>" data-dm-action data-ajax-submit="1">
                     <input type="hidden" name="action" value="bsky_dm_action">
                     <input type="hidden" name="convo" value="<?= h($dmBskyConvoId) ?>">
                     <input type="hidden" name="op" value="accept">
                     <button class="btn btn-primary" type="submit">Accept</button>
                   </form>
-                  <form method="post" action="?view=dms" data-dm-action data-dm-confirm="Tap again to decline">
+                  <form method="post" action="?view=dms" data-dm-action data-ajax-submit="1" data-dm-confirm="Tap again to decline">
                     <input type="hidden" name="action" value="bsky_dm_action">
                     <input type="hidden" name="convo" value="<?= h($dmBskyConvoId) ?>">
                     <input type="hidden" name="op" value="decline">
@@ -34129,7 +34131,7 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
           </section>
         </div>
         <script>
-        (function () {
+        window.vaakDmMediaBoot = function () {
           document.querySelectorAll('form.composer .dm-media-input').forEach(function (input) {
             const form = input.form;
             if (!form || form.dataset.dmMediaBound === '1' || typeof DataTransfer !== 'function') return;
@@ -34316,10 +34318,11 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
               addDmFiles(Array.from((event.dataTransfer && event.dataTransfer.files) || []));
             });
           });
-        })();
+        };
+        window.vaakDmMediaBoot();
         </script>
         <script>
-        (function () {
+        window.vaakDmBoot = function () {
           // DM screen: chat grouping, live thread, send without a page load,
           // conversation search, and the New message picker. Only runs on this
           // screen, so nothing here polls once you leave it.
@@ -34333,6 +34336,124 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
           const endMarker = document.getElementById('dm-message-last');
           const coarse = window.matchMedia && window.matchMedia('(pointer: coarse)').matches;
           const toast = function (msg, isErr) { if (window.apAdminToast) window.apAdminToast(msg, !!isErr); };
+
+          // ---- in-place navigation ----
+          // Opening a conversation, New message, and the request/menu actions
+          // swap #dm-workspace instead of loading the whole page. Each swap
+          // tears down this controller (timers, document listeners) and boots
+          // a fresh one on the new markup.
+          if (typeof window.vaakDmTeardown === 'function') window.vaakDmTeardown();
+          const life = typeof AbortController === 'function' ? new AbortController() : null;
+          const on = life ? { signal: life.signal } : undefined;
+          let alive = true;
+          window.vaakDmTeardown = function () {
+            alive = false;
+            if (life) life.abort();
+            [listTimer, pollTimer, bskyListTimer].forEach(function (t) { if (t) window.clearTimeout(t); });
+          };
+          window.vaakDmLive = function () {
+            const ws = document.getElementById('dm-workspace');
+            return !!ws && ws.getClientRects().length > 0;
+          };
+          function dmUrl(href) {
+            try {
+              const u = new URL(href, window.location.href);
+              return u.origin === window.location.origin && u.searchParams.get('view') === 'dms' ? u : null;
+            } catch (e) { return null; }
+          }
+          function workspaceHref(ws) {
+            const b = ws.getAttribute('data-dm-bsky') || '';
+            const p = ws.getAttribute('data-dm-peer') || '';
+            const u = new URL(window.location.href);
+            u.search = '?view=dms' + (b ? '&bsky=' + encodeURIComponent(b) : (p ? '&peer=' + encodeURIComponent(p) : ''));
+            return u.href;
+          }
+          function swapIn(html, href, push) {
+            const doc = new DOMParser().parseFromString(html, 'text/html');
+            const next = doc.getElementById('dm-workspace');
+            const live = document.getElementById('dm-workspace');
+            if (!next || !live) return false;
+            const target = href || workspaceHref(next);
+            window.vaakDmTeardown();
+            live.replaceWith(document.adoptNode(next));
+            doc.querySelectorAll('.flash').forEach(function (flash) {
+              const text = (flash.querySelector('span') || flash).textContent.trim();
+              if (text) toast(text, flash.classList.contains('err'));
+            });
+            if (doc.title) document.title = doc.title;
+            if (doc.body) document.body.classList.toggle('dm-peer-open', doc.body.classList.contains('dm-peer-open'));
+            if (push) {
+              if (target !== window.location.href) window.history.pushState({ vaakDm: 1 }, '', target);
+            } else if (href === null) {
+              window.history.replaceState({ vaakDm: 1 }, '', target);
+            }
+            if (typeof window.vaakDmMediaBoot === 'function') window.vaakDmMediaBoot();
+            window.vaakDmBoot();
+            return true;
+          }
+          // href: where the address bar should point (null = derive from the new workspace).
+          function go(url, init, href, push) {
+            const seq = (window.__vaakDmNavSeq = (window.__vaakDmNavSeq || 0) + 1);
+            workspace.classList.add('is-navigating');
+            workspace.setAttribute('aria-busy', 'true');
+            const isPost = !!(init && init.method === 'POST');
+            return fetch(url, Object.assign({ credentials: 'same-origin', cache: 'no-store', headers: { 'Accept': 'text/html' } }, init || {}))
+              .then(function (res) {
+                if (!res.ok && !isPost) throw new Error('HTTP ' + res.status);
+                return res.text();
+              })
+              .then(function (html) {
+                if (seq !== window.__vaakDmNavSeq) return;
+                if (!swapIn(html, href, push)) {
+                  if (!isPost) window.location.assign(url);
+                  else window.location.reload();
+                }
+              })
+              .catch(function () {
+                if (seq !== window.__vaakDmNavSeq) return;
+                if (!isPost) { window.location.assign(url); return; }
+                workspace.classList.remove('is-navigating');
+                workspace.removeAttribute('aria-busy');
+                toast('Network error. That did not go through.', true);
+              });
+          }
+          window.vaakDmGo = function (url, push) { return go(url, null, url, push !== false); };
+          if (life) {
+            document.addEventListener('click', function (event) {
+              if (event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+              const link = event.target.closest && event.target.closest('a[href]');
+              if (!link || !link.closest('#dm-workspace') || link.target === '_blank' || link.hasAttribute('download')) return;
+              const u = dmUrl(link.getAttribute('href') || '');
+              if (!u) return;
+              event.preventDefault();
+              // The shared link listener may already have shown Loading….
+              window.__vaakNavigationPending = false;
+              if (typeof window.vaakHideLoading === 'function') window.vaakHideLoading();
+              go(u.href, null, u.href, true);
+            }, { capture: true, signal: life.signal });
+            document.addEventListener('submit', function (event) {
+              const form = event.target;
+              if (event.defaultPrevented || !(form instanceof HTMLFormElement) || !form.hasAttribute('data-dm-action') || !form.closest('#dm-workspace')) return;
+              event.preventDefault();
+              if (typeof window.vaakHideLoading === 'function') window.vaakHideLoading();
+              const fd = new FormData(form);
+              if (event.submitter && event.submitter.name) fd.set(event.submitter.name, event.submitter.value);
+              if (typeof window.vaakCsrfApply === 'function') window.vaakCsrfApply(fd);
+              go(form.getAttribute('action') || '?view=dms', {
+                method: 'POST', body: fd, credentials: 'same-origin', cache: 'no-store',
+                headers: { 'Accept': 'text/html', 'X-VAAK-CSRF': window.VAAK_CSRF || '' },
+              }, null, true);
+            }, life ? { signal: life.signal } : false);
+            if (!window.__vaakDmPopBound) {
+              window.__vaakDmPopBound = true;
+              window.addEventListener('popstate', function () {
+                const u = dmUrl(window.location.href);
+                if (u && window.vaakDmLive && window.vaakDmLive() && typeof window.vaakDmGo === 'function') {
+                  window.vaakDmGo(u.href, false);
+                }
+              });
+            }
+          }
 
           // ---- grouping, day separators, local times ----
           function dayKey(d) { return d.getFullYear() + '-' + (d.getMonth() + 1) + '-' + d.getDate(); }
@@ -34414,7 +34535,7 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
             }, { passive: true });
             regroup();
             [0, 50, 150, 400, 900].forEach(function (delay) { window.setTimeout(scheduleFocus, delay); });
-            window.addEventListener('load', scheduleFocus, { once: true });
+            window.addEventListener('load', scheduleFocus, life ? { once: true, signal: life.signal } : { once: true });
             thread.addEventListener('load', function () { if (stickToBottom) focusLatestDm(); }, true);
           }
 
@@ -34500,7 +34621,7 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
               fetch('?ajax=dm_list&peer=' + encodeURIComponent(peer) + '&bsky=' + encodeURIComponent(bskyConvo), { credentials: 'same-origin', headers: { 'Accept': 'application/json' }, cache: 'no-store' })
                 .then(function (res) { return res.ok ? res.json() : null; })
                 .then(function (data) {
-                  if (!data || !data.ok || typeof data.html !== 'string') return;
+                  if (!alive || !data || !data.ok || typeof data.html !== 'string') return;
                   list.innerHTML = data.html;
                   applyFilter();
                   if (data.bsky_scope === false && !document.getElementById('dm-bsky-scope')) {
@@ -34523,12 +34644,12 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
           }
           window.addEventListener('vaak:dm-activity', function () {
             fetchNew().then(refreshList);
-          });
+          }, on);
           let pollTimer = 0;
           function schedulePoll() {
             if (pollTimer) window.clearTimeout(pollTimer);
             pollTimer = 0;
-            if ((!peer && !bskyConvo) || document.visibilityState !== 'visible') return;
+            if (!alive || (!peer && !bskyConvo) || document.visibilityState !== 'visible') return;
             pollTimer = window.setTimeout(function () {
               fetchNew().then(schedulePoll);
             }, 15000);
@@ -34539,7 +34660,7 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
           function scheduleBskyList() {
             if (bskyListTimer) window.clearTimeout(bskyListTimer);
             bskyListTimer = 0;
-            if (!bskyOn || document.visibilityState !== 'visible') return;
+            if (!alive || !bskyOn || document.visibilityState !== 'visible') return;
             bskyListTimer = window.setTimeout(function () {
               refreshList();
               scheduleBskyList();
@@ -34548,14 +34669,14 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
           if (bskyOn) {
             refreshList();
             scheduleBskyList();
-            document.addEventListener('visibilitychange', scheduleBskyList);
+            document.addEventListener('visibilitychange', scheduleBskyList, on);
           }
           document.addEventListener('visibilitychange', function () {
             if (document.visibilityState === 'visible') {
               fetchNew().then(refreshList);
             }
             schedulePoll();
-          });
+          }, on);
           schedulePoll();
 
           // ---- Bluesky reactions and conversation actions ----
@@ -34628,10 +34749,10 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
             });
             document.addEventListener('click', function (event) {
               if (reactPop && !event.target.closest('.dm-react-pop, [data-dm-react-open]')) closeReactPop();
-            });
+            }, on);
             document.addEventListener('keydown', function (event) {
               if (event.key === 'Escape') closeReactPop();
-            });
+            }, on);
           }
           // Leave/decline need a second tap; nothing here opens a browser dialog.
           document.querySelectorAll('form[data-dm-confirm]').forEach(function (form) {
@@ -34748,7 +34869,9 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
                     return;
                   }
                   if (kind === 'new') {
-                    window.location.assign(data.href || ('?view=dms&peer=' + encodeURIComponent(data.peer || '')));
+                    const nextHref = data.href || ('?view=dms&peer=' + encodeURIComponent(data.peer || ''));
+                    if (life) window.vaakDmGo(new URL(nextHref, window.location.href).href, true);
+                    else window.location.assign(nextHref);
                     return;
                   }
                   form.reset();
@@ -34864,7 +34987,8 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
               if (!to.value) to.focus();
             }
           }
-        })();
+        };
+        window.vaakDmBoot();
         </script>
 
       <?php elseif ($view === 'report'): ?>
@@ -48093,6 +48217,8 @@ window.vaakBootStatusThread();
     // Back to DMs, Notices, a post, and the other full-page views. The forward
     // trip swapped only the center column, so this has to load that document.
     if (!SOFT_VIEWS.has(view)) {
+      // The DM screen swaps its own workspace between conversations.
+      if (view === 'dms' && typeof window.vaakDmLive === 'function' && window.vaakDmLive()) return;
       window.location.reload();
       return;
     }
