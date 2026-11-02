@@ -80,6 +80,7 @@ reference_load($root . '/api/ap-admin.php', [
     'admin_bsky_dm_message_rows_html',
     'admin_bsky_dm_last_rev',
     'admin_dm_unread_tip_join',
+    'admin_bsky_dm_reactions_html',
 ]);
 
 $db = new PDO('sqlite::memory:');
@@ -284,6 +285,66 @@ $mixed = admin_dm_conversation_list_html($fedi, '', ap_bsky_chat_conversations(1
 bdm_check(strpos($mixed, 'bsky=c-ada') < strpos($mixed, 'remote.test'), 'fediverse and Bluesky conversations interleave by time');
 bdm_check(admin_dm_unread_tip_join('12', '') === '12' && admin_dm_unread_tip_join('12', '3m') === '12:b3m', 'the unread tip changes when either network has news');
 
+// ---- reactions ----
+$reacted = static fn (array $reactions): array => ['ok' => true, 'json' => ['message' => [
+    '$type' => 'chat.bsky.convo.defs#messageView', 'id' => 'm2', 'rev' => '3m1', 'text' => 'see https://example.com',
+    'sender' => ['did' => $GLOBALS['ada_did']], 'sentAt' => '2026-11-02T10:05:00.000Z', 'reactions' => $reactions,
+]]];
+$GLOBALS['bsky_answers']['chat.bsky.convo.addReaction'] = static fn (?array $q, ?array $b): array => $reacted([
+    ['value' => '🔥', 'sender' => ['did' => $GLOBALS['ada_did']], 'createdAt' => '2026-11-02T10:06:00.000Z'],
+    ['value' => (string) $b['value'], 'sender' => ['did' => $GLOBALS['me_did']], 'createdAt' => '2026-11-02T10:07:00.000Z'],
+]);
+$GLOBALS['bsky_answers']['chat.bsky.convo.removeReaction'] = static fn (?array $q, ?array $b): array => $reacted([
+    ['value' => '🔥', 'sender' => ['did' => $GLOBALS['ada_did']], 'createdAt' => '2026-11-02T10:06:00.000Z'],
+]);
+bdm_check(ap_bsky_chat_action(1, 'c-ada', 'react', 'm2', 'not one')['ok'] === false, 'a reaction must be a single emoji');
+bdm_check(ap_bsky_chat_action(1, 'c-ada', 'react', 'm2', '<b>')['ok'] === false, 'markup is never a reaction');
+$GLOBALS['calls'] = [];
+$res = ap_bsky_chat_action(1, 'c-ada', 'react', 'm2', '🔥');
+bdm_check(!empty($res['ok']) && bdm_calls('chat.bsky.convo.addReaction') === 1, 'reacting calls addReaction');
+bdm_check(end($GLOBALS['calls'])['body'] === ['convoId' => 'c-ada', 'messageId' => 'm2', 'value' => '🔥'], 'addReaction gets conversation, message and emoji');
+$chips = ap_bsky_chat_reactions(1, 'c-ada', $me);
+bdm_check(($chips['m2'][0] ?? []) === ['value' => '🔥', 'count' => 2, 'mine' => true], 'same emoji from two people is one chip with a count, marked as yours');
+$chipHtml = admin_bsky_dm_reactions_html($chips['m2']);
+bdm_check(str_contains($chipHtml, 'dm-reaction is-mine') && str_contains($chipHtml, 'aria-pressed="true"') && str_contains($chipHtml, '>2</span>'), 'your reaction chip is pressed and shows the count');
+ap_bsky_chat_action(1, 'c-ada', 'unreact', 'm2', '🔥');
+$chips = ap_bsky_chat_reactions(1, 'c-ada', $me);
+bdm_check(($chips['m2'][0] ?? []) === ['value' => '🔥', 'count' => 1, 'mine' => false], 'removing your reaction leaves theirs');
+$GLOBALS['bsky_answers']['chat.bsky.convo.getLog'] = [
+    ['ok' => true, 'json' => ['logs' => [
+        ['$type' => 'chat.bsky.convo.defs#logRemoveReaction', 'rev' => '3p1', 'convoId' => 'c-ada',
+            'message' => ['$type' => 'chat.bsky.convo.defs#messageView', 'id' => 'm2', 'rev' => '3m1', 'text' => 'see https://example.com', 'sender' => ['did' => $ada], 'sentAt' => '2026-11-02T10:05:00.000Z']],
+    ]]],
+    ['ok' => true, 'json' => ['logs' => []]],
+];
+$GLOBALS['bsky_answers']['chat.bsky.convo.getConvo'] = static fn (?array $q): array => ['ok' => true, 'json' => ['convo' => array_merge($GLOBALS['convo_a'], ['unreadCount' => 0])]];
+$GLOBALS['convo_a'] = $convoA;
+$GLOBALS['ap_bsky_chat_now'] += 700; // past the scope back-off above
+ap_bsky_chat_sync(1);
+bdm_check(ap_bsky_chat_reactions(1, 'c-ada', $me) === [], 'a reaction removed on Bluesky disappears after the next refresh');
+$rowsHtml = admin_bsky_dm_message_rows_html(ap_bsky_chat_messages(1, 'c-ada'), $me, ap_bsky_chat_convo(1, 'c-ada'), ['m2' => [['value' => '😂', 'count' => 1, 'mine' => false]]]);
+bdm_check(str_contains($rowsHtml, 'data-dm-react-open="m2"') && str_contains($rowsHtml, 'data-dm-react-for="m2">' . '<button class="dm-reaction"'), 'rows carry a react button and their chips');
+bdm_check(!str_contains($rowsHtml, 'data-dm-react-open="m1"'), 'deleted messages cannot be reacted to');
+
+// ---- requests, mute, leave ----
+$GLOBALS['bsky_answers']['chat.bsky.convo.acceptConvo'] = ['ok' => true, 'json' => ['rev' => '3q1']];
+$GLOBALS['bsky_answers']['chat.bsky.convo.muteConvo'] = static fn (?array $q, ?array $b): array => ['ok' => true, 'json' => ['convo' => array_merge($GLOBALS['convo_a'], ['muted' => true, 'unreadCount' => 0])]];
+$GLOBALS['bsky_answers']['chat.bsky.convo.unmuteConvo'] = static fn (?array $q, ?array $b): array => ['ok' => true, 'json' => ['convo' => array_merge($GLOBALS['convo_a'], ['muted' => false, 'unreadCount' => 0])]];
+$GLOBALS['bsky_answers']['chat.bsky.convo.leaveConvo'] = static fn (?array $q, ?array $b): array => ['ok' => true, 'json' => ['convoId' => $b['convoId'], 'rev' => '3q2']];
+$db->exec("UPDATE bsky_chat_convos SET status = 'request' WHERE convo_id = 'c-ada'");
+bdm_check(!empty(ap_bsky_chat_action(1, 'c-ada', 'accept')['ok']) && ap_bsky_chat_convo(1, 'c-ada')['status'] === 'accepted', 'accepting a request marks it accepted');
+bdm_check(!empty(ap_bsky_chat_action(1, 'c-ada', 'mute')['ok']) && (int) ap_bsky_chat_convo(1, 'c-ada')['muted'] === 1, 'muting stores the muted flag');
+bdm_check(str_contains(admin_dm_conversation_list_html([], '', ap_bsky_chat_conversations(1), '', $me), 'dm-muted-mark'), 'muted conversations show a bell mark');
+bdm_check(!empty(ap_bsky_chat_action(1, 'c-ada', 'unmute')['ok']) && (int) ap_bsky_chat_convo(1, 'c-ada')['muted'] === 0, 'unmuting clears it');
+bdm_check(ap_bsky_chat_action(1, 'c-ada', 'explode')['ok'] === false, 'unknown actions are refused');
+bdm_check(ap_bsky_chat_action(1, 'c-none', 'leave')['ok'] === false, 'actions need a known conversation');
+bdm_check(ap_bsky_chat_convo_for_peer(1, $ada) !== null && ap_bsky_chat_convo_for_peer(1, 'did:plc:stranger') === null, 'a Bluesky profile finds the existing chat, and only that one');
+$left = ap_bsky_chat_action(1, 'c-new', 'decline');
+bdm_check(!empty($left['ok']) && !empty($left['gone']) && ap_bsky_chat_convo(1, 'c-new') === null, 'declining leaves on Bluesky and forgets the chat here');
+$scoped = static fn (): array => ['ok' => false, 'error' => 'Bad token scope', 'scope' => true];
+$GLOBALS['bsky_answers']['chat.bsky.convo.muteConvo'] = $scoped;
+bdm_check(str_contains((string) ap_bsky_chat_action(1, 'c-ada', 'mute')['error'], 'app password'), 'a token without DM access explains how to fix it');
+
 // ---- a different Bluesky account starts over ----
 $GLOBALS['ap_bsky_chat_now'] += 700;
 $GLOBALS['sessions'][1]['did'] = 'did:plc:other';
@@ -301,6 +362,12 @@ bdm_check(str_contains($bsky, 'array $extraHeaders = []') && str_contains($bsky,
 bdm_check(str_contains($admin, "'bsky_dm_thread'], true)"), 'the DM screen has a Bluesky thread endpoint');
 bdm_check(str_contains($admin, 'fastcgi_finish_request();') && str_contains($admin, 'ap_bsky_chat_sync($ownerForBadge, AP_BSKY_CHAT_BADGE_SYNC_SEC)'), 'the badge poll refreshes Bluesky after answering');
 bdm_check(str_contains($admin, "\$action === 'bsky_dm_send'"), 'Bluesky messages have their own send action');
+bdm_check(str_contains($admin, "\$action === 'bsky_dm_action'"), 'Bluesky conversation actions have their own handler');
+bdm_check(str_contains($admin, '>DM on Bluesky</a>'), 'Bluesky profiles offer a Bluesky DM');
+bdm_check(!str_contains($admin, 'window.confirm(') || substr_count($admin, 'data-dm-confirm') >= 2, 'leave and decline use a second tap, not a browser dialog');
+$reactMigration = (string) file_get_contents($root . '/api/migrations/20261102_bsky_chat_reactions_postgres.sql');
+bdm_check(str_contains($reactMigration, 'CREATE TABLE IF NOT EXISTS bsky_chat_reactions') && str_contains($reactMigration, 'TO "www-data"'), 'the reactions migration creates and grants its table');
+bdm_check(str_contains((string) file_get_contents($root . '/deploy/remote/migrate.php'), "'20261102_bsky_chat_reactions_postgres.sql'"), 'deploy applies the reactions migration');
 $migration = (string) file_get_contents($root . '/api/migrations/20261102_bsky_chat_postgres.sql');
 bdm_check(substr_count($migration, 'CREATE TABLE IF NOT EXISTS bsky_chat_') === 3 && substr_count($migration, 'TO "www-data"') === 3, 'the migration creates and grants the three tables');
 bdm_check(str_contains((string) file_get_contents($root . '/deploy/remote/migrate.php'), "'20261102_bsky_chat_postgres.sql'"), 'deploy applies the migration');

@@ -84,6 +84,16 @@ function ap_bsky_chat_sqlite_ddl(): array
             PRIMARY KEY (owner_user_id, message_id)
         )',
         'CREATE INDEX IF NOT EXISTS idx_bsky_chat_messages_convo ON bsky_chat_messages (owner_user_id, convo_id, rev)',
+        'CREATE TABLE IF NOT EXISTS bsky_chat_reactions (
+            owner_user_id INTEGER NOT NULL,
+            convo_id TEXT NOT NULL,
+            message_id TEXT NOT NULL,
+            sender_did TEXT NOT NULL,
+            value TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT \'\',
+            PRIMARY KEY (owner_user_id, message_id, sender_did, value)
+        )',
+        'CREATE INDEX IF NOT EXISTS idx_bsky_chat_reactions_convo ON bsky_chat_reactions (owner_user_id, convo_id)',
         'CREATE TABLE IF NOT EXISTS bsky_chat_state (
             owner_user_id INTEGER PRIMARY KEY,
             did TEXT NOT NULL DEFAULT \'\',
@@ -123,7 +133,7 @@ function ap_bsky_chat_table_ready(?PDO $db = null): bool
     return $ok;
 }
 
-/** Ready for this user: switch on, tables present, Bluesky connected. */
+/** Ready for this user: switch on, tables present, Bluesky connected. Remembered per request. */
 function ap_bsky_chat_ready_for(int $ownerUserId): bool
 {
     if ($ownerUserId < 1 || !ap_bsky_chat_enabled() || !function_exists('ap_bsky_session_row')) {
@@ -132,7 +142,36 @@ function ap_bsky_chat_ready_for(int $ownerUserId): bool
     if (!ap_bsky_chat_table_ready()) {
         return false;
     }
-    return ap_bsky_session_row($ownerUserId) !== null;
+    $memo = &$GLOBALS['ap_bsky_chat_ready_memo'];
+    if (!is_array($memo)) {
+        $memo = [];
+    }
+    if (!array_key_exists($ownerUserId, $memo)) {
+        $memo[$ownerUserId] = ap_bsky_session_row($ownerUserId) !== null;
+    }
+    return $memo[$ownerUserId];
+}
+
+/** True when the reactions table exists (it ships in a later migration than the others). */
+function ap_bsky_chat_reactions_ready(): bool
+{
+    if (array_key_exists('ap_bsky_chat_reactions_ready', $GLOBALS) && is_bool($GLOBALS['ap_bsky_chat_reactions_ready'])) {
+        return $GLOBALS['ap_bsky_chat_reactions_ready'];
+    }
+    $ok = false;
+    try {
+        $db = ap_db();
+        if (strtolower((string) $db->getAttribute(PDO::ATTR_DRIVER_NAME)) === 'sqlite') {
+            $ok = ap_bsky_chat_table_ready($db);
+        } else {
+            $name = $db->query("SELECT to_regclass('public.bsky_chat_reactions')")->fetchColumn();
+            $ok = is_string($name) && $name !== '';
+        }
+    } catch (Throwable $e) {
+        $ok = false;
+    }
+    $GLOBALS['ap_bsky_chat_reactions_ready'] = $ok;
+    return $ok;
 }
 
 function ap_bsky_chat_now(): int
@@ -319,10 +358,31 @@ function ap_bsky_chat_store_message(int $ownerUserId, string $convoId, array $me
         (string) ($message['sentAt'] ?? ''),
         $deleted,
     ]);
+    // A full message view carries all of its reactions; replace what we had.
+    if (ap_bsky_chat_reactions_ready()) {
+        ap_db()->prepare('DELETE FROM bsky_chat_reactions WHERE owner_user_id = ? AND message_id = ?')->execute([$ownerUserId, $id]);
+        if (!$deleted) {
+            $ins = ap_db()->prepare(
+                'INSERT INTO bsky_chat_reactions (owner_user_id, convo_id, message_id, sender_did, value, created_at)
+                 VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (owner_user_id, message_id, sender_did, value) DO NOTHING'
+            );
+            foreach ((array) ($message['reactions'] ?? []) as $reaction) {
+                $value = is_array($reaction) ? (string) ($reaction['value'] ?? '') : '';
+                $sender = is_array($reaction) ? (string) ($reaction['sender']['did'] ?? '') : '';
+                if ($value === '' || $sender === '' || strlen($value) > 64) {
+                    continue;
+                }
+                $ins->execute([$ownerUserId, $convoId, $id, $sender, $value, (string) ($reaction['createdAt'] ?? '')]);
+            }
+        }
+    }
 }
 
 function ap_bsky_chat_forget_convo(int $ownerUserId, string $convoId): void
 {
+    if (ap_bsky_chat_reactions_ready()) {
+        ap_db()->prepare('DELETE FROM bsky_chat_reactions WHERE owner_user_id = ? AND convo_id = ?')->execute([$ownerUserId, $convoId]);
+    }
     ap_db()->prepare('DELETE FROM bsky_chat_messages WHERE owner_user_id = ? AND convo_id = ?')->execute([$ownerUserId, $convoId]);
     ap_db()->prepare('DELETE FROM bsky_chat_convos WHERE owner_user_id = ? AND convo_id = ?')->execute([$ownerUserId, $convoId]);
 }
@@ -369,6 +429,9 @@ function ap_bsky_chat_sync(int $ownerUserId, int $minIntervalSec = AP_BSKY_CHAT_
     if ((string) ($state['did'] ?? '') !== '' && (string) $state['did'] !== $ownDid) {
         // A different Bluesky account was connected: start over.
         ap_db()->prepare('DELETE FROM bsky_chat_messages WHERE owner_user_id = ?')->execute([$ownerUserId]);
+        if (ap_bsky_chat_reactions_ready()) {
+            ap_db()->prepare('DELETE FROM bsky_chat_reactions WHERE owner_user_id = ?')->execute([$ownerUserId]);
+        }
         ap_db()->prepare('DELETE FROM bsky_chat_convos WHERE owner_user_id = ?')->execute([$ownerUserId]);
         $state['log_cursor'] = '';
     }
@@ -447,7 +510,8 @@ function ap_bsky_chat_sync(int $ownerUserId, int $minIntervalSec = AP_BSKY_CHAT_
                 $changed++;
                 continue;
             }
-            if ((str_ends_with($type, '#logCreateMessage') || str_ends_with($type, '#logDeleteMessage'))
+            if ((str_ends_with($type, '#logCreateMessage') || str_ends_with($type, '#logDeleteMessage')
+                || str_ends_with($type, '#logAddReaction') || str_ends_with($type, '#logRemoveReaction'))
                 && is_array($log['message'] ?? null)) {
                 ap_bsky_chat_store_message($ownerUserId, $convoId, $log['message']);
             }
@@ -858,4 +922,133 @@ function ap_bsky_chat_recipient_is_bluesky(string $to): bool
     // @alice.bsky.social has one @ and a dot: not a fediverse address (@user@server).
     $bare = ltrim($to, '@');
     return $bare !== '' && !str_contains($bare, '@') && !str_contains($bare, '/') && str_contains($bare, '.');
+}
+
+
+/**
+ * Reactions for a conversation's messages, grouped by message and emoji.
+ *
+ * @return array<string,list<array{value:string,count:int,mine:bool}>> message id => chips, first reaction first
+ */
+function ap_bsky_chat_reactions(int $ownerUserId, string $convoId, string $ownDid): array
+{
+    if ($convoId === '' || !ap_bsky_chat_reactions_ready()) {
+        return [];
+    }
+    $st = ap_db()->prepare(
+        'SELECT message_id, sender_did, value FROM bsky_chat_reactions
+         WHERE owner_user_id = ? AND convo_id = ? ORDER BY created_at ASC, value ASC LIMIT 2000'
+    );
+    $st->execute([$ownerUserId, $convoId]);
+    $out = [];
+    foreach ($st->fetchAll() as $row) {
+        $mid = (string) $row['message_id'];
+        $value = (string) $row['value'];
+        $out[$mid][$value] ??= ['value' => $value, 'count' => 0, 'mine' => false];
+        $out[$mid][$value]['count']++;
+        if ($ownDid !== '' && (string) $row['sender_did'] === $ownDid) {
+            $out[$mid][$value]['mine'] = true;
+        }
+    }
+    return array_map('array_values', $out);
+}
+
+/** One emoji (a single grapheme), as Bluesky requires for a reaction. */
+function ap_bsky_chat_reaction_value_ok(string $value): bool
+{
+    if ($value === '' || strlen($value) > 64 || preg_match('/[\s<>"\'&]/u', $value)) {
+        return false;
+    }
+    $n = function_exists('grapheme_strlen') ? grapheme_strlen($value) : null;
+    if (is_int($n)) {
+        return $n === 1;
+    }
+    return preg_match('/^\X$/u', $value) === 1;
+}
+
+/**
+ * Conversation actions from the DM screen.
+ *   accept, decline (leave a request), mute, unmute, leave, react, unreact
+ *
+ * @return array{ok:bool,error?:string,gone?:bool}
+ */
+function ap_bsky_chat_action(int $ownerUserId, string $convoId, string $op, string $messageId = '', string $value = ''): array
+{
+    if (!ap_bsky_chat_ready_for($ownerUserId)) {
+        return ['ok' => false, 'error' => 'Bluesky DMs are off.'];
+    }
+    $convo = ap_bsky_chat_convo($ownerUserId, $convoId);
+    if ($convo === null) {
+        return ['ok' => false, 'error' => 'That conversation is not available.'];
+    }
+    $ownDid = ap_bsky_chat_own_did($ownerUserId);
+    $fail = static fn (array $res, string $fallback): array => [
+        'ok' => false,
+        'error' => !empty($res['scope']) ? ap_bsky_chat_send_error($res) : ((string) ($res['error'] ?? '') !== '' ? 'Bluesky said: ' . (string) $res['error'] : $fallback),
+    ];
+    switch ($op) {
+        case 'accept':
+            $res = ap_bsky_chat_xrpc($ownerUserId, 'chat.bsky.convo.acceptConvo', 'POST', null, ['convoId' => $convoId]);
+            if (empty($res['ok'])) {
+                return $fail($res, 'Could not accept the request.');
+            }
+            ap_db()->prepare('UPDATE bsky_chat_convos SET status = ?, updated_at = ? WHERE owner_user_id = ? AND convo_id = ?')
+                ->execute(['accepted', gmdate('c'), $ownerUserId, $convoId]);
+            return ['ok' => true];
+        case 'decline':
+        case 'leave':
+            $res = ap_bsky_chat_xrpc($ownerUserId, 'chat.bsky.convo.leaveConvo', 'POST', null, ['convoId' => $convoId]);
+            if (empty($res['ok'])) {
+                return $fail($res, 'Could not leave the conversation.');
+            }
+            ap_bsky_chat_forget_convo($ownerUserId, $convoId);
+            return ['ok' => true, 'gone' => true];
+        case 'mute':
+        case 'unmute':
+            $res = ap_bsky_chat_xrpc($ownerUserId, $op === 'mute' ? 'chat.bsky.convo.muteConvo' : 'chat.bsky.convo.unmuteConvo', 'POST', null, ['convoId' => $convoId]);
+            if (empty($res['ok'])) {
+                return $fail($res, 'Could not change notifications for this conversation.');
+            }
+            if (is_array($res['json']['convo'] ?? null)) {
+                ap_bsky_chat_upsert_convo($ownerUserId, $res['json']['convo'], $ownDid);
+            } else {
+                ap_db()->prepare('UPDATE bsky_chat_convos SET muted = ? WHERE owner_user_id = ? AND convo_id = ?')
+                    ->execute([$op === 'mute' ? 1 : 0, $ownerUserId, $convoId]);
+            }
+            return ['ok' => true];
+        case 'react':
+        case 'unreact':
+            if ($messageId === '' || !ap_bsky_chat_reaction_value_ok($value)) {
+                return ['ok' => false, 'error' => 'Pick one emoji to react with.'];
+            }
+            $res = ap_bsky_chat_xrpc($ownerUserId, $op === 'react' ? 'chat.bsky.convo.addReaction' : 'chat.bsky.convo.removeReaction', 'POST', null, [
+                'convoId' => $convoId,
+                'messageId' => $messageId,
+                'value' => $value,
+            ]);
+            if (empty($res['ok'])) {
+                $code = strtolower((string) ($res['json']['error'] ?? ''));
+                if (str_contains($code, 'limit')) {
+                    return ['ok' => false, 'error' => 'That message has as many reactions as Bluesky allows.'];
+                }
+                return $fail($res, 'Could not react to that message.');
+            }
+            if (is_array($res['json']['message'] ?? null)) {
+                ap_bsky_chat_store_message($ownerUserId, $convoId, $res['json']['message']);
+            }
+            return ['ok' => true];
+    }
+    return ['ok' => false, 'error' => 'Unknown action.'];
+}
+
+/** Cached conversation with this Bluesky account (DID), if there is one. */
+function ap_bsky_chat_convo_for_peer(int $ownerUserId, string $peerDid): ?array
+{
+    if (!str_starts_with($peerDid, 'did:') || !ap_bsky_chat_ready_for($ownerUserId)) {
+        return null;
+    }
+    $st = ap_db()->prepare('SELECT * FROM bsky_chat_convos WHERE owner_user_id = ? AND peer_did = ? ORDER BY last_at DESC LIMIT 1');
+    $st->execute([$ownerUserId, $peerDid]);
+    $row = $st->fetch();
+    return is_array($row) ? $row : null;
 }
