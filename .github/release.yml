@@ -1,0 +1,33 @@
+# Groups for GitHub's generated release notes (used by every deploy).
+# A pull request lands in the first group whose label it has.
+# deploy/release_notes.py reads the titles "Breaking changes" and "Features"
+# to choose a minor bump when version_bump is auto; keep those words.
+changelog:
+  exclude:
+    labels:
+      - skip-changelog
+  categories:
+    - title: 💥 Breaking changes
+      labels:
+        - breaking
+    - title: 🔒 Security
+      labels:
+        - security
+    - title: ✨ Features
+      labels:
+        - enhancement
+    - title: 🐛 Fixes
+      labels:
+        - bug
+    - title: ⚡ Performance
+      labels:
+        - performance
+    - title: 🧹 Maintenance
+      labels:
+        - dependencies
+        - github_actions
+        - documentation
+        - deploy
+    - title: Other changes
+      labels:
+        - "*"

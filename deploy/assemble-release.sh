@@ -92,7 +92,7 @@ assemble() {
 
   local version
   version="$(sed -n "s/^const VAAK_VERSION = '\\([^']*\\)';/\\1/p" "${output}/api/ap-version.php")"
-  [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]{2}$ ]] || { echo "bad version in release: $version" >&2; return 1; }
+  [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "bad version in release: $version" >&2; return 1; }
   printf '%s\n' "$version" > "${output}/VERSION"
   printf '%s\n' "$revision" > "${output}/REVISION"
 

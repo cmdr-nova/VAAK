@@ -6,7 +6,7 @@
 
 **Current release:** alpha **0.9.83** · 2026-11-02
 
-Notes: [0.9.83](docs/RELEASE-0.9.83.md).
+Notes: [v0.9.83](https://github.com/cmdr-nova/VAAK/releases/tag/v0.9.83) · [CHANGELOG](CHANGELOG.md).
 
 Hi, I'm Nova. VAAK is the social server I built so I could stay on the Fediverse and still have the rest of the internet I actually use in the same window.
 
@@ -61,7 +61,7 @@ The app I actually use is the link above. If you want to see how a copy is wired
 - Worker build, environment, and the commands that stay up: [rust/README.md](rust/README.md)
 - systemd units and backup scripts: [deploy/](deploy/)
 - Backups and the integrity check: [docs/vaak-integrity-policy.md](docs/vaak-integrity-policy.md)
-- This release: [docs/RELEASE-0.8.45.md](docs/RELEASE-0.8.45.md)
+- Release notes: [CHANGELOG.md](CHANGELOG.md) and [GitHub Releases](https://github.com/cmdr-nova/VAAK/releases)
 
 PostgreSQL is the database (`AP_DB_DSN` as a `pgsql:` DSN). SQLite is available when `AP_ALLOW_SQLITE=1` is set, for local work. Redis is a cache and a queue. If Redis is down, the app still serves. It just has more to do on the way.
 

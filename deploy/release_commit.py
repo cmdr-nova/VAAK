@@ -7,12 +7,14 @@ safe to ship when:
 
 - it has one parent
 - that parent is the CI-green commit the guard already accepted
-- the version is exactly one counter step ahead of the parent
-- the diff is only the files deploy/bump_version.py writes, byte for byte
+- the version is exactly one SemVer bump (patch, minor, or major) ahead
+  of the parent
+- the diff is only the files deploy/bump_version.py writes, byte for byte,
+  with CHANGELOG.md gaining exactly one new section at the top
 
 If main already is that commit, or later commits did not change the app
-and the server is still on an older counter, a run with version_bump=increment
-ships this version instead of creating the next number.
+and the server is still on an older version, a bumping run ships this
+version instead of creating the next number.
 """
 
 from __future__ import annotations
@@ -26,22 +28,28 @@ import tempfile
 from pathlib import Path
 
 from bump_version import (
-    VERSION_RE,
+    LEVELS,
+    READ_RE,
     VersionError,
     apply_version,
-    next_version,
+    bump,
+    bump_level,
+    changelog_date,
+    changelog_notes,
     parse_version_file,
     version_less,
 )
 
-# Files the bump writes, other than the new release note. vaak/index.php
-# renders vaak_version_label() and is not edited. The VERSION file inside a
-# release directory is created at assemble time and is not in git.
+# Files the bump writes. vaak/index.php renders vaak_version_label() and is
+# not edited. The VERSION file inside a release directory is created at
+# assemble time and is not in git.
 VERSION_PATHS = (
     "api/ap-version.php",
     "README.md",
     "rust/README.md",
+    "CHANGELOG.md",
 )
+BUMP_CHOICES = (*LEVELS, "none")
 
 # Paths that change the running app or the worker binary. A commit after the
 # release commit that touches one of these is a real change and may take a
@@ -69,10 +77,6 @@ RAW_RE = re.compile(r"^:(\d{6}) (\d{6}) [0-9a-f]+ [0-9a-f]+ ([A-Z])[0-9]*\t(.+)$
 
 class ReleaseError(RuntimeError):
     """The commit is not a pure version bump of a known parent."""
-
-
-def release_note_path(version: str) -> str:
-    return f"docs/RELEASE-{version}.md"
 
 
 def is_shipped_path(path: str) -> bool:
@@ -153,16 +157,11 @@ def verify_release(repo: Path, sha: str, parent: str) -> None:
         raise ReleaseError(f"{sha} parent is {found or 'none'}, expected {parent}")
     child_version, _channel, child_date = version_at(repo, sha)
     parent_version, _parent_channel, _parent_date = version_at(repo, parent)
-    if child_version != next_version(parent_version):
+    if bump_level(parent_version, child_version) is None:
         raise ReleaseError(
-            f"{sha} version {child_version} is not the next counter value after {parent_version}"
+            f"{sha} version {child_version} is not a patch, minor, or major bump of {parent_version}"
         )
-    expected = {
-        "api/ap-version.php": ("100644", "100644", "M"),
-        "README.md": ("100644", "100644", "M"),
-        "rust/README.md": ("100644", "100644", "M"),
-        release_note_path(child_version): ("000000", "100644", "A"),
-    }
+    expected = {path: ("100644", "100644", "M") for path in VERSION_PATHS}
     entries = diff_entries(repo, parent, sha)
     actual = {path: (old, new, status) for old, new, status, path in entries}
     if actual != expected:
@@ -179,9 +178,15 @@ def verify_release(repo: Path, sha: str, parent: str) -> None:
             if not isinstance(blob, bytes):
                 raise ReleaseError(f"could not read {parent}:{path}")
             target.write_bytes(blob)
-        (root / "docs").mkdir(parents=True, exist_ok=True)
+        child_log = git(repo, "show", f"{sha}:CHANGELOG.md", binary=True)
+        if not isinstance(child_log, bytes):
+            raise ReleaseError(f"could not read {sha}:CHANGELOG.md")
+        child_text = child_log.decode("utf-8")
+        notes = changelog_notes(child_text, child_version)
+        if notes is None or changelog_date(child_text, child_version) != child_date:
+            raise ReleaseError(f"{sha} CHANGELOG.md has no {child_version} section dated {child_date}")
         try:
-            apply_version(root, child_version, child_date, parent)
+            apply_version(root, child_version, child_date, notes)
         except VersionError as exc:
             raise ReleaseError(f"parent tree could not be bumped to match {sha}: {exc}") from exc
         for path in expected:
@@ -228,8 +233,8 @@ def version_introducer(repo: Path, sha: str) -> str | None:
 
 def plan_deploy(repo: Path, sha: str, version_bump: str) -> dict[str, str]:
     """Choose the CI-green commit, the tree to ship, and whether to bump."""
-    if version_bump not in {"increment", "none"}:
-        raise ReleaseError("version_bump must be increment or none")
+    if version_bump not in BUMP_CHOICES:
+        raise ReleaseError(f"version_bump must be one of {', '.join(BUMP_CHOICES)}")
     sha = ensure_commit(repo, sha)
     version = version_at(repo, sha)[0]
     if is_version_commit(repo, sha):
@@ -246,7 +251,7 @@ def plan_deploy(repo: Path, sha: str, version_bump: str) -> dict[str, str]:
         # green CI (it is not a GITHUB_TOKEN version bump). Do not invent
         # the next counter value for the same app.
         return _plan("reuse-tree", True, sha, sha, version, version)
-    ship = version if version_bump == "none" else next_version(version)
+    ship = version if version_bump == "none" else bump(version, version_bump)
     return _plan("ci-required", False, sha, sha, version, ship)
 
 
@@ -281,15 +286,15 @@ def format_plan(fields: dict[str, str]) -> str:
         if not re.fullmatch(r"[0-9a-f]{40}", fields.get(key, "")):
             raise ReleaseError(f"plan {key} is not a commit sha")
     for key in ("version", "next_version"):
-        if VERSION_RE.fullmatch(fields.get(key, "")) is None:
-            raise ReleaseError(f"plan {key} is not a VAAK counter")
+        if READ_RE.fullmatch(fields.get(key, "")) is None:
+            raise ReleaseError(f"plan {key} is not a VAAK version")
     return "".join(f"{key}={fields[key]}\n" for key in PLAN_KEYS)
 
 
 def live_is_older(live: str, ship: str) -> None:
-    """Raise unless the server counter is strictly older than ship.
+    """Raise unless the server version is strictly older than ship.
 
-    increment uses this so an undeployed release commit is activated as
+    A bumping run uses this so an undeployed release commit is activated as
     itself. An equal or newer server refuses, instead of publishing the
     next number for code that already went out.
     """
@@ -302,7 +307,7 @@ def live_is_older(live: str, ship: str) -> None:
     if not older:
         raise ReleaseError(
             f"server version {live} is not older than {ship}. "
-            f"Refusing to publish {next_version(ship)} for code that is already this release. "
+            f"Refusing to publish a newer number for code that is already this release. "
             "Run again with version_bump=none to redeploy this same commit."
         )
 
@@ -314,7 +319,7 @@ def main(argv: list[str] | None = None) -> int:
 
     plan = sub.add_parser("plan", help="Print how this commit should be deployed")
     plan.add_argument("--sha", required=True)
-    plan.add_argument("--version-bump", required=True, choices=["increment", "none"])
+    plan.add_argument("--version-bump", required=True, choices=list(BUMP_CHOICES))
     plan.add_argument("--github-output", type=Path)
     plan.add_argument("--expect-kind")
     plan.add_argument("--expect-reuse")
@@ -324,7 +329,7 @@ def main(argv: list[str] | None = None) -> int:
     verify.add_argument("--sha", required=True)
     verify.add_argument("--parent", required=True)
 
-    live = sub.add_parser("live-is-older", help="Require the server counter to be older")
+    live = sub.add_parser("live-is-older", help="Require the server version to be older")
     live.add_argument("--live", required=True)
     live.add_argument("--version", required=True)
 

@@ -384,7 +384,7 @@ deploy_tarball() {
   sha="$(<"${tmp}/REVISION")"
   version="$(<"${tmp}/VERSION")"
   [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || die "REVISION is not a git sha"
-  [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]{2}$ ]] || die "VERSION is not a VAAK counter"
+  [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "VERSION is not a VAAK version"
   dest="${ROOT}/releases/${sha}"
   previous_sha="$(<"${ROOT}/live-revision")"
   if [[ -d "$dest" && "$previous_sha" != "$sha" ]]; then

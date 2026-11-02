@@ -1,0 +1,38 @@
+# Area labels added to pull requests by path (actions/labeler).
+# Type labels (enhancement, bug, ...) come from .github/workflows/pr-labels.yml.
+bluesky:
+  - changed-files:
+      - any-glob-to-any-file:
+          - api/ap-bsky*
+          - rust/**/*bsky*
+          - deploy/ap-bsky-jetstream*
+federation:
+  - changed-files:
+      - any-glob-to-any-file:
+          - api/ap-inbox*
+          - api/ap-outbox*
+          - api/ap-deliver*
+          - api/ap-fanout-delivery*
+          - api/ap-publish-delivery*
+          - api/ap-defederation*
+          - rust/**/inbox_*
+nostr:
+  - changed-files:
+      - any-glob-to-any-file:
+          - api/*nostr*
+          - rust/**/*nostr*
+          - rust/**/nostr/**
+rust:
+  - changed-files:
+      - any-glob-to-any-file:
+          - rust/**
+# deploy and documentation only apply when every changed file matches, so
+# an app change that also touches deploy/ or docs is still filed by type.
+deploy:
+  - changed-files:
+      - all-globs-to-all-files:
+          - "{deploy/**,.github/**}"
+documentation:
+  - changed-files:
+      - all-globs-to-all-files:
+          - "{docs/**,*.md,**/*.md}"
