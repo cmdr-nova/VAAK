@@ -6898,8 +6898,63 @@ function ap_bsky_parse_feed_prefs(array $preferences): array
     return $out;
 }
 
+/** Seconds a custom feed's first page stays fresh in Redis. */
+const AP_BSKY_CUSTOM_FEED_HEAD_TTL = 90;
+/** Seconds an older (cursor) page stays cached; cursor pages barely change. */
+const AP_BSKY_CUSTOM_FEED_PAGE_TTL = 600;
+/** Seconds a head page may be served stale while a refetch is busy or failing. */
+const AP_BSKY_CUSTOM_FEED_STALE_TTL = 900;
+/** Head posts copied into bsky_posts per real fetch (Home recommendations read them). */
+const AP_BSKY_CUSTOM_FEED_INDEX_HEAD = 8;
+
 /**
- * @return array{ok:bool,error?:string,feed?:list<array>,cursor?:?string}
+ * Per-owner generation folded into every custom feed cache key. Bumping it
+ * (one INCR) retires all of that owner's cached pages without a key scan.
+ */
+function ap_bsky_custom_feed_cache_gen(int $ownerUserId, bool $bump = false): int
+{
+    $redis = function_exists('ap_redis_client') ? ap_redis_client('cache') : null;
+    if (!$redis || $ownerUserId < 1) {
+        return 0;
+    }
+    $key = 'vaak:bsky:feed:gen:v1:' . $ownerUserId;
+    try {
+        if ($bump) {
+            $gen = (int) $redis->incr($key);
+            $redis->expire($key, 86400 * 7);
+            return $gen;
+        }
+        return (int) ($redis->get($key) ?: 0);
+    } catch (Throwable $e) {
+        return 0;
+    }
+}
+
+function ap_bsky_custom_feed_cache_key(int $ownerUserId, string $feedUri, ?string $cursor, int $limit): string
+{
+    $page = ($cursor === null || $cursor === '') ? 'head' : substr(hash('sha256', $cursor), 0, 20);
+    return 'vaak:bsky:feed:v1:' . $ownerUserId . ':g' . ap_bsky_custom_feed_cache_gen($ownerUserId)
+        . ':' . substr(hash('sha256', $feedUri), 0, 24) . ':' . $page . ':' . $limit;
+}
+
+/** Retire every cached custom feed page for one owner (after a like, delete, block...). */
+function ap_bsky_custom_feed_cache_clear_owner(int $ownerUserId): void
+{
+    ap_bsky_custom_feed_cache_gen($ownerUserId, true);
+}
+
+/**
+ * One page of a Bluesky custom feed or list feed, fetched only when someone
+ * is looking at it. Nothing polls feeds in the background.
+ *
+ * Pages are cached in Redis (head 90 s, cursor pages 10 min) and a lock keeps
+ * two tabs from fetching the same page twice. A busy or failed refetch of the
+ * head serves the last good copy for up to 15 min. AppView already sends fully
+ * hydrated posts, so pages are not written to bsky_posts; only a few head
+ * posts per real fetch are copied after the response (Home recommendations
+ * read them). Blocks and mutes are applied on every read, cached or not.
+ *
+ * @return array{ok:bool,error?:string,feed?:list<array>,cursor?:?string,source?:string,cache?:string}
  */
 function ap_bsky_get_custom_feed(int $ownerUserId, string $feedUri, int $limit = 40, ?string $cursor = null): array
 {
@@ -6907,49 +6962,173 @@ function ap_bsky_get_custom_feed(int $ownerUserId, string $feedUri, int $limit =
     if (!str_starts_with($feedUri, 'at://')) {
         return ['ok' => false, 'error' => 'Invalid feed URI'];
     }
-    $tok = ap_bsky_access_token($ownerUserId, false);
-    if (empty($tok['ok'])) {
-        $tok = ap_bsky_access_token($ownerUserId, true);
-        if (empty($tok['ok'])) {
-            return ['ok' => false, 'error' => (string) ($tok['error'] ?? 'Not connected')];
+    $limit = max(1, min(50, $limit));
+    $isHead = ($cursor === null || $cursor === '');
+    $redisOn = function_exists('ap_redis_json_get') && function_exists('ap_redis_json_set');
+    $cacheKey = ap_bsky_custom_feed_cache_key($ownerUserId, $feedUri, $cursor, $limit);
+    $staleKey = $cacheKey . ':stale';
+    $fromCache = static function (?array $hit, string $tag) use ($ownerUserId): ?array {
+        if (!is_array($hit) || !is_array($hit['feed'] ?? null)) {
+            return null;
+        }
+        return [
+            'ok' => true,
+            'feed' => ap_bsky_filter_hidden_authors($ownerUserId, $hit['feed']),
+            'cursor' => isset($hit['cursor']) && is_string($hit['cursor']) && $hit['cursor'] !== '' ? $hit['cursor'] : null,
+            'source' => 'feed',
+            'cache' => $tag,
+        ];
+    };
+    if ($redisOn) {
+        $hit = $fromCache(ap_redis_json_get($cacheKey), 'hit');
+        if ($hit !== null) {
+            return $hit;
         }
     }
-    $row = ap_bsky_session_row($ownerUserId);
-    $pds = rtrim((string) ($row['pds_host'] ?? AP_BSKY_DEFAULT_PDS), '/');
-    $isList = str_contains($feedUri, '/app.bsky.graph.list/');
-    $nsid = $isList ? 'app.bsky.feed.getListFeed' : 'app.bsky.feed.getFeed';
-    $query = $isList
-        ? ['list' => $feedUri, 'limit' => max(1, min(50, $limit))]
-        : ['feed' => $feedUri, 'limit' => max(1, min(50, $limit))];
-    if (is_string($cursor) && $cursor !== '') {
-        $query['cursor'] = $cursor;
+    $lockKey = 'bsky-feed:' . substr(hash('sha256', $cacheKey), 0, 32);
+    $locked = function_exists('ap_redis_lock') ? ap_redis_lock($lockKey, 10) : false;
+    if (!$locked && $redisOn && function_exists('ap_redis_lock')) {
+        // Another request is fetching this exact page. Wait briefly for it.
+        $waited = function_exists('ap_redis_stampede_wait')
+            ? ap_redis_stampede_wait(static fn () => ap_redis_json_get($cacheKey), 2500)
+            : null;
+        $hit = $fromCache(is_array($waited) ? $waited : null, 'hit');
+        if ($hit !== null) {
+            return $hit;
+        }
+        if ($isHead) {
+            $stale = $fromCache(ap_redis_json_get($staleKey), 'stale');
+            if ($stale !== null) {
+                return $stale;
+            }
+        }
     }
-    $lastErr = $nsid . ' failed';
-    foreach (ap_bsky_feed_hosts($pds) as $apiHost) {
-        $attempt = ap_bsky_xrpc($apiHost, $nsid, 'GET', $query, null, (string) $tok['access'], 15);
-        if (($attempt['status'] ?? 0) === 401) {
+    try {
+        $tok = ap_bsky_access_token($ownerUserId, false);
+        if (empty($tok['ok'])) {
             $tok = ap_bsky_access_token($ownerUserId, true);
             if (empty($tok['ok'])) {
-                return ['ok' => false, 'error' => (string) ($tok['error'] ?? 'Session expired')];
+                return ['ok' => false, 'error' => (string) ($tok['error'] ?? 'Not connected')];
             }
-            $attempt = ap_bsky_xrpc($apiHost, $nsid, 'GET', $query, null, (string) $tok['access'], 15);
         }
-        if (!empty($attempt['ok']) && is_array($attempt['json'] ?? null)) {
-            $feed = is_array($attempt['json']['feed'] ?? null) ? $attempt['json']['feed'] : [];
-            ap_bsky_index_feed_items($feed, $ownerUserId, 15);
-            ap_bsky_schedule_hide_refresh($ownerUserId);
-            $feed = ap_bsky_filter_hidden_authors($ownerUserId, $feed);
-            return [
-                'ok' => true,
-                'feed' => $feed,
-                'cursor' => isset($attempt['json']['cursor']) && is_string($attempt['json']['cursor'])
-                    ? $attempt['json']['cursor'] : null,
-                'source' => 'feed',
-            ];
+        $row = ap_bsky_session_row($ownerUserId);
+        $pds = rtrim((string) ($row['pds_host'] ?? AP_BSKY_DEFAULT_PDS), '/');
+        $isList = str_contains($feedUri, '/app.bsky.graph.list/');
+        $nsid = $isList ? 'app.bsky.feed.getListFeed' : 'app.bsky.feed.getFeed';
+        $query = $isList ? ['list' => $feedUri, 'limit' => $limit] : ['feed' => $feedUri, 'limit' => $limit];
+        if (!$isHead) {
+            $query['cursor'] = $cursor;
         }
-        $lastErr = (string) ($attempt['error'] ?? $lastErr);
+        $lastErr = $nsid . ' failed';
+        $t0 = microtime(true);
+        foreach (ap_bsky_feed_hosts($pds) as $apiHost) {
+            // A slow feed generator must not hold a PHP worker for long:
+            // 6 s per call, and no second host once that budget is spent.
+            if (microtime(true) - $t0 > 6.0) {
+                break;
+            }
+            $attempt = ap_bsky_xrpc($apiHost, $nsid, 'GET', $query, null, (string) $tok['access'], 6);
+            if (($attempt['status'] ?? 0) === 401) {
+                $tok = ap_bsky_access_token($ownerUserId, true);
+                if (empty($tok['ok'])) {
+                    return ['ok' => false, 'error' => (string) ($tok['error'] ?? 'Session expired')];
+                }
+                $attempt = ap_bsky_xrpc($apiHost, $nsid, 'GET', $query, null, (string) $tok['access'], 6);
+            }
+            if (!empty($attempt['ok']) && is_array($attempt['json'] ?? null)) {
+                $feed = array_values(array_filter(
+                    is_array($attempt['json']['feed'] ?? null) ? $attempt['json']['feed'] : [],
+                    'is_array'
+                ));
+                $next = isset($attempt['json']['cursor']) && is_string($attempt['json']['cursor'])
+                    ? $attempt['json']['cursor'] : null;
+                if ($redisOn) {
+                    $doc = ['feed' => $feed, 'cursor' => $next, 'ts' => time()];
+                    ap_redis_json_set($cacheKey, $doc, $isHead ? AP_BSKY_CUSTOM_FEED_HEAD_TTL : AP_BSKY_CUSTOM_FEED_PAGE_TTL);
+                    if ($isHead) {
+                        ap_redis_json_set($staleKey, $doc, AP_BSKY_CUSTOM_FEED_STALE_TTL);
+                    }
+                }
+                if ($isHead && $feed !== []) {
+                    // syncLimit 0: every write runs after the response is sent.
+                    ap_bsky_index_feed_items(array_slice($feed, 0, AP_BSKY_CUSTOM_FEED_INDEX_HEAD), $ownerUserId, 0);
+                }
+                ap_bsky_schedule_hide_refresh($ownerUserId);
+                return [
+                    'ok' => true,
+                    'feed' => ap_bsky_filter_hidden_authors($ownerUserId, $feed),
+                    'cursor' => $next,
+                    'source' => 'feed',
+                    'cache' => 'miss',
+                ];
+            }
+            $lastErr = (string) ($attempt['error'] ?? $lastErr);
+        }
+        if ($isHead && $redisOn) {
+            $stale = $fromCache(ap_redis_json_get($staleKey), 'stale');
+            if ($stale !== null) {
+                return $stale;
+            }
+        }
+        return ['ok' => false, 'error' => $lastErr];
+    } finally {
+        if ($locked && function_exists('ap_redis_unlock')) {
+            ap_redis_unlock($lockKey);
+        }
     }
-    return ['ok' => false, 'error' => $lastErr];
+}
+
+/**
+ * Display names for pinned feeds and lists, keyed by AT-URI. Each name is
+ * looked up once on the public AppView and cached for a day; at most four
+ * new lookups run per call, the rest fall back to the record key until then.
+ *
+ * @param list<array{id?:string,type?:string,value?:string}> $pinned
+ * @return array<string,string>
+ */
+function ap_bsky_feed_labels(array $pinned): array
+{
+    $out = [];
+    $lookups = 0;
+    foreach ($pinned as $pin) {
+        $uri = is_array($pin) ? (string) ($pin['value'] ?? '') : '';
+        if (!str_starts_with($uri, 'at://') || isset($out[$uri])) {
+            continue;
+        }
+        $fallback = basename($uri);
+        $key = 'vaak:bsky:feedname:v1:' . substr(hash('sha256', $uri), 0, 32);
+        $cached = function_exists('ap_redis_json_get') ? ap_redis_json_get($key) : null;
+        if (is_array($cached) && array_key_exists('name', $cached)) {
+            $name = trim((string) $cached['name']);
+            $out[$uri] = $name !== '' ? $name : $fallback;
+            continue;
+        }
+        if ($lookups >= 4 || !defined('AP_BSKY_PUBLIC_API')) {
+            $out[$uri] = $fallback;
+            continue;
+        }
+        $lookups++;
+        $isList = str_contains($uri, '/app.bsky.graph.list/');
+        $got = $isList
+            ? ap_bsky_xrpc(AP_BSKY_PUBLIC_API, 'app.bsky.graph.getList', 'GET', ['list' => $uri, 'limit' => 1], null, null, 4)
+            : ap_bsky_xrpc(AP_BSKY_PUBLIC_API, 'app.bsky.feed.getFeedGenerator', 'GET', ['feed' => $uri], null, null, 4);
+        $name = '';
+        if (!empty($got['ok']) && is_array($got['json'] ?? null)) {
+            $name = $isList
+                ? (string) ($got['json']['list']['name'] ?? '')
+                : (string) ($got['json']['view']['displayName'] ?? '');
+        }
+        $name = trim(preg_replace('/\s+/u', ' ', $name) ?? '');
+        if (mb_strlen($name) > 40) {
+            $name = mb_substr($name, 0, 39) . '…';
+        }
+        if (function_exists('ap_redis_json_set')) {
+            // Remember misses for an hour so a dead feed is not retried on every paint.
+            ap_redis_json_set($key, ['name' => $name], $name !== '' ? 86400 : 3600);
+        }
+        $out[$uri] = $name !== '' ? $name : $fallback;
+    }
+    return $out;
 }
 
 /** Bluesky feed head cache (mirrors admin TL / Masto JSON head discipline). */
@@ -7026,6 +7205,7 @@ function ap_bsky_tl_cache_put(string $key, array $feed, ?string $cursor, string 
 
 function ap_bsky_tl_cache_clear_owner(int $ownerUserId): void
 {
+    ap_bsky_custom_feed_cache_clear_owner($ownerUserId);
     $dir = ap_bsky_tl_cache_dir();
     $prefix = 'bsky_' . $ownerUserId . '_';
     foreach (glob($dir . '/' . $prefix . '*.json') ?: [] as $f) {

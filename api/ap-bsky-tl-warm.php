@@ -1,7 +1,8 @@
 <?php
 /**
  * CLI: warm durable Bluesky post cache (bsky_posts) from each connected session's
- * home timeline (and author feed when home is empty).
+ * home timeline (and author feed when home is empty). Custom feeds are
+ * fetched on demand only, never from this cron.
  *
  * Usage:
  *   php ap-bsky-tl-warm.php
@@ -123,47 +124,11 @@ try {
                     $tl = $own;
                 }
             }
-            // Sample fewer pinned/saved feeds per tick to cut XRPC bursts.
+            // Custom feeds are no longer sampled here. They load on demand
+            // when someone opens one (ap_bsky_get_custom_feed, Redis-cached),
+            // so an idle owner costs no getFeed calls or bsky_posts writes.
             $feedExtra = 0;
-            $prefsRaw = ap_bsky_get_preferences($uid);
-            $prefs = ap_bsky_parse_feed_prefs(
-                !empty($prefsRaw['ok']) && is_array($prefsRaw['preferences'] ?? null)
-                    ? $prefsRaw['preferences']
-                    : []
-            );
             $savedUris = [];
-            foreach (array_slice($prefs['pinned'] ?? [], 0, 4) as $pin) {
-                if (!is_array($pin)) {
-                    continue;
-                }
-                $ptype = (string) ($pin['type'] ?? '');
-                $pval = (string) ($pin['value'] ?? '');
-                if (($ptype === 'feed' || $ptype === 'list') && str_starts_with($pval, 'at://')) {
-                    $savedUris[] = $pval;
-                }
-            }
-            foreach (array_slice($prefs['savedFeedUris'] ?? [], 0, 3) as $uri) {
-                if (is_string($uri) && str_starts_with($uri, 'at://')) {
-                    $savedUris[] = $uri;
-                }
-            }
-            $savedUris = array_values(array_unique($savedUris));
-            $samplePerFeed = max(5, min(12, (int) floor($limit / 3) + 2));
-            foreach (array_slice($savedUris, 0, 4) as $feedUri) {
-                $cf = ap_bsky_get_custom_feed($uid, $feedUri, $samplePerFeed, null);
-                if (empty($cf['ok']) || empty($cf['feed']) || !is_array($cf['feed'])) {
-                    continue;
-                }
-                foreach ($cf['feed'] as $item) {
-                    if (!is_array($item)) {
-                        continue;
-                    }
-                    if (!$dryRun) {
-                        ap_bsky_index_feed_item($item, $uid);
-                    }
-                    $feedExtra++;
-                }
-            }
             $n = 0;
             if (!$dryRun) {
                 foreach ($feed as $item) {
