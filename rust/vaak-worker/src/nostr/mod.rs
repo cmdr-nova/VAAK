@@ -12,6 +12,8 @@
 //! pages that have no extension, such as an iPhone Home Screen app.
 //! `pack` opens NIP-51 follow packs (Library > Collections) for one-signature
 //! follow-all.
+//! `quote` fetches the notes quotes point at, so a quoted note paints as
+//! a card instead of a link.
 //! `zap` is NIP-57: Lightning zaps sent from Nostr cards and receipts that
 //! notify.
 
@@ -26,6 +28,7 @@ pub mod moderation;
 pub mod nip44;
 pub mod notif;
 pub mod pack;
+pub mod quote;
 pub mod relay;
 pub mod relay_book;
 pub mod render;

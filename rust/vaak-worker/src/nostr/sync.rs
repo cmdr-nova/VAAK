@@ -18,11 +18,14 @@
 //!     relays (NIP-65 outbox), since that key's last good sync (at most 48 h
 //!     back), plus the notes those reposts point at. Every event's id and
 //!     signature are checked before it is stored.
-//!  4. Notifications (`notif`): events tagging each linked key, staged and
+//!  4. Quoted notes (`quote`): notes recent quotes point at that VAAK has
+//!     no copy of, asked for by id so the quote paints as a card instead of
+//!     a "Quoted note" link.
+//!  5. Notifications (`notif`): events tagging each linked key, staged and
 //!     handed to PHP's `ap_mention_store`.
-//!  5. Backup (`archive`): linked keys' own events, kept with no retention
+//!  6. Backup (`archive`): linked keys' own events, kept with no retention
 //!     for the backup relay.
-//!  6. Clean-up: notes older than the retention window, notes and profiles
+//!  7. Clean-up: notes older than the retention window, notes and profiles
 //!     nobody follows any more, follows of removed links. Notes a VAAK user
 //!     boosted, quoted, bookmarked or liked stay (and their authors' profiles),
 //!     as do notes a stored repost points at.
@@ -451,6 +454,13 @@ async fn sync_followee_meta(db: &Client, s: &Settings, now: i64, deadline: Insta
     let stale = now - META_REFRESH_SECS;
     // People who notified someone stay fresh too, once that table exists.
     let notifiers = if super::notif::ready(db).await { "UNION SELECT n.actor FROM nostr_notifs n" } else { "" };
+    // Authors of notes a quote points at: nobody need follow them, but
+    // their card wants a name and an avatar.
+    let quoted = if super::quote::ready(db).await {
+        "UNION SELECT t.pubkey FROM nostr_events t JOIN nostr_quote_links ql ON ql.quoted_id = t.id"
+    } else {
+        ""
+    };
     // Profiles read before zaps shipped have no nostr_zap_addrs row yet
     // (not even an empty one): read them again now rather than in a day,
     // so their ⚡ shows. Keys with no kind 0 (profile_at 0) wait for the
@@ -473,6 +483,7 @@ async fn sync_followee_meta(db: &Client, s: &Settings, now: i64, deadline: Insta
                UNION
                SELECT t.pubkey FROM nostr_events r JOIN nostr_events t ON t.id = r.reply_to AND t.kind = 1 WHERE r.kind = 6
                {notifiers}
+               {quoted}
              )
              SELECT w.pubkey FROM wanted w
              LEFT JOIN nostr_profiles p ON p.pubkey = w.pubkey
@@ -528,6 +539,20 @@ async fn sync_followee_meta(db: &Client, s: &Settings, now: i64, deadline: Insta
         upsert_meta(db, key, profile, newest.get(&(key.clone(), 10002)), meta_stamp(profile.is_some(), now)).await?;
     }
     Ok(keys.len())
+}
+
+/// Store one fetched note, if it is not stored already.
+pub(super) async fn store_note(db: &Client, ev: &Event, relay: &str, now: i64) -> Result<u64> {
+    let (is_reply, parent, pks) = ev.reply_info();
+    let tags = serde_json::to_value(&ev.tags).unwrap_or(Value::Array(Vec::new()));
+    let kind = ev.kind as i32;
+    db.execute(
+        "INSERT INTO nostr_events (id, pubkey, kind, created_at, content, tags, is_reply, reply_pubkeys, reply_to, relay, ingested_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) ON CONFLICT (id) DO NOTHING",
+        &[&ev.id, &ev.pubkey, &kind, &ev.created_at, &ev.content, &tags, &is_reply, &pks, &parent, &relay, &now],
+    )
+    .await
+    .context("nostr quoted note")
 }
 
 struct NotesReport {
@@ -785,6 +810,10 @@ async fn cleanup(db: &Client, s: &Settings, now: i64) -> Result<u64> {
     if notifs {
         kept.push(super::notif::KEPT_SQL);
     }
+    let quotes = super::quote::ready(db).await;
+    if quotes {
+        kept.push(super::quote::KEPT_SQL);
+    }
     let keep = if kept.is_empty() { String::new() } else { format!(" AND NOT ({})", kept.join(" OR ")) };
     let mut n = db.execute(&format!("DELETE FROM nostr_events e WHERE e.created_at < $1{keep}"), &[&cutoff]).await?;
     n += db
@@ -815,6 +844,9 @@ async fn cleanup(db: &Client, s: &Settings, now: i64) -> Result<u64> {
         .await
         .unwrap_or(0);
     n += super::notif::cleanup(db, cutoff).await;
+    if quotes {
+        n += super::quote::cleanup(db).await;
+    }
     let notifiers = if notifs { " AND NOT EXISTS (SELECT 1 FROM nostr_notifs n WHERE n.actor = p.pubkey)" } else { "" };
     n += db
         .execute(
@@ -892,7 +924,15 @@ pub async fn run_once(cfg: &Config, budget_secs: u64) -> Result<String> {
     sync_links(&mut db, &s, now, deadline, &mut log).await?;
     let meta = sync_followee_meta(&db, &s, now, deadline).await?;
     let notes = sync_notes(&mut db, &s, now, deadline).await?;
-    let rewarmed = rewarm_homes_with_fresh_notes(cfg, &db, &notes.fresh_authors).await.unwrap_or_else(|e| {
+    // Quoted notes nobody follows the author of, so the quote paints as a
+    // card. A failure here never holds up the rest of the run.
+    let (quotes, quoters) = super::quote::warm(&db, &s, now, deadline).await.unwrap_or_else(|e| {
+        tracing::warn!(error = %format!("{e:#}"), "nostr quote warm failed");
+        (super::quote::Report::default(), HashSet::new())
+    });
+    let mut fresh = notes.fresh_authors.clone();
+    fresh.extend(quoters);
+    let rewarmed = rewarm_homes_with_fresh_notes(cfg, &db, &fresh).await.unwrap_or_else(|e| {
         tracing::warn!(error = %format!("{e:#}"), "nostr home rewarm enqueue failed");
         0
     });
@@ -910,13 +950,14 @@ pub async fn run_once(cfg: &Config, budget_secs: u64) -> Result<String> {
     let cleaned = cleanup(&db, &s, now).await?;
     relay_book::prune(&db, now).await?;
     Ok(format!(
-        "nostr-sync {}meta={meta} authors={} relays={}/{} stored={} rejected={} rewarm={rewarmed} notifs={}/{} ingest={} {} cleaned={cleaned} ms={}",
+        "nostr-sync {}meta={meta} authors={} relays={}/{} stored={} rejected={} {}rewarm={rewarmed} notifs={}/{} ingest={} {} cleaned={cleaned} ms={}",
         if log.is_empty() { String::new() } else { format!("{} ", log.join(" ")) },
         notes.authors,
         notes.relays_ok,
         notes.relays,
         notes.stored,
         notes.rejected,
+        quotes.summary(),
         notifs.staged,
         notifs.owners,
         if notifs.ingest.is_empty() { "-" } else { notifs.ingest.as_str() },
