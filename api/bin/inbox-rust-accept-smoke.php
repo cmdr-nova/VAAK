@@ -116,6 +116,20 @@ $bob = 'https://other.test/users/bob';
 [$status, $json] = smoke_post($rust, '/inbox', smoke_like($bob, '3'), $bob . '#main-key', $priv);
 $check($status === 418 && ($json['forwarded'] ?? false) === true, 'unknown key is forwarded to PHP');
 $check(($json['host'] ?? '') === 'mkultra.monster' && ($json['uri'] ?? '') === '/inbox', 'forward keeps Host and path');
+
+// Rust key fetch (VAAK_INBOX_RUST_KEY_FETCH=1): a key PHP already found dead
+// is not fetched again, a blocked host is never fetched, and PHP honours a
+// dead key Rust recorded.
+$carolKey = 'https://other.test/users/carol#main-key';
+ap_key_neg_cache_set($carolKey, 'http_410', 410);
+[$status] = smoke_post($rust, '/inbox', smoke_like('https://other.test/users/carol', '11'), $carolKey, $priv);
+$check($status === 418, 'a key in the shared negative cache is left to PHP without a fetch');
+[$status] = smoke_post($rust, '/inbox', smoke_like('https://blocked.test/users/dan', '12'), 'https://blocked.test/users/dan#main-key', $priv);
+$check($status === 418, 'an unknown key on a blocked host is not fetched');
+$erinKey = 'https://other.test/users/erin#main-key';
+$redis->setEx(ap_key_neg_cache_shared_key($erinKey), 900, json_encode(['reason' => 'http_404', 'http' => 404, 'at' => time(), 'via' => 'rust']));
+$neg = ap_key_neg_cache_get($erinKey);
+$check(($neg['http'] ?? 0) === 404 && ap_fetch_actor_pubkey($erinKey) === null, 'PHP skips the fetch for a dead key Rust recorded');
 $check(($json['body_sha256'] ?? '') === hash('sha256', smoke_like($bob, '3')) && str_contains((string) ($json['xff'] ?? ''), '203.0.113.7'), 'forward keeps body and client address');
 
 $evil = 'https://blocked.test/users/eve';
@@ -165,7 +179,7 @@ foreach (['mismatched Like' => $mismatched, 'relay-signed Delete' => $delete] as
 $spooled = (int) $db->query("SELECT count(*) FROM ap_inbox_spool WHERE key_id <> 'https://stale.test/users/x#main-key'")->fetchColumn();
 $check($spooled === 6, 'only the six signed deliveries were spooled');
 $stats = $redis->hGetAll('vaak:inbox_rust:stats:v1');
-$check((int) ($stats['spooled'] ?? 0) === 4 && (int) ($stats['spooled_mismatch'] ?? 0) === 2 && (int) ($stats['fwd_no_key'] ?? 0) === 1
-    && (int) ($stats['fwd_blocked'] ?? 0) === 1 && !isset($stats['fwd_actor_mismatch']) && (int) ($stats['fwd_signature'] ?? 0) === 1 && (int) ($stats['fwd_unknown_user'] ?? 0) === 1, 'stats count each outcome');
+$check((int) ($stats['spooled'] ?? 0) === 4 && (int) ($stats['spooled_mismatch'] ?? 0) === 2 && (int) ($stats['fwd_key_not_public'] ?? 0) === 1
+    && (int) ($stats['fwd_key_negative'] ?? 0) === 1 && (int) ($stats['fwd_blocked'] ?? 0) === 2 && !isset($stats['fwd_actor_mismatch']) && (int) ($stats['fwd_signature'] ?? 0) === 1 && (int) ($stats['fwd_unknown_user'] ?? 0) === 1, 'stats count each outcome');
 
 echo "inbox-rust-accept: {$n} checks passed\n";

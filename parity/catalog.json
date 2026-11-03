@@ -114,6 +114,12 @@
       "php": {"script": "parity/php/inbox-sig-verify.php", "args": []}
     },
     {
+      "id": "ap-sign",
+      "area": "ActivityPub",
+      "summary": "Outbound draft-cavage rsa-sha256 Signature headers (and Digest for POST) the way ap_signed_get_ex and ap_deliver_signed_json build them: request-target with query, host case kept, 2048 and 4096-bit keys. Keys are generated per run with a fixed Date; no network and no database.",
+      "php": {"script": "parity/php/ap-sign.php", "args": []}
+    },
+    {
       "id": "wafrn-crosspost",
       "area": "Timelines",
       "summary": "Wafrn ActivityPub/Bluesky post identity, alsoKnownAs DID extraction, text ask cards, linkage dedupe, and the 10 minute text fallback. Fixture api/fixtures/wafrn-crosspost.json. Both sides call the pure planner and do not open a database.",
