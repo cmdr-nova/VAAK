@@ -1291,6 +1291,80 @@ async fn apply_nostr_toxicity_downrank(db: &Client, owner: i64, keys: &mut Vec<c
     Ok(())
 }
 
+/// Nostr authors the owner engaged with on VAAK: likes (nostr_reactions)
+/// and reposts or quotes (nostr_shares), keyed `nostr:{pubkey}` and weighted
+/// and decayed like the matching `ap_user_signals` rows.
+async fn load_nostr_actor_weights(db: &Client, owner: i64) -> HashMap<String, f64> {
+    if owner < 1 || !crate::nostr::sync::tables_ready(db).await {
+        return HashMap::new();
+    }
+    let now = chrono::Utc::now().timestamp();
+    let since = now - SIGNAL_EXPLICIT_DAYS * 86_400;
+    let rows = db
+        .query(
+            "SELECT e.pubkey, x.created_at, x.w FROM (
+                 (SELECT note_id, created_at, 1.4::float8 AS w FROM nostr_reactions
+                  WHERE owner_user_id = $1 AND created_at >= $2 ORDER BY created_at DESC LIMIT 1000)
+                 UNION ALL
+                 (SELECT note_id, created_at, 1.2::float8 FROM nostr_shares
+                  WHERE owner_user_id = $1 AND created_at >= $2 ORDER BY created_at DESC LIMIT 1000)
+             ) x JOIN nostr_events e ON e.id = x.note_id",
+            &[&owner, &since],
+        )
+        .await
+        .unwrap_or_else(|e| {
+            tracing::debug!(error = %e, owner, "nostr actor weights unavailable");
+            Vec::new()
+        });
+    nostr_weights_from(rows.iter().map(|r| (r.get::<_, String>(0), r.get::<_, i64>(1), r.get::<_, f64>(2))), now)
+}
+
+fn nostr_weights_from(rows: impl Iterator<Item = (String, i64, f64)>, now: i64) -> HashMap<String, f64> {
+    let mut weights = HashMap::new();
+    for (pubkey, created, w) in rows {
+        if pubkey.is_empty() {
+            continue;
+        }
+        let age = (now - created).max(0) as f64;
+        let delta = w * (-age / (14.0 * 86400.0)).exp();
+        let entry = weights.entry(format!("nostr:{pubkey}")).or_insert(0.0);
+        *entry = (*entry + delta).clamp(-3.0, 24.0);
+    }
+    weights
+}
+
+/// Bluesky's `stamp_bsky_sort` for Nostr: notes from the last 48 hours by
+/// authors the owner engages with move up by the same affinity bonus.
+fn stamp_nostr_affinity(keys: &mut [crate::nostr::home::NostrKey], weights: &HashMap<String, f64>, now: i64) {
+    if weights.is_empty() {
+        return;
+    }
+    for key in keys.iter_mut() {
+        let w = weights.get(&format!("nostr:{}", key.author)).copied().unwrap_or(0.0);
+        if w == 0.0 || key.sort < now - 172_800 || key.sort > now + 300 {
+            continue;
+        }
+        key.sort += affinity_bonus(w, 0);
+    }
+}
+
+async fn load_own_nostr_pubkey(db: &Client, owner: i64) -> Option<String> {
+    db.query_opt("SELECT pubkey FROM nostr_links WHERE owner_user_id = $1", &[&owner])
+        .await
+        .ok()
+        .flatten()
+        .map(|r| r.get::<_, String>(0))
+}
+
+fn apply_nostr_burst_spread(keys: &mut [crate::nostr::home::NostrKey], own: Option<&str>) {
+    let now = chrono::Utc::now().timestamp();
+    let exempt: HashSet<String> = own.map(str::to_string).into_iter().filter(|a| !a.is_empty()).collect();
+    let entries: Vec<(String, i64)> = keys.iter().map(|k| (k.author.clone(), k.sort)).collect();
+    for (key, shift) in keys.iter_mut().zip(burst_shifts(&entries, &exempt, now)) {
+        key.sort -= shift;
+    }
+}
+
 const BSKY_RECOMMENDATION_MAX: usize = 4;
 /// Of those slots, how many may go to posts the background sampler pulled
 /// from the owner's saved feeds (PHP ap_bsky_feed_sample_tick).
@@ -3426,6 +3500,12 @@ pub async fn warm_home_native(cfg: &Config, owner_user_id: i64) -> Result<String
     let muted_phrases = load_muted_phrases(&db, owner_user_id).await;
     match crate::nostr::home::fetch_keys(&db, owner_user_id, |text: &str| text_matches_muted(text, &muted_phrases)).await {
         Ok(mut keys) => {
+            // Same ranking help Bluesky gets: author affinity from the
+            // owner's Nostr likes and reposts, then burst spread.
+            if algorithm_on {
+                let weights = load_nostr_actor_weights(&db, owner_user_id).await;
+                stamp_nostr_affinity(&mut keys, &weights, chrono::Utc::now().timestamp());
+            }
             if downranking_on {
                 if let Err(e) = apply_nostr_toxicity_downrank(&db, owner_user_id, &mut keys).await {
                     tracing::warn!(
@@ -3435,6 +3515,11 @@ pub async fn warm_home_native(cfg: &Config, owner_user_id: i64) -> Result<String
                     );
                 }
             }
+            if algorithm_on && burst_spread_enabled() {
+                let own = load_own_nostr_pubkey(&db, owner_user_id).await;
+                apply_nostr_burst_spread(&mut keys, own.as_deref());
+            }
+            keys.sort_by_key(|k| std::cmp::Reverse(k.sort));
             ranked = crate::nostr::home::merge_ranked(ranked, &keys);
         }
         Err(e) => tracing::warn!(
@@ -5018,5 +5103,50 @@ mod feed_pick_tests {
         assert!(got.contains("at://did:plc:a/app.bsky.feed.post/1"));
         assert!(feed_picks_from_doc(None).is_empty());
         assert!(feed_picks_from_doc(Some(&json!({"items": "x"}))).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod nostr_rank_tests {
+    use super::*;
+    use crate::nostr::home::NostrKey;
+
+    fn key(id: &str, author: &str, sort: i64) -> NostrKey {
+        NostrKey { id: id.into(), sort, author: author.into(), text: String::new(), note: id.into() }
+    }
+
+    #[test]
+    fn nostr_likes_and_reposts_become_decayed_author_weights() {
+        let now = 1_800_000_000;
+        let w = nostr_weights_from(
+            vec![("aa".to_string(), now, 1.4), ("aa".to_string(), now, 1.2), ("bb".to_string(), now - 28 * 86_400, 1.4), (String::new(), now, 1.4)].into_iter(),
+            now,
+        );
+        assert!((w["nostr:aa"] - 2.6).abs() < 1e-9);
+        assert!(w["nostr:bb"] < 0.2, "four weeks old fades");
+        assert_eq!(w.len(), 2);
+    }
+
+    #[test]
+    fn affinity_lifts_only_recent_notes_by_liked_authors() {
+        let now = 1_800_000_000;
+        let weights: HashMap<String, f64> = [("nostr:aa".to_string(), 2.6)].into_iter().collect();
+        let mut keys = vec![key("1", "aa", now - 600), key("2", "bb", now - 600), key("3", "aa", now - 3 * 86_400)];
+        stamp_nostr_affinity(&mut keys, &weights, now);
+        assert_eq!(keys[0].sort, now - 600 + affinity_bonus(2.6, 0));
+        assert!(keys[0].sort > now - 600);
+        assert_eq!(keys[1].sort, now - 600, "no engagement, no lift");
+        assert_eq!(keys[2].sort, now - 3 * 86_400, "older than 48 hours, no lift");
+    }
+
+    #[test]
+    fn a_nostr_burst_is_spread_but_the_owner_is_exempt() {
+        let now = chrono::Utc::now().timestamp();
+        let mut keys: Vec<NostrKey> = (0..6).map(|i| key(&format!("a{i}"), "aa", now - 600 * i)).collect();
+        keys.extend((0..6).map(|i| key(&format!("m{i}"), "me", now - 600 * i)));
+        let before: Vec<i64> = keys.iter().map(|k| k.sort).collect();
+        apply_nostr_burst_spread(&mut keys, Some("me"));
+        assert!(keys[..6].iter().zip(&before[..6]).any(|(k, b)| k.sort < *b), "busy author pushed down");
+        assert!(keys[6..].iter().zip(&before[6..]).all(|(k, b)| k.sort == *b), "own notes untouched");
     }
 }
