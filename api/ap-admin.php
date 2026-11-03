@@ -15182,6 +15182,12 @@ function admin_status_home_href(string $object): string
     return str_starts_with($object, 'https://') ? $object : '';
 }
 
+/** Opened post whose quote holds a muted word: closed, but its thread still loads. */
+function admin_status_muted_words_html(): string
+{
+    return '<div class="empty">Can\'t open post due to muted words.</div>';
+}
+
 /** Unavailable post copy. Hidden posts do not get a link around the block. */
 function admin_status_unavailable_html(string $object, bool $hidden): string
 {
@@ -24613,14 +24619,21 @@ function admin_bsky_thread_fragment(string $object, string $part, string $from, 
         $at = admin_bsky_thread_target_uri($object);
         if (!is_string($at) || !admin_bsky_thread_at_uri_ok($at)) return null;
         $focus = admin_bsky_thread_focus_item($at, $owner, $part === 'focus');
-        if (!is_array($focus) || ($focus['post']['uri'] ?? '') !== $at
-            || !admin_bsky_thread_focus_allowed($focus, $owner)
-            || $policy !== admin_bsky_thread_policy_snapshot($owner)) return null;
+        if (!is_array($focus) || ($focus['post']['uri'] ?? '') !== $at) return null;
+        // A muted word only in the opened post's quote: the post stays closed,
+        // but its thread still loads (each post there is word-checked as usual).
+        $focusMuted = false;
+        if (!admin_bsky_thread_focus_allowed($focus, $owner)) {
+            if (!admin_bsky_thread_focus_allowed($focus, $owner, true)) return null;
+            $focusMuted = true;
+        }
+        if ($policy !== admin_bsky_thread_policy_snapshot($owner)) return null;
         $rootTwin = admin_bsky_thread_local_twin($at);
         $rootTwins = $rootTwin !== null ? [$rootTwin] : [];
         $rootSource = admin_bsky_thread_source_snapshot([$at], $rootTwins);
         $source = ap_normalize_from_bsky_post($focus);
         if (!is_array($source) || !admin_direct_status_allowed($source, $owner)) return null;
+        if ($focusMuted && $part === 'focus') return admin_status_muted_words_html();
         // Policy receipts are private request-local SQL rows, never supplied by AppView.
         $wantAncestors = in_array($part, ['1', 'ancestors', 'both'], true);
         $wantReplies = in_array($part, ['replies', 'descendants', 'both'], true);
@@ -24640,7 +24653,7 @@ function admin_bsky_thread_fragment(string $object, string $part, string $from, 
                 return null;
             }
             if (!admin_bsky_thread_node_valid($tree) || ($tree['post']['uri'] ?? '') !== $at
-                || !admin_bsky_thread_focus_allowed(['post'=>$tree['post']], $owner)) {
+                || !admin_bsky_thread_focus_allowed(['post'=>$tree['post']], $owner, $focusMuted)) {
                 admin_bsky_thread_log($at, $part, 'focus not usable in AppView thread');
                 return null;
             }
@@ -24681,7 +24694,7 @@ function admin_bsky_thread_fragment(string $object, string $part, string $from, 
         // Never publish a buffered fragment after settings/account withdrawal.
         if ($owner !== admin_owner_user_id() || $sources !== admin_bsky_thread_source_snapshot(array_values(array_unique($selectedUris)), $selectedTwins)
             || $policy !== admin_bsky_thread_policy_snapshot($owner)
-            || !admin_bsky_thread_focus_allowed($focus, $owner)
+            || !admin_bsky_thread_focus_allowed($focus, $owner, $focusMuted)
             || !admin_direct_status_allowed($source, $owner)) {
             admin_bsky_thread_log($at, $part, 'source or policy changed while rendering');
             return null;
@@ -24845,7 +24858,7 @@ function admin_bsky_thread_post_valid(array $post): bool
 }
 
 /** Explicit focus retains root mute/word behavior; nested material stays strict. */
-function admin_bsky_thread_focus_allowed(array $item, int $owner): bool
+function admin_bsky_thread_focus_allowed(array $item, int $owner, bool $ignoreQuoteWords = false): bool
 {
     $post=$item['post']??null;if(!is_array($post)||!admin_bsky_thread_post_valid($post))return false;
     if(!empty($post['viewer']['blockedBy'])||!empty($post['author']['viewer']['blockedBy']))return false;
@@ -24862,8 +24875,8 @@ function admin_bsky_thread_focus_allowed(array $item, int $owner): bool
     }
     $status=ap_normalize_from_bsky_post($item);
     if(!is_array($status)||!admin_direct_status_allowed($status,$owner)||admin_direct_status_content_blocked($status))return false;
-    if(is_array($post['embed']??null)&&!admin_library_bsky_item_allowed($post['embed'],$owner,0,true))return false;
-    if(is_array($post['record']['embed']??null)&&!admin_library_bsky_item_allowed($post['record']['embed'],$owner,0,true))return false;
+    if(is_array($post['embed']??null)&&!admin_library_bsky_item_allowed($post['embed'],$owner,0,true,$ignoreQuoteWords))return false;
+    if(is_array($post['record']['embed']??null)&&!admin_library_bsky_item_allowed($post['record']['embed'],$owner,0,true,$ignoreQuoteWords))return false;
     return true;
 }
 
@@ -27550,7 +27563,7 @@ function admin_library_render_context_allowed(array $status, int $ownerUserId, a
  * Walk PostView/RecordView, repost authors and nested quotes before either painter.
  * Labels remain under the existing sensitive/CW renderer and saved unblur setting.
  */
-function admin_library_bsky_item_allowed(array $item, int $ownerUserId, int $depth = 0, bool $allowGuest = false): bool
+function admin_library_bsky_item_allowed(array $item, int $ownerUserId, int $depth = 0, bool $allowGuest = false, bool $skipWords = false): bool
 {
     if (($ownerUserId < 1 && !$allowGuest) || $depth > 16 || !function_exists('ap_visibility_actor_hidden')
         || !function_exists('ap_muted_words_match')) {
@@ -27578,9 +27591,9 @@ function admin_library_bsky_item_allowed(array $item, int $ownerUserId, int $dep
         // settings actions. Current owner tables above are authoritative.
         if (!empty($item['viewer']['blockedBy'])
             || !empty($item['author']['viewer']['blockedBy'])) return false;
-        if (ap_muted_words_match($ownerUserId, (string) ($item['text'] ?? ''), '') !== null) return false;
+        if (!$skipWords && ap_muted_words_match($ownerUserId, (string) ($item['text'] ?? ''), '') !== null) return false;
         foreach ($item as $value) {
-            if (is_array($value) && !admin_library_bsky_item_allowed($value, $ownerUserId, $depth + 1, $allowGuest)) return false;
+            if (is_array($value) && !admin_library_bsky_item_allowed($value, $ownerUserId, $depth + 1, $allowGuest, $skipWords)) return false;
         }
         return true;
     } catch (Throwable $e) {
