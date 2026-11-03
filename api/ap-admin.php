@@ -21095,6 +21095,14 @@ function admin_remote_account_is_bot(mixed $account, string $actorRef): bool
     return is_array($row) && ap_actor_doc_is_bot($row['profile_json'] ?? null);
 }
 
+/** A Nostr note (`nostr:` id) or a boost wrapper around one. */
+function admin_status_is_nostr_card(array $st): bool
+{
+    $isNostr = static fn (array $s): bool => str_starts_with((string) ($s['id'] ?? ''), 'nostr:')
+        || ($s['source'] ?? '') === 'nostr';
+    return $isNostr($st) || (is_array($st['reblog'] ?? null) && $isNostr($st['reblog']));
+}
+
 function admin_render_masto_status_card(
     array $st,
     array $followingIds,
@@ -21105,6 +21113,20 @@ function admin_render_masto_status_card(
 
 ): void {
     $readOnlyGuest = !empty($GLOBALS['vaak_guest_profile']);
+    // A Nostr note, or a VAAK boost of one: the worker paints it with the
+    // Nostr-signed actions (VAAK's own like/boost refuse Nostr ids) and its
+    // links. Falls through to this painter only if the worker can't.
+    if (!$readOnlyGuest && !$hideHeader && admin_status_is_nostr_card($st)) {
+        if (!function_exists('ap_nostr_card_html')) {
+            require_once __DIR__ . '/ap-nostr.php';
+        }
+        $owner = function_exists('admin_owner_user_id') ? (int) admin_owner_user_id() : 0;
+        $html = $owner > 0 ? ap_nostr_card_html($st, $owner, $returnView) : '';
+        if ($html !== '') {
+            echo $html;
+            return;
+        }
+    }
     $directSurface = $focused || in_array($returnView, ['status', 'remote_profile'], true)
         || ($GLOBALS['view'] ?? '') === 'status';
     if (!$directSurface && in_array($returnView, ['bookmarks', 'favourites'], true)) {

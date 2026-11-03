@@ -5837,6 +5837,11 @@ function ap_masto_nostr_note_media(array $status, ?PDO $db = null): array
         $at = $pos + strlen($url);
         [$mime, $alt] = $meta[$url] ?? ['', ''];
         $type = str_starts_with($url, 'https://') ? $kind($url, $mime) : null;
+        // An imeta entry with no mime still marks attached media (Bluesky
+        // getBlob links from bridges have no extension), as in render.rs.
+        if ($type === null && $mime === '' && isset($meta[$url]) && str_starts_with($url, 'https://')) {
+            $type = 'image';
+        }
         if ($type !== null && count($media) < 4) {
             $media[] = [
                 'id' => 'nostr:' . $id . '-m' . (count($media) + 1),

@@ -829,7 +829,11 @@ struct NostrCardBody {
 
 /// Painted Nostr cards for PHP pages (Library), in request order.
 async fn shadow_nostr_card(State(state): State<AppState>, Json(body): Json<NostrCardBody>) -> axum::response::Response {
-    if body.owner_id < 1 || body.statuses.is_empty() || body.statuses.len() > 100 || !body.statuses.iter().all(crate::nostr::render::is_nostr_status) {
+    if body.owner_id < 1 || body.statuses.is_empty() || body.statuses.len() > 100 || !body.statuses.iter().all(|st| {
+        // A Nostr note, or a VAAK user's boost of one (its reblog is the note).
+        crate::nostr::render::is_nostr_status(st)
+            || st.get("reblog").filter(|r| r.is_object()).is_some_and(crate::nostr::render::is_nostr_status)
+    }) {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"ok": false, "error": "Nostr statuses required"}))).into_response();
     }
     let from: String = body.from.chars().filter(|c| c.is_ascii_lowercase() || *c == '_').take(32).collect();
