@@ -6581,7 +6581,18 @@ function ap_masto_notifications_unread_invalidate(?int $ownerUserId = null): voi
 function ap_mention_store(array $row): void
 {
     // Text + optional remote media URLs (https only). Never stores media bytes.
-    $content = isset($row['content']) ? mb_substr(strip_tags(ap_fix_utf8((string) $row['content'])), 0, 2000) : null;
+    // Keep paragraph and line breaks when flattening HTML. Without them a
+    // Mastodon quote's "RE: <link>" paragraph runs into the reply text
+    // ("…/notes/22a7c4d4*hoo") and the quote target can no longer be read.
+    $content = null;
+    if (isset($row['content'])) {
+        $html = ap_fix_utf8((string) $row['content']);
+        $html = preg_replace('#<br\s*/?>#i', "\n", $html) ?? $html;
+        $html = preg_replace('#</(?:p|div|blockquote|li|h[1-6])>#i', "$0\n\n", $html) ?? $html;
+        $plain = strip_tags($html);
+        $plain = trim(preg_replace("/\n{3,}/", "\n\n", $plain) ?? $plain);
+        $content = mb_substr($plain, 0, 2000);
+    }
     $objectId = $row['object_id'] ?? null;
     if (!$objectId) {
         return;

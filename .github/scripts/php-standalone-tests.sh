@@ -37,6 +37,7 @@ php_tests=(
   api/bin/post-media-warm-busy-smoke.php
   api/bin/bite-queue-smoke.php
   api/bin/trend-tag-score-smoke.php
+  api/bin/quote-url-glued-text-smoke.php
   api/bin/known-shared-inboxes-cache-smoke.php
   api/bin/actor-bot-doc-smoke.php
   api/bin/queue-media-draft-ref-smoke.php

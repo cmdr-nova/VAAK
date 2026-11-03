@@ -79,7 +79,22 @@ pub(crate) fn looks_like_status_object(url: &str) -> bool {
 }
 
 fn clean_url(raw: &str) -> String {
-    raw.trim().trim_end_matches(['.', ',', ')', ';', ']', '!', '?', '\'', '"']).trim_end_matches('/').to_owned()
+    trim_glued_text(raw.trim().trim_end_matches(['.', ',', ')', ';', ']', '!', '?', '\'', '"'])).trim_end_matches('/').to_owned()
+}
+
+/// Same cut as PHP `ap_masto_quote_url_from_event_summary`. Older notification rows were
+/// flattened with no paragraph breaks, so a quote's "RE: <link>" ran into the
+/// reply ("…/notes/22a7c4d4*hoo"). Status ids are plain `[A-Za-z0-9_-]`, so
+/// anything else right after the id is not part of the URL.
+pub(crate) fn trim_glued_text(url: &str) -> String {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(r"^(https://[^/\s]+/(?:(?:ap/)?users/[^/\s]+/(?:statuses|posts|notes)|notes|objects|@[^/\s]+)/[A-Za-z0-9_-]+)[^A-Za-z0-9_\-/?#]").unwrap()
+    });
+    match re.captures(url) {
+        Some(caps) => caps[1].to_owned(),
+        None => url.to_owned(),
+    }
 }
 
 /// Best quote-target URL from an event summary, using PHP's priority order.
@@ -431,6 +446,16 @@ fn collect_quote_cards<'a>(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn glued_reply_text_is_cut_from_quote_target() {
+        assert_eq!(
+            quote_target_url("RE: https://mkultra.monster/users/cmdr_nova/notes/22a7c4d49c6353d4*hoo !*").as_deref(),
+            Some("https://mkultra.monster/users/cmdr_nova/notes/22a7c4d49c6353d4")
+        );
+        assert_eq!(trim_glued_text("https://a.example/@bob/123?x=1"), "https://a.example/@bob/123?x=1");
+        assert_eq!(trim_glued_text("https://a.example/users/bob/statuses/42/activity"), "https://a.example/users/bob/statuses/42/activity");
+    }
+
     use super::*;
     use crate::audience::{replay_decision, ReplayRecord, Surface};
     use crate::library::bookmark::BookmarkCache;

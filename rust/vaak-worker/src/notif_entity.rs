@@ -657,8 +657,8 @@ fn regex_re() -> &'static regex::Regex {
 fn https_in(text: &str) -> Option<String> {
     let re = regex::Regex::new(r#"https://[^\s<>'"]+"#).ok()?;
     let url = re.captures(text)?.get(0)?.as_str();
-    let url = url.trim_end_matches(['.', ',', ')', ';', ']', '!', '?', '\'', '"']);
-    https_url(url).map(|item| trim_slash(&item))
+    let url = crate::library::quote::trim_glued_text(url.trim_end_matches(['.', ',', ')', ';', ']', '!', '?', '\'', '"']));
+    https_url(&url).map(|item| trim_slash(&item))
 }
 
 fn quote_target_from_create(raw: &str) -> Option<String> {
@@ -1057,6 +1057,11 @@ fn mention_status(item: &NotifInput, facts: &PageFacts, owner: &OwnerView) -> Va
         "quote": quote.unwrap_or(Value::Null),
         "quote_approval": quote_approval()
     });
+    // PHP sets quote_url beside the quote; painters use it to link a pending
+    // target instead of calling the quote unavailable.
+    if let Some(target) = quote_url.filter(|url| url.starts_with("https://")) {
+        status["quote_url"] = json!(target);
+    }
     flags(&mut status, facts);
     let _ = parent;
     if notif::is_nostr(&item.activity_id, &item.actor_id, &item.object_id) {

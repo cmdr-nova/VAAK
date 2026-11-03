@@ -1434,6 +1434,17 @@ function ap_masto_quote_url_from_event_summary(string $summary): ?string
     $candidates = [];
     $push = static function (string $url, int $pri) use (&$candidates): void {
         $url = rtrim(trim($url), '.,);]');
+        // Older notification rows were flattened with no paragraph breaks, so
+        // a quote's "RE: <link>" ran into the reply ("…/notes/22a7c4d4*hoo").
+        // Status ids are plain [A-Za-z0-9_-]; anything else right after the
+        // id is not part of the URL.
+        if (preg_match(
+            '~^(https://[^/\s]+/(?:(?:ap/)?users/[^/\s]+/(?:statuses|posts|notes)|notes|objects|@[^/\s]+)/[A-Za-z0-9_-]+)[^A-Za-z0-9_\-/?#]~',
+            $url,
+            $gm
+        )) {
+            $url = $gm[1];
+        }
         $url = rtrim($url, '/');
         if ($url === '' || !str_starts_with($url, 'https://')) {
             return;
