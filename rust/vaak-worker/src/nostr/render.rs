@@ -174,8 +174,18 @@ pub fn content_and_media(status_id: &str, content: &str, tags: &Value) -> (Strin
                 esc(&label)
             )),
             Piece::Link(url) => {
+                let described = meta.contains_key(&url);
                 let (mime, alt, hash) = meta.get(&url).cloned().unwrap_or_default();
-                let kind = if url.starts_with("https://") { media_type(&url, &mime) } else { None };
+                // An `imeta` entry marks the link as attached media even
+                // without a file extension (Bluesky getBlob links from
+                // bridges); with no `m` it is almost always a picture.
+                let kind = if !url.starts_with("https://") {
+                    None
+                } else if described && mime.is_empty() {
+                    media_type(&url, "").or(Some("image"))
+                } else {
+                    media_type(&url, &mime)
+                };
                 if let Some(kind) = kind {
                     if media.len() < MAX_MEDIA && media_urls.insert(url.clone()) {
                         media.push(json!({
@@ -391,6 +401,20 @@ mod tests {
     }
 
     #[test]
+    fn imeta_marks_extensionless_links_as_media_and_other_links_stay_clickable() {
+        let blob = "https://chalciporus.us-west.host.bsky.network/xrpc/com.atproto.sync.getBlob?did=did:plc:abc&cid=bafkreia";
+        let other = "https://chalciporus.us-west.host.bsky.network/xrpc/com.atproto.sync.getBlob?did=did:plc:abc&cid=bafkreib";
+        let content = format!("hi #kigurumi\n\n{blob}\n{other}");
+        let tags = json!([["imeta", format!("url {blob}")]]);
+        let (html, media) = content_and_media("s", &content, &tags);
+        assert_eq!(media.len(), 1, "{media:?}");
+        assert_eq!(media[0]["type"], "image");
+        assert_eq!(media[0]["url"], blob);
+        assert!(!html.contains("bafkreia"), "attached media leaves the text: {html}");
+        assert!(html.contains("<a href=\"https://chalciporus.us-west.host.bsky.network/xrpc/com.atproto.sync.getBlob?did=did:plc:abc&amp;cid=bafkreib\" target=\"_blank\""), "{html}");
+    }
+
+    #[test]
     fn javascript_and_quotes_never_become_links() {
         let (html, media) = content_and_media("s", "x javascript:alert(1) https://a.example/\"onmouseover=\"y", &json!([]));
         assert!(!html.contains("href=\"javascript"), "{html}");
@@ -538,6 +562,29 @@ mod tests {
         own["vaak_nostr_mine"] = json!(true);
         let html = crate::notif_embed::paint_lean_feed_card_opts(&own, "home", "");
         assert!(!html.contains("booster Alice on Nostr</button>"), "no follow on your own repost: {html}");
+    }
+
+    #[test]
+    fn vaak_boost_of_a_nostr_note_keeps_the_nostr_actions() {
+        let mut note = row("hello https://example.com/page", json!([]));
+        note.display_name = "Bob".into();
+        let inner = materialize(&note);
+        let wrapper = json!({
+            "id": format!("nostr-boost:{}:7", note.id),
+            "created_at": "2026-11-03T07:50:00.000Z",
+            "content": "",
+            "uri": "local:nostr-boost:x",
+            "url": inner["url"].clone(),
+            "visibility": "public",
+            "account": {"id": "7", "acct": "nagisaka", "username": "nagisaka", "display_name": "Nagisaka", "url": "https://mkultra.monster/users/nagisaka", "uri": "https://mkultra.monster/users/nagisaka", "avatar": ""},
+            "reblog": inner,
+            "media_attachments": [],
+        });
+        let html = crate::notif_embed::paint_lean_feed_card_opts(&wrapper, "home", "");
+        assert!(html.contains("Nagisaka</a> boosted"), "{html}");
+        assert!(html.contains(&format!("data-nostr-act=\"like\" data-nostr-target=\"{}\"", note.id)), "{html}");
+        assert!(!html.contains("favourite_status") && !html.contains("ph-tooth") && !html.contains("reblog_status"), "no VAAK like/boost/bite: {html}");
+        assert!(html.contains("<a class=\"ext-link\" href=\"https://example.com/page\" target=\"_blank\""), "links stay links: {html}");
     }
 
     #[test]

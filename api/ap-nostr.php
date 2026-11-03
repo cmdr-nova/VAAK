@@ -866,7 +866,11 @@ function ap_nostr_cards_html(array $statuses, int $ownerUserId, string $view): a
     $out = array_fill(0, count($statuses), '');
     $send = [];
     foreach (array_values($statuses) as $i => $status) {
-        if (is_array($status) && str_starts_with((string) ($status['id'] ?? ''), 'nostr:')) {
+        // A Nostr note, or a boost wrapper around one (a VAAK user's boost
+        // of a Nostr note: the worker paints the booster line too).
+        $inner = is_array($status['reblog'] ?? null) ? $status['reblog'] : null;
+        if (is_array($status) && (str_starts_with((string) ($status['id'] ?? ''), 'nostr:')
+            || ($inner !== null && str_starts_with((string) ($inner['id'] ?? ''), 'nostr:')))) {
             $send[$i] = $status;
         }
     }
