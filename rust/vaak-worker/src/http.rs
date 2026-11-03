@@ -182,6 +182,7 @@ pub async fn serve(cfg: Config, bind: SocketAddr) -> Result<()> {
         // copy the viewer's signer extension signed (nostr::act).
         .route("/shadow/nostr-prepare", post(shadow_nostr_prepare))
         .route("/shadow/nostr-publish", post(shadow_nostr_publish))
+        .route("/shadow/nostr-pack", post(shadow_nostr_pack))
         // A zap's pay panel asking whether its invoice was paid yet.
         .route("/shadow/nostr-zap-status", post(shadow_nostr_zap_status))
         // NIP-46: pair with a user's bunker, and sign through it for pages
@@ -278,6 +279,7 @@ async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
             "/api/v1/notifications",
             "/shadow/nostr-prepare (POST)",
             "/shadow/nostr-publish (POST)",
+            "/shadow/nostr-pack (POST)",
             "/shadow/nostr-zap-status (POST)",
             "/shadow/nostr-bunker-connect (POST)",
             "/shadow/nostr-bunker-sign (POST)",
@@ -702,6 +704,17 @@ struct NostrPrepareBody {
     /// Lightning address, for purpose "lightning" ("" clears it).
     #[serde(default)]
     lightning: Option<String>,
+    /// Pack members to follow, for purpose "follow_pack".
+    #[serde(default)]
+    picks: Vec<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct NostrPackBody {
+    owner_id: i64,
+    link: String,
+    #[serde(default)]
+    refresh: bool,
 }
 
 #[derive(serde::Deserialize)]
@@ -729,7 +742,15 @@ async fn shadow_nostr_prepare(State(state): State<AppState>, Json(body): Json<No
     if body.owner_id < 1 {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"ok": false, "error": "owner required"}))).into_response();
     }
-    nostr_reply(crate::nostr::act::prepare(&state.cfg, body.owner_id, &body.purpose, &body.target, &body.reason, body.note.as_ref(), body.zap.as_ref(), body.lightning.as_deref()).await)
+    nostr_reply(crate::nostr::act::prepare(&state.cfg, body.owner_id, &body.purpose, &body.target, &body.reason, body.note.as_ref(), body.zap.as_ref(), body.lightning.as_deref(), &body.picks).await)
+}
+
+/// Library > Collections: open a Nostr follow pack from a pasted link (nostr::pack).
+async fn shadow_nostr_pack(State(state): State<AppState>, Json(body): Json<NostrPackBody>) -> axum::response::Response {
+    if body.owner_id < 1 {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"ok": false, "error": "owner required"}))).into_response();
+    }
+    nostr_reply(crate::nostr::pack::open(&state.cfg, body.owner_id, &body.link, body.refresh).await)
 }
 
 async fn shadow_nostr_publish(State(state): State<AppState>, Json(body): Json<NostrPublishBody>) -> axum::response::Response {

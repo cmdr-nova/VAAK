@@ -389,6 +389,27 @@ function ap_nostr_action(string $action, int $ownerUserId, bool $isAdmin, array 
             'lightning' => $address,
         ], 30000);
     }
+    if ($action === 'nostr_prepare' && (string) ($post['purpose'] ?? '') === 'follow_pack') {
+        // Library > Collections: follow picked members of an open follow
+        // pack in one kind 3 edit (nostr/pack.rs, nostr/act.rs).
+        $addr = trim((string) ($post['target'] ?? ''));
+        $picks = ap_nostr_pack_picks((string) ($post['picks'] ?? ''));
+        if (!ap_nostr_pack_addr_ok($addr)) {
+            return $fail(400, 'Unknown follow pack.');
+        }
+        if ($picks === []) {
+            return $fail(400, 'Pick at least one person to follow.');
+        }
+        if (count($picks) > AP_NOSTR_PACK_MAX_PICKS) {
+            return $fail(400, 'Pick ' . AP_NOSTR_PACK_MAX_PICKS . ' or fewer people at a time.');
+        }
+        return ap_nostr_worker_call('/shadow/nostr-prepare', [
+            'owner_id' => $ownerUserId,
+            'purpose' => 'follow_pack',
+            'target' => $addr,
+            'picks' => $picks,
+        ], 30000);
+    }
     if ($action === 'nostr_prepare') {
         $purpose = (string) ($post['purpose'] ?? '');
         $target = strtolower(trim((string) ($post['target'] ?? '')));
@@ -1410,4 +1431,155 @@ function ap_nostr_downranked_evidence(string $pubkey, array $categories, array $
     } catch (Throwable $e) {
         return [];
     }
+}
+
+
+/** Keys one "Follow" press may add (nostr/pack.rs MAX_FOLLOW_PICKS). */
+const AP_NOSTR_PACK_MAX_PICKS = 150;
+
+/** A follow pack address: `39089:<hex pubkey>:<d tag>` (or 39092). */
+function ap_nostr_pack_addr_ok(string $addr): bool
+{
+    return strlen($addr) <= 300 && (bool) preg_match('/^(39089|39092):[0-9a-f]{64}:[^\x00-\x1f]{1,200}$/u', $addr);
+}
+
+/**
+ * Comma-separated hex keys from the pack page, lowercased, once each.
+ * Anything that isn't a key is dropped.
+ *
+ * @return list<string>
+ */
+function ap_nostr_pack_picks(string $raw): array
+{
+    $out = [];
+    foreach (explode(',', strtolower(substr($raw, 0, 200 * 66))) as $k) {
+        $k = trim($k);
+        if (preg_match('/^[0-9a-f]{64}$/', $k)) {
+            $out[$k] = true;
+        }
+    }
+    return array_keys($out);
+}
+
+/**
+ * Library > Collections: a Nostr follow pack from a pasted link, fetched and
+ * checked by the worker (`/shadow/nostr-pack`, nostr/pack.rs) and cached
+ * there for half an hour.
+ *
+ * @return array<string,mixed>
+ */
+function ap_nostr_pack_open(int $ownerUserId, string $link, bool $refresh = false): array
+{
+    $link = trim($link);
+    if ($ownerUserId < 1 || $link === '' || strlen($link) > 4000) {
+        return ['ok' => false, 'error' => 'Paste a follow pack link first.'];
+    }
+    $res = ap_nostr_worker_call('/shadow/nostr-pack', ['owner_id' => $ownerUserId, 'link' => $link, 'refresh' => $refresh], 25000);
+    $body = is_array($res['body'] ?? null) ? $res['body'] : [];
+    if (empty($body['ok'])) {
+        return ['ok' => false, 'error' => (string) ($body['error'] ?? 'VAAK couldn\'t open that pack. Try again.')];
+    }
+    return $body;
+}
+
+/**
+ * The pack page: title, author, members with checkboxes, and the Follow
+ * button the Home card script (ap-admin.php, nostr actions) signs and sends.
+ *
+ * @param array<string,mixed> $res ap_nostr_pack_open() answer
+ */
+function ap_nostr_pack_html(array $res, string $link): string
+{
+    $e = static fn ($v): string => htmlspecialchars((string) $v, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+    $fallback = defined('AP_REMOTE_AVATAR_FALLBACK') ? (string) AP_REMOTE_AVATAR_FALLBACK : 'https://mkultra.monster/img/avatar/default.jpg';
+    $back = '<div class="page-back" style="margin-bottom:.75rem"><a class="btn btn-ghost" href="?view=collections">← All collections</a></div>';
+    if (empty($res['ok'])) {
+        return $back . '<div class="empty">' . $e($res['error'] ?? 'Couldn\'t open that pack.') . '</div>';
+    }
+    $pack = is_array($res['pack'] ?? null) ? $res['pack'] : [];
+    $author = is_array($pack['author'] ?? null) ? $pack['author'] : [];
+    $members = is_array($res['members'] ?? null) ? $res['members'] : [];
+    $linked = !empty($res['linked']);
+    $max = (int) ($res['max_picks'] ?? AP_NOSTR_PACK_MAX_PICKS);
+    $nameOf = static function (array $p): string {
+        $name = trim((string) ($p['name'] ?? ''));
+        $npub = (string) ($p['npub'] ?? '');
+        return $name !== '' ? $name : (substr($npub, 0, 12) . '…' . substr($npub, -6));
+    };
+    $avatar = static function (array $p, string $class) use ($e, $fallback): string {
+        $src = (string) ($p['picture'] ?? '');
+        if (!str_starts_with($src, 'https://')) {
+            $src = $fallback;
+        }
+        return '<img class="' . $class . '" src="' . $e($src) . '" alt="" width="40" height="40" loading="lazy" decoding="async" referrerpolicy="no-referrer" onerror="this.onerror=null;this.src=' . $e(json_encode($fallback)) . '">';
+    };
+    $open = 0;
+    foreach ($members as $m) {
+        if (is_array($m) && empty($m['following']) && empty($m['me'])) {
+            $open++;
+        }
+    }
+    $title = trim((string) ($pack['title'] ?? '')) !== '' ? (string) $pack['title'] : 'Untitled follow pack';
+    $naddr = (string) ($pack['naddr'] ?? '');
+    $out = $back;
+    $out .= '<article class="tweet nostr-pack-head">';
+    if (str_starts_with((string) ($pack['image'] ?? ''), 'https://')) {
+        $out .= '<img class="nostr-pack-banner" src="' . $e($pack['image']) . '" alt="" loading="lazy" decoding="async" referrerpolicy="no-referrer" onerror="this.remove()">';
+    }
+    $out .= '<div class="tweet-hd">' . $avatar($author, 'tweet-av') . '<div class="tweet-hd-main"><div><span class="who">' . $e($title) . '</span> <span class="tag">Nostr</span></div>'
+        . '<div class="meta">Follow pack by <a href="https://njump.me/' . $e($author['npub'] ?? '') . '" target="_blank" rel="noopener noreferrer">' . $e($nameOf($author)) . '</a> · ' . count($members) . ' people</div></div></div>';
+    if (trim((string) ($pack['description'] ?? '')) !== '') {
+        $out .= '<div class="body" style="margin:.35rem 0;white-space:pre-line">' . $e($pack['description']) . '</div>';
+    }
+    if ((int) ($pack['dropped'] ?? 0) > 0) {
+        $out .= '<div class="meta">This pack lists ' . (int) $pack['dropped'] . ' more people than VAAK shows (' . count($members) . ' max).</div>';
+    }
+    $out .= '<div class="tweet-actions" style="gap:.75rem">';
+    if ($naddr !== '') {
+        $out .= '<a href="https://njump.me/' . $e($naddr) . '" target="_blank" rel="noopener noreferrer">Open on njump</a>';
+        $parts = explode(':', (string) ($pack['addr'] ?? ''), 3);
+        if (count($parts) === 3 && $parts[0] === '39089') {
+            $out .= '<a href="https://following.space/d/' . $e(rawurlencode($parts[2])) . '?p=' . $e($parts[1]) . '" target="_blank" rel="noopener noreferrer">Open on following.space</a>';
+        }
+    }
+    $out .= '<a href="?view=collections&amp;nostr_pack=' . $e(rawurlencode($link)) . '&amp;nostr_pack_refresh=1">Refresh</a>';
+    $out .= '</div></article>';
+
+    $out .= '<form class="nostr-pack-form" data-ajax-submit="1" data-nostr-pack="' . $e($pack['addr'] ?? '') . '" data-nostr-pack-max="' . $max . '" onsubmit="return false">';
+    if (!$linked) {
+        $out .= '<div class="empty" style="margin:.75rem 0">Link your npub in <a href="?view=profile">Settings &gt; Profile</a> to follow people from this pack.</div>';
+    } elseif ($open === 0) {
+        $out .= '<div class="meta" style="margin:.75rem 0">You already follow everyone in this pack.</div>';
+    } else {
+        $out .= '<div class="composer-actions nostr-pack-bar" style="margin:.75rem 0;gap:.5rem;flex-wrap:wrap">'
+            . '<label class="composer-check"><input type="checkbox" data-nostr-pack-all checked> <span>Select everyone you don\'t follow yet</span></label>'
+            . '<button class="btn btn-primary" type="button" data-nostr-pack-follow>Follow <span data-nostr-pack-count>' . min($open, $max) . '</span> on Nostr</button></div>'
+            . '<div class="meta" style="margin:-.25rem 0 .75rem">One signature adds everyone you picked to your Nostr follow list (up to ' . $max . ' at a time). Their posts reach Home after the next Nostr sync.</div>';
+    }
+    $checked = 0;
+    foreach ($members as $m) {
+        if (!is_array($m) || !preg_match('/^[0-9a-f]{64}$/', (string) ($m['pubkey'] ?? ''))) {
+            continue;
+        }
+        $done = !empty($m['following']) || !empty($m['me']);
+        $tick = !$done && $linked && $checked < $max;
+        if ($tick) {
+            $checked++;
+        }
+        $npub = (string) ($m['npub'] ?? '');
+        $out .= '<label class="tweet nostr-pack-member" style="display:block;cursor:' . ($done || !$linked ? 'default' : 'pointer') . '"><div class="tweet-hd">';
+        if ($linked) {
+            $out .= '<input type="checkbox" name="nostr_pack_pick" value="' . $e($m['pubkey']) . '"' . ($tick ? ' checked' : '') . ($done ? ' disabled' : '') . ' aria-label="' . $e('Follow ' . $nameOf($m)) . '" style="align-self:center;margin-right:.5rem">';
+        }
+        $out .= $avatar($m, 'tweet-av') . '<div class="tweet-hd-main"><div><span class="who">' . $e($nameOf($m)) . '</span>';
+        if (!empty($m['me'])) {
+            $out .= ' <span class="tag">you</span>';
+        } elseif (!empty($m['following'])) {
+            $out .= ' <span class="tag" data-nostr-pack-tag>following</span>';
+        }
+        $out .= '</div><div class="meta">';
+        $out .= trim((string) ($m['nip05'] ?? '')) !== '' ? $e(preg_replace('/^_@/', '', (string) $m['nip05'])) . ' · ' : '';
+        $out .= '<a href="https://njump.me/' . $e($npub) . '" target="_blank" rel="noopener noreferrer">' . $e(substr($npub, 0, 14) . '…') . '</a></div></div></div></label>';
+    }
+    return $out . '</form>';
 }

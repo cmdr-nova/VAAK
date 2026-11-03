@@ -271,7 +271,7 @@ pub(super) async fn linked_pubkey(db: &Client, owner: i64) -> Result<Option<(Str
         .filter(|(pk, _, _): &(String, i64, i64)| event::is_hex64(pk)))
 }
 
-async fn write_relays_of(db: &Client, pubkeys: &[String]) -> Vec<String> {
+pub(super) async fn write_relays_of(db: &Client, pubkeys: &[String]) -> Vec<String> {
     let mut out = Vec::new();
     if let Ok(rows) = db.query("SELECT write_relays FROM nostr_profiles WHERE pubkey = ANY($1)", &[&pubkeys]).await {
         for row in rows {
@@ -350,6 +350,7 @@ pub async fn prepare(
     note: Option<&NewNote>,
     zap_ask: Option<&ZapAsk>,
     lightning: Option<&str>,
+    picks: &[String],
 ) -> Result<Value> {
     if super::sync::disabled_by_env() {
         return refuse("Nostr is turned off on this server.");
@@ -362,7 +363,9 @@ pub async fn prepare(
         return refuse("Link your npub in Settings > Profile first.");
     };
     let target = target.trim().to_ascii_lowercase();
-    if purpose != "post" && purpose != "lightning" && !event::is_hex64(&target) {
+    // A follow pack is named by its address (`39089:pubkey:d`), not a key.
+    let target = if purpose == "follow_pack" { target.trim().to_string() } else { target };
+    if purpose != "post" && purpose != "lightning" && purpose != "follow_pack" && !event::is_hex64(&target) {
         return refuse("That isn't a Nostr note or person.");
     }
     let mut s = super::sync::Settings::from_env(30);
@@ -562,6 +565,43 @@ pub async fn prepare(
             };
             Pending {
                 purpose: purpose.into(),
+                target: target.clone(),
+                kind: 3,
+                tags,
+                content: Some(base.content.clone()),
+                suffix: None,
+                zap: None,
+                base: Some(base),
+                relays: merge_relays(&[&mine, &s.index_relays, &s.fallback_relays]),
+            }
+        }
+        "follow_pack" => {
+            // Library > Collections: follow picked members of a pack the
+            // user just opened (nostr::pack), in one kind 3 edit.
+            let Some(cached) = super::pack::cached(cfg, &target).await? else {
+                return refuse("That pack isn't open anymore. Open it again and pick people to follow.");
+            };
+            let mine = write_relays_of(&db, std::slice::from_ref(&me)).await;
+            let read_from = super::relay_book::without_skipped(merge_relays(&[&mine, &s.index_relays]), &s.skip);
+            let (base, answered) = newest_list(&me, 3, &read_from).await;
+            let Some(base) = base else {
+                return refuse(if answered == 0 {
+                    "No relay answered. Try again in a minute."
+                } else {
+                    "Couldn't find your current follow list on any relay, so VAAK won't risk replacing it."
+                });
+            };
+            if let Some(problem) = base_list_problem(&base, stored_count, stored_at) {
+                return refuse(&problem);
+            }
+            let adds = match super::pack::follow_picks(&cached.pack, picks, &base.tags, &me) {
+                Ok(adds) => adds,
+                Err(e) => return refuse(&e),
+            };
+            let mut tags = base.tags.clone();
+            tags.extend(adds.iter().map(|pk| tag(&["p", pk])));
+            Pending {
+                purpose: "follow_pack".into(),
                 target: target.clone(),
                 kind: 3,
                 tags,
@@ -932,6 +972,7 @@ pub async fn publish(cfg: &Config, owner: i64, nonce: &str, signed: &Value) -> R
             "asked": results.len(),
         }));
     }
+    let mut added: Vec<String> = Vec::new();
     match pending.purpose.as_str() {
         "like" => {
             db.execute(
@@ -1005,6 +1046,23 @@ pub async fn publish(cfg: &Config, owner: i64, nonce: &str, signed: &Value) -> R
             )
             .await?;
         }
+        "follow_pack" => {
+            // Whoever the new list has that the replaced one didn't.
+            let list = ev.follow_list();
+            let before: HashSet<String> = pending.base.as_ref().map(|b| b.follow_list().into_iter().collect()).unwrap_or_default();
+            let adds: Vec<String> = list.iter().filter(|pk| !before.contains(*pk)).cloned().collect();
+            db.execute(
+                "INSERT INTO nostr_follows (owner_user_id, pubkey) SELECT $1, unnest($2::text[]) ON CONFLICT DO NOTHING",
+                &[&owner, &adds],
+            )
+            .await?;
+            db.execute(
+                "UPDATE nostr_links SET follow_count = $2, follow_list_at = $3 WHERE owner_user_id = $1",
+                &[&owner, &(list.len() as i32), &ev.created_at],
+            )
+            .await?;
+            added = adds;
+        }
         "mute" | "unmute" => {
             super::sync::store_mute_list(&db, owner, &ev).await?;
         }
@@ -1020,6 +1078,7 @@ pub async fn publish(cfg: &Config, owner: i64, nonce: &str, signed: &Value) -> R
         "asked": results.len(),
         "note": if matches!(pending.purpose.as_str(), "reply" | "quote" | "post") { Value::String(super::bech32::note(&ev.id)) } else { Value::Null },
         "zaps": pending.purpose == "lightning" && pending.zap.as_ref().is_some_and(|z| z.allows_nostr),
+        "added": added,
     }))
 }
 

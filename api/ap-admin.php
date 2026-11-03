@@ -32674,6 +32674,8 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     }
     form.nostr-reply .nostr-reply-row { display: flex; gap: .5rem; justify-content: flex-end; }
     .nostr-reply-done { margin: .5rem 0 .2rem; }
+    .nostr-pack-banner { display: block; width: 100%; max-height: 180px; object-fit: cover; border-radius: 12px; margin-bottom: .6rem; }
+    .nostr-pack-member input[type="checkbox"] { width: 1.1rem; height: 1.1rem; flex: none; }
     .nostr-toast {
       position: fixed; left: 50%; bottom: calc(1.25rem + env(safe-area-inset-bottom, 0px)); transform: translateX(-50%);
       z-index: 13000; max-width: min(92vw, 30rem); padding: .65rem .9rem; border-radius: 10px;
@@ -37801,8 +37803,14 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
           }
           $collNotFound = ($collId > 0 && !$collDetail);
           $members = ($collDetail ? ap_collection_items((int) $collDetail['id'], 'accepted') : []);
+          // Nostr follow packs (NIP-51 kind 39089) open from a pasted link.
+          require_once __DIR__ . '/ap-nostr.php';
+          $nostrPacksOn = ap_nostr_form_visible(!empty($vaakIsAdmin));
+          $nostrPackLink = $nostrPacksOn && $collId < 1 ? trim((string) ($_GET['nostr_pack'] ?? '')) : '';
         ?>
-        <?php if ($collNotFound): ?>
+        <?php if ($nostrPackLink !== ''): ?>
+          <?= ap_nostr_pack_html(ap_nostr_pack_open((int) $vaakOwnerId, $nostrPackLink, !empty($_GET['nostr_pack_refresh'])), $nostrPackLink) ?>
+        <?php elseif ($collNotFound): ?>
           <div class="empty">Collection not found. <a href="?view=collections">Back to collections</a></div>
         <?php elseif ($collDetail): ?>
           <div style="margin-bottom:.75rem">
@@ -37922,6 +37930,15 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
             <?php endforeach; endif; ?>
           <?php endif; ?>
 
+          <?php if ($nostrPacksOn): ?>
+            <h3 style="font-size:.95rem;color:var(--muted);margin:1.25rem 0 .5rem">Nostr Follow Packs</h3>
+            <form class="composer" method="get" action="/vaak/" style="margin-bottom:1rem">
+              <input type="hidden" name="view" value="collections">
+              <div class="meta" style="margin-bottom:.5rem">Open a follow pack from Damus, following.space or njump</div>
+              <input name="nostr_pack" type="text" required maxlength="4000" autocomplete="off" spellcheck="false" placeholder="naddr1… or https://following.space/d/…">
+              <div class="composer-actions"><span class="meta">Pick who to follow, then sign once with your Nostr signer</span><button class="btn btn-primary" type="submit">Open pack</button></div>
+            </form>
+          <?php endif; ?>
 
           <h3 style="font-size:.95rem;color:var(--muted);margin:1.25rem 0 .5rem">Fediverse Collections</h3>
 
@@ -54218,7 +54235,80 @@ if (VIEW === 'analytics') loadAnalytics();
     }
   }
 
+  // Library > Collections: follow picked members of a Nostr follow pack in
+  // one signed kind 3 edit (ap_nostr_pack_html, nostr/pack.rs).
+  function packPicks(form) {
+    return Array.prototype.slice.call(form.querySelectorAll('input[name="nostr_pack_pick"]:checked:not(:disabled)'));
+  }
+
+  function packCount(form) {
+    const n = packPicks(form).length;
+    const max = parseInt(form.getAttribute('data-nostr-pack-max') || '150', 10);
+    const count = form.querySelector('[data-nostr-pack-count]');
+    if (count) count.textContent = String(n);
+    const btn = form.querySelector('[data-nostr-pack-follow]');
+    if (btn) btn.disabled = n === 0 || n > max;
+    const all = form.querySelector('[data-nostr-pack-all]');
+    if (all) {
+      const open = form.querySelectorAll('input[name="nostr_pack_pick"]:not(:disabled)').length;
+      all.checked = n > 0 && n === Math.min(open, max);
+      all.indeterminate = n > 0 && !all.checked;
+    }
+  }
+
+  document.addEventListener('change', function (event) {
+    const form = event.target.closest && event.target.closest('form[data-nostr-pack]');
+    if (!form) return;
+    if (event.target.matches('[data-nostr-pack-all]')) {
+      const max = parseInt(form.getAttribute('data-nostr-pack-max') || '150', 10);
+      let left = event.target.checked ? max : 0;
+      form.querySelectorAll('input[name="nostr_pack_pick"]:not(:disabled)').forEach(function (box) {
+        box.checked = left > 0;
+        if (left > 0) left--;
+      });
+    }
+    packCount(form);
+  });
+
+  async function followPack(btn) {
+    const form = btn.closest('form[data-nostr-pack]');
+    if (!form || btn.dataset.nostrBusy === '1') return;
+    const boxes = packPicks(form);
+    if (!boxes.length) { toast('Pick at least one person to follow.'); return; }
+    btn.dataset.nostrBusy = '1';
+    btn.disabled = true;
+    try {
+      toast('Reading your current Nostr follow list…');
+      const res = await run('follow_pack', form.getAttribute('data-nostr-pack') || '', '', '', {
+        picks: boxes.map(function (b) { return b.value; }).join(',')
+      });
+      if (!res) return;
+      const added = new Set((res.added || []).map(function (k) { return String(k).toLowerCase(); }));
+      boxes.forEach(function (box) {
+        if (!added.has(box.value)) return;
+        box.checked = false;
+        box.disabled = true;
+        const who = box.closest('.nostr-pack-member');
+        const line = who && who.querySelector('.who');
+        if (line && !who.querySelector('[data-nostr-pack-tag]')) {
+          const tag = document.createElement('span');
+          tag.className = 'tag';
+          tag.setAttribute('data-nostr-pack-tag', '1');
+          tag.textContent = 'following';
+          line.after(' ', tag);
+        }
+      });
+      const n = added.size;
+      toast('Followed ' + n + (n === 1 ? ' person' : ' people') + ' on Nostr. Their posts reach Home after the next Nostr sync.');
+    } finally {
+      btn.dataset.nostrBusy = '';
+      packCount(form);
+    }
+  }
+
   document.addEventListener('click', async function (event) {
+    const packBtn = event.target.closest('[data-nostr-pack-follow]');
+    if (packBtn) { event.preventDefault(); await followPack(packBtn); return; }
     const lnBtn = event.target.closest('[data-nostr-lightning-save]');
     if (lnBtn) { event.preventDefault(); await saveLightning(lnBtn); return; }
     const vaakBtn = event.target.closest('[data-nostr-vaak]');
