@@ -219,7 +219,8 @@ $addStatus->execute([1, $mine . '1', 'Hello #Nostr and #nostr #VAAK', 'public', 
 $addStatus->execute([2, $mine . '2', 'quiet', 'unlisted', '', null]);
 $addStatus->execute([3, $mine . '3', 'reply', 'public', '', 1]);
 $addStatus->execute([4, $mine . '4', 'thread', 'public', '', null]);
-$addStatus->execute([5, $mine . '5', '', 'public', '', null]);
+$addStatus->execute([5, $mine . '5', '(media)', 'public', '', null]);
+$addStatus->execute([6, $mine . '6', "\u{00A0}(poll)\u{00A0}", 'public', '', null]);
 $xdb->exec("INSERT INTO outbox_notes (id, in_reply_to) VALUES ('{$mine}4', 'https://elsewhere.test/notes/9')");
 $xdb->exec("INSERT INTO masto_media (local_id, status_local_id, public_url, mime, description) VALUES (1, 1, 'https://vaak.test/m/a.jpg', 'image/jpeg', ' a  bird '), (2, 1, 'http://insecure.test/b.jpg', 'image/jpeg', ''), (3, 5, 'https://vaak.test/m/c.mp4', '', '')");
 $x = ap_nostr_post_note(3, $mine . '1', $xdb);
@@ -231,6 +232,8 @@ $check(($x['tags'] ?? []) === [
     ['proxy', $mine . '1', 'activitypub'],
 ], 'crosspost tags: hashtags once, CW, imeta, proxy');
 $check(!empty(ap_nostr_post_note(3, $mine . '5', $xdb)['ok']) && ap_nostr_post_note(3, $mine . '5', $xdb)['tags'][0] === ['imeta', 'url https://vaak.test/m/c.mp4'], 'media-only post goes, imeta skips an empty mime');
+$check((ap_nostr_post_note(3, $mine . '5', $xdb)['content'] ?? '') === 'https://vaak.test/m/c.mp4', 'media-only post sends just its link, no (media) placeholder');
+$check(str_contains((string) (ap_nostr_post_note(3, $mine . '6', $xdb)['error'] ?? ''), 'nothing to post'), 'a bare sentinel with no media is not posted');
 $check(str_contains((string) (ap_nostr_post_note(3, $mine . '2', $xdb)['error'] ?? ''), 'public'), 'non-public posts stay on VAAK');
 $check(str_contains((string) (ap_nostr_post_note(3, $mine . '3', $xdb)['error'] ?? ''), 'Replies'), 'replies to VAAK posts stay on VAAK');
 $check(str_contains((string) (ap_nostr_post_note(3, $mine . '4', $xdb)['error'] ?? ''), 'Replies'), 'replies to remote posts stay on VAAK');
