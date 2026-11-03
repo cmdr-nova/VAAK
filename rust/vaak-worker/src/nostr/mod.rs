@@ -14,6 +14,8 @@
 //! follow-all.
 //! `quote` fetches the notes quotes point at, so a quoted note paints as
 //! a card instead of a link.
+//! `search` finds stored notes from a linked user's follows for Search, and
+//! `counts` gives recent ones like/repost counts for Trending posts.
 //! `zap` is NIP-57: Lightning zaps sent from Nostr cards and receipts that
 //! notify.
 
@@ -22,6 +24,7 @@ pub mod archive;
 pub mod backup_relay;
 pub mod bech32;
 pub mod bunker;
+pub mod counts;
 pub mod event;
 pub mod home;
 pub mod moderation;
@@ -32,6 +35,7 @@ pub mod quote;
 pub mod relay;
 pub mod relay_book;
 pub mod render;
+pub mod search;
 pub mod share;
 pub mod sync;
 pub mod zap;

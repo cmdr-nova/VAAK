@@ -7569,6 +7569,27 @@ function admin_trends_display_state(?array $user = null): array
     }
 }
 
+/**
+ * Trending posts for one viewer: the shared fediverse + Bluesky list, plus
+ * recent notes from the viewer's Nostr follows when they linked an npub
+ * (nostr/counts.rs, already filtered for this viewer), ranked together by
+ * the same age-decayed score. Without an npub the list is unchanged.
+ *
+ * @param list<array<string,mixed>> $items
+ * @return list<array<string,mixed>>
+ */
+function admin_trend_statuses_with_nostr(array $items, int $viewerId): array
+{
+    if (!function_exists('ap_nostr_trending_statuses') || !function_exists('ap_masto_trend_statuses_rank_mixed')) {
+        return $items;
+    }
+    $nostr = ap_nostr_trending_statuses($viewerId, 10);
+    if ($nostr === []) {
+        return $items;
+    }
+    return ap_masto_trend_statuses_rank_mixed(array_merge($items, $nostr));
+}
+
 function admin_trends_sidebar_html(string $viewForTrends, bool $allowStale = true, ?array &$meta = null, bool $bypassFragment = false, string $module = 'all'): string
 {
     if (!admin_trends_display_state()['enabled']) { $meta = ['disabled' => true]; return ''; }
@@ -7631,14 +7652,14 @@ function admin_trends_sidebar_html(string $viewForTrends, bool $allowStale = tru
             }
             // Skip bare-domain link cards (host only, no title/path context).
             $items[] = $candidate;
-            if (count($items) >= $limit) {
+            if (count($items) >= $limit && $kind !== 'statuses') {
                 break;
             }
         }
         if ($kind === 'tags') {
             $trendTags = $items;
         } else {
-            $trendStatuses = $items;
+            $trendStatuses = array_slice(admin_trend_statuses_with_nostr($items, $viewerId), 0, $limit);
         }
     }
     $meta = [
@@ -7713,7 +7734,12 @@ function admin_trends_sidebar_html(string $viewForTrends, bool $allowStale = tru
             }
             $html .= '<div class="trend-post-text"><div class="meta">' . h($who)
                 . ($media !== null && $media['count'] > 1 && $content !== '' ? ' · ' . h($media['label']) : '') . '</div>';
-            if ($surl !== '') {
+            $nostrUrl = str_starts_with((string) ($ts['id'] ?? ''), 'nostr:') ? (string) ($ts['url'] ?? '') : '';
+            if ($nostrUrl !== '' && str_starts_with($nostrUrl, 'https://')) {
+                // Nostr notes have no VAAK thread view; open the note viewer.
+                $html .= '<a href="' . h($nostrUrl) . '" target="_blank" rel="noopener noreferrer"'
+                    . ' style="color:var(--text);text-decoration:none">' . $label . '</a>';
+            } elseif ($surl !== '') {
                 $html .= '<a href="' . h(admin_status_href($surl, $viewForTrends))
                     . '" style="color:var(--text);text-decoration:none">' . $label . '</a>';
             } else {
@@ -14409,6 +14435,10 @@ function admin_search_render_head(string $sq, string $stype, bool $sresolve, ?ar
         . '</form>';
     echo '<nav class="search-tabs" aria-label="Search results">';
     $searchTabs = ['' => 'Top', 'accounts' => 'People', 'hashtags' => 'Tags', 'statuses' => 'Posts'];
+    if (ap_nostr_search_visible(admin_owner_user_id())) {
+        // Notes from the people this viewer follows on Nostr (linked npub only).
+        $searchTabs['nostr'] = 'Nostr';
+    }
     if (admin_bsky_connected()) {
         // Bluesky custom feeds. Searched only when this tab is opened.
         $searchTabs['feeds'] = 'Feeds';
@@ -14536,7 +14566,21 @@ function admin_search_render_page(string $sq, string $stype, bool $sresolve, arr
         }
         $stype = '';
     }
+    $nostrOn = ap_nostr_search_visible(admin_owner_user_id());
+    if ($stype === 'nostr' && !$nostrOn) {
+        $stype = '';
+    }
+    if ($stype === 'nostr') {
+        admin_search_render_nostr_page($sq, $sresolve, $searchLimit);
+        return;
+    }
     $sresults = $sq === '' ? null : admin_search_run($sq, $stype, $sresolve, $searchLimit, 0);
+    if (is_array($sresults) && $stype === '' && $nostrOn) {
+        // Top shows the newest few Nostr matches; the Nostr tab has the rest.
+        $nostr = ap_nostr_search_page(admin_owner_user_id(), $sq, 0, 3);
+        $sresults['nostr'] = $nostr['htmls'];
+        $sresults['has_more']['nostr'] = $nostr['has_more'];
+    }
     admin_search_render_head($sq, $stype, $sresolve, $sresults);
     if ($sq === '' || !is_array($sresults)) {
         admin_search_render_start($sresolve);
@@ -14545,15 +14589,16 @@ function admin_search_render_page(string $sq, string $stype, bool $sresolve, arr
     $acctN = count($sresults['accounts'] ?? []);
     $tagN = count($sresults['hashtags'] ?? []);
     $stN = count($sresults['statuses'] ?? []);
+    $nostrN = count($sresults['nostr'] ?? []);
     $shown = match ($stype) {
         'accounts' => $acctN,
         'hashtags' => $tagN,
         'statuses' => $stN,
-        default => $acctN + $tagN + $stN,
+        default => $acctN + $tagN + $stN + $nostrN,
     };
     echo '<div class="search-results-feed' . ($stype === '' ? ' is-top' : '') . '" data-search-results="' . h($sq) . '">';
     if ($shown === 0) {
-        if ($stype !== '' && $acctN + $tagN + $stN === 0) {
+        if ($stype !== '' && $acctN + $tagN + $stN + $nostrN === 0) {
             admin_search_render_no_results($sq, $sresolve);
         } elseif ($stype !== '') {
             $what = ['accounts' => 'people', 'hashtags' => 'tags', 'statuses' => 'posts'][$stype] ?? 'results';
@@ -14567,6 +14612,41 @@ function admin_search_render_page(string $sq, string $stype, bool $sresolve, arr
         admin_search_render_sections($sresults, $sq, $stype, $sresolve, $searchLimit, $followingIds);
     }
     echo '</div>';
+}
+
+/** Search > Nostr: matching notes from the people this viewer follows on Nostr. */
+function admin_search_render_nostr_page(string $sq, bool $sresolve, int $limit): void
+{
+    $page = $sq === '' ? null : ap_nostr_search_page(admin_owner_user_id(), $sq, 0, $limit);
+    admin_search_render_head($sq, 'nostr', $sresolve, $page === null ? null : ['nostr' => $page['htmls'], 'has_more' => ['nostr' => $page['has_more']]]);
+    if ($page === null) {
+        admin_search_render_start($sresolve);
+        return;
+    }
+    echo '<div class="search-results-feed" data-search-results="' . h($sq) . '">';
+    if (!$page['ok']) {
+        echo '<div class="search-state"><b>Nostr search couldn’t load</b><span>Try again in a minute.</span></div>';
+    } elseif ($page['htmls'] === []) {
+        echo '<div class="search-state"><b>No Nostr notes for “' . h($sq) . '”</b>'
+            . '<span>This searches notes from people you follow on Nostr, from the last few weeks.</span>'
+            . '<a href="' . h(admin_search_href($sq, '', $sresolve)) . '" data-vaak-soft-nav="search" data-search-q="' . h($sq)
+            . '" data-search-type="">Show all results</a></div>';
+    } else {
+        admin_search_render_nostr_section($page['htmls'], $page['has_more'], $sq, 'nostr', $sresolve, $limit);
+    }
+    echo '</div>';
+}
+
+/** @param list<string> $htmls worker-painted Nostr cards */
+function admin_search_render_nostr_section(array $htmls, bool $hasMore, string $sq, string $stype, bool $sresolve, int $limit): void
+{
+    $capped = $stype === '';
+    echo '<section class="search-section search-section-nostr">';
+    admin_search_section_head('Nostr', $sq, $stype, $sresolve, 'nostr', $capped && $hasMore ? 'See all →' : '');
+    admin_search_open_list('nostr', $sq, $sresolve, count($htmls), $limit, $hasMore && !$capped);
+    echo implode('', $htmls);
+    admin_search_sentinel($hasMore && !$capped);
+    echo '</div></section>';
 }
 
 /** Search > Feeds: Bluesky custom feeds by name, with Open and Pin to Home. */
@@ -14732,6 +14812,10 @@ function admin_search_render_sections(array $sresults, string $sq, string $stype
         admin_search_sentinel($stMore);
         echo '</div></section>';
     }
+    $nostr = is_array($sresults['nostr'] ?? null) ? $sresults['nostr'] : [];
+    if ($stype === '' && $nostr !== []) {
+        admin_search_render_nostr_section($nostr, !empty($more['nostr']), $sq, $stype, $sresolve, $limit);
+    }
 }
 
 /**
@@ -14742,10 +14826,16 @@ function admin_search_page_fragment(string $q, string $section, bool $resolve, i
     $section = preg_replace('/[^a-z]/', '', $section) ?: '';
     $limit = max(10, min(40, $limit));
     $offset = max(0, $offset);
-    if (!in_array($section, ['accounts', 'hashtags', 'statuses'], true) || trim($q) === '') {
+    if (!in_array($section, ['accounts', 'hashtags', 'statuses', 'nostr'], true) || trim($q) === '') {
         return ['html' => '<div data-search-fragment data-has-more="0"></div>', 'has_more' => false];
     }
     $owner = admin_owner_user_id();
+    if ($section === 'nostr') {
+        $page = ap_nostr_search_page($owner, $q, $offset, $limit);
+        return ['html' => '<div data-search-fragment data-section="nostr" data-offset="' . (int) ($offset + count($page['htmls']))
+            . '" data-limit="' . (int) $limit . '" data-has-more="' . ($page['has_more'] ? '1' : '0') . '">'
+            . implode('', $page['htmls']) . '</div>', 'has_more' => $page['has_more']];
+    }
     if ($owner > 0) {
         if (function_exists('ap_mutes_set_cached')) {
             ap_mutes_set_cached($owner);

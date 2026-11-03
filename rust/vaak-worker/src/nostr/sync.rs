@@ -942,6 +942,11 @@ pub async fn run_once(cfg: &Config, budget_secs: u64) -> Result<String> {
         tracing::warn!(error = %format!("{e:#}"), "nostr archive pull failed");
         super::archive::PullReport::default()
     });
+    // Trending counts never hold up the rest either.
+    let counts = super::counts::refresh(&db, &s, now, deadline).await.unwrap_or_else(|e| {
+        tracing::warn!(error = %format!("{e:#}"), "nostr trending counts failed");
+        super::counts::Report::default()
+    });
     db.execute(
         "UPDATE nostr_links SET synced_at = $1 WHERE show_in_home AND follow_list_at > 0",
         &[&now],
@@ -950,7 +955,7 @@ pub async fn run_once(cfg: &Config, budget_secs: u64) -> Result<String> {
     let cleaned = cleanup(&db, &s, now).await?;
     relay_book::prune(&db, now).await?;
     Ok(format!(
-        "nostr-sync {}meta={meta} authors={} relays={}/{} stored={} rejected={} {}rewarm={rewarmed} notifs={}/{} ingest={} {} cleaned={cleaned} ms={}",
+        "nostr-sync {}meta={meta} authors={} relays={}/{} stored={} rejected={} {}rewarm={rewarmed} notifs={}/{} ingest={} {} {} cleaned={cleaned} ms={}",
         if log.is_empty() { String::new() } else { format!("{} ", log.join(" ")) },
         notes.authors,
         notes.relays_ok,
@@ -962,6 +967,7 @@ pub async fn run_once(cfg: &Config, budget_secs: u64) -> Result<String> {
         notifs.owners,
         if notifs.ingest.is_empty() { "-" } else { notifs.ingest.as_str() },
         archive.summary(),
+        counts.summary(),
         started.elapsed().as_millis()
     ))
 }

@@ -2785,7 +2785,7 @@ fn host_of_actor(actor: &str) -> String {
         .to_ascii_lowercase()
 }
 
-async fn load_muted_phrases(db: &Client, owner: i64) -> Vec<String> {
+pub(crate) async fn load_muted_phrases(db: &Client, owner: i64) -> Vec<String> {
     if owner < 1 {
         return Vec::new();
     }
@@ -2811,7 +2811,7 @@ async fn load_muted_phrases(db: &Client, owner: i64) -> Vec<String> {
     out
 }
 
-fn text_matches_muted(text: &str, phrases: &[String]) -> bool {
+pub(crate) fn text_matches_muted(text: &str, phrases: &[String]) -> bool {
     if phrases.is_empty() {
         return false;
     }

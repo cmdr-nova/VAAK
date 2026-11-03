@@ -152,6 +152,8 @@ pub struct Query {
     pub tagged: String,
     /// Set for an `#e` lookup: events from anyone that tag this note.
     pub note: String,
+    /// Set for a many-note `#e` lookup: events that tag any of these notes.
+    pub notes: Vec<String>,
 }
 
 impl Query {
@@ -160,7 +162,7 @@ impl Query {
         if let Some(since) = since {
             filter["since"] = json!(since);
         }
-        Self { filter, authors, kinds, ids: Vec::new(), tagged: String::new(), note: String::new() }
+        Self { filter, authors, kinds, ids: Vec::new(), tagged: String::new(), note: String::new(), notes: Vec::new() }
     }
 
     /// Only events at or before `until` (paging back through history).
@@ -172,23 +174,33 @@ impl Query {
     /// Events of `kinds` from anyone that tag `pubkey` (notifications).
     pub fn tagging(pubkey: &str, kinds: Vec<i64>, since: i64, limit: i64) -> Self {
         let filter = json!({"#p": [pubkey], "kinds": kinds, "since": since, "limit": limit});
-        Self { filter, authors: Vec::new(), kinds, ids: Vec::new(), tagged: pubkey.to_string(), note: String::new() }
+        Self { filter, authors: Vec::new(), kinds, ids: Vec::new(), tagged: pubkey.to_string(), note: String::new(), notes: Vec::new() }
     }
 
     /// Fetch these events by id (reposted notes VAAK hasn't stored).
     pub fn by_ids(ids: Vec<String>, kinds: Vec<i64>) -> Self {
         let filter = json!({"ids": ids, "kinds": kinds, "limit": ids.len().max(1)});
-        Self { filter, authors: Vec::new(), kinds, ids, tagged: String::new(), note: String::new() }
+        Self { filter, authors: Vec::new(), kinds, ids, tagged: String::new(), note: String::new(), notes: Vec::new() }
     }
 
     /// Zap receipts (kind 9735) for `note`, from anyone.
     pub fn zap_receipts(note: &str, since: i64) -> Self {
         let kinds = vec![9735];
         let filter = json!({"#e": [note], "kinds": kinds, "since": since, "limit": 50});
-        Self { filter, authors: Vec::new(), kinds, ids: Vec::new(), tagged: String::new(), note: note.to_string() }
+        Self { filter, authors: Vec::new(), kinds, ids: Vec::new(), tagged: String::new(), note: note.to_string(), notes: Vec::new() }
+    }
+
+    /// Reactions/reposts (`kinds`) from anyone that tag any of `notes`.
+    pub fn tagging_notes(notes: Vec<String>, kinds: Vec<i64>, since: i64, limit: i64) -> Self {
+        let filter = json!({"#e": notes, "kinds": kinds, "since": since, "limit": limit});
+        Self { filter, authors: Vec::new(), kinds, ids: Vec::new(), tagged: String::new(), note: String::new(), notes }
     }
 
     fn wants(&self, ev: &Event) -> bool {
+        if !self.notes.is_empty() {
+            return self.kinds.contains(&ev.kind)
+                && ev.tags.iter().any(|t| t.first().map(String::as_str) == Some("e") && t.get(1).is_some_and(|id| self.notes.contains(id)));
+        }
         if !self.note.is_empty() {
             return self.kinds.contains(&ev.kind)
                 && ev.tags.iter().any(|t| t.first().map(String::as_str) == Some("e") && t.get(1) == Some(&self.note));
