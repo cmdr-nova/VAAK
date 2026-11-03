@@ -304,6 +304,32 @@ $check(empty(ap_nostr_hover_payload('https://njump.me/note1abc', 1, $hdb)['ok'])
 $check(empty(ap_nostr_hover_payload('https://evil.test/' . $npub, 1, $hdb)['ok']), 'only njump links get a hover card');
 unset($GLOBALS['ap_nostr_table_ready']);
 
+// Follow packs (Library > Collections): address and pick checks, page paint.
+$pk = str_repeat('ab', 32);
+$check(ap_nostr_pack_addr_ok('39089:' . $pk . ':0b6e-41aa'), 'a follow pack address is accepted');
+$check(ap_nostr_pack_addr_ok('39092:' . $pk . ':a:b'), 'media packs and colons in d are accepted');
+$check(!ap_nostr_pack_addr_ok('30000:' . $pk . ':x'), 'other list kinds are refused');
+$check(!ap_nostr_pack_addr_ok('39089:' . $pk . ':'), 'an empty d tag is refused');
+$check(ap_nostr_pack_picks(' ' . strtoupper($pk) . ',nope,' . $pk . ',' . str_repeat('cd', 32)) === [$pk, str_repeat('cd', 32)], 'picks are lowercased, deduped and filtered');
+$packHtml = ap_nostr_pack_html([
+    'ok' => true,
+    'linked' => true,
+    'max_picks' => 150,
+    'pack' => ['addr' => '39089:' . $pk . ':x1', 'naddr' => 'naddr1test', 'title' => 'Cool <people>', 'description' => 'hi', 'image' => 'javascript:alert(1)', 'dropped' => 0, 'author' => ['pubkey' => $pk, 'npub' => 'npub1author', 'name' => 'Ann', 'picture' => '']],
+    'members' => [
+        ['pubkey' => str_repeat('01', 32), 'npub' => 'npub1one', 'name' => 'One', 'picture' => 'https://img.example/1.png', 'nip05' => '_@one.example', 'following' => false, 'me' => false],
+        ['pubkey' => str_repeat('02', 32), 'npub' => 'npub1two', 'name' => '', 'picture' => '', 'nip05' => '', 'following' => true, 'me' => false],
+        ['pubkey' => $pk, 'npub' => 'npub1me', 'name' => 'Me', 'picture' => '', 'nip05' => '', 'following' => false, 'me' => true],
+    ],
+], 'naddr1test');
+$check(str_contains($packHtml, 'Cool &lt;people&gt;') && !str_contains($packHtml, 'javascript:'), 'pack title escaped, unsafe image dropped');
+$check(substr_count($packHtml, 'name="nostr_pack_pick"') === 3 && substr_count($packHtml, ' checked') === 2, 'one open member is ticked (plus the select-all box)');
+$check(substr_count($packHtml, ' disabled') === 2, 'followed members and yourself cannot be picked');
+$check(str_contains($packHtml, 'data-nostr-pack-count>1<') && str_contains($packHtml, 'following.space/d/x1?p=' . $pk), 'follow count and following.space link');
+$check(str_contains($packHtml, 'one.example') && !str_contains($packHtml, '_@'), 'NIP-05 shown without the _@ prefix');
+$check(str_contains(ap_nostr_pack_html(['ok' => true, 'linked' => false, 'pack' => [], 'members' => []], 'x'), 'Link your npub'), 'unlinked users are told to link an npub');
+$check(str_contains(ap_nostr_pack_html(['ok' => false, 'error' => 'No relay answered.'], 'x'), 'No relay answered.'), 'worker errors are shown');
+
 if ($failures !== []) {
     fwrite(STDERR, "nostr-smoke: " . count($failures) . " of {$checks} checks failed\n - " . implode("\n - ", $failures) . "\n");
     exit(1);
