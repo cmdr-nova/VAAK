@@ -30912,6 +30912,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     .search-tag-follow:hover { color: #0b0b0b; background: var(--primary); }
     .search-tag-state { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .7rem; color: var(--muted); text-decoration: none; padding: 0 .75rem 0 0; }
     .search-section-statuses [data-search-list] > .tweet { margin: 0; }
+    .search-results-feed.is-refreshing { opacity: .45; pointer-events: none; transition: opacity .15s; }
     mark.search-hit { background: var(--primary-dim); color: inherit; border-radius: 3px; padding: 0 .08rem; box-shadow: inset 0 -1px 0 var(--primary); }
     .search-start { display: flex; flex-direction: column; gap: 1.3rem; }
     .search-chips { display: flex; flex-wrap: wrap; gap: .45rem; }
@@ -48798,6 +48799,63 @@ window.vaakBootStatusThread();
       });
     });
   }
+  // The remote switch re-runs the same search in place: only the results and
+  // the tab counts change, the box, hint and switch stay put. Anything odd
+  // (profile redirect, wrong shell, network) falls back to a normal soft-nav.
+  let searchRefreshSeq = 0;
+  async function refreshSearchResults(form, q, resolve) {
+    const typeEl = form.querySelector('input[name="type"]');
+    const type = typeEl ? String(typeEl.value || '') : '';
+    const extra = { q: q };
+    if (type) extra.type = type;
+    if (resolve) extra.resolve = '1';
+    const fallback = () => {
+      if (typeof window.vaakSoftNavTo === 'function') window.vaakSoftNavTo('search', true, '', extra);
+      else if (typeof form.requestSubmit === 'function') form.requestSubmit();
+    };
+    const main = form.closest('section.main') || document.querySelector('section.main');
+    const results = main ? main.querySelector('[data-search-results]') : null;
+    const tabs = main ? main.querySelector('.search-tabs') : null;
+    if (!results || !tabs || typeof fetch !== 'function') { fallback(); return; }
+    const seq = ++searchRefreshSeq;
+    results.setAttribute('aria-busy', 'true');
+    results.classList.add('is-refreshing');
+    const params = new URLSearchParams({ view: 'search', partial: '1', shell: '1', q: q });
+    if (type) params.set('type', type);
+    if (resolve) params.set('resolve', '1');
+    try {
+      const res = await fetch('?' + params.toString(), {
+        credentials: 'same-origin',
+        headers: { Accept: 'text/html', 'X-Requested-With': 'XMLHttpRequest' },
+        cache: 'no-store'
+      });
+      if (seq !== searchRefreshSeq) return;
+      if (res.status === 401 || res.headers.get('X-VAAK-Auth') === 'required') {
+        if (typeof window.vaakRedirectToLogin === 'function') window.vaakRedirectToLogin('search-remote');
+        return;
+      }
+      if (!res.ok || res.headers.get('X-VAAK-View') !== 'search' || res.headers.get('X-VAAK-Profile')) throw new Error('shell');
+      const holder = document.createElement('div');
+      holder.innerHTML = await res.text();
+      if (seq !== searchRefreshSeq) return;
+      const nextResults = holder.querySelector('[data-search-results]');
+      const nextTabs = holder.querySelector('.search-tabs');
+      if (!nextResults || !nextTabs || !results.isConnected) throw new Error('shell');
+      results.replaceWith(nextResults);
+      tabs.replaceWith(nextTabs);
+      const href = typeof window.vaakSoftViewHref === 'function'
+        ? window.vaakSoftViewHref('search', '', extra)
+        : '/vaak/?' + params.toString().replace(/&?(partial|shell)=1/g, '');
+      history.replaceState({ vaakSoft: 'search', filter: '', extra: extra }, '', href);
+      if (typeof window.novaEnhanceTweetFolds === 'function') window.novaEnhanceTweetFolds(nextResults);
+      window.vaakBootSearch(main);
+    } catch (e) {
+      if (seq !== searchRefreshSeq) return;
+      results.removeAttribute('aria-busy');
+      results.classList.remove('is-refreshing');
+      fallback();
+    }
+  }
   function bootSearchChrome(root) {
     const head = root.querySelector('.search-head');
     if (!head) return;
@@ -48823,7 +48881,20 @@ window.vaakBootStatusThread();
       const form = box.closest('.search-form');
       paintSearchIntent(form);
       const input = form ? form.querySelector('input[name="q"]') : null;
-      if (form && input && input.value.trim() && typeof form.requestSubmit === 'function') form.requestSubmit();
+      const q = input ? input.value.trim() : '';
+      const resolve = !!box.checked;
+      // Tabs carry the switch too, so the next tab click keeps it.
+      document.querySelectorAll('.search-tabs a.search-tab').forEach((tab) => {
+        try {
+          const u = new URL(tab.getAttribute('href') || '', window.location.href);
+          if (resolve) u.searchParams.set('resolve', '1'); else u.searchParams.delete('resolve');
+          tab.setAttribute('href', u.search);
+        } catch (e) {}
+      });
+      if (!form || !q) return;
+      // A pasted link still full-loads on purpose (permalink redirect).
+      if (/^https:\/\//i.test(q)) { if (typeof form.requestSubmit === 'function') form.requestSubmit(); return; }
+      refreshSearchResults(form, q, resolve);
     });
     document.addEventListener('click', (ev) => {
       const t = ev.target && ev.target.closest ? ev.target : null;
