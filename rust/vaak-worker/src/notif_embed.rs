@@ -4198,13 +4198,22 @@ pub fn paint_lean_embed_from(
         } else {
             String::new()
         };
+        // Nostr authors have no VAAK profile page: name and avatar open
+        // their profile on Nostr (njump) in a new tab instead.
+        let nostr_profile = nostr_profile_url(status, &account);
         let av_img = format!(
             "<img class=\"tweet-av\" src=\"{}\" alt=\"\" width=\"40\" height=\"40\" loading=\"lazy\" decoding=\"async\" referrerpolicy=\"no-referrer\" onerror=\"this.onerror=null;this.src='https://mkultra.monster/img/avatar/default.webp'\" data-profile-hover-actor=\"{}\"{}>",
             esc(av),
             esc(actor_ref),
             hover_meta
         );
-        let av_block = if !profile_href.is_empty() {
+        let av_block = if let Some(open) = nostr_profile {
+            format!(
+                "<a href=\"{0}\" target=\"_blank\" rel=\"noopener noreferrer\" aria-label=\"Open profile on Nostr\" data-profile-hover-actor=\"{0}\" data-profile-hover-source=\"nostr\" style=\"text-decoration:none\">{1}</a>",
+                esc(open),
+                av_img.replace(&format!(" data-profile-hover-actor=\"{}\"", esc(actor_ref)), "")
+            )
+        } else if !profile_href.is_empty() {
             format!(
                 "<a href=\"{}\" data-profile-hover-actor=\"{}\"{} style=\"text-decoration:none\">{}</a>",
                 esc(&profile_href),
@@ -4215,7 +4224,14 @@ pub fn paint_lean_embed_from(
         } else {
             av_img
         };
-        let who = if !profile_href.is_empty() {
+        let who = if let Some(open) = nostr_profile {
+            format!(
+                "<a class=\"who\" href=\"{0}\" target=\"_blank\" rel=\"noopener noreferrer\" data-profile-hover-actor=\"{0}\" data-profile-hover-source=\"nostr\" style=\"color:inherit;text-decoration:none\">{1}</a><a class=\"meta\" href=\"{0}\" target=\"_blank\" rel=\"noopener noreferrer\" data-profile-hover-actor=\"{0}\" data-profile-hover-source=\"nostr\" style=\"color:var(--muted);text-decoration:none\"> @{2}</a>",
+                esc(open),
+                display_html,
+                esc(acct)
+            )
+        } else if !profile_href.is_empty() {
             format!(
                 "<a class=\"who\" href=\"{}\" data-profile-hover-actor=\"{}\"{} style=\"color:inherit;text-decoration:none\">{}</a><a class=\"meta\" href=\"{}\" data-profile-hover-actor=\"{}\"{} style=\"color:var(--muted);text-decoration:none\"> @{}</a>",
                 esc(&profile_href),
@@ -4400,6 +4416,67 @@ pub fn paint_lean_feed_card(status: &Value) -> String {
 /// boost, like, bookmark, ⋯. The `data-nostr-*` buttons are wired by the
 /// page script, which asks the signer extension to sign; the bookmark is a
 /// VAAK-only `masto_bookmarks` row like an RSS bookmark.
+/// A Nostr card's account opens on Nostr (njump), never a VAAK profile.
+fn nostr_profile_url<'a>(status: &Value, account: &'a Value) -> Option<&'a str> {
+    if !crate::nostr::render::is_nostr_status(status) {
+        return None;
+    }
+    account.get("url").and_then(|v| v.as_str()).filter(|u| u.starts_with("https://"))
+}
+
+/// Follow / Unfollow on Nostr. `who` names the person in the label (empty
+/// keeps the plain label); the browser keeps those labels when it flips the
+/// button and names `toast_name` in the confirmation.
+fn nostr_follow_item(pubkey: &str, following: bool, who: &str, toast_name: &str) -> String {
+    if !crate::nostr::event::is_hex64(pubkey) {
+        return String::new();
+    }
+    let (follow, unfollow) = if who.is_empty() {
+        ("Follow on Nostr".to_string(), "Unfollow on Nostr".to_string())
+    } else {
+        (format!("Follow {who} on Nostr"), format!("Unfollow {who} on Nostr"))
+    };
+    let toast_name = if toast_name.is_empty() { who } else { toast_name };
+    format!(
+        "<button type=\"button\" class=\"menu-action\" data-nostr-act=\"{act}\" data-nostr-target=\"{pubkey}\" data-nostr-follow-label=\"{fl}\" data-nostr-unfollow-label=\"{ul}\" data-nostr-name=\"{tn}\">{label}</button>",
+        act = if following { "unfollow" } else { "follow" },
+        fl = esc(&follow),
+        ul = esc(&unfollow),
+        tn = esc(toast_name),
+        label = esc(if following { &unfollow } else { &follow }),
+    )
+}
+
+/// A display name short enough for a menu label, without `:emoji:` codes.
+fn nostr_menu_name(raw: &str) -> String {
+    let mut words: Vec<String> = Vec::new();
+    for word in raw.split_whitespace() {
+        let mut kept = String::new();
+        let mut rest = word;
+        // Drop :shortcode: runs (NIP-30 custom emoji paint as images elsewhere).
+        while let Some(start) = rest.find(':') {
+            let after = &rest[start + 1..];
+            match after.find(':') {
+                Some(end) if end > 0 && after[..end].chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '+') => {
+                    kept.push_str(&rest[..start]);
+                    rest = &after[end + 1..];
+                }
+                _ => break,
+            }
+        }
+        kept.push_str(rest);
+        if !kept.is_empty() {
+            words.push(kept);
+        }
+    }
+    let name = words.join(" ");
+    if name.chars().count() > 24 {
+        format!("{}…", name.chars().take(23).collect::<String>().trim_end())
+    } else {
+        name
+    }
+}
+
 fn nostr_card_actions(status: &Value, action_base: &str, from_q: &str) -> String {
     let hex = |key: &str| {
         status
@@ -4419,6 +4496,21 @@ fn nostr_card_actions(status: &Value, action_base: &str, from_q: &str) -> String
     let zap_sats = status.get("vaak_nostr_zap_sats").and_then(|v| v.as_i64()).unwrap_or(0);
     // Home only carries notes from people the viewer follows.
     let following = status.get("vaak_nostr_following").and_then(|v| v.as_bool()).unwrap_or(true);
+    // Set by paint_lean_feed_card_opts on a Nostr repost: the reposter.
+    let booster = status
+        .get("vaak_nostr_booster")
+        .filter(|b| b.get("pubkey").and_then(|v| v.as_str()).is_some_and(crate::nostr::event::is_hex64))
+        .filter(|b| b.get("pubkey").and_then(|v| v.as_str()) != Some(author.as_str()));
+    let account = status.get("account").cloned().unwrap_or(Value::Null);
+    let author_url = nostr_profile_url(status, &account);
+    let author_display = nostr_menu_name(
+        account
+            .get("display_name")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| account.get("acct").and_then(|v| v.as_str()))
+            .unwrap_or(""),
+    );
     let mut out = String::new();
     if !note.is_empty() {
         out.push_str(&format!(
@@ -4484,10 +4576,18 @@ fn nostr_card_actions(status: &Value, action_base: &str, from_q: &str) -> String
             "<button type=\"button\" class=\"menu-action\" data-nostr-act=\"delete\" data-nostr-target=\"{note}\" style=\"color:var(--danger)\">Delete on Nostr</button>"
         ));
     } else if !author.is_empty() {
-        let (act, label) = if following { ("unfollow", "Unfollow on Nostr") } else { ("follow", "Follow on Nostr") };
-        menu.push_str(&format!(
-            "<button type=\"button\" class=\"menu-action\" data-nostr-act=\"{act}\" data-nostr-target=\"{author}\">{label}</button>"
-        ));
+        // On a repost the menu names both people, so it is clear whose
+        // profile opens and who gets followed.
+        let author_name = booster.map(|_| author_display.clone()).unwrap_or_default();
+        if let Some(open) = author_url {
+            let label = if author_name.is_empty() { "Open profile on Nostr".to_string() } else { format!("Open {author_name}'s profile on Nostr") };
+            menu.push_str(&format!(
+                "<a class=\"menu-action\" href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\">{}</a>",
+                esc(open),
+                esc(&label)
+            ));
+        }
+        menu.push_str(&nostr_follow_item(&author, following, &author_name, ""));
         // Mute edits the viewer's NIP-51 list (signed like a follow); Hide
         // and the admin Block stay on VAAK. Report is NIP-56 on the note.
         menu.push_str(&format!(
@@ -4502,6 +4602,22 @@ fn nostr_card_actions(status: &Value, action_base: &str, from_q: &str) -> String
         menu.push_str(&format!(
             "<button type=\"button\" class=\"menu-action nostr-admin-only\" data-nostr-vaak=\"nostr_block\" data-nostr-target=\"{author}\" style=\"color:var(--danger)\">Block on VAAK</button>"
         ));
+    }
+    if let Some(b) = booster {
+        let name = nostr_menu_name(b.get("name").and_then(|v| v.as_str()).unwrap_or(""));
+        let who = if name.is_empty() { "booster".to_string() } else { format!("booster {name}") };
+        if let Some(open) = b.get("url").and_then(|v| v.as_str()).filter(|u| u.starts_with("https://")) {
+            menu.push_str(&format!(
+                "<a class=\"menu-action\" href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\">{}</a>",
+                esc(open),
+                esc(&format!("Open {who}'s profile on Nostr"))
+            ));
+        }
+        let pk = b.get("pubkey").and_then(|v| v.as_str()).unwrap_or("");
+        let b_following = b.get("following").and_then(|v| v.as_bool()).unwrap_or(true);
+        if !json_flag(b, "mine") {
+            menu.push_str(&nostr_follow_item(pk, b_following, &who, if name.is_empty() { "the booster" } else { &name }));
+        }
     }
     if !mine && !author.is_empty() {
         // Nostr keys can go on moderation lists (hidden in VAAK).
@@ -4548,7 +4664,14 @@ pub fn paint_lean_feed_card_opts(status: &Value, from: &str, viewer_actor: &str)
                 .and_then(|v| v.as_str())
                 .or_else(|| booster.get("url").and_then(|v| v.as_str()))
                 .unwrap_or("");
-            let booster_label = if booster_ref.starts_with("https://") {
+            let booster_nostr = nostr_profile_url(&st, &booster);
+            let booster_label = if let Some(open) = booster_nostr {
+                format!(
+                    "<a href=\"{0}\" target=\"_blank\" rel=\"noopener noreferrer\" data-profile-hover-actor=\"{0}\" data-profile-hover-source=\"nostr\" style=\"color:inherit;text-decoration:none\">{1}</a>",
+                    esc(open),
+                    esc(booster_name)
+                )
+            } else if booster_ref.starts_with("https://") {
                 format!(
                     "<a href=\"?view=remote_profile&amp;actor={}&amp;from={}\" data-profile-hover-actor=\"{}\" style=\"color:inherit;text-decoration:none\">{}</a>",
                     urlencoding_encode(booster_ref),
@@ -4567,6 +4690,19 @@ pub fn paint_lean_feed_card_opts(status: &Value, from: &str, viewer_actor: &str)
             boost_header = format!(
                 "<div class=\"meta meta-row\" style=\"color:var(--primary)\"><i class=\"ph ph-repeat\" aria-hidden=\"true\"></i> {booster_label} boosted{when_bit}</div>"
             );
+            let mut inner = inner;
+            // A Nostr repost: hand the reposter to the card menu so it can
+            // offer the booster's profile and follow next to the author's.
+            let booster_pk = st.get("vaak_nostr_pubkey").and_then(|v| v.as_str()).unwrap_or("");
+            if let (Some(open), true) = (booster_nostr, crate::nostr::event::is_hex64(booster_pk)) {
+                inner["vaak_nostr_booster"] = serde_json::json!({
+                    "pubkey": booster_pk,
+                    "name": booster_name,
+                    "url": open,
+                    "following": st.get("vaak_nostr_following").and_then(|v| v.as_bool()).unwrap_or(true),
+                    "mine": json_flag(&st, "vaak_nostr_mine"),
+                });
+            }
             st = inner;
         }
     }

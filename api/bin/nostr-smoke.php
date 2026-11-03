@@ -281,6 +281,29 @@ $check(str_starts_with($bunkerLine, 'Connected to bunker npub1') && str_contains
 $check(!str_contains(ap_nostr_bunker_status_line(['signer_pubkey' => str_repeat('ab', 32), 'connected_at' => 1000, 'last_used_at' => 3000, 'last_error' => 'old', 'last_error_at' => 2000], 3030), 'old'), 'a problem older than the last signature is not shown');
 $check(ap_nostr_bunker_status_line(null, 5) === '', 'no pairing, no line');
 
+// Hover card for a Nostr account (njump npub URL).
+$hex = '7e7e9c42a91bfef19fa929e5fda1b72e0ebc1a4c1141673e2794234d86addf4e';
+unset($GLOBALS['ap_nostr_table_ready']);
+$hdb = new PDO('sqlite::memory:');
+$hdb->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+$hdb->exec('CREATE TABLE nostr_profiles (pubkey TEXT PRIMARY KEY, name TEXT, display_name TEXT, picture TEXT, nip05 TEXT)');
+$hdb->exec("INSERT INTO nostr_profiles VALUES ('{$hex}', 'bob', 'Bob', 'https://img.test/b.png', '_@bob.test')");
+ap_nostr_table_ready($hdb);
+$hdb->exec("INSERT INTO nostr_links (owner_user_id, pubkey, created_at, updated_at) VALUES (1, '" . str_repeat('ab', 32) . "', 'x', 'x'), (2, '{$hex}', 'x', 'x')");
+$hdb->exec("INSERT INTO nostr_follows (owner_user_id, pubkey) VALUES (1, '{$hex}')");
+$hover = ap_nostr_hover_payload('https://njump.me/' . $npub, 1, $hdb);
+$check(!empty($hover['ok']) && $hover['platform'] === 'nostr' && $hover['nostr_pubkey'] === $hex, 'hover card decodes the npub');
+$check($hover['display_name'] === 'Bob' && $hover['handle'] === '@bob.test' && $hover['avatar'] === 'https://img.test/b.png', 'hover card uses stored kind 0 metadata');
+$check($hover['following'] === true && $hover['can_follow'] === true && $hover['own'] === false, 'hover card knows the viewer follows them');
+$check($hover['profile_url'] === 'https://njump.me/' . $npub, 'hover card opens the profile on Nostr');
+$ownHover = ap_nostr_hover_payload('https://njump.me/' . $npub, 2, $hdb);
+$check($ownHover['own'] === true && $ownHover['can_follow'] === false, 'no follow on your own key');
+$unlinked = ap_nostr_hover_payload('https://njump.me/' . $npub, 3, $hdb);
+$check($unlinked['can_follow'] === false && $unlinked['following'] === false, 'no follow without a linked npub');
+$check(empty(ap_nostr_hover_payload('https://njump.me/note1abc', 1, $hdb)['ok']), 'only npub links get a hover card');
+$check(empty(ap_nostr_hover_payload('https://evil.test/' . $npub, 1, $hdb)['ok']), 'only njump links get a hover card');
+unset($GLOBALS['ap_nostr_table_ready']);
+
 if ($failures !== []) {
     fwrite(STDERR, "nostr-smoke: " . count($failures) . " of {$checks} checks failed\n - " . implode("\n - ", $failures) . "\n");
     exit(1);

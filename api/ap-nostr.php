@@ -1227,6 +1227,75 @@ function ap_nostr_names(array $pubkeys, ?PDO $db = null): array
 }
 
 /**
+ * Hover card data for a Nostr account (njump npub URL), from stored kind 0
+ * metadata and the viewer's stored follow list. Nothing is fetched inline.
+ *
+ * @return array<string,mixed>
+ */
+function ap_nostr_hover_payload(string $actorUrl, int $ownerUserId, ?PDO $db = null): array
+{
+    if (!preg_match('~^https://njump\.me/(npub1[02-9ac-hj-np-z]+)$~i', rtrim(trim($actorUrl), '/'), $m)) {
+        return ['ok' => false, 'error' => 'Invalid profile'];
+    }
+    $parsed = ap_nostr_parse_pubkey($m[1]);
+    $pubkey = (string) ($parsed['pubkey'] ?? '');
+    if (empty($parsed['ok']) || !preg_match('/^[0-9a-f]{64}$/', $pubkey)) {
+        return ['ok' => false, 'error' => 'Invalid profile'];
+    }
+    $npub = ap_nostr_npub($pubkey);
+    $short = substr($npub, 0, 10) . '…' . substr($npub, -6);
+    $display = '';
+    $handle = '';
+    $avatar = '';
+    $following = false;
+    $own = false;
+    $linked = false;
+    try {
+        $db ??= ap_db();
+        if (ap_nostr_table_ready($db)) {
+            $st = $db->prepare("SELECT COALESCE(name, ''), COALESCE(display_name, ''), COALESCE(picture, ''), COALESCE(nip05, '') FROM nostr_profiles WHERE pubkey = ? LIMIT 1");
+            $st->execute([$pubkey]);
+            $row = $st->fetch(PDO::FETCH_NUM);
+            if (is_array($row)) {
+                $display = trim((string) $row[1]) !== '' ? trim((string) $row[1]) : trim((string) $row[0]);
+                $avatar = str_starts_with((string) $row[2], 'https://') ? (string) $row[2] : '';
+                $nip05 = preg_replace('/^_@/', '', trim((string) $row[3]));
+                if (is_string($nip05) && $nip05 !== '' && str_contains($nip05, '.') && !preg_match('/\s/', $nip05)) {
+                    $handle = '@' . $nip05;
+                }
+            }
+            $link = ap_nostr_link_for_user($ownerUserId, $db);
+            $mine = strtolower((string) ($link['pubkey'] ?? ''));
+            $linked = $mine !== '';
+            $own = $linked && $mine === $pubkey;
+            if ($linked && !$own) {
+                $st = $db->prepare('SELECT 1 FROM nostr_follows WHERE owner_user_id = ? AND pubkey = ? LIMIT 1');
+                $st->execute([$ownerUserId, $pubkey]);
+                $following = (bool) $st->fetchColumn();
+            }
+        }
+    } catch (Throwable $e) {
+        // A card with just the npub is still useful.
+    }
+    return [
+        'ok' => true,
+        'loading' => false,
+        'actor' => 'https://njump.me/' . $npub,
+        'profile_url' => 'https://njump.me/' . $npub,
+        'platform' => 'nostr',
+        'nostr_pubkey' => $pubkey,
+        'display_name' => mb_substr($display !== '' ? $display : $short, 0, 80),
+        'handle' => $handle !== '' ? $handle : $short,
+        'avatar' => $avatar,
+        'bio' => '',
+        'following' => $following,
+        'follows_you' => false,
+        'own' => $own,
+        'can_follow' => $linked && !$own,
+    ];
+}
+
+/**
  * Settings > Profile list of the user's Nostr mutes and VAAK hides (and,
  * for admins, server blocks), with undo buttons the Home card script runs.
  */

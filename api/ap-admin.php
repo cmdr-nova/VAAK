@@ -20235,6 +20235,12 @@ function admin_profile_hover_payload(string $actorId, int $ownerUserId, string $
     if ($actorId === '' || !str_starts_with(strtolower($actorId), 'https://') || !filter_var($actorId, FILTER_VALIDATE_URL)) {
         return ['ok' => false, 'error' => 'Invalid profile'];
     }
+    if (strtolower($source) === 'nostr' || preg_match('~^https://njump\.me/npub1~i', $actorId)) {
+        // Nostr accounts have no VAAK profile page: the card opens them on
+        // Nostr and follows through the signer (ap-nostr.php).
+        require_once __DIR__ . '/ap-nostr.php';
+        return ap_nostr_hover_payload($actorId, $ownerUserId);
+    }
     $profileUrl = function_exists('admin_profile_app_href')
         ? admin_profile_app_href($actorId, 'home')
         : ('?view=remote_profile&actor=' . rawurlencode($actorId) . '&from=home');
@@ -32670,9 +32676,11 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     .nostr-toast {
       position: fixed; left: 50%; bottom: calc(1.25rem + env(safe-area-inset-bottom, 0px)); transform: translateX(-50%);
       z-index: 13000; max-width: min(92vw, 30rem); padding: .65rem .9rem; border-radius: 10px;
-      background: #151515; color: var(--text); border: 1px solid var(--border); box-shadow: 0 8px 24px rgba(0,0,0,.45);
-      font-size: .9rem; line-height: 1.35;
+      background: var(--panel-2, #1d1d1d); color: var(--text); border: 1px solid var(--primary); box-shadow: 0 10px 28px rgba(0,0,0,.55);
+      font-size: .9rem; line-height: 1.35; animation: ap-toast-in .18s ease-out;
     }
+    /* Done states match the green VAAK toast (window.apAdminToast). */
+    .nostr-toast.ok { background: #0a2a18; border-color: #1f5a3a; color: #b6f5d0; }
     .nostr-toast[hidden] { display: none; }
     /* Admin-only card actions; the server checks again. */
     body:not([data-vaak-admin="1"]) .nostr-admin-only { display: none !important; }
@@ -53426,9 +53434,31 @@ if (VIEW === 'analytics') loadAnalytics();
     const bio = String(data.bio || '');
     if (bio) card.appendChild(node('div', 'profile-hover-bio', bio.length > 220 ? bio.slice(0, 220) + '…' : bio));
     const foot = node('div', 'profile-hover-foot');
-    const relation = data.following && data.follows_you ? 'mutual' : data.following ? 'following' : data.follows_you ? 'follows you' : '';
+    let relation = data.following && data.follows_you ? 'mutual' : data.following ? 'following' : data.follows_you ? 'follows you' : '';
+    if (data.platform === 'nostr') relation = data.following ? 'following on Nostr' : 'on Nostr';
     foot.appendChild(node('span', 'meta', relation));
     const actions = node('span', '');
+    if (data.platform === 'nostr') {
+      // Nostr: open on Nostr in a new tab; Follow is signed by the viewer's
+      // signer like the card menu's Follow (data-nostr-act, Nostr card script).
+      if (data.profile_url) {
+        const link = node('a', 'btn btn-ghost', 'View on Nostr');
+        link.href = data.profile_url; link.target = '_blank'; link.rel = 'noopener noreferrer';
+        actions.appendChild(link);
+      }
+      if (data.can_follow && !data.own && /^[0-9a-f]{64}$/.test(String(data.nostr_pubkey || ''))) {
+        const button = node('button', 'btn btn-primary', data.following ? 'Unfollow' : 'Follow');
+        button.type = 'button';
+        button.setAttribute('data-nostr-act', data.following ? 'unfollow' : 'follow');
+        button.setAttribute('data-nostr-target', data.nostr_pubkey);
+        button.setAttribute('data-nostr-follow-label', 'Follow');
+        button.setAttribute('data-nostr-unfollow-label', 'Unfollow');
+        button.setAttribute('data-nostr-name', data.display_name || data.handle || '');
+        actions.appendChild(button);
+      }
+      foot.appendChild(actions); card.appendChild(foot); position();
+      return;
+    }
     if (data.profile_url) { const link = node('a', 'btn btn-ghost', 'View profile'); link.href = data.profile_url; actions.appendChild(link); }
     if (data.can_follow && !data.own) {
       const form = document.createElement('form'); form.method = 'post'; form.action = window.location.pathname + (window.location.search || '');
@@ -53615,7 +53645,7 @@ if (VIEW === 'analytics') loadAnalytics();
   if (document.documentElement.dataset.nostrActionsBound === '1') return;
   document.documentElement.dataset.nostrActionsBound = '1';
 
-  function toast(text) {
+  function toast(text, ok) {
     let el = document.getElementById('nostr-toast');
     if (!el) {
       el = document.createElement('div');
@@ -53626,6 +53656,10 @@ if (VIEW === 'analytics') loadAnalytics();
       document.body.appendChild(el);
     }
     el.textContent = text;
+    el.classList.toggle('ok', !!ok);
+    // Replay the slide-in so a second toast in a row is noticed too.
+    el.hidden = true;
+    void el.offsetWidth;
     el.hidden = false;
     clearTimeout(el._vaakTimer);
     el._vaakTimer = setTimeout(function () { el.hidden = true; }, 6000);
@@ -53754,7 +53788,11 @@ if (VIEW === 'analytics') loadAnalytics();
   function setFollowing(target, on) {
     sameTarget('follow', target).concat(sameTarget('unfollow', target)).forEach(function (btn) {
       btn.setAttribute('data-nostr-act', on ? 'unfollow' : 'follow');
-      btn.textContent = on ? 'Unfollow on Nostr' : 'Follow on Nostr';
+      // Menus that name the person (a repost names author and booster)
+      // and the hover card carry their own labels.
+      btn.textContent = on
+        ? (btn.getAttribute('data-nostr-unfollow-label') || 'Unfollow on Nostr')
+        : (btn.getAttribute('data-nostr-follow-label') || 'Follow on Nostr');
     });
   }
 
@@ -54133,6 +54171,12 @@ if (VIEW === 'analytics') loadAnalytics();
     if (act === 'delete' && !window.confirm('Delete this note on Nostr? Relays are asked to drop it, but copies elsewhere may stay.')) return;
     if (btn.dataset.nostrBusy === '1') return;
     btn.dataset.nostrBusy = '1';
+    // Follows wait on relays (VAAK re-reads your follow list first), so say
+    // right away that it started; the done toast replaces this one.
+    const who = (btn.getAttribute('data-nostr-name') || '').trim();
+    if (act === 'follow' || act === 'unfollow') {
+      toast((act === 'follow' ? 'Following ' : 'Unfollowing ') + (who || 'them') + ' on Nostr…');
+    }
     try {
       const res = await run(act, target, '');
       if (!res) return;
@@ -54140,20 +54184,22 @@ if (VIEW === 'analytics') loadAnalytics();
         setLiked(target, res.purpose === 'like');
       } else if (res.purpose === 'follow' || res.purpose === 'unfollow') {
         setFollowing(target, res.purpose === 'follow');
-        toast(res.purpose === 'follow' ? 'Followed on Nostr.' : 'Unfollowed on Nostr. Their posts leave Home on the next refresh.');
+        toast(res.purpose === 'follow'
+          ? (who ? 'Followed ' + who + ' on Nostr.' : 'Followed on Nostr.')
+          : (who ? 'Unfollowed ' + who + ' on Nostr.' : 'Unfollowed on Nostr.') + ' Their posts leave Home on the next refresh.', true);
       } else if (res.purpose === 'repost' || res.purpose === 'unrepost') {
         setReposted(target, res.purpose === 'repost');
-        toast(res.purpose === 'repost' ? 'Reposted on Nostr and boosted on VAAK.' : 'Repost undone.');
+        toast(res.purpose === 'repost' ? 'Reposted on Nostr and boosted on VAAK.' : 'Repost undone.', true);
       } else if (res.purpose === 'delete') {
         const card = btn.closest('article');
         if (card) card.remove();
-        toast('Deleted on Nostr.');
+        toast('Deleted on Nostr.', true);
       } else if (res.purpose === 'mute') {
         dropAuthor(target);
-        toast('Muted on Nostr. Other Nostr apps that read your mute list hide them too.');
+        toast('Muted on Nostr. Other Nostr apps that read your mute list hide them too.', true);
       } else if (res.purpose === 'unmute') {
         dropRow(btn);
-        toast('Unmuted on Nostr.');
+        toast('Unmuted on Nostr.', true);
       }
     } finally {
       btn.dataset.nostrBusy = '';
