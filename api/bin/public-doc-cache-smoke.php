@@ -264,7 +264,7 @@ $check(str_contains($schema, 'DISCARD ALL'), 'a reused session drops leftover st
 $check(str_contains($schema, 'ap_db_postgres_reset_session'), 'each request resets the Postgres session');
 $check(str_contains($entities, 'ap_events_distinct_actor_ids('), 'suggestions use the skip-scan helper');
 $check(
-    substr_count($entities, "AND action_taken IN ('local_accept_followback', ?)") === 2
+    substr_count($entities, "AND action_taken IN ('local_accept_followback', ?, 'nostr_follow')") === 2
         && substr_count($entities, 'AND (target_actor = ? OR target_actor = ?)') >= 2,
     'Bluesky follow notification lookups still filter on the target actor'
 );
