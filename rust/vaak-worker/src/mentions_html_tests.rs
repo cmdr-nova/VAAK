@@ -524,3 +524,26 @@ fn followed_bluesky_handle_hides_follow_back() {
     }
     assert!(junk.is_empty());
 }
+
+#[test]
+fn nostr_follower_follows_back_with_the_signer() {
+    let pk = "a".repeat(64);
+    let mut row = follow_row("nostr:npub1example", "https://njump.me/npub1example");
+    row["account"]["vaak_nostr_pubkey"] = serde_json::json!(pk);
+    row["account"]["vaak_nostr_can_follow"] = serde_json::json!(true);
+    row["account"]["vaak_nostr_following"] = serde_json::json!(false);
+    let html = paint_notif_card_follows(&row, "https://mkultra.monster/users/cmdr_nova", &HashSet::new());
+    assert!(html.contains(&format!("data-nostr-act=\"follow\" data-nostr-target=\"{pk}\"")));
+    assert!(html.contains(">Follow back</button>"));
+    assert!(!html.contains("follow_remote"), "never a fediverse follow of an njump URL");
+
+    row["account"]["vaak_nostr_following"] = serde_json::json!(true);
+    let html = paint_notif_card_follows(&row, "https://mkultra.monster/users/cmdr_nova", &HashSet::new());
+    assert!(html.contains("data-nostr-act=\"unfollow\""));
+    assert!(html.contains(">Following</button>"));
+
+    // No linked npub: nothing to sign with, and no fediverse form either.
+    row["account"]["vaak_nostr_can_follow"] = serde_json::json!(false);
+    let html = paint_notif_card_follows(&row, "https://mkultra.monster/users/cmdr_nova", &HashSet::new());
+    assert!(!html.contains("data-nostr-act") && !html.contains("follow_remote"));
+}

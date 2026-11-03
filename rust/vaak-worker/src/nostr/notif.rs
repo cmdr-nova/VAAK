@@ -20,6 +20,13 @@
 //! Zaps (NIP-57 kind 9735 receipts) notify as "zapped your post · N sats"
 //! when they check out (`zap::receipt`) and were signed by the user's own
 //! Lightning provider. The zapper (the zap request's key) is the notifier.
+//!
+//! Follows: a kind 3 contact list that names the linked key is a follow.
+//! Every edit of that list names the user again, so `nostr_followers`
+//! remembers who already did and only the first list notifies ("followed
+//! you", stored in `events` as action `nostr_follow` like a Bluesky follow).
+//! The first read for a linked key fills `nostr_followers` without
+//! notifying, so existing followers don't show up as new.
 
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
@@ -47,6 +54,23 @@ const PER_LINK_LIMIT: i64 = 300;
 const TARGET_LOOKUPS: usize = 200;
 const INGEST_TIMEOUT: Duration = Duration::from_secs(90);
 const VIEWER: &str = "https://njump.me/";
+const FOLLOW_KIND: i64 = 3;
+/// Contact lists naming the user per relay on the silent first read.
+const FOLLOWER_SEED_LIMIT: i64 = 500;
+/// New contact lists naming the user per relay on a normal read.
+const FOLLOWER_LIMIT: i64 = 100;
+
+/// `nostr_followers` and `nostr_follower_seed` exist (migration
+/// 20261103_nostr_followers). Without them follows don't notify.
+pub async fn followers_ready(db: &Client) -> bool {
+    db.query_one(
+        "SELECT to_regclass('nostr_followers') IS NOT NULL AND to_regclass('nostr_follower_seed') IS NOT NULL",
+        &[],
+    )
+    .await
+    .map(|r| r.get::<_, bool>(0))
+    .unwrap_or(false)
+}
 
 pub async fn ready(db: &Client) -> bool {
     db.query_one("SELECT to_regclass('nostr_notifs') IS NOT NULL AND to_regclass('nostr_notif_state') IS NOT NULL", &[])
@@ -135,6 +159,37 @@ fn mention_row(ev: &Event, target: &str, target_text: &str) -> Value {
     })
 }
 
+/// The staged row for a new follower. Ingest stores it in `events`
+/// (action `nostr_follow`), not `mentions`, like other follows.
+fn follow_row(ev: &Event) -> Value {
+    json!({
+        "activity_id": format!("nostr:{}", ev.id),
+        "actor_id": actor_url(&ev.pubkey),
+        "object_id": format!("nostr:follow:{}", ev.pubkey),
+        "activity_type": "Follow",
+        "type": "Follow",
+        "content": "",
+        "in_reply_to": "",
+        "created_at": iso(ev.created_at),
+    })
+}
+
+/// Newest contact list per author among `events` that name `me` (not
+/// `me`'s own list).
+fn follower_lists<'a>(events: &'a [Event], me: &str) -> HashMap<&'a str, &'a Event> {
+    let mut out: HashMap<&str, &Event> = HashMap::new();
+    for ev in events.iter().filter(|ev| ev.kind == FOLLOW_KIND && ev.pubkey != me) {
+        if !ev.follow_list().iter().any(|pk| pk == me) {
+            continue;
+        }
+        let slot = out.entry(ev.pubkey.as_str()).or_insert(ev);
+        if ev.created_at > slot.created_at {
+            *slot = ev;
+        }
+    }
+    out
+}
+
 /// The `mentions` row for a checked zap receipt, typed like a like and
 /// carrying the zapped note's text.
 fn zap_row(ev: &Event, zap: &zap::Receipt, target_text: &str) -> Value {
@@ -214,6 +269,19 @@ pub async fn sync(db: &mut Client, s: &Settings, now: i64, deadline: Instant) ->
     if links.is_empty() {
         return Ok(report);
     }
+    // Owners whose followers were read once for their current key.
+    let followers_on = followers_ready(db).await;
+    let seeded: HashMap<i64, String> = if followers_on {
+        db.query("SELECT owner_user_id, pubkey FROM nostr_follower_seed", &[])
+            .await
+            .context("nostr follower seeds")?
+            .iter()
+            .map(|r| (r.get(0), r.get(1)))
+            .collect()
+    } else {
+        HashMap::new()
+    };
+    let needs_seed = |l: &Link| followers_on && seeded.get(&l.owner) != Some(&l.pubkey);
 
     // One `#p` query per linked key on each of its relays.
     let mut jobs: HashMap<String, Vec<Query>> = HashMap::new();
@@ -222,15 +290,28 @@ pub async fn sync(db: &mut Client, s: &Settings, now: i64, deadline: Instant) ->
         let since = if l.since_at > 0 { (l.since_at - OVERLAP_SECS).max(floor) } else { floor };
         for url in &l.relays {
             jobs.entry(url.clone()).or_default().push(Query::tagging(&l.pubkey, KINDS.to_vec(), since, PER_LINK_LIMIT));
+            // Contact lists are large; ask for them on their own, every list
+            // ever on the first read and only recent edits after that.
+            if needs_seed(l) {
+                jobs.entry(url.clone()).or_default().push(Query::tagging(&l.pubkey, vec![FOLLOW_KIND], 0, FOLLOWER_SEED_LIMIT));
+            } else if followers_on {
+                jobs.entry(url.clone()).or_default().push(Query::tagging(&l.pubkey, vec![FOLLOW_KIND], since, FOLLOWER_LIMIT));
+            }
         }
     }
+    let asked: HashMap<String, usize> = jobs.iter().map(|(url, qs)| (url.clone(), qs.len())).collect();
     let mut answered: HashSet<String> = HashSet::new();
+    // Relays that finished every query, contact lists included.
+    let mut answered_all: HashSet<String> = HashSet::new();
     let mut relay_of: HashMap<String, String> = HashMap::new();
     let mut raw = Vec::new();
     for (url, res) in sync::fan_out(db, s, jobs.into_iter().collect(), deadline).await {
         if let Ok(res) = res {
             if res.completed > 0 {
                 answered.insert(url.clone());
+            }
+            if asked.get(&url).is_some_and(|n| res.completed >= *n) {
+                answered_all.insert(url.clone());
             }
             for ev in res.events {
                 relay_of.entry(ev.id.clone()).or_insert_with(|| url.clone());
@@ -348,7 +429,78 @@ pub async fn sync(db: &mut Client, s: &Settings, now: i64, deadline: Instant) ->
         }
     }
 
+    // New followers: authors of contact lists naming the user that VAAK
+    // hasn't seen name them before. The first read only remembers them.
+    let mut followers: Vec<(i64, String)> = Vec::new();
+    let mut seeds: Vec<&Link> = Vec::new();
+    let mut follow_staged: Vec<(i64, &Event, Value, bool)> = Vec::new();
+    let lists_by_link: Vec<(&Link, HashMap<&str, &Event>)> =
+        if followers_on { links.iter().map(|l| (l, follower_lists(&events, &l.pubkey))).collect() } else { Vec::new() };
+    for (l, lists) in &lists_by_link {
+        let seed = needs_seed(l);
+        if seed {
+            // Only a complete read counts, or followers it missed would show
+            // up as new the next time they edit their list.
+            if l.relays.iter().any(|r| answered_all.contains(r)) {
+                seeds.push(l);
+            } else {
+                continue;
+            }
+        }
+        if lists.is_empty() {
+            continue;
+        }
+        let authors: Vec<String> = lists.keys().map(|k| k.to_string()).collect();
+        let known: HashSet<String> = db
+            .query("SELECT pubkey FROM nostr_followers WHERE owner_user_id = $1 AND pubkey = ANY($2)", &[&l.owner, &authors])
+            .await
+            .context("nostr known followers")?
+            .iter()
+            .map(|r| r.get(0))
+            .collect();
+        let hidden = if seed { HashSet::new() } else { super::moderation::hidden_keys(db, l.owner).await };
+        for (author, ev) in lists {
+            if known.contains(*author) {
+                continue;
+            }
+            let notify = !seed && !hidden.contains(*author) && ev.created_at >= now - FIRST_LOOKBACK_SECS;
+            followers.push((l.owner, author.to_string()));
+            if notify {
+                let push = ev.created_at >= now - PUSH_WINDOW_SECS;
+                follow_staged.push((l.owner, ev, follow_row(ev), push));
+            }
+        }
+    }
+
     let tx = db.transaction().await?;
+    for (owner, pubkey) in &followers {
+        tx.execute(
+            "INSERT INTO nostr_followers (owner_user_id, pubkey, seen_at) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+            &[owner, pubkey, &now],
+        )
+        .await
+        .context("nostr follower")?;
+    }
+    for l in &seeds {
+        tx.execute(
+            "INSERT INTO nostr_follower_seed (owner_user_id, pubkey, seeded_at) VALUES ($1, $2, $3)
+             ON CONFLICT (owner_user_id) DO UPDATE SET pubkey = EXCLUDED.pubkey, seeded_at = EXCLUDED.seeded_at",
+            &[&l.owner, &l.pubkey, &now],
+        )
+        .await
+        .context("nostr follower seed")?;
+    }
+    for (owner, ev, row, push) in &follow_staged {
+        let kind = ev.kind as i32;
+        report.staged += tx
+            .execute(
+                "INSERT INTO nostr_notifs (owner_user_id, event_id, kind, actor, target_id, created_at, mention, push)
+                 VALUES ($1, $2, $3, $4, '', $5, $6, $7) ON CONFLICT (owner_user_id, event_id) DO NOTHING",
+                &[owner, &ev.id, &kind, &ev.pubkey, &ev.created_at, row, push],
+            )
+            .await
+            .context("nostr follow stage")?;
+    }
     for ev in fetched.iter().filter(|ev| keep_targets.contains(&ev.id)) {
         store_note(&tx, ev, relay_of.get(&ev.id).map(String::as_str).unwrap_or(""), now).await?;
     }
@@ -490,13 +642,33 @@ pub fn note_key(url: &str) -> Option<String> {
 /// and show the notifier's Nostr name and avatar. Ids stay as built so
 /// cursors and grouping don't move.
 pub async fn dress_entities(db: &Client, owner: i64, entities: &mut Vec<Value>) {
-    let is_nostr = |e: &Value| e.get("status").is_some_and(super::render::is_nostr_status);
+    let actor_of = |e: &Value| e.get("account").and_then(|a| a.get("uri")).and_then(Value::as_str).and_then(actor_key);
+    // Follows carry no status: their account (an njump npub) marks them.
+    let is_follow = |e: &Value| e.get("type").and_then(Value::as_str) == Some("follow") && actor_of(e).is_some();
+    let is_nostr = |e: &Value| e.get("status").is_some_and(super::render::is_nostr_status) || is_follow(e);
     if !entities.iter().any(is_nostr) {
         return;
     }
-    let actor_of = |e: &Value| e.get("account").and_then(|a| a.get("uri")).and_then(Value::as_str).and_then(actor_key);
     let hidden = super::moderation::hidden_keys(db, owner).await;
     entities.retain(|e| !is_nostr(e) || actor_of(e).is_none_or(|k| !hidden.contains(&k)));
+    // Follow back on Nostr reads the viewer's contact list, like card menus.
+    let followers: Vec<String> = entities.iter().filter(|e| is_follow(e)).filter_map(actor_of).collect();
+    let followed_back: HashSet<String> = if followers.is_empty() {
+        HashSet::new()
+    } else {
+        db.query("SELECT pubkey FROM nostr_follows WHERE owner_user_id = $1 AND pubkey = ANY($2)", &[&owner, &followers])
+            .await
+            .map(|rows| rows.iter().map(|r| r.get(0)).collect())
+            .unwrap_or_default()
+    };
+    let linked = !followers.is_empty() && super::act::linked_pubkey(db, owner).await.ok().flatten().is_some();
+    for e in entities.iter_mut().filter(|e| is_follow(e)) {
+        if let Some(key) = actor_of(e) {
+            e["account"]["vaak_nostr_pubkey"] = json!(key);
+            e["account"]["vaak_nostr_following"] = json!(followed_back.contains(&key));
+            e["account"]["vaak_nostr_can_follow"] = json!(linked);
+        }
+    }
     let ids: Vec<String> = entities
         .iter()
         .filter(|e| is_nostr(e))
@@ -605,6 +777,27 @@ mod tests {
         // My own events never notify me.
         let own_reply = signed(1, 30, 1, vec![tag(&["e", &mine_note, "", "reply"]), p], "self");
         assert_eq!(notifies(&own_reply, &me.pubkey, true, &is_mine), None);
+    }
+
+    #[test]
+    fn follower_lists_keep_the_newest_list_naming_me() {
+        let me = signed(1, 10, 0, vec![], "");
+        let p = tag(&["p", &me.pubkey]);
+        let other = tag(&["p", &"b".repeat(64)]);
+        let older = signed(2, 100, 3, vec![p.clone()], "");
+        let newer = signed(2, 200, 3, vec![other.clone(), p.clone()], "");
+        let not_me = signed(3, 150, 3, vec![other.clone()], "");
+        let note = signed(4, 150, 1, vec![p.clone()], "hi");
+        let mine = signed(1, 150, 3, vec![p.clone()], "");
+        let events = vec![older.clone(), newer.clone(), not_me, note, mine];
+        let lists = follower_lists(&events, &me.pubkey);
+        assert_eq!(lists.len(), 1, "only kind 3 lists by others that name me");
+        assert_eq!(lists.get(older.pubkey.as_str()).map(|e| e.id.as_str()), Some(newer.id.as_str()));
+        let row = follow_row(&newer);
+        assert_eq!(row["activity_type"], "Follow");
+        assert_eq!(row["actor_id"], actor_url(&newer.pubkey));
+        assert_eq!(row["object_id"], format!("nostr:follow:{}", newer.pubkey));
+        assert_eq!(row["activity_id"], format!("nostr:{}", newer.id));
     }
 
     #[test]
