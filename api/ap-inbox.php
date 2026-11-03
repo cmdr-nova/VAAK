@@ -2073,7 +2073,7 @@ function ap_key_neg_cache_get(string $keyId): ?array
 {
     $path = ap_key_neg_cache_path($keyId);
     if (!is_file($path)) {
-        return null;
+        return ap_key_neg_cache_shared_get($keyId);
     }
     if ((time() - filemtime($path)) >= AP_INBOX_KEY_NEG_CACHE_TTL) {
         @unlink($path);
@@ -2107,7 +2107,55 @@ function ap_key_neg_cache_set(string $keyId, string $reason, int $httpStatus = 0
     ], JSON_UNESCAPED_SLASHES);
     if (is_string($payload)) {
         @file_put_contents(ap_key_neg_cache_path($keyId), $payload);
+        ap_key_neg_cache_shared('set', $keyId, $payload);
     }
+}
+
+/**
+ * The negative cache in cache Redis, shared with the Rust inbox key fetch
+ * (rust/vaak-worker/src/inbox_key_fetch.rs), so a dead key is fetched by one
+ * side only. The /tmp files stay the PHP-local copy.
+ */
+function ap_key_neg_cache_shared_key(string $keyId): string
+{
+    return 'vaak:inbox:keyneg:v1:' . hash('sha256', trim($keyId));
+}
+
+function ap_key_neg_cache_shared(string $op, string $keyId, string $payload = ''): void
+{
+    try {
+        $redis = function_exists('ap_redis_client') ? ap_redis_client() : null;
+        if (!$redis) {
+            return;
+        }
+        if ($op === 'set') {
+            $redis->setEx(ap_key_neg_cache_shared_key($keyId), AP_INBOX_KEY_NEG_CACHE_TTL, $payload);
+        } else {
+            $redis->del(ap_key_neg_cache_shared_key($keyId));
+        }
+    } catch (Throwable $e) {
+        error_log('[ap-inbox] shared key neg cache ' . $op . ' failed: ' . $e->getMessage());
+    }
+}
+
+/** @return array{reason:string,http:int,at:int}|null */
+function ap_key_neg_cache_shared_get(string $keyId): ?array
+{
+    try {
+        $redis = function_exists('ap_redis_client') ? ap_redis_client() : null;
+        $raw = $redis ? $redis->get(ap_key_neg_cache_shared_key($keyId)) : false;
+    } catch (Throwable $e) {
+        return null;
+    }
+    $data = is_string($raw) ? json_decode($raw, true) : null;
+    if (!is_array($data)) {
+        return null;
+    }
+    return [
+        'reason' => (string) ($data['reason'] ?? 'cached_miss'),
+        'http' => (int) ($data['http'] ?? 0),
+        'at' => (int) ($data['at'] ?? time()),
+    ];
 }
 
 function ap_inbox_forget_actor_pubkey(string $keyId): void
@@ -2412,6 +2460,7 @@ function ap_fetch_actor_pubkey(string $keyId, bool $bypassCache = false): ?strin
         if (is_file($negPath)) {
             @unlink($negPath);
         }
+        ap_key_neg_cache_shared('del', $keyId);
         ap_log('key_fetch_ok keyId=' . ap_short($keyId) . ' via=' . ap_short($fetchUrl, 80) . ' http=' . $status);
         return $pem;
     }

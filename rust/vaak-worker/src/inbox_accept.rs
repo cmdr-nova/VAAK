@@ -8,9 +8,11 @@
 //! accepted relay signed for someone else is spooled too, as is any other
 //! verified delivery whose signer is not the actor; the drain does PHP's
 //! forward handling and origin recovery for those. Every other request is
-//! forwarded byte for byte to PHP on a loopback listener, so unknown keys,
-//! bad signatures, blocks and the other rejections keep their PHP behaviour.
-//! Rust never fetches a key and never routes an activity.
+//! forwarded byte for byte to PHP on a loopback listener, so bad signatures,
+//! blocks and the other rejections keep their PHP behaviour. With
+//! VAAK_INBOX_RUST_KEY_FETCH=1 an unknown shared-inbox key is fetched here
+//! first (inbox_key_fetch.rs); without it, or when that fails, PHP gets the
+//! request. Rust never routes an activity.
 //!
 //! Two deliveries are answered 202 without reaching PHP or the spool: a
 //! repeat of an activity id already spooled for the same inbox path in the
@@ -215,18 +217,41 @@ async fn fast_path(cfg: &crate::config::Config, uri: &Uri, headers: &HeaderMap, 
         }
     }
 
-    // Unknown keys go to PHP, which counts them against its own limits.
+    let now = chrono::Utc::now().timestamp();
+    let window = now / RATE_WINDOW;
+    let normal_key = format!("vaak:inbox_rust:rate:v1:{ip}:{window}");
+    let mut counted = false;
     let mirrored: Option<String> = redis::cmd("GET").arg(key_mirror_key(&key_id)).query_async(&mut redis).await.map_err(|_| "redis")?;
-    let mirrored: Value = mirrored.and_then(|raw| serde_json::from_str(&raw).ok()).ok_or("no_key")?;
+    let mirrored: Value = match mirrored.and_then(|raw| serde_json::from_str(&raw).ok()) {
+        Some(record) => record,
+        // A personal inbox signs its key fetch as that user; PHP keeps those.
+        None if !crate::inbox_key_fetch::enabled() || personal_inbox_user(uri.path()).is_some() => return Err("no_key"),
+        None => {
+            // Admission and blocks before the fetch, which is the costly part.
+            let (count, _): (i64, bool) =
+                redis::pipe().incr(&normal_key, 1).expire(&normal_key, RATE_WINDOW * 2).query_async(&mut redis).await.map_err(|_| "redis")?;
+            counted = true;
+            if count > RATE_MAX {
+                return Err("rate");
+            }
+            let db = conn(cfg).await.map_err(|_| "db")?;
+            let blocked = blocked_domains(&db).await.map_err(|_| "db")?;
+            if host_of(&key_id).is_none_or(|h| host_blocked(&h, &blocked)) {
+                return Err("blocked");
+            }
+            let fetched = crate::inbox_key_fetch::fetch(&mut redis, &db, &key_id).await;
+            idle_return(db);
+            let record = fetched.map_err(|miss| miss.reason())?;
+            stat(cfg, "key_fetched").await;
+            record
+        }
+    };
     let pem = mirrored.get("pem").and_then(Value::as_str).ok_or("no_key")?.to_string();
     let owner = mirrored.get("owner").and_then(Value::as_str).map(str::to_string);
     let relay = mirrored.get("relay").and_then(Value::as_bool).unwrap_or(false);
 
     // Like ap_inbox_rate_admit: a relay draws on its own bucket but still
     // needs room in the IP's normal one.
-    let now = chrono::Utc::now().timestamp();
-    let window = now / RATE_WINDOW;
-    let normal_key = format!("vaak:inbox_rust:rate:v1:{ip}:{window}");
     let admitted = if relay {
         let relay_key = format!("vaak:inbox_rust:rate:v1:relay:{ip}:{window}");
         let (normal, count, _): (Option<i64>, i64, bool) = redis::pipe()
@@ -237,6 +262,8 @@ async fn fast_path(cfg: &crate::config::Config, uri: &Uri, headers: &HeaderMap, 
             .await
             .map_err(|_| "redis")?;
         normal.unwrap_or(0) < RATE_MAX && count <= RATE_MAX_RELAY
+    } else if counted {
+        true
     } else {
         let (count, _): (i64, bool) =
             redis::pipe().incr(&normal_key, 1).expire(&normal_key, RATE_WINDOW * 2).query_async(&mut redis).await.map_err(|_| "redis")?;
