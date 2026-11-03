@@ -276,26 +276,9 @@ function ap_defed_dm_cmdr(string $plainText, bool $dryRun): array
         return ['ok' => false, 'error' => $stored['error'] ?? 'dm_store failed'];
     }
 
-    // Push only to cmdr_nova's devices
-    try {
-        if (function_exists('ap_webpush_notify_event')) {
-            $preview = trim(preg_replace('/\s+/', ' ', $plainText) ?? $plainText);
-            if (function_exists('mb_substr') && mb_strlen($preview) > 140) {
-                $preview = mb_substr($preview, 0, 137) . '…';
-            } elseif (strlen($preview) > 140) {
-                $preview = substr($preview, 0, 137) . '…';
-            }
-            ap_webpush_notify_event(
-                'mention',
-                AP_DEFED_MONITOR_PEER,
-                null,
-                $preview,
-                $ownerId
-            );
-        }
-    } catch (Throwable $e) {
-        error_log('[ap-defederation] webpush: ' . $e->getMessage());
-    }
+    // ap_dm_store already pushes inbound DMs with a notification id that
+    // resolves to this DM. A second push here sent a made-up id that Ice
+    // Cubes looked up as an unrelated boost ("ruby boosted" + DM text).
 
     return ['ok' => true, 'id' => (int) ($stored['id'] ?? 0)];
 }

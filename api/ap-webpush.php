@@ -519,9 +519,21 @@ function ap_webpush_notify_event(
         } elseif (strlen($bodyText) > 140) {
             $bodyText = substr($bodyText, 0, 137) . '…';
         }
+        // Ice Cubes fetches GET /api/v1/notifications/{notification_id} for
+        // every push and paints sender + type from that answer. A made-up id
+        // (it used to be time()) parsed as some old like/boost row, so a DM
+        // showed up as "<someone> boosted". No real id → one that 404s.
+        if ($notifId === null || $notifId === '') {
+            $notifId = function_exists('ap_masto_notification_id_unresolvable')
+                ? ap_masto_notification_id_unresolvable()
+                : '';
+        }
+        if ($notifId === '') {
+            return;
+        }
         ap_webpush_dispatch([
             'type' => $type,
-            'notification_id' => $notifId ?? (string) time(),
+            'notification_id' => $notifId,
             'title' => $title,
             'body' => $bodyText,
             'icon' => $icon,

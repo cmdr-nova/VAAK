@@ -48,6 +48,7 @@ php_tests=(
   api/bin/bsky-appview-takedown-smoke.php
   api/bin/bluemoji-facet-smoke.php
   api/bin/bite-ingest-notify-smoke.php
+  api/bin/notif-push-id-smoke.php
   api/bin/deprioritize-queue-smoke.php
   api/bin/bsky-thread-fragment-smoke.php
   api/bin/bsky-observation-refresh-smoke.php
