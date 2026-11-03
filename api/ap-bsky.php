@@ -15355,6 +15355,28 @@ function ap_bsky_interaction_is_twin_echo(
     }
 }
 
+/**
+ * at:// URI of the post a Bluesky record quotes (app.bsky.embed.record or
+ * the record half of recordWithMedia). Feed generators, lists and starter
+ * packs ride the same embed type but are not quoted posts.
+ */
+function ap_bsky_record_quoted_post_uri(array $record): ?string
+{
+    $embed = is_array($record['embed'] ?? null) ? $record['embed'] : null;
+    if ($embed === null) {
+        return null;
+    }
+    $type = (string) ($embed['$type'] ?? '');
+    $ref = null;
+    if (str_contains($type, 'recordWithMedia')) {
+        $ref = is_array($embed['record']['record'] ?? null) ? $embed['record']['record'] : null;
+    } elseif (str_contains($type, 'embed.record') || ($type === '' && is_array($embed['record'] ?? null))) {
+        $ref = is_array($embed['record'] ?? null) ? $embed['record'] : null;
+    }
+    $uri = is_array($ref) ? trim((string) ($ref['uri'] ?? '')) : '';
+    return preg_match('~^at://did:[^/\s]+/app\.bsky\.feed\.post/[A-Za-z0-9._:\~-]+$~D', $uri) ? $uri : null;
+}
+
 function ap_bsky_notification_to_mention_row(int $ownerUserId, string $ownerActorId, array $notif): ?array
 {
     $reason = strtolower(trim((string) ($notif['reason'] ?? '')));
@@ -15515,13 +15537,18 @@ function ap_bsky_notification_to_mention_row(int $ownerUserId, string $ownerActo
         } else {
             $inReplyTo = ap_bsky_https_url_from_at_uri($reasonSubject, null);
         }
-    } elseif ($reason === 'quote' && $reasonSubject !== '') {
-        // Keep quote target discoverable in content for Ice Cubes.
-        if ($text !== '') {
-            $text .= "\n\n↪ QT " . ap_bsky_https_url_from_at_uri($reasonSubject, null);
-        } else {
-            $text = '↪ QT ' . ap_bsky_https_url_from_at_uri($reasonSubject, null);
-        }
+    }
+    // Keep the quote target in content: the notification painters and Ice
+    // Cubes read it from the "↪ QT <url>" line. A quote notification quotes
+    // the subject; a reply or mention can quote any post (often the author's
+    // own), named only by the record's embed.
+    $quotedAt = $reason === 'quote' && $reasonSubject !== '' ? $reasonSubject : null;
+    if ($quotedAt === null && in_array($reason, ['mention', 'reply'], true)) {
+        $quotedAt = ap_bsky_record_quoted_post_uri($record);
+    }
+    if ($quotedAt !== null) {
+        $qtLine = '↪ QT ' . ap_bsky_https_url_from_at_uri($quotedAt, null);
+        $text = $text !== '' ? ($text . "\n\n" . $qtLine) : $qtLine;
     }
 
     // Upsert remote actor cache so Ice Cubes shows handle + avatar.
@@ -15712,6 +15739,17 @@ function ap_bsky_notification_subjects_warm(int $ownerUserId, array $notifs): in
             $want[$subject] = true;
         }
     }
+    // Posts quoted inside a reply or mention: the quote card paints from the cache.
+    foreach ($notifs as $notif) {
+        $reason = is_array($notif) ? strtolower(trim((string) ($notif['reason'] ?? ''))) : '';
+        if (!in_array($reason, ['mention', 'reply'], true) || !is_array($notif['record'] ?? null)) {
+            continue;
+        }
+        $quoted = ap_bsky_record_quoted_post_uri($notif['record']);
+        if ($quoted !== null) {
+            $want[$quoted] = true;
+        }
+    }
     if ($want === [] || $ownerUserId < 1) {
         return 0;
     }
@@ -15865,6 +15903,80 @@ function ap_bsky_notification_subjects_backfill(int $ownerUserId, int $days, int
     // Cached notification pages still hold the empty paint.
     ap_notification_projection_invalidate_owner($ownerUserId);
     sort($out['still_missing']);
+    return $out;
+}
+
+/**
+ * Repair Bluesky reply / mention notifications stored before ingest kept the
+ * post they quote. Re-reads those posts from the public AppView, appends the
+ * "↪ QT <url>" line and caches the quoted post so the card paints it.
+ * Opt-in only: api/bin/bsky-notif-quote-backfill.php.
+ *
+ * @return array{rows:int,fetched:int,quoting:int,updated:int,dry_run:bool,ids:list<int>}
+ */
+function ap_bsky_notification_quotes_backfill(int $ownerUserId, int $days, int $limit, bool $dryRun): array
+{
+    $out = ['rows' => 0, 'fetched' => 0, 'quoting' => 0, 'updated' => 0, 'dry_run' => $dryRun, 'ids' => []];
+    if ($ownerUserId < 1) {
+        return $out;
+    }
+    $st = ap_db()->prepare(
+        "SELECT id, activity_id, content FROM mentions
+         WHERE owner_user_id = ? AND deleted_at IS NULL AND created_at >= ?
+           AND activity_type = 'Create' AND activity_id LIKE 'at://%/app.bsky.feed.post/%'
+           AND content NOT LIKE '%↪ QT%'
+         ORDER BY id DESC LIMIT ?"
+    );
+    $st->bindValue(1, $ownerUserId, PDO::PARAM_INT);
+    $st->bindValue(2, gmdate('Y-m-d\TH:i:s', time() - max(1, $days) * 86400));
+    $st->bindValue(3, max(1, $limit), PDO::PARAM_INT);
+    $st->execute();
+    $rows = [];
+    foreach ($st->fetchAll() ?: [] as $row) {
+        $at = trim((string) ($row['activity_id'] ?? ''));
+        if (preg_match('~^at://did:[^/\s]+/app\.bsky\.feed\.post/[A-Za-z0-9._:\~-]+$~D', $at)) {
+            $rows[$at][] = ['id' => (int) $row['id'], 'content' => (string) ($row['content'] ?? '')];
+        }
+    }
+    $out['rows'] = array_sum(array_map('count', $rows));
+    $notifs = [];
+    $upd = ap_db()->prepare('UPDATE mentions SET content = ? WHERE id = ? AND owner_user_id = ?');
+    foreach (array_chunk(array_keys($rows), 25) as $chunk) {
+        $got = ap_bsky_xrpc(AP_BSKY_PUBLIC_API, 'app.bsky.feed.getPosts', 'GET', ['uris' => implode(',', $chunk)], null, null, 8);
+        if (empty($got['ok']) || !is_array($got['json']['posts'] ?? null)) {
+            continue;
+        }
+        foreach ($got['json']['posts'] as $post) {
+            $uri = is_array($post) ? (string) ($post['uri'] ?? '') : '';
+            if (!isset($rows[$uri]) || !is_array($post['record'] ?? null)) {
+                continue;
+            }
+            $out['fetched']++;
+            $quoted = ap_bsky_record_quoted_post_uri($post['record']);
+            if ($quoted === null) {
+                continue;
+            }
+            $out['quoting']++;
+            $notifs[] = ['reason' => 'reply', 'record' => $post['record']];
+            $line = '↪ QT ' . ap_bsky_https_url_from_at_uri($quoted, null);
+            foreach ($rows[$uri] as $row) {
+                $out['ids'][] = $row['id'];
+                if ($dryRun) {
+                    continue;
+                }
+                $text = trim($row['content']);
+                $upd->execute([$text !== '' ? ($text . "\n\n" . $line) : $line, $row['id'], $ownerUserId]);
+                $out['updated']++;
+            }
+        }
+    }
+    if (!$dryRun && $notifs !== []) {
+        foreach (array_chunk($notifs, 50) as $chunk) {
+            ap_bsky_notification_subjects_warm($ownerUserId, $chunk);
+        }
+        ap_notification_projection_invalidate_owner($ownerUserId);
+    }
+    sort($out['ids']);
     return $out;
 }
 

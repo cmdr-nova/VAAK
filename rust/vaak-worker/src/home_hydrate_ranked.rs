@@ -962,7 +962,7 @@ struct RssRow {
     spoiler_text: String,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct BskyRow {
     pub(crate) uri: String,
     pub(crate) author_did: String,
