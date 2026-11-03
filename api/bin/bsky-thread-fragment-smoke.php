@@ -96,7 +96,27 @@ foreach($guestContext as $key=>$value){if($value===null)unset($GLOBALS[$key]);el
 // Nested material does not inherit the explicit root word exemption.
 $nested=$focus;$nested['embed']=['$type'=>'app.bsky.embed.record#view','record'=>['text'=>'Nested restricted phrase','author'=>['did'=>'did:plc:fixture','handle'=>'alice.bsky.test']]];
 ap_db()->exec("INSERT INTO fixture_words VALUES(1,'restricted phrase')");
-thread_check(!admin_bsky_thread_focus_allowed(['post'=>$nested],1),'nested quote words deny explicit focus');ap_db()->exec('DELETE FROM fixture_words');
+thread_check(!admin_bsky_thread_focus_allowed(['post'=>$nested],1),'nested quote words deny explicit focus');
+thread_check(admin_bsky_thread_focus_allowed(['post'=>$nested],1,true),'quote words alone leave the thread reachable');
+// Opened post whose quote holds a muted word: closed with a notice, thread still loads.
+$muted=thread_post('mutedquote','Reply text stays');$muted['record']['reply']['parent']['uri']=$parent['uri'];
+$muted['embed']=['$type'=>'app.bsky.embed.record#view','record'=>['$type'=>'app.bsky.embed.record#viewRecord','uri'=>'at://did:plc:fixture/app.bsky.feed.post/q1','cid'=>'bafyq','author'=>$muted['author'],'value'=>['$type'=>'app.bsky.feed.post','text'=>'Nested restricted phrase here','createdAt'=>'2026-11-03T10:00:00Z'],'indexedAt'=>'2026-11-03T10:00:00Z']];
+$GLOBALS['thread_focus']=$muted;ap_bsky_post_upsert_from_feed_item(['post'=>$muted],1);
+$html=admin_bsky_thread_fragment($muted['uri'],'focus','mentions',[]);
+thread_check($html===admin_status_muted_words_html()&&!str_contains($html,'Reply text stays'),'muted quote: focus shows the muted-words notice');
+$mutedChild=thread_post('mutedchild','Clean reply below');$mutedChild['record']['reply']['parent']['uri']=$muted['uri'];
+$mutedBad=thread_post('mutedbad','Another restricted phrase reply');$mutedBad['record']['reply']['parent']['uri']=$muted['uri'];
+$GLOBALS['thread_reply']=['ok'=>true,'json'=>['thread'=>['$type'=>'app.bsky.feed.defs#threadViewPost','post'=>$muted,
+ 'parent'=>['$type'=>'app.bsky.feed.defs#threadViewPost','post'=>$parent],
+ 'replies'=>[['$type'=>'app.bsky.feed.defs#threadViewPost','post'=>$mutedChild],['$type'=>'app.bsky.feed.defs#threadViewPost','post'=>$mutedBad]]]]];
+$html=admin_bsky_thread_fragment($muted['uri'],'ancestors','mentions',[]);
+thread_check(is_string($html)&&str_contains($html,'Parent post'),'muted quote: ancestors still load');
+$html=admin_bsky_thread_fragment($muted['uri'],'replies','mentions',[]);
+thread_check(is_string($html)&&str_contains($html,'Clean reply below')&&!str_contains($html,'Another restricted phrase'),'muted quote: replies load, muted ones stay out');
+$GLOBALS['thread_reply']=['ok'=>true,'json'=>['thread'=>$tree]];$GLOBALS['thread_focus']=$focus;
+ap_db()->exec('DELETE FROM fixture_words');
+$html=admin_bsky_thread_fragment($muted['uri'],'focus','mentions',[]);
+thread_check(is_string($html)&&str_contains($html,'Reply text stays'),'without the mute the post opens');
 $nested['embed']['record']['author']['viewer']['blockedBy']=true;
 thread_check(!admin_bsky_thread_focus_allowed(['post'=>$nested],1),'nested blockedBy denies explicit focus');
 // An indexed withdrawn twin must not resurrect its bridged public copy.
