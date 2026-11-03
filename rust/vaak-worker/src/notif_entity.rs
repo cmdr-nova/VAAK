@@ -128,6 +128,8 @@ pub struct PageFacts {
     statuses_count: HashMap<String, i64>,
     /// Bluesky handle or DID, lowercased, to `vaak:{user id}` when the account is linked.
     identities: HashMap<String, String>,
+    /// Cached Bluesky posts (bsky_posts) a notification quotes, by at:// URI.
+    bsky_posts: HashMap<String, crate::home_hydrate_ranked::BskyRow>,
 }
 
 fn trim_slash(value: &str) -> String {
@@ -915,7 +917,45 @@ fn quote_entity(target: &str, authorized: bool, facts: &PageFacts, owner: &Owner
         let id = json_string(&status, "id");
         return json!({"state": "accepted", "quoted_status_id": id, "quoted_status": status});
     }
+    if let Some(mut status) = bsky_quoted_status(target, facts) {
+        if let Some(map) = status.as_object_mut() {
+            map.remove("quote");
+            map.remove("vaak_quote_preview");
+        }
+        let id = json_string(&status, "id");
+        return json!({"state": "accepted", "quoted_status_id": id, "quoted_status": status});
+    }
     json!({"state": "pending", "quoted_status": null, "quoted_status_id": null})
+}
+
+/// Quoted Bluesky post from the bsky_posts cache (a reply or mention that
+/// quotes someone's post, often the author's own). Handle permalinks match
+/// on rkey plus handle, never on rkey alone.
+fn bsky_quoted_status(target: &str, facts: &PageFacts) -> Option<Value> {
+    if !bsky_target(target) || facts.bsky_posts.is_empty() {
+        return None;
+    }
+    let row = bsky_row_for(target, facts)?;
+    Some(crate::home_hydrate_ranked::materialize_bsky(row))
+}
+
+fn bsky_row_for<'a>(target: &str, facts: &'a PageFacts) -> Option<&'a crate::home_hydrate_ranked::BskyRow> {
+    let target = trim_slash(target);
+    if target.starts_with("at://") {
+        return facts.bsky_posts.get(&target);
+    }
+    let re = regex::Regex::new(r"(?i)^https://bsky\.app/profile/([^/]+)/post/([^/?#]+)$").ok()?;
+    let caps = re.captures(&target)?;
+    let actor = rawurldecode(&caps[1]);
+    let rkey = caps[2].to_string();
+    if actor.starts_with("did:") {
+        return facts.bsky_posts.get(&format!("at://{actor}/app.bsky.feed.post/{rkey}"));
+    }
+    let suffix = format!("/app.bsky.feed.post/{rkey}");
+    facts
+        .bsky_posts
+        .values()
+        .find(|row| row.uri.ends_with(&suffix) && row.author_handle.eq_ignore_ascii_case(&actor))
 }
 
 fn event_status(object: &str, facts: &PageFacts, owner: &OwnerView) -> Option<Value> {
@@ -1388,6 +1428,7 @@ async fn load_facts(db: &Client, owner: &OwnerView, items: &[NotifInput]) -> Pag
     dedup(&mut actors);
     dedup(&mut bsky_urls);
     load_bsky(db, &bsky_urls, &mut facts).await;
+    load_bsky_quotes(db, items, &mut facts).await;
     for note in facts.bsky_note.values() {
         if note.starts_with("https://") {
             notes.push(trim_slash(note));
@@ -1667,6 +1708,50 @@ async fn load_bsky(db: &Client, urls: &[String], facts: &mut PageFacts) {
                 }
             }
         }
+    }
+}
+
+/// bsky_posts rows for Bluesky posts quoted in notification text, so the
+/// quote card shows the post instead of "not cached yet".
+async fn load_bsky_quotes(db: &Client, items: &[NotifInput], facts: &mut PageFacts) {
+    let mut ats = Vec::new();
+    let mut rkeys = Vec::new();
+    let re = match regex::Regex::new(r"(?i)^https://bsky\.app/profile/([^/]+)/post/([^/?#]+)$") {
+        Ok(re) => re,
+        Err(_) => return,
+    };
+    for item in items {
+        let Some(target) = quote_target_from_text(&item.content) else { continue };
+        if target.starts_with("at://") {
+            ats.push(target);
+        } else if let Some(caps) = re.captures(&target) {
+            let actor = rawurldecode(&caps[1]);
+            if actor.starts_with("did:") {
+                ats.push(format!("at://{actor}/app.bsky.feed.post/{}", &caps[2]));
+            } else {
+                rkeys.push(caps[2].to_string());
+            }
+        }
+    }
+    dedup(&mut rkeys);
+    if !rkeys.is_empty() {
+        for row in quiet(
+            db,
+            "SELECT bsky_uri FROM bsky_posts WHERE split_part(bsky_uri, '/app.bsky.feed.post/', 2) = ANY($1) LIMIT 200",
+            &[&rkeys],
+        )
+        .await
+        {
+            ats.push(row.get(0));
+        }
+    }
+    dedup(&mut ats);
+    if ats.is_empty() {
+        return;
+    }
+    match crate::home_hydrate_ranked::fetch_bsky_map(db, &ats).await {
+        Ok(map) => facts.bsky_posts.extend(map),
+        Err(err) => tracing::debug!(error = %err, "notif quote bsky_posts"),
     }
 }
 
@@ -2205,6 +2290,49 @@ mod tests {
         assert!(status["media_attachments"].as_array().unwrap().is_empty(), "quoted media was hoisted");
         assert_eq!(status["quote"]["quoted_status"]["media_attachments"][0]["url"], "https://pics.example/quoted.jpg");
         assert_eq!(status["quote"]["state"], "accepted");
+    }
+
+    #[test]
+    fn bluesky_reply_quoting_a_cached_post_paints_the_quote() {
+        let owner = owner_nova();
+        let mut facts = PageFacts::default();
+        let quoted_at = "at://did:plc:dame/app.bsky.feed.post/3own";
+        facts.bsky_posts.insert(quoted_at.into(), crate::home_hydrate_ranked::BskyRow {
+            uri: quoted_at.into(),
+            author_did: "did:plc:dame".into(),
+            author_handle: "dame.is".into(),
+            author_display: "dame".into(),
+            published_at: "2026-11-03T10:00:00Z".into(),
+            text: "my own earlier post".into(),
+            raw_json: r#"{"uri":"at://did:plc:dame/app.bsky.feed.post/3own","record":{"text":"my own earlier post"}}"#.into(),
+            ..Default::default()
+        });
+        let mut item = base_input("200", 9, "mention", "mention");
+        item.actor_id = "https://bsky.app/profile/dame.is".into();
+        item.object_id = "https://bsky.app/profile/dame.is/post/3reply".into();
+        item.activity_id = "at://did:plc:dame/app.bsky.feed.post/3reply".into();
+        item.is_bsky = true;
+        item.content = "for sure!\n\n↪ QT https://bsky.app/profile/did:plc:dame/post/3own".into();
+        let built = build_notifications(&[item.clone()], &facts, &owner);
+        let status = &built[0]["status"];
+        assert_eq!(status["quote"]["state"], "accepted");
+        assert!(status["quote"]["quoted_status"]["content"].as_str().unwrap().contains("my own earlier post"));
+        assert_eq!(status["quote"]["quoted_status"]["account"]["acct"], "dame.is");
+        let body = status["content"].as_str().unwrap();
+        assert!(body.contains("for sure!") && !body.contains("↪"), "QT line stays out of the body: {body}");
+
+        // Handle permalink: matched on rkey plus handle.
+        item.content = "for sure!\n\n↪ QT https://bsky.app/profile/dame.is/post/3own".into();
+        let built = build_notifications(&[item.clone()], &facts, &owner);
+        assert_eq!(built[0]["status"]["quote"]["state"], "accepted");
+        item.content = "for sure!\n\n↪ QT https://bsky.app/profile/someone.else/post/3own".into();
+        let built = build_notifications(&[item.clone()], &facts, &owner);
+        assert_eq!(built[0]["status"]["quote"]["state"], "pending", "same rkey, other handle must not borrow");
+
+        // Not cached: pending, with the target link kept for the painter.
+        let built = build_notifications(&[item], &PageFacts::default(), &owner);
+        assert_eq!(built[0]["status"]["quote"]["state"], "pending");
+        assert_eq!(built[0]["status"]["quote_url"], "https://bsky.app/profile/someone.else/post/3own");
     }
 
     #[test]
