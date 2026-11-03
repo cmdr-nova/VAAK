@@ -12,6 +12,13 @@ anything else bumps the patch number.
 Releases up to **0.9.83** used a two-digit deploy counter (0.9.05, 0.9.83)
 and have no notes here; their tags and GitHub Releases are unchanged.
 
+## [0.27.0](https://github.com/cmdr-nova/VAAK/releases/tag/v0.27.0) - 2026-11-03
+
+### ✨ Features
+* Keep trending posts fresh: 48h window, steeper age decay by @cmdr-nova in https://github.com/cmdr-nova/VAAK/pull/361
+
+**Full Changelog**: https://github.com/cmdr-nova/VAAK/compare/v0.26.0...v0.27.0
+
 ## [0.26.0](https://github.com/cmdr-nova/VAAK/releases/tag/v0.26.0) - 2026-11-03
 
 ### ✨ Features
