@@ -727,6 +727,12 @@ function ap_nostr_post_note(int $ownerUserId, string $noteId, ?PDO $db = null): 
         return ['ok' => false, 'error' => 'Only public posts go to Nostr.'];
     }
     $text = trim((string) $row['content_text']);
+    // Media-only, poll-only and quote-only posts store a "(media)"-style
+    // sentinel as their text; the Nostr note carries only the real body.
+    $bare = preg_replace('/^[\s\x{00A0}\x{2009}]+|[\s\x{00A0}\x{2009}]+$/u', '', $text) ?? $text;
+    if (in_array($bare, ['(media)', '(attachment)', '(poll)', '(quote)', '(boost)'], true)) {
+        $text = '';
+    }
     $tags = [];
     if (preg_match_all('/(?<![\w&#\/])#([\p{L}\p{N}_]{1,64})/u', $text, $m)) {
         foreach (array_unique(array_map(static fn (string $t): string => mb_strtolower($t), $m[1])) as $t) {
