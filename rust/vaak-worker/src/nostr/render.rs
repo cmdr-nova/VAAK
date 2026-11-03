@@ -285,6 +285,34 @@ pub fn quote_target(tags: &Value) -> Option<String> {
         .find(|id| super::event::is_hex64(id))
 }
 
+/// The relay the quote's `q` tag hints the quoted note lives on, if any.
+pub fn quote_hint(tags: &Value) -> String {
+    tags.as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_array)
+        .filter(|t| t.first().and_then(Value::as_str) == Some("q"))
+        .find_map(|t| t.get(2).and_then(Value::as_str))
+        .unwrap_or("")
+        .to_string()
+}
+
+/// The first `nostr:note1…` / `nostr:nevent1…` reference in a note's text.
+fn inline_quote_target(content: &str) -> Option<String> {
+    content.split(|c: char| c.is_whitespace()).find_map(|token| {
+        let entity = trim_url_tail(token).strip_prefix("nostr:")?;
+        let (hrp, hex) = bech32::decode_entity(entity)?;
+        matches!(hrp.as_str(), "note" | "nevent").then_some(hex)
+    })
+}
+
+/// The note a quote points at: its NIP-18 `q` tag, or, when it has none,
+/// the first note reference in its text. Clients wrote quotes that way
+/// before `q` tags existed, and several still do.
+pub fn quoted_note(content: &str, tags: &Value) -> Option<String> {
+    quote_target(tags).or_else(|| inline_quote_target(content))
+}
+
 /// Drop the `nostr:note1…` / `nostr:nevent1…` reference to `quoted` that a
 /// quote's text carries; the quoted card shows it instead.
 fn strip_quote_reference(content: &str, quoted: &str) -> String {
@@ -318,7 +346,7 @@ pub fn materialize(row: &NostrRow) -> Value {
     let status_id = format!("nostr:{}", row.id);
     let note = bech32::note(&row.id);
     let url = format!("{VIEWER}{note}");
-    let quoted = quote_target(&row.tags);
+    let quoted = quoted_note(&row.content, &row.tags);
     let text = match &quoted {
         Some(q) => strip_quote_reference(&row.content, q),
         None => row.content.clone(),
@@ -610,5 +638,24 @@ mod tests {
         let other = "cd".repeat(32);
         let st = materialize(&row(&format!("x nostr:{}", bech32::note(&other)), json!([["q", target]])));
         assert!(st["content"].as_str().unwrap().contains("njump.me/note1"), "other references stay: {}", st["content"]);
+    }
+
+    #[test]
+    fn a_bare_note_reference_is_a_quote_too() {
+        let target = "ef".repeat(32);
+        let st = materialize(&row(&format!("worth reading nostr:{}", bech32::note(&target)), json!([])));
+        assert_eq!(st["vaak_nostr_quote_id"], target);
+        assert_eq!(st["content"], "<p>worth reading</p>");
+        // An npub mention is not a quote.
+        let st = materialize(&row(&format!("hi nostr:{}", bech32::npub(&target)), json!([])));
+        assert!(st.get("vaak_nostr_quote_id").is_none(), "{st}");
+    }
+
+    #[test]
+    fn the_q_tag_relay_hint_is_read() {
+        let target = "ab".repeat(32);
+        assert_eq!(quote_hint(&json!([["q", target, "wss://nos.lol", "aa"]])), "wss://nos.lol");
+        assert_eq!(quote_hint(&json!([["q", "ab".repeat(32)]])), "");
+        assert_eq!(quote_hint(&json!([["e", "ab".repeat(32), "wss://nos.lol"]])), "");
     }
 }
