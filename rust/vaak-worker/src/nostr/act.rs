@@ -1033,34 +1033,14 @@ pub async fn publish(cfg: &Config, owner: i64, nonce: &str, signed: &Value) -> R
             super::share::unmirror_boost(&db, owner, &pending.target).await?;
         }
         "follow" | "unfollow" => {
-            let list = ev.follow_list();
-            let tx_sql = if pending.purpose == "follow" {
-                "INSERT INTO nostr_follows (owner_user_id, pubkey) VALUES ($1, $2) ON CONFLICT DO NOTHING"
-            } else {
-                "DELETE FROM nostr_follows WHERE owner_user_id = $1 AND pubkey = $2"
-            };
-            db.execute(tx_sql, &[&owner, &pending.target]).await?;
-            db.execute(
-                "UPDATE nostr_links SET follow_count = $2, follow_list_at = $3 WHERE owner_user_id = $1",
-                &[&owner, &(list.len() as i32), &ev.created_at],
-            )
-            .await?;
+            store_follow_list(&db, owner, &ev).await?;
         }
         "follow_pack" => {
             // Whoever the new list has that the replaced one didn't.
             let list = ev.follow_list();
             let before: HashSet<String> = pending.base.as_ref().map(|b| b.follow_list().into_iter().collect()).unwrap_or_default();
             let adds: Vec<String> = list.iter().filter(|pk| !before.contains(*pk)).cloned().collect();
-            db.execute(
-                "INSERT INTO nostr_follows (owner_user_id, pubkey) SELECT $1, unnest($2::text[]) ON CONFLICT DO NOTHING",
-                &[&owner, &adds],
-            )
-            .await?;
-            db.execute(
-                "UPDATE nostr_links SET follow_count = $2, follow_list_at = $3 WHERE owner_user_id = $1",
-                &[&owner, &(list.len() as i32), &ev.created_at],
-            )
-            .await?;
+            store_follow_list(&db, owner, &ev).await?;
             added = adds;
         }
         "mute" | "unmute" => {
@@ -1080,6 +1060,24 @@ pub async fn publish(cfg: &Config, owner: i64, nonce: &str, signed: &Value) -> R
         "zaps": pending.purpose == "lightning" && pending.zap.as_ref().is_some_and(|z| z.allows_nostr),
         "added": added,
     }))
+}
+
+/// After a follow edit, `nostr_follows` becomes exactly the kind 3 list the
+/// user just signed and published. That list started from the newest one on
+/// the relays, so follows made in another client since the last sync show up
+/// right away instead of after the next link refresh. One statement, so a
+/// reader never sees it half applied.
+async fn store_follow_list(db: &Client, owner: i64, ev: &Event) -> Result<()> {
+    let list = ev.follow_list();
+    db.execute(
+        "WITH gone AS (DELETE FROM nostr_follows WHERE owner_user_id = $1 AND pubkey <> ALL($2::text[])),
+              added AS (INSERT INTO nostr_follows (owner_user_id, pubkey) SELECT $1, unnest($2::text[]) ON CONFLICT DO NOTHING)
+         UPDATE nostr_links SET follow_count = $3, follow_list_at = $4 WHERE owner_user_id = $1",
+        &[&owner, &list, &(list.len() as i32), &ev.created_at],
+    )
+    .await
+    .context("nostr follow list store")?;
+    Ok(())
 }
 
 /// Viewer state on painted Nostr cards (boost wrappers included):

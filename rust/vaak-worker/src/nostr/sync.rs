@@ -11,7 +11,7 @@
 //!     linked key from the index relays and the key's own write relays. A
 //!     kind 3 replaces that user's `nostr_follows`, and a kind 10000 (mute
 //!     list) their Nostr mutes, only if newer than the one stored.
-//!     Rechecked hourly.
+//!     Rechecked every 10 minutes.
 //!  2. Followed keys, and authors of notes they reposted, without fresh
 //!     metadata (daily): kind 0 and kind 10002.
 //!  3. Notes: kind 1 and reposts (kind 6) from each followed key's write
@@ -41,7 +41,10 @@ use super::relay::{self, Query};
 use super::relay_book;
 use crate::config::Config;
 
-const LINK_REFRESH_SECS: i64 = 3600;
+/// Under the notification overlap (notif::OVERLAP_SECS, 15 min), so a
+/// mention from someone just followed in another client is still in the
+/// rescan window once their follow is known here.
+const LINK_REFRESH_SECS: i64 = 600;
 const META_REFRESH_SECS: i64 = 86_400;
 const NOTES_MAX_BACK_SECS: i64 = 48 * 3600;
 /// Overlap with the previous sync so a late relay write is not missed.
