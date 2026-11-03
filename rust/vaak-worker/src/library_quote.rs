@@ -82,7 +82,7 @@ fn clean_url(raw: &str) -> String {
     trim_glued_text(raw.trim().trim_end_matches(['.', ',', ')', ';', ']', '!', '?', '\'', '"'])).trim_end_matches('/').to_owned()
 }
 
-/// PHP `ap_quote_url_trim_glued_text`. Older notification rows were
+/// Same cut as PHP `ap_masto_quote_url_from_event_summary`. Older notification rows were
 /// flattened with no paragraph breaks, so a quote's "RE: <link>" ran into the
 /// reply ("…/notes/22a7c4d4*hoo"). Status ids are plain `[A-Za-z0-9_-]`, so
 /// anything else right after the id is not part of the URL.
