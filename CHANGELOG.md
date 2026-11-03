@@ -12,6 +12,14 @@ anything else bumps the patch number.
 Releases up to **0.9.83** used a two-digit deploy counter (0.9.05, 0.9.83)
 and have no notes here; their tags and GitHub Releases are unchanged.
 
+## [0.24.0](https://github.com/cmdr-nova/VAAK/releases/tag/v0.24.0) - 2026-11-03
+
+### ✨ Features
+* Nostr: keep the follow list in step with your real kind 3 by @cmdr-nova in https://github.com/cmdr-nova/VAAK/pull/354
+* Push notification ids resolve to the pushed DM, never a borrowed boost by @cmdr-nova in https://github.com/cmdr-nova/VAAK/pull/355
+
+**Full Changelog**: https://github.com/cmdr-nova/VAAK/compare/v0.23.0...v0.24.0
+
 ## [0.23.0](https://github.com/cmdr-nova/VAAK/releases/tag/v0.23.0) - 2026-11-03
 
 ### ✨ Features
