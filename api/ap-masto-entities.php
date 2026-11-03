@@ -13010,6 +13010,12 @@ const AP_MASTO_TRENDS_CACHE_TTL = 7200; // 2 hours
 
 /** Browser/Redis reuse window for an already filtered trending response. */
 const AP_TRENDS_RESPONSE_TTL = 600;
+/** Trending posts only consider posts (and engagement) from this many recent hours. */
+const AP_MASTO_TREND_STATUS_WINDOW_HOURS = 48;
+/** Age gravity for trending posts: score = (engagement + 1) / (age_h + 2)^gravity. */
+const AP_MASTO_TREND_STATUS_GRAVITY = 1.5;
+/** Bump when the trending-post selection changes so old cached lists are not served. */
+const AP_MASTO_TREND_STATUS_SOURCE_VERSION = 4;
 
 /**
  * @return array{path:string,ttl:int}
@@ -13343,7 +13349,7 @@ function ap_masto_trends_cache_read(string $kind, int $minItems = 1, bool $allow
                 return ap_trends_painted_remember($paintedKind, $ownerUserId, ['items' => ($kind==='tags'?ap_masto_trend_tags_recount($redisPayload['sources'],$ownerUserId):ap_masto_trend_links_recount($redisPayload['sources'],$ownerUserId)), 'age' => $age, 'stale' => $stale]);
             }
             if ($kind === 'statuses') {
-                if (($redisPayload['status_source_version'] ?? 0) !== 3) return null;
+                if (($redisPayload['status_source_version'] ?? 0) !== AP_MASTO_TREND_STATUS_SOURCE_VERSION) return null;
                 return ap_trends_painted_remember($paintedKind, $ownerUserId, ['items'=>ap_masto_trend_status_public_items(ap_masto_trend_status_world_items($redisPayload['items'])), 'age'=>$age, 'stale'=>$stale]);
             }
             return ap_trends_painted_remember($paintedKind, $ownerUserId, ['items' => $redisPayload['items'], 'age' => $age, 'stale' => $stale]);
@@ -13376,7 +13382,7 @@ function ap_masto_trends_cache_read(string $kind, int $minItems = 1, bool $allow
         return ap_trends_painted_remember($paintedKind, $ownerUserId, ['items' => ($kind==='tags'?ap_masto_trend_tags_recount($decoded['sources'],$ownerUserId):ap_masto_trend_links_recount($decoded['sources'],$ownerUserId)), 'age' => $age, 'stale' => $stale]);
     }
     if ($kind === 'statuses') {
-        if (($decoded['status_source_version'] ?? 0) !== 3) return null;
+        if (($decoded['status_source_version'] ?? 0) !== AP_MASTO_TREND_STATUS_SOURCE_VERSION) return null;
         return ap_trends_painted_remember($paintedKind, $ownerUserId, ['items'=>ap_masto_trend_status_public_items(ap_masto_trend_status_world_items($decoded['items'])), 'age'=>$age, 'stale'=>$stale]);
     }
     if (count($decoded['items']) < $minItems) {
@@ -13445,7 +13451,7 @@ function ap_masto_trends_cache_set(string $kind, array $items, ?array $sources =
     $info = ap_masto_trends_cache_info($kind);
     $redisKey = 'vaak:trends:' . (in_array($kind,['tags','links','statuses'],true) ? 'v3:' : 'v2:') . preg_replace('/[^a-z]/', '', strtolower($kind));
     $envelope = ['cached_at' => time(), 'items' => array_values($items)];
-    if ($kind === 'statuses') $envelope['status_source_version'] = 3;
+    if ($kind === 'statuses') $envelope['status_source_version'] = AP_MASTO_TREND_STATUS_SOURCE_VERSION;
     if (in_array($kind,['tags','links'],true)) {
         if ($sources === null) return;
         $envelope['source_policy_version'] = 3;
@@ -15297,9 +15303,20 @@ function ap_masto_trend_status_seen_uris(array $rows): array
 }
 
 /**
+ * Age-decayed trend score: (engagement + 1) / (age_h + 2)^gravity.
+ * Engagement counts are lifetime totals, so the gravity has to be steep
+ * enough that a day-old viral post yields to one taking off right now.
+ */
+function ap_masto_trend_status_score(int $engagement, float $ageHours): float
+{
+    return (max(0, $engagement) + 1) / ((max(0.0, $ageHours) + 2) ** AP_MASTO_TREND_STATUS_GRAVITY);
+}
+
+/**
  * Order trending posts from both networks by one popularity score:
- * likes + 2 × (boosts + replies + quotes), decayed by post age so a
- * week-old viral post doesn't own the list. Stable for equal scores.
+ * likes + 2 × (boosts + replies + quotes), decayed by post age. Posts older
+ * than AP_MASTO_TREND_STATUS_WINDOW_HOURS are dropped outright, so a viral
+ * post from days ago can't sit on the list. Stable for equal scores.
  *
  * @param list<array<string,mixed>> $items
  * @return list<array<string,mixed>>
@@ -15307,6 +15324,7 @@ function ap_masto_trend_status_seen_uris(array $rows): array
 function ap_masto_trend_statuses_rank_mixed(array $items, ?int $now = null): array
 {
     $now ??= time();
+    $maxAgeHours = (float) AP_MASTO_TREND_STATUS_WINDOW_HOURS;
     $scored = [];
     foreach (array_values($items) as $i => $st) {
         $eng = max(0, (int) ($st['favourites_count'] ?? 0))
@@ -15315,7 +15333,41 @@ function ap_masto_trend_statuses_rank_mixed(array $items, ?int $now = null): arr
                 + max(0, (int) ($st['quotes_count'] ?? 0)));
         $ts = strtotime((string) ($st['created_at'] ?? '')) ?: $now;
         $ageHours = max(0.0, ($now - $ts) / 3600.0);
-        $scored[] = [($eng + 1) / (($ageHours + 2) ** 0.8), $i, $st];
+        if ($ageHours > $maxAgeHours) {
+            continue;
+        }
+        $scored[] = [ap_masto_trend_status_score($eng, $ageHours), $i, $st];
+    }
+    usort($scored, static fn(array $a, array $b): int => [$b[0], $a[1]] <=> [$a[0], $b[1]]);
+    return array_column($scored, 2);
+}
+
+/**
+ * Bluesky candidate rows (lifetime counts from the bsky_posts cache) re-ordered
+ * by the same age-decayed score the final ranking uses, so the 20 Bluesky
+ * candidates are the ones rising now, not the biggest totals of the window.
+ *
+ * @param list<array<string,mixed>> $rows
+ * @return list<array<string,mixed>>
+ */
+function ap_masto_trend_bsky_rows_by_score(array $rows, ?int $now = null): array
+{
+    $now ??= time();
+    $scored = [];
+    foreach (array_values($rows) as $i => $row) {
+        if (!is_array($row)) {
+            continue;
+        }
+        $eng = max(0, (int) ($row['like_count'] ?? 0))
+            + 2 * (max(0, (int) ($row['repost_count'] ?? 0))
+                + max(0, (int) ($row['reply_count'] ?? 0))
+                + max(0, (int) ($row['quote_count'] ?? 0)));
+        $ts = strtotime((string) ($row['published_at'] ?? '')) ?: $now;
+        $ageHours = max(0.0, ($now - $ts) / 3600.0);
+        if ($ageHours > AP_MASTO_TREND_STATUS_WINDOW_HOURS) {
+            continue;
+        }
+        $scored[] = [ap_masto_trend_status_score($eng, $ageHours), $i, $row];
     }
     usort($scored, static fn(array $a, array $b): int => [$b[0], $a[1]] <=> [$a[0], $b[1]]);
     return array_column($scored, 2);
@@ -15329,8 +15381,10 @@ function ap_masto_trends_statuses(int $limit = 10): array
         return array_slice($cached, 0, $limit);
     }
 
-    $dayStart = (int) (floor(time() / 86400) * 86400);
-    $since = gmdate('c', $dayStart - (6 * 86400));
+    // Trending posts look at a short rolling window (tags keep their 7 days
+    // for sparklines). A day-bucketed 7-day window let posts linger ~a week.
+    $now = time();
+    $since = gmdate('c', $now - AP_MASTO_TREND_STATUS_WINDOW_HOURS * 3600);
     /** @var array<string,array{announces:int,likes:int,replies:int,accounts:array<string,bool>,last_ts:int}> $agg */
     $agg = [];
 
@@ -15482,12 +15536,13 @@ function ap_masto_trends_statuses(int $limit = 10): array
             'SELECT * FROM bsky_posts
              WHERE published_at >= ? AND raw_json IS NOT NULL AND raw_json <> \'\'
              ORDER BY (COALESCE(like_count, 0) + COALESCE(repost_count, 0) * 2 + COALESCE(reply_count, 0) * 2 + COALESCE(quote_count, 0) * 2) DESC,
-                      indexed_at DESC LIMIT 120'
+                      indexed_at DESC LIMIT 300'
         );
         $st->execute([$since]);
+        $bskyRows = ap_masto_trend_bsky_rows_by_score($st->fetchAll() ?: [], $now);
         $bskyAdded = 0;
         $bskyCap = 20;
-        foreach(array_chunk($st->fetchAll()?:[],32) as $batch) {
+        foreach(array_chunk($bskyRows,32) as $batch) {
             if($bskyAdded>=$bskyCap)break;
             $entries=[];foreach($batch as $row)$entries[]=['source'=>'bsky','row'=>$row];
             foreach(ap_masto_trend_status_candidate_batch($entries,ap_masto_trend_status_seen_uris($out)) as $status) {
