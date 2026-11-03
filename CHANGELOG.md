@@ -12,6 +12,15 @@ anything else bumps the patch number.
 Releases up to **0.9.83** used a two-digit deploy counter (0.9.05, 0.9.83)
 and have no notes here; their tags and GitHub Releases are unchanged.
 
+## [0.23.0](https://github.com/cmdr-nova/VAAK/releases/tag/v0.23.0) - 2026-11-03
+
+### ✨ Features
+* Paint VAAK boosts of Nostr notes with Nostr actions and real links by @cmdr-nova in https://github.com/cmdr-nova/VAAK/pull/351
+* Render Bluemoji custom emoji on Bluesky posts by @cmdr-nova in https://github.com/cmdr-nova/VAAK/pull/352
+* Inbox: Rust signs and fetches unknown sender keys itself by @cmdr-nova in https://github.com/cmdr-nova/VAAK/pull/353
+
+**Full Changelog**: https://github.com/cmdr-nova/VAAK/compare/v0.22.0...v0.23.0
+
 ## [0.22.0](https://github.com/cmdr-nova/VAAK/releases/tag/v0.22.0) - 2026-11-03
 
 ### ✨ Features
