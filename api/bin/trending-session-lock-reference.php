@@ -20,6 +20,6 @@ function ap_masto_trends_cache_read(string $kind,int $min,bool $stale):?array{
  return ['age'=>1,'stale'=>false,'items'=>[]];
 }
 function admin_trend_downrank_ref_set(int $id):array{return [];}
-reference_load(getenv('TREND_REFERENCE_SOURCE')?:dirname(__DIR__).'/ap-admin.php',['admin_trends_sidebar_html']);
+reference_load(getenv('TREND_REFERENCE_SOURCE')?:dirname(__DIR__).'/ap-admin.php',['admin_trend_statuses_with_nostr', 'admin_trends_sidebar_html']);
 $html=admin_trends_sidebar_html('home',true,$meta);$active=session_status()===PHP_SESSION_ACTIVE;
 if($active)session_write_close();echo json_encode(['html'=>$html,'active_after'=>$active]);

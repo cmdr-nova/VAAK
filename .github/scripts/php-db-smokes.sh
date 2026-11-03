@@ -199,5 +199,7 @@ done
 VAAK_INBOX_RUST_URL="$inbox_url" run "$runner" api/bin/inbox-rust-accept-smoke.php
 
 VAAK_SMOKE_DSN="$AP_DB_DSN" run "$runner" api/bin/banned-account-server-block-smoke.php
+# Last: it empties the Nostr tables of this disposable database.
+NOSTR_E2E_PG_DSN="$AP_DB_DSN" run "$runner" api/bin/nostr-trend-tags-smoke.php
 
-echo "db smokes: 15 passed"
+echo "db smokes: 16 passed"

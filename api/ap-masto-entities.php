@@ -14471,6 +14471,21 @@ function ap_masto_trend_tags_recount(array $sources, int $ownerUserId = 0): arra
         $ts = strtotime((string) ($row[$source === 'outbox' ? 'published' : ($source === 'bsky' ? 'published_at' : 'created_at')] ?? '')) ?: 0;
         $ingest($text,$ts,ap_search_canonical_actor($sourceActor));
     }
+    if ($ownerUserId > 0) {
+        // Nostr counts only in the trends of viewers with a linked npub, and
+        // only notes from the keys they follow there (stored for Home).
+        if (!function_exists('ap_nostr_trend_tag_notes')) {
+            @require_once __DIR__ . '/ap-nostr.php';
+        }
+        if (function_exists('ap_nostr_trend_tag_notes')) {
+            foreach (ap_nostr_trend_tag_notes($ownerUserId, $dayStart - 6 * 86400) as $note) {
+                if (ap_masto_trend_tag_words_hidden($policy['words'], $note['content'], $note['cw'])) continue;
+                $contributor = ['account' => ['uri' => 'nostr:' . $note['pubkey']], 'content' => $note['content'], 'spoiler_text' => $note['cw'], 'trend_actors' => []];
+                if (ap_masto_trend_status_is_downranked($contributor, $downrankRefs)) continue;
+                $ingest($note['content'], $note['created_at'], 'nostr:' . $note['pubkey']);
+            }
+        }
+    }
 
     $scored = [];
     foreach ($stats as $name => $s) {

@@ -931,6 +931,155 @@ function ap_nostr_favourites_fragment(int $ownerUserId, int $offset, int $limit)
     return ['html' => $html, 'has_more' => $hasMore];
 }
 
+/** Search > Nostr shows for viewers with a linked npub and "Show in Home" on. */
+function ap_nostr_search_visible(int $ownerUserId): bool
+{
+    if ($ownerUserId < 1 || getenv('VAAK_NOSTR') === '0') {
+        return false;
+    }
+    static $memo = [];
+    if (!array_key_exists($ownerUserId, $memo)) {
+        $link = ap_nostr_link_for_user($ownerUserId);
+        $memo[$ownerUserId] = is_array($link) && filter_var($link['show_in_home'] ?? true, FILTER_VALIDATE_BOOLEAN);
+    }
+    return $memo[$ownerUserId];
+}
+
+/**
+ * One page of Search > Nostr: stored notes from the viewer's Nostr follows
+ * that match $q, painted by the worker (nostr/search.rs). Cached for the
+ * request so the tab count and the section share one call.
+ *
+ * @return array{ok:bool,htmls:list<string>,has_more:bool}
+ */
+function ap_nostr_search_page(int $ownerUserId, string $q, int $offset, int $limit): array
+{
+    $none = ['ok' => true, 'htmls' => [], 'has_more' => false];
+    $q = trim($q);
+    if ($q === '' || mb_strlen($q) > 200 || !ap_nostr_search_visible($ownerUserId)) {
+        return $none;
+    }
+    $offset = max(0, min(400, $offset));
+    $limit = max(1, min(40, $limit));
+    static $memo = [];
+    $key = $ownerUserId . "\0" . $q . "\0" . $offset . "\0" . $limit;
+    if (isset($memo[$key])) {
+        return $memo[$key];
+    }
+    $res = ap_nostr_worker_call('/shadow/nostr-search', ['owner_id' => $ownerUserId, 'q' => $q, 'offset' => $offset, 'limit' => $limit], 3000);
+    $ok = !empty($res['body']['ok']) && is_array($res['body']['htmls'] ?? null);
+    $htmls = $ok ? array_values(array_filter($res['body']['htmls'], static fn ($h): bool => is_string($h) && $h !== '')) : [];
+    return $memo[$key] = ['ok' => $ok, 'htmls' => $htmls, 'has_more' => $ok && !empty($res['body']['has_more'])];
+}
+
+/**
+ * Trending posts, Nostr leg: recent notes from this viewer's Nostr follows
+ * with like/repost/reply counts, as statuses (nostr/counts.rs). Already
+ * filtered for the viewer (mutes, hides, blocks, lists, downranks, muted
+ * words). Empty without a linked npub or when the worker can't be reached.
+ *
+ * @return list<array<string,mixed>>
+ */
+function ap_nostr_trending_statuses(int $ownerUserId, int $limit = 10): array
+{
+    if (!ap_nostr_search_visible($ownerUserId)) {
+        return [];
+    }
+    $res = ap_nostr_worker_call('/shadow/nostr-trending', ['owner_id' => $ownerUserId, 'limit' => max(1, min(40, $limit))], 2000);
+    $statuses = $res['body']['statuses'] ?? null;
+    if (empty($res['body']['ok']) || !is_array($statuses)) {
+        return [];
+    }
+    return array_values(array_filter($statuses, static fn ($st): bool => is_array($st) && str_starts_with((string) ($st['id'] ?? ''), 'nostr:')));
+}
+
+/**
+ * Trending tags, Nostr leg: kind 1 notes from the last $sinceTs onward by
+ * the keys this viewer follows on Nostr (plus their own), for viewers with
+ * a linked npub and "Show in Home" on. Reads only notes nostr-sync already
+ * stores for Home, so it adds no relay traffic. Keys the viewer muted or
+ * hid, keys on their moderation lists, keys an admin blocked, and keys the
+ * viewer downranked by hand are left out. Notes whose text has no hashtag
+ * and no `t` tag are skipped in SQL.
+ *
+ * @return list<array{pubkey:string,content:string,created_at:int,cw:string}>
+ */
+function ap_nostr_trend_tag_notes(int $ownerUserId, int $sinceTs, int $limit = 3000, ?PDO $db = null): array
+{
+    if ($ownerUserId < 1 || getenv('VAAK_NOSTR') === '0') {
+        return [];
+    }
+    try {
+        $db ??= ap_db();
+        if (strtolower((string) $db->getAttribute(PDO::ATTR_DRIVER_NAME)) !== 'pgsql'
+            || !(bool) $db->query("SELECT to_regclass('public.nostr_links') IS NOT NULL AND to_regclass('public.nostr_events') IS NOT NULL")->fetchColumn()) {
+            return [];
+        }
+        $link = $db->prepare('SELECT show_in_home FROM nostr_links WHERE owner_user_id = ?');
+        $link->execute([$ownerUserId]);
+        $show = $link->fetchColumn();
+        if ($show === false || !filter_var($show, FILTER_VALIDATE_BOOLEAN)) {
+            return [];
+        }
+        $hidden = [];
+        if (ap_nostr_moderation_ready($db)) {
+            $st = $db->prepare('SELECT pubkey FROM nostr_mutes WHERE owner_user_id = ? AND (on_nostr OR hidden_vaak) UNION SELECT pubkey FROM nostr_blocks');
+            $st->execute([$ownerUserId]);
+            foreach ($st->fetchAll(PDO::FETCH_COLUMN) ?: [] as $pk) {
+                $hidden[strtolower((string) $pk)] = true;
+            }
+        }
+        if (function_exists('ap_lists_moderation_nostr_keys')) {
+            $hidden += ap_lists_moderation_nostr_keys($ownerUserId);
+        }
+        $st = $db->prepare("SELECT actor_id FROM ap_deprioritized_actors WHERE owner_user_id = ? AND actor_id LIKE 'nostr:%'");
+        $st->execute([$ownerUserId]);
+        foreach ($st->fetchAll(PDO::FETCH_COLUMN) ?: [] as $actor) {
+            $pk = ap_nostr_downranked_pubkey((string) $actor);
+            if ($pk !== '') {
+                $hidden[$pk] = true;
+            }
+        }
+        $st = $db->prepare(
+            "SELECT e.pubkey, e.content, e.created_at,
+                    COALESCE((SELECT t->>1 FROM jsonb_array_elements(e.tags) t WHERE t->>0 = 'content-warning' LIMIT 1), '') AS cw,
+                    COALESCE((SELECT string_agg('#' || (t->>1), ' ') FROM jsonb_array_elements(e.tags) t WHERE t->>0 = 't' AND COALESCE(t->>1, '') <> ''), '') AS ttags
+             FROM nostr_events e
+             WHERE e.kind = 1 AND e.created_at >= ?
+               AND e.pubkey IN (SELECT pubkey FROM nostr_follows WHERE owner_user_id = ? UNION SELECT pubkey FROM nostr_links WHERE owner_user_id = ?)
+               AND (e.content LIKE '%#%' OR e.tags @> '[[\"t\"]]'::jsonb)
+             ORDER BY e.created_at DESC
+             LIMIT ?"
+        );
+        $st->bindValue(1, $sinceTs, PDO::PARAM_INT);
+        $st->bindValue(2, $ownerUserId, PDO::PARAM_INT);
+        $st->bindValue(3, $ownerUserId, PDO::PARAM_INT);
+        $st->bindValue(4, max(1, min(5000, $limit)), PDO::PARAM_INT);
+        $st->execute();
+        $out = [];
+        foreach ($st->fetchAll() ?: [] as $row) {
+            $pk = strtolower((string) $row['pubkey']);
+            if (isset($hidden[$pk])) {
+                continue;
+            }
+            $content = (string) $row['content'];
+            // A `t` tag missing from the text still counts once (the recount
+            // dedupes a tag within one post).
+            $tags = (string) $row['ttags'];
+            $out[] = [
+                'pubkey' => $pk,
+                'content' => $tags === '' ? $content : $content . "\n" . $tags,
+                'created_at' => (int) $row['created_at'],
+                'cw' => (string) $row['cw'],
+            ];
+        }
+        return $out;
+    } catch (Throwable $e) {
+        error_log('[nostr] trend notes skipped: ' . $e->getMessage());
+        return [];
+    }
+}
+
 /** Same rules as the worker's normalize_relay_url (nostr/relay.rs): wss only, no ports but 443, no private names. */
 function ap_nostr_normalize_relay_url(string $raw): ?string
 {

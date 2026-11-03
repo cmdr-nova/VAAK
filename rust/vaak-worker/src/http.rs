@@ -194,6 +194,8 @@ pub async fn serve(cfg: Config, bind: SocketAddr) -> Result<()> {
         // One Nostr card's HTML, for PHP pages that fall back from Rust.
         .route("/shadow/nostr-card", post(shadow_nostr_card))
         .route("/shadow/nostr-likes", post(shadow_nostr_likes))
+        .route("/shadow/nostr-search", post(shadow_nostr_search))
+        .route("/shadow/nostr-trending", post(shadow_nostr_trending))
         .route("/shadow/nostr-relay-check", post(shadow_nostr_relay_check))
         .route_layer(axum::middleware::from_fn_with_state(shadow_token, crate::shadow_auth::require));
     let mut app = Router::new()
@@ -286,6 +288,8 @@ async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
             "/shadow/nostr-statuses (POST)",
             "/shadow/nostr-card (POST)",
             "/shadow/nostr-likes (POST)",
+            "/shadow/nostr-search (POST)",
+            "/shadow/nostr-trending (POST)",
             "/shadow/nostr-relay-check (POST)"
         ],
     }))
@@ -866,6 +870,56 @@ async fn shadow_nostr_likes(State(state): State<AppState>, Json(body): Json<Nost
         crate::nostr::act::stamp_viewer_flags(&db, body.owner_id, &mut statuses).await;
         let htmls: Vec<String> = statuses.iter().map(|st| crate::notif_embed::paint_lean_feed_card_opts(st, "favourites", "")).collect();
         Ok(serde_json::json!({"ok": true, "htmls": htmls, "has_more": more}))
+    }
+    .await;
+    nostr_reply(res)
+}
+
+#[derive(serde::Deserialize)]
+struct NostrSearchBody {
+    owner_id: i64,
+    q: String,
+    offset: i64,
+    limit: i64,
+}
+
+/// Search > Nostr: one painted page of stored notes from the owner's Nostr
+/// follows that match `q` (nostr::search). `enabled` is false when the
+/// owner has no linked npub, so PHP can hide the tab.
+async fn shadow_nostr_search(State(state): State<AppState>, Json(body): Json<NostrSearchBody>) -> axum::response::Response {
+    if body.owner_id < 1 || body.offset < 0 || body.offset > 400 || !(1..=40).contains(&body.limit) || body.q.len() > 300 {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"ok": false, "error": "Bad search"}))).into_response();
+    }
+    let res = async {
+        let db = crate::db::connect(&state.cfg.database_url).await?;
+        if !crate::nostr::search::enabled_for(&db, body.owner_id).await {
+            return Ok(serde_json::json!({"ok": true, "enabled": false, "htmls": [], "has_more": false}));
+        }
+        let (statuses, more) = crate::nostr::search::statuses(&db, body.owner_id, &body.q, body.offset, body.limit).await?;
+        let htmls: Vec<String> = statuses.iter().map(|st| crate::notif_embed::paint_lean_feed_card_opts(st, "search", "")).collect();
+        Ok(serde_json::json!({"ok": true, "enabled": true, "htmls": htmls, "has_more": more}))
+    }
+    .await;
+    nostr_reply(res)
+}
+
+#[derive(serde::Deserialize)]
+struct NostrTrendingBody {
+    owner_id: i64,
+    limit: i64,
+}
+
+/// Trending posts, Nostr leg: recent notes from the owner's Nostr follows
+/// with like/repost/reply counts (nostr::counts), as statuses for PHP to
+/// rank with fediverse and Bluesky posts. Empty without a linked npub.
+async fn shadow_nostr_trending(State(state): State<AppState>, Json(body): Json<NostrTrendingBody>) -> axum::response::Response {
+    if body.owner_id < 1 || !(1..=40).contains(&body.limit) {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"ok": false, "error": "Bad request"}))).into_response();
+    }
+    let res = async {
+        let db = crate::db::connect(&state.cfg.database_url).await?;
+        let statuses = crate::nostr::counts::trending(&db, body.owner_id, body.limit).await?;
+        Ok(serde_json::json!({"ok": true, "statuses": statuses}))
     }
     .await;
     nostr_reply(res)
