@@ -12,6 +12,16 @@ anything else bumps the patch number.
 Releases up to **0.9.83** used a two-digit deploy counter (0.9.05, 0.9.83)
 and have no notes here; their tags and GitHub Releases are unchanged.
 
+## [0.26.0](https://github.com/cmdr-nova/VAAK/releases/tag/v0.26.0) - 2026-11-03
+
+### ✨ Features
+* Bluesky: paint posts quoted inside reply and mention notifications by @cmdr-nova in https://github.com/cmdr-nova/VAAK/pull/357
+* Nostr: show quoted notes as cards instead of a "Quoted note" link by @cmdr-nova in https://github.com/cmdr-nova/VAAK/pull/358
+* Bluesky status: say a muted quote closed the post, still load its thread by @cmdr-nova in https://github.com/cmdr-nova/VAAK/pull/359
+* Nostr crosspost: drop "(media)" placeholder from media-only notes by @cmdr-nova in https://github.com/cmdr-nova/VAAK/pull/360
+
+**Full Changelog**: https://github.com/cmdr-nova/VAAK/compare/v0.25.0...v0.26.0
+
 ## [0.25.0](https://github.com/cmdr-nova/VAAK/releases/tag/v0.25.0) - 2026-11-03
 
 ### ✨ Features
