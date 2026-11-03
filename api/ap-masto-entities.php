@@ -1424,6 +1424,26 @@ function ap_object_target_mark_warm_miss(string $objectUrl, string $reason = 'mi
  * Extract a quote-target URL from an inbound event summary (↪ QT / RE: forms).
  * Prefers ActivityPub/Bluesky status URLs over ordinary links inside quoted text.
  */
+/**
+ * Cut text that was flattened onto the end of a status permalink.
+ *
+ * Older notification rows were stored with strip_tags() and no paragraph
+ * breaks, so a Mastodon quote's "RE: <link>" ran straight into the reply:
+ * "https://host/users/me/notes/22a7c4d4*hoo". Status ids are plain
+ * [A-Za-z0-9_-], so anything else right after the id is not part of the URL.
+ */
+function ap_quote_url_trim_glued_text(string $url): string
+{
+    if (preg_match(
+        '~^(https://[^/\s]+/(?:(?:ap/)?users/[^/\s]+/(?:statuses|posts|notes)|notes|objects|@[^/\s]+)/[A-Za-z0-9_-]+)[^A-Za-z0-9_\-/?#]~',
+        $url,
+        $m
+    )) {
+        return $m[1];
+    }
+    return $url;
+}
+
 function ap_masto_quote_url_from_event_summary(string $summary): ?string
 {
     $summary = trim($summary);
@@ -1433,7 +1453,7 @@ function ap_masto_quote_url_from_event_summary(string $summary): ?string
     /** @var list<array{url:string,pri:int}> $candidates */
     $candidates = [];
     $push = static function (string $url, int $pri) use (&$candidates): void {
-        $url = rtrim(trim($url), '.,);]');
+        $url = ap_quote_url_trim_glued_text(rtrim(trim($url), '.,);]'));
         $url = rtrim($url, '/');
         if ($url === '' || !str_starts_with($url, 'https://')) {
             return;
