@@ -7930,7 +7930,21 @@ function ap_publish_notify_local_reply_participants(array $create, string $actor
             ]);
             if (function_exists('ap_webpush_notify_event')) {
                 try {
-                    ap_webpush_notify_event('mention', $author, null, is_string($content) ? $content : null, $uid);
+                    $replyNid = null;
+                    if (function_exists('ap_masto_notification_id_for_mention')) {
+                        $rst = ap_db()->prepare(
+                            'SELECT id, created_at FROM mentions WHERE owner_user_id = ? AND object_id = ? ORDER BY id DESC LIMIT 1'
+                        );
+                        $rst->execute([$uid, $noteId]);
+                        $rrow = $rst->fetch();
+                        if (is_array($rrow)) {
+                            $replyNid = ap_masto_notification_id_for_mention(
+                                (int) $rrow['id'],
+                                (string) ($rrow['created_at'] ?? '')
+                            );
+                        }
+                    }
+                    ap_webpush_notify_event('mention', $author, $replyNid, is_string($content) ? $content : null, $uid);
                 } catch (Throwable $e) {
                     error_log('[ap-inbox] local reply webpush skipped: ' . $e->getMessage());
                 }

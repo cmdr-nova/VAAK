@@ -6220,6 +6220,52 @@ function ap_masto_notification_id_for_poll(int $pollLocalId, ?string $createdAt 
 }
 
 /**
+ * Push-only notification id for an inbound DM (type 8). Ice Cubes fetches
+ * GET /api/v1/notifications/{notification_id} for every push and paints the
+ * sender and type from that answer, so a DM push must carry an id that
+ * resolves to the DM itself, never a bare direct_messages row id (which
+ * parses as a legacy mention id and lands on someone else's like or boost).
+ */
+function ap_masto_notification_id_for_dm(int $dmId, ?string $createdAt = null): string
+{
+    if ($createdAt === null || $createdAt === '') {
+        $createdAt = gmdate('c');
+    }
+    return ap_masto_snowflake_id($createdAt, $dmId, 8);
+}
+
+/**
+ * Id for a push that has no stored notification behind it (type 9). It parses
+ * to nothing, so GET /api/v1/notifications/{id} answers 404 and clients show
+ * the push title and body as sent instead of borrowing an unrelated row.
+ */
+function ap_masto_notification_id_unresolvable(?string $createdAt = null): string
+{
+    if ($createdAt === null || $createdAt === '') {
+        $createdAt = gmdate('c');
+    }
+    return ap_masto_snowflake_id($createdAt, random_int(0, 99999999), 9);
+}
+
+/**
+ * A v2 notification id carries its row's created_at second. Reject ids whose
+ * second does not match the row, so a stray id can never borrow another row
+ * that merely shares the low digits.
+ */
+function ap_masto_notification_id_matches_row(array $parsed, array $row, string $col = 'created_at'): bool
+{
+    if ((int) ($parsed['ver'] ?? 0) !== 2) {
+        return true;
+    }
+    $sec = (int) ($parsed['sec'] ?? 0);
+    $t = strtotime((string) ($row[$col] ?? ''));
+    if ($sec < 1 || $t === false) {
+        return false;
+    }
+    return abs($t - $sec) <= 1;
+}
+
+/**
  * @return array{kind:string,db_id:int,ver?:int}|null
  */
 function ap_masto_parse_notification_id(int $id): ?array
@@ -6237,14 +6283,16 @@ function ap_masto_parse_notification_id(int $id): ?array
     if ($id < 3000000) {
         return ['kind' => 'poll', 'db_id' => $id - 2000000, 'ver' => 0];
     }
-    // v2 notif snowflake (types 5–7)
+    // v2 notif snowflake (types 5–8; 9 = push with no stored row)
     if ($id >= 1000000000000000000) {
         $dbId = $id % 100000000;
         $typeNum = (int) floor(($id % 1000000000) / 100000000);
+        $sec = intdiv($id, 1000000000);
         return match ($typeNum) {
-            5 => ['kind' => 'mention', 'db_id' => $dbId, 'ver' => 2],
-            6 => ['kind' => 'follow', 'db_id' => $dbId, 'ver' => 2],
-            7 => ['kind' => 'poll', 'db_id' => $dbId, 'ver' => 2],
+            5 => ['kind' => 'mention', 'db_id' => $dbId, 'ver' => 2, 'sec' => $sec],
+            6 => ['kind' => 'follow', 'db_id' => $dbId, 'ver' => 2, 'sec' => $sec],
+            7 => ['kind' => 'poll', 'db_id' => $dbId, 'ver' => 2, 'sec' => $sec],
+            8 => ['kind' => 'dm', 'db_id' => $dbId, 'ver' => 2, 'sec' => $sec],
             default => null,
         };
     }
@@ -9923,6 +9971,51 @@ function ap_masto_notification_dismiss(string $id): bool
     }
 }
 
+/**
+ * Inbound DM behind a type-8 push id, as a Mastodon `mention` notification
+ * (what Mastodon itself sends for a direct message). Owner-scoped, inbound
+ * only, and the id's second must match the DM's created_at.
+ *
+ * @param array{kind:string,db_id:int,ver?:int,sec?:int} $parsed
+ */
+function ap_masto_notification_for_dm_id(array $parsed): ?array
+{
+    $dmId = (int) ($parsed['db_id'] ?? 0);
+    $ownerUserId = ap_db_default_owner_user_id();
+    if ($dmId < 1 || $ownerUserId < 1) {
+        return null;
+    }
+    try {
+        $st = ap_db()->prepare(
+            "SELECT * FROM direct_messages
+             WHERE id = ? AND owner_user_id = ? AND direction = 'in' AND deleted_at IS NULL"
+        );
+        $st->execute([$dmId, $ownerUserId]);
+        $row = $st->fetch();
+    } catch (Throwable $e) {
+        return null;
+    }
+    if (!is_array($row) || !ap_masto_notification_id_matches_row($parsed, $row)) {
+        return null;
+    }
+    $peer = (string) ($row['peer_actor_id'] ?? '');
+    if ($peer === '' || (function_exists('ap_row_is_hidden')
+        ? ap_row_is_hidden($peer, null, $ownerUserId)
+        : ap_row_is_blocked($peer))) {
+        return null;
+    }
+    $createdAt = isset($row['created_at']) ? (string) $row['created_at'] : null;
+    $id = ap_masto_notification_id_for_dm($dmId, $createdAt);
+    return [
+        'id' => $id,
+        'type' => 'mention',
+        'group_key' => 'ungrouped-' . $id,
+        'created_at' => ap_masto_format_time($createdAt),
+        'account' => ap_masto_remote_account($peer),
+        'status' => ap_masto_status_from_dm($row),
+    ];
+}
+
 function ap_masto_notification_by_id(string $id): ?array
 {
     $parsed = ap_masto_parse_notification_id((int) $id);
@@ -9931,6 +10024,9 @@ function ap_masto_notification_by_id(string $id): ?array
     }
     $kind = $parsed['kind'];
     $dbId = $parsed['db_id'];
+    if ($kind === 'dm') {
+        return ap_masto_notification_for_dm_id($parsed);
+    }
     if ($kind === 'poll') {
         try {
             $st = ap_db()->prepare('SELECT * FROM masto_polls WHERE local_id = ?');
@@ -9951,7 +10047,7 @@ function ap_masto_notification_by_id(string $id): ?array
         );
         $st->execute([$dbId]);
         $row = $st->fetch();
-        if (!is_array($row)) {
+        if (!is_array($row) || !ap_masto_notification_id_matches_row($parsed, $row)) {
             return null;
         }
         return ap_masto_notification_entity(['kind' => 'follow', 'row' => $row]);
@@ -9962,7 +10058,7 @@ function ap_masto_notification_by_id(string $id): ?array
     );
     $st->execute([$dbId, $ownerUserId]);
     $row = $st->fetch();
-    if (!is_array($row)) {
+    if (!is_array($row) || !ap_masto_notification_id_matches_row($parsed, $row)) {
         return null;
     }
     $ent = ap_masto_notification_entity(['kind' => 'mention', 'row' => $row]);

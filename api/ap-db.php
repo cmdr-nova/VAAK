@@ -17968,10 +17968,12 @@ function ap_dm_store(array $row): array
             $attachmentsJson,
         ]);
         $st = ap_db()->prepare(
-            'SELECT id FROM direct_messages WHERE owner_user_id = ? AND object_id = ?'
+            'SELECT id, created_at FROM direct_messages WHERE owner_user_id = ? AND object_id = ?'
         );
         $st->execute([$ownerUserId, $objectId]);
-        $id = (int) ($st->fetch()['id'] ?? 0);
+        $storedRow = $st->fetch();
+        $id = (int) ($storedRow['id'] ?? 0);
+        $storedCreated = (string) ($storedRow['created_at'] ?? $created);
         // Inbound DMs: push to the owner's browsers/apps (best-effort).
         if ($id > 0 && $direction === 'in') {
             try {
@@ -17981,9 +17983,19 @@ function ap_dm_store(array $row): array
                         require_once $wp;
                     }
                 }
-                if (function_exists('ap_webpush_notify_event')) {
+                if (!function_exists('ap_masto_notification_id_for_dm')) {
+                    $ent = __DIR__ . '/ap-masto-entities.php';
+                    if (is_file($ent)) {
+                        require_once __DIR__ . '/ap-r2.php';
+                        require_once $ent;
+                    }
+                }
+                if (function_exists('ap_webpush_notify_event') && function_exists('ap_masto_notification_id_for_dm')) {
                     $snippet = is_string($content) ? trim(strip_tags($content)) : '';
-                    ap_webpush_notify_event('dm', $peer, (string) $id, $snippet !== '' ? $snippet : null, $ownerUserId);
+                    // Never the bare row id: clients read it as a legacy
+                    // mention id and show an unrelated like or boost.
+                    $nid = ap_masto_notification_id_for_dm($id, $storedCreated !== '' ? $storedCreated : $created);
+                    ap_webpush_notify_event('dm', $peer, $nid, $snippet !== '' ? $snippet : null, $ownerUserId);
                 }
             } catch (Throwable $e) {
                 error_log('[ap-dm] webpush: ' . $e->getMessage());
