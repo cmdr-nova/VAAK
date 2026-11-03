@@ -17091,6 +17091,59 @@ function admin_bsky_youtube_card_html(array $st, string $linkedHtml = ''): strin
     return '';
 }
 
+/**
+ * Swap Bluemoji (Bluesky custom emoji facets) for custom-emoji <img>s, from
+ * the DID-keyed rows in remote_custom_emojis. Cache-only; misses are warmed
+ * after the response. Rust parity: status_emoji::attach_bluemoji.
+ */
+function admin_apply_bluemoji_html(string $html, array $st): string
+{
+    if ($html === '' || !str_contains($html, ':') || !function_exists('ap_bsky_bluemoji_claims')) {
+        return $html;
+    }
+    $bundle = admin_bsky_link_facet_bundle($st);
+    $claims = ap_bsky_bluemoji_claims($bundle['text'], $bundle['facets']);
+    if ($claims === []) {
+        return $html;
+    }
+    try {
+        $map = ap_bsky_bluemoji_map($claims);
+        if (count($map) < count($claims) && getenv('VAAK_BLUEMOJI') !== '0') {
+            ap_bsky_bluemoji_ensure_deferred($claims);
+        }
+    } catch (Throwable $e) {
+        return $html;
+    }
+    if ($map === []) {
+        return $html;
+    }
+    // Text nodes only (never inside tags), same boundaries as custom emoji.
+    $parts = preg_split('/(<[^>]*>)/', $html, -1, PREG_SPLIT_DELIM_CAPTURE);
+    if (!is_array($parts)) {
+        return $html;
+    }
+    foreach ($parts as $i => $part) {
+        if ($part === '' || $part[0] === '<' || !str_contains($part, ':')) {
+            continue;
+        }
+        $parts[$i] = (string) preg_replace_callback(
+            '/(?<![\w\/-]):([A-Za-z0-9_-]{1,80}):(?![\w-])/',
+            static function (array $m) use ($map): string {
+                $url = $map[$m[1]] ?? null;
+                if (!is_string($url) || !str_starts_with($url, 'https://')) {
+                    return $m[0];
+                }
+                $src = htmlspecialchars($url, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+                $alt = htmlspecialchars($m[0], ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+                return '<img class="custom-emoji" src="' . $src . '" alt="' . $alt . '" title="' . $alt
+                    . '" loading="lazy" decoding="async" referrerpolicy="no-referrer" width="20" height="20">';
+            },
+            $part
+        );
+    }
+    return implode('', $parts);
+}
+
 function admin_apply_bsky_link_facets(string $html, array $st): string
 {
     if ($html === '') {
@@ -21556,6 +21609,7 @@ function admin_render_masto_status_card(
     if ($plain !== '') {
         $linkedBody = admin_linkify_body_html($plain, $returnView, $stMentions, $actorRef !== '' ? $actorRef : null);
         $linkedBody = admin_apply_bsky_link_facets($linkedBody, $st);
+        $linkedBody = admin_apply_bluemoji_html($linkedBody, $st);
         $bodyInner .= '<div class="body feed-body" style="white-space:pre-wrap">'
             . $linkedBody . '</div>';
     }
@@ -24097,6 +24151,7 @@ function admin_render_bsky_feed_item(array $item, string $feedKey = 'following',
     // Home: linkify as home so mentions/hashtags stay in-app like federated cards.
     $bodyHtml = $textForLink !== '' ? admin_linkify_body_html($textForLink, $linkView) : '';
     $bodyHtml = admin_apply_bsky_link_facets($bodyHtml, ['bsky_post' => $post, 'uri' => $uri]);
+    $bodyHtml = admin_apply_bluemoji_html($bodyHtml, ['bsky_post' => $post, 'uri' => $uri]);
     if ($linkCardHtml === '' && $imgs === []) {
         $ytFromFacet = admin_bsky_youtube_card_html(['bsky_post' => $post, 'uri' => $uri], $bodyHtml);
         if ($ytFromFacet !== '') {

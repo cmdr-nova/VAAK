@@ -1823,6 +1823,313 @@ function ap_bsky_get_record_direct(string $atUri, int $timeoutSec = 6): array
     ];
 }
 
+/*
+ * Bluemoji: custom emoji on Bluesky posts (blue.moji.richtext.facet).
+ * Spec: https://github.com/aendra-rininsland/bluemoji (RENDERING.md).
+ *
+ * Rows live in remote_custom_emojis with host = the emoji owner's DID, so the
+ * Rust and PHP painters share one cache. Paint is cache-only; misses are
+ * warmed after the response (PHP) or by api/bin/bsky-bluemoji-warm.php
+ * (spawned by the Rust worker). remote_emoji_host_meta (host = DID) holds
+ * the per-DID cooldown. Mirrors rust/vaak-worker/src/bluemoji.rs.
+ */
+
+/** CIDv1 base32, as ATproto blobs use. */
+function ap_bsky_bluemoji_valid_cid(string $cid): bool
+{
+    return (bool) preg_match('/^b[a-z2-7]{7,127}$/', $cid);
+}
+
+/** CID from a facet format (string) or a record blob ref ({ref:{$link}}). */
+function ap_bsky_bluemoji_cid_of(mixed $v): ?string
+{
+    $raw = null;
+    if (is_string($v)) {
+        $raw = $v;
+    } elseif (is_array($v)) {
+        $ref = $v['ref'] ?? null;
+        if (is_array($ref) && is_string($ref['$link'] ?? null)) {
+            $raw = $ref['$link'];
+        } elseif (is_string($ref)) {
+            $raw = $ref;
+        } elseif (is_string($v['$link'] ?? null)) {
+            $raw = $v['$link'];
+        }
+    }
+    $raw = is_string($raw) ? trim($raw) : '';
+    return ap_bsky_bluemoji_valid_cid($raw) ? $raw : null;
+}
+
+/**
+ * [url cid, static cid] from a formats object. Animated first for url, still
+ * first for static. Lottie and v0 booleans are never an <img>.
+ *
+ * @return array{0:string,1:string}|null
+ */
+function ap_bsky_bluemoji_pick_formats(mixed $formats): ?array
+{
+    if (!is_array($formats)) {
+        return null;
+    }
+    $get = static fn (string $k): ?string => ap_bsky_bluemoji_cid_of($formats[$k] ?? null);
+    $animated = $get('gif_128') ?? $get('apng_128');
+    $still = $get('png_128') ?? $get('webp_128');
+    $url = $animated ?? $get('webp_128') ?? $still;
+    if ($url === null) {
+        return null;
+    }
+    return [$url, $still ?? $url];
+}
+
+/** adultOnly or any self-label: stays text (inline emoji have no CW gate). */
+function ap_bsky_bluemoji_is_adult(array $v): bool
+{
+    if (($v['adultOnly'] ?? false) === true) {
+        return true;
+    }
+    $labels = is_array($v['labels'] ?? null) ? $v['labels'] : [];
+    return is_array($labels['values'] ?? null) && $labels['values'] !== [];
+}
+
+function ap_bsky_bluemoji_code(string $raw): ?string
+{
+    $code = trim(trim(trim($raw), ':'));
+    return preg_match('/^[A-Za-z0-9_-]{1,80}$/', $code) ? $code : null;
+}
+
+/**
+ * Bluemoji a post claims, first per shortcode. The shortcode is the facet's
+ * visible `:code:` text when it is one (painters swap what they see), else
+ * the feature's name.
+ *
+ * @param list<mixed> $facets
+ * @return list<array{did:string,code:string,cid:string,static_cid:string}>
+ */
+function ap_bsky_bluemoji_claims(string $text, array $facets): array
+{
+    $out = [];
+    $len = strlen($text);
+    foreach ($facets as $facet) {
+        if (!is_array($facet) || !is_array($facet['features'] ?? null)) {
+            continue;
+        }
+        foreach ($facet['features'] as $f) {
+            if (!is_array($f)) {
+                continue;
+            }
+            $type = (string) ($f['$type'] ?? '');
+            if ($type !== 'blue.moji.richtext.facet' && $type !== 'blue.moji.richtext.facet#main') {
+                continue;
+            }
+            $did = trim((string) ($f['did'] ?? ''));
+            if (ap_bsky_bluemoji_is_adult($f) || !ap_bsky_did_is_resolvable($did)) {
+                continue;
+            }
+            $pick = ap_bsky_bluemoji_pick_formats($f['formats'] ?? null);
+            if ($pick === null) {
+                continue;
+            }
+            $code = null;
+            $s = $facet['index']['byteStart'] ?? null;
+            $e = $facet['index']['byteEnd'] ?? null;
+            if (is_int($s) && is_int($e) && $s >= 0 && $s < $e && $e <= $len) {
+                $slice = substr($text, $s, $e - $s);
+                if (strlen($slice) > 2 && $slice[0] === ':' && $slice[strlen($slice) - 1] === ':') {
+                    $code = ap_bsky_bluemoji_code($slice);
+                }
+            }
+            $code ??= ap_bsky_bluemoji_code((string) ($f['name'] ?? ''));
+            if ($code === null || isset($out[$code])) {
+                continue;
+            }
+            $out[$code] = ['did' => $did, 'code' => $code, 'cid' => $pick[0], 'static_cid' => $pick[1]];
+        }
+    }
+    return array_values($out);
+}
+
+function ap_bsky_bluemoji_blob_url(string $pds, string $did, string $cid): string
+{
+    return rtrim($pds, '/') . '/xrpc/com.atproto.sync.getBlob?did=' . rawurlencode($did) . '&cid=' . rawurlencode($cid);
+}
+
+/**
+ * shortcode => url for cached Bluemoji claims. Cache-only.
+ *
+ * @param list<array{did:string,code:string}> $claims
+ * @return array<string,string>
+ */
+function ap_bsky_bluemoji_map(array $claims): array
+{
+    $map = [];
+    foreach ($claims as $c) {
+        if (!function_exists('ap_remote_emoji_map_for_host')) {
+            break;
+        }
+        $url = ap_remote_emoji_map_for_host($c['did'])[$c['code']] ?? null;
+        if (is_string($url)) {
+            $map[$c['code']] = $url;
+        }
+    }
+    return $map;
+}
+
+/**
+ * Fetch and cache Bluemoji for the claimed DIDs: one DID document lookup
+ * (Redis-cached) and up to 3 pages of the owner's blue.moji.collection.item
+ * records per DID. Verified records supply formats and adultOnly; a claim
+ * with no record falls back to the facet's own CID (the spec allows that
+ * best-effort render). At most 5 DIDs per call, one fetch per DID per hour
+ * unless $force.
+ *
+ * @param list<array{did:string,code:string,cid:string,static_cid:string}> $claims
+ * @return array{dids:int,fetched:int,stored:int,skipped:int}
+ */
+function ap_bsky_bluemoji_warm(array $claims, bool $force = false): array
+{
+    $stats = ['dids' => 0, 'fetched' => 0, 'stored' => 0, 'skipped' => 0];
+    $byDid = [];
+    foreach ($claims as $c) {
+        if (!is_array($c)) {
+            continue;
+        }
+        $did = trim((string) ($c['did'] ?? ''));
+        $code = ap_bsky_bluemoji_code((string) ($c['code'] ?? ''));
+        $cid = trim((string) ($c['cid'] ?? ''));
+        $static = trim((string) ($c['static_cid'] ?? ''));
+        if (!ap_bsky_did_is_resolvable($did) || $code === null || !ap_bsky_bluemoji_valid_cid($cid)) {
+            continue;
+        }
+        if (!ap_bsky_bluemoji_valid_cid($static)) {
+            $static = $cid;
+        }
+        if (!isset($byDid[$did]) && count($byDid) >= 5) {
+            continue;
+        }
+        $byDid[$did][$code] = ['cid' => $cid, 'static_cid' => $static];
+    }
+    $db = ap_db();
+    foreach ($byDid as $did => $wanted) {
+        $stats['dids']++;
+        if (!$force) {
+            $meta = $db->prepare('SELECT fetched_at FROM remote_emoji_host_meta WHERE host = ?');
+            $meta->execute([$did]);
+            $at = $meta->fetchColumn();
+            $age = is_string($at) && $at !== '' ? time() - (strtotime($at) ?: 0) : PHP_INT_MAX;
+            if ($age >= 0 && $age < 3600) {
+                $stats['skipped']++;
+                continue;
+            }
+        }
+        // Mark first: a slow or dead PDS must not be retried by every page.
+        $db->prepare(
+            'INSERT INTO remote_emoji_host_meta (host, fetched_at, source) VALUES (?, ?, ?)
+             ON CONFLICT(host) DO UPDATE SET fetched_at = excluded.fetched_at, source = excluded.source'
+        )->execute([$did, ap_db_now(), 'bluemoji']);
+        $pds = ap_bsky_did_pds_endpoint($did);
+        if ($pds === null) {
+            continue;
+        }
+        $stats['fetched']++;
+        // lowercase name => [url, static] | false (adult / labelled)
+        $verified = [];
+        $cursor = null;
+        for ($page = 0; $page < 3; $page++) {
+            $q = ['repo' => $did, 'collection' => 'blue.moji.collection.item', 'limit' => 100];
+            if ($cursor !== null) {
+                $q['cursor'] = $cursor;
+            }
+            $got = ap_bsky_xrpc($pds, 'com.atproto.repo.listRecords', 'GET', $q, null, null, 6);
+            if (empty($got['ok']) || !is_array($got['json']['records'] ?? null)) {
+                break;
+            }
+            foreach ($got['json']['records'] as $rec) {
+                $v = is_array($rec['value'] ?? null) ? $rec['value'] : [];
+                $name = ap_bsky_bluemoji_code((string) ($v['name'] ?? ''));
+                if ($name === null) {
+                    continue;
+                }
+                $key = strtolower($name);
+                if (ap_bsky_bluemoji_is_adult($v)) {
+                    $verified[$key] = false;
+                    continue;
+                }
+                $pick = ap_bsky_bluemoji_pick_formats($v['formats'] ?? null);
+                if ($pick !== null && !isset($verified[$key])) {
+                    $verified[$key] = [
+                        ap_bsky_bluemoji_blob_url($pds, $did, $pick[0]),
+                        ap_bsky_bluemoji_blob_url($pds, $did, $pick[1]),
+                    ];
+                }
+            }
+            $next = $got['json']['cursor'] ?? null;
+            if (!is_string($next) || $next === '' || count($got['json']['records']) < 100) {
+                break;
+            }
+            $cursor = $next;
+        }
+        $items = [];
+        foreach ($wanted as $code => $claim) {
+            $hit = $verified[strtolower($code)] ?? null;
+            if ($hit === false) {
+                continue;
+            }
+            if (is_array($hit)) {
+                $items[] = ['shortcode' => $code, 'url' => $hit[0], 'static_url' => $hit[1]];
+            } else {
+                $items[] = [
+                    'shortcode' => $code,
+                    'url' => ap_bsky_bluemoji_blob_url($pds, $did, $claim['cid']),
+                    'static_url' => ap_bsky_bluemoji_blob_url($pds, $did, $claim['static_cid']),
+                ];
+            }
+        }
+        if ($items !== [] && function_exists('ap_remote_emoji_upsert_batch')) {
+            ap_remote_emoji_upsert_batch($did, $items);
+            $stats['stored'] += count($items);
+        }
+    }
+    return $stats;
+}
+
+/**
+ * Queue {@see ap_bsky_bluemoji_warm} for claims with no cached row, after the
+ * response, so a page never waits on a PDS. At most 3 DIDs per request.
+ *
+ * @param list<array{did:string,code:string,cid:string,static_cid:string}> $claims
+ */
+function ap_bsky_bluemoji_ensure_deferred(array $claims): void
+{
+    static $pending = [];
+    static $registered = false;
+    $cached = ap_bsky_bluemoji_map($claims);
+    foreach ($claims as $c) {
+        if (isset($cached[$c['code']])) {
+            continue;
+        }
+        $dids = array_unique(array_column($pending, 'did'));
+        if (!in_array($c['did'], $dids, true) && count($dids) >= 3) {
+            continue;
+        }
+        $pending[$c['did'] . ' ' . $c['code']] = $c;
+    }
+    if ($pending === [] || $registered) {
+        return;
+    }
+    $registered = true;
+    register_shutdown_function(static function () use (&$pending): void {
+        if (PHP_SAPI !== 'cli' && function_exists('fastcgi_finish_request')) {
+            @fastcgi_finish_request();
+        }
+        try {
+            ap_bsky_bluemoji_warm(array_values($pending));
+        } catch (Throwable $e) {
+            error_log('[ap-bsky] deferred bluemoji warm: ' . $e->getMessage());
+        }
+        $pending = [];
+    });
+}
+
 /**
  * DIDs of every connected VAAK Bluesky session (per request).
  *

@@ -159,9 +159,96 @@ pub(crate) fn apply_cache(statuses: &mut [Value], cache: &HashMap<String, HashMa
     }
 }
 
+/// Bluemoji claims on a page (posts, reblogs, quotes), deduplicated by DID + code.
+pub(crate) fn bluemoji_claims(statuses: &[Value]) -> Vec<crate::bluemoji::Claim> {
+    let mut out: Vec<crate::bluemoji::Claim> = Vec::new();
+    for root in statuses {
+        let mut found = Vec::new();
+        visit(root, 0, &mut found);
+        for status in found {
+            for claim in crate::bluemoji::status_claims(status) {
+                if !out
+                    .iter()
+                    .any(|c| c.did == claim.did && c.code == claim.code)
+                {
+                    out.push(claim);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Pure half of [`attach_bluemoji`]; `cache` is DID -> shortcode -> (url, static).
+pub(crate) fn apply_bluemoji(
+    statuses: &mut [Value],
+    cache: &HashMap<String, HashMap<String, (String, String)>>,
+) {
+    let apply = |status: &mut Value| {
+        let claims = crate::bluemoji::status_claims(status);
+        let entries: Vec<Value> = claims
+            .iter()
+            .filter_map(|c| {
+                let (url, st) = cache.get(&c.did)?.get(&c.code)?;
+                emoji_entry(&c.code, url, Some(st))
+            })
+            .collect();
+        if entries.is_empty() {
+            return;
+        }
+        let mut list = status.get("emojis").cloned().unwrap_or(Value::Null);
+        merge_emojis(&mut list, entries);
+        status["emojis"] = list;
+    };
+    for root in statuses.iter_mut() {
+        visit_mut(root, 0, &apply);
+    }
+}
+
+/// Bluemoji (Bluesky custom emoji facets) from the DID-keyed rows in
+/// `remote_custom_emojis`. Misses go to the background warm in
+/// [`crate::bluemoji::kick`]; this never fetches.
+pub async fn attach_bluemoji(db: &Client, statuses: &mut [Value]) -> Result<()> {
+    let claims = bluemoji_claims(statuses);
+    if claims.is_empty() {
+        return Ok(());
+    }
+    let mut dids: Vec<String> = claims.iter().map(|c| c.did.clone()).collect();
+    let mut codes: Vec<String> = claims.iter().map(|c| c.code.clone()).collect();
+    dids.sort();
+    dids.dedup();
+    codes.sort();
+    codes.dedup();
+    let rows = db
+        .query(
+            "SELECT host, shortcode, url, COALESCE(static_url, '') FROM remote_custom_emojis
+             WHERE host = ANY($1) AND shortcode = ANY($2)",
+            &[&dids, &codes],
+        )
+        .await?;
+    let mut cache: HashMap<String, HashMap<String, (String, String)>> = HashMap::new();
+    for row in rows {
+        cache
+            .entry(row.get(0))
+            .or_default()
+            .insert(row.get(1), (row.get(2), row.get(3)));
+    }
+    let misses: Vec<crate::bluemoji::Claim> = claims
+        .into_iter()
+        .filter(|c| !cache.get(&c.did).is_some_and(|m| m.contains_key(&c.code)))
+        .collect();
+    apply_bluemoji(statuses, &cache);
+    crate::bluemoji::kick(&misses);
+    Ok(())
+}
+
 /// Batch-resolve `:shortcode:` text on a page of statuses (reblogs and quotes
 /// included) with one cache query. Cache-only: never fetches remotely.
+/// Bluemoji go first so a Bluesky post's own emoji win over host rows.
 pub async fn attach_custom_emojis(db: &Client, statuses: &mut [Value]) -> Result<()> {
+    if let Err(e) = attach_bluemoji(db, statuses).await {
+        tracing::debug!(error = %e, "bluemoji attach");
+    }
     let (hosts, codes) = wanted_pairs(statuses);
     if hosts.is_empty() || codes.is_empty() {
         return Ok(());
@@ -220,6 +307,50 @@ mod tests {
             assert_eq!(inner["account"]["emojis"][0]["shortcode"], "verifiedtrans");
         }
         assert!(page[0].get("emojis").is_none());
+    }
+
+    #[test]
+    fn bluemoji_fill_post_and_boosted_post() {
+        let did = "did:plc:abcdefghijklmnopqrstuvwx";
+        let cid = "bafkreigh2akiscaildcqabsyg3dfr6chu3fgpregiymsck7e7aqa4s52zy";
+        let text = "add support for bluemoji\n\n:cat_smoke_by_gabboman: :gone:";
+        let bsky = json!({
+            "uri": "at://did:plc:abcdefghijklmnopqrstuvwx/app.bsky.feed.post/3m",
+            "content": text,
+            "account": {"url": "https://bsky.app/profile/gabboman.xyz"},
+            "vaak_bsky_text": text,
+            "vaak_bsky_facets": [
+                {"index": {"byteStart": 26, "byteEnd": 49}, "features": [{"$type": "blue.moji.richtext.facet", "did": did, "name": ":cat_smoke_by_gabboman:", "formats": {"png_128": cid}}]},
+                {"index": {"byteStart": 50, "byteEnd": 56}, "features": [{"$type": "blue.moji.richtext.facet", "did": did, "name": ":gone:", "formats": {"png_128": cid}}]}
+            ]
+        });
+        let mut page = vec![
+            bsky.clone(),
+            json!({"content": "", "account": {"uri": "https://mkultra.monster/users/cmdr_nova"}, "reblog": bsky}),
+        ];
+        let claims = bluemoji_claims(&page);
+        assert_eq!(
+            claims.iter().map(|c| c.code.as_str()).collect::<Vec<_>>(),
+            vec!["cat_smoke_by_gabboman", "gone"]
+        );
+        let url = format!("https://pds.test/xrpc/com.atproto.sync.getBlob?did={did}&cid={cid}");
+        let cache = HashMap::from([(
+            did.to_string(),
+            HashMap::from([(
+                "cat_smoke_by_gabboman".to_string(),
+                (url.clone(), String::new()),
+            )]),
+        )]);
+        apply_bluemoji(&mut page, &cache);
+        for st in [&page[0], &page[1]["reblog"]] {
+            assert_eq!(st["emojis"].as_array().map(Vec::len), Some(1));
+            assert_eq!(st["emojis"][0]["url"], url.as_str());
+        }
+        assert!(page[1].get("emojis").is_none());
+        let map = vaak_types::emoji::status_emoji_map(&page[0]);
+        let html = crate::library::body::emojis(text, &map, false);
+        assert!(html.contains("<img class=\"custom-emoji\""), "{html}");
+        assert!(html.contains(":gone:"));
     }
 
     #[test]
