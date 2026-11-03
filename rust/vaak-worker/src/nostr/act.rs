@@ -1037,11 +1037,20 @@ pub async fn stamp_viewer_flags(db: &Client, owner: i64, statuses: &mut [Value])
             .filter(|s| super::render::is_nostr_status(s))
             .collect()
     }
+    // Kind 6 repost wrappers: the reposter, so the card menu can offer to
+    // follow the booster as well as the boosted author.
+    fn boosters(statuses: &mut [Value]) -> Vec<&mut Value> {
+        statuses
+            .iter_mut()
+            .filter(|s| s.get("reblog").is_some_and(Value::is_object) && super::render::is_nostr_status(s))
+            .collect()
+    }
     let field = |s: &Value, key: &str| s.get(key).and_then(Value::as_str).unwrap_or("").to_string();
-    let (ids, authors): (Vec<String>, Vec<String>) = cards(statuses)
+    let (ids, mut authors): (Vec<String>, Vec<String>) = cards(statuses)
         .iter()
         .map(|s| (field(s, "vaak_nostr_event_id"), field(s, "vaak_nostr_pubkey")))
         .unzip();
+    authors.extend(boosters(statuses).iter().map(|s| field(s, "vaak_nostr_pubkey")));
     if ids.is_empty() || owner < 1 || !super::sync::tables_ready(db).await {
         return;
     }
@@ -1070,6 +1079,11 @@ pub async fn stamp_viewer_flags(db: &Client, owner: i64, statuses: &mut [Value])
         if let Some(sats) = zapped.get(&id).filter(|s| **s > 0) {
             st["vaak_nostr_zap_sats"] = json!(sats);
         }
+    }
+    for st in boosters(statuses) {
+        let pk = field(st, "vaak_nostr_pubkey");
+        st["vaak_nostr_following"] = json!(following.contains(&pk));
+        st["vaak_nostr_mine"] = json!(!me.is_empty() && pk == me);
     }
 }
 

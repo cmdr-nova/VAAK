@@ -505,6 +505,52 @@ mod tests {
         assert!(html.contains("Alice"), "booster header: {html}");
         assert!(html.contains("hello from bob"), "{html}");
         assert!(html.contains(&format!("data-nostr-act=\"like\" data-nostr-target=\"{}\"", note.id)), "actions target the note: {html}");
+
+        // Booster and author names open their Nostr profiles, with hover cards.
+        let booster_url = st["account"]["url"].as_str().unwrap().to_string();
+        let author_url = st["reblog"]["account"]["url"].as_str().unwrap().to_string();
+        assert!(booster_url.starts_with("https://njump.me/npub1"), "{booster_url}");
+        assert!(
+            html.contains(&format!("<a href=\"{booster_url}\" target=\"_blank\" rel=\"noopener noreferrer\" data-profile-hover-actor=\"{booster_url}\" data-profile-hover-source=\"nostr\" style=\"color:inherit;text-decoration:none\">Alice</a> boosted")),
+            "booster name links to Nostr: {html}"
+        );
+        assert!(html.contains(&format!("class=\"who\" href=\"{author_url}\" target=\"_blank\"")), "author name links to Nostr: {html}");
+        assert!(!html.contains("data-profile-hover-actor=\"nostr:"), "hover uses the https profile: {html}");
+        assert!(!html.contains("view=remote_profile"), "{html}");
+
+        // The menu names both people and offers both follows.
+        assert!(html.contains(&format!("href=\"{author_url}\" target=\"_blank\" rel=\"noopener noreferrer\">Open Bob&#39;s profile on Nostr</a>")), "{html}");
+        assert!(html.contains(&format!("href=\"{booster_url}\" target=\"_blank\" rel=\"noopener noreferrer\">Open booster Alice&#39;s profile on Nostr</a>")), "{html}");
+        assert!(html.contains(&format!("data-nostr-act=\"unfollow\" data-nostr-target=\"{}\"", repost.pubkey)), "booster follow item: {html}");
+        assert!(html.contains(">Unfollow booster Alice on Nostr</button>"), "{html}");
+        assert!(html.contains(">Unfollow Bob on Nostr</button>"), "{html}");
+        assert!(html.contains("data-nostr-follow-label=\"Follow booster Alice on Nostr\""), "{html}");
+        assert!(html.contains("data-nostr-name=\"Alice\""), "toast names the booster: {html}");
+
+        let mut fresh = st.clone();
+        fresh["vaak_nostr_following"] = json!(false);
+        fresh["reblog"]["vaak_nostr_following"] = json!(false);
+        let html = crate::notif_embed::paint_lean_feed_card_opts(&fresh, "home", "");
+        assert!(html.contains(">Follow booster Alice on Nostr</button>"), "{html}");
+        assert!(html.contains(">Follow Bob on Nostr</button>"), "{html}");
+
+        let mut own = st.clone();
+        own["vaak_nostr_mine"] = json!(true);
+        let html = crate::notif_embed::paint_lean_feed_card_opts(&own, "home", "");
+        assert!(!html.contains("booster Alice on Nostr</button>"), "no follow on your own repost: {html}");
+    }
+
+    #[test]
+    fn menu_names_drop_emoji_codes_and_stay_short() {
+        let mut note = row("hi", json!([]));
+        note.display_name = "Bob".into();
+        let mut repost = row("", json!([]));
+        repost.id = "9".repeat(64);
+        repost.pubkey = "ab".repeat(32);
+        repost.display_name = "スカイラー :fillyDab: and a really long tail of words".into();
+        repost.reposted = Some(Box::new(note));
+        let html = crate::notif_embed::paint_lean_feed_card_opts(&materialize(&repost), "home", "");
+        assert!(html.contains(">Unfollow booster スカイラー and a really long… on Nostr</button>"), "{html}");
     }
 
     #[test]
