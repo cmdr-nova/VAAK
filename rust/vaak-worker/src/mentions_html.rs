@@ -671,6 +671,19 @@ fn paint_notif_card(n: &Value, viewer_actor: &str) -> String {
     paint_notif_card_follows(n, viewer_actor, &HashSet::new())
 }
 
+/// Follow back on Nostr: the shared Nostr button (`data-nostr-act`), which
+/// signs a kind 3 edit and flips between these two labels.
+fn nostr_follow_back_html(pubkey: &str, following: bool, name: &str) -> String {
+    format!(
+        "<button type=\"button\" class=\"btn btn-ghost{cls}\" data-nostr-act=\"{act}\" data-nostr-target=\"{pubkey}\" data-nostr-follow-label=\"Follow back\" data-nostr-unfollow-label=\"Following\" data-nostr-name=\"{name}\" title=\"{title}\" style=\"padding:.25rem .7rem;font-size:.8rem\">{label}</button>",
+        cls = if following { " btn-following" } else { "" },
+        act = if following { "unfollow" } else { "follow" },
+        name = esc(name),
+        title = if following { "Following on Nostr — click to unfollow" } else { "Follow back on Nostr" },
+        label = if following { "Following" } else { "Follow back" },
+    )
+}
+
 fn paint_notif_card_follows(n: &Value, viewer_actor: &str, following: &HashSet<String>) -> String {
     let n_type = n.get("type").and_then(|v| v.as_str()).unwrap_or("mention");
     let account = n.get("account").cloned().unwrap_or(Value::Null);
@@ -837,7 +850,21 @@ fn paint_notif_card_follows(n: &Value, viewer_actor: &str, following: &HashSet<S
     }
     // New follower rows: follow them back without leaving Notifications.
     // Same queued follow_remote form as the PHP Mentions fallback (Fediverse and Bluesky).
-    if n_type == "follow" {
+    // A Nostr follower (nostr::notif::dress_entities): follow back with the
+    // viewer's signer, like the card menus, not VAAK's fediverse follow.
+    let nostr_follower = account
+        .get("vaak_nostr_pubkey")
+        .and_then(Value::as_str)
+        .filter(|pk| n_type == "follow" && crate::nostr::event::is_hex64(pk));
+    if let Some(pk) = nostr_follower {
+        if account.get("vaak_nostr_can_follow").and_then(Value::as_bool).unwrap_or(false) {
+            actions.push_str(&nostr_follow_back_html(
+                pk,
+                account.get("vaak_nostr_following").and_then(Value::as_bool).unwrap_or(false),
+                display,
+            ));
+        }
+    } else if n_type == "follow" {
         let actor = follow_target(account_uri, account_url);
         let viewer = viewer_actor.trim().trim_end_matches('/');
         if actor.starts_with("https://")

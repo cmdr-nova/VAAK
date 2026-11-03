@@ -302,6 +302,19 @@ $unlinked = ap_nostr_hover_payload('https://njump.me/' . $npub, 3, $hdb);
 $check($unlinked['can_follow'] === false && $unlinked['following'] === false, 'no follow without a linked npub');
 $check(empty(ap_nostr_hover_payload('https://njump.me/note1abc', 1, $hdb)['ok']), 'only npub links get a hover card');
 $check(empty(ap_nostr_hover_payload('https://evil.test/' . $npub, 1, $hdb)['ok']), 'only njump links get a hover card');
+// Follow back on a Nostr follow notification signs through the viewer's signer.
+$back = ap_nostr_notif_follow_html('https://njump.me/' . $npub, 1, 'Bob', true, $hdb);
+$check($back['nostr'] && str_contains($back['html'], 'data-nostr-act="unfollow"') && str_contains($back['html'], '>Following</button>'), 'follow notification knows the viewer already follows back');
+$hdb->exec("DELETE FROM nostr_follows WHERE owner_user_id = 1");
+$back = ap_nostr_notif_follow_html('nostr:' . $npub, 1, 'Bob <x>', true, $hdb);
+$check(str_contains($back['html'], 'data-nostr-act="follow"') && str_contains($back['html'], 'data-nostr-target="' . $hex . '"') && str_contains($back['html'], '>Follow back</button>'), 'follow notification offers Follow back on Nostr');
+$check(str_contains($back['html'], 'Bob &lt;x&gt;') && !str_contains($back['html'], 'follow_remote'), 'name is escaped and no fediverse follow form');
+$check(str_contains(ap_nostr_notif_follow_html('https://njump.me/' . $npub, 1, 'Bob', false, $hdb)['html'], '>Follow</button>'), 'other Nostr notifications say Follow');
+$own = ap_nostr_notif_follow_html('https://njump.me/' . $npub, 2, 'Bob', true, $hdb);
+$check($own['nostr'] && $own['html'] === '', 'no button for your own key');
+$none = ap_nostr_notif_follow_html('https://njump.me/' . $npub, 3, 'Bob', true, $hdb);
+$check($none['nostr'] && $none['html'] === '', 'no button without a linked npub (and no fediverse form either)');
+$check(ap_nostr_notif_follow_html('https://mastodon.test/users/bob', 1, 'Bob', true, $hdb) === ['nostr' => false, 'html' => ''], 'fediverse actors are left to the usual forms');
 unset($GLOBALS['ap_nostr_table_ready']);
 
 // Follow packs (Library > Collections): address and pick checks, page paint.

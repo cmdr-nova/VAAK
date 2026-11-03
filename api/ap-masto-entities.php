@@ -8669,8 +8669,9 @@ function ap_masto_notifications_mention_exclusive_id(int $ownerUserId, int $maxI
  */
 function ap_masto_notifications_follow_where(): string
 {
+    // nostr_follow: first kind 3 list that names the owner (nostr/notif.rs).
     return "type = 'Follow'
-               AND action_taken IN ('local_accept_followback', ?)
+               AND action_taken IN ('local_accept_followback', ?, 'nostr_follow')
                AND (target_actor = ? OR target_actor = ?)";
 }
 
@@ -9730,7 +9731,7 @@ function ap_masto_notifications_unread_state(int $scan = 80, bool $bypassCache =
         $st = ap_db()->prepare(
             "SELECT id, created_at, actor_id, action_taken FROM events
              WHERE type = 'Follow'
-               AND action_taken IN ('local_accept_followback', ?)
+               AND action_taken IN ('local_accept_followback', ?, 'nostr_follow')
                AND (target_actor = ? OR target_actor = ?)
              ORDER BY id DESC LIMIT 100"
         );

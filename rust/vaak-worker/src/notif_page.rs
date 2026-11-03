@@ -568,10 +568,10 @@ fn exclusive_from_inclusive(best_inclusive: Option<i64>, fast: bool) -> Option<i
 }
 
 /// Follows aimed at one owner. Same predicate as PHP
-/// `ap_masto_notifications_follow_where`: accepted local follows and Bluesky
-/// follows. Page and seek queries share it instead of each carrying a copy.
+/// `ap_masto_notifications_follow_where`: accepted local follows, Bluesky
+/// follows and Nostr follows. Page and seek queries share it instead of each carrying a copy.
 const FOLLOW_OWNER_WHERE: &str = "type = 'Follow'
-    AND action_taken IN ('local_accept_followback', 'bsky_follow')
+    AND action_taken IN ('local_accept_followback', 'bsky_follow', 'nostr_follow')
     AND (target_actor = $1 OR target_actor = $2)";
 
 async fn follow_before(db: &Client, actor: &str, max_id: Option<&str>) -> Result<Option<i64>> {

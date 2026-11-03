@@ -8,7 +8,9 @@ declare(strict_types=1);
  * `vaak-worker nostr-sync` (rust/vaak-worker/src/nostr/notif.rs) reads the
  * replies, mentions, reposts, likes and zaps that tag each linked npub, keeps the
  * ones that should notify, and stages them in nostr_notifs with the mentions
- * row already built. It runs this script after each sync. Each row goes
+ * row already built. New followers (a kind 3 contact list that names the user
+ * for the first time) are staged the same way and stored in events as
+ * action_taken nostr_follow, like Bluesky follows. It runs this script after each sync. Each row goes
  * through ap_mention_store like a Bluesky notification, so the badge, the
  * notification caches, search and push all see it, and is stamped
  * ingested_at. A failed row stays staged and is tried again next run.
@@ -78,6 +80,34 @@ $rows = $db->prepare(
 $rows->execute([$limit]);
 $done = $db->prepare('UPDATE nostr_notifs SET ingested_at = ? WHERE owner_user_id = ? AND event_id = ?');
 
+/**
+ * A new Nostr follower: one events row per follower and owner (a later
+ * contact list edit is not a new follow). Returns whether it was stored.
+ *
+ * @param array<string,mixed> $row
+ * @param array<string,mixed> $staged
+ */
+function nostr_notif_store_follow(PDO $db, array $row, array $staged, int $ownerUserId, string $ownerActorId): bool
+{
+    $actorId = (string) ($row['actor_id'] ?? '');
+    $owner = rtrim($ownerActorId, '/');
+    if ($actorId === '' || $owner === '' || !str_starts_with($actorId, 'https://njump.me/npub1')) {
+        return false;
+    }
+    $exists = $db->prepare(
+        "SELECT 1 FROM events WHERE type = 'Follow' AND action_taken IN ('nostr_follow', 'undone')
+           AND rtrim(actor_id, '/') = ? AND (target_actor = ? OR target_actor = ?) LIMIT 1"
+    );
+    $exists->execute([$actorId, $owner, $owner . '/']);
+    if ($exists->fetchColumn()) {
+        return false;
+    }
+    $fields = nostr_notif_actor_fields($staged);
+    ap_remote_actor_upsert($actorId, $fields);
+    ap_metrics_record('Follow', $actorId, (string) $row['object_id'], $owner, 0, 'nostr_follow', (string) $fields['display_name'], null, (string) ($row['created_at'] ?? gmdate('c')));
+    return true;
+}
+
 $stored = 0;
 $skipped = 0;
 $pushed = 0;
@@ -93,6 +123,31 @@ foreach ($rows->fetchAll(PDO::FETCH_ASSOC) as $staged) {
         }
         $row['owner_user_id'] = $ownerUserId;
         $row['owner_actor_id'] = ap_db_owner_actor_id_for_user_id($ownerUserId);
+        if (($row['activity_type'] ?? '') === 'Follow') {
+            if (!nostr_notif_store_follow($db, $row, $staged, $ownerUserId, (string) $row['owner_actor_id'])) {
+                $done->execute([time(), $ownerUserId, $staged['event_id']]);
+                $skipped++;
+                continue;
+            }
+            $stored++;
+            $wantsPush = $staged['push'] === true || $staged['push'] === 't' || $staged['push'] === 1 || $staged['push'] === '1';
+            if ($wantsPush && function_exists('ap_webpush_notify_event')) {
+                $nid = null;
+                $find = $db->prepare(
+                    "SELECT id, created_at FROM events WHERE type = 'Follow' AND action_taken = 'nostr_follow'
+                       AND object_id = ? AND rtrim(target_actor, '/') = ? ORDER BY id DESC LIMIT 1"
+                );
+                $find->execute([(string) $row['object_id'], rtrim((string) $row['owner_actor_id'], '/')]);
+                $frow = $find->fetch(PDO::FETCH_ASSOC);
+                if (is_array($frow) && function_exists('ap_masto_notification_id_for_follow_event')) {
+                    $nid = ap_masto_notification_id_for_follow_event((int) $frow['id'], (string) $frow['created_at']);
+                }
+                ap_webpush_notify_event('follow', (string) $row['actor_id'], $nid, null, $ownerUserId);
+                $pushed++;
+            }
+            $done->execute([time(), $ownerUserId, $staged['event_id']]);
+            continue;
+        }
         if (($row['in_reply_to'] ?? '') === '') {
             $row['in_reply_to'] = null;
         }

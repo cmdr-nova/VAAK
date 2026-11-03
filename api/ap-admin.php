@@ -28118,7 +28118,18 @@ function admin_render_notification_card(array $n, array $followingIds, array $fo
       <?php if ($nRel !== 'none'): ?>
         <?= admin_rel_badge($nRel) ?>
       <?php endif; ?>
-      <?php if ($nActorRef !== '' && !$alreadyFollowing && $nType === 'follow'): ?>
+      <?php
+        // A Nostr key follows back with the viewer's signer, not a fediverse follow.
+        if (!function_exists('ap_nostr_notif_follow_html') && is_file(__DIR__ . '/ap-nostr.php')) {
+            require_once __DIR__ . '/ap-nostr.php';
+        }
+        $nNostrFollow = function_exists('ap_nostr_notif_follow_html')
+            ? ap_nostr_notif_follow_html($nActorRef !== '' ? $nActorRef : $nWebUrl, (int) admin_owner_user_id(), $nDisplay !== '' ? $nDisplay : $nAcct, $nType === 'follow')
+            : ['nostr' => false, 'html' => ''];
+      ?>
+      <?php if ($nNostrFollow['nostr']): ?>
+        <?= $nNostrFollow['html'] ?>
+      <?php elseif ($nActorRef !== '' && !$alreadyFollowing && $nType === 'follow'): ?>
         <form method="post" action="?view=mentions" style="display:inline">
           <input type="hidden" name="action" value="follow_remote">
           <input type="hidden" name="return_view" value="mentions">

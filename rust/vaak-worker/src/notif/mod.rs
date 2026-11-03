@@ -224,7 +224,7 @@ pub async fn compute_unread(db: &Client, owner_user_id: i64, scan: i64) -> Resul
         .query(
             "SELECT id::bigint, created_at, actor_id, action_taken FROM events
              WHERE type = 'Follow'
-               AND action_taken IN ('local_accept_followback', 'bsky_follow')
+               AND action_taken IN ('local_accept_followback', 'bsky_follow', 'nostr_follow')
                AND (target_actor = $1 OR target_actor = $2)
              ORDER BY id DESC
              LIMIT 100",

@@ -1252,6 +1252,55 @@ function ap_nostr_names(array $pubkeys, ?PDO $db = null): array
 }
 
 /**
+ * Follow / Follow back for a Nostr account in a notification row (PHP
+ * painter; the worker paints the same button in mentions_html.rs). It signs
+ * a kind 3 edit through the viewer's signer (data-nostr-act), never VAAK's
+ * fediverse follow. 'nostr' says the actor is a Nostr key, so the caller
+ * skips its fediverse forms; 'html' is '' when the viewer has no linked npub.
+ *
+ * @return array{nostr:bool,html:string}
+ */
+function ap_nostr_notif_follow_html(string $actorRef, int $ownerUserId, string $name, bool $followBack, ?PDO $db = null): array
+{
+    $ref = rtrim(trim($actorRef), '/');
+    if (!preg_match('~^(?:https://njump\.me/|nostr:)(npub1[02-9ac-hj-np-z]+)$~i', $ref, $m)) {
+        return ['nostr' => false, 'html' => ''];
+    }
+    $parsed = ap_nostr_parse_pubkey($m[1]);
+    $pubkey = (string) ($parsed['pubkey'] ?? '');
+    if (empty($parsed['ok']) || !preg_match('/^[0-9a-f]{64}$/', $pubkey) || $ownerUserId < 1) {
+        return ['nostr' => true, 'html' => ''];
+    }
+    $following = false;
+    try {
+        $db ??= ap_db();
+        if (!ap_nostr_table_ready($db)) {
+            return ['nostr' => true, 'html' => ''];
+        }
+        $mine = strtolower((string) (ap_nostr_link_for_user($ownerUserId, $db)['pubkey'] ?? ''));
+        if ($mine === '' || $mine === $pubkey) {
+            return ['nostr' => true, 'html' => ''];
+        }
+        $st = $db->prepare('SELECT 1 FROM nostr_follows WHERE owner_user_id = ? AND pubkey = ? LIMIT 1');
+        $st->execute([$ownerUserId, $pubkey]);
+        $following = (bool) $st->fetchColumn();
+    } catch (Throwable $e) {
+        return ['nostr' => true, 'html' => ''];
+    }
+    $follow = $followBack ? 'Follow back' : 'Follow';
+    $label = $following ? 'Following' : $follow;
+    $html = '<button type="button" class="btn btn-ghost' . ($following ? ' btn-following' : '') . '"'
+        . ' data-nostr-act="' . ($following ? 'unfollow' : 'follow') . '"'
+        . ' data-nostr-target="' . $pubkey . '"'
+        . ' data-nostr-follow-label="' . htmlspecialchars($follow, ENT_QUOTES) . '"'
+        . ' data-nostr-unfollow-label="Following"'
+        . ' data-nostr-name="' . htmlspecialchars(mb_substr($name, 0, 80), ENT_QUOTES) . '"'
+        . ' title="' . ($following ? 'Following on Nostr — click to unfollow' : htmlspecialchars($follow, ENT_QUOTES) . ' on Nostr') . '"'
+        . ' style="padding:.25rem .7rem;font-size:.8rem">' . $label . '</button>';
+    return ['nostr' => true, 'html' => $html];
+}
+
+/**
  * Hover card data for a Nostr account (njump npub URL), from stored kind 0
  * metadata and the viewer's stored follow list. Nothing is fetched inline.
  *

@@ -6007,7 +6007,7 @@ function ap_metrics_record(
             // previous projection.
             if (
                 $type === 'Follow'
-                && in_array($actionTaken, ['local_accept_followback', 'bsky_follow'], true)
+                && in_array($actionTaken, ['local_accept_followback', 'bsky_follow', 'nostr_follow'], true)
             ) {
                 $followOwner = function_exists('ap_db_owner_user_id_for_actor')
                     ? (int) ap_db_owner_user_id_for_actor(is_string($targetActor) ? $targetActor : '')
@@ -7552,7 +7552,7 @@ function ap_notification_mention_row_muted(int $ownerUserId, array $row, array $
 
 /**
  * Hide the follow notification stored for this actor/target pair.
- * Renderers only keep action_taken local_accept_followback and bsky_follow,
+ * Renderers only keep action_taken local_accept_followback, bsky_follow and nostr_follow,
  * including when the follower set is empty, so the row has to change.
  */
 function ap_notification_dismiss_follow(string $actorId, string $ownerActorId): int
@@ -7566,7 +7566,7 @@ function ap_notification_dismiss_follow(string $actorId, string $ownerActorId): 
         $st = ap_db()->prepare(
             "UPDATE events SET action_taken = 'undone'
              WHERE type = 'Follow'
-               AND action_taken IN ('local_accept_followback', 'bsky_follow')
+               AND action_taken IN ('local_accept_followback', 'bsky_follow', 'nostr_follow')
                AND rtrim(actor_id, '/') = ?
                AND rtrim(target_actor, '/') = ?"
         );

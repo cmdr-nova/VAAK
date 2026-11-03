@@ -436,7 +436,7 @@ SELECT
     OR EXISTS (
       SELECT 1 FROM events e
       WHERE e.type = 'Follow'
-        AND e.action_taken IN ('local_accept_followback', 'bsky_follow')
+        AND e.action_taken IN ('local_accept_followback', 'bsky_follow', 'nostr_follow')
         AND (
           e.target_actor = rtrim(u.actor_id, '/')
           OR e.target_actor = rtrim(u.actor_id, '/') || '/'
