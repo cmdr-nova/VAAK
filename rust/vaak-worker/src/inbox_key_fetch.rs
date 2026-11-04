@@ -196,6 +196,32 @@ async fn budget_take(redis: &mut redis::aio::ConnectionManager, key_id: &str) ->
 struct Fetched {
     status: u16,
     body: Option<Vec<u8>>,
+    /// The absolute Location of a 3xx answer.
+    location: Option<String>,
+}
+
+/// `ap_key_fetch_same_host_redirect`: the one redirect hop a key fetch
+/// follows, an https Location on the same host and port 443 (Lemmy answers
+/// some key URLs with a 301 to the canonical actor URL). Anything else stays
+/// a failure, so a redirect can never point the fetch at another server.
+fn same_host_redirect(from: &str, location: Option<&str>) -> Option<String> {
+    let location = location?.trim();
+    let base = reqwest::Url::parse(from).ok()?;
+    let next = base.join(location).ok()?;
+    if next.scheme() != "https" || !next.username().is_empty() || next.password().is_some() {
+        return None;
+    }
+    if next.port_or_known_default() != Some(443) || base.port_or_known_default() != Some(443) {
+        return None;
+    }
+    let same = matches!((base.host_str(), next.host_str()), (Some(a), Some(b)) if a.eq_ignore_ascii_case(b));
+    if !same {
+        return None;
+    }
+    let mut next = next;
+    next.set_fragment(None);
+    let next = next.to_string();
+    (next != from).then_some(next)
 }
 
 /// `ap_signed_get_ex` with `ap_http_curl_get_ex`'s limits.
@@ -221,16 +247,26 @@ async fn signed_get(signer: &Signer, url: &str, addrs: &[IpAddr]) -> Result<Fetc
         .await?;
     let status = resp.status().as_u16();
     if !(200..300).contains(&status) {
-        return Ok(Fetched { status, body: None });
+        let location = resp.headers().get(reqwest::header::LOCATION).and_then(|v| v.to_str().ok()).map(str::to_string);
+        return Ok(Fetched { status, body: None, location: (300..400).contains(&status).then_some(location).flatten() });
     }
     let mut buf = Vec::new();
     while let Some(chunk) = resp.chunk().await? {
         buf.extend_from_slice(&chunk);
         if buf.len() > MAX_BYTES {
-            return Ok(Fetched { status: 0, body: None });
+            return Ok(Fetched { status: 0, body: None, location: None });
         }
     }
-    Ok(Fetched { status, body: (!buf.is_empty()).then_some(buf) })
+    Ok(Fetched { status, body: (!buf.is_empty()).then_some(buf), location: None })
+}
+
+/// `signed_get`, following one same-host redirect. Returns the URL that answered.
+async fn signed_get_follow(signer: &Signer, url: &str, addrs: &[IpAddr]) -> Result<(Fetched, String)> {
+    let got = signed_get(signer, url, addrs).await?;
+    if let Some(next) = same_host_redirect(url, got.location.as_deref()) {
+        return Ok((signed_get(signer, &next, addrs).await?, next));
+    }
+    Ok((got, url.to_string()))
 }
 
 fn user_agent() -> String {
@@ -277,7 +313,7 @@ pub(crate) async fn fetch(redis: &mut redis::aio::ConnectionManager, db: &tokio_
     for url in candidates(key_id) {
         let Some(host) = crate::inbox_accept::host_of(&url) else { continue };
         let Some(addrs) = public_addrs(&host).await else { continue };
-        let got = match signed_get(&signer, &url, &addrs).await {
+        let (got, url) = match signed_get_follow(&signer, &url, &addrs).await {
             Ok(got) => got,
             Err(_) => {
                 last_reason = "empty_or_transport".into();
@@ -354,6 +390,20 @@ fn short(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn follows_only_same_host_https_redirects() {
+        let from = "https://startrek.website/u/Picard";
+        assert_eq!(same_host_redirect(from, Some("https://startrek.website/u/picard")).as_deref(), Some("https://startrek.website/u/picard"));
+        assert_eq!(same_host_redirect(from, Some("/u/picard")).as_deref(), Some("https://startrek.website/u/picard"));
+        assert_eq!(same_host_redirect(from, Some("https://STARTREK.website/u/picard#main-key")).as_deref(), Some("https://startrek.website/u/picard"));
+        assert_eq!(same_host_redirect(from, Some("https://evil.test/u/picard")), None);
+        assert_eq!(same_host_redirect(from, Some("http://startrek.website/u/picard")), None);
+        assert_eq!(same_host_redirect(from, Some("https://startrek.website:8443/u/picard")), None);
+        assert_eq!(same_host_redirect(from, Some("https://user@startrek.website/u/picard")), None);
+        assert_eq!(same_host_redirect(from, Some(from)), None);
+        assert_eq!(same_host_redirect(from, None), None);
+    }
 
     #[test]
     fn candidates_follow_php() {

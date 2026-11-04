@@ -1922,7 +1922,7 @@ function ap_http_response_status(?array $responseHeaders): int
  * with broken AAAA records (e.g. girlcock.club) while curl -4 succeeds.
  *
  * @param list<string> $headers
- * @return array{body:?string,status:int}
+ * @return array{body:?string,status:int,location?:string}
  */
 function ap_http_curl_get_ex(string $url, array $headers, int $timeoutSec = 8, int $maxBytes = 262144): array
 {
@@ -1973,6 +1973,7 @@ function ap_http_curl_get_ex(string $url, array $headers, int $timeoutSec = 8, i
         $ok = curl_exec($ch);
         $status = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
         $errno = curl_errno($ch);
+        $location = $status >= 300 && $status < 400 ? curl_getinfo($ch, CURLINFO_REDIRECT_URL) : null;
         curl_close($ch);
         if (function_exists('ap_timing_record')) {
             ap_timing_record('activitypub.fetch', (microtime(true) - $remoteStarted) * 1000.0);
@@ -1982,7 +1983,11 @@ function ap_http_curl_get_ex(string $url, array $headers, int $timeoutSec = 8, i
         }
         // Non-timeout HTTP error (401/403/404): don't bother with IPv4 retry
         if ($status > 0 && $errno === 0) {
-            return ['body' => null, 'status' => $status];
+            $out = ['body' => null, 'status' => $status];
+            if (is_string($location) && $location !== '') {
+                $out['location'] = $location;
+            }
+            return $out;
         }
     }
     return ['body' => null, 'status' => 0];
@@ -1991,7 +1996,7 @@ function ap_http_curl_get_ex(string $url, array $headers, int $timeoutSec = 8, i
 /**
  * Signed GET with status for diagnostics (Threads key fetch, etc.).
  *
- * @return array{body:?string,status:int}
+ * @return array{body:?string,status:int,location?:string}
  */
 function ap_signed_get_ex(string $url): array
 {
@@ -2046,7 +2051,48 @@ function ap_signed_get_ex(string $url): array
     if (is_string($res['body'] ?? null) && $res['body'] !== '') {
         return ['body' => $res['body'], 'status' => (int) ($res['status'] ?? 200)];
     }
-    return ['body' => null, 'status' => (int) ($res['status'] ?? 0)];
+    $out = ['body' => null, 'status' => (int) ($res['status'] ?? 0)];
+    if (isset($res['location']) && is_string($res['location'])) {
+        $out['location'] = $res['location'];
+    }
+    return $out;
+}
+
+/**
+ * The one redirect hop a key fetch follows: an https Location on the same
+ * host and port 443 (Lemmy answers some key URLs with a 301 to the canonical
+ * actor URL). Anything else stays a failure, so a redirect never points the
+ * fetch at another server. Mirrors same_host_redirect in
+ * rust/vaak-worker/src/inbox_key_fetch.rs.
+ */
+function ap_key_fetch_same_host_redirect(string $from, ?string $location): ?string
+{
+    $location = trim((string) $location);
+    if ($location === '') {
+        return null;
+    }
+    $base = parse_url($from);
+    if (!is_array($base) || ($base['scheme'] ?? '') !== 'https' || ($base['host'] ?? '') === '') {
+        return null;
+    }
+    if (str_starts_with($location, '/') && !str_starts_with($location, '//')) {
+        $location = 'https://' . $base['host'] . $location;
+    }
+    $next = parse_url($location);
+    if (!is_array($next) || ($next['scheme'] ?? '') !== 'https' || isset($next['user']) || isset($next['pass'])) {
+        return null;
+    }
+    if ((int) ($next['port'] ?? 443) !== 443 || (int) ($base['port'] ?? 443) !== 443) {
+        return null;
+    }
+    if (strtolower((string) ($next['host'] ?? '')) !== strtolower((string) $base['host'])) {
+        return null;
+    }
+    $url = 'https://' . strtolower((string) $next['host']) . ((string) ($next['path'] ?? '') !== '' ? (string) $next['path'] : '/');
+    if (isset($next['query']) && $next['query'] !== '') {
+        $url .= '?' . $next['query'];
+    }
+    return $url !== $from ? $url : null;
 }
 
 /**
@@ -2419,6 +2465,11 @@ function ap_fetch_actor_pubkey(string $keyId, bool $bypassCache = false): ?strin
 
         $tries++;
         $res = ap_signed_get_ex($fetchUrl);
+        $redirect = ap_key_fetch_same_host_redirect($fetchUrl, $res['location'] ?? null);
+        if ($redirect !== null) {
+            $fetchUrl = $redirect;
+            $res = ap_signed_get_ex($fetchUrl);
+        }
         $status = (int) ($res['status'] ?? 0);
         if ($status > 0) {
             $lastHttp = $status;

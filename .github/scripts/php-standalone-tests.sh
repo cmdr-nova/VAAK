@@ -97,6 +97,7 @@ php_tests=(
   api/bin/home-signal-batch-smoke.php
   api/bin/list-picker-moderation-smoke.php
   api/bin/inbox-signature-smoke.php
+  api/bin/key-fetch-redirect-smoke.php
   api/bin/inbox-ownership-smoke.php
   api/bin/inbox-flood-smoke.php
   api/bin/inbox-quote-notify-dedupe-smoke.php
