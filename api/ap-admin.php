@@ -7794,9 +7794,9 @@ function admin_trend_bsky_topic_link(array $tp, string $label): string
 
 /**
  * The Across networks Trending tags card for this viewer: big Mastodon
- * instances' tags, Bluesky's trending topics, then trending posts (Mastodon
- * instance trends plus, for viewers with a linked npub, nostr.wine's notes).
- * The viewer's blocks, mutes, muted words and downranks apply, as on VAAK.
+ * instances' tags, then Bluesky's trending topics. No posts section (kept
+ * the rail short); On VAAK still has one. The viewer's mutes, muted words
+ * and hidden tags apply, as on VAAK.
  * Only the tags module has a network card; Who to follow is the same in both.
  */
 function admin_trends_network_html(string $module, string $viewForTrends, int $viewerId): string
@@ -7804,7 +7804,7 @@ function admin_trends_network_html(string $module, string $viewForTrends, int $v
     if ($module !== 'tags') return '';
     $cacheKey = null;
     if ($viewerId > 0 && function_exists('ap_redis_json_get') && function_exists('ap_trends_policy_epoch')) {
-        $cacheKey = 'vaak:trends:net:html:v2:tags:' . $viewerId . ':' . admin_trends_network_data_gen() . ':' . ap_trends_policy_epoch($viewerId)
+        $cacheKey = 'vaak:trends:net:html:v3:tags:' . $viewerId . ':' . admin_trends_network_data_gen() . ':' . ap_trends_policy_epoch($viewerId)
             . ':' . preg_replace('/[^a-z_]/', '', $viewForTrends);
         $hit = ap_redis_json_get($cacheKey);
         if (is_array($hit) && is_string($hit['html'] ?? null)) return $hit['html'];
@@ -7841,41 +7841,11 @@ function admin_trends_network_html(string $module, string $viewForTrends, int $v
     }
     if ($topicRows !== '') $html .= '<h4 class="trend-subhead">Bluesky topics</h4>' . $topicRows;
 
-    $posts = admin_trends_network_snapshot('statuses');
-    $items = $posts['items'] ?? [];
-    $postSources = $posts['sources'] ?? [];
-    $nostrShown = false;
-    if (function_exists('ap_nostr_search_visible') && ap_nostr_search_visible($viewerId)) {
-        $nostr = admin_trends_network_snapshot('nostr');
-        if ($nostr !== null && $nostr['items'] !== []) {
-            $hidden = admin_trend_nostr_hidden_keys($viewerId);
-            foreach ($nostr['items'] as $st) {
-                if (!str_starts_with((string) ($st['id'] ?? ''), 'nostr:')) continue;
-                if (isset($hidden[strtolower((string) ($st['vaak_nostr_pubkey'] ?? ''))])) continue;
-                $items[] = $st;
-            }
-            $nostrShown = true;
-        }
-    }
-    $downrankRefs = admin_trend_downrank_ref_set($viewerId);
-    $kept = [];
-    foreach ($items as $candidate) {
-        if (admin_trend_status_hidden($candidate, $viewerId, $downrankRefs)) continue;
-        $kept[] = $candidate;
-    }
-    $ranked = function_exists('ap_masto_trend_statuses_rank_mixed') ? ap_masto_trend_statuses_rank_mixed($kept) : $kept;
-    $postRows = '';
-    $shown = 0;
-    foreach ($ranked as $ts) {
-        $postRows .= admin_trend_status_row_html($ts, $viewForTrends);
-        if (++$shown >= 5) break;
-    }
-    $html .= '<h4 class="trend-subhead">Trending posts</h4>'
-        . ($postRows !== '' ? $postRows : '<div class="meta empty-state">No network posts yet…</div>');
-    $sources = array_values(array_unique(array_merge($snap['sources'] ?? [], $postSources)));
-    if ($nostrShown) $sources[] = 'nostr.wine';
+    // No Trending posts here: network-wide posts made the rail too tall.
+    // On VAAK keeps its posts section.
+    $sources = $snap['sources'] ?? [];
     $src = admin_trends_network_sources_label($sources);
-    if ($src !== '') $html .= '<div class="meta trend-sources">From ' . h($src) . '</div>';
+    if ($src !== '') $html .= '<div class="meta trend-sources">Fediverse tags from ' . h($src) . '</div>';
     $html .= '</div>';
     if ($cacheKey !== null && function_exists('ap_redis_json_set')) ap_redis_json_set($cacheKey, ['html' => $html], 300);
     return $html;
