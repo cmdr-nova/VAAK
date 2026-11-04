@@ -1352,6 +1352,12 @@ function ap_remote_media_ensure(string $actorId, string $kind = 'avatar', bool $
         $host = is_string($host) ? strtolower($host) : null;
         $iconSrc = ap_as2_media_url($doc['icon'] ?? null, $actorId);
         $imageSrc = ap_as2_media_url($doc['image'] ?? null, $actorId);
+        // No icon in the document (Wafrn): ap_remote_actor_ensure may have
+        // stored the linked Bluesky account's avatar instead; use that.
+        if ($iconSrc === null) {
+            $iconSrc = ap_remote_media_known_source($meta, 'icon_source_url', $actorId);
+            $imageSrc ??= ap_remote_media_known_source($meta, 'image_source_url', $actorId);
+        }
         ap_remote_actor_upsert($actorId, [
             'username' => $username,
             'display_name' => $display,

@@ -207,5 +207,30 @@ $check(str_contains($admin, 'ap_remote_actor_warm_async($rpActor, $rpForceRefres
 $check(str_contains($admin, 'ap_remote_media_warm_async($rpActor, $rpForceRefresh);'), 'Refresh profile forces the media warm');
 $check(str_contains($admin, '$rpForceRefresh || !$ca || !$ch || $rpAvatarStale'), 'refresh or a stale avatar queues the media warm');
 
+// 7) Wafrn documents without icon/image borrow the linked Bluesky avatar.
+vaak_eval_functions($root . '/ap-db.php', ['ap_remote_actor_doc_dids', 'ap_remote_actor_did_twin_media']);
+$wafrnDoc = ['type' => 'Person', 'preferredUsername' => 'cat',
+    'alsoKnownAs' => ['https://wafrn.example/fediverse/blog/cat', 'at://did:plc:abc123xyz']];
+$check(ap_remote_actor_doc_dids($wafrnDoc) === ['did:plc:abc123xyz'], 'at:// alias yields the DID');
+$check(ap_remote_actor_doc_dids(['alsoKnownAs' => 'https://evil.example/did:plc:abc']) === [], 'a DID buried in a URL path is not trusted');
+$check(ap_remote_actor_doc_dids(['type' => 'Person']) === [], 'no alsoKnownAs, no DIDs');
+$GLOBALS['fixture_did_fetches'] = [];
+$GLOBALS['ap_remote_actor_did_profile_fetch'] = static function (string $did): ?array {
+    $GLOBALS['fixture_did_fetches'][] = $did;
+    return ['did' => $did, 'avatar' => 'https://cdn.bsky.example/img/avatar/plain/' . $did . '/a@jpeg',
+        'banner' => 'https://cdn.bsky.example/img/banner/plain/' . $did . '/b@jpeg'];
+};
+$twin = ap_remote_actor_did_twin_media($wafrnDoc);
+$check($twin['avatar'] === 'https://cdn.bsky.example/img/avatar/plain/did:plc:abc123xyz/a@jpeg', 'twin avatar comes from the linked Bluesky profile');
+$check(is_string($twin['banner']), 'twin banner comes along');
+$check($GLOBALS['fixture_did_fetches'] === ['did:plc:abc123xyz'], 'one profile lookup for one DID');
+$GLOBALS['ap_remote_actor_did_profile_fetch'] = static fn (string $did): ?array => ['did' => $did];
+$check(ap_remote_actor_did_twin_media($wafrnDoc) === ['avatar' => null, 'banner' => null], 'linked profile without an avatar gives nothing');
+unset($GLOBALS['ap_remote_actor_did_profile_fetch']);
+$dbSrc = (string) file_get_contents($root . '/ap-db.php');
+$ensure = vaak_extract_function($dbSrc, 'ap_remote_actor_ensure');
+$check(str_contains($ensure, '$twin = ap_remote_actor_did_twin_media($doc);'), 'actor refresh falls back to the Bluesky twin when the doc has no icon');
+$check(str_contains(vaak_extract_function($r2, 'ap_remote_media_ensure'), "if (\$iconSrc === null) {"), 'media warm uses the stored twin avatar when the doc has none');
+
 @unlink(ap_media_warm_lock_path());
 echo "remote-avatar-refresh-smoke ok checks={$n}\n";
