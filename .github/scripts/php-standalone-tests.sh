@@ -38,6 +38,7 @@ php_tests=(
   api/bin/bite-queue-smoke.php
   api/bin/trend-tag-score-smoke.php
   api/bin/trends-network-smoke.php
+  api/bin/follow-suggestion-exclusions-smoke.php
   api/bin/quote-url-glued-text-smoke.php
   api/bin/known-shared-inboxes-cache-smoke.php
   api/bin/actor-bot-doc-smoke.php
