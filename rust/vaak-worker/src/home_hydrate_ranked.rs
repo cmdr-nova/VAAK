@@ -1857,16 +1857,41 @@ fn split_quote_summary(summary: &str) -> (String, Option<Value>) {
     let mut commentary = commentary.to_string();
     // The inbox preserves the explicit quote URL on a leading RE: line,
     // while the QT excerpt itself can contain no URL at all. Keep that
-    // identity for cache resolution and remove the duplicate body preamble.
-    let re_prefix = regex::Regex::new(r"(?s)^RE:\s*(https://[^\s<>]+)\s*(?:\n|$)").unwrap();
-    let explicit_url = re_prefix.captures(&commentary).map(|capture| (
-        capture[1].to_string(), capture.get(0).unwrap().end()
-    ));
-    let url = explicit_url.as_ref().map(|(url, _)| url.clone()).or_else(|| regex::Regex::new(r"https://[^\s<>]+")
+    // identity for cache resolution and remove the duplicate body line.
+    // Wafrn writes its own "RE: <url>" inside the post body, after the
+    // commentary and before the tags, so the line is not always first
+    // (PHP ap_plain_strip_raw_quote_lines drops it wherever it sits).
+    let re_line = regex::Regex::new(r"(?m)^[ \t]*RE:[ \t]*(https://[^\s<>]+)").unwrap();
+    let explicit_url = re_line
+        .captures(&commentary)
+        .map(|capture| capture[1].trim_end_matches(['.', ',', ')']).to_string());
+    let url = explicit_url.clone().or_else(|| regex::Regex::new(r"https://[^\s<>]+")
         .ok()
         .and_then(|r| r.find(quoted).map(|m| m.as_str().trim_end_matches(['.', ',', ')']).to_string())))
         .unwrap_or_default();
-    if let Some((_, end)) = explicit_url { commentary = commentary[end..].trim().to_string(); }
+    if explicit_url.is_some() {
+        let mut tidy: Vec<String> = Vec::new();
+        let mut after_re = false;
+        for line in commentary.lines() {
+            if re_line.is_match(line) {
+                // Drop the RE: token; a line that held nothing else goes too.
+                let rest = re_line.replace_all(line, "").trim().to_string();
+                if !rest.is_empty() {
+                    tidy.push(rest);
+                }
+                after_re = true;
+                continue;
+            }
+            // Wafrn's tag line after RE: starts with a stray space.
+            let line = if std::mem::take(&mut after_re) { line.trim() } else { line.trim_end() };
+            // No double blank where the RE: line used to sit.
+            if line.trim().is_empty() && tidy.last().map_or(true, |prev| prev.trim().is_empty()) {
+                continue;
+            }
+            tidy.push(line.to_string());
+        }
+        commentary = tidy.join("\n").trim().to_string();
+    }
     let acct = acct.trim_start_matches('@');
     let display = if acct.is_empty() { "Quoted post" } else { acct };
     let account_url = if url.is_empty() { String::new() } else { url.clone() };
@@ -2283,7 +2308,92 @@ pub(crate) async fn hydrate_local_quote_targets(db: &Client, statuses: &mut [Val
             }
         }
     }
+    // A quote summary that names its author ("↪ QT @bryn@host: …") but whose
+    // target is not cached still paints split_quote_summary's stub: the
+    // handle as the display name and the default avatar. Wafrn post URLs
+    // (/fediverse/post/<uuid>) carry no author, so the URL path above cannot
+    // help. Use the quoting post's own account when the author quoted
+    // themselves, else the cached remote_actors row for that handle.
+    let mut wanted: Vec<(String, String)> = Vec::new();
+    for st in statuses.iter_mut() {
+        let Some(acct) = named_stub_quote_acct(st) else { continue };
+        let outer = st.get("account").filter(|a| a.is_object()).cloned();
+        if let Some(outer) = outer.filter(|a| account_acct_matches(a, &acct)) {
+            set_quote_author(st, outer);
+            continue;
+        }
+        if let Some((user, host)) = acct.split_once('@') {
+            wanted.push((user.to_ascii_lowercase(), host.to_ascii_lowercase()));
+        }
+    }
+    wanted.sort();
+    wanted.dedup();
+    if !wanted.is_empty() {
+        let users: Vec<String> = wanted.iter().map(|(u, _)| u.clone()).collect();
+        let hosts: Vec<String> = wanted.iter().map(|(_, h)| h.clone()).collect();
+        let rows = db
+            .query(
+                // Matches idx_remote_actors_lower_host_username.
+                "SELECT DISTINCT ON (w.h, w.u) COALESCE(r.actor_id,''), w.u, w.h
+                 FROM unnest($1::text[], $2::text[]) AS w(u, h)
+                 JOIN remote_actors r
+                   ON lower(COALESCE(r.host, '')) = w.h AND lower(COALESCE(r.username, '')) = w.u
+                 WHERE COALESCE(r.actor_id,'') LIKE 'https://%'
+                 ORDER BY w.h, w.u, length(r.actor_id)",
+                &[&users, &hosts],
+            )
+            .await
+            .unwrap_or_default();
+        let by_acct: HashMap<String, String> = rows
+            .iter()
+            .map(|row| (format!("{}@{}", row.get::<_, String>(1), row.get::<_, String>(2)), row.get::<_, String>(0)))
+            .collect();
+        let ids: Vec<String> = by_acct.values().cloned().collect();
+        let actors = fetch_actors_map(db, &ids).await.unwrap_or_default();
+        for st in statuses.iter_mut() {
+            let Some(acct) = named_stub_quote_acct(st) else { continue };
+            let account = by_acct
+                .get(&acct.to_ascii_lowercase())
+                .and_then(|id| actors.get(id.trim_end_matches('/')))
+                .map(actor_to_account);
+            if let Some(account) = account {
+                set_quote_author(st, account);
+            }
+        }
+    }
     Ok(())
+}
+
+/// Handle of a quote-summary stub author that was never resolved to a real
+/// account (no cached target, still the default avatar).
+fn named_stub_quote_acct(st: &Value) -> Option<String> {
+    let q = st.get("quote").and_then(|q| q.get("quoted_status")).filter(|v| v.is_object())?;
+    if q.get("source").and_then(Value::as_str) != Some("quote-summary") {
+        return None;
+    }
+    let account = q.get("account")?;
+    let avatar = account.get("avatar").and_then(Value::as_str).unwrap_or("");
+    if !avatar.is_empty() && avatar != DEFAULT_AVATAR {
+        return None;
+    }
+    let acct = account.get("acct").and_then(Value::as_str).unwrap_or("").trim().trim_start_matches('@');
+    if acct.is_empty() || acct == "quoted" || !acct.contains('@') {
+        return None;
+    }
+    Some(acct.to_string())
+}
+
+/// Same person: compare the full handle, ignoring case and a leading "@".
+fn account_acct_matches(account: &Value, acct: &str) -> bool {
+    let own = account.get("acct").and_then(Value::as_str).unwrap_or("").trim().trim_start_matches('@');
+    !own.is_empty() && own.eq_ignore_ascii_case(acct.trim().trim_start_matches('@'))
+}
+
+fn set_quote_author(st: &mut Value, account: Value) {
+    st["quote"]["quoted_status"]["account"] = account.clone();
+    if st.get("vaak_quote_preview").is_some_and(Value::is_object) {
+        st["vaak_quote_preview"]["account"] = account;
+    }
 }
 
 /// The quote card still carries split_quote_summary's anonymous stub author.
@@ -6402,6 +6512,42 @@ mod tests {
         assert!(quoted_author_is_anonymous(&st));
         let named_st = json!({"quote": {"quoted_status": {"source": "quote-summary", "account": {"acct": "alice@masto.test"}}}});
         assert!(!quoted_author_is_anonymous(&named_st));
+    }
+
+    #[test]
+    fn wafrn_self_quote_drops_mid_body_re_line_and_reuses_outer_author() {
+        // Wafrn writes "RE: <url>" inside the body, between text and tags.
+        let target = "https://app.wafrn.net/fediverse/post/01a18f23-540b-71e9-a425-aef26add8a60";
+        let summary = format!(
+            "I SAVED AMERICA\nRE: {target}\n #RARE\n\n↪ QT @brinazarski@app.wafrn.net: i voted early\n#america"
+        );
+        let (commentary, quote) = split_quote_summary(&summary);
+        assert_eq!(commentary, "I SAVED AMERICA\n#RARE");
+        let quote = quote.expect("quote preview");
+        assert_eq!(quote["url"], target);
+        assert_eq!(quote["account"]["acct"], "brinazarski@app.wafrn.net");
+
+        // Same line as the tags: only the RE: token goes.
+        let (commentary, _) = split_quote_summary(&format!(
+            "hi\n\nRE: {target} #RARE\n\n↪ QT @a@app.wafrn.net: x"
+        ));
+        assert_eq!(commentary, "hi\n\n#RARE");
+
+        let mut st = json!({
+            "account": {"acct": "BrinAzarski@app.wafrn.net", "display_name": "bryn", "avatar": "https://media.test/bryn.webp"},
+            "quote": {"state": "accepted", "quoted_status": quote.clone()},
+            "vaak_quote_preview": quote,
+        });
+        let acct = named_stub_quote_acct(&st).expect("stub author");
+        assert!(account_acct_matches(&st["account"], &acct));
+        let outer = st["account"].clone();
+        set_quote_author(&mut st, outer);
+        assert_eq!(st["quote"]["quoted_status"]["account"]["display_name"], "bryn");
+        assert_eq!(st["vaak_quote_preview"]["account"]["avatar"], "https://media.test/bryn.webp");
+        // Resolved now: a real avatar means no second lookup.
+        assert!(named_stub_quote_acct(&st).is_none());
+        // Someone else quoting bryn does not borrow the quoter's account.
+        assert!(!account_acct_matches(&json!({"acct": "other@app.wafrn.net"}), &acct));
     }
 
     #[test]
