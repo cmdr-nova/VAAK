@@ -32836,16 +32836,29 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       padding: .3rem .75rem;
       font-size: .82rem;
     }
-    /* Temporary feed (trending topic, Search > Feeds): marked chip, ✕, note */
-    .bsky-feed-tabs > .btn.temp-feed-chip { display:inline-flex; align-items:center; gap:.35rem; }
-    .temp-feed-tag {
-      font-size: .66rem; font-weight: 700; letter-spacing: .04em; text-transform: uppercase;
-      padding: .05rem .4rem; border-radius: 999px;
-      border: 1px solid currentColor; opacity: .85;
+    /* Temporary feed (trending topic, Search > Feeds): one pill holding the
+       chip and its ✕ (two sibling links styled as one), plus a note */
+    .bsky-feed-tabs > .temp-feed-pill { flex: 0 0 auto; display: inline-flex; align-items: stretch; }
+    .temp-feed-pill > .btn {
+      white-space: nowrap; padding: .3rem .4rem .3rem .75rem; font-size: .82rem;
+      border-top-right-radius: 0; border-bottom-right-radius: 0; border-right: 0;
     }
-    .bsky-feed-tabs > .btn.temp-feed-close {
-      margin-left: -.25rem; padding: .3rem .55rem; line-height: 1;
+    .temp-feed-pill > .temp-feed-close {
+      display: inline-flex; align-items: center; padding: 0 .65rem 0 .35rem;
+      border-radius: 0 999px 999px 0; border: 1px solid var(--border); border-left: 0;
+      color: var(--muted); text-decoration: none; font-size: .78rem; line-height: 1;
     }
+    .temp-feed-pill > .btn-primary + .temp-feed-close {
+      background: color-mix(in srgb, var(--primary) 78%, #000); color: #04140c; border-color: transparent;
+    }
+    .temp-feed-pill > .temp-feed-close:hover { filter: brightness(1.15); }
+    /* One gradient across chip and ✕ where :has() works (no seam). */
+    .temp-feed-pill:has(> .btn-primary) {
+      border-radius: 999px;
+      background: linear-gradient(135deg, var(--primary), color-mix(in srgb, var(--primary) 78%, #000));
+    }
+    .temp-feed-pill:has(> .btn-primary) > .btn-primary,
+    .temp-feed-pill:has(> .btn-primary) > .temp-feed-close { background: transparent; }
     .temp-feed-note {
       display: flex; flex-wrap: wrap; align-items: center; gap: .35rem .75rem;
       margin: -.45rem .55rem .85rem; padding: .5rem .75rem;
@@ -47609,16 +47622,17 @@ window.vaakBootStatusThread();
   // A Bluesky feed opened from outside the pinned row (a trending topic,
   // Search > Feeds, Library > Feeds, or a pin newer than the cached row) has
   // no chip, which left Home with nothing picked. Give it a chip of its own
-  // at the end of the row, marked Temporary with a ✕ beside it, plus a note
-  // under the row saying it is not pinned and a link back to the feed the
-  // viewer came from. All of it goes again once another chip is live.
+  // at the end of the row with a ✕ inside the pill, plus a note under the
+  // row saying it is not pinned and a link back to the feed the viewer came
+  // from. The ✕ is its own link joined onto the chip (a link inside a link
+  // is not valid HTML). All of it goes again once another chip is live.
   // Last pinned chip (or VAAK) the viewer had open: where ✕ goes back to.
   let lastPinnedChip = 'vaak';
   function ensureActiveChip(slot, active) {
     const row = slot.querySelector('.bsky-feed-tabs');
     if (!row) return;
-    row.querySelectorAll('a[data-temp-chip], a[data-temp-close]').forEach((a) => {
-      if (a.dataset.chip !== active && a.dataset.tempFor !== active) a.remove();
+    row.querySelectorAll('[data-temp-pill]').forEach((p) => {
+      if (p.dataset.tempFor !== active) p.remove();
     });
     const note = slot.querySelector('[data-temp-feed-note]');
     if (note && note.dataset.tempFor !== active) note.remove();
@@ -47648,7 +47662,7 @@ window.vaakBootStatusThread();
     };
 
     const a = document.createElement('a');
-    a.className = 'btn btn-ghost temp-feed-chip';
+    a.className = 'btn btn-ghost';
     a.href = (typeof window.vaakSoftViewHref === 'function')
       ? window.vaakSoftViewHref('bluesky', '', { feed: active })
       : '?view=bluesky&feed=' + encodeURIComponent(active);
@@ -47657,21 +47671,21 @@ window.vaakBootStatusThread();
     a.setAttribute('data-chip', active);
     a.setAttribute('data-temp-chip', '1');
     a.setAttribute('title', 'Temporary feed, not pinned');
-    const tag = document.createElement('span');
-    tag.className = 'temp-feed-tag';
-    tag.textContent = 'Temporary';
-    a.appendChild(tag);
-    a.appendChild(document.createTextNode(' ' + label));
-    row.appendChild(a);
+    a.textContent = label;
+    const pill = document.createElement('span');
+    pill.className = 'temp-feed-pill';
+    pill.setAttribute('data-temp-pill', '1');
+    pill.dataset.tempFor = active;
+    pill.appendChild(a);
+    row.appendChild(pill);
 
-    const x = backLink('btn btn-ghost temp-feed-close', {
+    const x = backLink('temp-feed-close', {
       'data-temp-close': '1',
       'aria-label': 'Close temporary feed, back to ' + backLabel,
       title: 'Close, back to ' + backLabel,
     });
-    x.dataset.tempFor = active;
     x.textContent = '✕';
-    row.appendChild(x);
+    pill.appendChild(x);
 
     const n = document.createElement('p');
     n.className = 'temp-feed-note';
