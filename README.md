@@ -4,9 +4,9 @@
   <img src="docs/assets/vaak-readme-mascot.png" alt="VAAK mascot" width="480">
 </p>
 
-**Current release:** alpha **0.31.0** · 2026-11-04
+**Current release:** alpha **0.32.0** · 2026-11-04
 
-Notes: [v0.31.0](https://github.com/cmdr-nova/VAAK/releases/tag/v0.31.0) · [CHANGELOG](CHANGELOG.md).
+Notes: [v0.32.0](https://github.com/cmdr-nova/VAAK/releases/tag/v0.32.0) · [CHANGELOG](CHANGELOG.md).
 
 Hi, I'm Nova. VAAK is the social server I built so I could stay on the Fediverse and still have the rest of the internet I actually use in the same window.
 
@@ -69,6 +69,6 @@ A small explainable ranker can train beside the live Home ordering and compare t
 
 ## Status
 
-Active alpha. **0.31.0** is the deployed version in `api/ap-version.php`.
+Active alpha. **0.32.0** is the deployed version in `api/ap-version.php`.
 
 The label in the app comes from that file: channel, number, and date. The counter steps the last component, and `0.8.99` rolls to `0.9.00`. How that bump is applied is written up in [docs/DEPLOY.md](docs/DEPLOY.md). Federation and Bluesky still depend on the other server. I would rather keep a cache warm and a queue bounded than make a page wait on somebody else's API.
