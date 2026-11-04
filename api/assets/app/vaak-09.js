@@ -891,6 +891,13 @@
     return parkLiveColumn(timelineSnap);
   }
 
+  // Parked columns are detached DOM. A like/boost/bookmark made in another
+  // view (vaakSyncInteractionState, vaak-03.js) updates their cards too, so
+  // Home shows it when it is restored.
+  window.vaakParkedColumnRoots = function () {
+    return Array.from(parkedColumns.values()).map((p) => p && p.holder).filter(Boolean);
+  };
+
   function takeParkedColumn(view, filter) {
     const key = columnParkKey(view, filter);
     if (!key) return null;

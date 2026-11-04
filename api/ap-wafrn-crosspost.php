@@ -297,6 +297,12 @@ function ap_wafrn_replay(array $input): array
     if ($op === 'dids') {
         return ['dids' => ap_wafrn_dids_from_also_known_as($input['also_known_as'] ?? [])];
     }
+    if ($op === 'twin_match') {
+        return ['match' => ap_wafrn_twin_texts_match(
+            ap_wafrn_twin_text((string) ($input['bsky'] ?? '')),
+            ap_wafrn_twin_text((string) ($input['fedi'] ?? ''))
+        )];
+    }
 
     return ['error' => 'unknown op'];
 }
@@ -869,4 +875,252 @@ function ap_wafrn_mark_missing_table(Throwable $e): void
     if (str_contains($message, 'wafrn_bsky_actors') || str_contains($message, '42P01')) {
         $GLOBALS['ap_wafrn_actors_missing'] = true;
     }
+}
+
+/**
+ * Notification side of the cross-post dedupe (Rust: wafrn_crosspost::twin_mention_ids).
+ * A Wafrn user with a linked Bluesky account reaches the owner twice for one
+ * mention: an ActivityPub Note and a Bluesky notification. The fediverse copy
+ * stays. A Bluesky mention row is a twin when its record's fediverseId
+ * (bsky_post_links) names a post the owner also got as a fediverse mention, or
+ * its DID is a learned Wafrn actor link and that actor sent the owner a mention
+ * within 10 minutes with the same text once mentions and links are removed.
+ * Database reads, not the page, so a twin on another page still counts.
+ *
+ * @param list<int> $ids mentions.id values
+ * @return array<int,true>
+ */
+function ap_wafrn_twin_mention_ids(int $ownerUserId, array $ids): array
+{
+    $ids = array_values(array_unique(array_filter(array_map('intval', $ids), static fn(int $id): bool => $id > 0)));
+    if ($ownerUserId < 1 || $ids === [] || !function_exists('ap_db')) {
+        return [];
+    }
+    $out = [];
+    try {
+        $ph = implode(',', array_fill(0, count($ids), '?'));
+        $st = ap_db()->prepare(
+            "SELECT id, activity_id, content, created_at FROM mentions
+             WHERE owner_user_id = ? AND id IN ($ph) AND deleted_at IS NULL
+               AND activity_id LIKE 'at://%'
+               AND COALESCE(activity_type, '') IN ('Create', 'Quote')"
+        );
+        $st->execute(array_merge([$ownerUserId], $ids));
+        $cands = [];
+        foreach ($st->fetchAll() ?: [] as $row) {
+            $uri = trim((string) ($row['activity_id'] ?? ''));
+            if (!str_contains($uri, '/app.bsky.feed.post/')) {
+                continue;
+            }
+            $did = preg_match('~^at://(did:[^/]+)/~', $uri, $m) ? $m[1] : '';
+            $cands[] = [
+                'id' => (int) $row['id'],
+                'uri' => $uri,
+                'did' => $did,
+                'text' => (string) ($row['content'] ?? ''),
+                'created_at' => strtotime((string) ($row['created_at'] ?? '')) ?: 0,
+            ];
+        }
+        if ($cands === []) {
+            return [];
+        }
+
+        $links = ap_wafrn_lookup_post_links(array_column($cands, 'uri'));
+        $fediOf = [];
+        foreach ($cands as $cand) {
+            $fedi = ap_wafrn_post_identity((string) ($links[$cand['uri']] ?? ''));
+            if (str_starts_with($fedi, 'https://') && !str_starts_with($fedi, 'https://bsky.app/')) {
+                $fediOf[$cand['id']] = $fedi;
+            }
+        }
+        if ($fediOf !== []) {
+            $objects = [];
+            foreach ($fediOf as $fedi) {
+                $objects[] = $fedi;
+                $objects[] = $fedi . '/';
+            }
+            $ph = implode(',', array_fill(0, count($objects), '?'));
+            $st = ap_db()->prepare(
+                "SELECT object_id FROM mentions
+                 WHERE owner_user_id = ? AND deleted_at IS NULL AND object_id IN ($ph)
+                   AND COALESCE(activity_id, '') NOT LIKE 'at://%'"
+            );
+            $st->execute(array_merge([$ownerUserId], $objects));
+            $seen = [];
+            foreach ($st->fetchAll() ?: [] as $row) {
+                $seen[ap_wafrn_post_identity((string) ($row['object_id'] ?? ''))] = true;
+            }
+            foreach ($fediOf as $id => $fedi) {
+                if (isset($seen[$fedi])) {
+                    $out[$id] = true;
+                }
+            }
+        }
+
+        $undecided = array_values(array_filter($cands, static fn(array $c): bool => !isset($out[$c['id']])
+            && !isset($fediOf[$c['id']]) && str_starts_with($c['did'], 'did:') && $c['created_at'] > 0));
+        if ($undecided === []) {
+            return $out;
+        }
+        $didToActors = ap_wafrn_lookup_actor_links(array_column($undecided, 'did'), []);
+        $actors = [];
+        $min = PHP_INT_MAX;
+        $max = 0;
+        foreach ($undecided as $cand) {
+            foreach ($didToActors[$cand['did']] ?? [] as $actor) {
+                $id = ap_wafrn_post_identity((string) $actor);
+                if ($id !== '') {
+                    $actors[$id] = true;
+                    $actors[$id . '/'] = true;
+                }
+            }
+            if (isset($didToActors[$cand['did']])) {
+                $min = min($min, $cand['created_at'] - 600);
+                $max = max($max, $cand['created_at'] + 600);
+            }
+        }
+        if ($actors === [] || $min > $max) {
+            return $out;
+        }
+        $actorIds = array_keys($actors);
+        $ph = implode(',', array_fill(0, count($actorIds), '?'));
+        $st = ap_db()->prepare(
+            "SELECT actor_id, content, created_at FROM mentions
+             WHERE owner_user_id = ? AND deleted_at IS NULL AND actor_id IN ($ph)
+               AND created_at >= ? AND created_at <= ?
+               AND COALESCE(activity_id, '') NOT LIKE 'at://%'
+             ORDER BY id DESC LIMIT 64"
+        );
+        $st->execute(array_merge([$ownerUserId], $actorIds, [gmdate('Y-m-d\TH:i:s', $min), gmdate('Y-m-d\TH:i:s', $max) . '~']));
+        $fediRows = [];
+        foreach ($st->fetchAll() ?: [] as $row) {
+            $fediRows[] = [
+                ap_wafrn_post_identity((string) ($row['actor_id'] ?? '')),
+                strtotime((string) ($row['created_at'] ?? '')) ?: 0,
+                ap_wafrn_twin_text((string) ($row['content'] ?? '')),
+            ];
+        }
+        foreach ($undecided as $cand) {
+            $linked = [];
+            foreach ($didToActors[$cand['did']] ?? [] as $actor) {
+                $linked[ap_wafrn_post_identity((string) $actor)] = true;
+            }
+            if ($linked === []) {
+                continue;
+            }
+            $text = ap_wafrn_twin_text($cand['text']);
+            foreach ($fediRows as [$actor, $created, $fediText]) {
+                if (isset($linked[$actor]) && $created > 0 && abs($created - $cand['created_at']) <= 600
+                    && ap_wafrn_twin_texts_match($text, $fediText)) {
+                    $out[$cand['id']] = true;
+                    break;
+                }
+            }
+        }
+    } catch (Throwable $e) {
+        ap_wafrn_mark_missing_table($e);
+        error_log('[ap-wafrn] twin mention check: ' . $e->getMessage());
+    }
+
+    return $out;
+}
+
+/** Mention text without anchors, @mentions, #tags, "↪ QT" lines, links, bare domains, or whitespace. */
+function ap_wafrn_twin_text(string $raw): string
+{
+    // Mentions, links, and hashtags are anchors in the Note HTML; their text differs per side.
+    $raw = preg_replace('~<a\b[^>]*>.*?</a>~isu', ' ', $raw) ?? $raw;
+    $plain = ap_wafrn_plain_text($raw);
+    $plain = preg_replace('/^\s*↪ QT \S*\s*$/mu', ' ', $plain) ?? $plain;
+    $plain = preg_replace('/(?:^|\s)[@#][\w.\-]+(?:@[\w.\-]+)?/u', ' ', $plain) ?? $plain;
+    $plain = preg_replace('~https?://\S+~iu', ' ', $plain) ?? $plain;
+    $plain = preg_replace('~(?:^|\s)[\w\-]+(?:\.[\w\-]+)+(?:/\S*)?~u', ' ', $plain) ?? $plain;
+
+    return mb_strtolower(ap_wafrn_normalize_text($plain), 'UTF-8');
+}
+
+/** Same text, or (Bluesky's 300-character cut) one copy starts with the other. */
+function ap_wafrn_twin_texts_match(string $a, string $b): bool
+{
+    if ($a === '' || $b === '') {
+        return false;
+    }
+    if ($a === $b) {
+        return true;
+    }
+    $a = rtrim($a, '….');
+    $b = rtrim($b, '….');
+    $shorter = min(mb_strlen($a, 'UTF-8'), mb_strlen($b, 'UTF-8'));
+
+    return $shorter >= 24 && (str_starts_with($a, $b) || str_starts_with($b, $a));
+}
+
+/** The mentions.id behind a notification item (entity or page pool row). */
+function ap_wafrn_notification_mention_db_id(mixed $item): int
+{
+    if (!is_array($item)) {
+        return 0;
+    }
+    $row = is_array($item['row'] ?? null) ? $item['row'] : null;
+    if ($row !== null) {
+        $kind = (string) ($item['kind'] ?? 'mention');
+        return $kind === 'mention' ? max(0, (int) ($row['id'] ?? 0)) : 0;
+    }
+    $type = (string) ($item['type'] ?? '');
+    if (!in_array($type, ['mention', 'quote', 'status'], true)) {
+        return 0;
+    }
+    $raw = preg_replace('/\D/', '', (string) ($item['id'] ?? '')) ?? '';
+    if ($raw === '' || strlen($raw) > 19) {
+        return 0;
+    }
+    $id = (int) $raw;
+    if ($id > 0 && $id < 1000000) {
+        return $id;
+    }
+    if ($id >= 1000000000000000000 && intdiv($id % 1000000000, 100000000) === 5) {
+        return $id % 100000000;
+    }
+
+    return 0;
+}
+
+/**
+ * Drop Bluesky copies of Wafrn mentions from a notification list.
+ *
+ * @param array<int,mixed> $items
+ * @return array<int,mixed> a list, or the surviving keys when $keepKeys
+ */
+function ap_notifications_drop_wafrn_twins(array $items, int $ownerUserId, bool $keepKeys = false): array
+{
+    if ($items === [] || $ownerUserId < 1) {
+        return $items;
+    }
+    $ids = [];
+    foreach ($items as $index => $item) {
+        $id = ap_wafrn_notification_mention_db_id($item);
+        if ($id > 0) {
+            $ids[$index] = $id;
+        }
+    }
+    if ($ids === []) {
+        return $items;
+    }
+    $twins = ap_wafrn_twin_mention_ids($ownerUserId, array_values($ids));
+    if ($twins === []) {
+        return $items;
+    }
+    $out = [];
+    foreach ($items as $index => $item) {
+        if (isset($ids[$index]) && isset($twins[$ids[$index]])) {
+            continue;
+        }
+        if ($keepKeys) {
+            $out[$index] = $item;
+        } else {
+            $out[] = $item;
+        }
+    }
+
+    return $out;
 }

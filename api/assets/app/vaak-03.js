@@ -1407,6 +1407,64 @@ window.apAdminToast = function (msg, isErr) {
     }
   }
 
+  // One post can be on screen more than once: a mention in Notifications and
+  // the same post on Home (parked while Notifications is open), a profile, or
+  // a thread. After a like, boost, or bookmark is saved, every other copy in
+  // the page and in parked columns takes the same state. Matched by object
+  // URI (and Bluesky at:// URI); status ids differ per view.
+  const SYNC_ACTIONS = {
+    favourite: ['favourite_status', 'unfavourite_status'],
+    bookmark: ['bookmark_status', 'unbookmark_status'],
+    reblog: ['reblog_status', 'unreblog_status'],
+  };
+  const SYNC_BSKY = { favourite: 'like', bookmark: 'bookmark', reblog: 'repost' };
+  function syncKey(raw) {
+    let s = String(raw || '').trim();
+    if (!s) return '';
+    s = s.replace(/^bsky:(?=at:\/\/)/, '').replace(/#announce-\d+$/, '').replace(/\/+$/, '');
+    return s.toLowerCase();
+  }
+  function syncRoots() {
+    const roots = [document];
+    try {
+      if (typeof window.vaakParkedColumnRoots === 'function') {
+        window.vaakParkedColumnRoots().forEach((root) => { if (root) roots.push(root); });
+      }
+    } catch (e) {}
+    return roots;
+  }
+  window.vaakSyncInteractionState = function (kind, active, keys, origin) {
+    const actions = SYNC_ACTIONS[kind];
+    if (!actions) return;
+    const want = new Set();
+    (keys || []).forEach((key) => { const k = syncKey(key); if (k) want.add(k); });
+    if (!want.size) return;
+    active = !!active;
+    syncRoots().forEach((root) => {
+      root.querySelectorAll('form input[name="object_id"]').forEach((input) => {
+        if (!want.has(syncKey(input.value))) return;
+        const form = input.closest('form');
+        if (!form || form === origin || form.dataset.busy === '1' || form.dataset.queuePending === '1') return;
+        const actionInput = form.querySelector('input[name="action"]');
+        const btn = form.querySelector('button[type="submit"]');
+        if (!actionInput || !btn || actions.indexOf(actionInput.value) < 0) return;
+        const current = btn.classList.contains('on');
+        if (current === active) return;
+        applyInteractButton(form, { ok: true, kind: kind, active: active }, current);
+      });
+      const bskyKind = SYNC_BSKY[kind];
+      root.querySelectorAll('button.bsky-action[data-bsky-action="' + bskyKind + '"]').forEach((btn) => {
+        if (btn === origin || btn.dataset.busy === '1' || btn.dataset.queuePending === '1') return;
+        const card = btn.closest('article');
+        const refs = [btn.dataset.uri, btn.dataset.objectRef, btn.dataset.objectId,
+          card && card.dataset.bskyUri, card && card.dataset.bskyObject];
+        if (!refs.some((ref) => want.has(syncKey(ref)))) return;
+        if (btn.classList.contains('on') === active) return;
+        if (typeof window.vaakApplyBskyState === 'function') window.vaakApplyBskyState(btn, kind, active);
+      });
+    });
+  };
+
   function snapshotInteractButton(form) {
     const btn = form.querySelector('button[type="submit"]');
     const actionInput = form.querySelector('input[name="action"]');
@@ -1651,6 +1709,11 @@ window.apAdminToast = function (msg, isErr) {
       }
       // beforeActive = current (optimistic) state so counts do not double-bump.
       applyInteractButton(form, data, btn ? btn.classList.contains('on') : !!data.active);
+      if (data.kind && typeof data.active === 'boolean') {
+        const oidInput = form.querySelector('input[name="object_id"]');
+        window.vaakSyncInteractionState(data.kind, data.active,
+          [data.object_id, oidInput ? oidInput.value : ''], form);
+      }
       if (data.queued && data.queue_id) {
         form.dataset.queuePending = '1';
         form.dataset.queueId = String(data.queue_id);

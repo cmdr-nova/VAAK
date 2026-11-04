@@ -1206,6 +1206,11 @@ pub async fn drop_bsky_hidden_notifications(
     if owner < 1 || items.is_empty() || !items.iter().any(notification_may_be_bluesky) {
         return Ok(());
     }
+    // Wafrn users with a linked Bluesky account reach the owner twice for one
+    // mention. Keep the fediverse copy, as timelines and profiles do.
+    if let Err(error) = crate::wafrn_crosspost::drop_twin_notifications(db, owner, items).await {
+        tracing::warn!(%error, "notification wafrn twin check skipped");
+    }
     let hide = match load_bsky_hide_dids(db, owner).await {
         Ok(set) => set,
         Err(error) => {

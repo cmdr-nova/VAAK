@@ -346,6 +346,60 @@
         }
       ],
       "expect": {"drop": [], "learn": []}
+    },
+    {
+      "id": "notif-twin-leading-mention",
+      "op": "twin_match",
+      "bsky": "Uh, I wish to poke the horns.",
+      "fedi": "<p><span class=\"h-card\"><a href=\"https://mkultra.monster/users/cmdr_nova\" class=\"u-url mention\">@<span>cmdr_nova</span></a></span> <a href=\"https://mkultra.monster/users/cmdr_nova\">@cmdr_nova@mkultra.monster</a></p><p><br></p><p>Uh, I wish to poke the horns.</p>",
+      "expect": {
+        "match": true
+      }
+    },
+    {
+      "id": "notif-twin-quote-line-and-link",
+      "op": "twin_match",
+      "bsky": "look at this https://example.com/a\n\n↪ QT https://bsky.app/profile/x/post/1",
+      "fedi": "<p>@cmdr_nova@mkultra.monster look at this <a href=\"https://example.com/a\">example.com/a</a></p>",
+      "expect": {
+        "match": true
+      }
+    },
+    {
+      "id": "notif-twin-cut-at-300",
+      "op": "twin_match",
+      "bsky": "the first part of a long post that Bluesky cut short…",
+      "fedi": "<p>@cmdr_nova the first part of a long post that Bluesky cut short and then it keeps going</p>",
+      "expect": {
+        "match": true
+      }
+    },
+    {
+      "id": "notif-twin-different-text",
+      "op": "twin_match",
+      "bsky": "see you tomorrow",
+      "fedi": "<p>@cmdr_nova@mkultra.monster see you today</p>",
+      "expect": {
+        "match": false
+      }
+    },
+    {
+      "id": "notif-twin-short-prefix-is-not-enough",
+      "op": "twin_match",
+      "bsky": "ok",
+      "fedi": "<p>@cmdr_nova ok sure thing</p>",
+      "expect": {
+        "match": false
+      }
+    },
+    {
+      "id": "notif-twin-empty",
+      "op": "twin_match",
+      "bsky": "",
+      "fedi": "<p>@cmdr_nova@mkultra.monster</p>",
+      "expect": {
+        "match": false
+      }
     }
   ]
 }
