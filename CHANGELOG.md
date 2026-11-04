@@ -12,6 +12,13 @@ anything else bumps the patch number.
 Releases up to **0.9.83** used a two-digit deploy counter (0.9.05, 0.9.83)
 and have no notes here; their tags and GitHub Releases are unchanged.
 
+## [0.38.0](https://github.com/cmdr-nova/VAAK/releases/tag/v0.38.0) - 2026-11-04
+
+### ✨ Features
+* Notifications: drop Wafrn Bluesky twins; sync likes/boosts/bookmarks across views by @cmdr-nova in https://github.com/cmdr-nova/VAAK/pull/383
+
+**Full Changelog**: https://github.com/cmdr-nova/VAAK/compare/v0.37.1...v0.38.0
+
 ## [0.37.1](https://github.com/cmdr-nova/VAAK/releases/tag/v0.37.1) - 2026-11-04
 
 ### 🐛 Fixes
