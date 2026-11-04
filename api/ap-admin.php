@@ -19756,6 +19756,17 @@ function admin_render_event_tweet(array $e, array $followingIds, string $returnV
                 $quotedStatusUrl = $cand;
             }
         }
+        // The card owns the quote target, so drop the "RE: <url>" fallback
+        // line from the body. Wafrn puts it mid-body (after the text, before
+        // the tags), so it is not always the first line.
+        if ($commentary !== '' && str_contains($commentary, 'RE:')) {
+            $stripped = preg_replace('/(?:^|\R)[ \t]*RE:[ \t]*https:\/\/[^\s<>]+[ \t]*/u', '', $commentary);
+            if (is_string($stripped)) {
+                $stripped = preg_replace('/\n{3,}/u', "\n\n", $stripped) ?? $stripped;
+                $commentary = trim($stripped);
+                $quoteParts['commentary'] = $commentary;
+            }
+        }
         if ($quotedStatusUrl !== '' && function_exists('ap_masto_lookup_status_by_object_url')) {
             $quotedStatus = ap_masto_lookup_status_by_object_url($quotedStatusUrl, 0, false);
             // Cache miss: queue a background ensure so the next paint can show
