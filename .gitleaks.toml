@@ -33,3 +33,8 @@ regexes = ['''^SHA-256=abcd$''']
 description = "Browser localStorage key name for the trends sidebar On VAAK / Across networks choice (PR #363). Not a credential."
 regexTarget = "secret"
 regexes = ['''^vaak\.trends\.scope\.v\d+$''']
+
+[[allowlists]]
+description = "Browser sessionStorage key name for the trends sidebar module cache. Not a credential."
+regexTarget = "secret"
+regexes = ['''^vaak\.trends\.modules\.v\d+$''']
