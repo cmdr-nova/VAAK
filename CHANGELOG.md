@@ -12,6 +12,17 @@ anything else bumps the patch number.
 Releases up to **0.9.83** used a two-digit deploy counter (0.9.05, 0.9.83)
 and have no notes here; their tags and GitHub Releases are unchanged.
 
+## [0.34.0](https://github.com/cmdr-nova/VAAK/releases/tag/v0.34.0) - 2026-11-04
+
+### ✨ Features
+* Temporary feed chip: drop the Temporary tag, put ✕ inside the pill by @cmdr-nova in https://github.com/cmdr-nova/VAAK/pull/375
+### 🐛 Fixes
+* Nostr: say which step failed instead of a bare "VAAK did not answer" by @cmdr-nova in https://github.com/cmdr-nova/VAAK/pull/374
+### ⚡ Performance
+* Speed up first Home load: share the worker's ranked cache key by @cmdr-nova in https://github.com/cmdr-nova/VAAK/pull/373
+
+**Full Changelog**: https://github.com/cmdr-nova/VAAK/compare/v0.33.0...v0.34.0
+
 ## [0.33.0](https://github.com/cmdr-nova/VAAK/releases/tag/v0.33.0) - 2026-11-04
 
 ### ✨ Features
