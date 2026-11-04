@@ -104,6 +104,7 @@ mod inbox_accept;
 mod fanout_delivery;
 mod inbox_key_fetch;
 mod inbox_origin;
+mod inbox_route_shadow;
 mod inbox_sig_shadow;
 mod parity_replay;
 

@@ -182,4 +182,33 @@ $stats = $redis->hGetAll('vaak:inbox_rust:stats:v1');
 $check((int) ($stats['spooled'] ?? 0) === 4 && (int) ($stats['spooled_mismatch'] ?? 0) === 2 && (int) ($stats['fwd_key_not_public'] ?? 0) === 1
     && (int) ($stats['fwd_key_negative'] ?? 0) === 1 && (int) ($stats['fwd_blocked'] ?? 0) === 2 && !isset($stats['fwd_actor_mismatch']) && (int) ($stats['fwd_signature'] ?? 0) === 1 && (int) ($stats['fwd_unknown_user'] ?? 0) === 1, 'stats count each outcome');
 
+// Cutover F3 shadow (the worker runs with VAAK_INBOX_ROUTE_SHADOW=1): each
+// spooled Delete carries the result Rust predicts, and the drain agrees.
+$db->prepare("INSERT INTO events (created_at, type, actor_id, object_id, action_taken) VALUES (?, 'Create', ?, ?, 'log')")
+    ->execute([gmdate('c'), $alice, $alice . '/statuses/20']);
+$deletes = [
+    'local_status_delete' => ['id' => $alice . '#delete/20', 'type' => 'Delete', 'actor' => $alice,
+        'object' => ['type' => 'Tombstone', 'id' => $alice . '/statuses/20']],
+    'delete_noop' => ['id' => $alice . '#delete/21', 'type' => 'Delete', 'actor' => $alice, 'object' => $alice . '/statuses/21'],
+    'delete_noop foreign' => ['id' => $alice . '#delete/22', 'type' => 'Delete', 'actor' => $alice, 'object' => 'https://other.test/notes/22'],
+];
+$redis->del('vaak:inbox_route_shadow:stats:v1');
+foreach ($deletes as $label => $doc) {
+    $body = json_encode($doc, JSON_UNESCAPED_SLASHES);
+    [$status] = smoke_post($rust, '/inbox', $body, $aliceKey, $priv);
+    $check($status === 202, "F3: {$label} Delete is spooled");
+    $predicted = $db->query("SELECT r.rust_result FROM ap_inbox_spool s JOIN ap_inbox_route_shadow r ON r.spool_id = s.id
+                             WHERE s.body = " . $db->quote($body))->fetchColumn();
+    $check($predicted === explode(' ', $label)[0], "F3: Rust predicts {$label} (got " . var_export($predicted, true) . ')');
+}
+shell_exec('VAAK_FPM_POOL_CONF=/nonexistent ' . $cmd);
+foreach ($deletes as $label => $doc) {
+    $result = $db->query("SELECT result FROM ap_inbox_spool WHERE body = " . $db->quote(json_encode($doc, JSON_UNESCAPED_SLASHES)))->fetchColumn();
+    $check($result === explode(' ', $label)[0], "F3: PHP routes {$label} the same (got " . var_export($result, true) . ')');
+}
+$shadow = $redis->hGetAll('vaak:inbox_route_shadow:stats:v1');
+$check((int) ($shadow['agree'] ?? 0) === 3 && !isset($shadow['disagree']), 'F3: the drain counts three agreements');
+$likeShadow = (int) $db->query("SELECT count(*) FROM ap_inbox_route_shadow r JOIN ap_inbox_spool s ON s.id = r.spool_id WHERE s.activity_type <> 'Delete'")->fetchColumn();
+$check($likeShadow === 0, 'F3: only Deletes get a prediction');
+
 echo "inbox-rust-accept: {$n} checks passed\n";

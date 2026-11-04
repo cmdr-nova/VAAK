@@ -130,6 +130,7 @@ function vaak_migrate_deploy_sql_files(string $apiRoot): array
         '20261103_nostr_followers_postgres.sql',
         '20261103_nostr_quote_links_postgres.sql',
         '20261103_nostr_note_counts_postgres.sql',
+        '20261104_inbox_route_shadow_postgres.sql',
     ];
     $files = [];
     $migrations = $root . DIRECTORY_SEPARATOR . 'migrations' . DIRECTORY_SEPARATOR;
