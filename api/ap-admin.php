@@ -1087,12 +1087,20 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
     $nostrModeration = in_array($action, ['nostr_hide', 'nostr_unhide', 'nostr_block', 'nostr_unblock'], true);
     if ($action === 'nostr_prepare' || $action === 'nostr_publish' || $action === 'nostr_bunker_sign' || $action === 'nostr_zap_status' || $nostrModeration) {
         require_once __DIR__ . '/ap-nostr.php';
-        $nostrReply = $nostrModeration
-            ? ap_nostr_moderation_action($action, (int) admin_owner_user_id(), !empty($vaakIsAdmin), $_POST)
-            : ap_nostr_action($action, (int) admin_owner_user_id(), !empty($vaakIsAdmin), $_POST);
+        // A bunker signature can take 45 s and a follow edit reads relays
+        // first: don't let the default time limit cut the JSON answer off.
+        @set_time_limit(120);
+        $nostrOwner = (int) admin_owner_user_id();
+        // Nothing here writes the session: release its lock before the
+        // worker call so the page's other requests don't queue behind it.
         if (function_exists('ap_auth_session_write_close')) {
             ap_auth_session_write_close();
+        } elseif (session_status() === PHP_SESSION_ACTIVE) {
+            session_write_close();
         }
+        $nostrReply = $nostrModeration
+            ? ap_nostr_moderation_action($action, $nostrOwner, !empty($vaakIsAdmin), $_POST)
+            : ap_nostr_action($action, $nostrOwner, !empty($vaakIsAdmin), $_POST);
         header('Content-Type: application/json; charset=utf-8');
         header('Cache-Control: no-store');
         http_response_code($nostrReply['status']);
@@ -54663,10 +54671,15 @@ if (VIEW === 'analytics') loadAnalytics();
         headers: { 'Accept': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
         body: body
       });
-      const data = await res.json();
+      const text = await res.text();
+      let data = null;
+      try { data = JSON.parse(text); } catch (e) {}
       if (data && typeof data === 'object') return data;
+      // Not JSON: a gateway timeout or a PHP error page. Name the step and
+      // the HTTP status so the cause can be found in the server logs.
+      return { ok: false, error: 'VAAK did not answer (' + (fields.action || 'request') + ', HTTP ' + res.status + '). Try again.' };
     } catch (e) {}
-    return { ok: false, error: 'VAAK did not answer. Try again.' };
+    return { ok: false, error: 'VAAK did not answer (' + (fields.action || 'request') + ', connection dropped). Try again.' };
   }
 
   // No extension (an iPhone Home Screen app never loads Safari extensions,
