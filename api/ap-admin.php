@@ -32764,6 +32764,24 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       padding: .3rem .75rem;
       font-size: .82rem;
     }
+    /* Temporary feed (trending topic, Search > Feeds): marked chip, ✕, note */
+    .bsky-feed-tabs > .btn.temp-feed-chip { display:inline-flex; align-items:center; gap:.35rem; }
+    .temp-feed-tag {
+      font-size: .66rem; font-weight: 700; letter-spacing: .04em; text-transform: uppercase;
+      padding: .05rem .4rem; border-radius: 999px;
+      border: 1px solid currentColor; opacity: .85;
+    }
+    .bsky-feed-tabs > .btn.temp-feed-close {
+      margin-left: -.25rem; padding: .3rem .55rem; line-height: 1;
+    }
+    .temp-feed-note {
+      display: flex; flex-wrap: wrap; align-items: center; gap: .35rem .75rem;
+      margin: -.45rem .55rem .85rem; padding: .5rem .75rem;
+      border: 1px dashed var(--border); border-radius: 10px;
+      color: var(--muted); font-size: .82rem; line-height: 1.35;
+    }
+    .temp-feed-note .temp-feed-back { color: var(--primary); font-weight: 600; text-decoration: none; white-space: nowrap; }
+    .temp-feed-note .temp-feed-back:hover { text-decoration: underline; }
     .timeline-skeleton { display:grid; gap:.6rem; margin:.5rem 0; }
     .timeline-skeleton-row { height:7.5rem; border:1px solid var(--border); border-radius:12px; background:linear-gradient(100deg,var(--panel) 30%,#202420 45%,var(--panel) 60%); background-size:220% 100%; animation:timeline-shimmer 1.1s linear infinite; }
     .trends-skeleton { display:grid; gap:.45rem; margin:.35rem 0 0; }
@@ -47519,24 +47537,82 @@ window.vaakBootStatusThread();
   // A Bluesky feed opened from outside the pinned row (a trending topic,
   // Search > Feeds, Library > Feeds, or a pin newer than the cached row) has
   // no chip, which left Home with nothing picked. Give it a chip of its own
-  // at the end of the row; it goes again once another chip is live.
+  // at the end of the row, marked Temporary with a ✕ beside it, plus a note
+  // under the row saying it is not pinned and a link back to the feed the
+  // viewer came from. All of it goes again once another chip is live.
+  // Last pinned chip (or VAAK) the viewer had open: where ✕ goes back to.
+  let lastPinnedChip = 'vaak';
   function ensureActiveChip(slot, active) {
     const row = slot.querySelector('.bsky-feed-tabs');
     if (!row) return;
-    row.querySelectorAll('a[data-temp-chip]').forEach((a) => {
-      if (a.dataset.chip !== active) a.remove();
+    row.querySelectorAll('a[data-temp-chip], a[data-temp-close]').forEach((a) => {
+      if (a.dataset.chip !== active && a.dataset.tempFor !== active) a.remove();
     });
-    const has = Array.prototype.some.call(row.querySelectorAll('a[data-chip]'), (a) => a.dataset.chip === active);
-    if (has || active === 'vaak') return;
+    const note = slot.querySelector('[data-temp-feed-note]');
+    if (note && note.dataset.tempFor !== active) note.remove();
+    const pinned = Array.prototype.filter.call(row.querySelectorAll('a[data-chip]'), (a) => a.dataset.tempChip !== '1');
+    const pinnedKeys = pinned.map((a) => a.dataset.chip);
+    if (active === 'vaak' || pinnedKeys.indexOf(active) >= 0) {
+      lastPinnedChip = active;
+      return;
+    }
+    const has = Array.prototype.some.call(row.querySelectorAll('a[data-temp-chip]'), (a) => a.dataset.chip === active);
+    if (has) return;
+    const label = slot.dataset.activeLabel || (active === 'following' ? 'Following' : 'Feed');
+    const back = pinnedKeys.indexOf(lastPinnedChip) >= 0 ? lastPinnedChip : 'vaak';
+    const backChip = pinned[pinnedKeys.indexOf(back)] || null;
+    const backLabel = backChip ? String(backChip.textContent || '').trim() || 'VAAK' : 'VAAK';
+    const backHref = (typeof window.vaakSoftViewHref === 'function')
+      ? (back === 'vaak' ? window.vaakSoftViewHref('home') : window.vaakSoftViewHref('bluesky', '', { feed: back }))
+      : (back === 'vaak' ? '?view=home' : '?view=bluesky&feed=' + encodeURIComponent(back));
+    const backLink = (cls, attrs) => {
+      const b = document.createElement('a');
+      b.className = cls;
+      b.href = backHref;
+      b.setAttribute('data-vaak-soft-nav', back === 'vaak' ? 'home' : 'bluesky');
+      if (back !== 'vaak') b.setAttribute('data-bsky-feed', back);
+      Object.keys(attrs).forEach((k) => b.setAttribute(k, attrs[k]));
+      return b;
+    };
+
     const a = document.createElement('a');
-    a.className = 'btn btn-ghost';
-    a.href = '?view=bluesky&feed=' + encodeURIComponent(active);
+    a.className = 'btn btn-ghost temp-feed-chip';
+    a.href = (typeof window.vaakSoftViewHref === 'function')
+      ? window.vaakSoftViewHref('bluesky', '', { feed: active })
+      : '?view=bluesky&feed=' + encodeURIComponent(active);
     a.setAttribute('data-vaak-soft-nav', 'bluesky');
     a.setAttribute('data-bsky-feed', active);
     a.setAttribute('data-chip', active);
     a.setAttribute('data-temp-chip', '1');
-    a.textContent = slot.dataset.activeLabel || (active === 'following' ? 'Following' : 'Feed');
+    a.setAttribute('title', 'Temporary feed, not pinned');
+    const tag = document.createElement('span');
+    tag.className = 'temp-feed-tag';
+    tag.textContent = 'Temporary';
+    a.appendChild(tag);
+    a.appendChild(document.createTextNode(' ' + label));
     row.appendChild(a);
+
+    const x = backLink('btn btn-ghost temp-feed-close', {
+      'data-temp-close': '1',
+      'aria-label': 'Close temporary feed, back to ' + backLabel,
+      title: 'Close, back to ' + backLabel,
+    });
+    x.dataset.tempFor = active;
+    x.textContent = '✕';
+    row.appendChild(x);
+
+    const n = document.createElement('p');
+    n.className = 'temp-feed-note';
+    n.setAttribute('data-temp-feed-note', '1');
+    n.setAttribute('role', 'status');
+    n.dataset.tempFor = active;
+    const txt = document.createElement('span');
+    txt.textContent = 'You’re viewing “' + label + '”, a temporary feed. It isn’t pinned and goes away when you switch feeds.';
+    n.appendChild(txt);
+    const bl = backLink('temp-feed-back', {});
+    bl.textContent = '← Back to ' + backLabel;
+    n.appendChild(bl);
+    if (row.nextSibling) slot.insertBefore(n, row.nextSibling); else slot.appendChild(n);
   }
   // Each switch paints a fresh chip row scrolled to the start, so a feed far
   // down a long row ended up selected but off screen. Bring it into view
