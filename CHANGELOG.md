@@ -12,6 +12,14 @@ anything else bumps the patch number.
 Releases up to **0.9.83** used a two-digit deploy counter (0.9.05, 0.9.83)
 and have no notes here; their tags and GitHub Releases are unchanged.
 
+## [0.37.0](https://github.com/cmdr-nova/VAAK/releases/tag/v0.37.0) - 2026-11-04
+
+### ✨ Features
+* Home: Klipy GIFs without a Bluesky thumbnail show the MP4's first frame by @cmdr-nova in https://github.com/cmdr-nova/VAAK/pull/380
+* Inbox: Rust shadow-predicts how the router handles Deletes (F3) by @cmdr-nova in https://github.com/cmdr-nova/VAAK/pull/381
+
+**Full Changelog**: https://github.com/cmdr-nova/VAAK/compare/v0.36.0...v0.37.0
+
 ## [0.36.0](https://github.com/cmdr-nova/VAAK/releases/tag/v0.36.0) - 2026-11-04
 
 ### ✨ Features
