@@ -35,6 +35,7 @@ php_tests=(
   api/bin/account-acct-key-error-smoke.php
   api/bin/avatar-refresh-smoke.php
   api/bin/post-media-warm-busy-smoke.php
+  api/bin/remote-avatar-refresh-smoke.php
   api/bin/bite-queue-smoke.php
   api/bin/trend-tag-score-smoke.php
   api/bin/trends-network-smoke.php
