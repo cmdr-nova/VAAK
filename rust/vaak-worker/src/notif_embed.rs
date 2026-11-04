@@ -3410,6 +3410,11 @@ fn attachment_paint_kind(att: &Value, url: &str) -> &'static str {
     if mime.starts_with("audio/") || declared == "audio" {
         return "audio";
     }
+    // A GIF file inside <video> never plays (black box, crossed-out play
+    // icon); paint it as an animated image whatever the type says.
+    if url.split(['?', '#']).next().unwrap_or("").to_ascii_lowercase().ends_with(".gif") {
+        return "image";
+    }
     if declared == "gifv" {
         return "gifv";
     }

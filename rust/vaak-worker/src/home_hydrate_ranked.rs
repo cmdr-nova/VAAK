@@ -796,11 +796,22 @@ fn bsky_media_and_card(embed_json: &str, status_id: &str) -> (Vec<Value>, Option
                 || uri.contains("klipy.com/");
             if looks_media {
                 let thumb = ext.get("thumb").and_then(|v| v.as_str()).unwrap_or("");
+                let thumb = if thumb.starts_with("https://") { thumb } else { "" };
+                // PHP ap_masto_animated_media_from_url parity: Klipy GIF links
+                // (Bluesky's GIF picker) carry ?mp4=ID, and only that sibling
+                // MP4 plays in a <video>. A bare .gif stays an animated image.
+                let (play, preview, kind, mime) = crate::search_collect::bsky::animated_media(uri, thumb);
+                let kind = if mime == Some("image/gif") || kind == "image" {
+                    if play.split(['?', '#']).next().unwrap_or("").to_ascii_lowercase().ends_with(".gif") { "image" } else { "gifv" }
+                } else {
+                    kind
+                };
                 media.push(json!({
                     "id": format!("{status_id}#media-{}", media.len() + 1),
-                    "type": "gifv",
-                    "url": uri,
-                    "preview_url": if thumb.starts_with("https://") { thumb } else { uri },
+                    "type": kind,
+                    "url": play,
+                    "preview_url": preview,
+                    "mediaType": mime,
                     "remote_url": uri,
                     "description": ext.get("title").and_then(|v| v.as_str()).unwrap_or("GIF"),
                     "blurhash": Value::Null,
@@ -6929,6 +6940,21 @@ mod timeline_contract {
         let link = materialize_bsky(&bsky_row("read", json!({"$type": "app.bsky.embed.external#view",
             "external": {"uri": "https://example.com/a", "title": "A", "description": "d", "thumb": ""}})));
         assert_eq!(checked(&link).card.as_ref().map(|c| c.url.as_str()), Some("https://example.com/a"));
+    }
+
+    #[test]
+    fn bluesky_klipy_and_tenor_gifs_paint_playable_media() {
+        let klipy = materialize_bsky(&bsky_row("Enjoy this beautiful day!!!", json!({"$type": "app.bsky.embed.external#view",
+            "external": {"uri": "https://static.klipy.com/ii/c3a1/25/8c/iZITSvkQ.gif?hh=480&ww=480&mp4=TqZsKsUP&webm=7sIjx",
+                "title": "Pudgy Penguin", "description": "", "thumb": "https://cdn.bsky.app/img/feed_thumbnail/plain/did:plc:x/bafkreithumb@jpeg"}})));
+        let html = crate::notif_embed::paint_lean_feed_card_opts(&klipy, "home", "");
+        assert!(html.contains("src=\"https://static.klipy.com/ii/c3a1/25/8c/TqZsKsUP.mp4\""), "{html}");
+        assert!(!html.contains("iZITSvkQ.gif?hh"), "GIF fed to <video>: {html}");
+        let tenor = materialize_bsky(&bsky_row("gif", json!({"$type": "app.bsky.embed.external#view",
+            "external": {"uri": "https://media.tenor.com/abcAAAAC/dance.gif?hh=200&ww=200", "title": "Dance", "description": "", "thumb": ""}})));
+        let html = crate::notif_embed::paint_lean_feed_card_opts(&tenor, "home", "");
+        assert!(!html.contains("<video"), "GIF painted as video: {html}");
+        assert!(html.contains("<img src=\"https://media.tenor.com/abcAAAAC/dance.gif"), "{html}");
     }
 
     #[test]
