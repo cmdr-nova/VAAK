@@ -54,6 +54,7 @@ WARM=(
 BULK=(
   vaak-backup-restore-drill.service
   vaak-ml-shadow.service
+  vaak-trends-service.service
 )
 
 tier_body() {

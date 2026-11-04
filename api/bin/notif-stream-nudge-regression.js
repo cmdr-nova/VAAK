@@ -47,6 +47,8 @@ const done=[];function check(ok,label){assert(ok,label);done.push(label)}
  await t.advance(60000);check(t.calls.length===0,'live stream stops the 12 s poll');
  await t.advance(60000);check(t.calls.length===1,'live stream keeps a slow safety poll');
  s.fire('notif');await t.flush();check(t.calls.length===2&&t.elements['notif-badge'].textContent==='5','notif nudge refreshes the badge');
+ let trendsRefreshed=0;t.win.novaRefreshDeferredTrends=()=>{trendsRefreshed++};
+ s.fire('trends');await t.flush();check(trendsRefreshed===1&&t.calls.length===2,'trends nudge refreshes the trends sidebar, not the badge');
  s.readyState=0;s.onerror();s.fire('ready');await t.flush();check(t.calls.length===3,'ready after a reconnect polls once for missed changes');
  s.readyState=2;s.onerror();await t.flush();
  check(t.win.VAAK_NOTIF_STREAM_TOKEN==='','closed stream drops its token');

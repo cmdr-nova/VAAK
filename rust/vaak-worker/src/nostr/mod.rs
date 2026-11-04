@@ -26,6 +26,7 @@ pub mod bech32;
 pub mod bunker;
 pub mod counts;
 pub mod event;
+pub mod global;
 pub mod home;
 pub mod moderation;
 pub mod nip44;

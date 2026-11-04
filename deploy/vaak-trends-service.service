@@ -1,0 +1,42 @@
+# VAAK trending service: keeps On VAAK and Across networks trend lists fresh
+# in Redis so page requests never compute them (docs/trends-service.md).
+#   install -m 644 deploy/vaak-trends-service.service /etc/systemd/system/
+#   systemctl daemon-reload && systemctl enable --now vaak-trends-service.service
+#
+# Legs: api/bin/trends-warm.php every 5 min (On VAAK lists), Bluesky
+# getTrends every 5 min, big Mastodon instances' /api/v1/trends every 10 min,
+# nostr.wine trending notes every 5 min (only while someone has a linked npub).
+# The PHP child runs inside this unit, so the caps below cover it too: a
+# quarter of one core at most, lowest CPU/IO priority, 256 MB.
+# Stop the unit (or set VAAK_TRENDS_SERVICE=0) and PHP goes back to its
+# old behavior within 3 minutes, when the heartbeat key expires.
+[Unit]
+Description=VAAK trending service (background trend snapshots)
+After=network.target postgresql.service redis-server.service
+Wants=postgresql.service
+ConditionPathExists=/usr/local/bin/vaak-worker
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+Environment=VAAK_ENV_FILE=/etc/mkultra/vaak.env
+Environment=VAAK_REDIS_URL=redis://127.0.0.1/0
+Environment=VAAK_API_ROOT=/srv/mkultra/html/api
+Environment=VAAK_PHP_BIN=/usr/bin/php
+Environment=AP_DB_DSN=pgsql:dbname=novalandia
+Environment=RUST_LOG=info
+ExecStart=/usr/local/bin/vaak-worker trends-service
+Restart=always
+RestartSec=15
+CPUQuota=25%
+CPUWeight=5
+IOWeight=10
+Nice=19
+MemoryMax=256M
+TasksMax=64
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
