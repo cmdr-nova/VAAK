@@ -7060,7 +7060,8 @@ function ap_deliver_fanout_background(array $activity, array $inboxUrls, string 
             ap_redis_queue_push('fanout-delivery', $activityKey);
         }
         $worker = __DIR__ . '/ap-fanout-delivery-worker.php';
-        if (is_file($worker)) {
+        $rustDelivers = function_exists('ap_fanout_rust_worker_active') && ap_fanout_rust_worker_active();
+        if (!$rustDelivers && is_file($worker)) {
             $php = ap_php_cli_binary();
             $running = trim((string) @shell_exec("pgrep -fc 'ap-fanout-delivery-worker.php' 2>/dev/null"));
             if ((int) $running === 0) {

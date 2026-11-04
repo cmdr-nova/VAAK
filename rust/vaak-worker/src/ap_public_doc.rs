@@ -17,13 +17,19 @@ use serde_json::{Map, Value};
 const MEDIA_CONTENT: &str = "<p>&#8203;</p>";
 
 pub(crate) fn pleroma_document(value: &Value) -> Value {
+    pleroma_document_with(value, true)
+}
+
+/// `ap_as2_pleroma_document($doc, $stripActorAliases)`. Deliveries pass
+/// false: Wafrn and Bridgy read the at:// alias on alsoKnownAs.
+pub(crate) fn pleroma_document_with(value: &Value, strip_actor_aliases: bool) -> Value {
     match value {
-        Value::Object(map) => Value::Object(normalize_object(map)),
+        Value::Object(map) => Value::Object(normalize_object(map, strip_actor_aliases)),
         other => other.clone(),
     }
 }
 
-fn normalize_object(map: &Map<String, Value>) -> Map<String, Value> {
+fn normalize_object(map: &Map<String, Value>, strip: bool) -> Map<String, Value> {
     let mut node = map.clone();
     if node.contains_key("url") {
         apply_url(&mut node);
@@ -31,16 +37,18 @@ fn normalize_object(map: &Map<String, Value>) -> Map<String, Value> {
     apply_media_content(&mut node);
     for key in ["object", "attachment", "icon", "image", "oneOf", "anyOf"] {
         if let Some(child) = node.get(key).cloned() {
-            node.insert(key.to_string(), normalize_child(child));
+            node.insert(key.to_string(), normalize_child(child, strip));
         }
     }
     if let Some(Value::Array(items)) = node.get("orderedItems").cloned() {
         node.insert(
             "orderedItems".to_string(),
-            Value::Array(items.into_iter().map(normalize_child).collect()),
+            Value::Array(items.into_iter().map(|item| normalize_child(item, strip)).collect()),
         );
     }
-    apply_actor_aliases(&mut node);
+    if strip {
+        apply_actor_aliases(&mut node);
+    }
     node
 }
 
@@ -120,10 +128,10 @@ fn actor_type_name(text: &str) -> bool {
     matches!(text, "Person" | "Service" | "Application" | "Group" | "Organization")
 }
 
-fn normalize_child(value: Value) -> Value {
+fn normalize_child(value: Value, strip: bool) -> Value {
     match value {
-        Value::Array(items) => Value::Array(items.into_iter().map(normalize_child).collect()),
-        Value::Object(map) => Value::Object(normalize_object(&map)),
+        Value::Array(items) => Value::Array(items.into_iter().map(|item| normalize_child(item, strip)).collect()),
+        Value::Object(map) => Value::Object(normalize_object(&map, strip)),
         other => other,
     }
 }

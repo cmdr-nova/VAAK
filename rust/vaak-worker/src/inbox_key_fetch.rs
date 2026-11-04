@@ -157,7 +157,7 @@ impl Miss {
 
 /// Every address `host` resolves to, when all of them are public
 /// (`ap_net_host_public_ips`).
-async fn public_addrs(host: &str) -> Option<Vec<IpAddr>> {
+pub(crate) async fn public_addrs(host: &str) -> Option<Vec<IpAddr>> {
     let host = host.trim_matches(|c| c == '[' || c == ']' || c == '.').to_ascii_lowercase();
     if host.is_empty() || host == "localhost" || host.ends_with(".localhost") || host.ends_with(".local") || host.ends_with(".internal") {
         return None;

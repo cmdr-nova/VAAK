@@ -624,6 +624,9 @@ function ap_fanout_host_kick_worker(): void
     if (getenv('VAAK_FANOUT_HOST_NO_KICK') === '1' || !empty($GLOBALS['ap_fanout_host_no_kick'])) {
         return;
     }
+    if (function_exists('ap_fanout_rust_worker_active') && ap_fanout_rust_worker_active()) {
+        return;
+    }
     $worker = __DIR__ . '/ap-fanout-delivery-worker.php';
     if (!is_file($worker) || !function_exists('ap_php_cli_binary')) {
         return;
