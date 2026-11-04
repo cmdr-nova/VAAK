@@ -746,6 +746,39 @@ function ap_fanout_rust_worker_active(): bool
     return $active;
 }
 
+/**
+ * Cutover D3: true while the Rust fan-out worker runs with
+ * VAAK_FANOUT_SYNC_RUST=1 and keeps vaak:fanout_delivery:rust_sync:v1 fresh.
+ * Fan-out PHP used to send inline (Bridgy, the first followers, the first 50
+ * of a profile Update or Move) then goes to ap_fanout_delivery_queue instead.
+ * A missing or stale key sends inline again.
+ */
+function ap_fanout_rust_sync_active(): bool
+{
+    static $checked = 0;
+    static $active = false;
+    $now = time();
+    if ($checked > 0 && ($now - $checked) < 5) {
+        return $active;
+    }
+    $checked = $now;
+    $active = false;
+    if (!ap_fanout_rust_worker_active()) {
+        return false;
+    }
+    $redis = ap_redis_client();
+    if (!$redis) {
+        return false;
+    }
+    try {
+        $beat = $redis->get('vaak:fanout_delivery:rust_sync:v1');
+        $active = is_string($beat) && ctype_digit($beat) && ($now - (int) $beat) <= 30;
+    } catch (Throwable $e) {
+        $active = false;
+    }
+    return $active;
+}
+
 /** Publish a durable database queue ID as a fast worker wake-up signal. */
 function ap_redis_queue_push(string $queue, string|int $item): bool
 {

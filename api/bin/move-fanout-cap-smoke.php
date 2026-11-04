@@ -33,7 +33,9 @@ function ap_deliver_signed_json(string $inbox, array $activity, string $keyId, s
     $GLOBALS['inline'][] = $inbox;
     return !str_contains($inbox, 'down.');
 }
-function ap_deliver_fanout_background(array $activity, array $inboxes, string $keyId, string $priv): bool {
+$rustSync = false;
+function ap_fanout_rust_sync_active(): bool { return $GLOBALS['rustSync']; }
+function ap_deliver_fanout_background(array $activity, array $inboxes, string $keyId, string $priv, ?int $priority = null): bool {
     $GLOBALS['queued'] = array_merge($GLOBALS['queued'], $inboxes);
     return $GLOBALS['queueOk'];
 }
@@ -64,6 +66,16 @@ $check($r === ['delivered' => 1, 'queued' => 0], 'failed inline delivery is not 
 $inline = []; $queued = []; $queueOk = false;
 $r = ap_deliver_inline_then_queue($move, $targets(60), 'k', 'p');
 $check($r['queued'] === 0 && count($queued) === 10, 'queue failure reports 0 queued');
+
+// Cutover D3: with the Rust worker's sync heartbeat, nothing goes inline.
+$inline = []; $queued = []; $queueOk = true; $rustSync = true;
+$all = $targets(80);
+$r = ap_deliver_inline_then_queue($move, $all, 'k', 'p');
+$check($inline === [] && $queued === $all && $r === ['delivered' => 0, 'queued' => 80], 'rust sync: every inbox queued, none inline');
+
+$inline = []; $queued = []; $queueOk = false;
+$r = ap_deliver_inline_then_queue($move, $targets(60), 'k', 'p');
+$check(count($inline) === 50, 'rust sync but queue down: falls back to inline');
 
 echo $fails === 0 ? "PASS\n" : "$fails failure(s)\n";
 exit($fails === 0 ? 0 : 1);
