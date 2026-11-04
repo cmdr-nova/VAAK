@@ -112,6 +112,24 @@
     if (data && data.object_id) btn.dataset.objectId = String(data.object_id);
   }
 
+  // Used by vaakSyncInteractionState (vaak-03.js) to mirror a saved action
+  // onto other copies of the same Bluesky post (Home parked under
+  // Notifications, profiles, threads).
+  window.vaakApplyBskyState = function (btn, kind, on) {
+    if (kind === 'favourite') {
+      setBskyIcon(btn, 'heart', on, { on: 'Unlike', off: 'Like on Bluesky' });
+      if (!on) btn.dataset.recordUri = '';
+    } else if (kind === 'reblog') {
+      btn.classList.toggle('on', on);
+      btn.setAttribute('aria-pressed', on ? 'true' : 'false');
+      btn.title = on ? 'Undo boost' : 'Boost on Bluesky';
+      btn.setAttribute('aria-label', on ? 'Undo boost' : 'Boost');
+      if (!on) btn.dataset.recordUri = '';
+    } else if (kind === 'bookmark') {
+      applyBskyBookmarkUi(btn, on);
+    }
+  };
+
   function snapshotBskyButton(btn) {
     return {
       html: btn.innerHTML,
@@ -228,6 +246,12 @@
     btn.disabled = false;
     try {
       const data = await postBskyAction(btn, postAction, before);
+      if (typeof window.vaakSyncInteractionState === 'function') {
+        const syncKind = action === 'like' ? 'favourite' : (action === 'repost' ? 'reblog' : 'bookmark');
+        const syncOn = action === 'like' ? !!data.liked : (action === 'repost' ? !!data.reposted : !!data.bookmarked);
+        window.vaakSyncInteractionState(syncKind, syncOn,
+          [data.uri, data.object_id, uri, objectRef, btn.dataset.objectId], btn);
+      }
       // Optimistic icon is enough; only toast on failure (watchBskyQueue).
       if (action === 'like') {
         const on = !!data.liked;

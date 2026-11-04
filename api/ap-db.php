@@ -7450,9 +7450,15 @@ function ap_notifications_drop_bsky_hidden_senders(array $items, int $ownerUserI
     if (!$sawBluesky) {
         return $items;
     }
+    // Wafrn users with a linked Bluesky account reach the owner twice for one
+    // mention. Keep the fediverse copy, as timelines and profiles do.
+    if (function_exists('ap_notifications_drop_wafrn_twins')) {
+        // Keys are kept so $idents still lines up; the loop below re-lists.
+        $items = ap_notifications_drop_wafrn_twins($items, $ownerUserId, true);
+    }
     $hide = ap_notification_owner_bsky_hide_set($ownerUserId);
     if ($hide === []) {
-        return $items;
+        return array_values($items);
     }
     $handleToDid = $pendingHandles === []
         ? []

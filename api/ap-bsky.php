@@ -15377,6 +15377,45 @@ function ap_bsky_record_quoted_post_uri(array $record): ?string
     return preg_match('~^at://did:[^/\s]+/app\.bsky\.feed\.post/[A-Za-z0-9._:\~-]+$~D', $uri) ? $uri : null;
 }
 
+/**
+ * The fediverse post a Bluesky notification record says it mirrors, when that
+ * is a remote fediverse URL (Wafrn sets fediverseId on every post it sends to
+ * Bluesky). Local VAAK mirrors and bsky.app links return null.
+ */
+function ap_bsky_notification_fediverse_twin(array $record): ?string
+{
+    $fedi = trim((string) ($record['fediverseId'] ?? $record['fediverse_id'] ?? ''));
+    if (!str_starts_with($fedi, 'https://') || str_starts_with($fedi, 'https://bsky.app/')) {
+        return null;
+    }
+    if (function_exists('ap_bsky_is_local_note_id') && ap_bsky_is_local_note_id($fedi)) {
+        return null;
+    }
+
+    return rtrim($fedi, '/');
+}
+
+/** True when the owner already has the fediverse copy of a dual-published post as a mention. */
+function ap_bsky_owner_has_fediverse_mention(int $ownerUserId, string $objectId): bool
+{
+    if ($ownerUserId < 1 || $objectId === '' || !function_exists('ap_db')) {
+        return false;
+    }
+    try {
+        $st = ap_db()->prepare(
+            "SELECT 1 FROM mentions
+             WHERE owner_user_id = ? AND deleted_at IS NULL AND object_id IN (?, ?)
+               AND COALESCE(activity_id, '') NOT LIKE 'at://%'
+             LIMIT 1"
+        );
+        $st->execute([$ownerUserId, $objectId, $objectId . '/']);
+
+        return $st->fetchColumn() !== false;
+    } catch (Throwable $e) {
+        return false;
+    }
+}
+
 function ap_bsky_notification_to_mention_row(int $ownerUserId, string $ownerActorId, array $notif): ?array
 {
     $reason = strtolower(trim((string) ($notif['reason'] ?? '')));
@@ -15524,7 +15563,15 @@ function ap_bsky_notification_to_mention_row(int $ownerUserId, string $ownerActo
     if (in_array($reason, ['mention', 'reply', 'quote'], true)
         && str_starts_with($uri, 'at://') && str_contains($uri, '/app.bsky.feed.post/')
         && $notifCid !== '' && function_exists('ap_bsky_post_link_upsert')) {
-        ap_bsky_post_link_upsert($uri, $notifCid, $postHttps !== 'https://bsky.app/' ? $postHttps : null);
+        // Wafrn (and other dual-publishers) name their fediverse copy in the
+        // record's fediverseId. Keep it so notification lists can drop this
+        // Bluesky twin (ap_wafrn_twin_mention_ids / wafrn_crosspost.rs).
+        $postLink = $postHttps !== 'https://bsky.app/' ? $postHttps : null;
+        $twinOf = ap_bsky_notification_fediverse_twin($record);
+        ap_bsky_post_link_upsert($uri, $notifCid, $twinOf ?? $postLink, $postLink);
+        if ($twinOf !== null && ap_bsky_owner_has_fediverse_mention($ownerUserId, $twinOf)) {
+            return null;
+        }
     }
 
     $inReplyTo = null;

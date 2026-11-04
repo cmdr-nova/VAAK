@@ -251,6 +251,12 @@ pub fn replay(input: &Value) -> Value {
         "dids" => json!({
             "dids": dids_from_also_known_as(input.get("also_known_as").unwrap_or(&Value::Null)),
         }),
+        "twin_match" => json!({
+            "match": twin_texts_match(
+                &twin_text(input.get("bsky").and_then(Value::as_str).unwrap_or("")),
+                &twin_text(input.get("fedi").and_then(Value::as_str).unwrap_or("")),
+            ),
+        }),
         _ => json!({"error": "unknown op"}),
     }
 }
@@ -863,6 +869,300 @@ async fn remember_pairs(db: &Client, pairs: &[(String, String)]) -> Result<()> {
     Ok(())
 }
 
+/// Notification side of the cross-post dedupe. A Wafrn user with a linked
+/// Bluesky account who mentions or replies to an owner reaches VAAK twice:
+/// once as an ActivityPub Note and once through the Bluesky notification
+/// poll. The fediverse copy stays, same as the timeline. A Bluesky mention
+/// row is a twin when
+/// - its record's `fediverseId` (`bsky_post_links`) names a post the owner
+///   also got as a fediverse mention, or
+/// - its DID is a learned Wafrn actor link (`wafrn_bsky_actors`) and that
+///   actor sent the owner a mention within 10 minutes with the same text
+///   once mentions and links are taken out.
+///
+/// The check reads the database, not the page, so a twin that sits on another
+/// page or arrives later still hides the Bluesky copy. A failed read keeps
+/// every row.
+pub async fn twin_mention_ids(db: &Client, owner: i64, ids: &[i64]) -> Result<HashSet<i64>> {
+    let mut out = HashSet::new();
+    if owner < 1 || ids.is_empty() {
+        return Ok(out);
+    }
+    let keys: Vec<i64> = ids.iter().copied().collect::<HashSet<_>>().into_iter().collect();
+    let rows = db
+        .query(
+            "SELECT id::bigint, COALESCE(activity_id, ''), COALESCE(content, ''), COALESCE(created_at, '')
+             FROM mentions
+             WHERE owner_user_id = $1::bigint AND id = ANY($2) AND deleted_at IS NULL
+               AND activity_id LIKE 'at://%'
+               AND COALESCE(activity_type, '') IN ('Create', 'Quote')",
+            &[&owner, &keys],
+        )
+        .await?;
+    let mut cands: Vec<TwinCandidate> = Vec::new();
+    for row in rows {
+        let uri: String = row.get(1);
+        let uri = uri.trim().to_string();
+        if !uri.contains("/app.bsky.feed.post/") {
+            continue;
+        }
+        let did = uri
+            .strip_prefix("at://")
+            .and_then(|rest| rest.split('/').next())
+            .unwrap_or("")
+            .to_string();
+        let created: String = row.get(3);
+        cands.push(TwinCandidate {
+            id: row.get(0),
+            uri,
+            did,
+            text: row.get(2),
+            created_at: crate::timeline::status_created_ts(&json!({ "created_at": created })),
+        });
+    }
+    if cands.is_empty() {
+        return Ok(out);
+    }
+
+    let uris: Vec<String> = cands.iter().map(|cand| cand.uri.clone()).collect();
+    let links = lookup_links(db, &uris).await?;
+    let mut fedi_of: HashMap<i64, String> = HashMap::new();
+    for cand in &cands {
+        if let Some(fedi) = links.get(&cand.uri).map(|fedi| post_identity(fedi)) {
+            if fedi.starts_with("https://") && !fedi.starts_with("https://bsky.app/") {
+                fedi_of.insert(cand.id, fedi);
+            }
+        }
+    }
+    if !fedi_of.is_empty() {
+        let mut objects: Vec<String> = Vec::new();
+        for fedi in fedi_of.values() {
+            objects.push(fedi.clone());
+            objects.push(format!("{fedi}/"));
+        }
+        let rows = db
+            .query(
+                "SELECT object_id FROM mentions
+                 WHERE owner_user_id = $1::bigint AND deleted_at IS NULL
+                   AND object_id = ANY($2)
+                   AND COALESCE(activity_id, '') NOT LIKE 'at://%'",
+                &[&owner, &objects],
+            )
+            .await?;
+        let seen: HashSet<String> = rows
+            .into_iter()
+            .map(|row| post_identity(&row.get::<_, Option<String>>(0).unwrap_or_default()))
+            .collect();
+        for (id, fedi) in &fedi_of {
+            if seen.contains(fedi) {
+                out.insert(*id);
+            }
+        }
+    }
+
+    let undecided: Vec<&TwinCandidate> = cands
+        .iter()
+        .filter(|cand| {
+            !out.contains(&cand.id)
+                && !fedi_of.contains_key(&cand.id)
+                && cand.did.starts_with("did:")
+                && cand.created_at > 0
+        })
+        .collect();
+    if undecided.is_empty() {
+        return Ok(out);
+    }
+    let dids: Vec<String> = undecided.iter().map(|cand| cand.did.clone()).collect();
+    let did_to_actors = match lookup_actor_links(db, &dids, &[]).await {
+        Ok(map) => map,
+        Err(err) if missing_actors_table(&err) => return Ok(out),
+        Err(err) => return Err(err),
+    };
+    let mut actors: HashSet<String> = HashSet::new();
+    let mut min_ts = i64::MAX;
+    let mut max_ts = 0i64;
+    for cand in &undecided {
+        let Some(linked) = did_to_actors.get(&cand.did) else {
+            continue;
+        };
+        for actor in linked {
+            let id = post_identity(actor);
+            if !id.is_empty() {
+                actors.insert(format!("{id}/"));
+                actors.insert(id);
+            }
+        }
+        min_ts = min_ts.min(cand.created_at - TWIN_WINDOW_SECS);
+        max_ts = max_ts.max(cand.created_at + TWIN_WINDOW_SECS);
+    }
+    if actors.is_empty() || min_ts > max_ts {
+        return Ok(out);
+    }
+    let from = chrono::DateTime::from_timestamp(min_ts, 0)
+        .map(|dt| dt.format("%Y-%m-%dT%H:%M:%S").to_string())
+        .unwrap_or_default();
+    let to = chrono::DateTime::from_timestamp(max_ts, 0)
+        .map(|dt| format!("{}~", dt.format("%Y-%m-%dT%H:%M:%S")))
+        .unwrap_or_default();
+    let actor_ids: Vec<String> = actors.into_iter().collect();
+    let rows = db
+        .query(
+            "SELECT actor_id, COALESCE(content, ''), COALESCE(created_at, '') FROM mentions
+             WHERE owner_user_id = $1::bigint AND deleted_at IS NULL
+               AND actor_id = ANY($2)
+               AND created_at >= $3 AND created_at <= $4
+               AND COALESCE(activity_id, '') NOT LIKE 'at://%'
+             ORDER BY id DESC
+             LIMIT 64",
+            &[&owner, &actor_ids, &from, &to],
+        )
+        .await?;
+    let fedi_rows: Vec<(String, i64, String)> = rows
+        .into_iter()
+        .map(|row| {
+            let actor: String = row.get::<_, Option<String>>(0).unwrap_or_default();
+            let created: String = row.get(2);
+            (
+                post_identity(&actor),
+                crate::timeline::status_created_ts(&json!({ "created_at": created })),
+                twin_text(&row.get::<_, String>(1)),
+            )
+        })
+        .collect();
+    for cand in undecided {
+        let Some(linked) = did_to_actors.get(&cand.did) else {
+            continue;
+        };
+        let linked: HashSet<String> = linked.iter().map(|actor| post_identity(actor)).collect();
+        let text = twin_text(&cand.text);
+        let hit = fedi_rows.iter().any(|(actor, created, fedi_text)| {
+            linked.contains(actor)
+                && *created > 0
+                && (created - cand.created_at).abs() <= TWIN_WINDOW_SECS
+                && twin_texts_match(&text, fedi_text)
+        });
+        if hit {
+            out.insert(cand.id);
+        }
+    }
+    Ok(out)
+}
+
+/// Drop Bluesky copies of Wafrn mentions from a notification list. Items are
+/// Mastodon notification entities (`id` is the notification snowflake) or
+/// page candidates; only mention rows can be twins.
+pub async fn drop_twin_notifications(db: &Client, owner: i64, items: &mut Vec<Value>) -> Result<()> {
+    let mut ids: Vec<(usize, i64)> = Vec::new();
+    for (index, item) in items.iter().enumerate() {
+        if let Some(id) = notification_mention_db_id(item) {
+            ids.push((index, id));
+        }
+    }
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let keys: Vec<i64> = ids.iter().map(|(_, id)| *id).collect();
+    let twins = twin_mention_ids(db, owner, &keys).await?;
+    if twins.is_empty() {
+        return Ok(());
+    }
+    let skip: HashSet<usize> = ids
+        .into_iter()
+        .filter(|(_, id)| twins.contains(id))
+        .map(|(index, _)| index)
+        .collect();
+    let mut kept = Vec::with_capacity(items.len());
+    for (index, item) in items.drain(..).enumerate() {
+        if !skip.contains(&index) {
+            kept.push(item);
+        }
+    }
+    *items = kept;
+    Ok(())
+}
+
+/// The `mentions.id` behind a notification whose status is the notifier's
+/// own post. Favourites and boosts point at our post and never twin here.
+pub fn notification_mention_db_id(item: &Value) -> Option<i64> {
+    let kind = item.get("type").and_then(Value::as_str).unwrap_or("");
+    if !matches!(kind, "mention" | "quote" | "status") {
+        return None;
+    }
+    if let Some(row) = item.get("row").filter(|row| row.is_object()) {
+        if let Some(id) = row.get("id").and_then(|id| id.as_i64().or_else(|| id.as_str().and_then(|s| s.parse().ok()))) {
+            return (id > 0).then_some(id);
+        }
+    }
+    let raw = item.get("id").and_then(Value::as_str).unwrap_or("");
+    let parsed = crate::notif_page::decode_notif_id(raw)?;
+    (parsed.kind == "mention" && parsed.ver != 1 && parsed.db_id > 0).then_some(parsed.db_id)
+}
+
+const TWIN_WINDOW_SECS: i64 = 600;
+
+struct TwinCandidate {
+    id: i64,
+    uri: String,
+    did: String,
+    text: String,
+    created_at: i64,
+}
+
+/// Mention text with the parts the two copies never share removed: the
+/// fediverse Note wraps `@user@host` mentions, links, and tags in anchors,
+/// the Bluesky row may carry a `↪ QT <url>` line, and each side prints links
+/// its own way.
+pub fn twin_text(raw: &str) -> String {
+    let raw = anchor_element().replace_all(raw, " ");
+    let plain = plain_text(&raw);
+    let plain = quote_line().replace_all(&plain, " ");
+    let plain = mention_token().replace_all(&plain, " ");
+    let plain = link_token().replace_all(&plain, " ");
+    let plain = bare_domain().replace_all(&plain, " ");
+    normalize_text(&plain).to_lowercase()
+}
+
+/// Same text, or (Bluesky's 300-character cut) one copy starts with the other.
+pub fn twin_texts_match(a: &str, b: &str) -> bool {
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
+    if a == b {
+        return true;
+    }
+    let trim = |s: &str| s.trim_end_matches(['…', '.']).to_string();
+    let (a, b) = (trim(a), trim(b));
+    let shorter = a.chars().count().min(b.chars().count());
+    shorter >= 24 && (a.starts_with(&b) || b.starts_with(&a))
+}
+
+fn quote_line() -> &'static regex::Regex {
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    RE.get_or_init(|| regex::Regex::new(r"(?m)^\s*↪ QT \S*\s*$").unwrap())
+}
+
+fn mention_token() -> &'static regex::Regex {
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    RE.get_or_init(|| regex::Regex::new(r"(?:^|\s)[@#][\w.\-]+(?:@[\w.\-]+)?").unwrap())
+}
+
+fn anchor_element() -> &'static regex::Regex {
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    RE.get_or_init(|| regex::Regex::new(r"(?is)<a\b[^>]*>.*?</a>").unwrap())
+}
+
+/// `example.com/path` as Mastodon and Bluesky print a link (same pattern
+/// as PHP `ap_wafrn_twin_text`).
+fn bare_domain() -> &'static regex::Regex {
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    RE.get_or_init(|| regex::Regex::new(r"(?:^|\s)[\w\-]+(?:\.[\w\-]+)+(?:/\S*)?").unwrap())
+}
+
+fn link_token() -> &'static regex::Regex {
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    RE.get_or_init(|| regex::Regex::new(r"(?i)https?://\S+").unwrap())
+}
+
 fn missing_actors_table(err: &anyhow::Error) -> bool {
     let message = err.to_string();
     message.contains("42P01") || message.contains("wafrn_bsky_actors")
@@ -993,6 +1293,28 @@ fn tags() -> &'static regex::Regex {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn notification_mention_ids_come_from_mention_snowflakes_only() {
+        let mention = crate::notif::snowflake_id(Some("2026-11-04T15:53:00Z"), 4242, 5);
+        let follow = crate::notif::snowflake_id(Some("2026-11-04T15:53:00Z"), 4242, 6);
+        assert_eq!(notification_mention_db_id(&json!({"id": mention, "type": "mention"})), Some(4242));
+        assert_eq!(notification_mention_db_id(&json!({"id": mention, "type": "quote"})), Some(4242));
+        assert_eq!(notification_mention_db_id(&json!({"id": mention, "type": "favourite"})), None);
+        assert_eq!(notification_mention_db_id(&json!({"id": follow, "type": "mention"})), None);
+        assert_eq!(notification_mention_db_id(&json!({"id": "12345", "type": "mention"})), Some(12345));
+    }
+
+    #[test]
+    fn twin_text_ignores_the_parts_each_network_adds() {
+        let bsky = twin_text("Uh, I wish to poke the horns.");
+        let fedi = twin_text(
+            "<p><span class=\"h-card\"><a href=\"https://mkultra.monster/users/cmdr_nova\">@<span>cmdr_nova</span></a></span></p><p>Uh, I wish to poke the horns.</p>",
+        );
+        assert_eq!(bsky, fedi);
+        assert!(twin_texts_match(&bsky, &fedi));
+        assert!(!twin_texts_match(&twin_text("see you tomorrow"), &twin_text("see you today")));
+    }
 
     #[test]
     fn fixture_matches_php_cases() {
