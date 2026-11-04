@@ -717,6 +717,35 @@ function ap_redis_stampede_wait(callable $fetch, int $maxWaitMs = 200)
     return null;
 }
 
+/**
+ * True while the Rust fan-out delivery worker (rust/vaak-worker/src/
+ * fanout_delivery.rs, VAAK_FANOUT_DELIVERY_RUST=1) keeps its heartbeat fresh.
+ * PHP then does not start ap-fanout-delivery-worker.php. A missing or stale
+ * heartbeat (worker off, crashed, Redis down) brings the PHP worker back.
+ */
+function ap_fanout_rust_worker_active(): bool
+{
+    static $checked = 0;
+    static $active = false;
+    $now = time();
+    if ($checked > 0 && ($now - $checked) < 5) {
+        return $active;
+    }
+    $checked = $now;
+    $active = false;
+    $redis = ap_redis_client();
+    if (!$redis) {
+        return false;
+    }
+    try {
+        $beat = $redis->get('vaak:fanout_delivery:rust:v1');
+        $active = is_string($beat) && ctype_digit($beat) && ($now - (int) $beat) <= 30;
+    } catch (Throwable $e) {
+        $active = false;
+    }
+    return $active;
+}
+
 /** Publish a durable database queue ID as a fast worker wake-up signal. */
 function ap_redis_queue_push(string $queue, string|int $item): bool
 {

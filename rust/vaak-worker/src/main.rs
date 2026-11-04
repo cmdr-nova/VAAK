@@ -101,6 +101,7 @@ mod fanout_host;
 mod follow_fallback;
 mod ap_sign;
 mod inbox_accept;
+mod fanout_delivery;
 mod inbox_key_fetch;
 mod inbox_origin;
 mod inbox_sig_shadow;

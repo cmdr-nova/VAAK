@@ -27,6 +27,11 @@ while (true) {
         if ($once) break;
         continue;
     }
+    // The Rust worker polls the fan-out queue itself while its heartbeat is fresh.
+    if ($queue === 'fanout-delivery' && function_exists('ap_fanout_rust_worker_active') && ap_fanout_rust_worker_active()) {
+        if ($once) break;
+        continue;
+    }
     $php = function_exists('ap_php_cli_binary') ? ap_php_cli_binary() : '/usr/bin/php';
     if ($php === '' || str_contains($php, 'php-fpm')) {
         $php = is_executable('/usr/bin/php8.3') ? '/usr/bin/php8.3' : '/usr/bin/php';

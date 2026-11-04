@@ -51,12 +51,13 @@ worker_pid=""
 profile_pid=""
 inbox_pid=""
 stub_pid=""
+fanout_pid=""
 cleanup() {
   if [[ -n "$worker_pid" ]]; then
     kill "$worker_pid" 2>/dev/null || true
     wait "$worker_pid" 2>/dev/null || true
   fi
-  for pid in "$profile_pid" "$inbox_pid" "$stub_pid"; do
+  for pid in "$profile_pid" "$inbox_pid" "$stub_pid" "$fanout_pid"; do
     if [[ -n "$pid" ]]; then
       kill "$pid" 2>/dev/null || true
       wait "$pid" 2>/dev/null || true
@@ -198,8 +199,23 @@ for _ in $(seq 1 60); do
 done
 VAAK_INBOX_RUST_URL="$inbox_url" run "$runner" api/bin/inbox-rust-accept-smoke.php
 
+# Rust fan-out delivery (cutover D2): seed the queue, then a worker with the
+# switch on works it. Nothing it is given resolves, so no request leaves CI.
+run "$runner" api/bin/fanout-rust-delivery-smoke.php --seed
+fanout_port="${VAAK_CI_FANOUT_PORT:-18797}"
+VAAK_ENV_FILE=/nonexistent VAAK_PHYRIAN_BRIDGE_ENV_FILE=/nonexistent VAAK_FANOUT_DELIVERY_RUST=1 \
+  VAAK_DATABASE_URL="postgresql://${PGUSER}@${PGHOST}:${PGPORT}/${db}" \
+  VAAK_REDIS_URL="redis://${redis_hostport}/0" VAAK_REDIS_QUEUE_URL="redis://${redis_hostport}/1" \
+  VAAK_JETSTREAM_STATE="${work}/worker/jetstream-fanout" VAAK_NOTIF_CACHE_DIR="${work}/worker" \
+  RUST_LOG=warn "$worker_bin" serve --bind "127.0.0.1:${fanout_port}" &
+fanout_pid=$!
+run "$runner" api/bin/fanout-rust-delivery-smoke.php --check
+kill "$fanout_pid" 2>/dev/null || true
+wait "$fanout_pid" 2>/dev/null || true
+fanout_pid=""
+
 VAAK_SMOKE_DSN="$AP_DB_DSN" run "$runner" api/bin/banned-account-server-block-smoke.php
 # Last: it empties the Nostr tables of this disposable database.
 NOSTR_E2E_PG_DSN="$AP_DB_DSN" run "$runner" api/bin/nostr-trend-tags-smoke.php
 
-echo "db smokes: 16 passed"
+echo "db smokes: 17 passed"

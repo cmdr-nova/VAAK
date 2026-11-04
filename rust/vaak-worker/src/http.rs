@@ -127,6 +127,11 @@ pub async fn serve(cfg: Config, bind: SocketAddr) -> Result<()> {
     if std::env::var("VAAK_INBOX_SIG_SHADOW").is_ok_and(|v| v.trim() == "1") {
         tokio::spawn(crate::inbox_sig_shadow::run(state.cfg.clone()));
     }
+    // Rust cutover D2: deliver ap_fanout_delivery_queue rows (PHP stands
+    // down while the heartbeat is fresh).
+    if crate::fanout_delivery::enabled() {
+        tokio::spawn(crate::fanout_delivery::run(state.cfg.clone()));
+    }
     let shadow_token = crate::shadow_auth::resolve();
     if shadow_token.is_none() {
         tracing::warn!("shadow HTTP token not configured; /shadow/* and /api/v1/* will answer 503");
