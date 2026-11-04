@@ -12,6 +12,14 @@ anything else bumps the patch number.
 Releases up to **0.9.83** used a two-digit deploy counter (0.9.05, 0.9.83)
 and have no notes here; their tags and GitHub Releases are unchanged.
 
+## [0.36.0](https://github.com/cmdr-nova/VAAK/releases/tag/v0.36.0) - 2026-11-04
+
+### ✨ Features
+* Delivery: Rust sends PHP's inline fan-out too (cutover D3) by @cmdr-nova in https://github.com/cmdr-nova/VAAK/pull/378
+* Home: play Bluesky Klipy GIFs instead of a dead video box by @cmdr-nova in https://github.com/cmdr-nova/VAAK/pull/379
+
+**Full Changelog**: https://github.com/cmdr-nova/VAAK/compare/v0.35.1...v0.36.0
+
 ## [0.35.1](https://github.com/cmdr-nova/VAAK/releases/tag/v0.35.1) - 2026-11-04
 
 ### ⚡ Performance
