@@ -49522,10 +49522,10 @@ window.vaakBootStatusThread();
   const STORAGE_KEY = 'vaak.trends.modules.v1';
   // On VAAK (default) or Across networks; the switch only renders when the
   // trends service has network data.
-  const SCOPE_KEY = 'vaak.trends.scope.v1';
+  const SCOPE_STORE = 'vaak.trends.scope.v1';
   function scope() {
     if (!document.getElementById('trends-scope')) return 'vaak';
-    try { return localStorage.getItem(SCOPE_KEY) === 'network' ? 'network' : 'vaak'; } catch (e) { return 'vaak'; }
+    try { return localStorage.getItem(SCOPE_STORE) === 'network' ? 'network' : 'vaak'; } catch (e) { return 'vaak'; }
   }
   function slot(module) { return scope() === 'network' ? module + ':network' : module; }
   let generation = 0;
@@ -49867,7 +49867,7 @@ window.vaakBootStatusThread();
       if (!btn) return;
       const next = btn.getAttribute('data-trends-scope') === 'network' ? 'network' : 'vaak';
       if (next === scope()) return;
-      try { localStorage.setItem(SCOPE_KEY, next); } catch (e) {}
+      try { localStorage.setItem(SCOPE_STORE, next); } catch (e) {}
       paintScope();
       // Keep the other scope's cards cached; just repaint this one.
       ++generation;

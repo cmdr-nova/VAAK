@@ -28,3 +28,8 @@ regexes = ['''^vaak-notif-chime-v\d+$''']
 description = "Scrub-fixture digest sample from the first follow-fallback commit. Not a credential. Current fixtures no longer contain it."
 regexTarget = "secret"
 regexes = ['''^SHA-256=abcd$''']
+
+[[allowlists]]
+description = "Browser localStorage key name for the trends sidebar On VAAK / Across networks choice (PR #363). Not a credential."
+regexTarget = "secret"
+regexes = ['''^vaak\.trends\.scope\.v\d+$''']
