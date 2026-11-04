@@ -180,7 +180,7 @@ php -S "127.0.0.1:${stub_port}" api/bin/inbox-forward-stub-fixture.php >"${work}
 stub_pid=$!
 inbox_port="${VAAK_CI_INBOX_PORT:-18798}"
 VAAK_ENV_FILE=/nonexistent VAAK_PHYRIAN_BRIDGE_ENV_FILE=/nonexistent \
-  VAAK_INBOX_RUST_ACCEPT=1 VAAK_INBOX_RUST_KEY_FETCH=1 VAAK_AP_SIGNING_KEY=/nonexistent VAAK_INBOX_PHP_URL="http://127.0.0.1:${stub_port}" \
+  VAAK_INBOX_RUST_ACCEPT=1 VAAK_INBOX_RUST_KEY_FETCH=1 VAAK_INBOX_ROUTE_SHADOW=1 VAAK_AP_SIGNING_KEY=/nonexistent VAAK_INBOX_PHP_URL="http://127.0.0.1:${stub_port}" \
   VAAK_DATABASE_URL="postgresql://${PGUSER}@${PGHOST}:${PGPORT}/${db}" \
   VAAK_REDIS_URL="redis://${redis_hostport}/0" VAAK_REDIS_QUEUE_URL="redis://${redis_hostport}/1" \
   VAAK_JETSTREAM_STATE="${work}/worker/jetstream-inbox" VAAK_NOTIF_CACHE_DIR="${work}/worker" \

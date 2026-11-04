@@ -321,7 +321,13 @@ async fn fast_path(cfg: &crate::config::Config, uri: &Uri, headers: &HeaderMap, 
             return Ok(Accepted::Duplicate);
         }
     }
-    let id = match spool_insert(&db, &ip, &key_id, uri.path(), &sig_path, &kind, body).await {
+    // Cutover F3 shadow: what Rust expects the drain's router to return.
+    let predicted = if !mismatch && crate::inbox_route_shadow::enabled() {
+        crate::inbox_route_shadow::predict(&db, body).await
+    } else {
+        None
+    };
+    let id = match spool_insert(&db, &ip, &key_id, uri.path(), &sig_path, &kind, body, predicted).await {
         Ok(id) => id,
         Err(e) => {
             tracing::warn!(error = %e, "inbox spool insert failed; forwarding to PHP");
@@ -407,15 +413,44 @@ pub(crate) fn personal_inbox_user(path: &str) -> Option<String> {
     Some(if ok { name } else { String::new() })
 }
 
-async fn spool_insert(db: &Client, ip: &str, key_id: &str, path: &str, sig_path: &str, kind: &str, body: &[u8]) -> Result<i64> {
+#[allow(clippy::too_many_arguments)]
+async fn spool_insert(
+    db: &Client,
+    ip: &str,
+    key_id: &str,
+    path: &str,
+    sig_path: &str,
+    kind: &str,
+    body: &[u8],
+    rust_result: Option<&str>,
+) -> Result<i64> {
     let body = std::str::from_utf8(body).context("body is not UTF-8")?;
-    let row = db
-        .query_one(
-            "INSERT INTO ap_inbox_spool (received_at, client_ip, key_id, request_path, signature_path, activity_type, body)
-             VALUES (now(), $1, $2, $3, $4, $5, $6) RETURNING id",
-            &[&ip, &key_id, &path, &sig_path, &kind, &body],
-        )
-        .await?;
+    let row = match rust_result {
+        None => {
+            db.query_one(
+                "INSERT INTO ap_inbox_spool (received_at, client_ip, key_id, request_path, signature_path, activity_type, body)
+                 VALUES (now(), $1, $2, $3, $4, $5, $6) RETURNING id",
+                &[&ip, &key_id, &path, &sig_path, &kind, &body],
+            )
+            .await?
+        }
+        // F3 shadow: the prediction lands in the same statement as the row,
+        // so the drain never sees one without the other.
+        // (migration 20261104_inbox_route_shadow_postgres.sql)
+        Some(r) => {
+            db.query_one(
+                "WITH s AS (
+                     INSERT INTO ap_inbox_spool (received_at, client_ip, key_id, request_path, signature_path, activity_type, body)
+                     VALUES (now(), $1, $2, $3, $4, $5, $6) RETURNING id
+                 ), p AS (
+                     INSERT INTO ap_inbox_route_shadow (spool_id, rust_result) SELECT id, $7 FROM s
+                 )
+                 SELECT id FROM s",
+                &[&ip, &key_id, &path, &sig_path, &kind, &body, &r],
+            )
+            .await?
+        }
+    };
     Ok(row.get(0))
 }
 

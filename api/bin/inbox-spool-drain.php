@@ -44,6 +44,53 @@ function inbox_drain_load_pool_env(string $path): int
     return $n;
 }
 
+/** The Rust prediction stored with this spool row (cutover F3), if any. */
+function inbox_drain_route_shadow_result(PDO $db, int $id): ?string
+{
+    static $st = null;
+    static $missing = false;
+    if ($missing) {
+        return null;
+    }
+    try {
+        $st ??= $db->prepare('SELECT rust_result FROM ap_inbox_route_shadow WHERE spool_id = ?');
+        $st->execute([$id]);
+        $v = $st->fetchColumn();
+        return is_string($v) && $v !== '' ? $v : null;
+    } catch (Throwable $e) {
+        // Release without the migration: stop asking.
+        $missing = true;
+        $st = null;
+        return null;
+    }
+}
+
+/**
+ * Cutover F3 shadow: compare the result the Rust front door predicted for a
+ * Delete/Tombstone with the router's. PHP outcomes outside the Delete branch
+ * (a block found while routing, a drain-level drop) count as skipped.
+ */
+function inbox_drain_route_shadow_note(int $id, string $rust, string $php): void
+{
+    $field = in_array($php, ['delete_noop', 'local_mention_delete', 'local_status_delete'], true)
+        ? ($php === $rust ? 'agree' : 'disagree')
+        : 'skipped';
+    if ($field === 'disagree') {
+        ap_log(sprintf('route_shadow_disagree id=%d rust=%s php=%s', $id, $rust, $php));
+    }
+    $redis = function_exists('ap_redis_client') ? ap_redis_client() : null;
+    if (!$redis) {
+        return;
+    }
+    try {
+        $redis->hIncrBy('vaak:inbox_route_shadow:stats:v1', $field, 1);
+        $redis->hIncrBy('vaak:inbox_route_shadow:stats:v1', $field . ':' . $rust, 1);
+        $redis->expire('vaak:inbox_route_shadow:stats:v1', 14 * 86400);
+    } catch (Throwable $e) {
+        // Shadow stats only.
+    }
+}
+
 $poolConf = getenv('VAAK_FPM_POOL_CONF') ?: '/etc/php/8.3/fpm/pool.d/www.conf';
 inbox_drain_load_pool_env($poolConf);
 
@@ -88,6 +135,11 @@ while (time() < $deadline) {
                        finished_at = CASE WHEN attempts >= 5 THEN now() END,
                        claimed_at = NULL
                    WHERE state = 'processing' AND claimed_at < now() - interval '10 minutes'");
+        try {
+            $db->exec("DELETE FROM ap_inbox_route_shadow WHERE created_at < now() - interval '7 days'");
+        } catch (Throwable $e) {
+            // Table not migrated yet.
+        }
         $db->exec("DELETE FROM ap_inbox_spool WHERE id IN (
                        SELECT id FROM ap_inbox_spool
                        WHERE finished_at < now() - interval '7 days' AND state IN ('done', 'dropped')
@@ -116,6 +168,12 @@ while (time() < $deadline) {
         $out = ap_inbox_spool_process($row);
         $finish->execute([$out['state'], $out['result'], $id]);
         $done++;
+        if (in_array(strtolower((string) $row['activity_type']), ['delete', 'tombstone'], true)) {
+            $rust = inbox_drain_route_shadow_result($db, $id);
+            if ($rust !== null) {
+                inbox_drain_route_shadow_note($id, $rust, (string) $out['result']);
+            }
+        }
     } catch (Throwable $e) {
         $attempts = (int) $row['attempts'];
         $state = $attempts >= 5 ? 'failed' : 'pending';
