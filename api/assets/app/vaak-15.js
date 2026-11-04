@@ -1303,8 +1303,9 @@
     }
     // A reply containing only participant handles is not authored content;
     // abandoning it should not create a draft merely because one handle was
-    // removed from the initial mention seed.
-    if (text !== '' && /^\s*(?:@[\w.!#$%&'*+\-/=?^`{|}~]+(?:@[\w.-]+)?\s*)+$/u.test(text)) {
+    // removed from the initial mention seed. Each handle must end at
+    // whitespace or end of text, so the match can't backtrack exponentially.
+    if (text !== '' && /^\s*(?:@[\w.!#$%&'*+\-/=?^`{|}~]+(?:@[\w.-]+)?(?:\s+|$))+$/u.test(text)) {
       text = '';
     }
     const existingMedia = ((draftMediaField && draftMediaField.value) || '').trim();
