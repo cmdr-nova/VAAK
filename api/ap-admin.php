@@ -13355,7 +13355,14 @@ if (empty($adminTlFirstPaintDeferred)) {
 function admin_tl_release_stampede_lock(): void
 {
     global $adminTlStampedeLock;
-    if ($adminTlStampedeLock !== '' && function_exists('ap_redis_unlock')) {
+    // Pretty profile pages (/vaak/users/{key}) require this file from inside
+    // ap_vaak_boot_pretty_profile(), so the page's "top-level" variables are
+    // that function's locals and this global is unset (null). Only a real
+    // lock key may reach ap_redis_unlock(string).
+    if (!is_string($adminTlStampedeLock) || $adminTlStampedeLock === '') {
+        return;
+    }
+    if (function_exists('ap_redis_unlock')) {
         ap_redis_unlock($adminTlStampedeLock);
         $adminTlStampedeLock = '';
     }
