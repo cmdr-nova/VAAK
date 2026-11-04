@@ -39,8 +39,53 @@ interactions AS MATERIALIZED (
 SELECT DISTINCT c.object_id FROM candidates c JOIN interactions i ON i.object_id=c.object_id
 "#;
 
+/// Every object the owner has explicitly interacted with: the same branches as
+/// `INTERACTED_SQL`, without the candidate join.
+const INTERACTED_ALL_SQL_TAIL: &str = "SELECT DISTINCT i.object_id FROM interactions i WHERE i.object_id <> ''";
+
+type InteractedCache = std::sync::Mutex<std::collections::HashMap<i64, (std::time::Instant, std::sync::Arc<HashSet<String>>)>>;
+
+/// Per-process cache of each owner's interaction set. INTERACTED_SQL rebuilt
+/// the whole set (favourites, boosts, bookmarks, own notes, signals) on every
+/// call, and ranked-warm plus every Rust Home fetch call it, which made it the
+/// heaviest statement on the server (93 ms x 412k calls). The set changes only
+/// when the owner acts, so reuse it briefly: a recommendation you just liked
+/// can stay up to this long. VAAK_RECO_INTERACTED_CACHE_SECS (default 30,
+/// 0 = query every call as before).
+static INTERACTED_CACHE: std::sync::LazyLock<InteractedCache> = std::sync::LazyLock::new(Default::default);
+
+fn interacted_cache_secs() -> u64 {
+    std::env::var("VAAK_RECO_INTERACTED_CACHE_SECS").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(30).min(600)
+}
+
+fn interacted_all_sql() -> String {
+    // The candidate CTE stays (it binds $2) but nothing reads it.
+    let head = INTERACTED_SQL.rsplit_once("SELECT DISTINCT c.object_id").map(|(h, _)| h).unwrap_or(INTERACTED_SQL);
+    format!("{head}{INTERACTED_ALL_SQL_TAIL}")
+}
+
+async fn owner_interactions(db: &Client, owner: i64, ttl: u64) -> Result<std::sync::Arc<HashSet<String>>> {
+    if let Some((at, set)) = INTERACTED_CACHE.lock().ok().and_then(|m| m.get(&owner).cloned()) {
+        if at.elapsed().as_secs() < ttl { return Ok(set); }
+    }
+    let empty: Vec<String> = Vec::new();
+    let rows = db.query(interacted_all_sql().as_str(), &[&owner, &empty]).await.context("select owner interactions")?;
+    let set = std::sync::Arc::new(rows.into_iter().map(|r| r.get::<_, String>(0)).collect::<HashSet<String>>());
+    if let Ok(mut m) = INTERACTED_CACHE.lock() {
+        if m.len() > 512 { m.retain(|_, (at, _)| at.elapsed().as_secs() < ttl); }
+        m.insert(owner, (std::time::Instant::now(), set.clone()));
+    }
+    Ok(set)
+}
+
+fn intersect(objects: &[String], set: &HashSet<String>) -> HashSet<String> {
+    objects.iter().map(|s| s.trim_end_matches('/').to_string()).filter(|s| set.contains(s)).collect()
+}
+
 pub async fn interacted_objects(db: &Client, owner: i64, objects: &[String]) -> Result<HashSet<String>> {
     if owner < 1 || objects.is_empty() { return Ok(HashSet::new()); }
+    let ttl = interacted_cache_secs();
+    if ttl > 0 { return Ok(intersect(objects, &*owner_interactions(db, owner, ttl).await?)); }
     let objects: Vec<String> = objects.iter().map(|s| s.trim_end_matches('/').to_string()).collect();
     Ok(db.query(INTERACTED_SQL, &[&owner, &objects]).await.context("select consumed recommendations")?.into_iter().map(|r| r.get(0)).collect())
 }
@@ -59,6 +104,20 @@ fn retain_unconsumed(statuses: &mut Vec<Value>, consumed: &HashSet<String>) {
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn all_interactions_sql_keeps_every_branch() {
+        let sql = interacted_all_sql();
+        assert!(sql.contains("interactions AS MATERIALIZED"));
+        assert!(sql.ends_with(INTERACTED_ALL_SQL_TAIL));
+        assert!(!sql.contains("JOIN interactions i ON i.object_id=c.object_id"));
+        assert!(sql.contains("$1::bigint") && sql.contains("$2::text[]"));
+    }
+    #[test]
+    fn intersect_matches_trailing_slash_variants() {
+        let set = HashSet::from(["https://test/post/1".to_string()]);
+        let got = intersect(&["https://test/post/1/".to_string(), "https://test/post/2".to_string()], &set);
+        assert_eq!(got, HashSet::from(["https://test/post/1".to_string()]));
+    }
     #[test]
     fn interaction_only_removes_discovery_copy() {
         let mut statuses=vec![json!({"uri":"https://test/post/1/","vaak_home_source":"recommendation"}), json!({"uri":"https://test/post/1"}), json!({"uri":"https://test/post/2","vaak_home_source":"recommendation"})];

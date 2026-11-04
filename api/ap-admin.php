@@ -9524,6 +9524,48 @@ function admin_owner_user_id(): int
     return 0;
 }
 
+/**
+ * Followed actor ids exactly as the ranked-warm worker reads them for its
+ * cache key: every `following` row for the owner (trailing slash trimmed,
+ * deduped, byte-sorted). Null when the query fails (caller falls back).
+ *
+ * @return list<string>|null
+ */
+function admin_tl_cache_follow_ids(int $owner): ?array
+{
+    static $memo = [];
+    if ($owner < 1) {
+        return null;
+    }
+    if (array_key_exists($owner, $memo)) {
+        return $memo[$owner];
+    }
+    try {
+        $db = ap_db();
+        $u = $db->prepare('SELECT actor_id FROM ap_users WHERE id = ?');
+        $u->execute([$owner]);
+        $actor = (string) ($u->fetchColumn() ?: '');
+        if ($actor === '') {
+            return $memo[$owner] = null;
+        }
+        $st = $db->prepare('SELECT actor_id FROM following WHERE owner_actor_id = ? OR owner_actor_id = ?');
+        $st->execute([$actor, $actor . '/']);
+        $ids = [];
+        foreach ($st->fetchAll(PDO::FETCH_COLUMN) ?: [] as $aid) {
+            $aid = rtrim((string) $aid, '/');
+            if ($aid !== '') {
+                $ids[$aid] = true;
+            }
+        }
+        $ids = array_map('strval', array_keys($ids));
+        sort($ids, SORT_STRING);
+        return $memo[$owner] = $ids;
+    } catch (Throwable $e) {
+        error_log('[ap-admin] tl cache follow ids: ' . $e->getMessage());
+        return $memo[$owner] = null;
+    }
+}
+
 function admin_tl_cache_key(string $view, array $following): string
 {
     if ($view === 'feed') {
@@ -9534,18 +9576,29 @@ function admin_tl_cache_key(string $view, array $following): string
         $view = 'home';
     }
     $parts = [];
-    // Local is follow-set independent (instance firehose).
-    if ($view !== 'local') {
-        foreach ($following as $f) {
-            $aid = rtrim((string) ($f['actor_id'] ?? ''), '/');
-            if ($aid !== '') {
-                $parts[] = $aid;
-            }
-        }
-        sort($parts);
-    }
     // Fingerprint follow-set + owner (per-user mutes/words/blocks)
     $owner = admin_owner_user_id();
+    // Local is follow-set independent (instance firehose).
+    if ($view !== 'local') {
+        // Same follow list as the ranked-warm worker (ranked_warm.rs
+        // load_following_actor_ids), so full pages find the cache the worker
+        // keeps fresh. The request's $following differs: full-page Home merges
+        // Bluesky graph follows and drops rejected follows, and partials may
+        // pass none, so every such request missed the worker's cache and
+        // rebuilt Home in PHP (~9 s on a first load).
+        $workerIds = admin_tl_cache_follow_ids($owner);
+        if ($workerIds !== null) {
+            $parts = $workerIds;
+        } else {
+            foreach ($following as $f) {
+                $aid = rtrim((string) ($f['actor_id'] ?? ''), '/');
+                if ($aid !== '') {
+                    $parts[] = $aid;
+                }
+            }
+            sort($parts, SORT_STRING);
+        }
+    }
     // Home ranking is a user preference; never serve an algorithmic cache to
     // an account that has opted into chronological/follow-only mode (or vice versa).
     $algorithmMode = 'na';
