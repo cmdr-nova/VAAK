@@ -354,6 +354,21 @@ function ap_nostr_status_line(?array $link, int $now): string
  */
 function ap_nostr_action(string $action, int $ownerUserId, bool $isAdmin, array $post): array
 {
+    $reply = ap_nostr_action_route($action, $ownerUserId, $isAdmin, $post);
+    if ($action === 'nostr_prepare' && !empty($reply['body']['ok'])) {
+        // Tells the page a bunker can sign when the browser's extension
+        // can't (no key, locked, or a different key than the linked npub).
+        $reply['body']['bunker'] = ap_nostr_bunker_for_user($ownerUserId) !== null;
+    }
+    return $reply;
+}
+
+/**
+ * @param array<string,mixed> $post
+ * @return array{status:int, body:array<string,mixed>}
+ */
+function ap_nostr_action_route(string $action, int $ownerUserId, bool $isAdmin, array $post): array
+{
     $fail = static fn (int $status, string $error): array => ['status' => $status, 'body' => ['ok' => false, 'error' => $error]];
     if (!ap_nostr_form_visible($isAdmin)) {
         return $fail(403, 'Nostr is not open on this server yet.');
@@ -439,8 +454,9 @@ function ap_nostr_action(string $action, int $ownerUserId, bool $isAdmin, array 
             $payload['zap'] = ['sats' => (int) $sats, 'comment' => $comment];
         }
     } elseif ($action === 'nostr_bunker_sign') {
-        // No signer extension on this page (an iPhone Home Screen app):
-        // the worker asks the user's NIP-46 bunker to sign instead.
+        // No usable signer extension on this page (an iPhone Home Screen
+        // app, or Safari on a Mac without one): the worker asks the user's
+        // NIP-46 bunker to sign instead.
         $nonce = (string) ($post['nonce'] ?? '');
         if (!preg_match('/^[0-9a-f]{32}$/', $nonce)) {
             return $fail(400, 'That action expired. Try again.');
