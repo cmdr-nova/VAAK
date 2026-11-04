@@ -9,7 +9,9 @@
 //! when the owner's notification fingerprint (newest mention row, read
 //! marker, unread DMs including cached Bluesky DMs, pending Phyrian
 //! requests) moves, and the page then runs its normal `?ajax=notif_unread`
-//! poll. Several tabs of one owner share
+//! poll. It also sends `event: trends` (at most every 2 minutes) when the
+//! trends service bumps `vaak:trends:data-gen:v1`, and the page refetches
+//! its trends sidebar. Several tabs of one owner share
 //! one fingerprint query per [`FP_TTL`].
 //!
 //! Auth: the page gets a random token from PHP, which stores
@@ -193,8 +195,50 @@ struct StreamState {
     cfg: Arc<Config>,
     owner: i64,
     last: Option<String>,
+    /// Last trends data generation this stream saw / when it last sent one.
+    trends_seen: Option<String>,
+    trends_sent: Option<Instant>,
     started: Instant,
     _slot: Slot,
+}
+
+/// Open tabs refetch the trends sidebar at most this often.
+const TRENDS_MIN_GAP: Duration = Duration::from_secs(120);
+/// All streams share one read of the trends generation for this long.
+const TRENDS_GEN_TTL: Duration = Duration::from_secs(10);
+static TRENDS_GEN: LazyLock<Mutex<Option<(Instant, String)>>> = LazyLock::new(Default::default);
+
+/// `vaak:trends:data-gen:v1`, bumped by the trends service when a
+/// network-wide trend list changes ("" when unset or unreadable).
+async fn trends_gen(cfg: &Config) -> String {
+    if let Some((at, g)) = TRENDS_GEN.lock().ok().and_then(|m| m.clone()) {
+        if at.elapsed() < TRENDS_GEN_TTL {
+            return g;
+        }
+    }
+    let g = match redis_conn(&cfg.redis_url).await {
+        Ok(mut r) => redis::cmd("GET")
+            .arg(crate::trends_service::KEY_GEN)
+            .query_async::<Option<String>>(&mut r)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_default(),
+        Err(_) => String::new(),
+    };
+    if let Ok(mut m) = TRENDS_GEN.lock() {
+        *m = Some((Instant::now(), g.clone()));
+    }
+    g
+}
+
+/// Whether to send `event: trends`: the generation moved since the stream
+/// first saw it, and the last one went out at least `TRENDS_MIN_GAP` ago.
+pub(crate) fn trends_due(seen: Option<&str>, now: &str, last_sent: Option<Duration>) -> bool {
+    match seen {
+        None => false,
+        Some(s) => s != now && !now.is_empty() && last_sent.is_none_or(|d| d >= TRENDS_MIN_GAP),
+    }
 }
 
 fn nudges(state: StreamState) -> impl Stream<Item = Result<Event, Infallible>> {
@@ -214,6 +258,14 @@ fn nudges(state: StreamState) -> impl Stream<Item = Result<Event, Infallible>> {
             if let Some(kind) = kind {
                 return Some((Ok(Event::default().event(kind).data("1")), st));
             }
+            let gen = trends_gen(&st.cfg).await;
+            if st.trends_seen.is_none() {
+                st.trends_seen = Some(gen);
+            } else if trends_due(st.trends_seen.as_deref(), &gen, st.trends_sent.map(|t| t.elapsed())) {
+                st.trends_seen = Some(gen);
+                st.trends_sent = Some(Instant::now());
+                return Some((Ok(Event::default().event("trends").data("1")), st));
+            }
         }
     })
 }
@@ -232,7 +284,7 @@ pub async fn handle(State(state): State<crate::http::AppState>, Query(q): Query<
     let Some(slot) = Slot::claim(owner) else {
         return (StatusCode::TOO_MANY_REQUESTS, [("cache-control", "no-store"), ("retry-after", "60")], "too many streams").into_response();
     };
-    let state = StreamState { cfg, owner, last: None, started: Instant::now(), _slot: slot };
+    let state = StreamState { cfg, owner, last: None, trends_seen: None, trends_sent: None, started: Instant::now(), _slot: slot };
     let sse = Sse::new(nudges(state)).keep_alive(KeepAlive::new().interval(Duration::from_secs(25)).text("hb"));
     (STREAM_HEADERS, sse).into_response()
 }
@@ -254,6 +306,16 @@ mod tests {
         assert_eq!(next_event(Some("1:0:0:0:0"), Some("2:0:0:0:0")), Some("notif"));
         assert_eq!(next_event(Some("1:0:0:0:0"), None), None, "a failed read never nudges");
         assert_eq!(next_event(None, None), None);
+    }
+
+    #[test]
+    fn trends_nudge_waits_for_a_change_and_the_gap() {
+        assert!(!trends_due(None, "5", None), "first read only records");
+        assert!(!trends_due(Some("5"), "5", None), "no change");
+        assert!(trends_due(Some("5"), "6", None), "changed, never sent");
+        assert!(!trends_due(Some("5"), "6", Some(Duration::from_secs(30))), "too soon");
+        assert!(trends_due(Some("5"), "6", Some(TRENDS_MIN_GAP)), "gap passed");
+        assert!(!trends_due(Some("5"), "", None), "unreadable key never nudges");
     }
 
     #[test]

@@ -201,11 +201,14 @@ restart_units() {
   fi
   # Optional and installed by hand. A missing sudoers line only warns, so
   # it can never fail a deploy.
-  if unit_installed vaak-nostr-relay.service && unit_enabled vaak-nostr-relay.service; then
-    sudo_restart vaak-nostr-relay.service || echo "vaak-release: warn: could not restart vaak-nostr-relay.service (sudoers line missing?)" >&2
-  else
-    echo "vaak-release: skip vaak-nostr-relay.service (not enabled)"
-  fi
+  local optional
+  for optional in vaak-nostr-relay.service vaak-trends-service.service; do
+    if unit_installed "$optional" && unit_enabled "$optional"; then
+      sudo_restart "$optional" || echo "vaak-release: warn: could not restart ${optional} (sudoers line missing?)" >&2
+    else
+      echo "vaak-release: skip ${optional} (not enabled)"
+    fi
+  done
 }
 
 health_check() {

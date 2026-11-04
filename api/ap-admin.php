@@ -7590,6 +7590,216 @@ function admin_trend_statuses_with_nostr(array $items, int $viewerId): array
     return ap_masto_trend_statuses_rank_mixed(array_merge($items, $nostr));
 }
 
+function admin_trend_strim(string $s, int $width): string
+{
+    if (function_exists('mb_strimwidth')) {
+        return mb_strimwidth($s, 0, $width, '…');
+    }
+    return strlen($s) > $width ? (substr($s, 0, max(0, $width - 1)) . '…') : $s;
+}
+
+/** One row of the Trending posts card (On VAAK and Across networks share it). */
+function admin_trend_status_row_html(array $ts, string $viewForTrends): string
+{
+    $html = '';
+    $acct = is_array($ts['account'] ?? null) ? $ts['account'] : [];
+    $who = (string) ($acct['acct'] ?? $acct['username'] ?? 'someone');
+    $content = function_exists('admin_html_to_plain')
+        ? admin_html_to_plain((string) ($ts['content'] ?? ''))
+        : trim(html_entity_decode(strip_tags((string) ($ts['content'] ?? '')), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+    $excerpt = admin_trend_strim($content, 96);
+    $surl = function_exists('ap_masto_trend_status_open_ref')
+        ? ap_masto_trend_status_open_ref($ts)
+        : (string) ($ts['uri'] ?? $ts['url'] ?? '');
+    $media = admin_trend_status_media($ts);
+    if ($excerpt === '' && $media !== null) {
+        $excerpt = $media['description'] !== '' ? admin_trend_strim($media['description'], 96) : $media['label'];
+    }
+    $label = h($excerpt !== '' ? $excerpt : '(media)');
+    $html .= '<div class="trend-post">';
+    if ($media !== null && $media['thumb'] !== '') {
+        // Small preview_url thumbnail: lazy, fixed box, never the full-size original.
+        $html .= '<img class="trend-post-thumb" src="' . h($media['thumb']) . '" alt="" width="44" height="44" loading="lazy" decoding="async" referrerpolicy="no-referrer">';
+    }
+    $html .= '<div class="trend-post-text"><div class="meta">' . h($who)
+        . ($media !== null && $media['count'] > 1 && $content !== '' ? ' · ' . h($media['label']) : '') . '</div>';
+    $nostrUrl = str_starts_with((string) ($ts['id'] ?? ''), 'nostr:') ? (string) ($ts['url'] ?? '') : '';
+    if ($nostrUrl !== '' && str_starts_with($nostrUrl, 'https://')) {
+        // Nostr notes have no VAAK thread view; open the note viewer.
+        $html .= '<a href="' . h($nostrUrl) . '" target="_blank" rel="noopener noreferrer"'
+            . ' style="color:var(--text);text-decoration:none">' . $label . '</a>';
+    } elseif ($surl !== '') {
+        $html .= '<a href="' . h(admin_status_href($surl, $viewForTrends))
+            . '" style="color:var(--text);text-decoration:none">' . $label . '</a>';
+    } else {
+        $html .= '<span>' . $label . '</span>';
+    }
+    $html .= '</div></div>';
+    return $html;
+}
+
+/**
+ * Across networks: snapshots vaak-worker trends-service writes to Redis
+ * (rust/vaak-worker/src/trends_service.rs). Off with VAAK_TRENDS_NETWORK=0.
+ *
+ * @return array{generated_at:int,sources:list<string>,items:list<array<string,mixed>>}|null
+ */
+function admin_trends_network_snapshot(string $part): ?array
+{
+    if (!in_array($part, ['tags', 'statuses', 'bsky_topics', 'nostr'], true) || !function_exists('ap_redis_json_get')) return null;
+    $row = ap_redis_json_get('vaak:trends:net:v1:' . $part);
+    if (!is_array($row) || !is_array($row['items'] ?? null)) return null;
+    $row['items'] = array_values(array_filter($row['items'], 'is_array'));
+    $row['sources'] = array_values(array_filter(is_array($row['sources'] ?? null) ? $row['sources'] : [], 'is_string'));
+    $row['generated_at'] = (int) ($row['generated_at'] ?? 0);
+    return $row;
+}
+
+/** Whether to offer the On VAAK / Across networks switch at all. */
+function admin_trends_network_available(): bool
+{
+    static $memo = null;
+    if ($memo !== null) return $memo;
+    if (getenv('VAAK_TRENDS_NETWORK') === '0' || !function_exists('ap_redis_client')) return $memo = false;
+    $redis = ap_redis_client('cache');
+    if (!$redis) return $memo = false;
+    try {
+        return $memo = (int) $redis->exists('vaak:trends:net:v1:tags', 'vaak:trends:net:v1:statuses', 'vaak:trends:net:v1:bsky_topics') > 0;
+    } catch (Throwable $e) {
+        return $memo = false;
+    }
+}
+
+/** Nostr keys this viewer muted or hid, plus keys an admin blocked. */
+function admin_trend_nostr_hidden_keys(int $viewerId): array
+{
+    $keys = [];
+    try {
+        $db = ap_db();
+        $q = $db->query("SELECT to_regclass('public.nostr_mutes') IS NOT NULL AND to_regclass('public.nostr_blocks') IS NOT NULL");
+        if (!$q || !$q->fetchColumn()) return [];
+        $st = $db->prepare('SELECT pubkey FROM nostr_mutes WHERE owner_user_id = ? AND (on_nostr OR hidden_vaak) UNION SELECT pubkey FROM nostr_blocks');
+        $st->execute([$viewerId]);
+        foreach ($st->fetchAll(PDO::FETCH_COLUMN) ?: [] as $pk) $keys[strtolower((string) $pk)] = true;
+    } catch (Throwable $e) {
+        error_log('[ap-admin] trends nostr hidden keys: ' . $e->getMessage());
+    }
+    return $keys;
+}
+
+function admin_trends_network_data_gen(): string
+{
+    if (!function_exists('ap_redis_client')) return '0';
+    $redis = ap_redis_client('cache');
+    if (!$redis) return '0';
+    try {
+        $gen = (string) ($redis->get('vaak:trends:data-gen:v1') ?: '0');
+    } catch (Throwable $e) {
+        return '0';
+    }
+    return preg_match('/^\d+$/', $gen) ? $gen : '0';
+}
+
+/** "mastodon.social and 9 more" */
+function admin_trends_network_sources_label(array $hosts): string
+{
+    $hosts = array_values(array_unique(array_map('strval', $hosts)));
+    if ($hosts === []) return '';
+    return count($hosts) === 1 ? $hosts[0] : $hosts[0] . ' and ' . (count($hosts) - 1) . ' more';
+}
+
+/**
+ * One Across networks module for this viewer: big Mastodon instances and
+ * Bluesky's own trending topics for tags; Mastodon instance trends plus, for
+ * viewers with a linked npub, nostr.wine's trending notes for posts. The
+ * viewer's blocks, mutes, muted words and downranks apply, as on VAAK.
+ */
+function admin_trends_network_html(string $module, string $viewForTrends, int $viewerId): string
+{
+    $module = $module === 'statuses' ? 'statuses' : 'tags';
+    $cacheKey = null;
+    if ($viewerId > 0 && function_exists('ap_redis_json_get') && function_exists('ap_trends_policy_epoch')) {
+        $cacheKey = 'vaak:trends:net:html:v1:' . $module . ':' . $viewerId . ':' . admin_trends_network_data_gen() . ':' . ap_trends_policy_epoch($viewerId)
+            . ':' . preg_replace('/[^a-z_]/', '', $viewForTrends);
+        $hit = ap_redis_json_get($cacheKey);
+        if (is_array($hit) && is_string($hit['html'] ?? null)) return $hit['html'];
+    }
+    $note = '<div class="meta trend-scope-note">Across networks</div>';
+    $html = '';
+    if ($module === 'tags') {
+        $snap = admin_trends_network_snapshot('tags');
+        $topics = admin_trends_network_snapshot('bsky_topics');
+        $html .= '<div class="side-card" data-trend-module="tags"><h3>Trending tags</h3>' . $note;
+        $rows = 0;
+        foreach ($snap['items'] ?? [] as $tg) {
+            $name = trim((string) ($tg['name'] ?? ''));
+            if ($name === '' || preg_match('/^[\p{N}_]+$/u', $name) === 1
+                || ap_masto_trend_item_hidden($tg, $viewerId, [], false)) continue;
+            $history = is_array($tg['history'] ?? null) ? $tg['history'] : [];
+            $people = !empty($history[0]['accounts']) ? (int) $history[0]['accounts'] : 0;
+            $servers = is_array($tg['vaak_trend_hosts'] ?? null) ? count($tg['vaak_trend_hosts']) : 1;
+            $html .= '<div class="trend-tag-row"><span class="trend-tag-text"><a href="?view=search&amp;q='
+                . urlencode('#' . $name) . '">#' . h($name) . '</a>'
+                . '<span class="meta">' . $people . ' ' . ($people === 1 ? 'person' : 'people') . ' today · '
+                . $servers . ' ' . ($servers === 1 ? 'server' : 'servers') . '</span></span>'
+                . admin_trend_sparkline_svg($history) . '</div>';
+            if (++$rows >= 5) break;
+        }
+        if ($rows === 0) $html .= '<div class="meta empty-state">No fediverse tags yet…</div>';
+        $topicRows = '';
+        $shown = 0;
+        foreach ($topics['items'] ?? [] as $tp) {
+            $label = trim((string) ($tp['display_name'] ?? ''));
+            if ($label === '' || (function_exists('ap_muted_words_match') && ap_muted_words_match($viewerId, $label, (string) ($tp['topic'] ?? '')) !== null)) continue;
+            $posts = (int) ($tp['post_count'] ?? 0);
+            $topicRows .= '<div class="trend-tag-row"><span class="trend-tag-text"><a href="?view=search&amp;q='
+                . urlencode($label) . '">' . h($label) . '</a>'
+                . '<span class="meta">' . ($posts > 0 ? number_format($posts) . ' posts' : 'Trending') . ' on Bluesky'
+                . (($tp['status'] ?? '') === 'hot' ? ' · hot' : '') . '</span></span></div>';
+            if (++$shown >= 5) break;
+        }
+        if ($topicRows !== '') $html .= '<h4 class="trend-subhead">Bluesky topics</h4>' . $topicRows;
+        $src = admin_trends_network_sources_label($snap['sources'] ?? []);
+        if ($src !== '') $html .= '<div class="meta trend-sources">Fediverse tags from ' . h($src) . '</div>';
+        $html .= '</div>';
+    } else {
+        $snap = admin_trends_network_snapshot('statuses');
+        $items = $snap['items'] ?? [];
+        $sources = $snap['sources'] ?? [];
+        if (function_exists('ap_nostr_search_visible') && ap_nostr_search_visible($viewerId)) {
+            $nostr = admin_trends_network_snapshot('nostr');
+            if ($nostr !== null && $nostr['items'] !== []) {
+                $hidden = admin_trend_nostr_hidden_keys($viewerId);
+                foreach ($nostr['items'] as $st) {
+                    if (!str_starts_with((string) ($st['id'] ?? ''), 'nostr:')) continue;
+                    if (isset($hidden[strtolower((string) ($st['vaak_nostr_pubkey'] ?? ''))])) continue;
+                    $items[] = $st;
+                }
+                $sources[] = 'nostr.wine';
+            }
+        }
+        $downrankRefs = admin_trend_downrank_ref_set($viewerId);
+        $kept = [];
+        foreach ($items as $candidate) {
+            if (admin_trend_status_hidden($candidate, $viewerId, $downrankRefs)) continue;
+            $kept[] = $candidate;
+        }
+        $ranked = function_exists('ap_masto_trend_statuses_rank_mixed') ? ap_masto_trend_statuses_rank_mixed($kept) : $kept;
+        $html .= '<div class="side-card" data-trend-module="statuses"><h3>Trending posts</h3>' . $note;
+        $rows = 0;
+        foreach ($ranked as $ts) {
+            $html .= admin_trend_status_row_html($ts, $viewForTrends);
+            if (++$rows >= 5) break;
+        }
+        if ($rows === 0) $html .= '<div class="meta empty-state">No network posts yet…</div>';
+        $src = admin_trends_network_sources_label($sources);
+        if ($src !== '') $html .= '<div class="meta trend-sources">From ' . h($src) . '</div>';
+        $html .= '</div>';
+    }
+    if ($cacheKey !== null && function_exists('ap_redis_json_set')) ap_redis_json_set($cacheKey, ['html' => $html], 300);
+    return $html;
+}
+
 function admin_trends_sidebar_html(string $viewForTrends, bool $allowStale = true, ?array &$meta = null, bool $bypassFragment = false, string $module = 'all'): string
 {
     if (!admin_trends_display_state()['enabled']) { $meta = ['disabled' => true]; return ''; }
@@ -7671,13 +7881,6 @@ function admin_trends_sidebar_html(string $viewForTrends, bool $allowStale = tru
         return '';
     }
 
-    $admin_strim = static function (string $s, int $width): string {
-        if (function_exists('mb_strimwidth')) {
-            return mb_strimwidth($s, 0, $width, '…');
-        }
-        return strlen($s) > $width ? (substr($s, 0, max(0, $width - 1)) . '…') : $s;
-    };
-
     $html = '';
     if ($module === 'all' || $module === 'tags') {
     $html .= '<div class="side-card" data-trend-module="tags"><h3>Trending tags</h3>';
@@ -7713,39 +7916,7 @@ function admin_trends_sidebar_html(string $viewForTrends, bool $allowStale = tru
             if (!is_array($ts)) {
                 continue;
             }
-            $acct = is_array($ts['account'] ?? null) ? $ts['account'] : [];
-            $who = (string) ($acct['acct'] ?? $acct['username'] ?? 'someone');
-            $content = function_exists('admin_html_to_plain')
-                ? admin_html_to_plain((string) ($ts['content'] ?? ''))
-                : trim(html_entity_decode(strip_tags((string) ($ts['content'] ?? '')), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
-            $excerpt = $admin_strim($content, 96);
-            $surl = function_exists('ap_masto_trend_status_open_ref')
-                ? ap_masto_trend_status_open_ref($ts)
-                : (string) ($ts['uri'] ?? $ts['url'] ?? '');
-            $media = admin_trend_status_media($ts);
-            if ($excerpt === '' && $media !== null) {
-                $excerpt = $media['description'] !== '' ? $admin_strim($media['description'], 96) : $media['label'];
-            }
-            $label = h($excerpt !== '' ? $excerpt : '(media)');
-            $html .= '<div class="trend-post">';
-            if ($media !== null && $media['thumb'] !== '') {
-                // Small preview_url thumbnail: lazy, fixed box, never the full-size original.
-                $html .= '<img class="trend-post-thumb" src="' . h($media['thumb']) . '" alt="" width="44" height="44" loading="lazy" decoding="async" referrerpolicy="no-referrer">';
-            }
-            $html .= '<div class="trend-post-text"><div class="meta">' . h($who)
-                . ($media !== null && $media['count'] > 1 && $content !== '' ? ' · ' . h($media['label']) : '') . '</div>';
-            $nostrUrl = str_starts_with((string) ($ts['id'] ?? ''), 'nostr:') ? (string) ($ts['url'] ?? '') : '';
-            if ($nostrUrl !== '' && str_starts_with($nostrUrl, 'https://')) {
-                // Nostr notes have no VAAK thread view; open the note viewer.
-                $html .= '<a href="' . h($nostrUrl) . '" target="_blank" rel="noopener noreferrer"'
-                    . ' style="color:var(--text);text-decoration:none">' . $label . '</a>';
-            } elseif ($surl !== '') {
-                $html .= '<a href="' . h(admin_status_href($surl, $viewForTrends))
-                    . '" style="color:var(--text);text-decoration:none">' . $label . '</a>';
-            } else {
-                $html .= '<span>' . $label . '</span>';
-            }
-            $html .= '</div></div>';
+            $html .= admin_trend_status_row_html($ts, $viewForTrends);
         }
     }
     $html .= '</div>';
@@ -7769,6 +7940,19 @@ if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'trends') {
     $module = (string) ($_GET['module'] ?? 'all');
     $module = in_array($module, ['tags', 'statuses'], true) ? $module : 'all';
     $forceRefresh = !empty($_GET['refresh']) || !empty($_GET['fresh']);
+    if ((string) ($_GET['scope'] ?? '') === 'network' && $module !== 'all' && admin_trends_network_available()) {
+        // Across networks: a Redis read and the viewer's filters, never a recompute.
+        $viewForTrends = preg_replace('/[^a-z_]/', '', (string) ($_GET['from'] ?? 'home')) ?: 'home';
+        $netHtml = admin_trends_network_html($module, $viewForTrends, (int) $displayState['owner']);
+        $publishDisplay = admin_trends_display_state();
+        header('X-VAAK-Trends-Enabled: ' . ($publishDisplay['enabled'] ? '1' : '0'));
+        header('X-VAAK-Trends-Owner: ' . $publishDisplay['owner']);
+        header('Cache-Control: private, no-store');
+        if (!$publishDisplay['enabled'] || $publishDisplay['owner'] !== $displayState['owner']) exit;
+        header('X-Vaak-Trends-Scope: network');
+        echo $netHtml;
+        exit;
+    }
     if ($forceRefresh) $GLOBALS['vaak_trends_bypass_paint'] = true;
     $viewForTrends = preg_replace('/[^a-z_]/', '', (string) ($_GET['from'] ?? 'home')) ?: 'home';
     $variant = 'html-' . $module;
@@ -32113,6 +32297,14 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     details.side-drop .side-drop-body a { color: var(--muted); font-size: .9rem; }
     details.side-drop .side-drop-body a:hover { color: var(--primary); }
     .bar-row { display: flex; justify-content: space-between; gap: .5rem; font-size: .85rem; margin: .3rem 0; }
+    .trend-scope { display: flex; gap: .3rem; margin: 0 0 .6rem; padding: .25rem; background: var(--panel); border: 1px solid var(--border); border-radius: 999px; }
+    .trend-scope[hidden] { display: none; }
+    .trend-scope button { flex: 1 1 0; min-width: 0; padding: .35rem .5rem; border: 0; border-radius: 999px; background: transparent; color: var(--muted); font: inherit; font-size: .8rem; cursor: pointer; white-space: nowrap; }
+    .trend-scope button[aria-pressed="true"] { background: var(--primary-dim); color: var(--text); font-weight: 600; }
+    .trend-scope button:focus-visible { outline: 2px solid var(--primary); outline-offset: 1px; }
+    .trend-scope-note { font-size: .72rem; margin: -.3rem 0 .35rem; }
+    .trend-subhead { margin: .8rem 0 .2rem; font-size: .78rem; font-weight: 600; color: var(--muted); }
+    .trend-sources { font-size: .7rem; margin-top: .5rem; }
     .trend-tag-row { display: flex; align-items: center; justify-content: space-between; gap: .6rem; margin: .45rem 0; font-size: .85rem; min-width: 0; }
     .trend-tag-text { display: flex; flex-direction: column; min-width: 0; }
     .trend-tag-text a { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -33294,6 +33486,12 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       </form>
     </div>
     <?php $vaakTrendsDisplay = admin_trends_display_state($vaakUser); ?>
+    <?php if ($vaakTrendsDisplay['enabled'] && admin_trends_network_available()): ?>
+    <div class="trend-scope" id="trends-scope" role="group" aria-label="Show trends from">
+      <button type="button" data-trends-scope="vaak" aria-pressed="true">On VAAK</button>
+      <button type="button" data-trends-scope="network" aria-pressed="false">Across networks</button>
+    </div>
+    <?php endif; ?>
     <div id="trends-sidebar"
          data-enabled="<?= $vaakTrendsDisplay['enabled'] ? '1' : '0' ?>"
          data-owner="<?= (int) $vaakTrendsDisplay['owner'] ?>"
@@ -43305,6 +43503,9 @@ if (!empty($GLOBALS['vaak_profile_shell'])) {
       scheduleNotifPoll();
     });
     source.addEventListener('notif', () => { if (notifStream === source) pollNotif(); });
+    source.addEventListener('trends', () => {
+      if (notifStream === source && typeof window.novaRefreshDeferredTrends === 'function') window.novaRefreshDeferredTrends();
+    });
     source.onerror = () => {
       if (notifStream !== source) return;
       source.__vaakReconnected = true;
@@ -49319,6 +49520,14 @@ window.vaakBootStatusThread();
   const MODULES = ['tags', 'statuses'];
   const TTL_MS = 10 * 60 * 1000;
   const STORAGE_KEY = 'vaak.trends.modules.v1';
+  // On VAAK (default) or Across networks; the switch only renders when the
+  // trends service has network data.
+  const SCOPE_STORE = 'vaak.trends.scope.v1';
+  function scope() {
+    if (!document.getElementById('trends-scope')) return 'vaak';
+    try { return localStorage.getItem(SCOPE_STORE) === 'network' ? 'network' : 'vaak'; } catch (e) { return 'vaak'; }
+  }
+  function slot(module) { return scope() === 'network' ? module + ':network' : module; }
   let generation = 0;
   let scheduled = false;
   let scheduleTicket = null;
@@ -49356,7 +49565,7 @@ window.vaakBootStatusThread();
   }
   function moduleRow(box, module) {
     const data = storeFor(box);
-    return data && data.modules ? data.modules[module] : null;
+    return data && data.modules ? data.modules[slot(module)] : null;
   }
   function moduleFresh(box, module) {
     const row = moduleRow(box, module);
@@ -49372,7 +49581,7 @@ window.vaakBootStatusThread();
     data.owner = String(box.dataset.owner || '0');
     data.enabled = String(box.dataset.enabled || '0');
     data.modules = data.modules || {};
-    data.modules[module] = { html: html || '', etag: etag || '', savedAt: Date.now(), ok: true };
+    data.modules[slot(module)] = { html: html || '', etag: etag || '', savedAt: Date.now(), ok: true };
     writeStore(data);
   }
   function visible(box) {
@@ -49473,6 +49682,8 @@ window.vaakBootStatusThread();
       box.dataset.owner = owner;
     }
     box.hidden = enabled !== '1';
+    const scopeBar = document.getElementById('trends-scope');
+    if (scopeBar) scopeBar.hidden = box.hidden;
     if (box.hidden) { box.innerHTML = ''; box.setAttribute('aria-busy', 'false'); }
   }
   window.novaSyncDeferredTrendsPolicy = syncPolicy;
@@ -49501,7 +49712,8 @@ window.vaakBootStatusThread();
     const headers = { Accept: 'text/html' };
     if (!job.force && row && row.etag) headers['If-None-Match'] = row.etag;
     try {
-      const res = await fetch('?ajax=trends&module=' + encodeURIComponent(job.module) + '&frag=5' + (job.force ? '&fresh=1' : ''), {
+      const res = await fetch('?ajax=trends&module=' + encodeURIComponent(job.module) + '&frag=5' + (job.force ? '&fresh=1' : '')
+        + (scope() === 'network' ? '&scope=network&from=' + encodeURIComponent(box.dataset.from || 'home') : ''), {
         credentials: 'same-origin',
         headers: headers,
         cache: job.force ? 'reload' : 'default',
@@ -49629,6 +49841,54 @@ window.vaakBootStatusThread();
     if (loading === true) showLoading(document.getElementById('trends-sidebar'));
   };
   window.novaLoadDeferredTrends = loadDeferredTrends;
+  // The notification stream sends `trends` when a network-wide list changed.
+  window.novaRefreshDeferredTrends = () => {
+    if (scope() !== 'network') return;
+    const data = readStore();
+    if (data && data.modules) {
+      MODULES.forEach((module) => { delete data.modules[module + ':network']; });
+      writeStore(data);
+    }
+    loadDeferredTrends(false);
+  };
+  function paintScope() {
+    const bar = document.getElementById('trends-scope');
+    if (!bar) return;
+    const current = scope();
+    bar.querySelectorAll('[data-trends-scope]').forEach((btn) => {
+      btn.setAttribute('aria-pressed', btn.getAttribute('data-trends-scope') === current ? 'true' : 'false');
+    });
+  }
+  paintScope();
+  const scopeBar = document.getElementById('trends-scope');
+  if (scopeBar) {
+    scopeBar.addEventListener('click', (event) => {
+      const btn = event.target instanceof Element ? event.target.closest('[data-trends-scope]') : null;
+      if (!btn) return;
+      const next = btn.getAttribute('data-trends-scope') === 'network' ? 'network' : 'vaak';
+      if (next === scope()) return;
+      try { localStorage.setItem(SCOPE_STORE, next); } catch (e) {}
+      paintScope();
+      // Keep the other scope's cards cached; just repaint this one.
+      ++generation;
+      scheduled = false;
+      scheduleTicket = null;
+      waiters.length = 0;
+      inflight.clear();
+      if (pendingAbort) pendingAbort.abort();
+      pendingAbort = null;
+      active = 0;
+      const box = document.getElementById('trends-sidebar');
+      if (box) {
+        MODULES.forEach((module) => {
+          if (moduleFresh(box, module)) paintHtml(box, module, moduleRow(box, module).html);
+          else showLoading(box, module);
+        });
+        rewriteFrom(box);
+      }
+      loadDeferredTrends(false);
+    });
+  }
   window.novaSetDeferredTrendsView = (view) => {
     const box = document.getElementById('trends-sidebar');
     if (!box) return;

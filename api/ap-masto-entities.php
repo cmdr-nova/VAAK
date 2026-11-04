@@ -13333,6 +13333,8 @@ function ap_trends_emit_json(string $kind, int $ownerUserId, int $limit, mixed $
 
 function ap_masto_trends_cache_read(string $kind, int $minItems = 1, bool $allowStale = false, int $ownerUserId = 0): ?array
 {
+    // api/bin/trends-warm.php (run by the trends service) rebuilds every cache.
+    if (!empty($GLOBALS['vaak_trends_force_recompute'])) return null;
     $info = ap_masto_trends_cache_info($kind);
     $paintedKind = preg_replace('/[^a-z]/', '', strtolower($kind)) ?: 'tags';
     $painted = ap_trends_painted_read($paintedKind, $ownerUserId, $minItems);
@@ -13408,10 +13410,34 @@ function ap_masto_trends_cache_get(string $kind, int $minItems = 1, int $ownerUs
  * After the HTTP response is sent, recompute expired trend caches.
  * Safe to call multiple times per request (runs once).
  */
+/**
+ * True while vaak-worker trends-service is running (its heartbeat key is
+ * set every 20 s with a 3 minute TTL). It rebuilds trend caches every few
+ * minutes off the request path, so PHP-FPM must not do it too.
+ */
+function ap_trends_service_alive(): bool
+{
+    static $memo = null;
+    if ($memo !== null) return $memo;
+    if (getenv('VAAK_TRENDS_SERVICE') === '0' || !function_exists('ap_redis_client')) return $memo = false;
+    $redis = ap_redis_client('cache');
+    if (!$redis) return $memo = false;
+    try {
+        $beat = (int) ($redis->get('vaak:trends:service:heartbeat:v1') ?: 0);
+    } catch (Throwable $e) {
+        return $memo = false;
+    }
+    return $memo = $beat > 0 && (time() - $beat) < 180;
+}
+
 function ap_masto_trends_schedule_refresh(): void
 {
     static $scheduled = false;
     if ($scheduled) {
+        return;
+    }
+    // The trends service keeps these caches fresh; never spend an FPM worker on it.
+    if (ap_trends_service_alive()) {
         return;
     }
     $scheduled = true;

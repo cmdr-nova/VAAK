@@ -70,6 +70,7 @@ mod bsky_observations;
 mod thin_media;
 mod thin_media_warm;
 mod timeline;
+mod trends_service;
 mod timeline_cursor;
 mod timeline_fanout;
 mod timeline_older;
@@ -312,6 +313,10 @@ enum Command {
         #[arg(long, default_value = "127.0.0.1:8797")]
         bind: String,
     },
+    /// Trending service: keeps On VAAK and network-wide trend snapshots
+    /// fresh in Redis so page requests never compute them
+    /// (deploy/vaak-trends-service.service). VAAK_TRENDS_SERVICE=0 idles it.
+    TrendsService,
     /// Print the cleanup retention plan. PHP still owns deletes.
     CleanupShadow {
         /// Refused. Present so a cutover attempt fails closed.
@@ -590,6 +595,9 @@ async fn worker_main() -> Result<()> {
         Command::NostrRelay { bind } => {
             let addr: SocketAddr = bind.parse()?;
             nostr::backup_relay::serve(&cfg, addr).await?;
+        }
+        Command::TrendsService => {
+            trends_service::run(&cfg).await?;
         }
         Command::CleanupShadow { execute } => {
             match cleanup::shadow_report(execute) {
