@@ -310,11 +310,45 @@ async fn bsky_leg(cfg: &Config, http: &reqwest::Client, redis: &mut redis::aio::
     let base = cfg.bsky_public_api.trim_end_matches('/');
     let base = if base.starts_with("https://") { base } else { "https://public.api.bsky.app" };
     let body = get_json(http, &format!("{base}/xrpc/app.bsky.unspecced.getTrends?limit={KEEP_TOPICS}")).await?;
-    let items = normalize_bsky_trends(&body);
+    let mut items = normalize_bsky_trends(&body);
     if items.is_empty() {
         bail!("getTrends returned no topics");
     }
+    // Each topic is a Bluesky feed; VAAK can open it in-app by its at:// URI.
+    let mut dids: HashMap<String, String> = HashMap::new();
+    for item in items.iter_mut() {
+        let Some((actor, rkey)) = feed_link_parts(s(item, "link")) else { continue };
+        let did = if actor.starts_with("did:") {
+            actor
+        } else if let Some(d) = dids.get(&actor) {
+            d.clone()
+        } else {
+            let url = format!("{base}/xrpc/com.atproto.identity.resolveHandle?handle={actor}");
+            let d = match get_json(http, &url).await {
+                Ok(v) => s(&v, "did").to_string(),
+                Err(e) => {
+                    tracing::warn!(%actor, error = %format!("{e:#}"), "trend feed handle did not resolve");
+                    String::new()
+                }
+            };
+            dids.insert(actor, d.clone());
+            d
+        };
+        if did.starts_with("did:") && did.len() <= 200 && !did.contains(char::is_whitespace) {
+            item["feed_uri"] = json!(format!("at://{did}/app.bsky.feed.generator/{rkey}"));
+        }
+    }
     store(redis, KEY_BSKY, items, vec!["bsky.app".into()]).await
+}
+
+/// `https://bsky.app/profile/{actor}/feed/{rkey}` -> (actor, rkey).
+pub fn feed_link_parts(link: &str) -> Option<(String, String)> {
+    let rest = link.strip_prefix("https://bsky.app/profile/")?;
+    let (actor, rkey) = rest.split_once("/feed/")?;
+    let rkey = rkey.split(['?', '#', '/']).next().unwrap_or("");
+    let ok_actor = !actor.is_empty() && actor.len() <= 253 && actor.bytes().all(|b| b.is_ascii_alphanumeric() || b".-:_".contains(&b));
+    let ok_rkey = !rkey.is_empty() && rkey.len() <= 512 && rkey.bytes().all(|b| b.is_ascii_alphanumeric() || b".-_:~".contains(&b));
+    (ok_actor && ok_rkey).then(|| (actor.to_ascii_lowercase(), rkey.to_string()))
 }
 
 // ---------- Fediverse (Mastodon instance trends)
@@ -607,6 +641,18 @@ async fn nostr_leg(cfg: &Config, http: &reqwest::Client, redis: &mut redis::aio:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn feed_links_split_into_actor_and_rkey() {
+        assert_eq!(
+            feed_link_parts("https://bsky.app/profile/trending.bsky.app/feed/3lzx?ref=1"),
+            Some(("trending.bsky.app".into(), "3lzx".into()))
+        );
+        assert_eq!(feed_link_parts("https://bsky.app/profile/did:plc:abc/feed/x"), Some(("did:plc:abc".into(), "x".into())));
+        assert_eq!(feed_link_parts("https://bsky.app/profile/a b/feed/x"), None);
+        assert_eq!(feed_link_parts("https://bsky.app/profile/x/post/1"), None);
+        assert_eq!(feed_link_parts("https://evil.example/profile/x/feed/1"), None);
+    }
 
     #[test]
     fn instances_parse_and_dedupe() {

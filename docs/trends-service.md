@@ -28,9 +28,25 @@ a worker on trend recomputes.
 
 The right rail gets an **On VAAK / Across networks** switch (On VAAK is the
 default, remembered per browser). The switch only shows once network data
-exists. Across networks shows merged Mastodon tags (people today, server
-count, 7-day sparkline), Bluesky's trending topics, and Mastodon trending
-posts; viewers with a linked npub also get nostr.wine's trending notes.
+exists. It changes one card, **Trending tags**, which holds trending posts too:
+
+- On VAAK: VAAK's tags, then a Trending posts section.
+- Across networks: merged Mastodon tags (people today, server count, 7-day
+  sparkline), Bluesky's trending topics, then trending posts (Mastodon
+  instance trends, plus nostr.wine's notes for viewers with a linked npub).
+
+Bluesky topics open their feed inside VAAK (`?view=bluesky&feed=at://…`) for
+viewers with Bluesky connected, and the topic on bsky.app otherwise. The
+service resolves each topic's `bsky.app/profile/…/feed/…` link to an at:// URI
+(`feed_uri`) when it writes the snapshot.
+
+Under it, **Who to follow** shows 3 random people from the same follow
+suggestions Home uses (`ap_masto_suggestions_v2(12)`, same cache, fetched
+after paint via `?ajax=who_to_follow`). The whole pool of up to 12 ships with
+the card and the browser swaps in another random 3 every minute, so rotating
+costs no requests. Following someone fades their row out and fills the gap.
+Home still shows its own suggestion strip.
+
 The viewer's blocks, mutes, muted words, moderation lists and downranks
 apply as on VAAK. `VAAK_TRENDS_NETWORK=0` (PHP-FPM env) hides the switch.
 
