@@ -36988,12 +36988,12 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
             <div class="meta">To like, reply and follow on Nostr from Home, install a Nostr signer extension in your browser, such as <a href="https://github.com/fiatjaf/nos2x" target="_blank" rel="noopener noreferrer">nos2x</a> or <a href="https://getalby.com/" target="_blank" rel="noopener noreferrer">Alby</a> (on iPhone or iPad, <a href="https://apps.apple.com/app/nostash/id6744309333" target="_blank" rel="noopener noreferrer">Nostash</a> for Safari, then switch it on under Settings &gt; Apps &gt; Safari &gt; Extensions), and add your key there. The extension signs each action and can ask you first; VAAK never sees your key. It must hold the same key as the npub above.</div>
             <?php if ($nostrHex !== ''): ?>
             <?php $nostrBunker = ap_nostr_bunker_for_user((int) $vaakOwnerId); ?>
-            <label for="nostr-bunker" style="margin-top:.75rem">Nostr bunker (for the Home Screen app)</label>
+            <label for="nostr-bunker" style="margin-top:.75rem">Nostr bunker (when there's no signer extension)</label>
             <div class="supporter-reward-row">
               <input id="nostr-bunker" form="nostr-bunker-form" name="nostr_bunker" type="password" autocomplete="off" spellcheck="false" maxlength="2000" value="" placeholder="<?= h(is_array($nostrBunker) ? 'Connected. Leave empty and save to disconnect.' : 'bunker://…') ?>">
               <button class="btn btn-primary" type="submit" form="nostr-bunker-form"><?= is_array($nostrBunker) ? 'Save' : 'Connect' ?></button>
             </div>
-            <div class="meta">A site added to the iPhone Home Screen can't use Safari extensions. Paste a NIP-46 <code>bunker://</code> link from a signer that holds your key somewhere else, and pages without an extension sign through it. The bunker decides what it signs and can revoke VAAK; VAAK still never sees your key.<?php $bunkerLine = ap_nostr_bunker_status_line($nostrBunker, time()); if ($bunkerLine !== ''): ?> <?= h($bunkerLine) ?><?php endif; ?></div>
+            <div class="meta">For browsers without a signer extension, like Safari on a Mac or a site added to the iPhone Home Screen (which can't use Safari extensions). Paste a NIP-46 <code>bunker://</code> link from a signer that holds your key somewhere else. On any device where you're signed in to VAAK, posts, likes, boosts, follows and follow packs then sign through it whenever there's no extension, or the extension has no key or a different one. The bunker decides what it signs and can revoke VAAK; VAAK still never sees your key.<?php $bunkerLine = ap_nostr_bunker_status_line($nostrBunker, time()); if ($bunkerLine !== ''): ?> <?= h($bunkerLine) ?><?php endif; ?></div>
             <?php $nostrLightning = ap_nostr_lightning_address($nostrHex); ?>
             <label for="nostr-lightning" style="margin-top:.75rem">Lightning address (for zaps)</label>
             <div class="supporter-reward-row nostr-lightning-row">
@@ -54364,8 +54364,8 @@ if (VIEW === 'analytics') loadAnalytics();
     return { ok: false, error: 'VAAK did not answer. Try again.' };
   }
 
-  // No extension (an iPhone Home Screen app never loads Safari extensions):
-  // ask the worker to have the user's NIP-46 bunker sign instead. It signs
+  // No extension (an iPhone Home Screen app never loads Safari extensions,
+  // and Safari on a Mac often has none): ask the worker to have the user's NIP-46 bunker sign instead. It signs
   // only the event prepared under `nonce` (nostr/bunker.rs).
   const bunkerSigner = {
     vaakBunker: true,
@@ -54405,6 +54405,13 @@ if (VIEW === 'analytics') loadAnalytics();
       pubkey = String(prep.pubkey || '');
     } else {
       try { pubkey = String(await signer.getPublicKey() || '').toLowerCase(); } catch (e) {}
+      // An extension that is installed but has no key, is locked, or holds
+      // another key can't sign this. Use the bunker when one is connected
+      // (prep.bunker), before the extension shows any signing prompt.
+      if ((!pubkey || pubkey !== prep.pubkey) && prep.bunker) {
+        signer = bunkerSigner;
+        pubkey = String(prep.pubkey || '');
+      }
     }
     if (!pubkey) { toast('Your signer extension did not share its key.'); return null; }
     if (pubkey !== prep.pubkey) {

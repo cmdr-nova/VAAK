@@ -283,6 +283,10 @@ $bunkerLine = ap_nostr_bunker_status_line(['signer_pubkey' => str_repeat('ab', 3
 $check(str_starts_with($bunkerLine, 'Connected to bunker npub1') && str_contains($bunkerLine, 'Last signed') && str_contains($bunkerLine, 'Last problem (just now): unauthorized.'), 'bunker status line: ' . $bunkerLine);
 $check(!str_contains(ap_nostr_bunker_status_line(['signer_pubkey' => str_repeat('ab', 32), 'connected_at' => 1000, 'last_used_at' => 3000, 'last_error' => 'old', 'last_error_at' => 2000], 3030), 'old'), 'a problem older than the last signature is not shown');
 $check(ap_nostr_bunker_status_line(null, 5) === '', 'no pairing, no line');
+$adminSrc = (string) file_get_contents(__DIR__ . '/../ap-admin.php');
+$check(str_contains($adminSrc, "if ((!pubkey || pubkey !== prep.pubkey) && prep.bunker) {"), 'an extension with no key or another key falls back to the bunker');
+$nostrSrc = (string) file_get_contents(__DIR__ . '/../ap-nostr.php');
+$check(str_contains($nostrSrc, "\$reply['body']['bunker'] = ap_nostr_bunker_for_user("), 'nostr_prepare answers say whether a bunker is connected');
 
 // Hover card for a Nostr account (njump npub URL).
 $hex = '7e7e9c42a91bfef19fa929e5fda1b72e0ebc1a4c1141673e2794234d86addf4e';
