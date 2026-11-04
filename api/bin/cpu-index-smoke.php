@@ -63,14 +63,10 @@ $check(
     'author-did index matches the lookup expression'
 );
 $check(
-    str_contains($entities, 'SELECT DISTINCT lower(author_handle) AS h, lower(author_did) AS d')
-        && str_contains($entities, 'WHERE lower(author_did) IN ($ph)'),
-    'the followed-handle lookup still filters on lower(author_did)'
-);
-$check(
     str_contains($entities, 'SELECT DISTINCT lower(author_handle) AS h FROM bsky_posts')
-        && substr_count($entities, 'WHERE lower(author_did) IN ($ph)') === 2,
-    'the hidden-handle lookup still filters on lower(author_did)'
+        && substr_count($entities, 'WHERE lower(author_did) IN ($ph)') >= 1
+        && !preg_match('/WHERE\s+author_did\s+IN\s*\(\$ph\)/', $entities),
+    'the followed/hidden handle lookup (one shared query) still filters on lower(author_did)'
 );
 $check(
     str_contains($specs['idx_remote_actors_lower_host_username']['create'], "ON remote_actors (lower(COALESCE(host, '')), lower(COALESCE(username, '')))"),

@@ -15832,6 +15832,26 @@ function ap_masto_suggestions_cache_path(int $ownerUserId, int $limit): string
 
 function ap_masto_suggestions_cache_clear(?int $ownerUserId = null): void
 {
+    // The Redis copy is read first, so it has to go too or a fresh follow can
+    // keep showing in Who to follow / Home until it ages out.
+    // Graph sync can invalidate once per synced follow; one clear per owner per
+    // second in a process is plenty.
+    static $lastClear = [];
+    $memoKey = $ownerUserId ?? 'all';
+    $nowClear = microtime(true);
+    if (isset($lastClear[$memoKey]) && $nowClear - $lastClear[$memoKey] < 1.0) {
+        return;
+    }
+    $lastClear[$memoKey] = $nowClear;
+    // Limits are clamped to 1..80, so one DEL covers every key for the owner.
+    if ($ownerUserId !== null && function_exists('ap_redis_delete')) {
+        ap_redis_delete(...array_map(
+            static fn(int $n): string => 'vaak:recommend:v1:suggestions:' . $ownerUserId . ':' . $n,
+            range(1, 80)
+        ));
+    } elseif ($ownerUserId === null && function_exists('ap_redis_delete_pattern')) {
+        ap_redis_delete_pattern('vaak:recommend:v1:suggestions:*');
+    }
     $dir = '/var/lib/mkultra/ap/suggestions';
     if (!is_dir($dir) || !is_readable($dir)) {
         return;
@@ -15845,6 +15865,237 @@ function ap_masto_suggestions_cache_clear(?int $ownerUserId = null): void
 }
 
 /**
+ * Identity keys for one account reference, so a recommendation can be matched
+ * against follows/blocks made under a different spelling of the same person:
+ *   url:<actor>      the URL plus its /@user and /users/user twins
+ *   bsky:<did|handle> bsky.app profiles, Bridgy /ap/did: actors, and the
+ *                     user.host.ap.brid.gy handle Bridgy gives a fediverse account
+ *   nostr:<hex>       Mostr-bridged Nostr keys
+ *   local             any account on this server (never recommended)
+ * Pure string work: no DB, no network.
+ *
+ * @return list<string>
+ */
+function ap_masto_suggestion_identity_keys(string $ref): array
+{
+    $ref = rtrim(trim($ref), '/');
+    if ($ref === '') {
+        return [];
+    }
+    $keys = [];
+    if (str_starts_with($ref, 'did:')) {
+        return ['bsky:' . strtolower($ref)];
+    }
+    if (str_starts_with($ref, 'at://did:') && preg_match('#^at://(did:[^/]+)#i', $ref, $am)) {
+        return ['bsky:' . strtolower($am[1])];
+    }
+    if (!preg_match('~^https://([^/?#]+)(/[^?#]*)?~i', $ref, $um)) {
+        return [];
+    }
+    $host = strtolower($um[1]);
+    $path = (string) ($um[2] ?? '');
+    $keys[] = 'url:' . $ref;
+    if ($host === 'mkultra.monster' && preg_match('~^/(?:users/|@)[A-Za-z0-9_]+$~', $path)) {
+        $keys[] = 'local';
+    }
+    if (($host === 'bsky.app' || $host === 'staging.bsky.app') && preg_match('~^/profile/([^/]+)~', $path, $pm)) {
+        $who = strtolower(ltrim(rawurldecode($pm[1]), '@'));
+        if ($who !== '') {
+            $keys[] = 'bsky:' . $who;
+            if (str_ends_with($who, '.mkultra.monster.ap.brid.gy')) {
+                $keys[] = 'local';
+            }
+        }
+        return array_values(array_unique($keys));
+    }
+    if (preg_match('~/(?:ap/)?(did:[a-z0-9]+:[a-z0-9._:%-]+)$~i', $path, $dm)) {
+        $keys[] = 'bsky:' . strtolower(rawurldecode($dm[1]));
+        return array_values(array_unique($keys));
+    }
+    if (in_array($host, ['mostr.pub', 'momostr.pink'], true) && preg_match('~^/users/([0-9a-f]{64})$~i', $path, $nm)) {
+        $keys[] = 'nostr:' . strtolower($nm[1]);
+        return array_values(array_unique($keys));
+    }
+    $user = '';
+    if (preg_match('~^/@([^/@]+)$~', $path, $m)) {
+        $user = rawurldecode($m[1]);
+        $keys[] = 'url:https://' . $um[1] . '/users/' . rawurlencode($user);
+    } elseif (preg_match('~^/users/([^/]+)$~', $path, $m)) {
+        $user = rawurldecode($m[1]);
+        if (!preg_match('/^\d{6,}$/', $user)) {
+            $keys[] = 'url:https://' . $um[1] . '/@' . rawurlencode($user);
+        } else {
+            $user = '';
+        }
+    }
+    // Bridgy Fed shows a fediverse account on Bluesky as user.host.ap.brid.gy
+    // (underscores become hyphens), so following one hides the other.
+    if ($user !== '' && preg_match('/^[A-Za-z0-9_.-]+$/', $user) && !str_ends_with($host, 'brid.gy')) {
+        $keys[] = 'bsky:' . strtolower(str_replace('_', '-', $user)) . '.' . $host . '.ap.brid.gy';
+    }
+    return array_values(array_unique($keys));
+}
+
+/** @param array<string,true> $set */
+function ap_masto_suggestion_keys_hit(array $set, string ...$refs): bool
+{
+    foreach ($refs as $ref) {
+        foreach (ap_masto_suggestion_identity_keys($ref) as $key) {
+            if (isset($set[$key])) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+/**
+ * Everyone the viewer should not be offered, as identity keys:
+ * follows on every network (fediverse incl. pending requests and still-queued
+ * follows, Bluesky, Nostr), the viewer's own identities, and dismissals go in
+ * "exclude"; Bluesky/Nostr blocks, mutes and moderation lists go in "hidden".
+ * Each source is best effort so one missing table never empties the guard.
+ *
+ * @param list<array<string,mixed>> $followingRows ap_following_list() rows
+ * @param array<string,true> $dismissed actor_id => true
+ * @param array<string,true> $bskyHideDids ap_bsky_hide_did_set() output
+ * @param list<string> $legacyBskyFollowActors actor ids from bsky_follow events
+ * @return array{exclude: array<string,true>, hidden: array<string,true>}
+ */
+function ap_masto_suggestion_exclusions(
+    PDO $db,
+    int $ownerUserId,
+    string $localActor,
+    array $followingRows,
+    array $dismissed = [],
+    array $bskyHideDids = [],
+    array $legacyBskyFollowActors = []
+): array {
+    $exclude = ['local' => true];
+    $hidden = [];
+    $add = static function (array &$set, string $ref): void {
+        foreach (ap_masto_suggestion_identity_keys($ref) as $key) {
+            $set[$key] = true;
+        }
+    };
+    $add($exclude, $localActor);
+    foreach ($followingRows as $row) {
+        if (is_array($row)) {
+            $add($exclude, (string) ($row['actor_id'] ?? ''));
+        }
+    }
+    foreach (array_keys($dismissed) as $ref) {
+        $add($exclude, (string) $ref);
+    }
+    foreach ($legacyBskyFollowActors as $ref) {
+        $add($exclude, (string) $ref);
+    }
+    foreach (array_keys($bskyHideDids) as $did) {
+        $add($hidden, (string) $did);
+    }
+    if ($ownerUserId < 1) {
+        return ['exclude' => $exclude, 'hidden' => $hidden];
+    }
+    $rows = static function (string $sql, array $args) use ($db): array {
+        try {
+            $st = $db->prepare($sql);
+            $st->execute($args);
+            return $st->fetchAll(PDO::FETCH_ASSOC) ?: [];
+        } catch (Throwable $e) {
+            return [];
+        }
+    };
+    // A follow request someone turned down is not a reason to offer them again.
+    foreach ($rows("SELECT actor_id FROM following WHERE (owner_actor_id = ? OR owner_actor_id = ?) AND follow_state = 'rejected'",
+        [rtrim($localActor, '/'), rtrim($localActor, '/') . '/']) as $r) {
+        $add($exclude, (string) ($r['actor_id'] ?? ''));
+    }
+    // Follows still waiting in the action queue (not yet in following/graph_sync).
+    foreach ($rows("SELECT target_key FROM ap_action_queue WHERE owner_user_id = ? AND action_kind = 'follow' AND desired_state = 1",
+        [$ownerUserId]) as $r) {
+        $add($exclude, (string) ($r['target_key'] ?? ''));
+    }
+    // Bluesky follows (synced graph), then the handles those DIDs go by.
+    $dids = [];
+    foreach ($rows("SELECT target_did FROM bsky_graph_sync WHERE owner_user_id = ? AND kind = 'follow'", [$ownerUserId]) as $r) {
+        $did = strtolower(trim((string) ($r['target_did'] ?? '')));
+        if (str_starts_with($did, 'did:')) {
+            $dids[$did] = true;
+        }
+    }
+    // The viewer's own Bluesky account.
+    foreach ($rows('SELECT did, handle FROM bsky_sessions WHERE owner_user_id = ?', [$ownerUserId]) as $r) {
+        $add($exclude, strtolower(trim((string) ($r['did'] ?? ''))));
+        $handle = strtolower(trim((string) ($r['handle'] ?? '')));
+        if ($handle !== '') {
+            $exclude['bsky:' . $handle] = true;
+        }
+    }
+    // Accounts the AppView last said we follow (covers follows made in other apps
+    // before graph sync catches up).
+    foreach ($rows("SELECT v.actor_ref, p.did FROM bsky_actor_viewers v LEFT JOIN bsky_actor_profiles p ON p.actor_ref = v.actor_ref
+                    WHERE v.owner_user_id = ? AND v.following_uri IS NOT NULL AND v.following_uri != ''", [$ownerUserId]) as $r) {
+        foreach ([(string) ($r['actor_ref'] ?? ''), (string) ($r['did'] ?? '')] as $ref) {
+            $ref = strtolower(trim($ref));
+            if ($ref === '') continue;
+            if (str_starts_with($ref, 'did:')) {
+                $dids[$ref] = true;
+            } elseif (!str_contains($ref, '/')) {
+                $exclude['bsky:' . ltrim($ref, '@')] = true;
+            } else {
+                $add($exclude, $ref);
+            }
+        }
+    }
+    foreach ($exclude as $key => $_) {
+        if (str_starts_with($key, 'bsky:did:')) {
+            $dids[substr($key, 5)] = true;
+        }
+    }
+    $hiddenDids = [];
+    foreach ($hidden as $key => $_) {
+        if (str_starts_with($key, 'bsky:did:')) {
+            $hiddenDids[substr($key, 5)] = true;
+        }
+    }
+    // Handles those DIDs go by, from the post and profile caches.
+    $handleKeys = static function (array $didList) use ($rows): array {
+        $out = [];
+        foreach ($didList as $did) {
+            $out['bsky:' . $did] = true;
+        }
+        foreach (array_chunk($didList, 200) as $chunk) {
+            $ph = implode(',', array_fill(0, count($chunk), '?'));
+            foreach ($rows("SELECT DISTINCT lower(author_handle) AS h FROM bsky_posts
+                            WHERE lower(author_did) IN ($ph) AND author_handle IS NOT NULL AND author_handle != ''", $chunk) as $r) {
+                $h = trim((string) ($r['h'] ?? ''));
+                if ($h !== '') $out['bsky:' . $h] = true;
+            }
+            foreach ($rows("SELECT profile_json FROM bsky_actor_profiles WHERE lower(did) IN ($ph)", $chunk) as $r) {
+                $profile = json_decode((string) ($r['profile_json'] ?? ''), true);
+                $h = is_array($profile) ? strtolower(trim((string) ($profile['handle'] ?? ''))) : '';
+                if ($h !== '' && !str_starts_with($h, 'did:')) $out['bsky:' . $h] = true;
+            }
+        }
+        return $out;
+    };
+    $exclude += $handleKeys(array_keys($dids));
+    $hidden += $handleKeys(array_keys($hiddenDids));
+    // Nostr: contact list and own key; mutes and admin blocks.
+    foreach ($rows('SELECT pubkey FROM nostr_follows WHERE owner_user_id = ? UNION SELECT pubkey FROM nostr_links WHERE owner_user_id = ?',
+        [$ownerUserId, $ownerUserId]) as $r) {
+        $pk = strtolower(trim((string) ($r['pubkey'] ?? '')));
+        if ($pk !== '') $exclude['nostr:' . $pk] = true;
+    }
+    foreach ($rows('SELECT pubkey FROM nostr_mutes WHERE owner_user_id = ? UNION SELECT pubkey FROM nostr_blocks',
+        [$ownerUserId]) as $r) {
+        $pk = strtolower(trim((string) ($r['pubkey'] ?? '')));
+        if ($pk !== '') $hidden['nostr:' . $pk] = true;
+    }
+    return ['exclude' => $exclude, 'hidden' => $hidden];
+}
+
+/**
  * Official Explore → For You: accounts to follow (not a post feed).
  * Sources mirror Mastodon Suggestion: past_interactions + global.
  *
@@ -15855,142 +16106,36 @@ function ap_masto_suggestions_v2_uncached(int $limit = 40): array
     $limit = max(1, min(80, $limit));
     $local = ap_masto_session_actor_id();
     $dismissed = ap_masto_suggestion_dismissed_set();
-    $following = [];
-    /** @var array<string,true> $followingKeys bare did / handle keys for Bluesky alias matching */
-    $followingKeys = [];
-    foreach (ap_following_list() as $row) {
-        $id = rtrim((string) ($row['actor_id'] ?? ''), '/');
-        if ($id !== '') {
-            $following[$id] = true;
-        }
-    }
-    // Bluesky follows live outside the AP following table — include them so
-    // Home suggestions don't keep offering accounts you already follow there.
     $ownerUserId = function_exists('ap_db_masto_owner_user_id') ? ap_db_masto_owner_user_id() : 0;
-    if ($ownerUserId > 0) {
+    if ($ownerUserId > 0 && function_exists('ap_bsky_graph_sync_migrate')) {
         try {
-            if (function_exists('ap_bsky_graph_sync_migrate')) {
-                ap_bsky_graph_sync_migrate();
-            }
-            $gst = ap_db()->prepare(
-                "SELECT target_did FROM bsky_graph_sync WHERE owner_user_id = ? AND kind = 'follow'"
-            );
-            $gst->execute([$ownerUserId]);
-            foreach ($gst->fetchAll() as $grow) {
-                $did = trim((string) ($grow['target_did'] ?? ''));
-                if ($did === '' || !str_starts_with($did, 'did:')) {
-                    continue;
-                }
-                $followingKeys[strtolower($did)] = true;
-                $following['https://bsky.app/profile/' . $did] = true;
-                $following['https://bsky.app/profile/' . rawurlencode($did)] = true;
-            }
+            ap_bsky_graph_sync_migrate();
         } catch (Throwable $e) {
             // ignore
         }
+    }
+    // Older Bluesky follows recorded as events (kept as before: a wider net).
+    $legacyBskyFollows = [];
+    if ($ownerUserId > 0 && function_exists('ap_events_distinct_actor_ids')) {
         try {
-            $bskyAction = defined('AP_BSKY_FOLLOW_ACTION') ? AP_BSKY_FOLLOW_ACTION : 'bsky_follow';
-            if (function_exists('ap_events_distinct_actor_ids')) {
-                $actorRows = ap_events_distinct_actor_ids($bskyAction);
-            } else {
-                $est = ap_db()->prepare(
-                    'SELECT DISTINCT actor_id FROM events WHERE action_taken = ? AND actor_id IS NOT NULL'
-                );
-                $est->execute([$bskyAction]);
-                $actorRows = [];
-                foreach ($est->fetchAll() as $erow) {
-                    if (is_array($erow)) {
-                        $actorRows[] = (string) ($erow['actor_id'] ?? '');
-                    }
-                }
-            }
-            foreach ($actorRows as $rawAid) {
-                $aid = rtrim((string) $rawAid, '/');
-                if ($aid === '') {
-                    continue;
-                }
-                $following[$aid] = true;
-                if (preg_match('~^https://bsky\.app/profile/([^/?#]+)~i', $aid, $bm)) {
-                    $followingKeys[strtolower(rawurldecode($bm[1]))] = true;
-                }
-            }
+            $legacyBskyFollows = ap_events_distinct_actor_ids(defined('AP_BSKY_FOLLOW_ACTION') ? AP_BSKY_FOLLOW_ACTION : 'bsky_follow');
         } catch (Throwable $e) {
-            // ignore
-        }
-        // Map followed DIDs → known handles so handle-form suggestions also skip.
-        if ($followingKeys !== []) {
-            try {
-                $dids = [];
-                foreach (array_keys($followingKeys) as $k) {
-                    if (str_starts_with($k, 'did:')) {
-                        $dids[] = $k;
-                    }
-                }
-                if ($dids !== []) {
-                    // Chunk to keep IN lists reasonable.
-                    foreach (array_chunk($dids, 40) as $chunk) {
-                        $ph = implode(',', array_fill(0, count($chunk), '?'));
-                        $hst = ap_db()->prepare(
-                            "SELECT DISTINCT lower(author_handle) AS h, lower(author_did) AS d
-                             FROM bsky_posts
-                             WHERE lower(author_did) IN ($ph)
-                               AND author_handle IS NOT NULL AND author_handle != ''"
-                        );
-                        $hst->execute($chunk);
-                        foreach ($hst->fetchAll() as $hrow) {
-                            $h = trim((string) ($hrow['h'] ?? ''));
-                            if ($h === '') {
-                                continue;
-                            }
-                            $followingKeys[$h] = true;
-                            $following['https://bsky.app/profile/' . $h] = true;
-                        }
-                    }
-                }
-            } catch (Throwable $e) {
-                // ignore
-            }
+            $legacyBskyFollows = [];
         }
     }
-    // The Bluesky hide set includes synced VAAK blocks/mutes plus blocks, mutes,
-    // and subscribed moderation lists pulled from Bluesky. Build handle aliases
-    // from cached posts so handle-form suggestions are matched to hidden DIDs.
-    $bskyHiddenKeys = [];
-    if ($ownerUserId > 0 && function_exists('ap_bsky_hide_did_set')) {
-        $bskyHiddenKeys = ap_bsky_hide_did_set($ownerUserId);
-        $hiddenDids = array_values(array_filter(array_keys($bskyHiddenKeys), static fn($v) => str_starts_with($v, 'did:')));
-        foreach (array_chunk($hiddenDids, 40) as $chunk) {
-            try {
-                $ph = implode(',', array_fill(0, count($chunk), '?'));
-                $hst = ap_db()->prepare(
-                    "SELECT DISTINCT lower(author_handle) AS h FROM bsky_posts
-                     WHERE lower(author_did) IN ($ph) AND author_handle IS NOT NULL AND author_handle != ''"
-                );
-                $hst->execute($chunk);
-                foreach ($hst->fetchAll() as $hrow) {
-                    $handle = strtolower(trim((string) ($hrow['h'] ?? '')));
-                    if ($handle !== '') $bskyHiddenKeys[$handle] = true;
-                }
-                try {
-                    $pst = ap_db()->prepare(
-                        "SELECT profile_json FROM bsky_actor_profiles WHERE lower(did) IN ($ph)"
-                    );
-                    $pst->execute($chunk);
-                    foreach ($pst->fetchAll() as $prow) {
-                        $profile = json_decode((string) ($prow['profile_json'] ?? ''), true);
-                        $handle = is_array($profile) ? strtolower(trim((string) ($profile['handle'] ?? ''))) : '';
-                        if ($handle !== '') $bskyHiddenKeys[$handle] = true;
-                    }
-                } catch (Throwable $e) {
-                    // Actor-profile cache is optional; post-cache aliases are sufficient when present.
-                }
-            } catch (Throwable $e) {
-                // DIDs still match direct Bluesky URLs even if the post cache is unavailable.
-            }
-        }
-    }
+    $exclusions = ap_masto_suggestion_exclusions(
+        ap_db(),
+        $ownerUserId,
+        (string) $local,
+        ap_following_list(),
+        $dismissed,
+        ($ownerUserId > 0 && function_exists('ap_bsky_hide_did_set')) ? ap_bsky_hide_did_set($ownerUserId) : [],
+        $legacyBskyFollows
+    );
+    $excludeKeys = $exclusions['exclude'];
+    $hiddenKeys = $exclusions['hidden'];
 
-    $skip = static function (string $actorId) use ($local, $dismissed, $following, $followingKeys, $ownerUserId, $bskyHiddenKeys): bool {
+    $skip = static function (string $actorId) use ($local, $excludeKeys, $hiddenKeys, $ownerUserId): bool {
         $actorId = rtrim($actorId, '/');
         if ($actorId === '' || !str_starts_with($actorId, 'https://')) {
             return true;
@@ -15999,22 +16144,18 @@ function ap_masto_suggestions_v2_uncached(int $limit = 40): array
         if ($actorId === $local || ap_masto_is_local_actor_url($actorId)) {
             return true;
         }
-        if (isset($dismissed[$actorId]) || isset($following[$actorId])) {
-            return true;
-        }
-        if (preg_match('~^https://bsky\.app/profile/([^/?#]+)~i', $actorId, $bm)) {
-            $key = strtolower(rawurldecode($bm[1]));
-            if ($key !== '' && isset($followingKeys[$key])) {
-                return true;
-            }
-        }
         // Check both the recommendation URL and its best known alias. This
         // matters for Bridgy/Bluesky actors which can have distinct AP URLs.
-        $moderationRefs = [$actorId];
+        $refs = [$actorId];
         if (function_exists('ap_masto_suggestion_best_actor_id')) {
-            $moderationRefs[] = ap_masto_suggestion_best_actor_id($actorId);
+            $refs[] = ap_masto_suggestion_best_actor_id($actorId);
         }
-        foreach (array_unique($moderationRefs) as $ref) {
+        $refs = array_values(array_unique($refs));
+        // Already followed (any network, any spelling), requested, queued, self, or dismissed.
+        if (ap_masto_suggestion_keys_hit($excludeKeys, ...$refs) || ap_masto_suggestion_keys_hit($hiddenKeys, ...$refs)) {
+            return true;
+        }
+        foreach ($refs as $ref) {
             if (function_exists('ap_is_blocked_actor') && ap_is_blocked_actor($ref)) {
                 return true;
             }
@@ -16025,14 +16166,6 @@ function ap_masto_suggestions_v2_uncached(int $limit = 40): array
                 return true;
             }
             if (function_exists('ap_is_globally_muted_actor') && ap_is_globally_muted_actor($ref)) {
-                return true;
-            }
-            if (preg_match('~^https://bsky\.app/profile/([^/?#]+)~i', $ref, $bm)) {
-                $key = strtolower(rawurldecode($bm[1]));
-                if (isset($bskyHiddenKeys[$key])) return true;
-            }
-            if (preg_match('~/(?:ap/)?(did:[a-z0-9]+:[a-z0-9]+)(?:[/#?]|$)~i', $ref, $dm)
-                && isset($bskyHiddenKeys[strtolower($dm[1])])) {
                 return true;
             }
         }
@@ -16077,24 +16210,27 @@ function ap_masto_suggestions_v2_uncached(int $limit = 40): array
         // Older installations may not have the signal table yet.
     }
 
-    // Past positive interactions: people whose posts we favourited / boosted
+    // Past positive interactions: people whose posts this viewer favourited / boosted
+    // (owner scoped, so one account's likes never drive another's suggestions)
     try {
-        $st = ap_db()->query(
+        $st = ap_db()->prepare(
             "SELECT target_actor AS a, COUNT(*) AS c FROM masto_favourites
-             WHERE target_actor IS NOT NULL AND target_actor != ''
+             WHERE owner_user_id = ? AND target_actor IS NOT NULL AND target_actor != ''
              GROUP BY target_actor ORDER BY c DESC LIMIT 80"
         );
+        $st->execute([$ownerUserId]);
         foreach ($st as $row) {
             $bump((string) $row['a'], 3.0 * (float) $row['c'], 'past_interactions');
         }
     } catch (Throwable $e) {
     }
     try {
-        $st = ap_db()->query(
+        $st = ap_db()->prepare(
             "SELECT target_actor AS a, COUNT(*) AS c FROM masto_reblogs
-             WHERE target_actor IS NOT NULL AND target_actor != ''
+             WHERE owner_user_id = ? AND target_actor IS NOT NULL AND target_actor != ''
              GROUP BY target_actor ORDER BY c DESC LIMIT 80"
         );
+        $st->execute([$ownerUserId]);
         foreach ($st as $row) {
             $bump((string) $row['a'], 4.0 * (float) $row['c'], 'past_interactions');
         }
@@ -16102,11 +16238,12 @@ function ap_masto_suggestions_v2_uncached(int $limit = 40): array
     }
     // People who mentioned / replied to us a lot (familiar but not followed)
     try {
-        $st = ap_db()->query(
+        $st = ap_db()->prepare(
             "SELECT actor_id AS a, COUNT(*) AS c FROM mentions
-             WHERE deleted_at IS NULL AND actor_id IS NOT NULL AND actor_id != ''
+             WHERE owner_user_id = ? AND deleted_at IS NULL AND actor_id IS NOT NULL AND actor_id != ''
              GROUP BY actor_id ORDER BY c DESC LIMIT 80"
         );
+        $st->execute([$ownerUserId]);
         foreach ($st as $row) {
             $bump((string) $row['a'], 2.0 * (float) $row['c'], 'past_interactions');
         }

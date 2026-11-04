@@ -94,6 +94,10 @@ function ap_action_queue_enqueue(
         if (function_exists('ap_redis_queue_push')) {
             ap_redis_queue_push('actions', $id);
         }
+        if ($kind === 'follow' && function_exists('ap_masto_suggestions_cache_clear')) {
+            // Queued follows are excluded from suggestions right away.
+            ap_masto_suggestions_cache_clear($ownerUserId);
+        }
         if ($kind !== 'bite') {
             // Bite rows are one-shot (nonce target keys), not ranking signals.
             ap_signal_record($ownerUserId, $platform, $kind, $targetKey, $desired, $payload);

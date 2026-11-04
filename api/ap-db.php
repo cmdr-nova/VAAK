@@ -9676,6 +9676,10 @@ function ap_follow_lists_reset_memo(?string $ownerActorId = null): void
         $keys[] = 'vaak:bsky:followed-handles:' . $uid;
     }
     ap_redis_delete(...$keys);
+    if ($uid > 0 && function_exists('ap_masto_suggestions_cache_clear')) {
+        // Follow suggestions are built from this graph.
+        ap_masto_suggestions_cache_clear($uid);
+    }
     if (function_exists('ap_redis_relset_metric')) {
         ap_redis_relset_metric('invalidate');
     }
@@ -10025,6 +10029,9 @@ function ap_following_id_set_invalidate_owner(int $ownerUserId): void
             'vaak:relset:v1:followers:' . $ownerUserId . ':bare',
             'vaak:bsky:followed-handles:' . $ownerUserId
         );
+    }
+    if (function_exists('ap_masto_suggestions_cache_clear')) {
+        ap_masto_suggestions_cache_clear($ownerUserId);
     }
     if (function_exists('ap_redis_relset_metric')) {
         ap_redis_relset_metric('invalidate');

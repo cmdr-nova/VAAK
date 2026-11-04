@@ -49720,14 +49720,43 @@ window.vaakBootStatusThread();
     const card = document.querySelector('#trends-sidebar [data-trend-module="follow"]');
     if (card && visible(document.getElementById('trends-sidebar'))) rotateFollow(card, false);
   }, FOLLOW_ROTATE_MS);
-  document.addEventListener('vaak:wtf-followed', () => {
-    refillFollow();
+  function dropStoredFollow() {
     // The stored pool still lists who was just followed; fetch a fresh one next time.
     const data = readStore();
     if (data && data.modules && data.modules.follow) {
       delete data.modules.follow;
       writeStore(data);
     }
+  }
+  document.addEventListener('vaak:wtf-followed', () => {
+    refillFollow();
+    dropStoredFollow();
+  });
+  // A follow (or dismiss) anywhere: Home suggestions, Who to follow, For You,
+  // or a profile/search Follow button. Take that account out of every
+  // suggestion list on the page and out of the stored Who to follow pool.
+  document.addEventListener('vaak:account-followed', (ev) => {
+    const actor = String((ev && ev.detail && ev.detail.actor) || '').replace(/\/+$/, '');
+    let removedRow = false;
+    if (actor) {
+      document.querySelectorAll('form input[name="action"][value="suggestion_follow"]').forEach((input) => {
+        const form = input.form;
+        const idInput = form && form.querySelector('input[name="actor_id"]');
+        if (!idInput || String(idInput.value || '').replace(/\/+$/, '') !== actor) return;
+        if (form.dataset.busy === '1') return; // the card that was clicked fades itself
+        const card = form.closest('article.home-suggestion, article.wtf-row, article.tweet');
+        if (!card) return;
+        const grid = card.parentElement;
+        if (card.classList.contains('wtf-row')) removedRow = true;
+        card.remove();
+        if (grid && grid.classList.contains('home-suggestions-grid') && !grid.querySelector('article.home-suggestion')) {
+          const section = grid.closest('section.home-suggestions');
+          if (section) section.remove();
+        }
+      });
+    }
+    if (removedRow) refillFollow();
+    dropStoredFollow();
   });
   function cardStable(box, module) {
     const card = box.querySelector('[data-trend-module="' + module + '"]');
@@ -53605,6 +53634,8 @@ if (VIEW === 'analytics') loadAnalytics();
         throw new Error((data && data.error) || (action === 'suggestion_follow' ? 'Could not follow.' : 'Could not dismiss.'));
       }
       fadeCard();
+      const actorField = form.querySelector('input[name="actor_id"]');
+      document.dispatchEvent(new CustomEvent('vaak:account-followed', { detail: { actor: actorField ? String(actorField.value || '') : '' } }));
     } catch (err) {
       button.innerHTML = beforeLabel;
       button.disabled = beforeDisabled;
@@ -53679,6 +53710,10 @@ if (VIEW === 'analytics') loadAnalytics();
       const res = await fetch(form.getAttribute('action') || window.location.href, { method: 'POST', body: fd, credentials: 'same-origin', headers: { 'Accept': 'application/json', 'X-Requested-With': 'XMLHttpRequest' } });
       const data = await res.json().catch(() => null);
       if (!data || !data.ok || !data.queued) throw new Error((data && data.error) || 'Could not queue follow action.');
+      if (want) {
+        const actorField = form.querySelector('input[name="actor_id"]');
+        document.dispatchEvent(new CustomEvent('vaak:account-followed', { detail: { actor: actorField ? String(actorField.value || '') : '' } }));
+      }
       if (want && data.requested) {
         button.innerHTML = 'Requested';
         button.title = 'Requested — they approve new followers';
