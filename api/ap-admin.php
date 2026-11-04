@@ -35946,8 +35946,10 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
                       || $rpMetaUpdated < time() - 12 * 3600
                       || $rpForceRefresh
                   );
+                  // Refresh profile bypasses the 12 h freshness gate; without
+                  // force the warmer re-read the cached row and changed nothing.
                   if ($rpNeedsWarm && function_exists('ap_remote_actor_warm_async')) {
-                      ap_remote_actor_warm_async($rpActor);
+                      ap_remote_actor_warm_async($rpActor, $rpForceRefresh);
                   }
                   if (is_array($rpMeta)) {
                       $sum = trim((string) ($rpMeta['summary'] ?? ''));
@@ -35978,8 +35980,14 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
                       // account matters to the user. Warm both media slots
                       // asynchronously so later Notifications/timelines can
                       // use the cached avatar instead of the default.
-                      if ((!$ca || !$ch) && function_exists('ap_remote_media_warm_async')) {
-                          ap_remote_media_warm_async($rpActor);
+                      // Refresh profile forces a new download of both images,
+                      // and a cached copy of an avatar the actor has since
+                      // replaced counts as missing.
+                      $rpIconSource = is_array($rpMeta) ? trim((string) ($rpMeta['icon_source_url'] ?? '')) : '';
+                      $rpAvatarStale = is_array($ca) && $rpIconSource !== ''
+                          && trim((string) ($ca['source_url'] ?? '')) !== $rpIconSource;
+                      if (($rpForceRefresh || !$ca || !$ch || $rpAvatarStale) && function_exists('ap_remote_media_warm_async')) {
+                          ap_remote_media_warm_async($rpActor, $rpForceRefresh);
                       }
                   }
                   if ($rpActor !== '') {

@@ -18939,6 +18939,95 @@ function ap_remote_actor_host_fetch_allowed(string $actorId): bool
  *
  * @return array{actor_id:string,username:?string,display_name:?string,host:?string,icon_source_url:?string,image_source_url:?string}|null
  */
+/** Bluesky DIDs an AS2 actor document names in alsoKnownAs (at://did:… or did:…). */
+function ap_remote_actor_doc_dids(array $doc): array
+{
+    $aka = $doc['alsoKnownAs'] ?? $doc['also_known_as'] ?? null;
+    if (is_string($aka)) {
+        $aka = [$aka];
+    }
+    if (!is_array($aka)) {
+        return [];
+    }
+    $out = [];
+    foreach ($aka as $item) {
+        if (is_array($item)) {
+            $item = (string) ($item['id'] ?? $item['href'] ?? '');
+        }
+        if (is_string($item) && preg_match('~^(?:at://)?(did:(?:plc|web):[A-Za-z0-9._:%-]+)/?$~', trim($item), $m)) {
+            $out[$m[1]] = true;
+        }
+    }
+    return array_slice(array_keys($out), 0, 2);
+}
+
+/**
+ * Avatar/banner of the Bluesky account an actor document links to, for
+ * documents that carry no icon of their own. Cached bsky_actor_profiles row
+ * first, then one public AppView getProfile (background warmers only).
+ *
+ * @return array{avatar:?string,banner:?string}
+ */
+function ap_remote_actor_did_twin_media(array $doc): array
+{
+    $none = ['avatar' => null, 'banner' => null];
+    $pick = static function (array $profile): array {
+        $avatar = ap_profile_sanitize_https_url(is_string($profile['avatar'] ?? null) ? $profile['avatar'] : null);
+        $banner = ap_profile_sanitize_https_url(is_string($profile['banner'] ?? null) ? $profile['banner'] : null);
+        return ['avatar' => $avatar, 'banner' => $banner];
+    };
+    foreach (ap_remote_actor_doc_dids($doc) as $did) {
+        if (function_exists('ap_bsky_actor_profile_cache_get')) {
+            $cached = ap_bsky_actor_profile_cache_get($did);
+            if (is_array($cached['profile'] ?? null)) {
+                $got = $pick($cached['profile']);
+                if ($got['avatar'] !== null) {
+                    return $got;
+                }
+            }
+        }
+        $fetch = $GLOBALS['ap_remote_actor_did_profile_fetch'] ?? null;
+        $profile = is_callable($fetch) ? $fetch($did) : ap_remote_actor_public_bsky_profile($did);
+        if (is_array($profile)) {
+            $got = $pick($profile);
+            if ($got['avatar'] !== null) {
+                return $got;
+            }
+        }
+    }
+    return $none;
+}
+
+/** One public AppView getProfile for a DID; null on any failure. */
+function ap_remote_actor_public_bsky_profile(string $did): ?array
+{
+    if (!preg_match('~^did:(?:plc|web):[A-Za-z0-9._:%-]+$~', $did)) {
+        return null;
+    }
+    $ch = curl_init('https://public.api.bsky.app/xrpc/app.bsky.actor.getProfile?actor=' . rawurlencode($did));
+    if ($ch === false) {
+        return null;
+    }
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_PROTOCOLS => CURLPROTO_HTTPS,
+        CURLOPT_CONNECTTIMEOUT => 3,
+        CURLOPT_TIMEOUT => 5,
+        CURLOPT_HTTPHEADER => [
+            'Accept: application/json',
+            'User-Agent: ' . (function_exists('vaak_user_agent') ? vaak_user_agent('Bluesky') : 'VAAK'),
+        ],
+    ]);
+    $body = curl_exec($ch);
+    $status = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+    if (!is_string($body) || $status !== 200) {
+        return null;
+    }
+    $json = json_decode($body, true);
+    return is_array($json) && ($json['did'] ?? '') === $did ? $json : null;
+}
+
 function ap_remote_actor_ensure(string $actorId, bool $allowFetch = true): ?array
 {
     $actorId = rtrim(trim($actorId), '/');
@@ -18998,6 +19087,18 @@ function ap_remote_actor_ensure(string $actorId, bool $allowFetch = true): ?arra
                 }
                 $icon = ap_remote_actor_as2_media_url($doc['icon'] ?? null, $actorId);
                 $image = ap_remote_actor_as2_media_url($doc['image'] ?? null, $actorId);
+                // Wafrn leaves icon/image out of some actor documents but
+                // names the account's Bluesky DID in alsoKnownAs. Borrow that
+                // profile's avatar/banner so the account is not faceless.
+                if (!is_string($icon) || $icon === '') {
+                    $twin = ap_remote_actor_did_twin_media($doc);
+                    if ($twin['avatar'] !== null) {
+                        $icon = $twin['avatar'];
+                        if (!is_string($image) || $image === '') {
+                            $image = $twin['banner'];
+                        }
+                    }
+                }
                 if (is_string($icon) && $icon !== '') {
                     ap_remote_actor_icon_miss_clear($actorId);
                 } else {

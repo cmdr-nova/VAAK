@@ -1287,6 +1287,19 @@ function ap_remote_media_download_slot_release(?array $slot): void
     }
 }
 
+/** A stored remote_actors image URL, or null when none is usable. */
+function ap_remote_media_known_source(?array $meta, string $field, string $actorId): ?string
+{
+    $url = is_array($meta) ? ($meta[$field] ?? null) : null;
+    if (!is_string($url) || trim($url) === '') {
+        return null;
+    }
+    $url = function_exists('ap_account_media_resolve')
+        ? ap_account_media_resolve($url, $actorId)
+        : ap_profile_sanitize_https_url($url);
+    return is_string($url) && $url !== '' ? $url : null;
+}
+
 /**
  * Ensure avatar or header for an actor is cached in R2.
  * Returns public R2 URL on success, or null.
@@ -1326,33 +1339,47 @@ function ap_remote_media_ensure(string $actorId, string $kind = 'avatar', bool $
         require_once __DIR__ . '/ap-inbox.php';
     }
     $doc = ap_fetch_actor_doc($actorId);
-    if (!is_array($doc)) {
-        if ($cached) {
-            ap_remote_media_touch($actorId, $kind);
-            return (string) $cached['public_url'];
+    if (is_array($doc)) {
+        $username = null;
+        if (isset($doc['preferredUsername']) && is_string($doc['preferredUsername'])) {
+            $username = $doc['preferredUsername'];
         }
-        return null;
+        $display = null;
+        if (isset($doc['name']) && is_string($doc['name'])) {
+            $display = $doc['name'];
+        }
+        $host = parse_url($actorId, PHP_URL_HOST);
+        $host = is_string($host) ? strtolower($host) : null;
+        $iconSrc = ap_as2_media_url($doc['icon'] ?? null, $actorId);
+        $imageSrc = ap_as2_media_url($doc['image'] ?? null, $actorId);
+        // No icon in the document (Wafrn): ap_remote_actor_ensure may have
+        // stored the linked Bluesky account's avatar instead; use that.
+        if ($iconSrc === null) {
+            $iconSrc = ap_remote_media_known_source($meta, 'icon_source_url', $actorId);
+            $imageSrc ??= ap_remote_media_known_source($meta, 'image_source_url', $actorId);
+        }
+        ap_remote_actor_upsert($actorId, [
+            'username' => $username,
+            'display_name' => $display,
+            'host' => $host,
+            'icon_source_url' => $iconSrc,
+            'image_source_url' => $imageSrc,
+        ]);
+    } else {
+        // The actor document did not come back this time (timeout, rate
+        // limit, a host that refuses this fetch). The warmer just ran
+        // ap_remote_actor_ensure, so remote_actors usually already knows the
+        // image URLs: download those instead of giving up with no avatar.
+        $iconSrc = ap_remote_media_known_source($meta, 'icon_source_url', $actorId);
+        $imageSrc = ap_remote_media_known_source($meta, 'image_source_url', $actorId);
+        if ($iconSrc === null && $imageSrc === null) {
+            if ($cached) {
+                ap_remote_media_touch($actorId, $kind);
+                return (string) $cached['public_url'];
+            }
+            return null;
+        }
     }
-
-    $username = null;
-    if (isset($doc['preferredUsername']) && is_string($doc['preferredUsername'])) {
-        $username = $doc['preferredUsername'];
-    }
-    $display = null;
-    if (isset($doc['name']) && is_string($doc['name'])) {
-        $display = $doc['name'];
-    }
-    $host = parse_url($actorId, PHP_URL_HOST);
-    $host = is_string($host) ? strtolower($host) : null;
-    $iconSrc = ap_as2_media_url($doc['icon'] ?? null, $actorId);
-    $imageSrc = ap_as2_media_url($doc['image'] ?? null, $actorId);
-    ap_remote_actor_upsert($actorId, [
-        'username' => $username,
-        'display_name' => $display,
-        'host' => $host,
-        'icon_source_url' => $iconSrc,
-        'image_source_url' => $imageSrc,
-    ]);
 
     $source = $kind === 'header' ? $imageSrc : $iconSrc;
     if ($source === null) {
@@ -1459,15 +1486,22 @@ function ap_remote_media_ensure(string $actorId, string $kind = 'avatar', bool $
     }
 }
 
+/**
+ * Media kind of a forced actor-media job ("Refresh profile"): the worker
+ * downloads avatar and header again even when a cached copy exists.
+ */
+const AP_MEDIA_WARM_FORCE_KIND = 'avatar_header_force';
+
 /** Enqueue a durable remote actor-media warm, coalescing duplicate requests. */
-function ap_media_warm_enqueue_actor(string $actorId): bool
+function ap_media_warm_enqueue_actor(string $actorId, bool $force = false): bool
 {
     $actorId = rtrim(trim($actorId), '/');
     if ($actorId === '' || !str_starts_with($actorId, 'https://')) {
         return false;
     }
+    $kind = $force ? AP_MEDIA_WARM_FORCE_KIND : 'avatar_header';
     if (ap_redis_client('queue') !== null
-        && !ap_redis_lock('media-warm:actor:' . hash('sha256', $actorId), 20)) {
+        && !ap_redis_lock('media-warm:actor:' . ($force ? 'force:' : '') . hash('sha256', $actorId), 20)) {
         return false;
     }
     try {
@@ -1476,20 +1510,20 @@ function ap_media_warm_enqueue_actor(string $actorId): bool
         $st = $db->prepare(
             "INSERT INTO ap_media_warm_queue
              (job_type, target_key, media_kind, status, attempts, max_attempts, next_attempt_at, created_at, updated_at)
-             VALUES ('actor_media', ?, 'avatar_header', 'pending', 0, 8, ?, ?, ?)
+             VALUES ('actor_media', ?, ?, 'pending', 0, 8, ?, ?, ?)
              ON CONFLICT(job_type, target_key, media_kind) DO NOTHING"
         );
-        $st->execute([$actorId, $now, $now, $now]);
+        $st->execute([$actorId, $kind, $now, $now, $now]);
         // A completed/failed row becomes eligible again when a caller asks
         // for a fresh warm; an in-flight row remains untouched and coalesced.
         $up = $db->prepare(
             "UPDATE ap_media_warm_queue
              SET status = 'pending', attempts = 0, next_attempt_at = ?,
                  claimed_at = NULL, last_error = NULL, updated_at = ?
-             WHERE job_type = 'actor_media' AND target_key = ? AND media_kind = 'avatar_header'
+             WHERE job_type = 'actor_media' AND target_key = ? AND media_kind = ?
                AND status IN ('succeeded', 'failed')"
         );
-        $up->execute([$now, $now, $actorId]);
+        $up->execute([$now, $now, $actorId, $kind]);
         return true;
     } catch (Throwable $e) {
         error_log('[ap-media-warm] enqueue: ' . $e->getMessage());
@@ -1547,12 +1581,12 @@ function ap_media_warm_worker_nudge(): void
  * The database row survives PHP/VPS restarts; a worker is nudged immediately
  * but cron also drains pending/retry rows when no request is active.
  */
-function ap_remote_media_warm_async(string $actorId): void
+function ap_remote_media_warm_async(string $actorId, bool $force = false): void
 {
     if (function_exists('ap_feature_enabled') && !ap_feature_enabled('remote_media_warm', true)) {
         return;
     }
-    if (!ap_media_warm_enqueue_actor($actorId)) {
+    if (!ap_media_warm_enqueue_actor($actorId, $force)) {
         return;
     }
     ap_media_warm_worker_nudge();
@@ -1621,9 +1655,15 @@ function ap_media_warm_worker_run(int $limit = 3): array
                     }
                 } else {
                     $actor = rtrim($target, '/');
-                    if (function_exists('ap_remote_actor_ensure')) ap_remote_actor_ensure($actor, true);
-                    $avatar = ap_remote_media_ensure($actor, 'avatar', false);
-                    $header = ap_remote_media_ensure($actor, 'header', false);
+                    $forceMedia = (string) ($row['media_kind'] ?? '') === AP_MEDIA_WARM_FORCE_KIND;
+                    if ($forceMedia) $GLOBALS['ap_remote_actor_force_refresh'] = true;
+                    try {
+                        if (function_exists('ap_remote_actor_ensure')) ap_remote_actor_ensure($actor, true);
+                    } finally {
+                        if ($forceMedia) unset($GLOBALS['ap_remote_actor_force_refresh']);
+                    }
+                    $avatar = ap_remote_media_ensure($actor, 'avatar', $forceMedia);
+                    $header = ap_remote_media_ensure($actor, 'header', $forceMedia);
                     // An actor may legitimately publish neither image. Treat a
                     // completed lookup as success so it is not retried forever.
                     $ok = true;
