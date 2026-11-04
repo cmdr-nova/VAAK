@@ -56,6 +56,7 @@ php_tests=(
   api/bin/bsky-observation-refresh-smoke.php
   api/bin/classic-profile-redirect-smoke.php
   api/bin/guest-status-link-smoke.php
+  api/bin/first-paint-after-shell-smoke.php
   api/bin/vaak-status-permalink-smoke.php
   api/bin/bsky-thread-no-federation-smoke.php
   api/bin/bsky-thread-local-notify-smoke.php
