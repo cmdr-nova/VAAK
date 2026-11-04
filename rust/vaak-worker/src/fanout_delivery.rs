@@ -45,6 +45,8 @@ const PER_HOST_PER_PASS: usize = 4;
 /// PHP then queues the deliveries it used to send inline.
 pub(crate) const SYNC_HEARTBEAT_KEY: &str = "vaak:fanout_delivery:rust_sync:v1";
 const IDLE_POLL: Duration = Duration::from_secs(2);
+/// PHP `ap_redis_queue_push('fanout-delivery', …)` on the queue database.
+const WAKE_QUEUE: &str = "fanout-delivery";
 const PROBE_EVERY: Duration = Duration::from_secs(60);
 const HOST_CACHE_SECS: u64 = 60;
 const SNIPPET: usize = 180;
@@ -897,7 +899,8 @@ fn bump(tally: &Mutex<Tally>, f: impl FnOnce(&mut Tally)) {
     }
 }
 
-/// One pass: reclaim stale leases, then work up to BATCH due rows.
+/// One pass: reclaim stale leases, then work up to BATCH due rows. Returns
+/// how many due rows it selected, including ones left for the next pass.
 async fn pass(state: &Arc<State>) -> Result<i64> {
     let now = now_unix();
     let stale = iso(now - 600);
@@ -916,6 +919,7 @@ async fn pass(state: &Arc<State>) -> Result<i64> {
             &[&iso(now), &BATCH],
         )
         .await?;
+    let selected = rows.len() as i64;
     let mut by_host: Vec<(String, Vec<Row>)> = Vec::new();
     for r in rows {
         let row = Row {
@@ -957,7 +961,7 @@ async fn pass(state: &Arc<State>) -> Result<i64> {
         tracing::info!(claimed = t.0, succeeded = t.1, retried = t.2, failed = t.3, "fanout_delivery");
     }
     STATS.add(t);
-    Ok(t.0)
+    Ok(selected)
 }
 
 /// Counts waiting to be written to Redis by the main loop.
@@ -979,6 +983,27 @@ impl PendingStats {
 }
 
 static STATS: PendingStats = PendingStats(Mutex::new((0, 0, 0, 0)));
+
+/// Wait up to IDLE_POLL for PHP's wake-up push, then drop the other pushes:
+/// one pass serves them all. Nothing else pops this list while Rust runs.
+async fn idle(wake: &mut Option<redis::aio::MultiplexedConnection>) {
+    let Some(conn) = wake.as_mut() else {
+        tokio::time::sleep(IDLE_POLL).await;
+        return;
+    };
+    match crate::redis_util::queue_brpop(conn, WAKE_QUEUE, IDLE_POLL.as_secs_f64()).await {
+        Ok(Some(_)) => {
+            let key = format!("vaak:queue:{WAKE_QUEUE}");
+            let _: std::result::Result<(), _> = redis::cmd("DEL").arg(&key).query_async(conn).await;
+        }
+        Ok(None) => {}
+        Err(e) => {
+            tracing::warn!(error = %e, "fanout delivery wake queue unavailable; polling");
+            *wake = None;
+            tokio::time::sleep(IDLE_POLL).await;
+        }
+    }
+}
 
 pub async fn run(cfg: Arc<crate::config::Config>) {
     loop {
@@ -1005,6 +1030,7 @@ async fn work(cfg: &crate::config::Config) -> Result<()> {
         // Turning D3 off takes effect at once, not after the TTL.
         let _: std::result::Result<(), _> = redis::cmd("DEL").arg(SYNC_HEARTBEAT_KEY).query_async(&mut redis).await;
     }
+    let mut wake = crate::redis_util::connect(&cfg.redis_queue_url).await.ok();
     tracing::info!(sync, "fanout delivery worker running");
     let mut last_probe: Option<Instant> = None;
     loop {
@@ -1016,7 +1042,7 @@ async fn work(cfg: &crate::config::Config) -> Result<()> {
             state.requeue_probe().await;
             last_probe = Some(Instant::now());
         }
-        let claimed = pass(&state).await?;
+        let selected = pass(&state).await?;
         let (c, s, r, f) = STATS.take();
         if c + s + r + f > 0 {
             let _: std::result::Result<(), _> = redis::pipe()
@@ -1028,8 +1054,8 @@ async fn work(cfg: &crate::config::Config) -> Result<()> {
                 .query_async(&mut redis)
                 .await;
         }
-        if claimed < BATCH {
-            tokio::time::sleep(IDLE_POLL).await;
+        if selected < BATCH {
+            idle(&mut wake).await;
         }
     }
 }
