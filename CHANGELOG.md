@@ -12,6 +12,13 @@ anything else bumps the patch number.
 Releases up to **0.9.83** used a two-digit deploy counter (0.9.05, 0.9.83)
 and have no notes here; their tags and GitHub Releases are unchanged.
 
+## [0.37.1](https://github.com/cmdr-nova/VAAK/releases/tag/v0.37.1) - 2026-11-04
+
+### 🐛 Fixes
+* Profiles: fix the 503 on every /vaak/users/{key} page by @cmdr-nova in https://github.com/cmdr-nova/VAAK/pull/382
+
+**Full Changelog**: https://github.com/cmdr-nova/VAAK/compare/v0.37.0...v0.37.1
+
 ## [0.37.0](https://github.com/cmdr-nova/VAAK/releases/tag/v0.37.0) - 2026-11-04
 
 ### ✨ Features
