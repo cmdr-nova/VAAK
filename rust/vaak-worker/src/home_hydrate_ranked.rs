@@ -806,11 +806,16 @@ fn bsky_media_and_card(embed_json: &str, status_id: &str) -> (Vec<Value>, Option
                 } else {
                     kind
                 };
+                // With no Bluesky thumbnail the helper falls back to the GIF
+                // link as poster, which Klipy doesn't serve to browsers: a
+                // black box. No poster lets the painter's #t=0.001 first-frame
+                // trick draw the MP4's opening frame instead.
+                let preview = if kind == "gifv" && thumb.is_empty() { String::new() } else { preview };
                 media.push(json!({
                     "id": format!("{status_id}#media-{}", media.len() + 1),
                     "type": kind,
                     "url": play,
-                    "preview_url": preview,
+                    "preview_url": if preview.is_empty() { Value::Null } else { Value::String(preview) },
                     "mediaType": mime,
                     "remote_url": uri,
                     "description": ext.get("title").and_then(|v| v.as_str()).unwrap_or("GIF"),
@@ -6955,6 +6960,15 @@ mod timeline_contract {
         let html = crate::notif_embed::paint_lean_feed_card_opts(&tenor, "home", "");
         assert!(!html.contains("<video"), "GIF painted as video: {html}");
         assert!(html.contains("<img src=\"https://media.tenor.com/abcAAAAC/dance.gif"), "{html}");
+    }
+
+    #[test]
+    fn bluesky_klipy_gif_without_thumb_paints_first_frame() {
+        let st = materialize_bsky(&bsky_row("gif", json!({"$type": "app.bsky.embed.external#view",
+            "external": {"uri": "https://static.klipy.com/ii/c3a1/25/8c/iZITSvkQ.gif?hh=480&ww=480&mp4=TqZsKsUP", "title": "GIF", "description": ""}})));
+        let html = crate::notif_embed::paint_lean_feed_card_opts(&st, "home", "");
+        assert!(html.contains("src=\"https://static.klipy.com/ii/c3a1/25/8c/TqZsKsUP.mp4#t=0.001\""), "{html}");
+        assert!(!html.contains("poster="), "{html}");
     }
 
     #[test]
