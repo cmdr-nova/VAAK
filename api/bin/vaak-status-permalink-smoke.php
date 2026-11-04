@@ -1,5 +1,6 @@
 <?php
 declare(strict_types=1);
+require_once __DIR__ . '/admin-shell-source.php';
 /**
  * Local post permalinks are /vaak/@{key}/{id}. The ActivityPub id is rebuilt
  * from that path. Old ?view=status links are not redirected. No database.
@@ -142,7 +143,7 @@ $index = (string) file_get_contents($root . '/vaak/index.php');
 $applyAt = strpos($index, 'ap_vaak_apply_short_status_request()');
 $guestAt = strpos($index, "=== 'status'\n        && trim((string) (\$_GET['object'] ?? '')) !== ''");
 permalink_check($applyAt !== false && $guestAt !== false && $applyAt < $guestAt, 'short links are resolved before the guest status gate');
-$admin = (string) file_get_contents($root . '/api/ap-admin.php');
+$admin = vaak_admin_shell_source($root . '/api/ap-admin.php');
 permalink_check(str_contains($admin, 'ap_vaak_local_status_href'), 'status links are built by the short-permalink helper');
 permalink_check(str_contains($admin, 'window.vaakStatusHref = function'), 'the SPA builds the short form');
 permalink_check(str_contains($admin, "localFrom !== 'remote_profile'"), 'the SPA does not tag local notes as remote profiles');

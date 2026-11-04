@@ -1,5 +1,6 @@
 <?php
 declare(strict_types=1);
+require_once __DIR__ . '/admin-shell-source.php';
 /**
  * Deprioritize on Home saves one row and hands the Home rebuild to the
  * timeline fan-out queue (`owner_rewarm`). It must not clear every user's
@@ -41,7 +42,7 @@ dq_check($GLOBALS['owner_cleared'] === [], 'nothing is cleared inline when the q
 admin_home_rank_pref_rewarm(0);
 dq_check(count($GLOBALS['queued']) === 1, 'no owner, no job');
 
-$admin = (string) file_get_contents($api . '/ap-admin.php');
+$admin = vaak_admin_shell_source($api . '/ap-admin.php');
 $start = strpos($admin, "} elseif (\$action === 'deprioritize_remote' || \$action === 'undeprioritize_remote') {");
 $end = strpos($admin, "} elseif (\$action === 'subscribe_posts'", (int) $start);
 dq_check($start !== false && $end !== false, 'deprioritize handler found');

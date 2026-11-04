@@ -6,7 +6,7 @@ const assert = require('assert');
 const path = require('path');
 
 const file = process.argv[2] || path.join(__dirname, '..', 'ap-admin.php');
-const source = fs.readFileSync(file, 'utf8');
+const source = require('./admin-shell-source.js').adminShellSource(file);
 const begin = source.indexOf('/* vaak-reply-preview:start */');
 const end = source.indexOf('/* vaak-reply-preview:end */', begin);
 assert(begin > 0 && end > begin, 'reply preview markers');

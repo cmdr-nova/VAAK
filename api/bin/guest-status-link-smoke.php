@@ -1,5 +1,6 @@
 <?php
 declare(strict_types=1);
+require_once __DIR__ . '/admin-shell-source.php';
 /**
  * Shared post links (/vaak/?view=status&object=…) open read-only for visitors
  * without an account. Guests stay cache-only: no remote fetches, no thread
@@ -20,7 +21,7 @@ function guest_status_check(bool $condition, string $message): void
 }
 
 $front = (string) file_get_contents($root . '/vaak/index.php');
-$admin = (string) file_get_contents($root . '/api/ap-admin.php');
+$admin = vaak_admin_shell_source($root . '/api/ap-admin.php');
 
 // Front controller: a logged-out full-page GET for a post boots the guest view,
 // before the partial/AJAX 401 path, and only for GET/HEAD with an object.

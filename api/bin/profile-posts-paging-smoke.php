@@ -1,5 +1,6 @@
 <?php
 declare(strict_types=1);
+require_once __DIR__ . '/admin-shell-source.php';
 /**
  * Profile Posts and Replies pages are filtered in SQL.
  * A mixed window of replies must not end the Posts cursor, and walking
@@ -406,7 +407,7 @@ $check(ap_outbox_media_count($mediaActor) === count($mediaExpected), 'media coun
 $check(substr_count($php, "COALESCE(visibility, \\'public\\') = \\'public\\' AND raw_create_json LIKE \\'%\"attachment\"%\\'") === 2, 'media count and list share the public attachment predicate');
 $check(str_contains($user, "\$tab !== 'media' && function_exists('ap_outbox_note_is_reply')"), 'classic media does not drop replies after the page is fetched');
 $check(str_contains($user, 'ap_user_post_preview_html($actorKey, $mediaRow)'), 'a media row with no gallery still renders on its page');
-$admin = (string) file_get_contents($root . '/api/ap-admin.php');
+$admin = vaak_admin_shell_source($root . '/api/ap-admin.php');
 $headerRust = (string) file_get_contents($root . '/rust/vaak-worker/src/profile_header.rs');
 $check(str_contains($headerRust, 'vaak:profile:media-count:v2:') && !str_contains($headerRust, 'media-count:v1:'), 'Rust media count uses the public v2 cache key');
 $check(str_contains((string) file_get_contents($root . '/api/bin/local-profile-header-reference.php'), 'vaak:profile:media-count:v2:fixture'), 'header fixture seeds the v2 media count');

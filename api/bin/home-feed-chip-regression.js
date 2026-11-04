@@ -10,7 +10,7 @@ const assert = require('assert');
 const path = require('path');
 
 const file = process.argv[2] || path.join(__dirname, '..', 'ap-admin.php');
-const source = fs.readFileSync(file, 'utf8');
+const source = require('./admin-shell-source.js').adminShellSource(file);
 
 // The chip script block; other scripts have their own paint().
 const anchor = source.indexOf('// Home feed chips: VAAK (Home) first');

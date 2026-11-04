@@ -1,5 +1,6 @@
 <?php
 declare(strict_types=1);
+require_once __DIR__ . '/admin-shell-source.php';
 
 /**
  * DM reply context names a real post once, then stays quiet.
@@ -254,7 +255,7 @@ $GLOBALS['db'] = $saved;
 dm_reply_check($failed === [''], 'an unreadable parent does not invent a status link');
 
 $root = dirname(__DIR__, 2);
-$admin = (string) file_get_contents($root . '/api/ap-admin.php');
+$admin = vaak_admin_shell_source($root . '/api/ap-admin.php');
 dm_reply_check(substr_count($admin, 'Open referenced post') === 1, 'the link text exists only in the DM reply helper');
 dm_reply_check(!str_contains($admin, 'function admin_dm_reply_context_html'), 'per-message DM context helper is gone');
 $start = strpos($admin, "<?php elseif (\$view === 'dms'): ?>");

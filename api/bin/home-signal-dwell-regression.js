@@ -5,7 +5,7 @@ const vm = require('vm');
 const assert = require('assert');
 const path = require('path');
 
-const source = fs.readFileSync(path.join(__dirname, '..', 'ap-admin.php'), 'utf8');
+const source = require('./admin-shell-source.js').adminShellSource(path.join(__dirname, '..', 'ap-admin.php'));
 const probeMarker = 'const probe = window.__VAAK_HOME_SIGNAL_PROBE === true';
 const probeAt = source.indexOf(probeMarker);
 const start = probeAt > 0 ? source.lastIndexOf('(function ', probeAt) : -1;

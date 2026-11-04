@@ -3,7 +3,7 @@ const args=process.argv.slice(2);
 const flag=args.find((arg)=>arg.startsWith('--'))||'';
 const abortCapable=flag!=='--without-abort-controller';
 const file=args.find((arg)=>!arg.startsWith('--'))||path.join(__dirname,'..','ap-admin.php');
-const source=fs.readFileSync(file,'utf8');
+const source=require('./admin-shell-source.js').adminShellSource(file);
 const begin=source.indexOf('  // Notification + DM badges and tab title');const end=source.indexOf('\n})();\n\n// VAAK browser Web Push',begin);
 assert(begin>0&&end>begin);
 let js='(function(){\n'+source.slice(begin,end)+'\n})();';
