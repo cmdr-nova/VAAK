@@ -26454,7 +26454,28 @@ function admin_bsky_home_chips_slot(string $active): string
     if (!function_exists('ap_bsky_tab_enabled') || !ap_bsky_tab_enabled()) {
         return '';
     }
-    return '<div class="home-feed-chips" data-bsky-home-chips data-active="' . h($active !== '' ? $active : 'vaak') . '" hidden></div>';
+    $active = admin_bsky_chip_key($active);
+    // A feed opened from outside the pinned row (trending topic, Search >
+    // Feeds, Library > Feeds, a pin made on bsky.app inside the 10 min chip
+    // cache) has no chip of its own. The row then shows a chip for it, so
+    // Home never sits with nothing picked; this is that chip's label.
+    $label = '';
+    if (str_starts_with($active, 'at://') && function_exists('ap_bsky_feed_labels')) {
+        $label = (string) (ap_bsky_feed_labels([['value' => $active]], 1)[$active] ?? '');
+    }
+    return '<div class="home-feed-chips" data-bsky-home-chips data-active="' . h($active) . '"'
+        . ($label !== '' ? ' data-active-label="' . h($label) . '"' : '')
+        . ' hidden></div>';
+}
+
+/** Chip key for a feed param: 'timeline' is Following, blank is VAAK. */
+function admin_bsky_chip_key(string $feed): string
+{
+    $feed = trim($feed);
+    if ($feed === '') {
+        return 'vaak';
+    }
+    return $feed === 'timeline' ? 'following' : $feed;
 }
 
 /**
@@ -47482,7 +47503,10 @@ window.vaakBootStatusThread();
       slot.innerHTML = chipsHtml;
       slot.dataset.filled = '1';
     }
-    const active = slot.dataset.active || 'vaak';
+    let active = slot.dataset.active || 'vaak';
+    if (active === 'timeline') active = 'following';
+    if (view === 'bluesky' && active === 'vaak') active = 'following';
+    ensureActiveChip(slot, active);
     slot.querySelectorAll('a[data-chip]').forEach((a) => {
       const on = a.dataset.chip === active;
       a.classList.toggle('btn-primary', on);
@@ -47491,6 +47515,28 @@ window.vaakBootStatusThread();
     });
     slot.hidden = false;
     revealActiveChip(slot);
+  }
+  // A Bluesky feed opened from outside the pinned row (a trending topic,
+  // Search > Feeds, Library > Feeds, or a pin newer than the cached row) has
+  // no chip, which left Home with nothing picked. Give it a chip of its own
+  // at the end of the row; it goes again once another chip is live.
+  function ensureActiveChip(slot, active) {
+    const row = slot.querySelector('.bsky-feed-tabs');
+    if (!row) return;
+    row.querySelectorAll('a[data-temp-chip]').forEach((a) => {
+      if (a.dataset.chip !== active) a.remove();
+    });
+    const has = Array.prototype.some.call(row.querySelectorAll('a[data-chip]'), (a) => a.dataset.chip === active);
+    if (has || active === 'vaak') return;
+    const a = document.createElement('a');
+    a.className = 'btn btn-ghost';
+    a.href = '?view=bluesky&feed=' + encodeURIComponent(active);
+    a.setAttribute('data-vaak-soft-nav', 'bluesky');
+    a.setAttribute('data-bsky-feed', active);
+    a.setAttribute('data-chip', active);
+    a.setAttribute('data-temp-chip', '1');
+    a.textContent = slot.dataset.activeLabel || (active === 'following' ? 'Following' : 'Feed');
+    row.appendChild(a);
   }
   // Each switch paints a fresh chip row scrolled to the start, so a feed far
   // down a long row ended up selected but off screen. Bring it into view
