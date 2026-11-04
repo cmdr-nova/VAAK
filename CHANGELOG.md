@@ -12,6 +12,14 @@ anything else bumps the patch number.
 Releases up to **0.9.83** used a two-digit deploy counter (0.9.05, 0.9.83)
 and have no notes here; their tags and GitHub Releases are unchanged.
 
+## [0.33.0](https://github.com/cmdr-nova/VAAK/releases/tag/v0.33.0) - 2026-11-04
+
+### ✨ Features
+* Mark trending-topic feeds as temporary, with a close and back link by @cmdr-nova in https://github.com/cmdr-nova/VAAK/pull/370
+* Show Wafrn self-quotes with the real author and drop the mid-body RE: line by @cmdr-nova in https://github.com/cmdr-nova/VAAK/pull/371
+
+**Full Changelog**: https://github.com/cmdr-nova/VAAK/compare/v0.32.0...v0.33.0
+
 ## [0.32.0](https://github.com/cmdr-nova/VAAK/releases/tag/v0.32.0) - 2026-11-04
 
 ### ✨ Features
