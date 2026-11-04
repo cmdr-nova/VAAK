@@ -1,10 +1,10 @@
 <?php
 /**
  * Across networks trends (snapshots from vaak-worker trends-service):
- * one Trending tags card holding tags, Bluesky topics and trending posts;
- * viewer filters apply, Nostr only for npub-linked viewers, Bluesky topics
- * honor muted words and open their feed, and a missing snapshot degrades to
- * an empty card. Also the Who to follow card.
+ * one Trending tags card holding tags and Bluesky topics (no network posts);
+ * viewer filters apply, Bluesky topics honor muted words and open their
+ * feed, and a missing snapshot degrades to an empty card. Also the Who to
+ * follow card.
  */
 declare(strict_types=1);
 
@@ -59,7 +59,7 @@ $post = static fn(string $uri, string $acct, string $text): array => [
 // Nothing written yet: empty cards, no errors.
 $html = admin_trends_network_html('tags', 'home', 7);
 check(str_contains($html, 'data-trend-module="tags"') && str_contains($html, 'No fediverse tags yet'), 'empty tags card');
-check(str_contains($html, 'Trending posts') && str_contains($html, 'No network posts yet'), 'empty posts section inside the tags card');
+check(!str_contains($html, 'Trending posts'), 'no posts section in Across networks');
 check(admin_trends_network_html('statuses', 'home', 7) === '', 'no separate network posts card');
 
 $GLOBALS['snap'] = [
@@ -92,11 +92,12 @@ check(str_contains($html, 'Bluesky topics') && str_contains($html, 'World Series
 check(!str_contains($html, 'Show spoilers'), 'muted word hides a Bluesky topic');
 check(!str_contains($html, 'view=search&amp;q=World'), 'topic no longer opens an empty VAAK search');
 check(str_contains($html, 'href="https://bsky.app/profile/trending.bsky.app/feed/665497821" target="_blank"'), 'topic opens bsky.app without a Bluesky connection');
-check(str_contains($html, 'From mastodon.social and 1 more'), 'sources line');
-check(str_contains($html, 'hello fediverse') && !str_contains($html, 'should not show'), 'viewer filters apply to network posts');
-check(strpos($html, 'Bluesky topics') < strpos($html, 'Trending posts') && strpos($html, 'Trending posts') < strpos($html, 'hello fediverse'), 'tags, topics, then posts');
-check(str_contains($html, 'trend-post-row') && str_contains($html, 'a@mastodon.social · 3 likes'), 'post row shows who and likes like a topic row');
-check(!str_contains($html, 'nostr hello'), 'no Nostr without a linked npub');
+check(str_contains($html, 'Fediverse tags from mastodon.social and 1 more'), 'sources line');
+check(!str_contains($html, 'hello fediverse') && !str_contains($html, 'Trending posts') && !str_contains($html, 'trend-post-row'), 'network posts left out');
+check(strpos($html, '#Cats') < strpos($html, 'Bluesky topics'), 'tags, then topics');
+// The shared post row (On VAAK uses it) keeps the topic-row layout.
+$row = admin_trend_status_row_html($GLOBALS['snap']['statuses']['items'][0], 'home');
+check(str_contains($row, 'trend-post-row') && str_contains($row, 'a@mastodon.social · 3 likes'), 'post row shows who and likes like a topic row');
 
 $GLOBALS['bsky_connected'] = true;
 $html = admin_trends_network_html('tags', 'home', 7);
@@ -107,9 +108,9 @@ check(!str_contains($bad, 'javascript') && str_contains($bad, 'https://bsky.app/
 
 $GLOBALS['nostr_linked'] = true;
 $html = admin_trends_network_html('tags', 'home', 7);
-check(str_contains($html, 'nostr hello') && !str_contains($html, 'muted key'), 'Nostr for linked viewers, hidden keys out');
-check(str_contains($html, 'href="https://njump.me/note1" target="_blank"'), 'Nostr notes open the note viewer');
-check(str_contains($html, 'From mastodon.social and 2 more'), 'nostr.wine named as a source');
+check(!str_contains($html, 'nostr hello'), 'no network Nostr posts even for linked viewers');
+$row = admin_trend_status_row_html($GLOBALS['snap']['nostr']['items'][0], 'home');
+check(str_contains($row, 'href="https://njump.me/note1" target="_blank"'), 'Nostr post rows open the note viewer');
 
 // Who to follow: the whole pool ships, three rows show.
 $sug = static fn(string $n): array => ['account' => ['uri' => 'https://x.social/users/' . $n, 'display_name' => 'Name ' . $n, 'acct' => $n . '@x.social', 'avatar' => 'https://x.social/a/' . $n . '.png']];

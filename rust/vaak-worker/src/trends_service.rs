@@ -11,13 +11,16 @@
 //!   child inherits this unit's CPU cap.
 //! * **Bluesky** (`bsky`, 300 s): `app.bsky.unspecced.getTrends` on the
 //!   public AppView, no auth. Bluesky's own network-wide trending topics.
-//! * **Fediverse** (`mastodon`, 600 s): public `/api/v1/trends/tags` and
-//!   `/api/v1/trends/statuses` from the largest Mastodon instances
-//!   (`VAAK_TRENDS_MASTODON_INSTANCES`), merged by tag name and post URI.
-//! * **Nostr** (`nostr`, 300 s): `api.nostr.wine/trending` ids + counts, the
-//!   notes themselves fetched from the fallback relays and signature checked.
-//!   Only runs while some VAAK user has a linked npub; PHP shows it only to
-//!   those users.
+//! * **Fediverse** (`mastodon`, 600 s): public `/api/v1/trends/tags` from the
+//!   largest Mastodon instances (`VAAK_TRENDS_MASTODON_INSTANCES`), merged by
+//!   tag name.
+//!
+//! Network-wide trending posts are off: the sidebar stopped showing them
+//! (too tall). `VAAK_TRENDS_NETWORK_POSTS=1` brings back the data legs:
+//! `/api/v1/trends/statuses` in the Mastodon leg, merged by post URI, and
+//! **Nostr** (`nostr`, 300 s): `api.nostr.wine/trending` ids + counts, the
+//! notes fetched from the fallback relays and signature checked, only while
+//! some VAAK user has a linked npub.
 //!
 //! Network snapshots go to `vaak:trends:net:v1:*`. When one changes,
 //! `vaak:trends:data-gen:v1` is bumped; the notification SSE stream turns
@@ -78,6 +81,11 @@ fn secs_env(name: &str, default: u64, lo: u64, hi: u64) -> Duration {
 }
 
 /// `0` in a leg's interval turns that leg off.
+/// Network-wide trending posts (Mastodon statuses, nostr.wine). Off by default.
+fn network_posts() -> bool {
+    std::env::var("VAAK_TRENDS_NETWORK_POSTS").map(|v| v.trim() == "1").unwrap_or(false)
+}
+
 fn leg_interval(name: &str, default: u64) -> Option<Duration> {
     let raw = std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(default);
     if raw == 0 {
@@ -139,7 +147,7 @@ pub async fn run(cfg: &Config) -> Result<()> {
         Leg { name: "local", every: leg_interval("VAAK_TRENDS_LOCAL_SECS", 300), last: None },
         Leg { name: "bsky", every: leg_interval("VAAK_TRENDS_BSKY_SECS", 300), last: None },
         Leg { name: "mastodon", every: leg_interval("VAAK_TRENDS_MASTODON_SECS", 600), last: None },
-        Leg { name: "nostr", every: leg_interval("VAAK_TRENDS_NOSTR_SECS", 300), last: None },
+        Leg { name: "nostr", every: if network_posts() { leg_interval("VAAK_TRENDS_NOSTR_SECS", 300) } else { None }, last: None },
     ];
     tracing::info!(instances = ?instances(), "trends-service starting");
     loop {
@@ -552,9 +560,14 @@ pub fn merge_statuses(lists: &[(String, Value)], now: i64) -> Vec<Value> {
 
 async fn mastodon_leg(http: &reqwest::Client, redis: &mut redis::aio::MultiplexedConnection) -> Result<bool> {
     let hosts = instances();
+    let posts = network_posts();
     let fetches = hosts.iter().map(|host| async move {
         let tags = get_json(http, &format!("https://{host}/api/v1/trends/tags?limit=20")).await;
-        let statuses = get_json(http, &format!("https://{host}/api/v1/trends/statuses?limit=40")).await;
+        let statuses = if posts {
+            Some(get_json(http, &format!("https://{host}/api/v1/trends/statuses?limit=40")).await)
+        } else {
+            None
+        };
         (host.clone(), tags, statuses)
     });
     let results = futures_util::future::join_all(fetches).await;
@@ -567,9 +580,10 @@ async fn mastodon_leg(http: &reqwest::Client, redis: &mut redis::aio::Multiplexe
             Err(e) => tracing::warn!(%host, error = %format!("{e:#}"), "trends/tags failed"),
         }
         match statuses {
-            Ok(v) if v.is_array() => status_lists.push((host, v)),
-            Ok(_) => tracing::warn!(%host, "trends/statuses: not a list"),
-            Err(e) => tracing::warn!(%host, error = %format!("{e:#}"), "trends/statuses failed"),
+            None => {}
+            Some(Ok(v)) if v.is_array() => status_lists.push((host, v)),
+            Some(Ok(_)) => tracing::warn!(%host, "trends/statuses: not a list"),
+            Some(Err(e)) => tracing::warn!(%host, error = %format!("{e:#}"), "trends/statuses failed"),
         }
     }
     if tag_lists.is_empty() && status_lists.is_empty() {
