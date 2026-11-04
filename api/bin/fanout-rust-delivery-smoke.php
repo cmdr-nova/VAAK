@@ -112,6 +112,8 @@ $check(($r['status'] ?? '') === 'pending', 'expired lease is reclaimed and retri
 $check((int) ($r['attempts'] ?? 0) === 5, 'expired lease counts the reclaim and the try');
 
 $check(ap_fanout_rust_worker_active(), 'PHP sees the Rust heartbeat');
+// CI starts the worker with VAAK_FANOUT_SYNC_RUST=1 (cutover D3).
+$check(ap_fanout_rust_sync_active(), 'PHP sees the Rust sync heartbeat');
 $stats = ap_redis_client()?->hGetAll('vaak:fanout_delivery_rust:stats:v1') ?: [];
 $check((int) ($stats['claimed'] ?? 0) >= 5, 'worker counts its claims');
 

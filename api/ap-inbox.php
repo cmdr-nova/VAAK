@@ -6986,6 +6986,11 @@ function ap_deliver_signed_json(string $inboxUrl, array $activity, string $keyId
 function ap_deliver_inline_then_queue(array $activity, array $targets, string $keyId, string $privPath, int $inlineMax = 50): array
 {
     $targets = array_values($targets);
+    // Cutover D3: the Rust worker sends every inbox from the queue.
+    if ($targets !== [] && function_exists('ap_fanout_rust_sync_active') && ap_fanout_rust_sync_active()
+        && ap_deliver_fanout_background($activity, $targets, $keyId, $privPath)) {
+        return ['delivered' => 0, 'queued' => count($targets)];
+    }
     $delivered = 0;
     foreach (array_slice($targets, 0, $inlineMax) as $inbox) {
         if (ap_deliver_signed_json($inbox, $activity, $keyId, $privPath)) {
@@ -7009,7 +7014,7 @@ function ap_deliver_inline_then_queue(array $activity, array $targets, string $k
  *
  * @param list<string> $inboxUrls
  */
-function ap_deliver_fanout_background(array $activity, array $inboxUrls, string $keyId, string $privPath): bool
+function ap_deliver_fanout_background(array $activity, array $inboxUrls, string $keyId, string $privPath, ?int $priorityOverride = null): bool
 {
     $inboxUrls = array_values(array_unique(array_filter($inboxUrls, static fn($u) => is_string($u) && str_starts_with($u, 'https://'))));
     if (!$inboxUrls) {
@@ -7036,6 +7041,9 @@ function ap_deliver_fanout_background(array $activity, array $inboxUrls, string 
         }
         // Replies and direct mentions should not sit behind bulk fan-out.
         $priority = !empty($activityObject['inReplyTo']) ? 10 : ($hasMention ? 20 : 50);
+        if ($priorityOverride !== null) {
+            $priority = min($priority, max(0, $priorityOverride));
+        }
         $db = ap_db();
         $st = $db->prepare('INSERT INTO ap_fanout_delivery_queue
             (activity_key,inbox_url,activity_json,key_id,priv_path,status,priority,attempts,next_attempt_at,created_at,updated_at)
@@ -7135,9 +7143,23 @@ function ap_deliver_public_activity(array $activity, array $priorityExtra = [], 
 
     $delivered = 0;
     $bridgyOk = false;
+    // Cutover D3: Bridgy and the first followers go to the Rust worker's
+    // queue ahead of the rest (priority 5) instead of being sent here.
+    $viaQueue = function_exists('ap_fanout_rust_sync_active') && ap_fanout_rust_sync_active();
+    $urgent = [];
+    if ($viaQueue && !$skipBridgy) {
+        // One Bridgy inbox, like the inline loop's stop at the first 2xx; the
+        // queue retries it rather than sending a second copy elsewhere.
+        foreach ($bridgyInboxes as $inbox) {
+            if (!ap_is_blocked_inbox($inbox)) {
+                $urgent[] = $inbox;
+                break;
+            }
+        }
+    }
     // Bridgy FIRST and alone — never sit behind slow followers/shared inboxes.
     // Personal inbox is enough for Bluesky; stop early on first 2xx.
-    foreach ($skipBridgy ? [] : $bridgyInboxes as $inbox) {
+    foreach (($skipBridgy || $viaQueue) ? [] : $bridgyInboxes as $inbox) {
         if (ap_is_blocked_inbox($inbox)) {
             continue;
         }
@@ -7148,7 +7170,7 @@ function ap_deliver_public_activity(array $activity, array $priorityExtra = [], 
             break;
         }
     }
-    if (!$bridgyOk && !$skipBridgy) {
+    if (!$bridgyOk && !$skipBridgy && !$viaQueue) {
         // Don't lose Bluesky if Bridgy timed out — retry in background.
         ap_deliver_fanout_background($activity, $bridgyInboxes, $ident['key_id'], $ident['priv']);
         ap_log('deliver_bridgy_deferred type=' . (string) ($activity['type'] ?? '?'));
@@ -7178,6 +7200,22 @@ function ap_deliver_public_activity(array $activity, array $priorityExtra = [], 
     $syncBudget = 6;
     $sync = array_slice($otherPriority, 0, $syncBudget);
     $bgFollowers = array_slice($otherPriority, $syncBudget);
+    if ($viaQueue) {
+        $urgent = array_values(array_unique(array_merge($urgent, $sync)));
+        if ($urgent === [] || ap_deliver_fanout_background($activity, $urgent, $ident['key_id'], $ident['priv'], 5)) {
+            $sync = [];
+        } else {
+            // Queue unavailable: send them here as before.
+            $viaQueue = false;
+            foreach ($skipBridgy ? [] : $bridgyInboxes as $inbox) {
+                if (!ap_is_blocked_inbox($inbox) && ap_fanout_deliver_or_hold($inbox, $activity, $ident['key_id'], $ident['priv'], 5.0)) {
+                    $delivered++;
+                    $bridgyOk = true;
+                    break;
+                }
+            }
+        }
+    }
     foreach ($sync as $inbox) {
         if (ap_fanout_deliver_or_hold($inbox, $activity, $ident['key_id'], $ident['priv'], 2.5)) {
             $delivered++;
@@ -7246,6 +7284,10 @@ function ap_deliver_public_activity(array $activity, array $priorityExtra = [], 
         ap_request_actor_set(is_array($prevActor) ? (string) ($prevActor['key'] ?? '') : null);
     }
 
+    if ($viaQueue) {
+        $queued += count($urgent);
+    }
+
     return ['delivered' => $delivered, 'queued' => $queued, 'bridgy' => $bridgyOk];
 }
 
@@ -7293,6 +7335,14 @@ function ap_deliver_followers_activity(array $activity, array $priorityExtra = [
     $syncBudget = 8;
     $sync = array_slice($targets, 0, $syncBudget);
     $deferred = array_slice($targets, $syncBudget);
+    $urgentQueued = 0;
+    // Cutover D3: the first followers go to the Rust worker's queue ahead of
+    // the rest (priority 5) instead of being sent here.
+    if ($sync !== [] && function_exists('ap_fanout_rust_sync_active') && ap_fanout_rust_sync_active()
+        && ap_deliver_fanout_background($activity, $sync, $ident['key_id'], $ident['priv'], 5)) {
+        $urgentQueued = count($sync);
+        $sync = [];
+    }
     foreach ($sync as $inbox) {
         if (ap_fanout_deliver_or_hold($inbox, $activity, $ident['key_id'], $ident['priv'], 2.5)) {
             $delivered++;
@@ -7313,7 +7363,7 @@ function ap_deliver_followers_activity(array $activity, array $priorityExtra = [
     if (function_exists('ap_request_actor_set')) {
         ap_request_actor_set(is_array($prevActor) ? (string) ($prevActor['key'] ?? '') : null);
     }
-    return ['delivered' => $delivered, 'queued' => $queued, 'bridgy' => false];
+    return ['delivered' => $delivered, 'queued' => $queued + $urgentQueued, 'bridgy' => false];
 }
 
 /** Send a FEP-044f Reject to the requesting actor when local policy denies it. */

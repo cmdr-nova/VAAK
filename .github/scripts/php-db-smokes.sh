@@ -203,7 +203,7 @@ VAAK_INBOX_RUST_URL="$inbox_url" run "$runner" api/bin/inbox-rust-accept-smoke.p
 # switch on works it. Nothing it is given resolves, so no request leaves CI.
 run "$runner" api/bin/fanout-rust-delivery-smoke.php --seed
 fanout_port="${VAAK_CI_FANOUT_PORT:-18797}"
-VAAK_ENV_FILE=/nonexistent VAAK_PHYRIAN_BRIDGE_ENV_FILE=/nonexistent VAAK_FANOUT_DELIVERY_RUST=1 \
+VAAK_ENV_FILE=/nonexistent VAAK_PHYRIAN_BRIDGE_ENV_FILE=/nonexistent VAAK_FANOUT_DELIVERY_RUST=1 VAAK_FANOUT_SYNC_RUST=1 \
   VAAK_DATABASE_URL="postgresql://${PGUSER}@${PGHOST}:${PGPORT}/${db}" \
   VAAK_REDIS_URL="redis://${redis_hostport}/0" VAAK_REDIS_QUEUE_URL="redis://${redis_hostport}/1" \
   VAAK_JETSTREAM_STATE="${work}/worker/jetstream-fanout" VAAK_NOTIF_CACHE_DIR="${work}/worker" \

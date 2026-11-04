@@ -35,6 +35,15 @@ const STATS_TTL: i64 = 14 * 86_400;
 const BATCH: i64 = 40;
 const HOST_PARALLEL: usize = 8;
 const DELIVERY_TIMEOUT: Duration = Duration::from_millis(2_500);
+/// PHP gave Bridgy Fed 5 s inline ("Bridgy often ACKs immediately even when
+/// its media pipeline is busy"); keep that when its rows come through here.
+const BRIDGY_TIMEOUT: Duration = Duration::from_secs(5);
+/// Rows one host may send in a single pass. A slow host otherwise holds the
+/// pass (and the next reply or Bridgy row behind it) for 40 x 2.5 s.
+const PER_HOST_PER_PASS: usize = 4;
+/// Set next to the heartbeat while VAAK_FANOUT_SYNC_RUST=1 (cutover D3):
+/// PHP then queues the deliveries it used to send inline.
+pub(crate) const SYNC_HEARTBEAT_KEY: &str = "vaak:fanout_delivery:rust_sync:v1";
 const IDLE_POLL: Duration = Duration::from_secs(2);
 const PROBE_EVERY: Duration = Duration::from_secs(60);
 const HOST_CACHE_SECS: u64 = 60;
@@ -42,6 +51,20 @@ const SNIPPET: usize = 180;
 
 pub(crate) fn enabled() -> bool {
     std::env::var("VAAK_FANOUT_DELIVERY_RUST").is_ok_and(|v| v.trim() == "1")
+}
+
+/// Cutover D3: PHP stops sending fan-out inline and queues it for this worker.
+fn sync_enabled() -> bool {
+    std::env::var("VAAK_FANOUT_SYNC_RUST").is_ok_and(|v| v.trim() == "1")
+}
+
+fn is_bridgy_host(host: &str) -> bool {
+    let h = host.trim_end_matches('.').to_ascii_lowercase();
+    h == "brid.gy" || h.ends_with(".brid.gy")
+}
+
+fn timeout_for(host: &str) -> Duration {
+    if is_bridgy_host(host) { BRIDGY_TIMEOUT } else { DELIVERY_TIMEOUT }
 }
 
 /// `gmdate('c', $unix)`.
@@ -690,8 +713,8 @@ async fn deliver(state: &State, inbox: &str, activity: &Value, key_id: &str, pri
         .redirect(reqwest::redirect::Policy::none())
         .https_only(true)
         .http1_only()
-        .timeout(DELIVERY_TIMEOUT)
-        .connect_timeout(DELIVERY_TIMEOUT.max(Duration::from_secs(1)))
+        .timeout(timeout_for(&host))
+        .connect_timeout(timeout_for(&host).max(Duration::from_secs(1)))
         .resolve_to_addrs(&host.to_ascii_lowercase(), &v4)
         .build()
     {
@@ -905,8 +928,11 @@ async fn pass(state: &Arc<State>) -> Result<i64> {
             last_error: r.get(6),
         };
         let host = crate::inbox_accept::host_of(&row.inbox_url).unwrap_or_default();
+        // Rows past the cap stay pending (they are claimed in process()) and
+        // come first in the next pass.
         match by_host.iter_mut().find(|(h, _)| *h == host) {
-            Some((_, list)) => list.push(row),
+            Some((_, list)) if list.len() < PER_HOST_PER_PASS => list.push(row),
+            Some(_) => {}
             None => by_host.push((host, vec![row])),
         }
     }
@@ -974,10 +1000,18 @@ async fn work(cfg: &crate::config::Config) -> Result<()> {
         hosts: tokio::sync::Mutex::new((HashMap::new(), None)),
         log_path,
     });
-    tracing::info!("fanout delivery worker running");
+    let sync = sync_enabled();
+    if !sync {
+        // Turning D3 off takes effect at once, not after the TTL.
+        let _: std::result::Result<(), _> = redis::cmd("DEL").arg(SYNC_HEARTBEAT_KEY).query_async(&mut redis).await;
+    }
+    tracing::info!(sync, "fanout delivery worker running");
     let mut last_probe: Option<Instant> = None;
     loop {
         let _: std::result::Result<(), _> = redis::cmd("SET").arg(HEARTBEAT_KEY).arg(now_unix()).arg("EX").arg(HEARTBEAT_TTL).query_async(&mut redis).await;
+        if sync {
+            let _: std::result::Result<(), _> = redis::cmd("SET").arg(SYNC_HEARTBEAT_KEY).arg(now_unix()).arg("EX").arg(HEARTBEAT_TTL).query_async(&mut redis).await;
+        }
         if last_probe.is_none_or(|at| at.elapsed() >= PROBE_EVERY) {
             state.requeue_probe().await;
             last_probe = Some(Instant::now());
@@ -1003,6 +1037,15 @@ async fn work(cfg: &crate::config::Config) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bridgy_rows_get_the_longer_timeout() {
+        assert_eq!(timeout_for("bsky.brid.gy"), BRIDGY_TIMEOUT);
+        assert_eq!(timeout_for("BRID.GY"), BRIDGY_TIMEOUT);
+        assert_eq!(timeout_for("fed.brid.gy."), BRIDGY_TIMEOUT);
+        assert_eq!(timeout_for("notbrid.gy"), DELIVERY_TIMEOUT);
+        assert_eq!(timeout_for("mastodon.social"), DELIVERY_TIMEOUT);
+    }
 
     #[test]
     fn iso_is_php_gmdate_c() {
