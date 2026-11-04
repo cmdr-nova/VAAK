@@ -9,7 +9,7 @@ const vm = require('vm');
 const assert = require('assert');
 
 const file = process.argv[2] || require('path').join(__dirname, '..', 'ap-admin.php');
-const source = fs.readFileSync(file, 'utf8');
+const source = require('./admin-shell-source.js').adminShellSource(file);
 const start = source.indexOf('(function () {\n  /** Replace a timeline card in place');
 const end = source.indexOf('\n})();\n</script>', start);
 assert(start > 0 && end > start, 'timeline boot script markers');

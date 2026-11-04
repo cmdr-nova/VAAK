@@ -1,5 +1,6 @@
 <?php
 declare(strict_types=1);
+require_once __DIR__ . '/admin-shell-source.php';
 /**
  * Bites go through the durable action queue like Like/Boost/Bookmark.
  * Each bite is one-shot (a nonce target key), so a second bite on the same
@@ -59,7 +60,7 @@ bite_check(ap_bite_precheck('https://mkultra.monster/users/cmdr_nova/notes/1', '
 bite_check(ap_bite_precheck('alice', 'user') !== null, 'non-URL target is rejected');
 bite_check(ap_bite_precheck($post, 'nibble') === 'Invalid bite kind', 'unknown kind is rejected');
 
-$admin = (string) file_get_contents($api . '/ap-admin.php');
+$admin = vaak_admin_shell_source($api . '/ap-admin.php');
 bite_check(str_contains($admin, "(int) \$vaakOwnerId, 'fedi', 'bite',"), 'Bite button handler enqueues');
 bite_check(str_contains($admin, "actionInput.value !== 'bite_remote'"), 'Bite forms submit in the background');
 

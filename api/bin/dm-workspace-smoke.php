@@ -1,5 +1,6 @@
 <?php
 declare(strict_types=1);
+require_once __DIR__ . '/admin-shell-source.php';
 
 /**
  * DM screen rework: newest messages first-load, live "after id" reads, chat
@@ -218,7 +219,7 @@ dm_ws_check(strpos($rows, 'ctx-stub') < strpos($rows, 'dm-bubble dm-in'), 'reply
 dm_ws_check(str_contains($rows, 'hi &lt;b&gt;'), 'message text stays escaped by the bubble renderer');
 
 // ---- wiring ----
-$admin = (string) file_get_contents($root . '/api/ap-admin.php');
+$admin = vaak_admin_shell_source($root . '/api/ap-admin.php');
 $inbox = (string) file_get_contents($root . '/api/ap-inbox.php');
 $send = substr($inbox, (int) strpos($inbox, 'function ap_dm_send('));
 dm_ws_check(strpos($send, 'ap_dm_local_recipient($peer)') < strpos($send, 'ap_fetch_actor_doc($peer)'), 'local recipients are found before any actor fetch');

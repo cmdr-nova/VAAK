@@ -1,5 +1,6 @@
 <?php
 declare(strict_types=1);
+require_once __DIR__ . '/admin-shell-source.php';
 
 /**
  * DM media display, direct addressing, and the "never public" boundary.
@@ -287,7 +288,7 @@ foreach (['list' => $gallery, 'count' => $galleryCount] as $label => $source) {
 
 $routes = (string) file_get_contents($api . '/ap-mastodon.php');
 $entities = (string) file_get_contents($api . '/ap-masto-entities.php');
-$admin = (string) file_get_contents($api . '/ap-admin.php');
+$admin = vaak_admin_shell_source($api . '/ap-admin.php');
 $check(!str_contains($routes, 'DM media attachments are not supported yet'), 'Mastodon clients can attach media to a direct status');
 $check(str_contains($routes, 'ap_dm_send($status, $dmPeer, $inReplyTo, $mediaIds, $dmSpoiler, $dmSensitive)'), 'direct statuses pass media ids through');
 $check(str_contains($routes, 'Polls are not supported in DMs'), 'DM polls stay unsupported');

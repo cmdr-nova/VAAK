@@ -1,5 +1,6 @@
 <?php
 declare(strict_types=1);
+require_once __DIR__ . '/admin-shell-source.php';
 
 /**
  * Phyrian clans.
@@ -242,7 +243,7 @@ $check(str_contains($migration, 'phyrian_clans') && str_contains($migration, 'ph
 $check(!str_contains($migration, 'phyrian_players') && !str_contains($migration, 'ALTER '), 'migration does not change existing player columns');
 $check(!preg_match('/secret|password|api[_-]?key|BEGIN [A-Z0-9]/i', $migration), 'migration contains no secret material');
 
-$admin = (string) file_get_contents(dirname(__DIR__) . '/ap-admin.php');
+$admin = vaak_admin_shell_source(dirname(__DIR__) . '/ap-admin.php');
 $check(substr_count($admin, "getenv('VAAK_PHYRIAN_CLANS')") === 4, 'admin checks the switch before the tab, the page, and the write');
 $check(substr_count($admin, "require_once __DIR__ . '/ap-phyrian-clans.php'") === 3, 'admin loads the helper only from the gated branches');
 $offset = 0;

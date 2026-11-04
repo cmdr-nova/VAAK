@@ -1,5 +1,6 @@
 <?php
 declare(strict_types=1);
+require_once __DIR__ . '/admin-shell-source.php';
 
 /**
  * Phyrian postable moments.
@@ -289,7 +290,7 @@ $check(str_contains($hubUnmarked, 'Nothing is posted until you confirm.'), 'hub 
 $badKey = ap_phyrian_moments_profile_url('not a key');
 $check($badKey === 'https://mkultra.monster/', 'unsafe actor keys fall back to the site home');
 
-$admin = (string) file_get_contents(dirname(__DIR__) . '/ap-admin.php');
+$admin = vaak_admin_shell_source(dirname(__DIR__) . '/ap-admin.php');
 $check(substr_count($admin, "getenv('VAAK_PHYRIAN_MOMENTS')") === 2, 'admin checks the switch in the action and on the hub');
 $check(substr_count($admin, "require_once __DIR__ . '/ap-phyrian-moments.php'") === 2, 'admin loads the helper only in those two places');
 $offset = 0;

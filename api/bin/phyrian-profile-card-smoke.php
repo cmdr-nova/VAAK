@@ -1,5 +1,6 @@
 <?php
 declare(strict_types=1);
+require_once __DIR__ . '/admin-shell-source.php';
 
 /**
  * Phyrian local-profile card.
@@ -184,7 +185,7 @@ $pure = ap_phyrian_profile_card_html([
 $check(str_contains($pure, 'Rose Static') && str_contains($pure, 'Open game'), 'markup helper renders a supplied row with no lookup');
 $check(ap_phyrian_profile_card_lookup_count() === $before, 'markup helper does not query');
 
-$admin = (string) file_get_contents(dirname(__DIR__) . '/ap-admin.php');
+$admin = vaak_admin_shell_source(dirname(__DIR__) . '/ap-admin.php');
 $flagAt = strpos($admin, "getenv('VAAK_PHYRIAN_PROFILE_CARD')");
 $requireAt = strpos($admin, "require_once __DIR__ . '/ap-phyrian-profile-card.php'");
 $statsAt = strpos($admin, '<div class="remote-profile-stats" aria-label="Profile stats">');

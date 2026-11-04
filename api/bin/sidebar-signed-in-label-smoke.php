@@ -1,5 +1,6 @@
 <?php
 declare(strict_types=1);
+require_once __DIR__ . '/admin-shell-source.php';
 /**
  * Sidebar "signed in as" label is the local @handle only.
  * The account acct, actor id, profile URL, mentions, and VAAK_HANDLE stay full.
@@ -15,7 +16,7 @@ function sidebar_label_check(bool $ok, string $label): void
     $GLOBALS['checks']++;
 }
 
-$admin = (string) file_get_contents($root . '/api/ap-admin.php');
+$admin = vaak_admin_shell_source($root . '/api/ap-admin.php');
 if (!preg_match('/^function admin_sidebar_local_handle\([^\n]*\).*?^\}/ms', $admin, $fn)) {
     throw new RuntimeException('missing admin_sidebar_local_handle');
 }

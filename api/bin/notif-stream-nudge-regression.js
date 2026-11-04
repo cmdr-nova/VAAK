@@ -3,7 +3,7 @@
 // a closed stream (401/no route) falls back to the 12 s poll.
 const fs=require('fs'),vm=require('vm'),assert=require('assert'),path=require('path');
 const file=process.argv[2]||path.join(__dirname,'..','ap-admin.php');
-const source=fs.readFileSync(file,'utf8');
+const source=require('./admin-shell-source.js').adminShellSource(file);
 const begin=source.indexOf('  // Notification + DM badges and tab title');const end=source.indexOf('\n})();\n\n// VAAK browser Web Push',begin);
 assert(begin>0&&end>begin);
 const js='(function(){\n'+source.slice(begin,end).replace(/<\?=([\s\S]*?)\?>/g,(_,expr)=>{
