@@ -74,4 +74,18 @@ foreach (["admin_page_timing_mark('head');", "admin_page_timing_mark('shell');",
 }
 first_paint_check(str_contains($admin, "header('Server-Timing: app-head;dur='"), 'Server-Timing header');
 
+// The ranked cache key uses the worker's follow list, or full pages never
+// find the cache ranked-warm keeps fresh (merged Bluesky follows, dropped
+// rejected follows and empty partial lists all gave PHP a different key).
+$rust = (string) file_get_contents($root . '/rust/vaak-worker/src/ranked_warm.rs');
+first_paint_check(str_contains($rust, '"SELECT actor_id FROM following WHERE owner_actor_id = $1 OR owner_actor_id = $2"'), 'worker reads every following row for its key');
+first_paint_check(str_contains($admin, "\$st = \$db->prepare('SELECT actor_id FROM following WHERE owner_actor_id = ? OR owner_actor_id = ?');"), 'PHP reads the same rows');
+first_paint_check(str_contains($admin, "\$workerIds = admin_tl_cache_follow_ids(\$owner);"), 'cache key uses the worker follow list');
+
+$fixture = ['https://b.example/users/y', 'https://a.example/users/x'];
+sort($fixture, SORT_STRING);
+first_paint_check('v13_home_u1_aon_' . substr(hash('sha256', implode('|', $fixture)), 0, 24) === 'v13_home_u1_aon_73c8dea2f8ebbc4876e1037b', 'PHP key format matches the worker fixture');
+first_paint_check(str_contains($rust, 'assert_eq!(key, "v13_home_u1_aon_73c8dea2f8ebbc4876e1037b");'), 'worker pins the same fixture key');
+first_paint_check(str_contains($admin, "return 'v13_' . \$view . '_u' . \$owner . '_a' . \$algorithmMode . '_' . substr(hash('sha256', implode('|', \$parts)), 0, 24);"), 'PHP key built from the shared parts');
+
 echo "first-paint-after-shell-smoke: {$checks} checks passed\n";

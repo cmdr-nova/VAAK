@@ -4486,6 +4486,14 @@ mod tests {
     }
 
     #[test]
+    fn home_key_matches_php_fixture() {
+        // api/bin/first-paint-after-shell-smoke.php pins the same literal:
+        // PHP admin_tl_cache_key must find the key this worker writes.
+        let key = cache_key_home(1, true, &["https://b.example/users/y".into(), "https://a.example/users/x".into()]);
+        assert_eq!(key, "v13_home_u1_aon_73c8dea2f8ebbc4876e1037b");
+    }
+
+    #[test]
     fn home_cache_key_shape() {
         let key = cache_key_home(1, true, &["https://example.com/users/a".into()]);
         assert!(key.starts_with("v13_home_u1_aon_"));
