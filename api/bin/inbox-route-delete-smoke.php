@@ -66,6 +66,9 @@ $zedKey = $zed . '#main-key';
 ap_inbox_rust_key_mirror($zedKey, $pem);
 $redis = ap_redis_client();
 $redis->del('vaak:inbox_rust:stats:v1');
+// The worker caches actor blocks for 60 s from its first Delete, so the block
+// the actor-block case needs has to exist before any request.
+$db->exec("INSERT INTO ap_blocks (created_at, updated_at, scope, value, kind) VALUES ('2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 'actor', 'https://blockhost.test/users/troll', 'block')");
 
 $spoolRow = static function (string $body) use ($db): ?array {
     $r = $db->query('SELECT * FROM ap_inbox_spool WHERE body = ' . $db->quote($body) . ' ORDER BY id DESC LIMIT 1')->fetch(PDO::FETCH_ASSOC);
@@ -130,9 +133,8 @@ $check(rd_post($rust, $body, $zedKey, $priv) === 202, 'mention case: answered 20
 $row = $spoolRow($body);
 $check(($row['state'] ?? '') === 'pending', 'mention case: left to the PHP drain');
 
-// An actor block that names the host: PHP resolves block aliases, so Rust
-// spools it pending even for another account there.
-$db->exec("INSERT INTO ap_blocks (created_at, updated_at, scope, value, kind) VALUES ('2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 'actor', 'https://blockhost.test/users/troll', 'block')");
+// An actor block that names the host (seeded before the first request): PHP
+// resolves block aliases, so Rust spools it pending even for another account there.
 $amy = 'https://blockhost.test/users/amy';
 ap_inbox_rust_key_mirror($amy . '#main-key', $pem);
 $body = json_encode(['id' => $amy . '#delete/1', 'type' => 'Delete', 'actor' => $amy, 'object' => $amy . '/statuses/1'], JSON_UNESCAPED_SLASHES);
