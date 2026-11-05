@@ -19152,6 +19152,23 @@ function admin_reblog_is_bsky(array $row): bool
         || str_contains($objectId, 'bsky.mkultra.monster/');
 }
 
+/**
+ * Hex note id of a VAAK boost or quote of a Nostr note (status_id
+ * `nostr:{id}`, boost_status_id `nostr-boost:{id}:{owner}`), '' otherwise.
+ * Mirrors nostr::share::key_note_id.
+ */
+function admin_reblog_nostr_note_id(array $row): string
+{
+    foreach (['status_id' => 'nostr:', 'boost_status_id' => 'nostr-boost:'] as $col => $prefix) {
+        $key = strtolower(trim((string) ($row[$col] ?? '')));
+        if (str_starts_with($key, $prefix)
+            && preg_match('/^[0-9a-f]{64}(?::|$)/', substr($key, strlen($prefix)), $m) === 1) {
+            return substr($key, strlen($prefix), 64);
+        }
+    }
+    return '';
+}
+
 /** True for a local-only RSS boost/quote stored in masto_reblogs. */
 function admin_reblog_is_rss(array $row): bool
 {
@@ -23479,6 +23496,25 @@ function admin_render_boost_card(array $rb, array $followingIds, string $returnV
             }
         }
         // Deleted/missing item: fall through to the unavailable stub below.
+    }
+
+    // Nostr boosts and quotes (nostr:{id} keys, nostr/share.rs): the worker
+    // paints the stored note like Rust Home does. Without this branch the
+    // row fell into the fedi shell below ("unknown", "Boosted post
+    // unavailable.") whenever PHP painted the page, e.g. right after
+    // posting a Nostr quote, until the next Rust rewarm.
+    $nostrNote = admin_reblog_nostr_note_id($rb);
+    if ($nostrNote !== '') {
+        if (!function_exists('ap_nostr_statuses')) {
+            require_once __DIR__ . '/ap-nostr.php';
+        }
+        $nostrInner = ap_nostr_statuses([$nostrNote])[$nostrNote] ?? null;
+        if (is_array($nostrInner) && function_exists('ap_masto_status_from_reblog')) {
+            admin_render_masto_status_card(ap_masto_status_from_reblog($rb, $nostrInner), $followingIds, $returnView, false, true);
+        }
+        // Note not stored (or worker down): skip the row, as Rust Home does,
+        // rather than paint an authorless shell.
+        return;
     }
 
     // Bluesky-native reposts: render the real post from ATProto cache with the
