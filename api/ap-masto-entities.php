@@ -17788,6 +17788,11 @@ function ap_masto_own_reblogs_as_statuses(int $limit = 40, ?string $maxId = null
             || str_contains($reblogObjectId, 'bsky.mkultra.monster/')) {
             continue;
         }
+        // Nostr boosts/quotes (nostr:{id}, nostr/share.rs) are VAAK-only and
+        // have no Mastodon status a client could open or act on.
+        if (str_starts_with($reblogStatusId, 'nostr:') || str_starts_with($reblogObjectId, 'nostr:')) {
+            continue;
+        }
         $targetActor = (string) ($row['target_actor'] ?? '');
         if ($targetActor !== '' && function_exists('ap_row_is_hidden')
             && ap_row_is_hidden($targetActor, null, $ownerUserId)) {
@@ -17818,38 +17823,9 @@ function ap_masto_own_reblogs_as_statuses(int $limit = 40, ?string $maxId = null
             }
         }
         if ($original === null) {
-            // Minimal stub so the boost still appears
-            $objectId = (string) ($row['object_id'] ?? '');
-            $target = (string) ($row['target_actor'] ?? '');
-            $original = [
-                'id' => (string) ($row['status_id'] ?? ''),
-                'created_at' => ap_masto_format_time((string) ($row['created_at'] ?? null)),
-                'in_reply_to_id' => null,
-                'in_reply_to_account_id' => null,
-                'sensitive' => false,
-                'spoiler_text' => '',
-                'visibility' => 'public',
-                'language' => null,
-                'uri' => $objectId,
-                'url' => $objectId,
-                'replies_count' => 0,
-                'reblogs_count' => 0,
-                'favourites_count' => 0,
-                'edited_at' => null,
-                'favourited' => false,
-                'reblogged' => true,
-                'muted' => false,
-                'bookmarked' => false,
-                'content' => '<p></p>',
-                'reblog' => null,
-                'account' => $target !== '' ? ap_masto_remote_account($target) : ap_masto_account(),
-                'media_attachments' => [],
-                'mentions' => [],
-                'tags' => [],
-                'emojis' => [],
-                'card' => null,
-                'poll' => null,
-            ];
+            // Boosted post not cached: leave the boost out rather than send
+            // clients an empty "<p></p>" stub with no real author.
+            continue;
         }
         $out[] = ap_masto_status_from_reblog($row, $original);
         if (count($out) >= $limit) {
