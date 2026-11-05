@@ -31,7 +31,7 @@ jobs:
 
       - name: Type label from the title
         if: github.event.action != 'synchronize'
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
             const pr = context.payload.pull_request;
