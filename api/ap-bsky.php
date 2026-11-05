@@ -8709,6 +8709,59 @@ function ap_bsky_media_items_from_embeds(mixed $embeds): array
 }
 
 /**
+ * Quoted-post author with the best profile VAAK already has: the embed's own
+ * fields first, then the shared Bluesky author lookup (actor memo, durable
+ * profile cache, newest bsky_posts row). Cache-only; never fetches.
+ *
+ * @param array<string,mixed> $author
+ * @return array<string,mixed>
+ */
+function ap_bsky_quote_author_best_known(array $author, string $quotedUri = ''): array
+{
+    $did = trim((string) ($author['did'] ?? ''));
+    if (!str_starts_with($did, 'did:')
+        && preg_match('#^at://(did:[a-z0-9]+:[A-Za-z0-9._:%-]+)/app\.bsky\.feed\.post/#', trim($quotedUri), $m)) {
+        $author['did'] = $m[1];
+    }
+    if (!str_starts_with(trim((string) ($author['did'] ?? '')), 'did:') || !function_exists('ap_bsky_enrich_author_view')) {
+        return $author;
+    }
+    $owner = (int) ($GLOBALS['vaak_owner_id'] ?? 0);
+    $did = trim((string) $author['did']);
+    // The durable profile cache is what the hover card shows and what
+    // actor-warm keeps fresh. An embed is a snapshot from when the quote was
+    // ingested, so its avatar CID can be retired (CDN 404 → default face) and
+    // its name stale. When the cache has a value, it wins.
+    if (function_exists('ap_bsky_actor_profile_cache_get')) {
+        try {
+            $cached = ap_bsky_actor_profile_cache_get($did);
+            $profile = is_array($cached['profile'] ?? null) ? $cached['profile'] : [];
+            $cav = function_exists('ap_bsky_avatar_public_url')
+                ? (ap_bsky_avatar_public_url($profile['avatar'] ?? null, $did) ?? '')
+                : '';
+            if (str_starts_with($cav, 'https://')) {
+                $author['avatar'] = $cav;
+            }
+            $cdn = trim((string) ($profile['displayName'] ?? ''));
+            if ($cdn !== '' && strcasecmp($cdn, 'bluesky user') !== 0) {
+                $author['displayName'] = $cdn;
+            }
+            $ch = trim((string) ($profile['handle'] ?? ''));
+            if ($ch !== '' && !str_starts_with($ch, 'did:') && $ch !== 'handle.invalid') {
+                $author['handle'] = $ch;
+            }
+        } catch (Throwable $e) {
+            // Fall through to the thin-author fill below.
+        }
+    }
+    try {
+        return ap_bsky_enrich_author_view($author, $owner);
+    } catch (Throwable $e) {
+        return $author;
+    }
+}
+
+/**
  * @return array{uri:?string,handle:string,display:string,text:string,url:string,media?:list<array{url:string,mediaType:?string,preview_url?:string}>}|null
  */
 function ap_bsky_quote_preview(array $post): ?array
@@ -8759,11 +8812,17 @@ function ap_bsky_quote_preview(array $post): ?array
         return null;
     }
     $author = is_array($viewRecord['author'] ?? null) ? $viewRecord['author'] : [];
+    // A thin or cached embed can lack the quoted author's avatar/name even when
+    // VAAK already knows the profile (hover card, Home). Fill it from the same
+    // shared author lookup the post cards use. The at:// URI names the DID.
+    $author = ap_bsky_quote_author_best_known($author, (string) ($viewRecord['uri'] ?? ''));
     $handle = (string) ($author['handle'] ?? '');
     $display = trim((string) ($author['displayName'] ?? ''));
     if ($display === '') {
         $display = $handle !== '' ? $handle : 'Bluesky user';
     }
+    $quoteDid = trim((string) ($author['did'] ?? ''));
+    $quoteAvatar = trim((string) ($author['avatar'] ?? ''));
     $value = is_array($viewRecord['value'] ?? null)
         ? $viewRecord['value']
         : (is_array($viewRecord['record'] ?? null) ? $viewRecord['record'] : []);
@@ -8840,6 +8899,13 @@ function ap_bsky_quote_preview(array $post): ?array
         'url' => $url,
         'media' => $media,
     ];
+    // Quote cards (normalize + admin_quote_status_from_bsky_preview) read these.
+    if (str_starts_with($quoteDid, 'did:')) {
+        $out['did'] = $quoteDid;
+    }
+    if (str_starts_with($quoteAvatar, 'https://')) {
+        $out['avatar'] = $quoteAvatar;
+    }
     // Preserve external link embeds so quote cards can show a link preview.
     foreach ($embeds as $em) {
         if (!is_array($em)) {

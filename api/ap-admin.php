@@ -16522,6 +16522,11 @@ function admin_feed_quote_embed_html(array $st, string $returnView, array $opts)
         $st = ap_masto_quoted_display_status($st);
     }
     $account = is_array($st['account'] ?? null) ? $st['account'] : [];
+    // Same author lookup as the post cards and the hover card, so a quoted
+    // author VAAK already knows never paints as a bare handle + default face.
+    if (function_exists('admin_account_best_known')) {
+        $account = admin_account_best_known($account);
+    }
     $acct = trim((string) ($account['acct'] ?? ''));
     $display = trim((string) ($account['display_name'] ?? ''));
     if ($display === '') {
@@ -20761,6 +20766,20 @@ function admin_actor_avatar_url(?string $actorId): string
             }
         }
     }
+    // Bluesky identities: the durable profile cache (what the hover card shows,
+    // kept fresh by actor-warm) before remote_actors, which bsky.app never fills.
+    $bskyCached = function_exists('admin_bsky_cached_profile') ? admin_bsky_cached_profile($actorId) : null;
+    if ($bskyCached !== null) {
+        $bskyDid = trim((string) ($bskyCached['did'] ?? ''));
+        $bskyAv = function_exists('ap_bsky_avatar_public_url')
+            ? (ap_bsky_avatar_public_url($bskyCached['profile']['avatar'] ?? null, $bskyDid) ?? '')
+            : '';
+        $bskyAv = ap_profile_sanitize_https_url($bskyAv);
+        if ($bskyAv !== null) {
+            $memo[$actorId] = $bskyAv;
+            return $bskyAv;
+        }
+    }
     // No fresh R2 object. Show a known https icon immediately, and queue a
     // refresh when the row, the icon, or the 12h metadata window is missing.
     // bsky.app is not an ActivityPub actor; fetching that URL never yields an icon.
@@ -20794,6 +20813,124 @@ function admin_actor_avatar_url(?string $actorId): string
     }
     $memo[$actorId] = $remoteFallback;
     return $remoteFallback;
+}
+
+/**
+ * Cached Bluesky profile for a bsky.app / did: / Bridgy Fed actor ref, or null.
+ * Cache-only (bsky_actor_profiles via Redis); never fetches.
+ *
+ * @return array{profile:array<string,mixed>,did:string}|null
+ */
+function admin_bsky_cached_profile(string $actorRef): ?array
+{
+    static $memo = [];
+    $actorRef = rtrim(trim($actorRef), '/');
+    if ($actorRef === '' || !function_exists('ap_bsky_is_profile_ref') || !ap_bsky_is_profile_ref($actorRef)
+        || !function_exists('ap_bsky_actor_profile_cache_get')) {
+        return null;
+    }
+    if (array_key_exists($actorRef, $memo)) {
+        return $memo[$actorRef];
+    }
+    $key = $actorRef;
+    if (preg_match('~^https://bsky\.brid\.gy/ap/(did:[^/?#]+)~i', $actorRef, $m)
+        || preg_match('~^at://(did:[^/]+)~', $actorRef, $m)) {
+        $key = rawurldecode($m[1]);
+    }
+    $out = null;
+    try {
+        $cached = ap_bsky_actor_profile_cache_get($key);
+        if (is_array($cached['profile'] ?? null) && $cached['profile'] !== []) {
+            $did = trim((string) ($cached['did'] ?? ''));
+            if ($did === '') {
+                $did = trim((string) ($cached['profile']['did'] ?? ''));
+            }
+            $out = ['profile' => $cached['profile'], 'did' => $did];
+        }
+    } catch (Throwable $e) {
+        $out = null;
+    }
+    $memo[$actorRef] = $out;
+    return $out;
+}
+
+/**
+ * One author lookup for every card surface: a status account keeps its own
+ * fields, and any missing or placeholder avatar / name is filled from what
+ * VAAK already knows about that actor (local profile, R2 avatar cache,
+ * Bluesky profile cache, remote_actors). Cache-only; a still-thin actor is
+ * queued for warming by admin_actor_avatar_url.
+ *
+ * @param array<string,mixed> $account
+ * @return array<string,mixed>
+ */
+function admin_account_best_known(array $account): array
+{
+    $actor = admin_account_actor_ref($account);
+    if ($actor === '' || !str_starts_with($actor, 'https://')) {
+        return $account;
+    }
+    $hasAvatar = false;
+    foreach (['avatar', 'avatar_static'] as $key) {
+        $url = trim((string) ($account[$key] ?? ''));
+        if (str_starts_with($url, 'https://') && !admin_avatar_is_placeholder($url)) {
+            $hasAvatar = true;
+            break;
+        }
+    }
+    if (!$hasAvatar) {
+        try {
+            $url = admin_actor_avatar_url($actor);
+        } catch (Throwable $e) {
+            $url = '';
+        }
+        if (str_starts_with($url, 'https://') && !admin_avatar_is_placeholder($url)) {
+            $account['avatar'] = $url;
+            $account['avatar_static'] = $url;
+        }
+    }
+    $acct = ltrim(trim((string) ($account['acct'] ?? '')), '@');
+    $username = ltrim(trim((string) ($account['username'] ?? '')), '@');
+    $display = trim((string) ($account['display_name'] ?? ''));
+    $nameThin = $display === '' || $display === '?'
+        || ($acct !== '' && strcasecmp($display, $acct) === 0)
+        || ($username !== '' && strcasecmp($display, $username) === 0)
+        || strcasecmp($display, 'bluesky user') === 0;
+    if (!$nameThin) {
+        return $account;
+    }
+    $name = '';
+    $bsky = function_exists('admin_bsky_cached_profile') ? admin_bsky_cached_profile($actor) : null;
+    if ($bsky !== null) {
+        $name = trim((string) ($bsky['profile']['displayName'] ?? ''));
+        $handle = trim((string) ($bsky['profile']['handle'] ?? ''));
+        if (($acct === '' || str_starts_with($acct, 'did:')) && $handle !== '' && !str_starts_with($handle, 'did:')) {
+            $account['acct'] = $handle;
+            $account['username'] = $handle;
+        }
+    } elseif (function_exists('ap_remote_actor_get')) {
+        try {
+            $remote = ap_remote_actor_get($actor);
+        } catch (Throwable $e) {
+            $remote = null;
+        }
+        if (is_array($remote)) {
+            $name = trim((string) ($remote['display_name'] ?? ''));
+            if ($name !== '' && function_exists('ap_remote_actor_username_is_placeholder')
+                && ap_remote_actor_username_is_placeholder($name)) {
+                $name = '';
+            }
+        }
+    }
+    if ($name !== '' && strcasecmp($name, 'bluesky user') !== 0) {
+        $account['display_name'] = $name;
+    }
+    return $account;
+}
+
+function admin_avatar_is_placeholder(string $url): bool
+{
+    return (bool) preg_match('~/img/avatar/(?:local-)?default\.(?:webp|jpe?g|png)(?:[?#]|$)~i', $url);
 }
 
 function admin_avatar_img(?string $actorId, string $class = 'tweet-av', bool $profileHover = true): string
