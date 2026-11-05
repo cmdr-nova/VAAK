@@ -2796,7 +2796,18 @@ function ap_route_verified_activity(array $activity, int $bytes): string
                 ? 'local_follow_pending'
                 : ($ok ? 'local_accept_followback' : 'local_follow_fail');
             ap_metrics_record('Follow', $actorId, $objectId, ap_local_actor_id(), $bytes, $followAction, null);
-            if ($ok && !$pendingFollow && is_string($actorId) && $actorId !== '') {
+            // A Follow from someone who already follows (retried delivery, a
+            // re-sent Follow after a lost Accept) used to add a second
+            // "followed you". Keep the first row and skip the second push.
+            $repeatFollow = false;
+            if ($followAction === 'local_accept_followback' && is_string($actorId) && $actorId !== ''
+                && function_exists('ap_notification_collapse_repeat_follows')) {
+                $repeatFollow = ap_notification_collapse_repeat_follows($actorId, ap_local_actor_id()) > 0;
+                if ($repeatFollow) {
+                    ap_log('follow_repeat actor=' . ap_short($actorId) . ' (kept first notification)');
+                }
+            }
+            if ($ok && !$pendingFollow && !$repeatFollow && is_string($actorId) && $actorId !== '') {
                 try {
                     require_once __DIR__ . '/ap-webpush.php';
                     $nid = null;

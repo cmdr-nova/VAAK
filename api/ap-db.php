@@ -7557,6 +7557,64 @@ function ap_notification_mention_row_muted(int $ownerUserId, array $row, array $
 }
 
 /**
+ * Keep one live follow notification per follower/target pair.
+ *
+ * A remote that sends Follow again while it still follows (a retried delivery
+ * with a fresh activity id, a re-sent Follow after a lost Accept, or the same
+ * Follow landing twice) records another local_accept_followback row, and every
+ * notification reader showed both. The oldest live row stays; later ones become
+ * local_follow_repeat, which no reader lists. Undo Follow already turns the old
+ * row into 'undone', so a real unfollow and refollow still notifies.
+ *
+ * Returns how many rows were collapsed. Safe to call from two concurrent
+ * deliveries: both keep the same oldest row.
+ */
+function ap_notification_collapse_repeat_follows(string $actorId, string $ownerActorId): int
+{
+    $actorId = rtrim(trim($actorId), '/');
+    $ownerActorId = rtrim(trim($ownerActorId), '/');
+    if ($actorId === '' || $ownerActorId === '') {
+        return 0;
+    }
+    try {
+        $st = ap_db()->prepare(
+            "UPDATE events SET action_taken = 'local_follow_repeat'
+             WHERE type = 'Follow'
+               AND action_taken = 'local_accept_followback'
+               AND actor_id IN (?, ?)
+               AND target_actor IN (?, ?)
+               AND id > (
+                   SELECT MIN(k.id) FROM events k
+                   WHERE k.type = 'Follow'
+                     AND k.action_taken = 'local_accept_followback'
+                     AND k.actor_id IN (?, ?)
+                     AND k.target_actor IN (?, ?)
+               )"
+        );
+        $pair = [$actorId, $actorId . '/', $ownerActorId, $ownerActorId . '/'];
+        $st->execute(array_merge($pair, $pair));
+        $n = (int) $st->rowCount();
+        if ($n > 0) {
+            $ownerUserId = function_exists('ap_db_owner_user_id_for_actor')
+                ? (int) ap_db_owner_user_id_for_actor($ownerActorId)
+                : 0;
+            if ($ownerUserId > 0) {
+                if (function_exists('ap_notification_projection_invalidate_owner')) {
+                    ap_notification_projection_invalidate_owner($ownerUserId);
+                }
+                if (function_exists('ap_masto_notifications_unread_invalidate')) {
+                    ap_masto_notifications_unread_invalidate($ownerUserId);
+                }
+            }
+        }
+        return $n;
+    } catch (Throwable $e) {
+        error_log('[ap-db] collapse repeat follows failed');
+        return 0;
+    }
+}
+
+/**
  * Hide the follow notification stored for this actor/target pair.
  * Renderers only keep action_taken local_accept_followback, bsky_follow and nostr_follow,
  * including when the follower set is empty, so the row has to change.
