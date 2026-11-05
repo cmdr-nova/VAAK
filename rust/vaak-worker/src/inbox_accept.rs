@@ -88,6 +88,8 @@ pub(crate) enum Accepted {
     /// `Delete` of an actor VAAK holds nothing for. PHP would fetch the gone
     /// key, then the gone actor, and end at `delete_noop`.
     UnknownSelfDelete,
+    /// Routed here (cutover F3): the spool row is written already done.
+    Routed(i64, &'static str),
 }
 
 impl Accepted {
@@ -97,12 +99,14 @@ impl Accepted {
             Accepted::SpooledMismatch(_) => "spooled_mismatch",
             Accepted::Duplicate => "duplicate",
             Accepted::UnknownSelfDelete => "unknown_self_delete",
+            Accepted::Routed(_, "local_status_delete") => "routed_local_status_delete",
+            Accepted::Routed(_, _) => "routed_delete_noop",
         }
     }
 
     fn body(&self) -> &'static str {
         match self {
-            Accepted::Spooled(_) | Accepted::SpooledMismatch(_) => r#"{"status":"accepted","action":"spooled"}"#,
+            Accepted::Spooled(_) | Accepted::SpooledMismatch(_) | Accepted::Routed(..) => r#"{"status":"accepted","action":"spooled"}"#,
             Accepted::Duplicate => r#"{"status":"accepted","action":"duplicate"}"#,
             Accepted::UnknownSelfDelete => r#"{"status":"accepted","action":"ignored"}"#,
         }
@@ -286,7 +290,7 @@ async fn fast_path(cfg: &crate::config::Config, uri: &Uri, headers: &HeaderMap, 
     let sig_path = verdict.path.clone().filter(|_| verdict.ok).ok_or("signature")?;
 
     let key_host = host_of(&key_id).ok_or("signature")?;
-    let db = conn(cfg).await.map_err(|_| "db")?;
+    let mut db = conn(cfg).await.map_err(|_| "db")?;
     let blocked = blocked_domains(&db).await.map_err(|_| "db")?;
     if host_blocked(&key_host, &blocked) {
         return Err("blocked");
@@ -319,6 +323,19 @@ async fn fast_path(cfg: &crate::config::Config, uri: &Uri, headers: &HeaderMap, 
         if fresh.is_none() {
             idle_return(db);
             return Ok(Accepted::Duplicate);
+        }
+    }
+    // Cutover F3: Rust routes the Delete itself when every guard holds.
+    if !mismatch && crate::inbox_route_delete::enabled() {
+        match crate::inbox_route_delete::route(&mut db, &blocked, &ip, &key_id, uri.path(), &sig_path, &kind, body).await {
+            crate::inbox_route_delete::Routed::Done { spool_id, result } => {
+                idle_return(db);
+                return Ok(Accepted::Routed(spool_id, result));
+            }
+            crate::inbox_route_delete::Routed::Defer(why) if why != "not_delete" => {
+                stat(cfg, &format!("route_defer_{why}")).await;
+            }
+            crate::inbox_route_delete::Routed::Defer(_) => {}
         }
     }
     // Cutover F3 shadow: what Rust expects the drain's router to return.

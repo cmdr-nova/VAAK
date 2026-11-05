@@ -31,7 +31,7 @@ pub(crate) fn enabled() -> bool {
 
 /// `ap_as_id`: a non-empty string, a one-element list of one, or an
 /// object's `id`, else its `href`.
-fn as_id(v: &Value) -> Option<String> {
+pub(crate) fn as_id(v: &Value) -> Option<String> {
     match v {
         Value::String(s) if !s.is_empty() => Some(s.clone()),
         Value::Array(list) if list.len() == 1 => as_id(&list[0]),
@@ -86,7 +86,7 @@ fn owned_by_actor(object_id: &str, actor: &str) -> bool {
 }
 
 /// `LIKE` pattern for `id#…` with PHP's `addcslashes($id, '\\%_')`.
-fn like_suffix_pattern(id: &str) -> String {
+pub(crate) fn like_suffix_pattern(id: &str) -> String {
     let mut out = String::with_capacity(id.len() + 2);
     for c in id.chars() {
         if matches!(c, '\\' | '%' | '_') {
