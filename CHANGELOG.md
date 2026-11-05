@@ -12,6 +12,18 @@ anything else bumps the patch number.
 Releases up to **0.9.83** used a two-digit deploy counter (0.9.05, 0.9.83)
 and have no notes here; their tags and GitHub Releases are unchanged.
 
+## [0.40.0](https://github.com/cmdr-nova/VAAK/releases/tag/v0.40.0) - 2026-11-05
+
+### ✨ Features
+* Paint Nostr boosts and quotes in the PHP boost card by @cmdr-nova in https://github.com/cmdr-nova/VAAK/pull/388
+* Show nothing for boosts VAAK can't display by @cmdr-nova in https://github.com/cmdr-nova/VAAK/pull/389
+### 🧹 Maintenance
+* Bump redis from 1.8.0 to 1.8.1 in /rust in the cargo-minor-patch group by @dependabot[bot] in https://github.com/cmdr-nova/VAAK/pull/385
+* Bump actions/labeler from 5 to 7 by @dependabot[bot] in https://github.com/cmdr-nova/VAAK/pull/386
+* Bump actions/github-script from 7 to 9 by @dependabot[bot] in https://github.com/cmdr-nova/VAAK/pull/387
+
+**Full Changelog**: https://github.com/cmdr-nova/VAAK/compare/v0.39.0...v0.40.0
+
 ## [0.39.0](https://github.com/cmdr-nova/VAAK/releases/tag/v0.39.0) - 2026-11-04
 
 ### ✨ Features
