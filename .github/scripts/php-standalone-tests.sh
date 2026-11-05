@@ -93,6 +93,7 @@ php_tests=(
   api/bin/fanout-dead-host-smoke.php
   api/bin/move-fanout-cap-smoke.php
   api/bin/fanout-sync-rust-smoke.php
+  api/bin/fanout-actions-rust-smoke.php
   api/bin/listenbrainz-smoke.php
   api/bin/nostr-smoke.php
   api/bin/home-bsky-index-smoke.php

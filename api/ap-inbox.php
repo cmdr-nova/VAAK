@@ -7006,6 +7006,23 @@ function ap_deliver_inline_then_queue(array $activity, array $targets, string $k
 }
 
 /**
+ * Cutover A1: hand a user action's deliveries (Like, Undo Like, Undo Announce)
+ * to the Rust fan-out worker. Returns how many inboxes were queued, or null
+ * when PHP should send them itself (switch off, heartbeat stale, queue down).
+ * Priority 3 puts them ahead of Bridgy and first-follower rows (5).
+ *
+ * @param list<string> $inboxes
+ */
+function ap_deliver_action_via_rust(array $activity, array $inboxes, string $keyId, string $privPath): ?int
+{
+    $inboxes = array_values(array_unique(array_filter($inboxes, static fn($u) => is_string($u) && str_starts_with($u, 'https://'))));
+    if ($inboxes === [] || !function_exists('ap_fanout_rust_actions_active') || !ap_fanout_rust_actions_active()) {
+        return null;
+    }
+    return ap_deliver_fanout_background($activity, $inboxes, $keyId, $privPath, 3) ? count($inboxes) : null;
+}
+
+/**
  * Queue remaining inbox deliveries in a background PHP worker so admin compose
  * can return to "Your posts" immediately after priority (followers) fan-out.
  *
@@ -10199,7 +10216,13 @@ function ap_cmdr_send_like(string $objectId, string $targetActor, ?string $stabl
         return ['ok' => false, 'error' => 'no inbox', 'like_id' => $likeId];
     }
     $delivered = 0;
-    foreach ($inboxes as $inbox) {
+    $queued = ap_deliver_action_via_rust($activity, $inboxes, $ident['key_id'], $ident['priv']);
+    if ($queued !== null) {
+        // The Rust worker sends and retries them; count them as handed over.
+        $delivered = $queued;
+        ap_log('like_queued_rust targets=' . $queued . ' object=' . ap_short($objectId));
+    }
+    foreach ($queued !== null ? [] : $inboxes as $inbox) {
         if (ap_deliver_signed_json($inbox, $activity, $ident['key_id'], $ident['priv'], 8.0)) {
             $delivered++;
         }
@@ -10249,7 +10272,12 @@ function ap_cmdr_send_undo_like(string $likeActivityId, string $objectId, string
     ];
     $inboxes = ap_actor_delivery_inboxes($targetActor);
     $delivered = 0;
-    foreach ($inboxes as $inbox) {
+    $queued = ap_deliver_action_via_rust($activity, $inboxes, $ident['key_id'], $ident['priv']);
+    if ($queued !== null) {
+        $delivered = $queued;
+        ap_log('unlike_queued_rust targets=' . $queued . ' object=' . ap_short($objectId));
+    }
+    foreach ($queued !== null ? [] : $inboxes as $inbox) {
         if (ap_deliver_signed_json($inbox, $activity, $ident['key_id'], $ident['priv'], 8.0)) {
             $delivered++;
         }
@@ -10357,7 +10385,24 @@ function ap_cmdr_send_undo_announce(string $announceActivityId, string $objectId
     $followers = ap_followers_list($actor);
     $priority = ap_delivery_targets_filtered($followers, $priorityExtra);
     $delivered = 0;
-    foreach ($priority as $inbox) {
+    // Bridgy and the boosted author go first; the followers keep bulk priority.
+    $first = array_values(array_intersect($priority, $priorityExtra));
+    $rest = array_values(array_diff($priority, $first));
+    $inline = $priority;
+    $queued = ap_deliver_action_via_rust($activity, $first !== [] ? $first : $priority, $ident['key_id'], $ident['priv']);
+    if ($queued !== null) {
+        $inline = [];
+        if ($first !== [] && $rest !== []) {
+            if (ap_deliver_fanout_background($activity, $rest, $ident['key_id'], $ident['priv'])) {
+                $queued += count($rest);
+            } else {
+                $inline = $rest; // the queue went away mid-way: send the rest from here
+            }
+        }
+        $delivered = $queued;
+        ap_log('unboost_queued_rust targets=' . $queued . ' object=' . ap_short($objectId));
+    }
+    foreach ($inline as $inbox) {
         if (ap_deliver_signed_json($inbox, $activity, $ident['key_id'], $ident['priv'], 3.0)) {
             $delivered++;
         }

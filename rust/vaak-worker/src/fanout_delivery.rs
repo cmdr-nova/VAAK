@@ -44,6 +44,10 @@ const PER_HOST_PER_PASS: usize = 4;
 /// Set next to the heartbeat while VAAK_FANOUT_SYNC_RUST=1 (cutover D3):
 /// PHP then queues the deliveries it used to send inline.
 pub(crate) const SYNC_HEARTBEAT_KEY: &str = "vaak:fanout_delivery:rust_sync:v1";
+/// Set next to the heartbeat while VAAK_FANOUT_ACTIONS_RUST=1 (cutover A1):
+/// PHP then queues the likes, unlikes and unboosts it sent from the action
+/// queue instead of sending them itself.
+pub(crate) const ACTIONS_HEARTBEAT_KEY: &str = "vaak:fanout_delivery:rust_actions:v1";
 const IDLE_POLL: Duration = Duration::from_secs(2);
 /// PHP `ap_redis_queue_push('fanout-delivery', …)` on the queue database.
 const WAKE_QUEUE: &str = "fanout-delivery";
@@ -56,6 +60,10 @@ pub(crate) fn enabled() -> bool {
 }
 
 /// Cutover D3: PHP stops sending fan-out inline and queues it for this worker.
+fn actions_enabled() -> bool {
+    std::env::var("VAAK_FANOUT_ACTIONS_RUST").is_ok_and(|v| v.trim() == "1")
+}
+
 fn sync_enabled() -> bool {
     std::env::var("VAAK_FANOUT_SYNC_RUST").is_ok_and(|v| v.trim() == "1")
 }
@@ -1031,10 +1039,17 @@ async fn work(cfg: &crate::config::Config) -> Result<()> {
         let _: std::result::Result<(), _> = redis::cmd("DEL").arg(SYNC_HEARTBEAT_KEY).query_async(&mut redis).await;
     }
     let mut wake = crate::redis_util::connect(&cfg.redis_queue_url).await.ok();
-    tracing::info!(sync, "fanout delivery worker running");
+    let actions = actions_enabled();
+    if !actions {
+        let _: std::result::Result<(), _> = redis::cmd("DEL").arg(ACTIONS_HEARTBEAT_KEY).query_async(&mut redis).await;
+    }
+    tracing::info!(sync, actions, "fanout delivery worker running");
     let mut last_probe: Option<Instant> = None;
     loop {
         let _: std::result::Result<(), _> = redis::cmd("SET").arg(HEARTBEAT_KEY).arg(now_unix()).arg("EX").arg(HEARTBEAT_TTL).query_async(&mut redis).await;
+        if actions {
+            let _: std::result::Result<(), _> = redis::cmd("SET").arg(ACTIONS_HEARTBEAT_KEY).arg(now_unix()).arg("EX").arg(HEARTBEAT_TTL).query_async(&mut redis).await;
+        }
         if sync {
             let _: std::result::Result<(), _> = redis::cmd("SET").arg(SYNC_HEARTBEAT_KEY).arg(now_unix()).arg("EX").arg(HEARTBEAT_TTL).query_async(&mut redis).await;
         }
