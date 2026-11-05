@@ -651,7 +651,9 @@ function vaak_tl_older_outbox(string $view, ?array $cursor, int $fetchLimit, str
         $local = str_starts_with($id, 'https://mkultra.monster/users/') && str_contains($id, '/notes/');
         $own = $owner !== '' && ($id === $owner || str_starts_with($id, $owner . '/'));
         $keep = $local;
-        if (function_exists('admin_outbox_is_bsky_import') && admin_outbox_is_bsky_import($nrow)) {
+        // Bluesky-native imports show on Local (local users' posts), not
+        // on Federated or other views.
+        if ($view !== 'local' && function_exists('admin_outbox_is_bsky_import') && admin_outbox_is_bsky_import($nrow)) {
             $keep = false;
         }
         if ($view !== 'local') {

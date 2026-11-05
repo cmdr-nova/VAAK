@@ -11472,7 +11472,9 @@ function admin_tl_lean_ranked_warm(string $view, array $following, string $cache
                  LIMIT 160"
             );
             foreach ($st->fetchAll() ?: [] as $nrow) {
-                if (!is_array($nrow) || admin_outbox_is_bsky_import($nrow)) {
+                // Bluesky-native posts of local accounts (vaakOrigin=bluesky)
+                // stay in: Local shows what local users post anywhere.
+                if (!is_array($nrow)) {
                     continue;
                 }
                 $timeline[] = [
@@ -12347,7 +12349,7 @@ function admin_tl_extend_ranked(string $view, array $following, array $ranked, i
             );
             $st->execute([$beforeAt, $want * 2]);
             foreach ($st->fetchAll() ?: [] as $nrow) {
-                if (!is_array($nrow) || admin_outbox_is_bsky_import($nrow)) {
+                if (!is_array($nrow)) {
                     continue;
                 }
                 $oid = rtrim((string) ($nrow['id'] ?? ''), '/');
@@ -13286,11 +13288,6 @@ if (!$wantNewerPoll && !$adminTlFromCache && ($view === 'local' || ($isPartial &
     }
     foreach ($localNotes as $n) {
         if (!is_array($n)) {
-            continue;
-        }
-        if (admin_outbox_is_bsky_import($n)) {
-            // Historical Bluesky imports belong in Your Posts/profile views,
-            // but must not be reintroduced into the instance Local timeline.
             continue;
         }
         $outItem = [
@@ -19218,8 +19215,10 @@ function admin_local_timeline_item_allowed(array $item): bool
         return false;
     }
     if ($kind === 'outbox') {
-        return vaak_is_local_url((string) ($row['id'] ?? ''))
-            && !admin_outbox_is_bsky_import($row);
+        // Includes Bluesky-native posts imported onto a local profile
+        // (vaakOrigin=bluesky). The importer never mints one for a VAAK
+        // mirror (fediverseId / mirror map / existing link), so no doubles.
+        return vaak_is_local_url((string) ($row['id'] ?? ''));
     }
     if ($kind === 'event') {
         if (!vaak_is_local_url((string) ($row['actor_id'] ?? ''))) {
