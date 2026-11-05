@@ -779,6 +779,39 @@ function ap_fanout_rust_sync_active(): bool
     return $active;
 }
 
+/**
+ * Cutover A1: true while the Rust fan-out worker runs with
+ * VAAK_FANOUT_ACTIONS_RUST=1 and keeps vaak:fanout_delivery:rust_actions:v1
+ * fresh. Likes, unlikes and unboosts from the action queue then go to
+ * ap_fanout_delivery_queue instead of being sent from PHP. A missing or
+ * stale key sends them from PHP again.
+ */
+function ap_fanout_rust_actions_active(): bool
+{
+    static $checked = 0;
+    static $active = false;
+    $now = time();
+    if ($checked > 0 && ($now - $checked) < 5) {
+        return $active;
+    }
+    $checked = $now;
+    $active = false;
+    if (!ap_fanout_rust_worker_active()) {
+        return false;
+    }
+    $redis = ap_redis_client();
+    if (!$redis) {
+        return false;
+    }
+    try {
+        $beat = $redis->get('vaak:fanout_delivery:rust_actions:v1');
+        $active = is_string($beat) && ctype_digit($beat) && ($now - (int) $beat) <= 30;
+    } catch (Throwable $e) {
+        $active = false;
+    }
+    return $active;
+}
+
 /** Publish a durable database queue ID as a fast worker wake-up signal. */
 function ap_redis_queue_push(string $queue, string|int $item): bool
 {
