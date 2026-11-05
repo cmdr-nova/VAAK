@@ -471,7 +471,8 @@ async fn outbox_page(
         }
         let local = id.starts_with("https://mkultra.monster/users/") && id.contains("/notes/");
         let own = !owner.is_empty() && (id.starts_with(&owner) || id.starts_with(&format!("{owner}/")));
-        let mut keep = local && !outbox_is_bsky_import(&raw);
+        // Bluesky-native imports belong on Local (local users' posts) only.
+        let mut keep = local && (view == "local" || !outbox_is_bsky_import(&raw));
         if view != "local" {
             keep = keep && own;
         }

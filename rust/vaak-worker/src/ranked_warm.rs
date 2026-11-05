@@ -193,22 +193,6 @@ fn cache_key_feed(owner: i64, following_actor_ids: &[String]) -> String {
     )
 }
 
-fn outbox_is_bsky_import(raw_create_json: &str) -> bool {
-    let raw = raw_create_json.trim();
-    if raw.is_empty() {
-        return false;
-    }
-    // Match PHP admin_outbox_is_bsky_import: object.vaakOrigin === 'bluesky'
-    if let Ok(v) = serde_json::from_str::<Value>(raw) {
-        return v
-            .get("object")
-            .and_then(|o| o.get("vaakOrigin"))
-            .and_then(|x| x.as_str())
-            == Some("bluesky");
-    }
-    false
-}
-
 fn reblog_is_bsky(status_id: &str, object_id: &str) -> bool {
     let status = status_id.trim().to_ascii_lowercase();
     let object = object_id.trim().to_ascii_lowercase();
@@ -1915,12 +1899,12 @@ async fn write_ranked_cache(
     Ok(())
 }
 
-/// Instance Local: public outbox notes + local masto_reblogs (skip Bluesky imports).
+/// Instance Local: public outbox notes (incl. Bluesky-native imports) + local masto_reblogs.
 async fn fetch_local_timeline(db: &Client) -> Result<Vec<TimelineItem>> {
     let mut items = Vec::new();
     let note_rows = db
         .query(
-            "SELECT id, published, COALESCE(raw_create_json, '')
+            "SELECT id, published
              FROM outbox_notes
              WHERE id LIKE 'https://mkultra.monster/users/%/notes/%'
                AND COALESCE(visibility, 'public') = 'public'
@@ -1940,10 +1924,8 @@ async fn fetch_local_timeline(db: &Client) -> Result<Vec<TimelineItem>> {
             continue;
         }
         let published: String = row.try_get::<_, Option<String>>(1)?.unwrap_or_default();
-        let raw: String = row.try_get::<_, Option<String>>(2)?.unwrap_or_default();
-        if outbox_is_bsky_import(&raw) {
-            continue;
-        }
+        // Bluesky-native posts imported onto a local profile stay in Local:
+        // the importer never creates one for a VAAK mirror, so no doubles.
         let actor = id
             .rsplit_once("/notes/")
             .map(|(prefix, _)| prefix.to_string())
@@ -4526,14 +4508,10 @@ mod tests {
     }
 
     #[test]
-    fn bsky_reblog_and_import_filters() {
+    fn bsky_reblog_filter() {
         assert!(reblog_is_bsky("bsky-repost-abc", ""));
         assert!(reblog_is_bsky("x", "https://bsky.app/profile/x/post/1"));
         assert!(!reblog_is_bsky("123", "https://mastodon.social/users/a/statuses/1"));
-        assert!(outbox_is_bsky_import(
-            r#"{"object":{"vaakOrigin":"bluesky","content":"hi"}}"#
-        ));
-        assert!(!outbox_is_bsky_import(r#"{"object":{"content":"hi"}}"#));
     }
 
     #[test]
