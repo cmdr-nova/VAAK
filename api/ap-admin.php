@@ -23610,6 +23610,14 @@ function admin_render_boost_card(array $rb, array $followingIds, string $returnV
         && ap_row_is_hidden($targetActor, null, admin_owner_user_id())) {
         return;
     }
+    // Nothing to show and no https object to fetch later: paint nothing
+    // rather than an empty "unknown / Boosted post unavailable." shell.
+    // https targets still get the hydrate card; the JS drops it if the
+    // fetch can't fill it.
+    if ($innerSummary === '' && $innerMedia === []
+        && !($objectId !== '' && str_starts_with($objectId, 'https://'))) {
+        return;
+    }
     $alreadyFollowing = $targetActor !== '' && (
         !empty($followingIds[$targetActor]) || !empty($followingIds[rtrim($targetActor, '/')])
     );

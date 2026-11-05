@@ -99,13 +99,12 @@
             try { neu.remove(); } catch (e) {}
             return;
           }
-          if (neu && (neu.dataset.boostHydrate === '1' || neu.dataset.boostHydrateLocal === '1')) {
-            const st = neu.querySelector('.boost-hydrate-status');
-            if (st) {
-              st.textContent = 'Boost details unavailable';
-            }
-            neu.dataset.boostHydrate = '0';
-            neu.dataset.boostHydrateLocal = '0';
+          // Still unresolved (or a terminal "unavailable" stub): a boost we
+          // can't show is dropped, never left as an empty boost card.
+          if (neu && (neu.dataset.boostHydrate === '1' || neu.dataset.boostHydrateLocal === '1'
+            || (neu.classList.contains('tweet-boost') && neu.querySelector('.boost-hydrate-status')))) {
+            try { neu.remove(); } catch (e) {}
+            return;
           }
           // Empty Create still unresolved — drop the stub from the timeline
           // instead of leaving “isn’t cached yet” chrome on Home.
@@ -115,16 +114,9 @@
           }
         })
         .catch(() => {
-          if (isCreate) {
-            // Failed create-hydrate: remove the empty shell from the feed.
-            try { card.remove(); } catch (e) {}
-            return;
-          } else {
-            const st = card.querySelector('.boost-hydrate-status');
-            if (st) st.textContent = 'Couldn’t load boosted post';
-            card.dataset.boostHydrate = '0';
-          }
-          card.dataset.boostHydrating = '0';
+          // Failed hydrate (create or boost): remove the empty shell from
+          // the feed rather than leave an empty card behind.
+          try { card.remove(); } catch (e) {}
         })
         .finally(() => {
           boostActive--;
