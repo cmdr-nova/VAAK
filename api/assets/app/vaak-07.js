@@ -1168,7 +1168,11 @@
   }
 
   // Pull-to-refresh (mobile): rubber-band pull, settle animation, soft poll when possible.
+  // The gesture may start anywhere on the page (cards, links, the sticky
+  // bars), not only on bare feed background. A finger that moves never
+  // produces a click, so links under the pull are safe.
   let ptrStartY = 0;
+  let ptrStartX = 0;
   let ptrDy = 0;
   let ptrPull = 0;
   let ptrTracking = false;
@@ -1176,17 +1180,50 @@
   let ptrArmed = false;
   let ptrBusy = false;
   let ptrWasArmed = false;
+  let ptrDirection = ''; // '' undecided, 'y' ours, 'x' horizontal swipe (not ours)
+  let ptrInHScroller = false;
+  let ptrFrame = 0;
   const PTR_READY = 64;
   const PTR_MAX = 120;
   const PTR_HOLD = 52; // height while “Refreshing…”
+  const PTR_MIN_SPIN_MS = 450; // a refresh that answers instantly still reads as a refresh
+  const PTR_NOTE_MS = 650; // how long "Up to date" / "Couldn't refresh" stays
+  const PTR_SOFT_INPUT = 'textarea, input, select, [contenteditable="true"], .compose-modal';
+
+  // Window mode (phones) needs the root scroller to stop its own bounce and
+  // Chrome's native pull-to-reload; otherwise both fire on the same pull.
+  document.documentElement.classList.add('vaak-ptr');
+
+  function ptrHost() {
+    // Soft-nav replaces section.main; keep the indicator in the live feed.
+    if (ptrEl && ptrEl.isConnected) return ptrEl;
+    const feed = document.querySelector('section.main .feed') || document.querySelector('.feed');
+    if (!feed) return null;
+    let el = feed.querySelector(':scope > .feed-ptr');
+    if (!el) {
+      el = ptrEl && !ptrEl.isConnected ? ptrEl : document.createElement('div');
+      el.className = 'feed-ptr';
+      el.setAttribute('aria-hidden', 'true');
+      el.style.height = '0px';
+      el.textContent = 'Pull to refresh';
+      feed.insertBefore(el, feed.firstChild);
+    }
+    ptrEl = el;
+    return ptrEl;
+  }
 
   function ptrLabel(text, spinning) {
     if (!ptrEl) return;
     if (spinning) {
       ptrEl.innerHTML = '<span class="feed-ptr__spinner" aria-hidden="true"></span><span>' + text + '</span>';
     } else {
-      ptrEl.textContent = text;
+      ptrEl.innerHTML = '<span class="feed-ptr__arrow" aria-hidden="true">↓</span><span></span>';
+      ptrEl.lastChild.textContent = text;
     }
+  }
+  function ptrNote(text) {
+    if (!ptrEl) return;
+    ptrEl.textContent = text;
   }
 
   function ptrRubber(dy) {
@@ -1195,97 +1232,197 @@
     return PTR_MAX * (1 - Math.exp(-t / (PTR_MAX * 1.15)));
   }
 
-  function ptrResetInstant() {
-    ptrTracking = false;
-    ptrDragging = false;
-    ptrArmed = false;
-    ptrWasArmed = false;
-    ptrDy = 0;
-    ptrPull = 0;
-    if (!ptrEl || ptrBusy) return;
-    ptrEl.classList.remove('show', 'ready', 'settling', 'refreshing');
-    ptrEl.style.height = '0px';
-    ptrLabel('Pull to refresh', false);
+  function ptrPaint() {
+    ptrFrame = 0;
+    if (!ptrEl || !ptrDragging) return;
+    ptrEl.style.height = ptrPull.toFixed(1) + 'px';
+    ptrEl.style.setProperty('--ptr-progress', Math.min(1, ptrPull / PTR_READY).toFixed(3));
+    ptrEl.classList.add('show');
+    const wasReady = ptrEl.classList.contains('ready');
+    if (wasReady !== ptrArmed || !ptrEl.firstChild) {
+      ptrEl.classList.toggle('ready', ptrArmed);
+      ptrLabel(ptrArmed ? 'Release to refresh' : 'Pull to refresh', false);
+    }
   }
 
-  function ptrCollapse(then) {
+  function ptrCollapse(then, delay) {
+    if (ptrFrame) {
+      window.cancelAnimationFrame(ptrFrame);
+      ptrFrame = 0;
+    }
     if (!ptrEl) {
       if (typeof then === 'function') then();
       return;
     }
-    ptrEl.classList.remove('ready', 'refreshing');
-    ptrEl.classList.add('settling', 'show');
-    // Force style flush so the transition runs from current height → 0.
-    void ptrEl.offsetHeight;
-    ptrEl.style.height = '0px';
-    window.setTimeout(() => {
-      if (!ptrBusy) {
-        ptrEl.classList.remove('show', 'settling');
-        ptrLabel('Pull to refresh', false);
+    const el = ptrEl;
+    const run = () => {
+      if (ptrDragging) return; // a new pull took over during the note
+      el.classList.remove('ready', 'refreshing');
+      el.classList.add('settling', 'show');
+      // Force style flush so the transition runs from current height → 0.
+      void el.offsetHeight;
+      el.style.height = '0px';
+      window.setTimeout(() => {
+        if (!ptrBusy && !ptrDragging) {
+          el.classList.remove('show', 'settling');
+          el.style.removeProperty('--ptr-progress');
+          ptrLabel('Pull to refresh', false);
+        }
+        if (typeof then === 'function') then();
+      }, 300);
+    };
+    if (delay > 0) window.setTimeout(run, delay);
+    else run();
+  }
+
+  function ptrScrollerAbove(target) {
+    // A nested scroller (long CW body, menus, carousels) owns its own drags.
+    let vScrolled = false;
+    let hScroll = false;
+    for (let el = target; el && el !== document.body && el !== document.documentElement; el = el.parentElement) {
+      if (el === root) break;
+      const st = window.getComputedStyle(el);
+      if ((st.overflowY === 'auto' || st.overflowY === 'scroll') && el.scrollHeight > el.clientHeight + 1 && el.scrollTop > 0) {
+        vScrolled = true;
+        break;
       }
-      if (typeof then === 'function') then();
-    }, 300);
+      if ((st.overflowX === 'auto' || st.overflowX === 'scroll') && el.scrollWidth > el.clientWidth + 1) hScroll = true;
+    }
+    return { vScrolled, hScroll };
   }
 
   function ptrCanStart(ev) {
     if (ptrBusy) return false;
-    const target = ev && ev.target;
-    if (target && target.closest && target.closest('textarea, input, select, button, a, .compose-modal')) return false;
-    return nearTop() && !document.body.classList.contains('mobile-nav-open');
+    if (!ev.touches || ev.touches.length !== 1) return false;
+    if (document.body.classList.contains('mobile-nav-open')) return false;
+    if (document.querySelector('.compose-modal.open, dialog[open]')) return false;
+    const target = ev.target && ev.target.nodeType === 1 ? ev.target : (ev.target && ev.target.parentElement);
+    if (target && target.closest && target.closest(PTR_SOFT_INPUT)) return false;
+    return nearTop();
   }
 
   document.addEventListener('touchstart', (ev) => {
-    if (!ev.touches || !ev.touches[0] || !ptrCanStart(ev)) {
+    if (!ptrCanStart(ev)) {
       ptrTracking = false;
       return;
     }
+    const target = ev.target && ev.target.nodeType === 1 ? ev.target : (ev.target && ev.target.parentElement);
+    const scrollers = ptrScrollerAbove(target);
+    if (scrollers.vScrolled) {
+      ptrTracking = false;
+      return;
+    }
+    ptrInHScroller = scrollers.hScroll;
     ptrTracking = true;
     ptrDragging = false;
     ptrArmed = false;
     ptrWasArmed = false;
+    ptrDirection = '';
     ptrStartY = ev.touches[0].clientY;
+    ptrStartX = ev.touches[0].clientX;
     ptrDy = 0;
     ptrPull = 0;
+    ptrHost();
     if (ptrEl) ptrEl.classList.remove('settling', 'refreshing');
   }, { passive: true, capture: true });
 
   document.addEventListener('touchmove', (ev) => {
     if (!ptrTracking || ptrBusy || !ev.touches || !ev.touches[0]) return;
-    if (sc.top() > 6) {
+    if (ev.touches.length > 1) {
+      // Pinch: hand the gesture back.
       if (ptrDragging) ptrCollapse();
       ptrTracking = false;
       ptrDragging = false;
       return;
     }
-    ptrDy = ev.touches[0].clientY - ptrStartY;
-    if (ptrDy < 10 && !ptrDragging) return;
-    // Only claim the gesture once we're clearly pulling down at the top.
-    if (!ptrDragging && ptrDy >= 10) ptrDragging = true;
-    if (!ptrDragging) return;
+    const y = ev.touches[0].clientY;
+    const x = ev.touches[0].clientX;
+    if (sc.top() > 1) {
+      // Still scrolling up toward the head. Re-anchor so the pull starts
+      // from wherever the page reaches the top, like native apps.
+      if (ptrDragging) {
+        ptrDragging = false;
+        ptrArmed = false;
+        ptrCollapse();
+      }
+      ptrStartY = y;
+      ptrStartX = x;
+      ptrDirection = '';
+      return;
+    }
+    ptrDy = y - ptrStartY;
+    const dx = x - ptrStartX;
+    if (!ptrDirection) {
+      if (Math.abs(dx) + Math.abs(ptrDy) < 4) {
+        // Too small to tell yet. At the head a downward start would hand the
+        // whole gesture to the browser's own overscroll unless claimed now;
+        // skip that inside horizontal strips so their swipes keep working.
+        if (ptrDy > 0 && !ptrInHScroller && ev.cancelable) ev.preventDefault();
+        return;
+      }
+      ptrDirection = (Math.abs(dx) > Math.abs(ptrDy)) ? 'x' : 'y';
+    }
+    if (ptrDirection === 'x' || ptrDy <= 0) {
+      if (ptrDirection === 'x') ptrTracking = false;
+      if (ptrDragging) {
+        ptrDragging = false;
+        ptrArmed = false;
+        ptrCollapse();
+      }
+      return;
+    }
+    if (!ev.cancelable) {
+      // The browser already committed this touch to a native scroll.
+      ptrTracking = false;
+      if (ptrDragging) {
+        ptrDragging = false;
+        ptrCollapse();
+      }
+      return;
+    }
     ev.preventDefault();
-    ptrPull = ptrRubber(ptrDy);
+    // Small dead zone so taps and slight wobble never show the indicator.
+    if (!ptrDragging && ptrDy < 8) return;
+    ptrDragging = true;
+    ptrPull = ptrRubber(ptrDy - 8);
     const nowArmed = ptrPull >= PTR_READY;
     if (nowArmed && !ptrWasArmed) {
       window.vaakHaptic && window.vaakHaptic(12);
     }
     ptrWasArmed = nowArmed;
     ptrArmed = nowArmed;
-    if (ptrEl) {
-      ptrEl.style.height = ptrPull.toFixed(1) + 'px';
-      ptrEl.classList.add('show');
-      ptrEl.classList.toggle('ready', ptrArmed);
-      ptrLabel(ptrArmed ? 'Release to refresh' : 'Pull to refresh', false);
-    }
+    if (!ptrFrame) ptrFrame = window.requestAnimationFrame(ptrPaint);
   }, { passive: false, capture: true });
+
+  function ptrSoftCapable() {
+    // Only Home / Local / Federated have a head poll. Everywhere else
+    // (Bluesky, Notifications, Sent, or a page soft-navved away from the
+    // timeline) the old code spun and loaded nothing.
+    const live = document.getElementById('timeline-items');
+    if (!live || live !== items || !items.isConnected) return false;
+    if (timelinePollSuspended || window.__vaakNavigationPending || tabSwapBusy) return false;
+    return timelineHeadPollView();
+  }
+
+  function ptrHardReload() {
+    const u = new URL(window.location.href);
+    u.searchParams.set('_r', String(Date.now()));
+    window.location.href = u.pathname + u.search + u.hash;
+  }
 
   document.addEventListener('touchend', () => {
     if (!ptrTracking) return;
+    if (ptrFrame) {
+      window.cancelAnimationFrame(ptrFrame);
+      ptrFrame = 0;
+    }
     const doRefresh = ptrDragging && ptrArmed && !ptrBusy;
+    const wasDragging = ptrDragging;
     ptrTracking = false;
     ptrDragging = false;
     ptrArmed = false;
     if (!doRefresh) {
-      ptrCollapse();
+      if (wasDragging) ptrCollapse();
       return;
     }
     ptrBusy = true;
@@ -1296,37 +1433,40 @@
       ptrLabel('Refreshing…', true);
     }
     window.vaakHaptic && window.vaakHaptic(18);
-    // Soft refresh when the live poller is available; otherwise hard reload.
-    const soft = typeof pollNewer === 'function';
-    const finish = () => {
-      ptrBusy = false;
-      ptrCollapse();
-    };
-    if (soft) {
-      Promise.resolve()
-        .then(() => pollNewer())
-        .then(() => {
-          if (pendingCount > 0 && typeof insertPending === 'function') {
-            insertPending({ scrollToTop: true });
-          } else if (nearTop()) {
-            sc.setTop(0, true);
-          }
-        })
-        .catch(() => {})
-        .then(() => window.setTimeout(finish, 180));
-    } else {
-      const u = new URL(window.location.href);
-      u.searchParams.set('view', viewName);
-      u.searchParams.set('_r', String(Date.now()));
-      window.location.href = u.pathname + u.search;
+    if (!ptrSoftCapable()) {
+      ptrHardReload();
+      return;
     }
+    const startedAt = Date.now();
+    const before = pendingCount;
+    let note = '';
+    Promise.resolve()
+      .then(() => pollNewer())
+      .then(() => {
+        if (pendingCount > 0) {
+          insertPending({ scrollToTop: true });
+        } else {
+          note = timelinePollCompleted || before > 0 ? 'Up to date' : 'Couldn’t refresh';
+          if (nearTop()) sc.setTop(0, true);
+        }
+      })
+      .catch(() => { note = 'Couldn’t refresh'; })
+      .then(() => {
+        const wait = Math.max(0, PTR_MIN_SPIN_MS - (Date.now() - startedAt));
+        window.setTimeout(() => {
+          if (note) ptrNote(note);
+          ptrBusy = false;
+          ptrCollapse(null, note ? PTR_NOTE_MS : 0);
+        }, wait);
+      });
   }, { passive: true });
   document.addEventListener('touchcancel', () => {
-    if (ptrBusy) return;
+    if (ptrBusy || !ptrTracking) return;
     ptrTracking = false;
+    const wasDragging = ptrDragging;
     ptrDragging = false;
     ptrArmed = false;
-    ptrCollapse();
+    if (wasDragging) ptrCollapse();
   }, { passive: true });
 
   // Auto-hydrate: use a bounded SSE stream for near-real-time updates. The
