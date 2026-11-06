@@ -15589,6 +15589,31 @@ function view_title(string $view): string
     };
 }
 
+/**
+ * True when a remote_profile actor param names one of our own accounts:
+ * https://mkultra.monster/users/{key}, /@{key} on our hosts, @{key}@ours,
+ * or a bare @{key}. Bare names resolve to the local account first (#285).
+ */
+function admin_profile_actor_is_local(string $actor): bool
+{
+    $actor = rtrim(trim($actor), '/');
+    if ($actor === '') {
+        return false;
+    }
+    $hosts = '(?:www\.)?(?:mkultra|vaak)\.monster';
+    return (bool) preg_match('#^https?://' . $hosts . '/(?:vaak/)?(?:users/|@)[A-Za-z0-9_]+$#i', $actor)
+        || (bool) preg_match('#^@?[A-Za-z0-9_]+(?:@' . $hosts . ')?$#i', $actor);
+}
+
+/** view_title() with the profile view named for what it shows. */
+function admin_current_view_title(string $view): string
+{
+    if ($view === 'remote_profile' && admin_profile_actor_is_local((string) ($_GET['actor'] ?? ''))) {
+        return 'Local profile';
+    }
+    return view_title($view);
+}
+
 /** True when this object should use native Bluesky like/repost, not ActivityPub favourite. */
 function admin_object_is_bluesky_post(string $objectUrl): bool
 {
@@ -30337,7 +30362,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
   <title><?= h($vaakShareMeta['title'] . ' · VAAK') ?></title>
   <?= ap_vaak_share_meta_tags($vaakShareMeta) ?>
   <?php else: ?>
-  <title><?= $notifUnreadNav > 0 ? '(' . h($notifBadgeLabel) . ') ' : '' ?>VAAK · <?= h(view_title($view)) ?></title>
+  <title><?= $notifUnreadNav > 0 ? '(' . h($notifBadgeLabel) . ') ' : '' ?>VAAK · <?= h(admin_current_view_title($view)) ?></title>
   <?php endif; ?>
   <!-- Versioned, path-specific icons keep Safari from reusing the root site's favicon. -->
   <link rel="manifest" href="/vaak/manifest.webmanifest?v=20260909">
@@ -30370,7 +30395,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
 <div class="mobile-nav-backdrop" id="mobile-nav-backdrop" hidden></div>
 <header class="mobile-topbar" id="mobile-topbar">
   <button type="button" class="mobile-topbar__menu" id="mobile-menu-btn" aria-label="Open menu" aria-controls="admin-rail-left" aria-expanded="false">☰</button>
-  <div class="mobile-topbar__title"><span>VAAK</span> · <?= h(view_title($view)) ?></div>
+  <div class="mobile-topbar__title"><span>VAAK</span> · <?= h(admin_current_view_title($view)) ?></div>
   <?php if (empty($GLOBALS['vaak_guest_profile'])): ?>
   <a class="mobile-topbar__search" href="/vaak/?view=search" data-vaak-soft-nav="search" aria-label="Search">⌕</a>
   <?php else: ?>
@@ -30646,13 +30671,7 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
 <?php endif; ?>
     <div class="topbar<?= in_array($view, ['home', 'local', 'feed', 'bluesky'], true) ? ' topbar-timeline' : '' ?>">
       <?php
-        $topTitle = $view === 'bluesky' ? view_title('home') : view_title($view);
-        if ($view === 'remote_profile') {
-            $topActor = rtrim(trim((string) ($_GET['actor'] ?? '')), '/');
-            if (preg_match('#^https://mkultra\.monster/users/[A-Za-z0-9_]+$#', $topActor)) {
-                $topTitle = 'Local profile';
-            }
-        }
+        $topTitle = $view === 'bluesky' ? view_title('home') : admin_current_view_title($view);
       ?>
       <h1><?= h($topTitle) ?></h1>
       <div class="topbar-actions">
@@ -39009,7 +39028,7 @@ if (!empty($GLOBALS['vaak_profile_shell'])) {
   </section>
 </div>
 
-<script>window.VAAK_BOOT=window.VAAK_BOOT||{};VAAK_BOOT.s03=[<?= json_encode((string) ($vaakUsername ?? ''), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) ?>,<?= json_encode((string) ($vaakHandle ?? ''), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) ?>,<?= json_encode((string) (($vaakGuestProfile ?? false) ? '' : ($vaakActorKey ?? '')), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) ?>,<?= json_encode((($vaakGuestProfile ?? false) || !function_exists('ap_notif_stream_token')) ? '' : ap_notif_stream_token((int) admin_owner_user_id())) ?>,<?= !empty($GLOBALS['vaak_guest_profile']) ? 'true' : 'false' ?>,<?= json_encode($view === 'mentions') ?>,<?= json_encode($view === 'dms') ?>,<?= json_encode('VAAK · ' . view_title($view)) ?>,<?= json_encode(array_combine($titleViews = ['home', 'local', 'feed', 'bluesky', 'mentions', 'outbox', 'favourites', 'bookmarks', 'following', 'followers', 'search', 'status', 'remote_profile', 'rss', 'dms', 'blog', 'bsky_feeds'], array_map('view_title', $titleViews))) ?>,<?= json_encode($notifLastReadIdNav) ?>,<?= json_encode($notifLatestUnreadIdNav !== '' ? $notifLatestUnreadIdNav : $notifLatestIdNav) ?>,<?= json_encode($dmLatestIdNav) ?>,<?= (int) $notifUnreadNav ?>,<?= (int) $dmUnreadNav ?>,<?= json_encode($notifLatestUnreadIdNav !== '' ? $notifLatestUnreadIdNav : $notifLatestIdNav) ?>,<?= json_encode($notifLastReadIdNav) ?>,<?= json_encode($dmLatestIdNav) ?>,<?= (int) $phyrianPendingNav ?>];</script>
+<script>window.VAAK_BOOT=window.VAAK_BOOT||{};VAAK_BOOT.s03=[<?= json_encode((string) ($vaakUsername ?? ''), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) ?>,<?= json_encode((string) ($vaakHandle ?? ''), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) ?>,<?= json_encode((string) (($vaakGuestProfile ?? false) ? '' : ($vaakActorKey ?? '')), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) ?>,<?= json_encode((($vaakGuestProfile ?? false) || !function_exists('ap_notif_stream_token')) ? '' : ap_notif_stream_token((int) admin_owner_user_id())) ?>,<?= !empty($GLOBALS['vaak_guest_profile']) ? 'true' : 'false' ?>,<?= json_encode($view === 'mentions') ?>,<?= json_encode($view === 'dms') ?>,<?= json_encode('VAAK · ' . admin_current_view_title($view)) ?>,<?= json_encode(array_combine($titleViews = ['home', 'local', 'feed', 'bluesky', 'mentions', 'outbox', 'favourites', 'bookmarks', 'following', 'followers', 'search', 'status', 'remote_profile', 'rss', 'dms', 'blog', 'bsky_feeds'], array_map('view_title', $titleViews))) ?>,<?= json_encode($notifLastReadIdNav) ?>,<?= json_encode($notifLatestUnreadIdNav !== '' ? $notifLatestUnreadIdNav : $notifLatestIdNav) ?>,<?= json_encode($dmLatestIdNav) ?>,<?= (int) $notifUnreadNav ?>,<?= (int) $dmUnreadNav ?>,<?= json_encode($notifLatestUnreadIdNav !== '' ? $notifLatestUnreadIdNav : $notifLatestIdNav) ?>,<?= json_encode($notifLastReadIdNav) ?>,<?= json_encode($dmLatestIdNav) ?>,<?= (int) $phyrianPendingNav ?>];</script>
 <script src="<?= h(admin_static_asset_url('app/vaak-03.js')) ?>"></script>
 <script>document.documentElement.dataset.ownerSignals=<?= ($vaakOwnerId > 0 && empty($GLOBALS['vaak_guest_profile'])) ? "'1'" : "''" ?>;</script>
 <script src="<?= h(admin_static_asset_url('app/vaak-04.js')) ?>"></script>
