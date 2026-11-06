@@ -120,6 +120,9 @@
       }
       body { height: auto; overflow: auto; }
       body.mobile-nav-open { overflow: hidden; touch-action: none; }
+      /* Pull-to-refresh is drawn by vaak-07.js; stop the root bounce and
+         Chrome's own pull-to-reload so both don't fire on one pull. */
+      html.vaak-ptr, html.vaak-ptr body { overscroll-behavior-y: none; }
       /* Never leave the tablet 72px icon column reserved on phones. */
       .rail-right { display: none !important; }
 
@@ -169,7 +172,12 @@
       /* Keep timeline navigation reachable while the feed scrolls. The
          mobile menu/search bar occupies the first row, so the timeline bar
          sticks directly beneath it. */
-      .main > .topbar { position: sticky; top: calc(3.45rem + env(safe-area-inset-top)); z-index: 55; padding: .45rem .65rem; background: rgba(10,10,10,.98); }
+      /* Stick exactly under .mobile-topbar: its padding-top is
+         max(.55rem, safe-area), plus a 2.4rem button row, .55rem bottom
+         padding and a 1px border. The old 3.45rem + safe-area left a ~7px
+         gap on notched phones (Home Screen app) where posts showed through.
+         2.95rem tucks this bar 1px under that border instead. */
+      .main > .topbar { position: sticky; top: calc(max(.55rem, env(safe-area-inset-top)) + 2.95rem); z-index: 55; padding: .45rem .65rem; background: rgba(10,10,10,.98); }
       .main > .topbar h1 { display: none; }
       .main > .topbar .topbar-actions { width: 100%; justify-content: space-between; gap: .35rem; flex-wrap: nowrap; }
       .main > .topbar .timeline-tabs { flex: 0 1 auto; min-width: 0; max-width: calc(100% - 3rem); overflow-x: auto; justify-content: flex-start; scrollbar-width: none; }
@@ -1478,6 +1486,12 @@
       color: var(--primary);
       transition: height .2s ease, opacity .2s ease;
     }
+    .feed-ptr__arrow {
+      display: inline-block; font-size: 1rem; line-height: 1;
+      transform: rotate(calc(var(--ptr-progress, 0) * 180deg));
+      opacity: calc(.35 + var(--ptr-progress, 0) * .65);
+    }
+    .feed-ptr.ready .feed-ptr__arrow { transform: rotate(180deg); opacity: 1; transition: transform .15s ease; }
     .feed-ptr__spinner {
       width: .85rem; height: .85rem; border-radius: 50%;
       border: 2px solid currentColor; border-right-color: transparent;
