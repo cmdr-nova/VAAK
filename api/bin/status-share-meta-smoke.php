@@ -174,6 +174,6 @@ $head = substr($admin, (int) strpos($admin, '<!DOCTYPE html>'), 6000);
 share_check(str_contains($head, "if (\$view === 'status' && !empty(\$GLOBALS['vaak_guest_status']) && function_exists('ap_vaak_status_share_meta'))"), 'tags only on the guest status page');
 share_check(str_contains($head, '<?= ap_vaak_share_meta_tags($vaakShareMeta) ?>'), 'tags printed in <head>');
 share_check(strpos($head, 'ap_vaak_share_meta_tags') < strpos($head, '</head>'), 'tags come before </head>');
-share_check(str_contains($head, "VAAK · <?= h(view_title(\$view)) ?></title>"), 'plain title kept when there is no card');
+share_check(str_contains($head, "VAAK · <?= h(admin_current_view_title(\$view)) ?></title>"), 'plain title kept when there is no card');
 
 echo "status-share-meta-smoke: {$checks} checks passed\n";
