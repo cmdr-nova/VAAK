@@ -2931,6 +2931,27 @@ pub(crate) async fn fetch_bsky_map(db: &Client, uris: &[String]) -> Result<HashM
         .collect();
     dids.sort();
     dids.dedup();
+    // Quoted posts carry an author snapshot inside embed_json. Fill it from the
+    // same profile cache (one shared lookup for post and quote authors).
+    let mut quoted_dids: Vec<String> = map.values()
+        .filter_map(|r| quoted_embed_author_did(&r.embed_json))
+        .collect();
+    quoted_dids.sort();
+    quoted_dids.dedup();
+    if !quoted_dids.is_empty() {
+        let mut known = fetch_bsky_author_cards(db, &quoted_dids).await;
+        let missing: Vec<String> = quoted_dids.iter().filter(|d| !known.contains_key(*d)).cloned().collect();
+        if !missing.is_empty() {
+            for (did, card) in fetch_bsky_post_author_cards(db, &missing).await {
+                known.entry(did).or_insert(card);
+            }
+        }
+        for post in map.values_mut() {
+            if let Some(patched) = fill_quoted_embed_author(&post.embed_json, &known) {
+                post.embed_json = patched;
+            }
+        }
+    }
     if !dids.is_empty() {
         if let Ok(rows) = db.query(
             "SELECT actor_ref, profile_json, COALESCE(updated_at::text,'') FROM bsky_actor_profiles WHERE actor_ref = ANY($1)",
@@ -2956,6 +2977,173 @@ pub(crate) async fn fetch_bsky_map(db: &Client, uris: &[String]) -> Result<HashM
         }
     }
     Ok(map)
+}
+
+/// Best-known Bluesky author fields for one DID.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct BskyAuthorCard {
+    pub(crate) handle: String,
+    pub(crate) display: String,
+    pub(crate) avatar: String,
+    /// True when the values come from the durable profile cache (what the
+    /// hover card shows), which outranks an embed's ingest-time snapshot.
+    pub(crate) from_profile: bool,
+}
+
+/// The quoted viewRecord inside a Bluesky embed (record or recordWithMedia),
+/// using the same shape rules as `bsky_quote_status_from_embed`.
+fn quoted_embed_record_mut(embed: &mut Value) -> Option<&mut Value> {
+    let etype = embed.get("$type").and_then(Value::as_str).unwrap_or("").to_ascii_lowercase();
+    if !etype.contains("record") {
+        return None;
+    }
+    let with_media = etype.contains("recordwithmedia");
+    let record = embed.get_mut("record").filter(|v| v.is_object())?;
+    let nested = record.get("record").is_some_and(|inner| {
+        inner.is_object()
+            && (with_media || inner.get("author").is_some() || inner.get("value").is_some() || inner.get("text").is_some())
+    });
+    if nested {
+        return record.get_mut("record");
+    }
+    Some(record)
+}
+
+/// DID of a quoted post's author: the embed author, else the at:// URI.
+fn quoted_record_did(record: &Value) -> Option<String> {
+    let vtype = record.get("$type").and_then(Value::as_str).unwrap_or("").to_ascii_lowercase();
+    if vtype.contains("notfound") || vtype.contains("blocked") || vtype.contains("detached")
+        || vtype.contains("generatorview") || vtype.contains("listview")
+        || vtype.contains("starterpack") || vtype.contains("labelerview") {
+        return None;
+    }
+    let did = record.get("author").and_then(|a| a.get("did")).and_then(Value::as_str).unwrap_or("").trim();
+    if did.starts_with("did:") {
+        return Some(did.to_string());
+    }
+    let uri = record.get("uri").and_then(Value::as_str).unwrap_or("").trim();
+    let rest = uri.strip_prefix("at://")?;
+    let (did, path) = rest.split_once('/')?;
+    (did.starts_with("did:") && path.starts_with("app.bsky.feed.post/")).then(|| did.to_string())
+}
+
+fn quoted_embed_author_did(embed_json: &str) -> Option<String> {
+    if !embed_json.contains("record") {
+        return None;
+    }
+    let mut embed: Value = serde_json::from_str(embed_json).ok()?;
+    quoted_record_did(quoted_embed_record_mut(&mut embed)?)
+}
+
+/// Rewrite a quoted author with the best-known card. The profile cache wins
+/// (embed avatars can be retired CIDs that 404 into the default face); a
+/// bsky_posts fallback only fills empty fields. None when nothing changed.
+fn fill_quoted_embed_author(embed_json: &str, known: &HashMap<String, BskyAuthorCard>) -> Option<String> {
+    if known.is_empty() || !embed_json.contains("record") {
+        return None;
+    }
+    let mut embed: Value = serde_json::from_str(embed_json).ok()?;
+    let record = quoted_embed_record_mut(&mut embed)?;
+    let did = quoted_record_did(record)?;
+    let card = known.get(&did)?;
+    if !record.get("author").is_some_and(Value::is_object) {
+        record["author"] = json!({});
+    }
+    let author = record.get_mut("author")?;
+    let mut changed = false;
+    let mut set = |key: &str, value: &str, force: bool| {
+        let value = value.trim();
+        if value.is_empty() {
+            return;
+        }
+        let current = author.get(key).and_then(Value::as_str).unwrap_or("").trim().to_string();
+        let thin = current.is_empty()
+            || (key == "handle" && (current.starts_with("did:") || current == "handle.invalid"))
+            || (key == "avatar" && (!current.starts_with("https://") || current == DEFAULT_AVATAR));
+        if current != value && (thin || force) {
+            author[key] = json!(value);
+            changed = true;
+        }
+    };
+    set("did", &did, false);
+    set("handle", &card.handle, card.from_profile);
+    set("displayName", &card.display, card.from_profile);
+    set("avatar", &card.avatar, card.from_profile);
+    if !changed {
+        return None;
+    }
+    serde_json::to_string(&embed).ok()
+}
+
+/// Durable Bluesky profile cache rows (actor-warm / hover card), keyed by DID.
+async fn fetch_bsky_author_cards(db: &Client, dids: &[String]) -> HashMap<String, BskyAuthorCard> {
+    let mut out = HashMap::new();
+    if dids.is_empty() {
+        return out;
+    }
+    let Ok(rows) = db.query(
+        "SELECT COALESCE(did, actor_ref), actor_ref, profile_json FROM bsky_actor_profiles
+         WHERE actor_ref = ANY($1) OR did = ANY($1)
+         ORDER BY updated_at DESC",
+        &[&dids],
+    ).await else {
+        return out;
+    };
+    for row in rows {
+        let did: String = row.get(0);
+        let actor_ref: String = row.get(1);
+        let did = if did.starts_with("did:") { did } else { actor_ref };
+        if !did.starts_with("did:") || out.contains_key(&did) {
+            continue;
+        }
+        let Ok(profile) = serde_json::from_str::<Value>(&row.get::<_, String>(2)) else { continue };
+        let handle = profile.get("handle").and_then(Value::as_str).unwrap_or("").trim();
+        let display = profile.get("displayName").or_else(|| profile.get("display_name"))
+            .and_then(Value::as_str).unwrap_or("").trim();
+        let card = BskyAuthorCard {
+            handle: if handle.starts_with("did:") || handle == "handle.invalid" { String::new() } else { handle.to_string() },
+            display: if display.eq_ignore_ascii_case("bluesky user") { String::new() } else { display.to_string() },
+            avatar: crate::actor_warm::bsky_avatar_url(profile.get("avatar"), &did).unwrap_or_default(),
+            from_profile: true,
+        };
+        out.insert(did, card);
+    }
+    out
+}
+
+/// Newest stored post per DID (matches idx_bsky_posts_author_idx), for authors
+/// the profile cache has not seen yet.
+async fn fetch_bsky_post_author_cards(db: &Client, dids: &[String]) -> HashMap<String, BskyAuthorCard> {
+    let mut out = HashMap::new();
+    if dids.is_empty() {
+        return out;
+    }
+    let Ok(rows) = db.query(
+        "SELECT d.did, p.h, p.n, p.a
+         FROM unnest($1::text[]) AS d(did)
+         CROSS JOIN LATERAL (
+             SELECT COALESCE(author_handle,'') AS h, COALESCE(author_display,'') AS n, COALESCE(author_avatar,'') AS a
+             FROM bsky_posts
+             WHERE author_did = d.did
+               AND author_handle IS NOT NULL AND author_handle <> '' AND author_handle NOT LIKE 'did:%'
+             ORDER BY indexed_at DESC
+             LIMIT 1
+         ) p",
+        &[&dids],
+    ).await else {
+        return out;
+    };
+    for row in rows {
+        let did: String = row.get(0);
+        let avatar: String = row.get(3);
+        out.insert(did.clone(), BskyAuthorCard {
+            handle: row.get(1),
+            display: row.get(2),
+            avatar: crate::actor_warm::bsky_avatar_url(Some(&json!(avatar)), &did).unwrap_or_default(),
+            from_profile: false,
+        });
+    }
+    out
 }
 
 fn bsky_profile_ts(raw: &str) -> i64 {
@@ -6853,6 +7041,41 @@ mod settings_regression_tests {
         let mut unlinked = json!({"account":{"url":"https://bsky.app/profile/other.test","acct":"alice.bsky.test"}});
         refresh_account_tree(&mut unlinked, &profiles, &aliases, 0);
         assert!(unlinked["account"].get("avatar").is_none());
+    }
+    #[test]
+    fn quoted_bluesky_author_uses_best_known_profile() {
+        let did = "did:plc:quoted";
+        let profile = BskyAuthorCard { handle: "pat.bsky.social".into(), display: "Pat".into(),
+            avatar: "https://cdn.bsky.app/img/avatar/plain/did:plc:quoted/new@jpeg".into(), from_profile: true };
+        let known = HashMap::from([(did.to_string(), profile)]);
+        // Thin quote: no author at all, DID only in the at:// URI.
+        let thin = json!({"$type":"app.bsky.embed.record#view","record":{"$type":"app.bsky.embed.record#viewRecord",
+            "uri":"at://did:plc:quoted/app.bsky.feed.post/3q","value":{"$type":"app.bsky.feed.post","text":"hi"}}});
+        assert_eq!(quoted_embed_author_did(&thin.to_string()).as_deref(), Some(did));
+        let patched = fill_quoted_embed_author(&thin.to_string(), &known).expect("filled");
+        let quoted = bsky_quote_status_from_embed(&patched).expect("quote");
+        assert_eq!(quoted["account"]["display_name"], "Pat");
+        assert_eq!(quoted["account"]["acct"], "pat.bsky.social");
+        assert_eq!(quoted["account"]["avatar"], "https://cdn.bsky.app/img/avatar/plain/did:plc:quoted/new@jpeg");
+        // Stale snapshot inside recordWithMedia: the profile cache wins.
+        let stale = json!({"$type":"app.bsky.embed.recordWithMedia#view","media":{},"record":{"record":{
+            "$type":"app.bsky.embed.record#viewRecord","uri":"at://did:plc:quoted/app.bsky.feed.post/3q",
+            "author":{"did":did,"handle":"pat.bsky.social","displayName":"Old","avatar":"https://cdn.bsky.app/img/avatar/plain/did:plc:quoted/old@jpeg"},
+            "value":{"$type":"app.bsky.feed.post","text":"hi"}}}});
+        let patched: Value = serde_json::from_str(&fill_quoted_embed_author(&stale.to_string(), &known).expect("refreshed")).unwrap();
+        assert_eq!(patched["record"]["record"]["author"]["displayName"], "Pat");
+        assert_eq!(patched["record"]["record"]["author"]["avatar"], "https://cdn.bsky.app/img/avatar/plain/did:plc:quoted/new@jpeg");
+        // Already current: no rewrite.
+        assert!(fill_quoted_embed_author(&patched.to_string(), &known).is_none());
+        // A stored-post fallback only fills gaps; it never overrides the embed.
+        let weak = HashMap::from([(did.to_string(), BskyAuthorCard { handle: "pat.bsky.social".into(), display: "Older".into(),
+            avatar: "https://cdn.bsky.app/img/avatar/plain/did:plc:quoted/x@jpeg".into(), from_profile: false })]);
+        assert!(fill_quoted_embed_author(&patched.to_string(), &weak).is_none());
+        // Lists, feeds and unavailable records are left alone.
+        let gone = json!({"$type":"app.bsky.embed.record#view","record":{"$type":"app.bsky.embed.record#viewNotFound","uri":"at://did:plc:quoted/app.bsky.feed.post/3q"}});
+        assert!(fill_quoted_embed_author(&gone.to_string(), &known).is_none());
+        let list = json!({"$type":"app.bsky.embed.record#view","record":{"$type":"app.bsky.graph.defs#listView","uri":"at://did:plc:quoted/app.bsky.graph.list/l"}});
+        assert!(fill_quoted_embed_author(&list.to_string(), &known).is_none());
     }
     #[test]
     fn ranked_algorithm_modes_do_not_cross() {
