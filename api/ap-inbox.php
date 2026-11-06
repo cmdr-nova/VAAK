@@ -10371,18 +10371,26 @@ function ap_cmdr_send_undo_announce(string $announceActivityId, string $objectId
     if (is_string($targetActor) && str_starts_with($targetActor, 'https://')) {
         $cc[] = rtrim($targetActor, '/');
     }
+    $cc = array_values(array_unique($cc));
+    $published = gmdate('c');
+    // The embedded Announce carries its audience and date like Mastodon's:
+    // GoToSocial rejects an Undo whose Announce has no to/cc
+    // ("malformed incoming activity").
     $activity = [
         '@context' => 'https://www.w3.org/ns/activitystreams',
         'id' => $undoId,
         'type' => 'Undo',
         'actor' => $actor,
-        'published' => gmdate('c'),
+        'published' => $published,
         'to' => $to,
-        'cc' => array_values(array_unique($cc)),
+        'cc' => $cc,
         'object' => [
             'id' => $announceActivityId,
             'type' => 'Announce',
             'actor' => $actor,
+            'published' => $published,
+            'to' => $to,
+            'cc' => $cc,
             'object' => $objectId,
         ],
     ];
