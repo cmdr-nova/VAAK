@@ -91,13 +91,18 @@ try {
         $ok = false;
         if (!empty($plan['try_http'])) {
             $ok = is_array($activity) && ap_deliver_signed_json((string) $row['inbox_url'], $activity, (string) $row['key_id'], (string) $row['priv_path'], 2.5);
-            if ($ok) ap_fanout_circuit_success($host);
+            $sendError = (string) ($GLOBALS['ap_delivery_last_error'] ?? '');
+            $answered = !$ok && function_exists('ap_fanout_host_answered') && ap_fanout_host_answered($sendError);
+            if ($ok || $answered) ap_fanout_circuit_success($host);
             else ap_fanout_circuit_failure($host);
             if ($ok && function_exists('ap_fanout_host_note_success')) ap_fanout_host_note_success($host);
         }
         $outcome = function_exists('ap_fanout_worker_outcome')
             ? ap_fanout_worker_outcome($suspended, $probe, $circuitOpen, $ok, (int) $row['attempts'])
             : ['status' => $ok ? 'succeeded' : (((int) $row['attempts'] + 1) >= 12 ? 'failed' : 'pending'), 'terminal' => !$ok && ((int) $row['attempts'] + 1) >= 12, 'record_terminal' => !$ok && ((int) $row['attempts'] + 1) >= 12];
+        if (!empty($plan['try_http']) && !$ok && function_exists('ap_fanout_inbox_gone') && ap_fanout_inbox_gone((string) ($GLOBALS['ap_delivery_last_error'] ?? ''))) {
+            $outcome = ['try_http' => true, 'status' => 'failed', 'terminal' => true, 'record_terminal' => true];
+        }
         if (($outcome['status'] ?? '') === 'succeeded') {
             $db->prepare("UPDATE ap_fanout_delivery_queue SET status='succeeded',claimed_at=NULL,last_error=NULL,updated_at=? WHERE id=?")->execute([gmdate('c'), (int) $row['id']]);
             $stats['succeeded']++;
@@ -105,7 +110,9 @@ try {
         }
         $attempts = (int) $row['attempts'] + 1;
         $terminal = !empty($outcome['terminal']);
-        $delay = $circuitUntil > time() ? max(60, $circuitUntil - time()) : min(3600, 15 * (2 ** min(8, $attempts - 1)));
+        $delay = function_exists('ap_fanout_retry_delay')
+            ? ap_fanout_retry_delay($circuitUntil, time(), $attempts)
+            : ($circuitUntil > time() ? max(60, $circuitUntil - time()) : min(3600, 15 * (2 ** min(8, $attempts - 1))));
         if ($suspended && !$probe) {
             $detail = 'Suspended remote host';
         } else {

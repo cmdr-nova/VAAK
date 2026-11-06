@@ -245,6 +245,12 @@ $check(str_contains($script, 'terminal fan-out failures on live hosts require re
 $check(!preg_match('/failed_fanout_suspended && .*warn/', $script), 'suspended failures do not warn');
 $check(str_contains($script, 'VAAK_FANOUT_DEAD_DAYS') && str_contains($script, 'VAAK_FANOUT_DEAD_FAILURES'), 'integrity uses the same knobs');
 $check(str_contains($script, 'last_live_at') && str_contains($script, 'last_success_at') && str_contains($script, 'streak_started_at'), 'integrity uses the health record');
+$check(str_contains($script, "THEN 'gone'") && !preg_match('/failed_fanout_gone && .*warn/', $script), 'gone inboxes are counted apart and never warn');
+$check(str_contains($script, "circuit is open%' AND h.last_live_status IN (401,403,429,500)"), 'circuit rows on a rejecting host count as rejected');
+$check(ap_fanout_host_answered('HTTP 410 {"error":"Gone"}') && ap_fanout_host_answered('HTTP 401 nope'), 'an answered 4xx does not trip the circuit');
+$check(!ap_fanout_host_answered('HTTP 429 slow') && !ap_fanout_host_answered('HTTP 500 oops') && !ap_fanout_host_answered('No HTTP response from inbox Operation timed out'), '429, 5xx and timeouts still trip the circuit');
+$check(ap_fanout_inbox_gone('HTTP 410 {"error":"Gone"}') && ap_fanout_inbox_gone('HTTP 404') && !ap_fanout_inbox_gone('HTTP 4100'), 'gone inboxes are 404 and 410');
+$check(ap_fanout_retry_delay(1200, 1000, 1) === 200 && ap_fanout_retry_delay(1200, 1000, 6) === 480 && ap_fanout_retry_delay(0, 1000, 12) === 3600, 'an open circuit never shortens the backoff');
 $bash = shell_exec('bash -n ' . escapeshellarg(dirname(__DIR__, 2) . '/deploy/vaak-integrity-check.sh') . ' 2>&1');
 $check($bash === null || $bash === '', 'integrity script parses');
 

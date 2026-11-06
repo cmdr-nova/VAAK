@@ -244,14 +244,43 @@ pub(crate) fn worker_outcome(suspended: bool, probe: bool, circuit_open: bool, h
     Outcome { try_http: true, status: if terminal { "failed" } else { "pending" }, terminal, record_terminal: terminal }
 }
 
-/// The worker's retry delay: an open circuit waits it out, otherwise
-/// `min(3600, 15 * 2^min(8, attempts - 1))`.
+/// The worker's retry delay: `min(3600, 15 * 2^min(8, attempts - 1))`. An
+/// open circuit also waits at least until it closes (and at least 60 s), but
+/// never less than the backoff, so rows skipped by an open circuit spread
+/// their 12 attempts over the same hours as real retries instead of using
+/// them all up within about an hour.
 pub(crate) fn retry_delay(circuit_until: i64, now: i64, attempts: i64) -> i64 {
-    if circuit_until > now {
-        return (circuit_until - now).max(60);
-    }
     let exp = (attempts - 1).clamp(0, 8) as u32;
-    (15 * 2_i64.pow(exp)).min(3600)
+    let backoff = (15 * 2_i64.pow(exp)).min(3600);
+    if circuit_until > now {
+        return (circuit_until - now).max(60).max(backoff);
+    }
+    backoff
+}
+
+/// The status code of a delivery error written by `report`
+/// ("HTTP 410 ..."), or None for a transport failure.
+pub(crate) fn error_http_status(error: &str) -> Option<u16> {
+    let rest = error.trim_start().strip_prefix("HTTP ")?;
+    let code: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if code.len() != 3 {
+        return None;
+    }
+    code.parse().ok()
+}
+
+/// The host answered with a 4xx about this one inbox or activity (a deleted
+/// account, a stale key record, a rejected activity). The host itself is up,
+/// so this must not open its circuit: one dead follower inbox would
+/// otherwise hold back every other delivery to that server. 408 and 429 are
+/// the host asking us to slow down, so they still count.
+pub(crate) fn host_answered(error: &str) -> bool {
+    matches!(error_http_status(error), Some(s) if (400..500).contains(&s) && s != 408 && s != 429)
+}
+
+/// 404 or 410: the inbox is gone. Retrying cannot help.
+pub(crate) fn inbox_gone(error: &str) -> bool {
+    matches!(error_http_status(error), Some(404 | 410))
 }
 
 #[derive(Debug, Clone, Default)]
@@ -860,12 +889,15 @@ async fn process(state: &State, row: Row, tally: &Mutex<Tally>) -> Result<()> {
             }
             None => ok = false,
         }
-        state.circuit_note(&host, ok);
+        state.circuit_note(&host, ok || host_answered(&delivery_error));
         if ok {
             state.note_success(&host).await;
         }
     }
-    let outcome = worker_outcome(suspended, probe, circuit_open, ok, row.attempts);
+    let mut outcome = worker_outcome(suspended, probe, circuit_open, ok, row.attempts);
+    if plan.try_http && !ok && inbox_gone(&delivery_error) {
+        outcome = Outcome { try_http: true, status: "failed", terminal: true, record_terminal: true };
+    }
     if outcome.status == "succeeded" {
         state
             .db
@@ -1148,6 +1180,26 @@ mod tests {
         assert_eq!(retry_delay(0, 1000, 20), 3600);
         assert_eq!(retry_delay(1030, 1000, 1), 60);
         assert_eq!(retry_delay(1200, 1000, 1), 200);
+        // An open circuit never shortens the backoff.
+        assert_eq!(retry_delay(1200, 1000, 6), 480);
+        assert_eq!(retry_delay(1200, 1000, 12), 3600);
+    }
+
+    #[test]
+    fn answered_4xx_does_not_trip_circuit() {
+        assert_eq!(error_http_status("HTTP 410 {\"error\":\"Gone\"}"), Some(410));
+        assert_eq!(error_http_status("No HTTP response from inbox Operation timed out"), None);
+        assert!(host_answered("HTTP 410 {\"error\":\"Gone\"}"));
+        assert!(host_answered("HTTP 401 {\"error\":\"Verification failed\"}"));
+        assert!(host_answered("HTTP 400 {\"error\":\"Bad Request\"}"));
+        assert!(!host_answered("HTTP 429 slow down"));
+        assert!(!host_answered("HTTP 408"));
+        assert!(!host_answered("HTTP 500 Internal Server Error"));
+        assert!(!host_answered("HTTP 502 <html>"));
+        assert!(!host_answered("No HTTP response from inbox Connection timed out after 2500 milliseconds"));
+        assert!(inbox_gone("HTTP 410 {\"error\":\"Gone\"}"));
+        assert!(inbox_gone("HTTP 404"));
+        assert!(!inbox_gone("HTTP 401"));
     }
 
     #[test]

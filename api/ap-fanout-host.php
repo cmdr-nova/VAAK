@@ -226,6 +226,39 @@ function ap_fanout_host_after_terminal_failure(array $row, string $error, int $n
 /**
  * @return array{try_http:bool,status:string,terminal:bool,record_terminal:bool}
  */
+/** Status code of a delivery error ("HTTP 410 ..."), or null for a transport failure. */
+function ap_fanout_error_http_status(string $error): ?int
+{
+    return preg_match('/^\s*HTTP (\d{3})(?!\d)/', $error, $m) ? (int) $m[1] : null;
+}
+
+/**
+ * The host answered with a 4xx about one inbox or activity (deleted account,
+ * stale key record, rejected activity). The host is up, so this must not open
+ * its circuit and hold back every other delivery to it. 408 and 429 still count.
+ */
+function ap_fanout_host_answered(string $error): bool
+{
+    $s = ap_fanout_error_http_status($error);
+    return $s !== null && $s >= 400 && $s < 500 && $s !== 408 && $s !== 429;
+}
+
+/** 404 or 410: the inbox is gone, retrying cannot help. */
+function ap_fanout_inbox_gone(string $error): bool
+{
+    return in_array(ap_fanout_error_http_status($error), [404, 410], true);
+}
+
+/** Retry delay; an open circuit waits until it closes but never shortens the backoff. */
+function ap_fanout_retry_delay(int $circuitUntil, int $now, int $attempts): int
+{
+    $backoff = min(3600, 15 * (2 ** min(8, max(0, $attempts - 1))));
+    if ($circuitUntil > $now) {
+        return max(60, $circuitUntil - $now, $backoff);
+    }
+    return $backoff;
+}
+
 function ap_fanout_worker_outcome(bool $suspended, bool $probe, bool $circuitOpen, bool $httpOk, int $attempts): array
 {
     if ($suspended && !$probe) {
