@@ -55,6 +55,7 @@ function ap_deliver_signed_json(string $inbox, array $a, string $k, string $p, f
     return true;
 }
 function ap_deliver_fanout_background(array $activity, array $inboxes, string $keyId, string $priv, ?int $priority = null): bool {
+    $GLOBALS['lastActivity'] = $activity;
     if (!$GLOBALS['queueOk']) return false;
     $GLOBALS['queued'][] = [array_values($inboxes), $priority];
     return true;
@@ -112,6 +113,11 @@ $check(($queued[0][1] ?? null) === 3 && count($queued[0][0]) === 3
     && in_array('https://bsky.brid.gy/inbox', $queued[0][0], true), 'unboost on: Bridgy + author inboxes first at priority 3');
 $check(array_key_exists(1, $queued) && $queued[1][1] === null && count($queued[1][0]) === 12, 'unboost on: followers keep bulk priority');
 $check($r['ok'] && $r['delivered'] === 15, 'unboost on: all 15 counted');
+$embedded = $GLOBALS['lastActivity']['object'] ?? [];
+$check(($embedded['to'] ?? null) === ['https://www.w3.org/ns/activitystreams#Public']
+    && in_array(ME . '/followers', $embedded['cc'] ?? [], true)
+    && in_array($author, $embedded['cc'] ?? [], true)
+    && is_string($embedded['published'] ?? null), 'unboost: embedded Announce carries to, cc and published (GoToSocial)');
 $queueOk = false; $reset();
 ap_cmdr_send_undo_announce(ME . '/announces/queue-2-1', $note, $author, ME . '/undos/queue-boost-2-2');
 $check(count($inline) === 15, 'unboost on, queue down: sent inline');
