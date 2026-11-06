@@ -220,6 +220,29 @@ for _ in $(seq 1 60); do
   sleep 1
 done
 VAAK_INBOX_RUST_URL="$inbox_url" run "$runner" api/bin/inbox-route-delete-smoke.php
+kill "$inbox_pid" 2>/dev/null || true
+wait "$inbox_pid" 2>/dev/null || true
+
+# Rust Undo and mention-Delete routing (cutover F4): a third worker with them on.
+VAAK_ENV_FILE=/nonexistent VAAK_PHYRIAN_BRIDGE_ENV_FILE=/nonexistent \
+  VAAK_INBOX_RUST_ACCEPT=1 VAAK_INBOX_ROUTE_DELETE=1 VAAK_INBOX_ROUTE_DELETE_MENTIONS=1 VAAK_INBOX_ROUTE_UNDO=1 \
+  VAAK_AP_SIGNING_KEY=/nonexistent VAAK_INBOX_PHP_URL="http://127.0.0.1:${stub_port}" \
+  VAAK_DATABASE_URL="postgresql://${PGUSER}@${PGHOST}:${PGPORT}/${db}" \
+  VAAK_REDIS_URL="redis://${redis_hostport}/0" VAAK_REDIS_QUEUE_URL="redis://${redis_hostport}/1" \
+  VAAK_JETSTREAM_STATE="${work}/worker/jetstream-inbox-undo" VAAK_NOTIF_CACHE_DIR="${work}/worker" \
+  RUST_LOG=warn "$worker_bin" serve --bind "127.0.0.1:${inbox_port}" &
+inbox_pid=$!
+for _ in $(seq 1 60); do
+  if php -r 'exit(@file_get_contents($argv[1]) === false ? 1 : 0);' "${inbox_url}/healthz"; then
+    break
+  fi
+  if ! kill -0 "$inbox_pid" 2>/dev/null; then
+    echo "inbox undo vaak-worker exited" >&2
+    exit 1
+  fi
+  sleep 1
+done
+VAAK_INBOX_RUST_URL="$inbox_url" run "$runner" api/bin/inbox-route-undo-smoke.php
 
 # Rust fan-out delivery (cutover D2): seed the queue, then a worker with the
 # switch on works it. Nothing it is given resolves, so no request leaves CI.
