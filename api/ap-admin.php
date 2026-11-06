@@ -63,6 +63,7 @@ require_once __DIR__ . '/ap-featured.php'; // Profile → Featured accounts (end
 require_once __DIR__ . '/ap-profile-html.php'; // Shared profile tab order / HTML helpers
 require_once __DIR__ . '/ap-vaak-profile-route.php'; // Pretty /vaak/users/{key} + vaak.monster/users/{key}
 require_once __DIR__ . '/ap-vaak-status-route.php'; // /vaak/@{key}/{id} local post permalinks
+require_once __DIR__ . '/ap-vaak-status-share.php'; // Link preview cards for shared post links
 require_once __DIR__ . '/ap-notices.php'; // Local-only operator notices
 require_once __DIR__ . '/ap-discuss.php'; // Local-only discussion forums
 require_once __DIR__ . '/ap-webpush.php'; // Browser + Ice Cubes Web Push
@@ -30317,7 +30318,27 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
   <?php if ($vaakPrettyProfile): ?>
   <base href="/vaak/">
   <?php endif; ?>
+  <?php
+    // Shared post links: link unfurlers (iMessage, Discord, Slack, fedi and
+    // Bluesky apps) read Open Graph tags from this first response and never
+    // carry a session, so they always see the guest page. Cache-only, and no
+    // tags unless the guest page itself would show the post.
+    $vaakShareMeta = null;
+    if ($view === 'status' && !empty($GLOBALS['vaak_guest_status']) && function_exists('ap_vaak_status_share_meta')) {
+        try {
+            $vaakShareMeta = ap_vaak_status_share_meta((string) ($_GET['object'] ?? ''));
+        } catch (Throwable $e) {
+            error_log('[ap-admin] status share meta: ' . $e->getMessage());
+            $vaakShareMeta = null;
+        }
+    }
+  ?>
+  <?php if (is_array($vaakShareMeta)): ?>
+  <title><?= h($vaakShareMeta['title'] . ' · VAAK') ?></title>
+  <?= ap_vaak_share_meta_tags($vaakShareMeta) ?>
+  <?php else: ?>
   <title><?= $notifUnreadNav > 0 ? '(' . h($notifBadgeLabel) . ') ' : '' ?>VAAK · <?= h(view_title($view)) ?></title>
+  <?php endif; ?>
   <!-- Versioned, path-specific icons keep Safari from reusing the root site's favicon. -->
   <link rel="manifest" href="/vaak/manifest.webmanifest?v=20260909">
   <link rel="icon" href="/vaak/favicon.svg?v=20260907" type="image/svg+xml">
