@@ -27,6 +27,7 @@ mod interaction_flags;
 mod link_preview;
 mod mentions_html;
 mod notif;
+mod notif_invalidate;
 mod notif_embed;
 mod status_emoji;
 mod quote_media;
@@ -106,6 +107,7 @@ mod inbox_key_fetch;
 mod inbox_origin;
 mod inbox_route_delete;
 mod inbox_route_shadow;
+mod inbox_route_undo;
 mod inbox_sig_shadow;
 mod parity_replay;
 

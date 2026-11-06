@@ -49,6 +49,12 @@ pub(crate) fn enabled() -> bool {
     std::env::var("VAAK_INBOX_ROUTE_DELETE").is_ok_and(|v| v.trim() == "1")
 }
 
+/// Cutover F4: also route Deletes that match a live mention (the
+/// notification caches are cleared by `notif_invalidate`).
+fn mentions_enabled() -> bool {
+    std::env::var("VAAK_INBOX_ROUTE_DELETE_MENTIONS").is_ok_and(|v| v.trim() == "1")
+}
+
 /// What the router would have returned, or why Rust left the row to PHP.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Routed {
@@ -56,13 +62,13 @@ pub(crate) enum Routed {
     Defer(&'static str),
 }
 
-fn is_bridgy_host(host: &str) -> bool {
+pub(crate) fn is_bridgy_host(host: &str) -> bool {
     host == "brid.gy" || host.ends_with(".brid.gy")
 }
 
 /// True when some actor block's value mentions `host` (a URL or handle on
 /// it). Over-matches on purpose: those rows go to PHP's alias check.
-fn actor_block_names_host(values: &[String], host: &str) -> bool {
+pub(crate) fn actor_block_names_host(values: &[String], host: &str) -> bool {
     !host.is_empty() && values.iter().any(|v| v.contains(host))
 }
 
@@ -70,7 +76,7 @@ fn actor_block_names_host(values: &[String], host: &str) -> bool {
 type ValueCache = Option<(Instant, Vec<String>)>;
 static ACTOR_BLOCKS: Mutex<ValueCache> = Mutex::new(None);
 
-async fn actor_block_values(db: &Client) -> Result<Vec<String>> {
+pub(crate) async fn actor_block_values(db: &Client) -> Result<Vec<String>> {
     if let Some((at, list)) = ACTOR_BLOCKS.lock().ok().and_then(|b| b.clone()) {
         if at.elapsed() < BLOCKS_TTL {
             return Ok(list);
@@ -105,11 +111,15 @@ const SCHEMA: &[(&str, &str, &str)] = &[
     ("ap_notification_projection", "status_id", "text"),
     ("ap_inbox_host_seen", "last_seen_at", "text"),
     ("ap_fanout_host_health", "updated_at", "text"),
+    ("mentions", "deleted_at", "text"),
+    ("mentions", "object_id", "text"),
+    ("mentions", "activity_id", "text"),
+    ("mentions", "actor_id", "text"),
 ];
 
 static SCHEMA_OK: Mutex<Option<bool>> = Mutex::new(None);
 
-async fn schema_ok(db: &Client) -> bool {
+pub(crate) async fn schema_ok(db: &Client) -> bool {
     if let Some(ok) = SCHEMA_OK.lock().ok().and_then(|g| *g) {
         return ok;
     }
@@ -117,7 +127,7 @@ async fn schema_ok(db: &Client) -> bool {
         .query(
             "SELECT table_name::text, column_name::text, data_type::text FROM information_schema.columns
              WHERE table_schema = current_schema()
-               AND table_name IN ('events', 'direct_messages', 'ap_notification_projection', 'ap_inbox_host_seen', 'ap_fanout_host_health')",
+               AND table_name IN ('events', 'direct_messages', 'ap_notification_projection', 'ap_inbox_host_seen', 'ap_fanout_host_health', 'mentions')",
             &[],
         )
         .await
@@ -152,7 +162,7 @@ async fn schema_ok(db: &Client) -> bool {
 
 static FTS: Mutex<Option<bool>> = Mutex::new(None);
 
-fn fts_available() -> bool {
+pub(crate) fn fts_available() -> bool {
     FTS.lock().ok().and_then(|g| *g).unwrap_or(false)
 }
 
@@ -175,7 +185,7 @@ fn host_note_due(host: &str) -> bool {
 }
 
 /// `preg_replace('/[^A-Za-z]/', '', $type)`, else `Activity`.
-fn seen_type(kind: &str) -> String {
+pub(crate) fn seen_type(kind: &str) -> String {
     let t: String = kind.chars().filter(|c| c.is_ascii_alphabetic()).collect();
     if t.is_empty() || t.len() > 32 {
         "Activity".to_string()
@@ -186,7 +196,7 @@ fn seen_type(kind: &str) -> String {
 
 /// `ap_short`: whitespace runs become one space; over 120 bytes is cut
 /// (here on a char boundary) and gets `…`.
-fn short(s: &str) -> String {
+pub(crate) fn short(s: &str) -> String {
     let flat: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
     if flat.len() <= 120 {
         return flat;
@@ -198,7 +208,7 @@ fn short(s: &str) -> String {
     format!("{}…", &flat[..end])
 }
 
-fn inbox_log(lines: &[String]) {
+pub(crate) fn inbox_log(lines: &[String]) {
     let Some(path) = std::env::var("VAAK_AP_INBOX_LOG").ok().filter(|p| !p.trim().is_empty()) else {
         for l in lines {
             tracing::info!(target: "ap_inbox", "{l}");
@@ -213,7 +223,7 @@ fn inbox_log(lines: &[String]) {
     }
 }
 
-fn now_unix() -> i64 {
+pub(crate) fn now_unix() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
 }
 
@@ -234,6 +244,8 @@ fn plan(doc: &Value) -> Option<Plan> {
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn route(
     db: &mut Client,
+    redis: &mut redis::aio::ConnectionManager,
+    cache_dir: &std::path::Path,
     blocked_domains: &[String],
     ip: &str,
     key_id: &str,
@@ -264,10 +276,21 @@ pub(crate) async fn route(
         Ok(_) => return Routed::Defer("actor_block"),
         Err(_) => return Routed::Defer("db"),
     }
-    match apply(db, &plan, ip, key_id, path, sig_path, kind, body).await {
-        Ok(Some((spool_id, result, events))) => {
-            after_commit(db, &plan, key_id, kind, spool_id, result, events, body.len()).await;
-            Routed::Done { spool_id, result }
+    match apply(db, redis, &plan, ip, key_id, path, sig_path, kind, body).await {
+        Ok(Some(done)) => {
+            if done.mentions > 0 {
+                crate::notif_invalidate::drop_list_caches(redis).await;
+                crate::notif_invalidate::unread_owners(redis, cache_dir, &done.owners).await;
+            }
+            notes_after_commit(db, key_id, kind, "Delete", &plan.actor, plan.object_id.as_deref()).await;
+            let object = short(plan.object_id.as_deref().unwrap_or(""));
+            let line = if done.result == "delete_noop" {
+                format!("delete_noop object={object}")
+            } else {
+                format!("{} mentions={} events={} object={object}", done.result, done.mentions, done.events)
+            };
+            log_routed(done.spool_id, kind, body.len(), key_id, line);
+            Routed::Done { spool_id: done.spool_id, result: done.result }
         }
         Ok(None) => Routed::Defer("mention"),
         Err(e) => {
@@ -277,10 +300,20 @@ pub(crate) async fn route(
     }
 }
 
-/// The transaction. None when a live mention matches (PHP's branch).
+struct Applied {
+    spool_id: i64,
+    result: &'static str,
+    events: i64,
+    mentions: i64,
+    owners: Vec<i64>,
+}
+
+/// The transaction. None when a live mention matches and mention routing is
+/// off (PHP's branch).
 #[allow(clippy::too_many_arguments)]
 async fn apply(
     db: &mut Client,
+    redis: &mut redis::aio::ConnectionManager,
     plan: &Plan,
     ip: &str,
     key_id: &str,
@@ -288,7 +321,7 @@ async fn apply(
     sig_path: &str,
     kind: &str,
     body: &[u8],
-) -> Result<Option<(i64, &'static str, i64)>> {
+) -> Result<Option<Applied>> {
     let text = std::str::from_utf8(body)?;
     let tx = db.transaction().await?;
     let now = crate::fanout_delivery::iso(now_unix());
@@ -305,19 +338,43 @@ async fn apply(
                 )
                 .await?
                 .get(0);
-            if hit {
+            if hit && !mentions_enabled() {
                 tx.rollback().await?;
                 return Ok(None);
             }
         }
     }
     let mut events: i64 = 0;
+    let mut mentions: i64 = 0;
+    let mut owners: Vec<i64> = Vec::new();
     for did in &plan.ids {
         // ap_notification_projection_invalidate_status: rtrim(trim($id), '/').
         let status = did.trim().trim_end_matches('/');
         if !status.is_empty() {
             let slash = format!("{status}/");
             tx.execute("DELETE FROM ap_notification_projection WHERE status_id = $1 OR status_id = $2", &[&status, &slash]).await?;
+        }
+        // ap_mention_soft_delete: rtrim($id, '/'), its #suffix rows too.
+        let m = did.trim_end_matches('/');
+        if m.starts_with("https://") {
+            let slash = format!("{m}/");
+            let pattern = crate::inbox_route_shadow::like_suffix_pattern(m);
+            let filter = "deleted_at IS NULL AND (object_id = $1 OR object_id = $2 OR object_id LIKE $3 ESCAPE E'\\\\')";
+            for row in tx
+                .query(&format!("SELECT DISTINCT owner_user_id::bigint FROM mentions WHERE {filter}"), &[&m, &slash, &pattern])
+                .await?
+            {
+                if let Some(o) = row.get::<_, Option<i64>>(0) {
+                    owners.push(o);
+                }
+            }
+            let n = tx
+                .execute(&format!("UPDATE mentions SET deleted_at = $4 WHERE {filter}"), &[&m, &slash, &pattern, &now])
+                .await? as i64;
+            if n > 0 && fts_available() {
+                tx.execute("DELETE FROM ap_search_docs WHERE object_id = $1 OR object_id = $2", &[&m, &slash]).await?;
+            }
+            mentions += n;
         }
         // ap_dm_soft_delete_by_object: the id exactly as sent.
         tx.execute("UPDATE direct_messages SET deleted_at = $1 WHERE object_id = $2 AND deleted_at IS NULL", &[&now, did]).await?;
@@ -342,40 +399,35 @@ async fn apply(
             events += n;
         }
     }
-    let (result, action, target): (&'static str, &str, Option<&str>) =
-        if events > 0 { ("local_status_delete", "local_status_delete", Some(LOCAL_ACTOR)) } else { ("delete_noop", "log", None) };
-    // ap_metrics_record('Delete', $actorId, $objectId, …): no summary, media,
-    // reply or CW; host is the actor's, lowercased.
+    let (result, action, target): (&'static str, &str, Option<&str>) = if events > 0 {
+        ("local_status_delete", "local_status_delete", Some(LOCAL_ACTOR))
+    } else if mentions > 0 {
+        ("local_mention_delete", "local_mention_delete", Some(LOCAL_ACTOR))
+    } else {
+        ("delete_noop", "log", None)
+    };
+    // ap_metrics_record('Delete', $actorId, $objectId, …).
     let actor = (!plan.actor.is_empty()).then_some(plan.actor.as_str());
-    let host = actor.and_then(crate::inbox_accept::host_of);
-    let bytes = body.len() as i64;
-    tx.execute(
-        "INSERT INTO events (created_at, type, actor_id, object_id, target_actor, host, bytes, action_taken, summary, media_urls, in_reply_to, spoiler_text, sensitive, visibility)
-         VALUES ($1, 'Delete', $2, $3, $4, $5, $6::bigint, $7, NULL, NULL, NULL, '', 0, 'public')",
-        &[&now, &actor, &plan.object_id, &target, &host, &bytes, &action],
-    )
-    .await?;
-    let spool_id: i64 = tx
-        .query_one(
-            "INSERT INTO ap_inbox_spool (received_at, client_ip, key_id, request_path, signature_path, activity_type, body,
-                                         state, attempts, claimed_at, finished_at, result)
-             VALUES (now(), $1, $2, $3, $4, $5, $6, 'done', 1, now(), now(), $7) RETURNING id",
-            &[&ip, &key_id, &path, &sig_path, &kind, &text, &result],
-        )
-        .await?
-        .get(0);
+    insert_metrics(&tx, &now, "Delete", actor, plan.object_id.as_deref(), target, body.len(), action).await?;
+    let spool_id = insert_spool_done(&tx, ip, key_id, path, sig_path, kind, text, result).await?;
+    if mentions > 0 {
+        // ap_notification_projection_invalidate_all: epoch first, then rows.
+        tx.execute("DELETE FROM ap_notification_projection", &[]).await?;
+        crate::notif_invalidate::bump_server_epoch(redis).await;
+    }
     tx.commit().await?;
-    Ok(Some((spool_id, result, events)))
+    Ok(Some(Applied { spool_id, result, events, mentions, owners }))
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn after_commit(db: &Client, plan: &Plan, key_id: &str, kind: &str, spool_id: i64, result: &str, events: i64, bytes: usize) {
+/// What the drain does around routing, after commit: `ap_timeline_notify`,
+/// `ap_inbox_host_seen_note` and `ap_fanout_host_note_inbound` for the key
+/// host (at most every 5 minutes per host).
+pub(crate) async fn notes_after_commit(db: &Client, key_id: &str, kind: &str, notify_type: &str, actor: &str, object: Option<&str>) {
     let now = crate::fanout_delivery::iso(now_unix());
-    // ap_timeline_notify: rtrim'd actor and object.
     let payload = serde_json::json!({
-        "type": "Delete",
-        "actor": plan.actor.trim_end_matches('/'),
-        "object": plan.object_id.as_deref().unwrap_or("").trim_end_matches('/'),
+        "type": notify_type,
+        "actor": actor.trim_end_matches('/'),
+        "object": object.unwrap_or("").trim_end_matches('/'),
         "at": now,
     })
     .to_string();
@@ -404,18 +456,61 @@ async fn after_commit(db: &Client, plan: &Plan, key_id: &str, kind: &str, spool_
                 .await;
         }
     }
-    let object = short(plan.object_id.as_deref().unwrap_or(""));
-    let mut lines = vec![format!(
-        "accepted via=rust_route id={spool_id} type={} bytes={bytes} keyId={}",
-        seen_type(kind),
-        short(key_id)
-    )];
-    lines.push(if result == "delete_noop" {
-        format!("delete_noop object={object}")
-    } else {
-        format!("{result} mentions=0 events={events} object={object}")
-    });
-    inbox_log(&lines);
+}
+
+/// The drain's `accepted` line plus the router's own.
+pub(crate) fn log_routed(spool_id: i64, kind: &str, bytes: usize, key_id: &str, line: String) {
+    inbox_log(&[
+        format!("accepted via=rust_route id={spool_id} type={} bytes={bytes} keyId={}", seen_type(kind), short(key_id)),
+        line,
+    ]);
+}
+
+/// `ap_metrics_record` for a routed activity: no summary, media, reply or
+/// CW; host is the actor's, lowercased.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn insert_metrics(
+    tx: &tokio_postgres::Transaction<'_>,
+    now: &str,
+    kind: &str,
+    actor: Option<&str>,
+    object: Option<&str>,
+    target: Option<&str>,
+    bytes: usize,
+    action: &str,
+) -> Result<()> {
+    let host = actor.and_then(crate::inbox_accept::host_of);
+    let bytes = bytes as i64;
+    tx.execute(
+        "INSERT INTO events (created_at, type, actor_id, object_id, target_actor, host, bytes, action_taken, summary, media_urls, in_reply_to, spoiler_text, sensitive, visibility)
+         VALUES ($1, $2, $3, $4, $5, $6, $7::bigint, $8, NULL, NULL, NULL, '', 0, 'public')",
+        &[&now, &kind, &actor, &object, &target, &host, &bytes, &action],
+    )
+    .await?;
+    Ok(())
+}
+
+/// The spool row, already finished.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn insert_spool_done(
+    tx: &tokio_postgres::Transaction<'_>,
+    ip: &str,
+    key_id: &str,
+    path: &str,
+    sig_path: &str,
+    kind: &str,
+    body: &str,
+    result: &str,
+) -> Result<i64> {
+    Ok(tx
+        .query_one(
+            "INSERT INTO ap_inbox_spool (received_at, client_ip, key_id, request_path, signature_path, activity_type, body,
+                                         state, attempts, claimed_at, finished_at, result)
+             VALUES (now(), $1, $2, $3, $4, $5, $6, 'done', 1, now(), now(), $7) RETURNING id",
+            &[&ip, &key_id, &path, &sig_path, &kind, &body, &result],
+        )
+        .await?
+        .get(0))
 }
 
 #[cfg(test)]

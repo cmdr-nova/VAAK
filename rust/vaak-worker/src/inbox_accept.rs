@@ -100,6 +100,10 @@ impl Accepted {
             Accepted::Duplicate => "duplicate",
             Accepted::UnknownSelfDelete => "unknown_self_delete",
             Accepted::Routed(_, "local_status_delete") => "routed_local_status_delete",
+            Accepted::Routed(_, "local_mention_delete") => "routed_local_mention_delete",
+            Accepted::Routed(_, "local_undo_like") => "routed_local_undo_like",
+            Accepted::Routed(_, "local_undo_reblog") => "routed_local_undo_reblog",
+            Accepted::Routed(_, "local_undo_quote") => "routed_local_undo_quote",
             Accepted::Routed(_, _) => "routed_delete_noop",
         }
     }
@@ -325,17 +329,30 @@ async fn fast_path(cfg: &crate::config::Config, uri: &Uri, headers: &HeaderMap, 
             return Ok(Accepted::Duplicate);
         }
     }
-    // Cutover F3: Rust routes the Delete itself when every guard holds.
-    if !mismatch && crate::inbox_route_delete::enabled() {
-        match crate::inbox_route_delete::route(&mut db, &blocked, &ip, &key_id, uri.path(), &sig_path, &kind, body).await {
-            crate::inbox_route_delete::Routed::Done { spool_id, result } => {
+    // Cutover F3/F4: Rust routes a Delete or an Undo itself when every guard
+    // holds; anything else, or any deferral, is spooled for the drain.
+    if !mismatch {
+        use crate::inbox_route_delete::Routed;
+        let routed = match kind.as_str() {
+            "Delete" | "Tombstone" | "tombstone" if crate::inbox_route_delete::enabled() => Some(
+                crate::inbox_route_delete::route(&mut db, &mut redis, &cfg.notif_cache_dir, &blocked, &ip, &key_id, uri.path(), &sig_path, &kind, body)
+                    .await,
+            ),
+            "Undo" if crate::inbox_route_undo::enabled() => Some(
+                crate::inbox_route_undo::route(&mut db, &mut redis, &cfg.notif_cache_dir, &blocked, &ip, &key_id, uri.path(), &sig_path, &kind, body)
+                    .await,
+            ),
+            _ => None,
+        };
+        match routed {
+            Some(Routed::Done { spool_id, result }) => {
                 idle_return(db);
                 return Ok(Accepted::Routed(spool_id, result));
             }
-            crate::inbox_route_delete::Routed::Defer(why) if why != "not_delete" => {
+            Some(Routed::Defer(why)) if why != "not_delete" && why != "not_undo" => {
                 stat(cfg, &format!("route_defer_{why}")).await;
             }
-            crate::inbox_route_delete::Routed::Defer(_) => {}
+            _ => {}
         }
     }
     // Cutover F3 shadow: what Rust expects the drain's router to return.
