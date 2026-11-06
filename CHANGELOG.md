@@ -12,6 +12,13 @@ anything else bumps the patch number.
 Releases up to **0.9.83** used a two-digit deploy counter (0.9.05, 0.9.83)
 and have no notes here; their tags and GitHub Releases are unchanged.
 
+## [0.46.0](https://github.com/cmdr-nova/VAAK/releases/tag/v0.46.0) - 2026-11-06
+
+### ✨ Features
+* Fan-out: answered 4xx no longer opens a host's circuit; gone inboxes give up at once by @cmdr-nova in https://github.com/cmdr-nova/VAAK/pull/395
+
+**Full Changelog**: https://github.com/cmdr-nova/VAAK/compare/v0.45.0...v0.46.0
+
 ## [0.45.0](https://github.com/cmdr-nova/VAAK/releases/tag/v0.45.0) - 2026-11-06
 
 ### ✨ Features
