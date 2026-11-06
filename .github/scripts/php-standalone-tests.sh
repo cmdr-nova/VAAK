@@ -62,6 +62,7 @@ php_tests=(
   api/bin/pretty-profile-lock-release-smoke.php
   api/bin/shell-static-assets-smoke.php
   api/bin/vaak-status-permalink-smoke.php
+  api/bin/status-share-meta-smoke.php
   api/bin/bsky-thread-no-federation-smoke.php
   api/bin/bsky-thread-local-notify-smoke.php
   api/bin/cpu-index-smoke.php
