@@ -4102,6 +4102,7 @@ function ap_masto_status_context(int $statusId, array $opts = []): array
                 // Ensure immediate parent is cached before walking (Ice Cubes loads status+context in parallel)
                 if (
                     $allowFetch
+                    && !str_starts_with($parentUrl, 'https://njump.me/')
                     && function_exists('ap_event_by_object_id')
                     && !is_array(ap_event_by_object_id($parentUrl))
                 ) {
@@ -4142,6 +4143,22 @@ function ap_masto_context_ancestors_from_object_url(string $objectUrl, int $maxD
         }
         $seenUrl[$curUrl] = true;
 
+        // A Nostr parent (https://njump.me/note1…) that is a crosspost of a
+        // local post: walk on from that post. Other Nostr notes have no AS2
+        // document to fetch; only a stored mention row can stand in.
+        $isNostr = str_starts_with($curUrl, 'https://njump.me/');
+        if ($isNostr) {
+            if (!function_exists('ap_nostr_proxied_local_note')) {
+                require_once __DIR__ . '/ap-nostr.php';
+            }
+            $proxied = ap_nostr_proxied_local_note($curUrl);
+            if ($proxied !== '' && !isset($seenUrl[$proxied])) {
+                $curUrl = $proxied;
+                $seenUrl[$curUrl] = true;
+                $isNostr = false;
+            }
+        }
+
         // Local note
         $local = ap_masto_status_by_note_id($curUrl);
         if (is_array($local)) {
@@ -4160,7 +4177,7 @@ function ap_masto_context_ancestors_from_object_url(string $objectUrl, int $maxD
         }
 
         $event = function_exists('ap_event_by_object_id') ? ap_event_by_object_id($curUrl) : null;
-        if (!is_array($event) && $allowFetch) {
+        if (!is_array($event) && $allowFetch && !$isNostr) {
             $event = ap_masto_ensure_remote_note_event($curUrl);
         }
         if (!is_array($event)) {
@@ -4190,7 +4207,7 @@ function ap_masto_context_ancestors_from_object_url(string $objectUrl, int $maxD
         }
         $next = rtrim((string) ($event['in_reply_to'] ?? ''), '/');
         // If cached event lacks in_reply_to, try live doc once
-        if ($next === '' && $allowFetch) {
+        if ($next === '' && $allowFetch && !$isNostr) {
             $fetched = ap_masto_ensure_remote_note_event($curUrl);
             if (is_array($fetched) && !empty($fetched['in_reply_to'])) {
                 $next = rtrim((string) $fetched['in_reply_to'], '/');

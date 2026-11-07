@@ -15,13 +15,19 @@ declare(strict_types=1);
  * notification caches, search and push all see it, and is stamped
  * ingested_at. A failed row stays staged and is tried again next run.
  *
+ *
+ * A reply to a crossposted note (one carrying a NIP-48 proxy tag back to a
+ * VAAK post) is stored as a reply to that VAAK post, so the thread shows the
+ * post above the reply and the post lists it under its replies.
+ * --remap-replies rewrites rows stored before that the same way, then exits.
+ *
  * Usage (as www-data, from the release root):
- *   php api/bin/nostr-notif-ingest.php [--limit=200]
+ *   php api/bin/nostr-notif-ingest.php [--limit=200] [--remap-replies]
  */
 
-$opts = getopt('', ['limit:', 'help']);
+$opts = getopt('', ['limit:', 'remap-replies', 'help']);
 if (isset($opts['help'])) {
-    fwrite(STDOUT, "nostr-notif-ingest.php [--limit=200]\n");
+    fwrite(STDOUT, "nostr-notif-ingest.php [--limit=200] [--remap-replies]\n");
     exit(0);
 }
 $limit = isset($opts['limit']) ? max(1, min(1000, (int) $opts['limit'])) : 200;
@@ -69,6 +75,25 @@ function nostr_notif_actor_fields(array $staged): array
 }
 
 $db = ap_db();
+
+if (isset($opts['remap-replies'])) {
+    $old = $db->query(
+        "SELECT id, in_reply_to FROM mentions
+         WHERE in_reply_to LIKE 'https://njump.me/note1%' AND deleted_at IS NULL"
+    )->fetchAll(PDO::FETCH_ASSOC);
+    $fix = $db->prepare('UPDATE mentions SET in_reply_to = ? WHERE id = ?');
+    $remapped = 0;
+    foreach ($old as $m) {
+        $local = ap_nostr_proxied_local_note((string) $m['in_reply_to'], $db);
+        if ($local !== '') {
+            $fix->execute([$local, (int) $m['id']]);
+            $remapped++;
+        }
+    }
+    echo 'checked=' . count($old) . " remapped={$remapped}\n";
+    exit(0);
+}
+
 $rows = $db->prepare(
     'SELECT n.owner_user_id, n.event_id, n.actor, n.mention, n.push,
             p.name, p.display_name, p.picture
@@ -150,6 +175,11 @@ foreach ($rows->fetchAll(PDO::FETCH_ASSOC) as $staged) {
         }
         if (($row['in_reply_to'] ?? '') === '') {
             $row['in_reply_to'] = null;
+        } else {
+            $localParent = ap_nostr_proxied_local_note((string) $row['in_reply_to'], $db);
+            if ($localParent !== '') {
+                $row['in_reply_to'] = $localParent;
+            }
         }
         $exists = $db->prepare(
             'SELECT 1 FROM mentions WHERE owner_user_id = ? AND (activity_id = ? OR object_id = ?) LIMIT 1'

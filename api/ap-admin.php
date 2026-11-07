@@ -19604,6 +19604,35 @@ function admin_event_is_empty_private_stub(array $e): bool
 }
 
 /**
+ * Reply chrome for a Nostr parent (https://njump.me/note1…). A crosspost of a
+ * local post resolves to that post (in-app link, its text and @handle);
+ * any other Nostr note links out to njump, since Nostr notes have no status
+ * view. null when the parent isn't a Nostr note.
+ *
+ * @return array{url:string,snippet:string,handle:string,external:bool}|null
+ */
+function admin_reply_parent_nostr(string $replyUrl): ?array
+{
+    if (!str_starts_with($replyUrl, 'https://njump.me/')) {
+        return null;
+    }
+    $local = function_exists('ap_nostr_proxied_local_note') ? ap_nostr_proxied_local_note($replyUrl) : '';
+    if ($local === '') {
+        return ['url' => $replyUrl, 'snippet' => '', 'handle' => '', 'external' => true];
+    }
+    $snippet = '';
+    $row = function_exists('ap_masto_status_by_note_id') ? ap_masto_status_by_note_id($local) : null;
+    if (is_array($row)) {
+        $snippet = mb_substr(trim((string) ($row['content_text'] ?? '')), 0, 120);
+        if (in_array($snippet, ['(media)', '(attachment)', '(poll)', '(quote)', '(boost)'], true)) {
+            $snippet = '';
+        }
+    }
+    $handle = preg_match('#/users/([A-Za-z0-9_]+)/notes/#', $local, $m) ? $m[1] : '';
+    return ['url' => $local, 'snippet' => $snippet, 'handle' => $handle, 'external' => false];
+}
+
+/**
  * Shared-card ↩ reply to chrome (Fediverse + Bluesky).
  * Uses vaak_reply_parent (Bluesky preview), vaak_in_reply_to_url, or in_reply_to_id.
  *
@@ -19695,7 +19724,12 @@ function admin_status_reply_to_meta_html(array $st, string $returnView): string
 
     $parentSnippet = '';
     $parentHandle = '';
-    if (str_starts_with($replyUrl, 'https://') && function_exists('ap_event_by_object_id')) {
+    $nostrParent = admin_reply_parent_nostr($replyUrl);
+    if ($nostrParent !== null) {
+        $replyUrl = $nostrParent['url'];
+        $parentSnippet = $nostrParent['snippet'];
+        $parentHandle = $nostrParent['handle'];
+    } elseif (str_starts_with($replyUrl, 'https://') && function_exists('ap_event_by_object_id')) {
         $parentEvent = ap_event_by_object_id($replyUrl);
         if (is_array($parentEvent) && !empty($parentEvent['summary'])) {
             $parentSnippet = mb_substr(trim((string) $parentEvent['summary']), 0, 120);
@@ -19706,7 +19740,7 @@ function admin_status_reply_to_meta_html(array $st, string $returnView): string
     }
     $parentIsBsky = str_contains(strtolower($replyUrl), 'bsky.app')
         || str_starts_with(strtolower($replyUrl), 'at://');
-    $parentSource = $parentIsBsky ? 'Bluesky' : 'fediverse';
+    $parentSource = $nostrParent !== null ? 'Nostr' : ($parentIsBsky ? 'Bluesky' : 'fediverse');
     // A locally authored reply to a Bluesky post stores the canonical web
     // parent URL in outbox_notes. There is no local events actor row to ask
     // for a handle, so derive it from /profile/{handle}/post/{rkey} rather
@@ -19742,7 +19776,11 @@ function admin_status_reply_to_meta_html(array $st, string $returnView): string
         $html .= '<span>@' . h(ltrim($parentHandle, '@')) . '</span> ';
     }
     $html .= '<span class="tag" style="margin-left:.15rem" title="Reply source">' . h($parentSource) . '</span> ';
-    $html .= '<a href="' . h($href) . '">' . h($linkText) . '</a>';
+    if (!empty($nostrParent['external'])) {
+        $html .= '<a href="' . h($replyUrl) . '" target="_blank" rel="noopener noreferrer">' . h($linkText) . '</a>';
+    } else {
+        $html .= '<a href="' . h($href) . '">' . h($linkText) . '</a>';
+    }
     $html .= '</div>';
     return $html;
 }
@@ -20024,9 +20062,13 @@ function admin_render_event_tweet(array $e, array $followingIds, string $returnV
             <?php
               $replyParentUrl = rtrim((string) ($e['in_reply_to'] ?? ''), '/');
               if ($replyParentUrl !== '' && str_starts_with($replyParentUrl, 'https://')):
-                  $parentEvent = function_exists('ap_event_by_object_id') ? ap_event_by_object_id($replyParentUrl) : null;
-                  $parentSnippet = '';
-                  $parentHandle = '';
+                  $nostrParent = admin_reply_parent_nostr($replyParentUrl);
+                  if ($nostrParent !== null) {
+                      $replyParentUrl = $nostrParent['url'];
+                  }
+                  $parentEvent = $nostrParent === null && function_exists('ap_event_by_object_id') ? ap_event_by_object_id($replyParentUrl) : null;
+                  $parentSnippet = (string) ($nostrParent['snippet'] ?? '');
+                  $parentHandle = (string) ($nostrParent['handle'] ?? '');
                   if (is_array($parentEvent) && !empty($parentEvent['summary'])) {
                       $parentSnippet = mb_substr(trim((string) $parentEvent['summary']), 0, 120);
                   }
@@ -20035,13 +20077,15 @@ function admin_render_event_tweet(array $e, array $followingIds, string $returnV
                   }
                   $parentIsBsky = str_contains(strtolower($replyParentUrl), 'bsky.app')
                       || str_starts_with(strtolower($replyParentUrl), 'at://');
-                  $parentSource = $parentIsBsky ? 'Bluesky' : 'fediverse';
+                  $parentSource = $nostrParent !== null ? 'Nostr' : ($parentIsBsky ? 'Bluesky' : 'fediverse');
+                  $parentHref = !empty($nostrParent['external']) ? $replyParentUrl : admin_status_href($replyParentUrl, $returnView);
+                  $parentTarget = !empty($nostrParent['external']) ? ' target="_blank" rel="noopener noreferrer"' : '';
             ?>
               <div class="meta" style="margin:.35rem 0 .5rem">
                 ↩ reply to
                 <?php if ($parentHandle !== ''): ?><span>@<?= h(ltrim($parentHandle, '@')) ?></span><?php endif; ?>
                 <span class="tag" style="margin-left:.25rem" title="Reply source"><?= h($parentSource) ?></span>
-                <a href="<?= h(admin_status_href($replyParentUrl, $returnView)) ?>"><?= h($parentSnippet !== '' ? $parentSnippet : 'parent post') ?></a>
+                <a href="<?= h($parentHref) ?>"<?= $parentTarget ?>><?= h($parentSnippet !== '' ? $parentSnippet : 'parent post') ?></a>
               </div>
             <?php endif; ?>
             <?php
