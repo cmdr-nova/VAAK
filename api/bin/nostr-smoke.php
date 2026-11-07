@@ -351,6 +351,36 @@ $check(str_contains($packHtml, 'one.example') && !str_contains($packHtml, '_@'),
 $check(str_contains(ap_nostr_pack_html(['ok' => true, 'linked' => false, 'pack' => [], 'members' => []], 'x'), 'Link your npub'), 'unlinked users are told to link an npub');
 $check(str_contains(ap_nostr_pack_html(['ok' => false, 'error' => 'No relay answered.'], 'x'), 'No relay answered.'), 'worker errors are shown');
 
+// Replies to crossposted notes resolve to the local post (NIP-48 proxy).
+// ap_db_owner_actor_id_for_user_id is stubbed above: user N is https://vaak.test/users/uN.
+$pdb = new PDO('sqlite::memory:');
+$pdb->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+$pdb->exec('CREATE TABLE nostr_archive (id TEXT PRIMARY KEY, pubkey TEXT, tags TEXT)');
+$pdb->exec('CREATE TABLE nostr_events (id TEXT PRIMARY KEY, pubkey TEXT, tags TEXT)');
+$pdb->exec('CREATE TABLE nostr_links (owner_user_id INTEGER, pubkey TEXT)');
+$pdb->exec('CREATE TABLE masto_statuses (note_id TEXT)');
+$shanaKey = str_repeat('5a', 32);
+$malloryKey = str_repeat('6b', 32);
+$localNote = 'https://vaak.test/users/u7/notes/abc123';
+$pdb->prepare('INSERT INTO nostr_links VALUES (?, ?), (?, ?)')->execute([7, $shanaKey, 8, $malloryKey]);
+$pdb->prepare('INSERT INTO masto_statuses VALUES (?)')->execute([$localNote]);
+$noteHex = static fn (string $byte): string => str_repeat($byte, 32);
+$noteLink = static fn (string $hex): string => 'https://njump.me/' . ap_nostr_bech32_encode('note', hex2bin($hex));
+$proxy = json_encode([['t', 'jellyfish'], ['proxy', $localNote, 'activitypub']]);
+$ins = $pdb->prepare('INSERT INTO nostr_archive VALUES (?, ?, ?)');
+$ins->execute([$noteHex('01'), $shanaKey, $proxy]);
+$ins->execute([$noteHex('02'), $malloryKey, $proxy]);
+$ins->execute([$noteHex('03'), $shanaKey, json_encode([['t', 'x']])]);
+$pdb->prepare('INSERT INTO nostr_events VALUES (?, ?, ?)')->execute([$noteHex('04'), $shanaKey, $proxy]);
+$check(ap_nostr_note_hex_from_url($noteLink($noteHex('01'))) === $noteHex('01'), 'njump note link decodes to its hex id');
+$check(ap_nostr_note_hex_from_url('https://njump.me/' . ap_nostr_npub($shanaKey)) === '', 'an npub link is not a note');
+$check(ap_nostr_note_hex_from_url('https://example.com/note1abc') === '', 'only njump links decode');
+$check(ap_nostr_proxied_local_note($noteLink($noteHex('01')), $pdb) === $localNote, 'own crosspost maps to the local post');
+$check(ap_nostr_proxied_local_note($noteLink($noteHex('02')), $pdb) === '', 'a proxy tag naming someone else\'s post is ignored');
+$check(ap_nostr_proxied_local_note($noteLink($noteHex('03')), $pdb) === '', 'a note with no proxy tag stays on Nostr');
+$check(ap_nostr_proxied_local_note($noteLink($noteHex('04')), $pdb) === $localNote, 'nostr_events copies map too');
+$check(ap_nostr_proxied_local_note($noteLink($noteHex('09')), $pdb) === '', 'an unknown note stays on Nostr');
+
 if ($failures !== []) {
     fwrite(STDERR, "nostr-smoke: " . count($failures) . " of {$checks} checks failed\n - " . implode("\n - ", $failures) . "\n");
     exit(1);

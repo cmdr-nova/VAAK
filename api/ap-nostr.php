@@ -790,6 +790,94 @@ function ap_nostr_post_note(int $ownerUserId, string $noteId, ?PDO $db = null): 
 }
 
 /**
+ * The hex id of a Nostr note from its njump link (https://njump.me/note1…,
+ * how nostr-sync stores Nostr notes and their parents), or ''.
+ */
+function ap_nostr_note_hex_from_url(string $url): string
+{
+    if (!preg_match('#^https://njump\.me/(note1[02-9ac-hj-np-z]{6,})/?$#i', trim($url), $m)) {
+        return '';
+    }
+    $dec = ap_nostr_bech32_decode($m[1]);
+    if (!is_array($dec) || $dec[0] !== 'note' || strlen($dec[1]) !== 32) {
+        return '';
+    }
+    return bin2hex($dec[1]);
+}
+
+/**
+ * The local post a Nostr note is a crosspost of, or ''.
+ *
+ * Crossposts (composer checkbox, Shana's scripts) carry a NIP-48
+ * `["proxy", <local note URL>, "activitypub"]` tag (ap_nostr_post_note).
+ * A Nostr reply to one names only the Nostr note, so without this the
+ * thread shows "reply to parent post" with nothing above it. The note is
+ * looked up in the backup archive (linked users' own events) and in
+ * nostr_events; the proxy is only believed when the note's key is linked to
+ * the account that owns that local post, so a stranger can't tag their note
+ * as someone else's post.
+ */
+function ap_nostr_proxied_local_note(string $url, ?PDO $db = null): string
+{
+    static $cache = [];
+    $hex = ap_nostr_note_hex_from_url($url);
+    if ($hex === '') {
+        return '';
+    }
+    if (array_key_exists($hex, $cache)) {
+        return $cache[$hex];
+    }
+    $found = '';
+    try {
+        $db ??= ap_db();
+        foreach (['nostr_archive', 'nostr_events'] as $table) {
+            try {
+                $st = $db->prepare("SELECT pubkey, tags FROM {$table} WHERE id = ? LIMIT 1");
+                $st->execute([$hex]);
+                $row = $st->fetch(PDO::FETCH_ASSOC);
+            } catch (Throwable $e) {
+                $row = false;
+            }
+            if (!is_array($row)) {
+                continue;
+            }
+            $tags = is_array($row['tags']) ? $row['tags'] : json_decode((string) $row['tags'], true);
+            $proxy = '';
+            foreach (is_array($tags) ? $tags : [] as $tag) {
+                if (is_array($tag) && ($tag[0] ?? '') === 'proxy' && ($tag[2] ?? '') === 'activitypub'
+                    && is_string($tag[1] ?? null) && str_starts_with($tag[1], 'https://')) {
+                    $proxy = rtrim($tag[1], '/');
+                    break;
+                }
+            }
+            if ($proxy === '') {
+                break;
+            }
+            $owners = $db->prepare('SELECT owner_user_id FROM nostr_links WHERE pubkey = ?');
+            $owners->execute([(string) $row['pubkey']]);
+            foreach ($owners->fetchAll(PDO::FETCH_COLUMN) as $ownerId) {
+                $actor = function_exists('ap_db_owner_actor_id_for_user_id')
+                    ? rtrim(ap_db_owner_actor_id_for_user_id((int) $ownerId), '/')
+                    : '';
+                if ($actor === '' || !str_starts_with($proxy, $actor . '/notes/')) {
+                    continue;
+                }
+                $local = $db->prepare('SELECT 1 FROM masto_statuses WHERE note_id = ? LIMIT 1');
+                $local->execute([$proxy]);
+                if ($local->fetchColumn()) {
+                    $found = $proxy;
+                }
+                break;
+            }
+            break;
+        }
+    } catch (Throwable $e) {
+        $found = '';
+    }
+    return $cache[$hex] = $found;
+}
+
+/**
  * POST to the worker's shadow API on loopback.
  *
  * @return array{status:int, body:array<string,mixed>}
