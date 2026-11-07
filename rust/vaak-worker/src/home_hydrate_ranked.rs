@@ -1477,7 +1477,8 @@ fn bsky_quote_status_from_embed(embed_json: &str) -> Option<Value> {
     if uri.contains("/app.bsky.graph.list/") || uri.contains("/app.bsky.graph.starterpack/") {
         return None;
     }
-    let unavailable = vtype.contains("notfound") || vtype.contains("blocked") || vtype.contains("detached");
+    let unavailable = vtype.contains("notfound") || vtype.contains("blocked") || vtype.contains("detached")
+        || quoted_view_is_hollow(record);
     if !unavailable && !uri.starts_with("at://") {
         return None;
     }
@@ -1535,13 +1536,18 @@ fn bsky_quote_status_from_embed(embed_json: &str) -> Option<Value> {
     } else {
         "https://bsky.app/".into()
     };
-    let acct = if !handle.is_empty() {
+    // A blocked or missing quote has no author to show. The DID as a
+    // display name and handle reads like a broken profile.
+    let acct = if unavailable {
+        String::new()
+    } else if !handle.is_empty() {
         handle.to_string()
     } else if !did.is_empty() {
         did.to_string()
     } else {
         "quoted".into()
     };
+    let avatar = if unavailable { "" } else { avatar };
     let account_id = if !did.is_empty() { did } else { profile.as_str() };
     let account = empty_account(account_id, &acct, &acct, &display, &profile, avatar);
     let https = if uri.starts_with("at://") {
@@ -3009,12 +3015,36 @@ fn quoted_embed_record_mut(embed: &mut Value) -> Option<&mut Value> {
     Some(record)
 }
 
+/// A quote that older PHP compact caches rebuilt from viewBlocked /
+/// viewNotFound / viewDetached: a viewRecord with no text, no timestamp and
+/// no media. A real quoted post always has `value.createdAt`. Mirrors PHP
+/// ap_bsky_quote_view_is_hollow.
+fn quoted_view_is_hollow(record: &Value) -> bool {
+    let vtype = record.get("$type").and_then(Value::as_str).unwrap_or("").to_ascii_lowercase();
+    if !vtype.is_empty() && !vtype.contains("viewrecord") {
+        return false;
+    }
+    let field = |v: Option<&Value>| v.and_then(Value::as_str).unwrap_or("").trim().is_empty();
+    let value = record.get("value");
+    let empty_embeds = record.get("embeds").and_then(Value::as_array).is_none_or(Vec::is_empty);
+    let no_value_embed = value.and_then(|v| v.get("embed")).is_none_or(Value::is_null);
+    field(value.and_then(|v| v.get("text")))
+        && field(value.and_then(|v| v.get("createdAt")))
+        && field(record.get("text"))
+        && field(record.get("createdAt"))
+        && field(record.get("indexedAt"))
+        && empty_embeds
+        && no_value_embed
+        && record.get("uri").and_then(Value::as_str).unwrap_or("").trim().starts_with("at://")
+}
+
 /// DID of a quoted post's author: the embed author, else the at:// URI.
 fn quoted_record_did(record: &Value) -> Option<String> {
     let vtype = record.get("$type").and_then(Value::as_str).unwrap_or("").to_ascii_lowercase();
     if vtype.contains("notfound") || vtype.contains("blocked") || vtype.contains("detached")
         || vtype.contains("generatorview") || vtype.contains("listview")
-        || vtype.contains("starterpack") || vtype.contains("labelerview") {
+        || vtype.contains("starterpack") || vtype.contains("labelerview")
+        || quoted_view_is_hollow(record) {
         return None;
     }
     let did = record.get("author").and_then(|a| a.get("did")).and_then(Value::as_str).unwrap_or("").trim();
@@ -7041,6 +7071,33 @@ mod settings_regression_tests {
         let mut unlinked = json!({"account":{"url":"https://bsky.app/profile/other.test","acct":"alice.bsky.test"}});
         refresh_account_tree(&mut unlinked, &profiles, &aliases, 0);
         assert!(unlinked["account"].get("avatar").is_none());
+    }
+    #[test]
+    fn blocked_bluesky_quote_never_paints_the_did_as_its_author() {
+        let did = "did:plc:d363uy4ngyyc7ofy4jtvgsgb";
+        let uri = "at://did:plc:d363uy4ngyyc7ofy4jtvgsgb/app.bsky.feed.post/3mznm6hj6pk2c";
+        let known = HashMap::from([(did.to_string(), BskyAuthorCard { handle: "tachi.bsky.social".into(),
+            display: "tachi".into(), avatar: "https://cdn.bsky.app/img/avatar/plain/x@jpeg".into(), from_profile: true })]);
+        // Live AppView shape (thin-media warm stores it as is).
+        let live = json!({"$type":"app.bsky.embed.record#view","record":{"$type":"app.bsky.embed.record#viewBlocked",
+            "uri":uri,"blocked":true,"author":{"did":did}}});
+        // What older PHP compact caches stored for the same view.
+        let hollow = json!({"$type":"app.bsky.embed.record#view","record":{"$type":"app.bsky.embed.record#viewRecord",
+            "uri":uri,"cid":"","author":{"did":did,"handle":"","displayName":"","avatar":""},
+            "value":{"$type":"app.bsky.feed.post","text":"","createdAt":""}}});
+        for (embed, text) in [(live, "Quoted post is blocked"), (hollow, "Quoted post unavailable")] {
+            assert!(quoted_embed_author_did(&embed.to_string()).is_none());
+            assert!(fill_quoted_embed_author(&embed.to_string(), &known).is_none());
+            let quoted = bsky_quote_status_from_embed(&embed.to_string()).expect("quote");
+            assert_eq!(quoted["account"]["acct"], "");
+            assert_eq!(quoted["account"]["display_name"], "Unavailable");
+            assert!(quoted["content"].as_str().unwrap().contains(text));
+            assert!(!quoted.to_string().contains("\"acct\":\"did:"));
+        }
+        // A real quote with text but no timestamp is not hollow.
+        let real = json!({"$type":"app.bsky.embed.record#view","record":{"$type":"app.bsky.embed.record#viewRecord",
+            "uri":uri,"author":{"did":did},"value":{"$type":"app.bsky.feed.post","text":"hi"}}});
+        assert_eq!(quoted_embed_author_did(&real.to_string()).as_deref(), Some(did));
     }
     #[test]
     fn quoted_bluesky_author_uses_best_known_profile() {

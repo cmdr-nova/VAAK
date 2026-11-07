@@ -69,7 +69,7 @@ function ap_remote_actor_get(string $actorId): ?array
         : null;
 }
 
-reference_load(dirname(__DIR__) . '/ap-bsky.php', ['ap_bsky_quote_author_best_known', 'ap_bsky_quote_preview']);
+reference_load(dirname(__DIR__) . '/ap-bsky.php', ['ap_bsky_quote_author_best_known', 'ap_bsky_quote_preview', 'ap_bsky_quote_view_is_hollow']);
 reference_load(dirname(__DIR__) . '/ap-admin.php', ['admin_bsky_cached_profile', 'admin_account_best_known', 'admin_avatar_is_placeholder', 'admin_account_actor_ref']);
 
 $uri = 'at://' . QA_DID . '/app.bsky.feed.post/3quoted';
@@ -122,5 +122,48 @@ qa_check(($fedi['avatar'] ?? '') === 'https://remote.example/media/bryn.png', 'f
 $kept = admin_account_best_known(['acct' => 'bryn@remote.example', 'display_name' => 'Custom', 'avatar' => 'https://remote.example/own.png',
     'uri' => 'https://remote.example/users/bryn']);
 qa_check($kept['display_name'] === 'Custom' && $kept['avatar'] === 'https://remote.example/own.png', 'real account fields are kept');
+
+// 5) Blocked / deleted quotes are not posts. AppView sends viewBlocked with
+// only the DID; older compact caches stored it as an empty viewRecord, which
+// painted the DID as name and handle with no text.
+$blockedUri = 'at://did:plc:d363uy4ngyyc7ofy4jtvgsgb/app.bsky.feed.post/3mznm6hj6pk2c';
+$warmed = [];
+function ap_bsky_post_preview_warm_enqueue(string $url, int $ownerUserId = 0): bool { $GLOBALS['warmed'][] = $url; return true; }
+$prev = ap_bsky_quote_preview(['uri' => 'at://did:plc:edith/app.bsky.feed.post/q', 'embed' => ['$type' => 'app.bsky.embed.record#view', 'record' => [
+    '$type' => 'app.bsky.embed.record#viewBlocked', 'uri' => $blockedUri, 'blocked' => true,
+    'author' => ['did' => 'did:plc:d363uy4ngyyc7ofy4jtvgsgb'],
+]]]);
+qa_check(($prev['display'] ?? '') === 'Unavailable' && ($prev['text'] ?? '') === 'Quoted post is blocked', 'live blocked quote reads as blocked');
+qa_check($warmed === [], 'live blocked quote queues nothing');
+foreach (['did:plc:d363uy4ngyyc7ofy4jtvgsgb', ''] as $hollowDid) {
+    $prev = ap_bsky_quote_preview(['uri' => 'at://did:plc:edith/app.bsky.feed.post/q', 'embed' => ['$type' => 'app.bsky.embed.record#view', 'record' => [
+        '$type' => 'app.bsky.embed.record#viewRecord', 'uri' => $blockedUri, 'cid' => '',
+        'author' => ['did' => $hollowDid, 'handle' => '', 'displayName' => '', 'avatar' => ''],
+        'value' => ['$type' => 'app.bsky.feed.post', 'text' => '', 'createdAt' => ''],
+    ]]]);
+    qa_check(($prev['display'] ?? '') === 'Unavailable' && ($prev['handle'] ?? 'x') === '', 'hollow cached quote is not painted as a DID author');
+    qa_check(($prev['text'] ?? '') === 'Quoted post unavailable', 'hollow cached quote says unavailable');
+}
+qa_check(count($warmed) === 2 && $warmed[0] === 'at://did:plc:edith/app.bsky.feed.post/q', 'hollow quote queues an AppView warm of the quoting post');
+
+// 6) The compact cache keeps the gone state instead of inventing a post.
+reference_load(dirname(__DIR__) . '/ap-bsky.php', ['ap_bsky_post_embed_compact', 'ap_bsky_compact_label_list', 'ap_bsky_embed_video_view']);
+$compact = ap_bsky_post_embed_compact(['$type' => 'app.bsky.embed.record#view', 'record' => [
+    '$type' => 'app.bsky.embed.record#viewBlocked', 'uri' => $blockedUri, 'blocked' => true,
+    'author' => ['did' => 'did:plc:d363uy4ngyyc7ofy4jtvgsgb', 'viewer' => ['blockedBy' => false]],
+]]);
+qa_check(($compact['record']['$type'] ?? '') === 'app.bsky.embed.record#viewBlocked', 'compact keeps viewBlocked');
+qa_check(!isset($compact['record']['value']) && ($compact['record']['blocked'] ?? null) === true, 'compact invents no post body');
+$compact = ap_bsky_post_embed_compact(['$type' => 'app.bsky.embed.recordWithMedia#view', 'media' => ['$type' => 'app.bsky.embed.images#view', 'images' => []],
+    'record' => ['record' => ['$type' => 'app.bsky.embed.record#viewNotFound', 'uri' => $blockedUri, 'notFound' => true]]]);
+qa_check(($compact['record']['record']['$type'] ?? '') === 'app.bsky.embed.record#viewNotFound', 'compact keeps viewNotFound inside recordWithMedia');
+$prev = ap_bsky_quote_preview(['embed' => $compact]);
+qa_check(($prev['text'] ?? '') === 'Quoted post unavailable', 'compacted viewNotFound previews as unavailable');
+$compact = ap_bsky_post_embed_compact(['$type' => 'app.bsky.embed.record#view', 'record' => [
+    '$type' => 'app.bsky.embed.record#viewRecord', 'uri' => $uri,
+    'author' => ['did' => QA_DID, 'handle' => 'patigallardo.bsky.social'],
+    'value' => ['$type' => 'app.bsky.feed.post', 'text' => 'Well. Shit.', 'createdAt' => '2026-11-07T00:00:00Z'],
+]]);
+qa_check(($compact['record']['value']['text'] ?? '') === 'Well. Shit.', 'real quotes still compact to a viewRecord');
 
 echo "quote-author-best-known-smoke ok checks=$checks\n";
