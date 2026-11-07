@@ -8132,13 +8132,17 @@ function ap_local_object_is_private(string $objectId): bool
     } catch (Throwable) {
         // Older installations may not have the DM table yet.
     }
+    // events also holds likes and boosts OF the object (a Mastodon Like has no
+    // audience, so its row says "private"); only the object's own Create or
+    // Update row tells its visibility. Without the type filter the first like
+    // of a public post made every later like look like one of a private post.
     foreach ([
-        ['outbox_notes', 'id'],
-        ['masto_statuses', 'note_id'],
-        ['events', 'object_id'],
-    ] as [$table, $column]) {
+        ['outbox_notes', 'id', ''],
+        ['masto_statuses', 'note_id', ''],
+        ['events', 'object_id', " AND type IN ('Create', 'Update')"],
+    ] as [$table, $column, $only]) {
         try {
-            $st = $db->prepare("SELECT visibility FROM {$table} WHERE ({$column} = ? OR {$column} = ?) LIMIT 1");
+            $st = $db->prepare("SELECT visibility FROM {$table} WHERE ({$column} = ? OR {$column} = ?){$only} LIMIT 1");
             $st->execute($ids);
             $visibility = $st->fetchColumn();
             if ($visibility !== false && ap_normalize_visibility($visibility) !== 'public') {

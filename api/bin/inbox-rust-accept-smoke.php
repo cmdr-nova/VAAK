@@ -209,6 +209,67 @@ foreach ($deletes as $label => $doc) {
 $shadow = $redis->hGetAll('vaak:inbox_route_shadow:stats:v1');
 $check((int) ($shadow['agree'] ?? 0) === 3 && !isset($shadow['disagree']), 'F3: the drain counts three agreements');
 $likeShadow = (int) $db->query("SELECT count(*) FROM ap_inbox_route_shadow r JOIN ap_inbox_spool s ON s.id = r.spool_id WHERE s.activity_type <> 'Delete'")->fetchColumn();
-$check($likeShadow === 0, 'F3: only Deletes get a prediction');
+$check($likeShadow === 0, 'F3: likes of remote posts get no prediction');
+
+// Cutover F5 shadow: likes and boosts of local notes. Rust predicts the
+// result and the notification row; PHP still writes it; the drain agrees.
+$db->exec("INSERT INTO ap_users (username, email, password_hash, actor_key, actor_id, is_admin, created_at, updated_at)
+           VALUES ('f5_owner', 'f5@vaak.test', 'unused', 'f5_owner', 'https://mkultra.monster/users/f5_owner', 0,
+                   '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')");
+$f5 = (int) $db->query("SELECT id FROM ap_users WHERE username = 'f5_owner'")->fetchColumn();
+$cmdrNote = 'https://mkultra.monster/users/cmdr_nova/notes/f5a';
+$f5Note = 'https://mkultra.monster/users/f5_owner/notes/f5b';
+$f5Private = 'https://mkultra.monster/users/f5_owner/notes/f5c';
+$db->prepare("INSERT INTO outbox_notes (id, create_id, published, content, raw_create_json, visibility) VALUES (?, ?, ?, '', '{}', 'private')")
+    ->execute([$f5Private, $f5Private . '/activity', gmdate('c')]);
+$stable = static fn (string $target, string $kind): string => ap_mention_interaction_object_id($target, $alice, $kind);
+$public = ['https://www.w3.org/ns/activitystreams#Public'];
+$f5Cases = [
+    // [label, inbox path, activity, predicted result]
+    ['shared-inbox like of a cmdr_nova note', '/inbox',
+        ['id' => $alice . '#likes/f5-1', 'type' => 'Like', 'actor' => $alice, 'object' => $cmdrNote],
+        'local_observe 1 ' . $stable($cmdrNote, 'like')],
+    ['personal-inbox like', '/users/f5_owner/inbox',
+        ['id' => $alice . '#likes/f5-2', 'type' => 'Like', 'actor' => $alice, 'object' => $f5Note],
+        "local_observe {$f5} " . $stable($f5Note, 'like')],
+    ['emoji reaction after a like of the same note (once read as private)', '/users/f5_owner/inbox',
+        ['id' => $alice . '#react/f5-3', 'type' => 'EmojiReact', 'actor' => $alice, 'object' => $f5Note, 'content' => ':blobcat:'],
+        "local_observe {$f5} " . $stable($f5Note, 'like')],
+    ['public boost addressed to its author', '/inbox',
+        ['id' => $alice . '#boost/f5-4', 'type' => 'Announce', 'actor' => $alice, 'object' => $f5Note,
+            'to' => $public, 'cc' => [$alice . '/followers', 'https://mkultra.monster/users/f5_owner']],
+        "local_observe {$f5} " . $stable($f5Note, 'reblog')],
+    ['shared-inbox like of another account\'s note', '/inbox',
+        ['id' => $alice . '#likes/f5-5', 'type' => 'Like', 'actor' => $alice, 'object' => $f5Note . '/'],
+        'local_observe'],
+    ['like of a private note', '/users/f5_owner/inbox',
+        ['id' => $alice . '#likes/f5-6', 'type' => 'Like', 'actor' => $alice, 'object' => $f5Private],
+        'local_private_interaction_skipped'],
+];
+$redis->del('vaak:inbox_route_shadow:stats:v1');
+foreach ($f5Cases as [$label, $path, $doc, $want]) {
+    $body = json_encode($doc, JSON_UNESCAPED_SLASHES);
+    [$status] = smoke_post($rust, $path, $body, $aliceKey, $priv);
+    $check($status === 202, "F5: {$label} is spooled (got {$status})");
+    $predicted = $db->query("SELECT r.rust_result FROM ap_inbox_spool s JOIN ap_inbox_route_shadow r ON r.spool_id = s.id
+                             WHERE s.body = " . $db->quote($body))->fetchColumn();
+    $check($predicted === $want, "F5: Rust predicts the {$label} (got " . var_export($predicted, true) . ')');
+}
+// A wrong prediction must be caught: this one names a row PHP never writes.
+$wrong = json_encode(['id' => $alice . '#likes/f5-7', 'type' => 'Like', 'actor' => $alice, 'object' => $cmdrNote . '7'], JSON_UNESCAPED_SLASHES);
+[$status] = smoke_post($rust, '/inbox', $wrong, $aliceKey, $priv);
+$db->exec("UPDATE ap_inbox_route_shadow SET rust_result = 'local_observe 1 https://mkultra.monster/users/cmdr_nova/notes/none#like-000000000000'
+           WHERE spool_id = (SELECT id FROM ap_inbox_spool WHERE body = " . $db->quote($wrong) . ")");
+shell_exec('VAAK_FPM_POOL_CONF=/nonexistent ' . $cmd);
+foreach ($f5Cases as [$label, $path, $doc, $want]) {
+    $result = $db->query("SELECT result FROM ap_inbox_spool WHERE body = " . $db->quote(json_encode($doc, JSON_UNESCAPED_SLASHES)))->fetchColumn();
+    $check($result === explode(' ', $want)[0], "F5: PHP routes the {$label} the same (got " . var_export($result, true) . ')');
+}
+$shadow = $redis->hGetAll('vaak:inbox_route_shadow:stats:v1');
+$check((int) ($shadow['agree'] ?? 0) === count($f5Cases) && !isset($shadow['skipped']),
+    'F5: the drain agrees on every result and notification row (' . json_encode($shadow) . ')');
+$check((int) ($shadow['agree:local_observe+mention'] ?? 0) === 4, 'F5: four of them are notifications');
+$check((int) ($shadow['disagree'] ?? 0) === 1 && (int) ($shadow['disagree:local_observe+mention'] ?? 0) === 1,
+    'F5: a prediction naming a missing notification row is a disagreement');
 
 echo "inbox-rust-accept: {$n} checks passed\n";

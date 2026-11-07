@@ -355,13 +355,13 @@ async fn fast_path(cfg: &crate::config::Config, uri: &Uri, headers: &HeaderMap, 
             _ => {}
         }
     }
-    // Cutover F3 shadow: what Rust expects the drain's router to return.
+    // Cutover F3/F5 shadow: what Rust expects the drain's router to return.
     let predicted = if !mismatch && crate::inbox_route_shadow::enabled() {
-        crate::inbox_route_shadow::predict(&db, body).await
+        crate::inbox_route_shadow::predict(&db, body, uri.path()).await
     } else {
         None
     };
-    let id = match spool_insert(&db, &ip, &key_id, uri.path(), &sig_path, &kind, body, predicted).await {
+    let id = match spool_insert(&db, &ip, &key_id, uri.path(), &sig_path, &kind, body, predicted.as_deref()).await {
         Ok(id) => id,
         Err(e) => {
             tracing::warn!(error = %e, "inbox spool insert failed; forwarding to PHP");
