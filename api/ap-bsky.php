@@ -4724,6 +4724,23 @@ function ap_bsky_post_embed_compact(?array $embed): ?array
             && (isset($rec['record']['author']) || isset($rec['record']['value']))) {
             $rec = $rec['record'];
         }
+        // viewBlocked / viewNotFound / viewDetached carry no post. Rebuilding
+        // them as a viewRecord left a hollow quote (DID as the name, no text)
+        // that every painter drew as a real post. Keep the state instead.
+        $recType = (string) ($rec['$type'] ?? '');
+        if (str_contains($recType, 'Blocked') || str_contains($recType, 'NotFound') || str_contains($recType, 'Detached')) {
+            $gone = ['$type' => $recType, 'uri' => (string) ($rec['uri'] ?? '')];
+            foreach (['blocked', 'notFound', 'detached'] as $flag) {
+                if (isset($rec[$flag])) {
+                    $gone[$flag] = (bool) $rec[$flag];
+                }
+            }
+            $goneDid = (string) ($rec['author']['did'] ?? '');
+            if ($goneDid !== '') {
+                $gone['author'] = ['did' => $goneDid];
+            }
+            return $gone;
+        }
         $author = is_array($rec['author'] ?? null) ? $rec['author'] : [];
         $value = is_array($rec['value'] ?? null)
             ? $rec['value']
@@ -8762,6 +8779,29 @@ function ap_bsky_quote_author_best_known(array $author, string $quotedUri = ''):
 }
 
 /**
+ * A stored quote that older compact caches rebuilt from viewBlocked /
+ * viewNotFound / viewDetached: a viewRecord with no text, no timestamp and no
+ * media. A real quoted post always has value.createdAt.
+ *
+ * @param array<string,mixed> $viewRecord
+ */
+function ap_bsky_quote_view_is_hollow(array $viewRecord): bool
+{
+    $vType = (string) ($viewRecord['$type'] ?? '');
+    if ($vType !== '' && !str_contains($vType, 'viewRecord')) {
+        return false;
+    }
+    $value = is_array($viewRecord['value'] ?? null) ? $viewRecord['value'] : [];
+    foreach ([$value['text'] ?? '', $value['createdAt'] ?? '', $viewRecord['text'] ?? '', $viewRecord['createdAt'] ?? '', $viewRecord['indexedAt'] ?? ''] as $field) {
+        if (trim((string) $field) !== '') {
+            return false;
+        }
+    }
+    return empty($viewRecord['embeds']) && empty($value['embed'])
+        && str_starts_with(trim((string) ($viewRecord['uri'] ?? '')), 'at://');
+}
+
+/**
  * @return array{uri:?string,handle:string,display:string,text:string,url:string,media?:list<array{url:string,mediaType:?string,preview_url?:string}>}|null
  */
 function ap_bsky_quote_preview(array $post): ?array
@@ -8787,9 +8827,20 @@ function ap_bsky_quote_preview(array $post): ?array
         return null;
     }
     $vType = (string) ($viewRecord['$type'] ?? '');
-    if ($vType !== '' && (str_contains($vType, 'NotFound') || str_contains($vType, 'Blocked') || str_contains($vType, 'Detached'))) {
+    $hollow = ap_bsky_quote_view_is_hollow($viewRecord);
+    if ($hollow || ($vType !== '' && (str_contains($vType, 'NotFound') || str_contains($vType, 'Blocked') || str_contains($vType, 'Detached')))) {
         $goneUri = isset($viewRecord['uri']) ? trim((string) $viewRecord['uri']) : '';
-        if ($goneUri !== '' && (str_contains($vType, 'NotFound') || str_contains($vType, 'Detached'))) {
+        // A hollow cached quote may hide a live post (or a block). Queue the
+        // AppView view of the quoting post; the next paint shows the truth.
+        $outerUri = trim((string) ($post['uri'] ?? ''));
+        if ($hollow && str_starts_with($outerUri, 'at://') && function_exists('ap_bsky_post_preview_warm_enqueue')) {
+            try {
+                ap_bsky_post_preview_warm_enqueue($outerUri, (int) ($GLOBALS['vaak_owner_id'] ?? 0));
+            } catch (Throwable $e) {
+                // best-effort
+            }
+        }
+        if (!$hollow && $goneUri !== '' && (str_contains($vType, 'NotFound') || str_contains($vType, 'Detached'))) {
             ap_bsky_tombstone_uri($goneUri, null);
         }
         return [

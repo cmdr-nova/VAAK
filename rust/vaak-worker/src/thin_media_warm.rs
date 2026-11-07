@@ -84,7 +84,10 @@ pub async fn enqueue_thin_scan(cfg: &Config, owner: i64, limit: usize) -> Result
                )
                -- PHP built these URLs from Jetstream blob refs; AppView still
                -- owes the moderation labels and the quoted post.
-               OR embed_json LIKE '%\"vaak_synth\":true%')
+               OR embed_json LIKE '%\"vaak_synth\":true%'
+               -- Older PHP compact caches rebuilt blocked / deleted quotes as
+               -- an empty viewRecord. AppView gives the real state (or post).
+               OR embed_json LIKE '%\"text\":\"\",\"createdAt\":\"\"%')
              ORDER BY indexed_at DESC NULLS LAST
              LIMIT $1",
             &[&limit],

@@ -13,7 +13,7 @@ reference_load(dirname(__DIR__) . '/ap-bsky.php', [
     'ap_bsky_post_video_media', 'ap_bsky_embed_video_view',
     'ap_bsky_external_link_card_html',
     'ap_bsky_reply_parent_preview','ap_bsky_reply_parent_preview_enrich',
-    'ap_bsky_quote_preview','ap_bsky_quote_author_best_known','ap_bsky_media_items_from_embeds',
+    'ap_bsky_quote_preview','ap_bsky_quote_view_is_hollow','ap_bsky_quote_author_best_known','ap_bsky_media_items_from_embeds',
 ]);
 reference_load(dirname(__DIR__) . '/ap-db.php', ['ap_masto_status_is_pinned']);
 ap_db()->exec('CREATE TABLE masto_pins(owner_user_id INTEGER,status_local_id INTEGER)');

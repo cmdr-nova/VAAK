@@ -231,7 +231,7 @@ if(!function_exists('ap_bsky_resolve_handle_did')){
   return null;
  }
 }
-reference_load(dirname(__DIR__).'/ap-bsky.php',['ap_bsky_quote_preview','ap_bsky_quote_author_best_known','ap_bsky_tombstone_uri','ap_bsky_media_items_from_embeds']);
+reference_load(dirname(__DIR__).'/ap-bsky.php',['ap_bsky_quote_preview','ap_bsky_quote_view_is_hollow','ap_bsky_quote_author_best_known','ap_bsky_tombstone_uri','ap_bsky_media_items_from_embeds']);
 $old=gmdate('c',time()-10000);
 $quoted=thread_post('quotedtarget','Quoted body text');
 $quoted['uri']='at://did:plc:quoted/app.bsky.feed.post/quotedtarget';
