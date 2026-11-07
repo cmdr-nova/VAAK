@@ -91,6 +91,67 @@ function inbox_drain_route_shadow_note(int $id, string $rust, string $php): void
     }
 }
 
+/**
+ * Cutover F5 shadow: a like or boost of a local note. Rust predicted
+ * "local_observe", "local_observe {owner} {object_id}" (a notification row)
+ * or "local_private_interaction_skipped". Agree needs the same result and,
+ * for a notification, that live mentions row; with no notification
+ * predicted, no live row may carry this activity's id. Other PHP outcomes
+ * count as skipped.
+ */
+function inbox_drain_interaction_shadow_note(PDO $db, int $id, string $rust, string $php, string $body): void
+{
+    $parts = explode(' ', $rust, 3);
+    $rustResult = $parts[0];
+    $owner = isset($parts[2]) ? (int) $parts[1] : 0;
+    $mentionId = $parts[2] ?? '';
+    $label = $rustResult . ($mentionId !== '' ? '+mention' : '');
+    $field = 'skipped';
+    if (in_array($php, ['local_observe', 'local_private_interaction_skipped', 'log'], true)) {
+        $field = $php === $rustResult ? 'agree' : 'disagree';
+        $why = $field === 'disagree' ? 'result' : '';
+        if ($field === 'agree' && $php === 'local_observe') {
+            try {
+                if ($mentionId !== '') {
+                    $st = $db->prepare('SELECT 1 FROM mentions WHERE owner_user_id = ? AND object_id = ? AND deleted_at IS NULL LIMIT 1');
+                    $st->execute([$owner, $mentionId]);
+                    if ($st->fetchColumn() === false) {
+                        $field = 'disagree';
+                        $why = 'mention_missing';
+                    }
+                } else {
+                    $doc = json_decode($body, true);
+                    $activityId = is_array($doc) ? ap_as_id($doc['id'] ?? null) : null;
+                    if (is_string($activityId) && $activityId !== '') {
+                        $st = $db->prepare('SELECT 1 FROM mentions WHERE activity_id = ? AND deleted_at IS NULL LIMIT 1');
+                        $st->execute([$activityId]);
+                        if ($st->fetchColumn() !== false) {
+                            $field = 'disagree';
+                            $why = 'mention_unexpected';
+                        }
+                    }
+                }
+            } catch (Throwable $e) {
+                $field = 'skipped';
+            }
+        }
+        if ($field === 'disagree') {
+            ap_log(sprintf('route_shadow_disagree id=%d rust=%s php=%s why=%s', $id, $label, $php, $why));
+        }
+    }
+    $redis = function_exists('ap_redis_client') ? ap_redis_client() : null;
+    if (!$redis) {
+        return;
+    }
+    try {
+        $redis->hIncrBy('vaak:inbox_route_shadow:stats:v1', $field, 1);
+        $redis->hIncrBy('vaak:inbox_route_shadow:stats:v1', $field . ':' . $label, 1);
+        $redis->expire('vaak:inbox_route_shadow:stats:v1', 14 * 86400);
+    } catch (Throwable $e) {
+        // Shadow stats only.
+    }
+}
+
 $poolConf = getenv('VAAK_FPM_POOL_CONF') ?: '/etc/php/8.3/fpm/pool.d/www.conf';
 inbox_drain_load_pool_env($poolConf);
 
@@ -168,10 +229,16 @@ while (time() < $deadline) {
         $out = ap_inbox_spool_process($row);
         $finish->execute([$out['state'], $out['result'], $id]);
         $done++;
-        if (in_array(strtolower((string) $row['activity_type']), ['delete', 'tombstone'], true)) {
+        $shadowType = strtolower((string) $row['activity_type']);
+        if (in_array($shadowType, ['delete', 'tombstone'], true)) {
             $rust = inbox_drain_route_shadow_result($db, $id);
             if ($rust !== null) {
                 inbox_drain_route_shadow_note($id, $rust, (string) $out['result']);
+            }
+        } elseif (in_array($shadowType, ['like', 'emojireact', 'announce'], true)) {
+            $rust = inbox_drain_route_shadow_result($db, $id);
+            if ($rust !== null) {
+                inbox_drain_interaction_shadow_note($db, $id, $rust, (string) $out['result'], (string) $row['body']);
             }
         }
     } catch (Throwable $e) {
