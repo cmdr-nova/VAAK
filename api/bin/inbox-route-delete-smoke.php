@@ -133,16 +133,23 @@ $check(rd_post($rust, $body, $zedKey, $priv) === 202, 'mention case: answered 20
 $row = $spoolRow($body);
 $check(($row['state'] ?? '') === 'pending', 'mention case: left to the PHP drain');
 
-// An actor block that names the host (seeded before the first request): PHP
-// resolves block aliases, so Rust spools it pending even for another account there.
+// An actor block (seeded before the first request): the blocked account
+// itself, in either URL form, goes to PHP; another account on that host is
+// routed by Rust.
 $amy = 'https://blockhost.test/users/amy';
 ap_inbox_rust_key_mirror($amy . '#main-key', $pem);
 $body = json_encode(['id' => $amy . '#delete/1', 'type' => 'Delete', 'actor' => $amy, 'object' => $amy . '/statuses/1'], JSON_UNESCAPED_SLASHES);
-$check(rd_post($rust, $body, $amy . '#main-key', $priv) === 202, 'actor-block host: answered 202');
-$check(($spoolRow($body)['state'] ?? '') === 'pending', 'actor-block host: left to the PHP drain');
+$check(rd_post($rust, $body, $amy . '#main-key', $priv) === 202, 'other account on a blocked actor\'s host: answered 202');
+$check(($spoolRow($body)['state'] ?? '') === 'done', 'other account on a blocked actor\'s host: routed by Rust');
+foreach (['https://blockhost.test/users/troll', 'https://blockhost.test/@troll'] as $i => $troll) {
+    ap_inbox_rust_key_mirror($troll . '#main-key', $pem);
+    $body = json_encode(['id' => $troll . '#delete/' . $i, 'type' => 'Delete', 'actor' => $troll, 'object' => $troll . '/statuses/' . $i], JSON_UNESCAPED_SLASHES);
+    $check(rd_post($rust, $body, $troll . '#main-key', $priv) === 202, "blocked actor {$troll}: answered 202");
+    $check(($spoolRow($body)['state'] ?? '') === 'pending', "blocked actor {$troll}: left to the PHP drain");
+}
 
 $stats = $redis->hGetAll('vaak:inbox_rust:stats:v1');
-$check((int) ($stats['routed_local_status_delete'] ?? 0) === 1 && (int) ($stats['routed_delete_noop'] ?? 0) === 1, 'stats count what Rust routed');
-$check((int) ($stats['route_defer_mention'] ?? 0) === 1 && (int) ($stats['route_defer_actor_block'] ?? 0) === 1, 'stats count each deferral');
+$check((int) ($stats['routed_local_status_delete'] ?? 0) === 1 && (int) ($stats['routed_delete_noop'] ?? 0) === 2, 'stats count what Rust routed');
+$check((int) ($stats['route_defer_mention'] ?? 0) === 1 && (int) ($stats['route_defer_actor_block'] ?? 0) === 2, 'stats count each deferral');
 
 echo "inbox-route-delete: {$n} checks passed\n";

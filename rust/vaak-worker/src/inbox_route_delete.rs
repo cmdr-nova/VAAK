@@ -66,10 +66,62 @@ pub(crate) fn is_bridgy_host(host: &str) -> bool {
     host == "brid.gy" || host.ends_with(".brid.gy")
 }
 
-/// True when some actor block's value mentions `host` (a URL or handle on
-/// it). Over-matches on purpose: those rows go to PHP's alias check.
-pub(crate) fn actor_block_names_host(values: &[String], host: &str) -> bool {
-    !host.is_empty() && values.iter().any(|v| v.contains(host))
+/// `ap_is_blocked_actor`'s actor-block half, without its Bluesky lookups:
+/// true when `actor` may be blocked, so the row goes to PHP.
+///
+/// `values` are the lowercased actor-block values. A plain ActivityPub
+/// actor URL (https, not bsky.app, no DID) matches when both sides agree
+/// after `canonical_actor` (host case, trailing slash, `/@name` vs
+/// `/users/name`, percent-encoding, and path case, which only over-matches).
+/// Any other value (a DID, a bsky.app profile, a handle, anything PHP
+/// resolves through its Bluesky caches) still defers every actor on a host it
+/// names. An actor whose own URL carries a DID always defers.
+pub(crate) fn actor_block_defers(values: &[String], actor: &str, actor_host: &str) -> bool {
+    if actor_host.is_empty() || actor.to_ascii_lowercase().contains("did:") {
+        return true;
+    }
+    let me = canonical_actor(actor);
+    values.iter().any(|v| match plain_actor_value(v) {
+        true => canonical_actor(v) == me,
+        false => v.contains(actor_host),
+    })
+}
+
+fn plain_actor_value(v: &str) -> bool {
+    v.starts_with("https://")
+        && !v.contains("did:")
+        && crate::inbox_accept::host_of(v).is_some_and(|h| h != "bsky.app" && !h.ends_with(".bsky.app"))
+}
+
+/// Lowercased, percent-decoded, no trailing slash, `/@name` as `/users/name`.
+fn canonical_actor(url: &str) -> String {
+    let lower = percent_decode(url.trim()).to_lowercase();
+    let lower = lower.trim_end_matches('/');
+    let Some(rest) = lower.strip_prefix("https://") else { return lower.to_string() };
+    let (host, path) = rest.split_once('/').unwrap_or((rest, ""));
+    let path = match path.strip_prefix('@') {
+        Some(name) if !name.is_empty() && !name.contains('/') => format!("users/{name}"),
+        _ => path.to_string(),
+    };
+    format!("https://{host}/{path}")
+}
+
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let (Some(h), Some(l)) = ((b[i + 1] as char).to_digit(16), (b[i + 2] as char).to_digit(16)) {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Actor-scope block values (lowercased), cached like the domain list.
@@ -272,7 +324,7 @@ pub(crate) async fn route(
         return Routed::Defer("schema");
     }
     match actor_block_values(db).await {
-        Ok(values) if !actor_block_names_host(&values, &actor_host) => {}
+        Ok(values) if !actor_block_defers(&values, &plan.actor, &actor_host) => {}
         Ok(_) => return Routed::Defer("actor_block"),
         Err(_) => return Routed::Defer("db"),
     }
@@ -522,10 +574,21 @@ mod tests {
     fn bridgy_and_blocked_hosts_go_to_php() {
         assert!(is_bridgy_host("bsky.brid.gy") && is_bridgy_host("brid.gy") && !is_bridgy_host("notbrid.gy"));
         let blocks = vec!["https://bad.test/users/x".to_string(), "@troll@other.test".to_string(), "did:plc:abc".to_string()];
-        assert!(actor_block_names_host(&blocks, "bad.test"));
-        assert!(actor_block_names_host(&blocks, "other.test"));
-        assert!(!actor_block_names_host(&blocks, "fine.test"));
-        assert!(!actor_block_names_host(&blocks, ""));
+        // A plain blocked actor URL only matches that actor, in PHP's forms.
+        assert!(actor_block_defers(&blocks, "https://bad.test/users/x", "bad.test"));
+        assert!(actor_block_defers(&blocks, "https://BAD.test/@x/", "bad.test"));
+        assert!(actor_block_defers(&blocks, "https://bad.test/users/%78", "bad.test"));
+        assert!(!actor_block_defers(&blocks, "https://bad.test/users/y", "bad.test"));
+        assert!(!actor_block_defers(&blocks, "https://bad.test/users/xy", "bad.test"));
+        // A handle names the host: every actor there still goes to PHP.
+        assert!(actor_block_defers(&blocks, "https://other.test/users/anyone", "other.test"));
+        assert!(!actor_block_defers(&blocks, "https://fine.test/users/a", "fine.test"));
+        // DIDs and bsky.app values: any actor carrying a DID defers.
+        assert!(actor_block_defers(&blocks, "https://some.bridge/ap/did:plc:abc", "some.bridge"));
+        let bsky = vec!["https://bsky.app/profile/someone.fine.test".to_string()];
+        assert!(actor_block_defers(&bsky, "https://fine.test/users/a", "fine.test"));
+        assert!(actor_block_defers(&[], "", ""));
+        assert!(!actor_block_defers(&[], "https://fine.test/users/a", "fine.test"));
     }
 
     #[test]

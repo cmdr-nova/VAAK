@@ -125,7 +125,7 @@ pub(crate) async fn route(
         return Routed::Defer("schema");
     }
     match crate::inbox_route_delete::actor_block_values(db).await {
-        Ok(values) if !crate::inbox_route_delete::actor_block_names_host(&values, &actor_host) => {}
+        Ok(values) if !crate::inbox_route_delete::actor_block_defers(&values, &plan.actor, &actor_host) => {}
         Ok(_) => return Routed::Defer("actor_block"),
         Err(_) => return Routed::Defer("db"),
     }
