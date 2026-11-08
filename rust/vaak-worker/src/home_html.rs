@@ -370,6 +370,9 @@ async fn tl_html_older(
         &page.kept,
     )
     .await?;
+    // Quotes are now filled in; apply the same quoted-post audience check
+    // the first page gets (timeline.rs) so a resolved target never leaks.
+    crate::audience::filter_statuses(&db, owner_user_id, crate::audience::Surface::timeline(view), &mut statuses).await?;
     if statuses.is_empty() {
         return Ok(None);
     }
