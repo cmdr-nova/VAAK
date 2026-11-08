@@ -373,6 +373,8 @@ function ap_site_publish_note(
     if (is_array($blogRow) && function_exists('ap_blog_set_note')) {
         ap_blog_set_note('cmdr_nova', $blogSlug, $noteId);
         ap_blog_mark_published('cmdr_nova', $blogSlug);
+        require_once __DIR__ . '/ap-blog.php';
+        ap_blog_refresh_html('cmdr_nova', $blogSlug);
     }
 
     // Ice Cubes / Mastodon API timelines read masto_statuses, not outbox alone.

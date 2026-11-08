@@ -2040,7 +2040,7 @@ function ap_cmdr_html(): void
             if (!empty($blogPost['tags'])) {
                 echo '<p class="muted">' . htmlspecialchars(implode(' ', array_map(static fn($tag): string => '#' . (string) $tag, (array) $blogPost['tags'])), ENT_QUOTES, 'UTF-8') . '</p>';
             }
-            echo '<div class="note-body">' . ap_cmdr_blog_markdown_html((string) ($blogPost['body_markdown'] ?? '')) . '</div>';
+            echo ap_blog_header_html($blogPost) . '<div class="note-body">' . ap_blog_body_html($blogPost, 'ap_cmdr_blog_markdown_html') . '</div>';
             echo '<p><a href="/users/cmdr_nova?tab=blog">← All blog posts</a> · <a href="/users/cmdr_nova?tab=blog&amp;post=' . htmlspecialchars(rawurlencode((string) $blogPost['slug']), ENT_QUOTES, 'UTF-8') . '&amp;format=jekyll">Download Jekyll Markdown</a></p>';
             echo '</article>';
         } elseif (!$blogRows) {

@@ -13,6 +13,7 @@ mod jetstream;
 mod account_switch;
 mod admin_health;
 mod admin_read;
+mod blog;
 mod settings_profile_save;
 mod admin_actions;
 mod settings_actions;

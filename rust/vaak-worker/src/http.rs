@@ -225,6 +225,8 @@ pub async fn serve(cfg: Config, bind: SocketAddr) -> Result<()> {
     if crate::admin_read::enabled(){app=app.route("/internal/admin/read",post(internal_admin_read).layer(axum::extract::DefaultBodyLimit::max(16*1024)).layer(axum::middleware::map_response(crate::profile_bridge::no_store)));}
     if crate::admin_read::enabled(){app=app.route("/internal/settings/profile-save",post(internal_settings_profile_save).layer(axum::extract::DefaultBodyLimit::max(64*1024)).layer(axum::middleware::map_response(crate::profile_bridge::no_store)));}
     if crate::admin_read::enabled(){app=app.route("/internal/admin/action",post(internal_admin_action).layer(axum::extract::DefaultBodyLimit::max(512*1024)).layer(axum::middleware::map_response(crate::profile_bridge::no_store)));}
+    if crate::admin_read::enabled(){app=app.route("/internal/blog/render",post(crate::blog::render_route).layer(axum::extract::DefaultBodyLimit::max(2*1024*1024)).layer(axum::middleware::map_response(crate::profile_bridge::no_store)));}
+    if crate::admin_read::enabled(){app=app.route("/internal/blog/editor",post(internal_blog_editor).layer(axum::extract::DefaultBodyLimit::max(2*1024*1024)).layer(axum::middleware::map_response(crate::profile_bridge::no_store)));}
     if crate::admin_read::enabled(){app=app.route("/internal/settings/action",post(internal_settings_action).layer(axum::extract::DefaultBodyLimit::max(64*1024)).layer(axum::middleware::map_response(crate::profile_bridge::no_store)));}
     // Rust cutover F2: inbox POSTs. Routed here only when Caddy sends them;
     // with VAAK_INBOX_RUST_ACCEPT unset every request is forwarded to PHP.
@@ -1697,4 +1699,5 @@ async fn internal_profile_page(State(state):State<AppState>,headers:axum::http::
 async fn internal_admin_action(State(state):State<AppState>,headers:axum::http::HeaderMap,bytes:axum::body::Bytes)->axum::response::Response{crate::admin_actions::action_route(&state.cfg,headers,bytes).await}
 async fn internal_settings_action(State(state):State<AppState>,headers:axum::http::HeaderMap,bytes:axum::body::Bytes)->axum::response::Response{crate::settings_actions::action_route(&state.cfg,headers,bytes).await}
 async fn internal_settings_profile_save(State(state):State<AppState>,headers:axum::http::HeaderMap,bytes:axum::body::Bytes)->axum::response::Response{crate::settings_profile_save::save_route(&state.cfg,headers,bytes).await}
+async fn internal_blog_editor(State(state):State<AppState>,headers:axum::http::HeaderMap,bytes:axum::body::Bytes)->axum::response::Response{crate::blog::editor_route(&state.cfg,headers,bytes).await}
 async fn internal_admin_read(State(state):State<AppState>,headers:axum::http::HeaderMap,bytes:axum::body::Bytes)->axum::response::Response{crate::admin_read::render(&state.cfg,headers,bytes).await}

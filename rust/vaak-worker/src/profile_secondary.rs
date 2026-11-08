@@ -16,15 +16,24 @@ pub(super) fn markdown(raw:&str)->String{
   else{if list{out.push("</ul>".into());list=false;}out.push(format!("<p>{safe}</p>"));}
  }if list{out.push("</ul>".into());}out.join("\n")
 }
+/// Cover image and subtitle, as ap_blog_header_html() paints them in PHP.
+fn header(v:&Value)->String{
+ let mut out=String::new();let cover=s(v,"cover_url");
+ if cover.starts_with("https://"){out.push_str(&format!("<img class=\"blog-post-cover\" src=\"{}\" alt=\"{}\" loading=\"lazy\">",h(cover),h(s(v,"cover_alt"))));}
+ let sub=s(v,"subtitle").trim();if !sub.is_empty(){out.push_str(&format!("<p class=\"blog-post-subtitle\">{}</p>",h(sub)));}
+ out
+}
 fn title(v:&Value)->&str{v.get("title").and_then(Value::as_str).unwrap_or("Untitled")}
 fn published(v:&Value)->&str{v.get("published_at").filter(|v|!v.is_null()).and_then(Value::as_str).unwrap_or_else(||s(v,"created_at"))}
 pub(super) fn blog(f:&HeaderFacts)->Result<String>{
  anyhow::ensure!(f.effective_tab=="blog","blog selection required");let mut out=String::new();
  if let Some(v)=&f.blog_post{
-  out.push_str(&format!("<article class=\"remote-profile-blog-post\"><div class=\"meta\">Blog{}</div><h2>{}</h2><div class=\"meta\">{}</div>",if s(v,"category").is_empty(){String::new()}else{format!(" · {}",h(s(v,"category")))},h(title(v)),h(published(v))));
+  out.push_str(&format!("<article class=\"remote-profile-blog-post\"><div class=\"meta\">Blog{}</div><h2>{}</h2>{}<div class=\"meta\">{}</div>",if s(v,"category").is_empty(){String::new()}else{format!(" · {}",h(s(v,"category")))},h(title(v)),header(v),h(published(v))));
   let mut tags=vec![];if let Ok(values)=serde_json::from_str::<Value>(s(v,"tags_json")){for v in values.as_array().into_iter().flatten(){let raw=super::card::scalar_string(&serde_json::json!({"v":v}),"v");let raw=super::card::php_trim(&raw).trim_start_matches('#');let tag=regex::Regex::new(r"[^\p{L}\p{N}_-]+").unwrap().replace_all(raw,"").to_ascii_lowercase();if !tag.is_empty()&&!tags.contains(&tag){tags.push(tag);}}}
   if !tags.is_empty(){out.push_str(&format!("<p class=\"meta\">#{}</p>",h(&tags.join(" #"))));}
-  out.push_str(&format!("<div class=\"note-body\">{}</div><p class=\"composer-actions\"><a class=\"btn btn-ghost\" href=\"{}blog\">← All blog posts</a></p></article>",markdown(s(v,"body_markdown")),h(&f.tab_href)));
+  // Blog composer v2 stores the Rust render (crate::blog::markdown); older rows fall back.
+  let body=if s(v,"body_html").is_empty(){markdown(s(v,"body_markdown"))}else{s(v,"body_html").to_string()};
+  out.push_str(&format!("<div class=\"note-body\">{}</div><p class=\"composer-actions\"><a class=\"btn btn-ghost\" href=\"{}blog\">← All blog posts</a></p></article>",body,h(&f.tab_href)));
  }else if f.blog_rows.is_empty(){out.push_str(if f.blog_offset>0{"<div class=\"empty\">No more blog posts.</div>"}else{"<div class=\"empty\">No blog posts yet.</div>"});}
  else{for v in &f.blog_rows{let href=h(&format!("{}blog&post={}",f.tab_href,q(s(v,"slug"))));out.push_str(&format!("<article class=\"remote-profile-blog-post\"><div class=\"meta\">Blog{} · {}</div><h2><a href=\"{href}\" style=\"color:inherit;text-decoration:none\">{}</a></h2>",if s(v,"category").is_empty(){String::new()}else{format!(" · {}",h(s(v,"category")))},h(published(v)),h(title(v))));if super::card::boolean(v,"excerpt"){out.push_str(&format!("<p class=\"meta\" style=\"white-space:pre-wrap\">{}</p>",h(s(v,"excerpt"))));}out.push_str(&format!("<p><a class=\"btn btn-ghost\" href=\"{href}\">Read</a></p></article>"));}}
  if f.blog_post.is_none(){

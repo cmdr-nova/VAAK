@@ -49,6 +49,18 @@ try {
         $stats['reclaimed'],
         $stats['pruned'] ?? 0
     ));
+    // Scheduled blog posts ride the same every-minute cron.
+    require_once __DIR__ . '/ap-blog.php';
+    $blogStats = ap_blog_publish_due($limit);
+    if ($blogStats['due'] > 0) {
+        fwrite(STDOUT, sprintf(
+            "[%s] blog_publish due=%d published=%d failed=%d\n",
+            gmdate('c'),
+            $blogStats['due'],
+            $blogStats['published'],
+            $blogStats['failed']
+        ));
+    }
 } catch (Throwable $e) {
     fwrite(STDERR, sprintf("[%s] queue_publish error %s\n", gmdate('c'), $e->getMessage()));
     flock($lockFh, LOCK_UN);
