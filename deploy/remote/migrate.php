@@ -515,6 +515,26 @@ function vaak_migrate_cpu_index_specs(): array
             'create' => "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_events_local_timeline_created ON events (created_at DESC, id DESC) WHERE action_taken IN ('log', 'local_observe') AND actor_id LIKE 'https://mkultra.monster/users/%'",
             'drop' => 'DROP INDEX CONCURRENTLY IF EXISTS idx_events_local_timeline_created',
         ],
+        'idx_events_in_reply_to' => [
+            'table' => 'events',
+            'create' => 'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_events_in_reply_to ON events (in_reply_to)',
+            'drop' => 'DROP INDEX CONCURRENTLY IF EXISTS idx_events_in_reply_to',
+        ],
+        'idx_masto_favourites_object' => [
+            'table' => 'masto_favourites',
+            'create' => 'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_masto_favourites_object ON masto_favourites (object_id)',
+            'drop' => 'DROP INDEX CONCURRENTLY IF EXISTS idx_masto_favourites_object',
+        ],
+        'idx_masto_reblogs_object' => [
+            'table' => 'masto_reblogs',
+            'create' => 'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_masto_reblogs_object ON masto_reblogs (object_id)',
+            'drop' => 'DROP INDEX CONCURRENTLY IF EXISTS idx_masto_reblogs_object',
+        ],
+        'idx_nostr_events_reply_to' => [
+            'table' => 'nostr_events',
+            'create' => "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_nostr_events_reply_to ON nostr_events (reply_to) WHERE reply_to <> ''",
+            'drop' => 'DROP INDEX CONCURRENTLY IF EXISTS idx_nostr_events_reply_to',
+        ],
     ];
 }
 
@@ -665,7 +685,7 @@ function vaak_migrate_cpu_indexes(PDO $db): void
         if ($action === 'missing-table') {
             // bsky_posts is already required by the home Bluesky indexes.
             // Observations are created on first Bluesky use; skip until then.
-            if ($spec['table'] === 'bsky_post_observations') {
+            if ($spec['table'] === 'bsky_post_observations' || $spec['table'] === 'nostr_events') {
                 continue;
             }
             throw new RuntimeException($spec['table'] . ' is missing; cpu index was not created');

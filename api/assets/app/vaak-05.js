@@ -7,10 +7,29 @@
   if (document.documentElement.dataset.bskyActionsBound === '1') return;
   document.documentElement.dataset.bskyActionsBound = '1';
 
-  function setBskyIcon(btn, phName, on, titles) {
+  // Flip on/off and move the like/boost count with it. Replaces only the
+  // icon: rewriting innerHTML dropped the count span.
+  function setBskyOn(btn, on) {
+    const was = btn.classList.contains('on');
     btn.classList.toggle('on', on);
     btn.setAttribute('aria-pressed', on ? 'true' : 'false');
-    btn.innerHTML = '<i class="ph' + (on ? '-fill' : '') + ' ph-' + phName + '" aria-hidden="true"></i>';
+    if (btn.hasAttribute('data-eng-count') && typeof window.vaakBumpActionCount === 'function') {
+      window.vaakBumpActionCount(btn, was, on);
+    }
+  }
+
+  function setBskyIcon(btn, phName, on, titles) {
+    if (btn.dataset.bskyAction === 'bookmark') {
+      btn.classList.toggle('on', on);
+      btn.setAttribute('aria-pressed', on ? 'true' : 'false');
+    } else {
+      setBskyOn(btn, on);
+    }
+    const icon = document.createElement('i');
+    icon.className = 'ph' + (on ? '-fill' : '') + ' ph-' + phName;
+    icon.setAttribute('aria-hidden', 'true');
+    const old = btn.querySelector('i');
+    if (old) old.replaceWith(icon); else btn.prepend(icon);
     const tOn = (titles && titles.on) || '';
     const tOff = (titles && titles.off) || '';
     btn.title = on ? tOn : tOff;
@@ -120,8 +139,7 @@
       setBskyIcon(btn, 'heart', on, { on: 'Unlike', off: 'Like on Bluesky' });
       if (!on) btn.dataset.recordUri = '';
     } else if (kind === 'reblog') {
-      btn.classList.toggle('on', on);
-      btn.setAttribute('aria-pressed', on ? 'true' : 'false');
+      setBskyOn(btn, on);
       btn.title = on ? 'Undo boost' : 'Boost on Bluesky';
       btn.setAttribute('aria-label', on ? 'Undo boost' : 'Boost');
       if (!on) btn.dataset.recordUri = '';
@@ -139,6 +157,7 @@
       ariaPressed: btn.getAttribute('aria-pressed'),
       recordUri: btn.dataset.recordUri,
       bmPicker: btn.getAttribute('data-bm-picker'),
+      engCount: btn.getAttribute('data-eng-count'),
     };
   }
 
@@ -154,6 +173,8 @@
     else btn.dataset.recordUri = state.recordUri;
     if (state.bmPicker === null) btn.removeAttribute('data-bm-picker');
     else btn.setAttribute('data-bm-picker', state.bmPicker);
+    if (state.engCount === null || state.engCount === undefined) btn.removeAttribute('data-eng-count');
+    else btn.setAttribute('data-eng-count', state.engCount);
   }
 
   document.addEventListener('click', async (ev) => {
@@ -234,8 +255,7 @@
     const optimisticOn = postAction === 'bsky_like' || postAction === 'bsky_repost' || postAction === 'bsky_bookmark';
     if (action === 'like') setBskyIcon(btn, 'heart', optimisticOn, { on: 'Unlike', off: 'Like on Bluesky' });
     else if (action === 'repost') {
-      btn.classList.toggle('on', optimisticOn);
-      btn.setAttribute('aria-pressed', optimisticOn ? 'true' : 'false');
+      setBskyOn(btn, optimisticOn);
       btn.title = optimisticOn ? 'Undo boost' : 'Boost on Bluesky';
       btn.setAttribute('aria-label', optimisticOn ? 'Undo boost' : 'Boost');
     } else if (action === 'bookmark') applyBskyBookmarkUi(btn, optimisticOn);
@@ -263,8 +283,7 @@
       } else if (action === 'repost') {
         const on = !!data.reposted;
         // Match federated boosts: color via .on, no fill variant for ph-repeat.
-        btn.classList.toggle('on', on);
-        btn.setAttribute('aria-pressed', on ? 'true' : 'false');
+        setBskyOn(btn, on);
         btn.title = on ? 'Undo boost' : 'Boost on Bluesky';
         btn.setAttribute('aria-label', on ? 'Undo boost' : 'Boost');
         if (!on) btn.dataset.recordUri = '';

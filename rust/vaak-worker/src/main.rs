@@ -25,6 +25,7 @@ mod wafrn_crosspost;
 mod ap_public_doc;
 mod home_hydrate_ranked;
 mod interaction_flags;
+mod engagement_counts;
 mod link_preview;
 mod mentions_html;
 mod notif;

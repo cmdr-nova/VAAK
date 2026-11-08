@@ -2085,33 +2085,13 @@ fn json_count(st: &Value, key: &str) -> i64 {
 
 /// PHP `admin_format_compact_count` parity.
 fn format_compact_count(n: i64) -> String {
-    if n < 1 {
-        return String::new();
-    }
-    if n < 1000 {
-        return n.to_string();
-    }
-    if n < 10_000 {
-        let tenths = n / 100;
-        let whole = tenths / 10;
-        let frac = tenths % 10;
-        if frac > 0 {
-            format!("{whole}.{frac}k")
-        } else {
-            format!("{whole}k")
-        }
-    } else if n < 1_000_000 {
-        format!("{}k", n / 1000)
-    } else {
-        let tenths = n / 100_000;
-        let whole = tenths / 10;
-        let frac = tenths % 10;
-        if frac > 0 {
-            format!("{whole}.{frac}M")
-        } else {
-            format!("{whole}M")
-        }
-    }
+    crate::library::actions::compact_count(n)
+}
+
+/// " (1.2K)" for an aria-label, empty for 0.
+fn count_suffix(n: i64) -> String {
+    let label = format_compact_count(n);
+    if label.is_empty() { String::new() } else { format!(" ({label})") }
 }
 
 fn action_count_html(n: i64) -> String {
@@ -2901,6 +2881,7 @@ fn paint_lean_timeline_actions(status: &Value, from: &str, viewer_actor: &str) -
     let fav_n = json_count(status, "favourites_count");
     let rb_n = json_count(status, "reblogs_count");
     let qt_n = json_count(status, "quotes_count");
+    let rp_n = json_count(status, "replies_count");
     let rss = is_rss(status);
     let bsky = is_bsky(status, acct, uri);
     let local = !rss && !bsky && is_local_uri(uri);
@@ -3062,8 +3043,11 @@ fn paint_lean_timeline_actions(status: &Value, from: &str, viewer_actor: &str) -
             reply_href.push_str(&reply_mention_query(status, viewer_actor));
             reply_href.push_str(&cw_q);
             actions.push_str(&format!(
-                "<a class=\"icon-btn\" href=\"{}\" title=\"Reply\" aria-label=\"Reply\"><i class=\"ph ph-arrow-bend-up-left\" aria-hidden=\"true\"></i></a>",
-                esc(&reply_href)
+                "<a class=\"icon-btn{}\" href=\"{}\" title=\"Reply\" aria-label=\"Reply{}\"><i class=\"ph ph-arrow-bend-up-left\" aria-hidden=\"true\"></i>{}</a>",
+                if rp_n > 0 { " has-count" } else { "" },
+                esc(&reply_href),
+                count_suffix(rp_n),
+                action_count_html(rp_n)
             ));
         }
 
@@ -4555,17 +4539,30 @@ fn nostr_card_actions(status: &Value, action_base: &str, from_q: &str) -> String
             .or_else(|| account.get("acct").and_then(|v| v.as_str()))
             .unwrap_or(""),
     );
+    let fav_n = json_count(status, "favourites_count");
+    let rb_n = json_count(status, "reblogs_count");
+    let rp_n = json_count(status, "replies_count");
+    let qt_n = json_count(status, "quotes_count");
+    let has = |n: i64| if n > 0 { " has-count" } else { "" };
     let mut out = String::new();
     if !note.is_empty() {
         out.push_str(&format!(
-            "<button type=\"button\" class=\"icon-btn\" data-nostr-act=\"reply\" data-nostr-target=\"{note}\" title=\"Reply on Nostr\" aria-label=\"Reply on Nostr\"><i class=\"ph ph-arrow-bend-up-left\" aria-hidden=\"true\"></i></button>\
-             <button type=\"button\" class=\"icon-btn\" data-nostr-act=\"quote\" data-nostr-target=\"{note}\" title=\"Quote on Nostr\" aria-label=\"Quote on Nostr\"><i class=\"ph ph-quotes\" aria-hidden=\"true\"></i></button>"
+            "<button type=\"button\" class=\"icon-btn{rp_has}\" data-nostr-act=\"reply\" data-nostr-target=\"{note}\" title=\"Reply on Nostr\" aria-label=\"Reply on Nostr{rp_label}\"><i class=\"ph ph-arrow-bend-up-left\" aria-hidden=\"true\"></i>{rp_count}</button>\
+             <button type=\"button\" class=\"icon-btn{qt_has}\" data-nostr-act=\"quote\" data-nostr-target=\"{note}\" title=\"Quote on Nostr\" aria-label=\"Quote on Nostr{qt_label}\"><i class=\"ph ph-quotes\" aria-hidden=\"true\"></i>{qt_count}</button>",
+            rp_has = has(rp_n),
+            rp_label = count_suffix(rp_n),
+            rp_count = action_count_html(rp_n),
+            qt_has = has(qt_n),
+            qt_label = count_suffix(qt_n),
+            qt_count = action_count_html(qt_n),
         ));
         out.push_str(&format!(
-            "<button type=\"button\" class=\"icon-btn{on}\" data-nostr-act=\"repost\" data-nostr-target=\"{note}\" aria-pressed=\"{pressed}\" title=\"{label}\" aria-label=\"{label}\"><i class=\"ph ph-repeat\" aria-hidden=\"true\"></i></button>",
+            "<button type=\"button\" class=\"icon-btn{on}{rb_has}\" data-nostr-act=\"repost\" data-nostr-target=\"{note}\" data-eng-count=\"{rb_n}\" aria-pressed=\"{pressed}\" title=\"{label}\" aria-label=\"{label}\"><i class=\"ph ph-repeat\" aria-hidden=\"true\"></i>{rb_count}</button>",
             on = if reposted { " on" } else { "" },
+            rb_has = has(rb_n),
             pressed = if reposted { "true" } else { "false" },
             label = if reposted { "Undo repost" } else { "Repost on Nostr" },
+            rb_count = action_count_html(rb_n),
         ));
         // Zap sits where Bite sits on other posts (NIP-57, nostr::zap): only
         // when the author names a Lightning address. Own notes show the sats.
@@ -4580,8 +4577,10 @@ fn nostr_card_actions(status: &Value, action_base: &str, from_q: &str) -> String
             ));
         }
         out.push_str(&format!(
-            "<button type=\"button\" class=\"icon-btn{on}\" data-nostr-act=\"like\" data-nostr-target=\"{note}\" aria-pressed=\"{pressed}\" title=\"{label}\" aria-label=\"{label}\"><i class=\"{icon} ph-heart\" aria-hidden=\"true\"></i></button>",
+            "<button type=\"button\" class=\"icon-btn{on}{fav_has}\" data-nostr-act=\"like\" data-nostr-target=\"{note}\" data-eng-count=\"{fav_n}\" aria-pressed=\"{pressed}\" title=\"{label}\" aria-label=\"{label}\"><i class=\"{icon} ph-heart\" aria-hidden=\"true\"></i>{fav_count}</button>",
             on = if liked { " on" } else { "" },
+            fav_has = has(fav_n),
+            fav_count = action_count_html(fav_n),
             pressed = if liked { "true" } else { "false" },
             label = if liked { "Unlike on Nostr" } else { "Like on Nostr" },
             icon = if liked { "ph-fill" } else { "ph" },

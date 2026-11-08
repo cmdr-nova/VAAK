@@ -147,8 +147,16 @@
     return Array.prototype.slice.call(document.querySelectorAll(sel));
   }
 
+  // Move the like/repost count with the state; never drop it.
+  function bumpCount(btn, on) {
+    if (btn.hasAttribute('data-eng-count') && typeof window.vaakBumpActionCount === 'function') {
+      window.vaakBumpActionCount(btn, btn.classList.contains('on'), on);
+    }
+  }
+
   function setLiked(target, on) {
     sameTarget('like', target).forEach(function (btn) {
+      bumpCount(btn, on);
       btn.classList.toggle('on', on);
       btn.setAttribute('aria-pressed', on ? 'true' : 'false');
       const label = on ? 'Unlike on Nostr' : 'Like on Nostr';
@@ -157,7 +165,8 @@
       const icon = document.createElement('i');
       icon.className = (on ? 'ph-fill' : 'ph') + ' ph-heart';
       icon.setAttribute('aria-hidden', 'true');
-      btn.replaceChildren(icon);
+      const oldIcon = btn.querySelector('i');
+      if (oldIcon) oldIcon.replaceWith(icon); else btn.prepend(icon);
     });
   }
 
@@ -174,6 +183,7 @@
 
   function setReposted(target, on) {
     sameTarget('repost', target).forEach(function (btn) {
+      bumpCount(btn, on);
       btn.classList.toggle('on', on);
       btn.setAttribute('aria-pressed', on ? 'true' : 'false');
       const label = on ? 'Undo repost' : 'Repost on Nostr';
