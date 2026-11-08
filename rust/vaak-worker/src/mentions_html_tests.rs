@@ -396,6 +396,9 @@ fn mention_cards_do_not_offer_follow_back() {
     );
     assert!(!html.contains("Follow back"));
     assert!(!html.contains("follow_remote"));
+    // The header already links the author; no stray Profile button under the post.
+    assert!(!html.contains(">Profile</a>"));
+    assert!(html.contains("view=remote_profile"));
 }
 
 #[test]

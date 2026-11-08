@@ -250,7 +250,7 @@
         const syncKind = action === 'like' ? 'favourite' : (action === 'repost' ? 'reblog' : 'bookmark');
         const syncOn = action === 'like' ? !!data.liked : (action === 'repost' ? !!data.reposted : !!data.bookmarked);
         window.vaakSyncInteractionState(syncKind, syncOn,
-          [data.uri, data.object_id, uri, objectRef, btn.dataset.objectId], btn);
+          [data.uri, data.object_id, uri, objectRef, btn.dataset.objectId].concat(data.twin_keys || []), btn);
       }
       // Optimistic icon is enough; only toast on failure (watchBskyQueue).
       if (action === 'like') {

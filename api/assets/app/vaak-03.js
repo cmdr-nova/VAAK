@@ -1411,7 +1411,9 @@ window.apAdminToast = function (msg, isErr) {
   // the same post on Home (parked while Notifications is open), a profile, or
   // a thread. After a like, boost, or bookmark is saved, every other copy in
   // the page and in parked columns takes the same state. Matched by object
-  // URI (and Bluesky at:// URI); status ids differ per view.
+  // URI (and Bluesky at:// URI); status ids differ per view. The server adds
+  // twin_keys for the other network's copy of the same post (a Wafrn post's
+  // fediverse Note and its Bluesky record).
   const SYNC_ACTIONS = {
     favourite: ['favourite_status', 'unfavourite_status'],
     bookmark: ['bookmark_status', 'unbookmark_status'],
@@ -1712,7 +1714,7 @@ window.apAdminToast = function (msg, isErr) {
       if (data.kind && typeof data.active === 'boolean') {
         const oidInput = form.querySelector('input[name="object_id"]');
         window.vaakSyncInteractionState(data.kind, data.active,
-          [data.object_id, oidInput ? oidInput.value : ''], form);
+          [data.object_id, oidInput ? oidInput.value : ''].concat(data.twin_keys || []), form);
       }
       if (data.queued && data.queue_id) {
         form.dataset.queuePending = '1';

@@ -31,6 +31,13 @@ if (!source.includes('window.vaakSyncInteractionState(data.kind, data.active,'))
   process.exit(1);
 }
 
+// The other network's copy of a post (Wafrn fediverse Note <-> Bluesky
+// record) arrives as twin_keys on the action response.
+if ((source.match(/data\.twin_keys \|\| \[\]/g) || []).length < 1 || !bsky.includes('data.twin_keys || []')) {
+  console.error('interaction sync no longer passes twin_keys');
+  process.exit(1);
+}
+
 let failures = 0;
 function check(ok, label) {
   if (!ok) {
@@ -110,6 +117,11 @@ check(applied.length === before, 'already-liked copies are not re-applied (count
 
 window.vaakSyncInteractionState('reblog', true, ['https://app.wafrn.net/fediverse/post/abc#announce-12'], null);
 check(homeBoost.btn.classList.on === true, 'boost fragment is ignored when matching');
+
+// Liked on Bluesky (Home): the fediverse twin in Notifications follows.
+const twinBefore = applied.length;
+window.vaakSyncInteractionState('bookmark', false, ['at://did:plc:x/app.bsky.feed.post/1', 'https://app.wafrn.net/fediverse/post/abc'], null);
+check(applied.length === twinBefore, 'twin keys only touch copies whose state differs');
 
 if (failures) process.exit(1);
 console.log('interaction-sync-regression ok');

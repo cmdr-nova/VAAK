@@ -488,3 +488,142 @@ function ap_action_queue_worker_run(int $limit = 20): array
     }
     return $stats;
 }
+
+/**
+ * Other copy of one post: the fediverse Note and its Bluesky record, linked in
+ * bsky_post_links by the record's fediverseId (Wafrn and other dual
+ * publishers). An at:// key returns the fediverse id; an https key returns
+ * the at:// URI. Cache only, never fetches.
+ *
+ * @return list<string>
+ */
+function ap_interaction_twin_keys(string $key): array
+{
+    $key = rtrim(trim($key), '/');
+    if (str_starts_with($key, 'bsky:at://')) {
+        $key = substr($key, 5);
+    }
+    $key = preg_replace('/#announce-\d+$/', '', $key) ?? $key;
+    if ($key === '' || str_starts_with($key, 'https://bsky.app/')) {
+        return [];
+    }
+    if (!function_exists('ap_bsky_post_link_by_uri')) {
+        require_once __DIR__ . '/ap-bsky.php';
+    }
+    $out = [];
+    try {
+        if (str_starts_with($key, 'at://')) {
+            $link = ap_bsky_post_link_by_uri($key);
+            $fedi = rtrim(trim((string) ($link['fediverse_id'] ?? '')), '/');
+            if (str_starts_with($fedi, 'https://')) {
+                $out[] = $fedi;
+            }
+        } elseif (str_starts_with($key, 'https://')) {
+            $tries = [$key];
+            if (!function_exists('ap_wafrn_post_identity') && is_file(__DIR__ . '/ap-wafrn-crosspost.php')) {
+                require_once __DIR__ . '/ap-wafrn-crosspost.php';
+            }
+            if (function_exists('ap_wafrn_post_identity')) {
+                $canon = ap_wafrn_post_identity($key);
+                if ($canon !== '' && $canon !== $key) {
+                    $tries[] = $canon;
+                }
+            }
+            foreach ($tries as $try) {
+                $link = ap_bsky_post_link_by_fedi($try);
+                $uri = trim((string) ($link['bsky_uri'] ?? ''));
+                if (str_starts_with($uri, 'at://')) {
+                    $out[] = $uri;
+                    break;
+                }
+            }
+        }
+    } catch (Throwable $e) {
+        return [];
+    }
+    return array_values(array_unique($out));
+}
+
+/**
+ * Undoing a like, boost or bookmark on one copy of a post also undoes it on
+ * the other copy, because both cards show the shared state. Only touches a
+ * twin this account actually has the action on.
+ *
+ * @param string $kind like|boost|bookmark
+ * @param string $key  the acted copy's object id or at:// URI
+ * @return list<string> twin keys (for the client's live sync)
+ */
+function ap_interaction_twin_undo(int $ownerUserId, string $kind, string $key): array
+{
+    $twins = ap_interaction_twin_keys($key);
+    if ($ownerUserId < 1 || $twins === []) {
+        return $twins;
+    }
+    try {
+        $db = ap_db();
+        foreach ($twins as $twin) {
+            $variants = [$twin, $twin . '/'];
+            if (str_starts_with($twin, 'at://')) {
+                $hash = 'bsky:' . substr(hash('sha256', $twin), 0, 32);
+                $https = function_exists('ap_bsky_https_url_from_at_uri') ? ap_bsky_https_url_from_at_uri($twin, null) : null;
+                if (is_string($https) && $https !== '') {
+                    $variants[] = $https;
+                }
+                $ph = implode(',', array_fill(0, count($variants), '?'));
+                if ($kind === 'like') {
+                    $st = $db->prepare("SELECT status_id, object_id FROM masto_favourites WHERE owner_user_id = ? AND (status_id = ? OR object_id IN ($ph)) LIMIT 1");
+                    $st->execute(array_merge([$ownerUserId, $hash], $variants));
+                    $row = $st->fetch();
+                    if (!is_array($row)) continue;
+                    ap_action_queue_enqueue($ownerUserId, 'bsky', 'like', $twin, false, [
+                        'uri' => $twin, 'cid' => '', 'record_uri' => '',
+                        'status_id' => (string) $row['status_id'], 'object_id' => (string) $row['object_id'],
+                    ]);
+                    // The Bluesky worker only clears the local row when it knows the record.
+                    ap_masto_favourite_remove((string) $row['status_id'], $ownerUserId, (string) $row['object_id']);
+                } elseif ($kind === 'bookmark') {
+                    $st = $db->prepare("SELECT status_id, object_id FROM masto_bookmarks WHERE owner_user_id = ? AND (status_id = ? OR object_id IN ($ph)) LIMIT 1");
+                    $st->execute(array_merge([$ownerUserId, $hash], $variants));
+                    $row = $st->fetch();
+                    if (!is_array($row)) continue;
+                    ap_action_queue_enqueue($ownerUserId, 'bsky', 'bookmark', $twin, false, [
+                        'uri' => $twin, 'status_id' => (string) $row['status_id'], 'object_id' => (string) $row['object_id'],
+                    ]);
+                    ap_masto_bookmark_remove((string) $row['status_id'], $ownerUserId, (string) $row['object_id']);
+                }
+                // Boosts: a fediverse unboost already undoes the Bluesky twin
+                // (ap_masto_reblog_perform -> ap_bsky_unrepost_object).
+                continue;
+            }
+            $ph = implode(',', array_fill(0, count($variants), '?'));
+            if ($kind === 'like') {
+                $st = $db->prepare("SELECT status_id, object_id, target_actor FROM masto_favourites WHERE owner_user_id = ? AND object_id IN ($ph) LIMIT 1");
+                $st->execute(array_merge([$ownerUserId], $variants));
+                $row = $st->fetch();
+                if (!is_array($row) || !preg_match('/^\d+$/', (string) $row['status_id'])) continue;
+                // The fediverse worker removes the row and sends Undo(Like).
+                ap_action_queue_enqueue($ownerUserId, 'fedi', 'like', (string) $row['object_id'], false, [
+                    'status_id' => (string) $row['status_id'], 'object_id' => (string) $row['object_id'],
+                    'target_actor' => (string) ($row['target_actor'] ?? ''),
+                ]);
+            } elseif ($kind === 'bookmark') {
+                $st = $db->prepare("SELECT status_id, object_id FROM masto_bookmarks WHERE owner_user_id = ? AND object_id IN ($ph) LIMIT 1");
+                $st->execute(array_merge([$ownerUserId], $variants));
+                $row = $st->fetch();
+                if (!is_array($row)) continue;
+                ap_masto_bookmark_remove((string) $row['status_id'], $ownerUserId, (string) $row['object_id']);
+            } elseif ($kind === 'boost') {
+                $st = $db->prepare("SELECT status_id, object_id FROM masto_reblogs WHERE owner_user_id = ? AND object_id IN ($ph) LIMIT 1");
+                $st->execute(array_merge([$ownerUserId], $variants));
+                $row = $st->fetch();
+                if (!is_array($row) || !preg_match('/^\d+$/', (string) $row['status_id'])) continue;
+                ap_action_queue_enqueue($ownerUserId, 'fedi', 'boost', (string) $row['object_id'], false, [
+                    'status_id' => (int) $row['status_id'], 'object_id' => (string) $row['object_id'],
+                ]);
+            }
+        }
+    } catch (Throwable $e) {
+        error_log('[ap-action-queue] twin undo: ' . $e->getMessage());
+    }
+    return $twins;
+}

@@ -842,7 +842,10 @@ fn paint_notif_card_follows(n: &Value, viewer_actor: &str, following: &HashSet<S
     }
 
     let mut actions = String::new();
-    if !profile_href.is_empty() {
+    // The avatar and name above already open the profile. A card that shows a
+    // post (mention, quote, like, boost…) has its own action row, so a second
+    // "Profile" button there is just a stray link. Follow-type rows keep it.
+    if !profile_href.is_empty() && status.is_none() {
         actions.push_str(&format!(
             "<a class=\"btn btn-ghost\" href=\"{}\" style=\"padding:.25rem .7rem;font-size:.8rem\">Profile</a>",
             esc(&profile_href)
