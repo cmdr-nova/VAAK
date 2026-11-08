@@ -6175,6 +6175,9 @@ pub(crate) async fn statuses_for_older_hits(
         st["vaak_tl_cursor"] = json!(crate::timeline_cursor::pack(&hit.cursor()));
         statuses.push(st);
     }
+    // Same quote resolution as the first page (warm_view): without it an
+    // older page paints every quote as the bare "Quoted post" placeholder.
+    let _ = hydrate_local_quote_targets(db, &mut statuses).await;
     crate::nostr::share::attach_quotes(db, &mut statuses).await;
     crate::nostr::moderation::filter_statuses(db, owner_user_id, &mut statuses).await;
     Ok(statuses)
