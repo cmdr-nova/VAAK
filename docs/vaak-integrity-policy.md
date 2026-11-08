@@ -14,7 +14,7 @@
   failures continue through the worker. Use `api/ap-queue-replay.php` only
   after confirming the remote host is healthy.
 - `vaak-integrity-check.sh` checks services, backup age, restore drill age,
-  queue growth, and disk pressure every 15 minutes and logs warnings/critical
+  queue growth, a stalled publish queue, and disk pressure every 15 minutes and logs warnings/critical
   failures to journald. Terminal fan-out failures on suspended dead hosts are
   counted apart from failures on hosts that are still healthy, and so are
   "dying" hosts: a streak of at least `VAAK_FANOUT_DEAD_FAILURES` terminal
@@ -26,6 +26,11 @@
   `rejected_fanout_hosts` and left out of the healthy count. They warn only
   when `VAAK_INTEGRITY_REJECTED_HOSTS_WARN` (default 25) or more hosts refuse
   at once, which points at VAAK's own signing rather than one remote server.
+  A stalled publish queue warns when any post has waited more than
+  `VAAK_PUBLISH_STALL_MINUTES` (default 15) without a delivery attempt, or a
+  claimed row has sat in `processing` that long. Every new post's Fediverse
+  fan-out and Bluesky mirror go through that queue, so this is the "mirror
+  stopped" alarm. The worker itself also kills a run older than 10 minutes.
   `VAAK_FANOUT_DEAD_DAYS` (default 7) and
   `VAAK_FANOUT_DEAD_FAILURES` (default 20) are the same knobs the delivery
   worker uses. A recent success, or a recent HTTP 401, 403, 429, or 500, keeps a
