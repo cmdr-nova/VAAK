@@ -216,6 +216,7 @@ pub async fn load_twins(db: &Client, object_ids: &HashSet<String>) -> Twins {
     twins
 }
 
+#[cfg(test)]
 fn apply_one(
     st: &mut Value,
     fav: &HashSet<String>,
