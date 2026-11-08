@@ -12,6 +12,15 @@ anything else bumps the patch number.
 Releases up to **0.9.83** used a two-digit deploy counter (0.9.05, 0.9.83)
 and have no notes here; their tags and GitHub Releases are unchanged.
 
+## [0.54.0](https://github.com/cmdr-nova/VAAK/releases/tag/v0.54.0) - 2026-11-08
+
+### ✨ Features
+* F5 shadow: check "no notification" against this delivery's recipient by @cmdr-nova in https://github.com/cmdr-nova/VAAK/pull/406
+### 🐛 Fixes
+* Quote cards: fill quoted posts on older timeline pages, fix placeholder fields by @cmdr-nova in https://github.com/cmdr-nova/VAAK/pull/405
+
+**Full Changelog**: https://github.com/cmdr-nova/VAAK/compare/v0.53.0...v0.54.0
+
 ## [0.53.0](https://github.com/cmdr-nova/VAAK/releases/tag/v0.53.0) - 2026-11-07
 
 ### ✨ Features
