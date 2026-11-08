@@ -12,6 +12,14 @@ anything else bumps the patch number.
 Releases up to **0.9.83** used a two-digit deploy counter (0.9.05, 0.9.83)
 and have no notes here; their tags and GitHub Releases are unchanged.
 
+## [0.56.0](https://github.com/cmdr-nova/VAAK/releases/tag/v0.56.0) - 2026-11-08
+
+### ✨ Features
+* Share likes, boosts and bookmarks between a post's fediverse and Bluesky copies; drop stray Profile button on notification posts by @cmdr-nova in https://github.com/cmdr-nova/VAAK/pull/408
+* Show Home likes on Bluesky mentions in Notifications by @cmdr-nova in https://github.com/cmdr-nova/VAAK/pull/409
+
+**Full Changelog**: https://github.com/cmdr-nova/VAAK/compare/v0.55.0...v0.56.0
+
 ## [0.55.0](https://github.com/cmdr-nova/VAAK/releases/tag/v0.55.0) - 2026-11-08
 
 ### ✨ Features
