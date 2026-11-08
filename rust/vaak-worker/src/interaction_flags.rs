@@ -37,6 +37,23 @@ fn bsky_status_key(at_uri: &str) -> String {
     format!("bsky:{}", &digest[..32.min(digest.len())])
 }
 
+/// `https://bsky.app/profile/{actor}/post/{rkey}` -> (actor, rkey). The actor
+/// is a DID or a lowercased handle.
+fn bsky_permalink(raw: &str) -> Option<(String, String)> {
+    let rest = trim_slash(raw).strip_prefix("https://bsky.app/profile/")?;
+    let mut parts = rest.split('/');
+    let actor = parts.next().unwrap_or("").replace("%3A", ":").replace("%3a", ":");
+    if parts.next() != Some("post") {
+        return None;
+    }
+    let rkey = parts.next().unwrap_or("").split(['?', '#']).next().unwrap_or("");
+    if actor.is_empty() || rkey.is_empty() || parts.next().is_some() {
+        return None;
+    }
+    let actor = if actor.starts_with("did:") { actor } else { actor.to_ascii_lowercase() };
+    Some((actor, rkey.to_string()))
+}
+
 /// Collect status_id + object_id lookup keys for one status (and nested reblog).
 fn collect_keys(st: &Value, status_ids: &mut HashSet<String>, object_ids: &mut HashSet<String>) {
     let id = st
@@ -74,6 +91,25 @@ fn collect_keys(st: &Value, status_ids: &mut HashSet<String>, object_ids: &mut H
         .filter(|u| u.contains("bsky.app/"))
     {
         push_key(object_ids, https);
+    }
+
+    // A Bluesky mention in Notifications carries only its bsky.app permalink.
+    // A like from Home is stored under the at:// URI (bsky:<hash> status id),
+    // so a DID permalink also gets its at:// keys. Handle permalinks are
+    // resolved from bsky_posts in load_twins.
+    for key in ["vaak_bsky_uri", "bsky_uri", "uri", "url"] {
+        let Some(raw) = st.get(key).and_then(|v| v.as_str()) else { continue };
+        let at = if raw.starts_with("at://") {
+            Some(trim_slash(raw).to_string())
+        } else {
+            bsky_permalink(raw).and_then(|(actor, rkey)| {
+                actor.starts_with("did:").then(|| format!("at://{actor}/app.bsky.feed.post/{rkey}"))
+            })
+        };
+        if let Some(at) = at.filter(|at| at.contains("/app.bsky.feed.post/")) {
+            push_key(status_ids, &bsky_status_key(&at));
+            push_key(object_ids, &at);
+        }
     }
 
     if let Some(inner) = st.get("reblog").filter(|v| v.is_object()) {
@@ -141,18 +177,48 @@ fn expand_twins(twins: &Twins, status_ids: &mut HashSet<String>, object_ids: &mu
     if twins.is_empty() {
         return;
     }
-    let mut extra = Vec::new();
-    for key in object_ids.iter() {
-        if let Some(list) = twins.get(trim_slash(key)) {
-            extra.extend(list.iter().cloned());
+    // Chains are short (handle permalink -> at:// -> Wafrn Note).
+    for _ in 0..3 {
+        let mut extra = Vec::new();
+        for key in object_ids.iter() {
+            if let Some(list) = twins.get(trim_slash(key)) {
+                extra.extend(list.iter().filter(|t| !object_ids.contains(t.as_str())).cloned());
+            }
+        }
+        if extra.is_empty() {
+            break;
+        }
+        for key in extra {
+            if key.starts_with("at://") {
+                push_key(status_ids, &bsky_status_key(&key));
+            }
+            push_key(object_ids, &key);
         }
     }
-    for key in extra {
-        if key.starts_with("at://") {
-            push_key(status_ids, &bsky_status_key(&key));
+}
+
+/// at:// URI this status resolves to through a handle permalink, when the
+/// status itself carries none (Bluesky mentions in Notifications). Painters
+/// read `vaak_bsky_uri` for the card's data-uri, which the live sync matches.
+fn resolved_at_uri(st: &Value, twins: &Twins) -> Option<String> {
+    for key in ["vaak_bsky_uri", "bsky_uri", "uri"] {
+        if st.get(key).and_then(|v| v.as_str()).is_some_and(|v| v.starts_with("at://")) {
+            return None;
         }
-        push_key(object_ids, &key);
     }
+    for key in ["url", "uri"] {
+        let Some(raw) = st.get(key).and_then(|v| v.as_str()) else { continue };
+        if bsky_permalink(raw).is_none() {
+            continue;
+        }
+        if let Some(at) = twins
+            .get(trim_slash(raw))
+            .and_then(|list| list.iter().find(|t| t.starts_with("at://")))
+        {
+            return Some(at.clone());
+        }
+    }
+    None
 }
 
 /// Lookup keys for `bsky_post_links`: at:// URIs, and https object ids
@@ -177,8 +243,57 @@ fn twin_lookup_keys(object_ids: &HashSet<String>) -> (Vec<String>, Vec<String>) 
     (at.into_iter().collect(), https.into_iter().collect())
 }
 
+/// Handle permalinks (`bsky.app/profile/name.example/post/rkey`) to at://
+/// URIs, from cached posts. Uses the bsky_posts rkey expression index.
+async fn load_handle_permalinks(db: &Client, object_ids: &HashSet<String>, twins: &mut Twins) -> Vec<String> {
+    let mut wanted: HashMap<String, Vec<(String, String)>> = HashMap::new();
+    for key in object_ids {
+        let key = trim_slash(key);
+        if let Some((actor, rkey)) = bsky_permalink(key) {
+            if !actor.starts_with("did:") {
+                wanted.entry(rkey).or_default().push((actor, key.to_string()));
+            }
+        }
+    }
+    if wanted.is_empty() {
+        return Vec::new();
+    }
+    let rkeys: Vec<String> = wanted.keys().cloned().collect();
+    let Ok(rows) = db
+        .query(
+            "SELECT bsky_uri, lower(COALESCE(author_handle, '')) FROM bsky_posts
+             WHERE split_part(bsky_uri, '/app.bsky.feed.post/', 2) = ANY($1)",
+            &[&rkeys],
+        )
+        .await
+    else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    for row in rows {
+        let uri: String = row.get(0);
+        let handle: String = row.get(1);
+        let Some(rkey) = uri.split("/app.bsky.feed.post/").nth(1) else { continue };
+        let Some(links) = wanted.get(rkey) else { continue };
+        for (actor, permalink) in links {
+            if !handle.is_empty() && handle == *actor {
+                remember_twin(twins, permalink, &uri);
+                remember_twin(twins, &uri, permalink);
+                found.push(uri.clone());
+            }
+        }
+    }
+    found
+}
+
 pub async fn load_twins(db: &Client, object_ids: &HashSet<String>) -> Twins {
     let mut twins = Twins::new();
+    let resolved = load_handle_permalinks(db, object_ids, &mut twins).await;
+    let mut keys = object_ids.clone();
+    for uri in resolved {
+        push_key(&mut keys, &uri);
+    }
+    let object_ids = &keys;
     let (at, https) = twin_lookup_keys(object_ids);
     if at.is_empty() && https.is_empty() {
         return twins;
@@ -235,6 +350,9 @@ fn apply_one_with_twins(
     viewer_did: Option<&str>,
     twins: &Twins,
 ) {
+    if let Some(at) = resolved_at_uri(st, twins) {
+        st["vaak_bsky_uri"] = json!(at);
+    }
     let mut sids = HashSet::new();
     let mut oids = HashSet::new();
     collect_keys(st, &mut sids, &mut oids);
@@ -551,6 +669,53 @@ mod tests {
         apply_one_with_twins(&mut other, &fav, &bm, &HashSet::new(), None, &twins);
         assert_eq!(other["favourited"], json!(false));
         assert_eq!(other["bookmarked"], json!(false));
+    }
+
+    #[test]
+    fn bluesky_mention_permalink_matches_home_like() {
+        // Liked on Home: stored as bsky:<hash of at://> + did permalink.
+        let at = "at://did:plc:glam/app.bsky.feed.post/3mabc";
+        let mut fav = HashSet::new();
+        push_key(&mut fav, &bsky_status_key(at));
+        push_key(&mut fav, "https://bsky.app/profile/did:plc:glam/post/3mabc");
+
+        // Notifications: a mention row carries only the handle permalink.
+        let handle_url = "https://bsky.app/profile/glamgothcollective.mu.social/post/3mabc";
+        let mut twins = Twins::new();
+        remember_twin(&mut twins, handle_url, at);
+        remember_twin(&mut twins, at, handle_url);
+        let mut mention = json!({ "id": "116", "uri": handle_url, "url": handle_url });
+        apply_one_with_twins(&mut mention, &fav, &HashSet::new(), &HashSet::new(), None, &twins);
+        assert_eq!(mention["favourited"], json!(true));
+        assert_eq!(mention["vaak_bsky_uri"], json!(at));
+
+        // DID permalinks need no lookup.
+        let did_url = "https://bsky.app/profile/did:plc:glam/post/3mabc";
+        let mut by_did = json!({ "id": "117", "uri": did_url, "url": did_url });
+        let mut only_hash = HashSet::new();
+        push_key(&mut only_hash, &bsky_status_key(at));
+        apply_one_with_twins(&mut by_did, &only_hash, &HashSet::new(), &HashSet::new(), None, &Twins::new());
+        assert_eq!(by_did["favourited"], json!(true));
+
+        // Unresolved handle permalink stays as it was.
+        let mut other = json!({ "id": "118", "uri": "https://bsky.app/profile/x.example/post/zz", "url": "https://bsky.app/profile/x.example/post/zz" });
+        apply_one_with_twins(&mut other, &fav, &HashSet::new(), &HashSet::new(), None, &twins);
+        assert_eq!(other["favourited"], json!(false));
+        assert!(other.get("vaak_bsky_uri").is_none());
+    }
+
+    #[test]
+    fn permalink_parser() {
+        assert_eq!(
+            bsky_permalink("https://bsky.app/profile/Name.Example/post/3abc/"),
+            Some(("name.example".to_string(), "3abc".to_string()))
+        );
+        assert_eq!(
+            bsky_permalink("https://bsky.app/profile/did%3Aplc%3Ax/post/3abc"),
+            Some(("did:plc:x".to_string(), "3abc".to_string()))
+        );
+        assert_eq!(bsky_permalink("https://bsky.app/profile/name.example"), None);
+        assert_eq!(bsky_permalink("https://bsky.app/profile/a/post/1/liked-by"), None);
     }
 
     #[test]
