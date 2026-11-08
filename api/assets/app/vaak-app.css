@@ -3207,6 +3207,7 @@
     .quote-block > .notif-status-embed > article.tweet:hover {
       background: var(--panel); border-color: #3a3a3a;
     }
+    .quote-block:not(.compose-reply-context):has(a.tweet-time) { cursor: pointer; }
     .quote-block--openable {
       cursor: pointer;
       transition: background .12s ease, border-color .12s ease;

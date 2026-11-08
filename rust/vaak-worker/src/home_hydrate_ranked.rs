@@ -6264,7 +6264,7 @@ mod tests {
                 if case=="production_public" { std::fs::write("/tmp/vaak-quote-media-production-hydration-diagnostic.json",serde_json::to_vec_pretty(&json!({"width":width,"original_status":original_status,"hydrated":hydrated,"html":html}))?)?; }
                 let asset="https://cdn2.miau.pub/media_attachments/files/117/418/821/758/171/621/original/71535357c1f9fd5e.jpg";
                 if admitted && !matches!(case,"underscore_target_mismatch"|"undo_only") {
-                    let quote=html.find("class=\"quote-block\"").context("quote missing")?;
+                    let quote=html.find("class=\"quote-block").context("quote missing")?;
                     anyhow::ensure!(html.find(asset).context("asset missing")?>quote,"quoted asset outside quote {width}/{case}");
                     anyhow::ensure!(hydrated["quote"]["quoted_status"]["uri"]==production["events"][1]["object_id"],"canonical quoted source changed");
                     anyhow::ensure!(hydrated["quote"]["quoted_status"]["vaak_quote_requested_uri"]=="https://lgbtqia.space/@alice/117418829058105216","requested quote identity lost");

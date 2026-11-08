@@ -492,33 +492,85 @@
   function scheduleTweetFolds(root) {
     requestAnimationFrame(() => enhanceTweetFolds(root));
   }
-  // Any activation of an openable quote card opens the quoted post in VAAK.
-  // Capture + stopImmediatePropagation so target=_blank / remote anchors cannot win.
-  function openQuoteBlock(qb) {
-    if (!qb || !qb.classList || !qb.classList.contains('quote-block--openable')) return false;
-    const href = qb.getAttribute('data-href') || '';
-    if (!href || href === '#') return false;
-    window.location.assign(href);
+  // Clicking or tapping a quote card opens the quoted post's thread: the
+  // in-app status view for local, fediverse and Bluesky posts, njump for
+  // Nostr notes (no in-app Nostr thread). Links, media, buttons and forms
+  // inside the card keep their own behavior, and selecting text never
+  // navigates. Painters mark cards with .quote-block--openable + data-href;
+  // older painters (PHP feed cards, saved cards) fall back to the quoted
+  // card's own timestamp link.
+  function quoteBlockFor(el) {
+    const qb = el && el.closest ? el.closest('.quote-block') : null;
+    if (!qb || qb.classList.contains('compose-reply-context')) return null;
+    // The composer's own quote preview is not a link.
+    const form = qb.closest('form');
+    if (form && form.querySelector('textarea')) return null;
+    return qb;
+  }
+  function ownedBy(qb, el) {
+    return el && el.closest('.quote-block') === qb;
+  }
+  function quoteOpenAnchor(qb) {
+    const links = qb.querySelectorAll('a.tweet-time[href]');
+    for (let i = 0; i < links.length; i++) {
+      if (ownedBy(qb, links[i])) return links[i];
+    }
+    return null;
+  }
+  // Only in-app paths and https pages: never javascript:/data: from markup.
+  function safeQuoteHref(raw) {
+    if (!raw || raw === '#') return '';
+    let u;
+    try { u = new URL(raw, window.location.href); } catch (e) { return ''; }
+    if (u.protocol !== 'https:' && !(u.protocol === 'http:' && u.origin === window.location.origin)) return '';
+    return raw.charAt(0) === '?' || raw.charAt(0) === '/' ? raw : u.href;
+  }
+  function quoteOpenTarget(qb) {
+    const anchor = quoteOpenAnchor(qb);
+    const raw = qb.getAttribute('data-href') || (anchor ? anchor.getAttribute('href') : '') || '';
+    const href = safeQuoteHref(raw);
+    if (!href) return null;
+    const external = qb.getAttribute('data-quote-external') === '1'
+      || (!qb.hasAttribute('data-href') && !!anchor && anchor.target === '_blank');
+    return { href, anchor, external };
+  }
+  function quoteHasSelection(qb) {
+    const sel = window.getSelection ? window.getSelection() : null;
+    if (!sel || sel.isCollapsed || !sel.rangeCount) return false;
+    if (!String(sel).trim()) return false;
+    const range = sel.getRangeAt(0);
+    return qb.contains(range.commonAncestorContainer);
+  }
+  function openQuoteBlock(qb, newTab) {
+    const t = quoteOpenTarget(qb);
+    if (!t) return false;
+    if (newTab || t.external) {
+      window.open(t.href, '_blank', 'noopener');
+      return true;
+    }
+    // Clicking the card's own in-app link goes through soft-nav (vaak-09.js),
+    // the same as clicking the timestamp.
+    if (t.anchor && t.anchor.getAttribute('href') === t.href && t.anchor.target !== '_blank') {
+      t.anchor.click();
+      return true;
+    }
+    window.location.assign(new URL(t.href, window.location.href).href);
     return true;
   }
-  function quoteActivationTarget(ev) {
-    const t = ev.target;
-    if (!t || !t.closest) return null;
-    // Media controls stay usable.
-    if (t.closest('video, audio, .note-media-trigger, .media-cell, button, input, textarea, select, label')) {
-      return null;
-    }
-    return t.closest('.quote-block--openable');
-  }
   function onQuoteActivate(ev) {
-    const qb = quoteActivationTarget(ev);
+    const t = ev.target;
+    if (!t || !t.closest || ev.defaultPrevented) return;
+    if (ev.type === 'auxclick' && ev.button !== 1) return;
+    if (ev.type === 'click' && ev.button !== 0) return;
+    // Anything interactive inside the card keeps its own behavior.
+    if (t.closest('a[href], video, audio, button, input, textarea, select, label, summary, .note-media-trigger, .media-cell, [data-nostr-act], .post-action-menu, [contenteditable="true"]')) return;
+    const qb = quoteBlockFor(t);
     if (!qb) return;
-    // Allow explicit "Open original" (Bluesky) only.
-    const a = ev.target.closest ? ev.target.closest('a') : null;
-    if (a && /open original/i.test((a.textContent || '').trim())) return;
+    if (quoteHasSelection(qb)) return;
+    if (!quoteOpenTarget(qb)) return;
     ev.preventDefault();
-    ev.stopImmediatePropagation();
-    openQuoteBlock(qb);
+    ev.stopPropagation();
+    openQuoteBlock(qb, ev.type === 'auxclick' || ev.metaKey || ev.ctrlKey || ev.shiftKey);
   }
   document.addEventListener('click', onQuoteActivate, true);
   document.addEventListener('auxclick', onQuoteActivate, true);
@@ -529,7 +581,7 @@
       : null;
     if (!qb) return;
     ev.preventDefault();
-    openQuoteBlock(qb);
+    openQuoteBlock(qb, ev.metaKey || ev.ctrlKey);
   });
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', () => scheduleTweetFolds(document));

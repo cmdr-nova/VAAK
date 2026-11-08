@@ -1808,25 +1808,57 @@ pub(crate) fn unresolved_quote_target(status: &Value) -> Option<String> {
     (!url.is_empty()).then_some(url)
 }
 
+/// `data-href` (and link role) for a painted quote card: the same target its
+/// timestamp opens. Fediverse, local and Bluesky posts open the in-app thread;
+/// Nostr notes have no in-app thread view, so they open njump in a new tab.
+fn quote_open_attrs(quoted: &Value, from: &str) -> String {
+    let from_q = if from.is_empty() { "mentions" } else { from };
+    let nostr = quoted
+        .get("url")
+        .and_then(Value::as_str)
+        .filter(|u| u.starts_with("https://") && crate::nostr::render::is_nostr_status(quoted));
+    let (href, external) = if let Some(open) = nostr {
+        (open.to_string(), true)
+    } else {
+        let uri = resolvable_status_uri(quoted);
+        if uri.is_empty() {
+            return String::new();
+        }
+        (crate::library::actions::in_app_status_href(&status_open_ref(quoted, &uri), from_q), false)
+    };
+    if href.is_empty() || href == "#" {
+        return String::new();
+    }
+    format!(
+        " data-href=\"{}\"{} role=\"link\" tabindex=\"0\" aria-label=\"Open quoted post\"",
+        esc(&href),
+        if external { " data-quote-external=\"1\"" } else { "" }
+    )
+}
+
 /// Nested quote inside a timeline card. A resolved quote paints as a lean
 /// embed; an unresolved one paints PHP's pending/unavailable quote chrome
 /// (`admin_render_masto_status_card`) instead of an anonymous empty card.
 fn paint_nested_quote(status: &Value, q_raw: &Value, from: &str, viewer_actor: &str) -> String {
-    let wrap = |inner: String| {
+    // The whole card opens the quoted post's thread (vaak-03.js). Inner
+    // links, media and buttons keep their own behavior there.
+    let wrap_for = |quoted: &Value, inner: String| {
+        let open = quote_open_attrs(quoted, from);
         format!(
-            "<div class=\"quote-block\" style=\"margin-top:.55rem;background:transparent;border:0;padding:0;border-radius:0;color:inherit\">{inner}</div>"
+            "<div class=\"quote-block{}\"{open} style=\"margin-top:.55rem;background:transparent;border:0;padding:0;border-radius:0;color:inherit\">{inner}</div>",
+            if open.is_empty() { "" } else { " quote-block--openable" }
         )
     };
     let q = normalized_quote_preview(q_raw);
     if quote_status_paintable(&q) {
-        return wrap(paint_lean_embed_from(&q, false, from, viewer_actor, false));
+        return wrap_for(&q, paint_lean_embed_from(&q, false, from, viewer_actor, false));
     }
     // `quote` wins over `vaak_quote_preview`, so a pending envelope used to
     // hide a usable preview. Fall back to it before giving up.
     if let Some(preview) = status.get("vaak_quote_preview").filter(|v| v.is_object() && *v != q_raw) {
         let p = normalized_quote_preview(preview);
         if quote_status_paintable(&p) {
-            return wrap(paint_lean_embed_from(&p, false, from, viewer_actor, false));
+            return wrap_for(&p, paint_lean_embed_from(&p, false, from, viewer_actor, false));
         }
         let text = preview.get("text").and_then(Value::as_str).unwrap_or("").trim();
         if !text.is_empty() {
@@ -1858,13 +1890,20 @@ fn paint_nested_quote(status: &Value, q_raw: &Value, from: &str, viewer_actor: &
                 "account": account,
                 "media_attachments": [],
             });
-            return wrap(paint_lean_embed_from(&synthetic, false, from, viewer_actor, false));
+            return wrap_for(&synthetic, paint_lean_embed_from(&synthetic, false, from, viewer_actor, false));
         }
     }
     let url = unresolved_quote_url(status, q_raw);
     let state = q_raw.get("state").and_then(Value::as_str).unwrap_or("");
     let gone = matches!(state, "deleted" | "rejected" | "revoked" | "unauthorized");
-    let mut html = String::from("<div class=\"quote-block quote-block--unresolved\" style=\"margin-top:.55rem\">");
+    let mut html = if url.is_empty() || gone {
+        String::from("<div class=\"quote-block quote-block--unresolved\" style=\"margin-top:.55rem\">")
+    } else {
+        format!(
+            "<div class=\"quote-block quote-block--unresolved quote-block--openable\" data-href=\"{}\" role=\"link\" tabindex=\"0\" aria-label=\"Open quoted post\" style=\"margin-top:.55rem\">",
+            esc(&crate::library::actions::in_app_status_href(&url, from))
+        )
+    };
     if url.is_empty() || gone {
         html.push_str("<div class=\"meta\" style=\"margin-top:.3rem\">Quoted post unavailable</div>");
         if !url.is_empty() {
@@ -5802,6 +5841,55 @@ mod tests {
     }
 
     #[test]
+    fn quote_cards_open_their_thread_on_every_source() {
+        let quoting = |quoted: serde_json::Value| json!({
+            "id": "q1", "uri": "https://mastodon.test/notes/q1", "url": "https://mastodon.test/notes/q1",
+            "created_at": "2026-11-08T07:00:00Z", "content": "<p>look</p>",
+            "account": {"acct": "a@mastodon.test", "display_name": "A", "uri": "https://mastodon.test/users/a"},
+            "media_attachments": [],
+            "quote": {"state": "accepted", "quoted_status": quoted},
+        });
+        let author = json!({"acct": "b@mastodon.test", "display_name": "B", "uri": "https://mastodon.test/users/b"});
+        let opener = |html: &str| -> String {
+            let at = html.find("quote-block--openable").unwrap_or_else(|| panic!("quote card not openable: {html}"));
+            let tail = &html[at..];
+            let start = tail.find("data-href=\"").expect(html) + 11;
+            tail[start..start + tail[start..].find('"').unwrap()].to_string()
+        };
+        // Fediverse and local quotes open the in-app thread, like the timestamp.
+        let fedi = paint_lean_feed_card(&quoting(json!({
+            "id": "t1", "uri": "https://mastodon.test/notes/t1", "created_at": "2026-11-08T06:00:00Z",
+            "content": "<p>quoted</p>", "account": author.clone(), "media_attachments": []})));
+        assert!(opener(&fedi).contains("view=status") && opener(&fedi).contains(&urlencoding_encode("https://mastodon.test/notes/t1")), "{fedi}");
+        let local = paint_lean_feed_card(&quoting(json!({
+            "id": "t2", "uri": "https://mkultra.monster/users/shana_flux/notes/abc", "created_at": "2026-11-08T06:00:00Z",
+            "content": "<p>quoted</p>", "account": {"acct": "shana_flux", "display_name": "Shana"}, "media_attachments": []})));
+        assert!(opener(&local).starts_with("/vaak/@shana_flux/abc"), "{local}");
+        // Bluesky opens the in-app thread for the post.
+        let bsky = paint_lean_feed_card(&quoting(json!({
+            "id": "bsky:x", "uri": "at://did:plc:abc/app.bsky.feed.post/3kx", "url": "https://bsky.app/profile/did:plc:abc/post/3kx",
+            "source": "bluesky", "created_at": "2026-11-08T06:00:00Z", "content": "<p>sky</p>",
+            "account": {"acct": "c.bsky.social", "display_name": "C"}, "media_attachments": []})));
+        assert!(opener(&bsky).contains("view=status"), "{bsky}");
+        assert!(!bsky.contains("data-quote-external"), "{bsky}");
+        // Nostr has no in-app thread view: the card opens njump in a new tab.
+        let njump = "https://njump.me/note1xyz";
+        let nostr = paint_lean_feed_card(&quoting(json!({
+            "id": format!("nostr:{}", "a".repeat(64)), "uri": njump, "url": njump, "source": "nostr",
+            "created_at": "2026-11-08T06:00:00Z", "content": "<p>zap</p>",
+            "account": {"acct": "max@towardsliberty.com", "display_name": "Max"}, "media_attachments": []})));
+        assert_eq!(opener(&nostr), njump, "{nostr}");
+        assert!(nostr.contains("data-quote-external=\"1\""), "{nostr}");
+        // Not cached yet still opens the in-app status view (which fetches it).
+        let target = "https://misskey.test/notes/target1";
+        let pending = paint_lean_feed_card(&pending_quote_boost(json!({"state":"pending","quoted_status":null}), Some(target)));
+        assert!(opener(&pending).contains(&urlencoding_encode(target)), "{pending}");
+        // Gone quotes have nothing to open.
+        let gone = paint_lean_feed_card(&pending_quote_boost(json!({"state":"deleted","quoted_status":null}), Some(target)));
+        assert!(!gone.contains("quote-block--openable"), "{gone}");
+    }
+
+    #[test]
     fn unresolved_quote_without_url_or_gone_says_unavailable() {
         let html = paint_lean_feed_card(&pending_quote_boost(json!({"state":"pending","quoted_status":null}), None));
         assert!(html.contains("Quoted post unavailable") && !html.contains("@?"), "{html}");
@@ -5839,7 +5927,7 @@ mod tests {
         });
         for surface in ["home", "local", "feed", "remote_profile", "outbox", "mentions"] {
             let html = paint_lean_feed_card_opts(&status, surface, "");
-            let quote = html.find("class=\"quote-block\"").unwrap();
+            let quote = html.find("class=\"quote-block").unwrap();
             assert!(html.find("https://media.test/parent.jpg").unwrap() < quote, "parent asset lost on {surface}");
             assert!(html.find("https://media.test/quoted.jpg").unwrap() > quote, "quoted asset escaped nest on {surface}");
             assert!(html.find("Quoted warning").unwrap() > quote, "quoted warning escaped nest on {surface}");
@@ -5851,7 +5939,7 @@ mod tests {
         parent_warning["_vaak_auto_unblur_sensitive"] = json!(true);
         let html = paint_lean_feed_card(&parent_warning);
         let parent_gate = html.find("Parent warning").unwrap();
-        let quote = html.find("class=\"quote-block\"").unwrap();
+        let quote = html.find("class=\"quote-block").unwrap();
         assert!(parent_gate < quote);
         assert!(html[quote..].find("</details>").is_some(), "quoted content stays within explicit parent warning");
         assert_eq!(html.matches("class=\"cw-gate\"").count(), 2, "parent and child warnings remain separate");
@@ -5861,7 +5949,7 @@ mod tests {
         let mut unresolved = status;
         unresolved["quote"]["quoted_status"]["media_attachments"] = json!([]);
         let html = paint_lean_feed_card(&unresolved);
-        assert!(html.find("https://media.test/quoted.jpg").unwrap() < html.find("class=\"quote-block\"").unwrap(), "unproved ownership must not move parent media");
+        assert!(html.find("https://media.test/quoted.jpg").unwrap() < html.find("class=\"quote-block").unwrap(), "unproved ownership must not move parent media");
     }
 
     #[test]
@@ -5888,7 +5976,7 @@ mod tests {
             }}
         });
         let html = paint_lean_feed_card(&status);
-        let quote = html.find("class=\"quote-block\"").expect(&html);
+        let quote = html.find("class=\"quote-block").expect(&html);
         let media = html.find("https://media.test/ambipom.jpg").expect(&html);
         assert!(media > quote, "summary image painted as the quoting post's media: {html}");
         assert!(html.contains("Ambipom"), "{html}");
@@ -5904,7 +5992,7 @@ mod tests {
             {"type":"audio","url":"https://media.test/four.mp3"}
         ]);
         let html = paint_lean_feed_card(&status);
-        let quote = html.find("class=\"quote-block\"").expect(&html);
+        let quote = html.find("class=\"quote-block").expect(&html);
         for url in ["https://media.test/one.jpg", "https://media.test/two.mp4", "https://media.test/three.mp4", "https://media.test/four.mp3"] {
             assert!(html.find(url).expect(url) > quote, "{url} left the quote: {html}");
         }
@@ -6404,7 +6492,7 @@ mod tests {
     }
 
     fn assert_quote_media_inside(html: &str, quoted: &str, parent: Option<&str>) {
-        let quote = html.find("class=\"quote-block\"").unwrap_or_else(|| panic!("missing quote: {html}"));
+        let quote = html.find("class=\"quote-block").unwrap_or_else(|| panic!("missing quote: {html}"));
         let media = html.find(quoted).unwrap_or_else(|| panic!("missing quoted media: {html}"));
         assert!(media > quote, "quoted media rendered outside the quote: {html}");
         assert!(!html[..quote].contains(quoted), "quoted media also rendered outside the quote: {html}");
@@ -6638,7 +6726,7 @@ mod tests {
         unresolved["media_attachments"] = json!([image(parent_media), image(quoted_media)]);
         unresolved["quote"]["quoted_status"]["media_attachments"] = json!([]);
         let html = paint_lean_feed_card_opts(&unresolved, "home", viewer);
-        let quote = html.find("class=\"quote-block\"").unwrap();
+        let quote = html.find("class=\"quote-block").unwrap();
         assert!(html.find(quoted_media).unwrap() < quote, "unproved parent media moved inside: {html}");
     }
 
