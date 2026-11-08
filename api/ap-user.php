@@ -1162,11 +1162,11 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
         if ($blogPost) {
             $blogTitle = htmlspecialchars((string) ($blogPost['title'] ?? 'Untitled'), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
             echo '<article class="profile-blog-post"><div class="muted">' . htmlspecialchars((string) (($blogPost['category'] ?? '') ?: 'Blog'), ENT_QUOTES, 'UTF-8') . '</div>';
-            echo '<h2>' . $blogTitle . '</h2><div class="muted">' . htmlspecialchars((string) ($blogPost['published_at'] ?? ''), ENT_QUOTES, 'UTF-8') . '</div>';
+            echo '<h2>' . $blogTitle . '</h2>' . ap_blog_header_html($blogPost) . '<div class="muted">' . htmlspecialchars((string) ($blogPost['published_at'] ?? ''), ENT_QUOTES, 'UTF-8') . '</div>';
             if (!empty($blogPost['tags']) && is_array($blogPost['tags'])) {
                 echo '<p class="muted">' . htmlspecialchars(implode(' ', array_map(static fn($tag): string => '#' . (string) $tag, $blogPost['tags']),), ENT_QUOTES, 'UTF-8') . '</p>';
             }
-            echo '<div class="note-body">' . ap_user_blog_markdown_html((string) ($blogPost['body_markdown'] ?? '')) . '</div>';
+            echo '<div class="note-body">' . ap_blog_body_html($blogPost, 'ap_user_blog_markdown_html') . '</div>';
             echo '<p><a href="/users/' . $safe . '?tab=blog">← All blog posts</a></p></article>';
         } elseif (!$blogRows) {
             echo '<p class="muted">No public blog posts yet.</p>';

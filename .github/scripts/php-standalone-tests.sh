@@ -32,6 +32,7 @@ if ! php -r 'exit(extension_loaded("pdo_sqlite") ? 0 : 1);'; then
 fi
 
 php_tests=(
+  api/bin/blog-service-smoke.php
   api/bin/account-acct-key-error-smoke.php
   api/bin/avatar-refresh-smoke.php
   api/bin/post-media-warm-busy-smoke.php

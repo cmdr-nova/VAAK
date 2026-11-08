@@ -2566,6 +2566,14 @@ function ap_masto_api(string $method, string $path): void
         return;
     }
 
+    // Blog posts for token apps (ap_blog_api in api/ap-blog.php).
+    if (preg_match('#^/api/v1/vaak/blog(?:/([A-Za-z0-9-]{1,120}))?$#', $path, $bm) && in_array($method, ['GET', 'POST', 'DELETE'], true)) {
+        ap_masto_require_token($method === 'GET' ? 'read' : 'write');
+        require_once __DIR__ . '/ap-blog.php';
+        $reply = ap_blog_api($method, (string) ($bm[1] ?? ''), (array) ($GLOBALS['vaak_user'] ?? []), $method === 'POST' ? ap_masto_input() : []);
+        ap_masto_json($reply['body'], $reply['status']);
+        return;
+    }
     // Nostr crosspost for token apps that sign on their own machine
     // (ap_nostr_api_action in api/ap-nostr.php).
     if (preg_match('#^/api/v1/vaak/nostr/(prepare|publish)$#', $path, $nm) && $method === 'POST') {

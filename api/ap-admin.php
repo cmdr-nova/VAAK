@@ -540,7 +540,11 @@ if ($view === 'blog' && strtolower((string) ($_GET['format'] ?? '')) === 'jekyll
         . 'title: ' . $yaml((string) ($post['title'] ?? '')) . "\n"
         . 'category: ' . $yaml((string) ($post['category'] ?? '')) . "\n"
         . 'tags: [' . implode(', ', array_map($yaml, (array) ($post['tags'] ?? []))) . "]\n"
-        . 'date: ' . $yaml((string) ($post['published_at'] ?? $post['created_at'] ?? '')) . "\n---\n\n";
+        . 'date: ' . $yaml((string) ($post['published_at'] ?? $post['created_at'] ?? '')) . "\n"
+        . ((string) ($post['subtitle'] ?? '') !== '' ? 'subtitle: ' . $yaml((string) $post['subtitle']) . "\n" : '')
+        . ((string) ($post['summary'] ?? '') !== '' ? 'description: ' . $yaml((string) $post['summary']) . "\n" : '')
+        . (str_starts_with((string) ($post['cover_url'] ?? ''), 'https://') ? 'image: ' . $yaml((string) $post['cover_url']) . "\n" : '')
+        . "---\n\n";
     header('Content-Type: text/markdown; charset=utf-8');
     header('Content-Disposition: attachment; filename="' . preg_replace('/[^a-z0-9_-]+/i', '-', $slug) . '.md"');
     echo $front . (string) ($post['body_markdown'] ?? '');
@@ -1341,51 +1345,50 @@ $vaakAdminOnlyActions = [
         echo json_encode(['ok' => true, 'avatars' => $urls], JSON_UNESCAPED_SLASHES);
         exit;
     }
-    if ($action === 'blog_save') {
-        $title = trim((string) ($_POST['blog_title'] ?? ''));
-        $category = trim((string) ($_POST['blog_category'] ?? ''));
-        $body = trim((string) ($_POST['blog_body'] ?? ''));
-        $tagsRaw = trim((string) ($_POST['blog_tags'] ?? ''));
-        $existingSlug = trim((string) ($_POST['blog_slug'] ?? ''));
-        $publish = !empty($_POST['blog_publish']);
-        $tags = [];
-        foreach (preg_split('/[,\s]+/', $tagsRaw) ?: [] as $tag) {
-            $tag = ltrim(trim((string) $tag), '#');
-            $tag = preg_replace('/[^\p{L}\p{N}_-]+/u', '', $tag) ?? '';
-            if ($tag !== '') { $tags[strtolower($tag)] = true; }
-        }
-        $tags = array_keys($tags);
+    if ($action === 'blog_save' || $action === 'blog_autosave' || $action === 'blog_delete' || $action === 'blog_preview') {
+        require_once __DIR__ . '/ap-blog.php';
         $view = 'blog';
-        if ($title === '' || mb_strlen($title) > 240) {
-            $error = 'A blog title is required (maximum 240 characters).';
-        } elseif ($body === '' || mb_strlen($body) > 200000) {
-            $error = 'Blog content is required and must be under 200,000 characters.';
-        } elseif (mb_strlen($category) > 120) {
-            $error = 'Category must be under 120 characters.';
-        } else {
-            $excerpt = admin_blog_excerpt($body, 420);
-            $slug = $existingSlug !== '' ? $existingSlug : ap_blog_slug($title, substr(bin2hex(random_bytes(4)), 0, 8));
-            $blog = $existingSlug !== ''
-                ? ap_blog_update_draft($vaakOwnerId, $vaakActorKey, $slug, $title, $category, $tags, $body, $excerpt)
-                : ap_blog_create($vaakOwnerId, $vaakActorKey, $slug, $title, $category, $tags, $body, $excerpt, 'draft');
-            if (!is_array($blog)) {
-                $error = 'Could not save the blog post.';
-            } elseif (!$publish) {
-                $notice = 'Blog draft saved.';
+        if ($action === 'blog_preview' || $action === 'blog_autosave') {
+            // Editor background calls: JSON in the shape vaak-13.js reads.
+            if (function_exists('ap_auth_session_write_close')) {
+                ap_auth_session_write_close();
+            } elseif (session_status() === PHP_SESSION_ACTIVE) {
+                session_write_close();
+            }
+            if ($action === 'blog_preview') {
+                $md = (string) ($_POST['blog_body'] ?? '');
+                $render = mb_strlen($md) <= 200000 ? ap_blog_render($md) : null;
+                $reply = $render !== null
+                    ? ['ok' => true, 'html' => $render['html'], 'words' => $render['words'], 'minutes' => $render['minutes']]
+                    : ['ok' => true, 'html' => admin_blog_markdown_html($md), 'legacy' => true];
             } else {
-                if (!defined('AP_INBOX_LIB_ONLY')) { define('AP_INBOX_LIB_ONLY', true); }
-                require_once __DIR__ . '/ap-inbox.php';
-                $profileUrl = 'https://mkultra.monster/users/' . rawurlencode($vaakActorKey) . '?tab=blog&post=' . rawurlencode($slug);
-                $tagLine = $tags !== [] ? "\n\n" . implode(' ', array_map(static fn(string $tag): string => '#' . $tag, $tags)) : '';
-                $teaser = ($excerpt !== '' ? $excerpt : '') . $tagLine . "\n\nRead the full post: " . $profileUrl;
-                $published = ap_local_post_reply($teaser, '', null, $title, true, null, [], 'public');
-                if (empty($published['ok'])) {
-                    $error = 'Draft saved, but publishing failed: ' . (string) ($published['error'] ?? 'unknown error');
-                } else {
-                    ap_blog_set_note($vaakActorKey, $slug, (string) ($published['note_id'] ?? ''));
-                    ap_blog_mark_published($vaakActorKey, $slug);
-                    $notice = 'Blog post published.';
-                }
+                $reply = ap_blog_save((int) $vaakOwnerId, (string) $vaakActorKey, ap_blog_input($_POST), null, true);
+            }
+            header('Content-Type: application/json; charset=utf-8');
+            header('Cache-Control: no-store');
+            echo json_encode($reply, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+            exit;
+        }
+        if ($action === 'blog_delete') {
+            $res = ap_blog_delete((int) $vaakOwnerId, (string) $vaakActorKey, trim((string) ($_POST['blog_slug'] ?? '')));
+        } else {
+            $cover = isset($_FILES['blog_cover']) && is_array($_FILES['blog_cover']) && !is_array($_FILES['blog_cover']['name'] ?? null)
+                ? $_FILES['blog_cover'] : null;
+            $res = ap_blog_save((int) $vaakOwnerId, (string) $vaakActorKey, ap_blog_input($_POST), $cover);
+        }
+        if (!empty($res['ok'])) {
+            $notice = (string) ($res['notice'] ?? 'Saved.');
+            $GLOBALS['vaak_blog_result'] = $res;
+            if (function_exists('admin_tl_cache_clear') && in_array((string) ($res['status'] ?? ''), ['published'], true)) {
+                admin_tl_cache_clear();
+            }
+        } else {
+            $error = (string) ($res['error'] ?? 'Could not save the blog post.');
+            // The editor keeps the submitted text; a draft saved before a failed
+            // publish keeps its slug so the retry updates that draft.
+            if (!empty($res['slug'])) {
+                $_POST['blog_slug'] = (string) $res['slug'];
+                $blog = ['slug' => (string) $res['slug']];
             }
         }
     }
@@ -30821,6 +30824,24 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
         <?php
           $blogSlug = trim((string) ($_GET['post'] ?? ''));
           $blogPost = $blogSlug !== '' ? ap_blog_post_get($vaakActorKey, $blogSlug, false) : null;
+          $blogNativeHtml = null;
+          if (!$blogPost) {
+              require_once __DIR__ . '/ap-blog.php';
+              $blogNostrOk = false;
+              if (getenv('VAAK_BLOG_NATIVE') === '1') {
+                  require_once __DIR__ . '/ap-nostr.php';
+                  $blogNostrOk = function_exists('ap_nostr_compose_identity') && ap_nostr_compose_identity((int) $vaakOwnerId, !empty($vaakIsAdmin)) !== null;
+              }
+              $blogNativeHtml = ap_blog_native_page(
+                  (int) $vaakOwnerId,
+                  (string) $vaakActorKey,
+                  (string) ap_auth_csrf_token(),
+                  trim((string) ($_GET['edit'] ?? $_GET['draft'] ?? '')),
+                  is_array($GLOBALS['vaak_blog_result'] ?? null) ? $GLOBALS['vaak_blog_result'] : null,
+                  ($_SERVER['REQUEST_METHOD'] ?? '') === 'POST' && (string) ($_POST['action'] ?? '') === 'blog_save' && is_string($error) && $error !== '',
+                  $blogNostrOk
+              );
+          }
           $editingSlug = trim((string) ($_GET['draft'] ?? ''));
           $editingDraft = $editingSlug !== '' ? ap_blog_post_get($vaakActorKey, $editingSlug, false) : null;
           if (!is_array($editingDraft) || (string) ($editingDraft['status'] ?? '') !== 'draft') {
@@ -30841,7 +30862,7 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
           }
           $blogEditorTags = $blogSubmitted ? (string) ($_POST['blog_tags'] ?? '')
               : implode(' ', array_map(static fn($tag): string => '#' . (string) $tag, (array) ($editingDraft['tags'] ?? [])));
-          $blogShadow = admin_you_projection_axum_fetch('blog', (int) $vaakOwnerId, 100);
+          $blogShadow = $blogNativeHtml === null ? admin_you_projection_axum_fetch('blog', (int) $vaakOwnerId, 100) : ['rows' => []];
           if (is_array($blogShadow)) {
               $blogRows = array_map(static function (array $row): array {
                   $row['tags'] = ap_blog_tags_decode($row['tags_json'] ?? '[]');
@@ -30859,14 +30880,18 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
           if ($blogPost):
         ?>
           <article class="side-card blog-post-card">
+            <?php if (str_starts_with((string) ($blogPost['cover_url'] ?? ''), 'https://')): ?><img class="blog-post-cover" src="<?= h((string) $blogPost['cover_url']) ?>" alt="<?= h((string) ($blogPost['cover_alt'] ?? '')) ?>"><?php endif; ?>
             <div class="meta">Blog<?= ($blogPost['category'] ?? '') !== '' ? ' · ' . h((string) $blogPost['category']) : '' ?></div>
             <h2><?= h((string) ($blogPost['title'] ?? 'Untitled')) ?></h2>
-            <div class="meta"><?= h((string) ($blogPost['published_at'] ?? $blogPost['created_at'] ?? '')) ?></div>
+            <?php if ((string) ($blogPost['subtitle'] ?? '') !== ''): ?><p class="blog-post-subtitle"><?= h((string) $blogPost['subtitle']) ?></p><?php endif; ?>
+            <div class="meta"><?= h((string) ($blogPost['published_at'] ?? $blogPost['created_at'] ?? '')) ?><?= (string) ($blogPost['status'] ?? '') !== 'published' ? ' · ' . h(ucfirst((string) ($blogPost['status'] ?? 'draft'))) : '' ?></div>
             <?php if (!empty($blogPost['tags'])): ?><p class="meta">#<?= h(implode(' #', (array) $blogPost['tags'])) ?></p><?php endif; ?>
             <?php if (str_starts_with((string) ($blogPost['canonical_url'] ?? ''), 'https://')): ?><p class="meta"><a href="<?= h((string) $blogPost['canonical_url']) ?>" target="_blank" rel="noopener noreferrer">Open original site post</a></p><?php endif; ?>
-            <div class="blog-post-body"><?= admin_blog_markdown_html((string) ($blogPost['body_markdown'] ?? '')) ?></div>
-            <p class="composer-actions"><a class="btn btn-ghost" href="?view=blog">← All blog posts</a> <a class="btn btn-ghost" href="?view=blog&amp;post=<?= h(rawurlencode((string) $blogPost['slug'])) ?>&amp;format=jekyll">Download Jekyll Markdown</a></p>
+            <div class="blog-post-body"><?= (string) ($blogPost['body_html'] ?? '') !== '' ? (string) $blogPost['body_html'] : admin_blog_markdown_html((string) ($blogPost['body_markdown'] ?? '')) ?></div>
+            <p class="composer-actions"><a class="btn btn-ghost" href="?view=blog">← All blog posts</a> <?php if (getenv('VAAK_BLOG_NATIVE') === '1'): ?><a class="btn btn-ghost" href="?view=blog&amp;edit=<?= h(rawurlencode((string) $blogPost['slug'])) ?>">Edit</a> <?php endif; ?><a class="btn btn-ghost" href="?view=blog&amp;post=<?= h(rawurlencode((string) $blogPost['slug'])) ?>&amp;format=jekyll">Download Jekyll Markdown</a></p>
           </article>
+        <?php elseif (is_string($blogNativeHtml)): ?>
+          <?= $blogNativeHtml ?>
         <?php else: ?>
           <section class="side-card blog-editor">
             <div class="meta">Long-form publishing · Markdown-compatible (**bold**, *italics*, headings, lists, and links)</div>
@@ -37528,9 +37553,10 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
               <article class="remote-profile-blog-post">
                 <div class="meta">Blog<?= ($rpBlogPost['category'] ?? '') !== '' ? ' · ' . h((string) $rpBlogPost['category']) : '' ?></div>
                 <h2><?= h((string) ($rpBlogPost['title'] ?? 'Untitled')) ?></h2>
+                <?= function_exists('ap_blog_header_html') ? ap_blog_header_html($rpBlogPost) : '' ?>
                 <div class="meta"><?= h((string) ($rpBlogPost['published_at'] ?? $rpBlogPost['created_at'] ?? '')) ?></div>
                 <?php if (!empty($rpBlogPost['tags'])): ?><p class="meta">#<?= h(implode(' #', (array) $rpBlogPost['tags'])) ?></p><?php endif; ?>
-                <div class="note-body"><?= function_exists('admin_blog_markdown_html') ? admin_blog_markdown_html((string) ($rpBlogPost['body_markdown'] ?? '')) : h((string) ($rpBlogPost['body_markdown'] ?? '')) ?></div>
+                <div class="note-body"><?= (string) ($rpBlogPost['body_html'] ?? '') !== '' ? (string) $rpBlogPost['body_html'] : (function_exists('admin_blog_markdown_html') ? admin_blog_markdown_html((string) ($rpBlogPost['body_markdown'] ?? '')) : h((string) ($rpBlogPost['body_markdown'] ?? ''))) ?></div>
                 <p class="composer-actions"><a class="btn btn-ghost" href="<?= h($rpTabHref . 'blog') ?>">← All blog posts</a></p>
               </article>
             <?php elseif ($rpBlogPosts === []): ?>

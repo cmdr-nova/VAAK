@@ -793,6 +793,17 @@ SQL);
             $db->exec("ALTER TABLE vaak_blog_posts ADD COLUMN IF NOT EXISTS canonical_url TEXT NOT NULL DEFAULT ''");
             ap_schema_remember_column($db, 'vaak_blog_posts', 'canonical_url', "''::text");
         }
+        // Blog composer v2: subtitle, own summary, cover, rendered HTML, schedule and teaser options.
+        foreach (ap_blog_v2_columns() as $blogColumn => [$blogDdl, $blogDefault]) {
+            if (!ap_schema_has_column($db, 'vaak_blog_posts', $blogColumn)) {
+                $db->exec('ALTER TABLE vaak_blog_posts ADD COLUMN IF NOT EXISTS ' . $blogColumn . ' ' . $blogDdl);
+                ap_schema_remember_column($db, 'vaak_blog_posts', $blogColumn, $blogDefault);
+            }
+        }
+        if (!ap_schema_has_index($db, 'idx_vaak_blog_scheduled')) {
+            $db->exec('CREATE INDEX IF NOT EXISTS idx_vaak_blog_scheduled ON vaak_blog_posts(status, scheduled_at)');
+            ap_schema_remember_index($db, 'idx_vaak_blog_scheduled');
+        }
     } catch (Throwable $e) {
         error_log('[ap-db] blog table not provisioned: ' . $e->getMessage());
     }
@@ -1792,6 +1803,12 @@ SQL);
         $blogCols = $db->query('PRAGMA table_info(vaak_blog_posts)')->fetchAll();
         if ($blogCols && !in_array('canonical_url', array_column($blogCols, 'name'), true)) {
             $db->exec("ALTER TABLE vaak_blog_posts ADD COLUMN canonical_url TEXT NOT NULL DEFAULT ''");
+        }
+        $blogColNames = $blogCols ? array_column($blogCols, 'name') : [];
+        foreach (ap_blog_v2_columns() as $blogColumn => [$blogDdl, $blogDefault]) {
+            if ($blogCols && !in_array($blogColumn, $blogColNames, true)) {
+                $db->exec('ALTER TABLE vaak_blog_posts ADD COLUMN ' . $blogColumn . ' ' . str_replace('BIGINT', 'INTEGER', $blogDdl));
+            }
         }
     } catch (Throwable $e) {
         // The table is created above on fresh SQLite databases.
@@ -8221,6 +8238,34 @@ function ap_outbox_store(array $note): void
     ap_home_recommendation_record_publication($note, is_array($decoded) ? $decoded : []);
 }
 
+/**
+ * Columns added for the blog composer v2 (subtitle, own summary, cover image,
+ * Rust-rendered body, scheduling and teaser options), as name => [DDL, default].
+ * Defaults reproduce the original behaviour, so rows written by older callers
+ * (Shana's form posts, site publishing) keep publishing a public teaser with
+ * the title as content warning and the usual Bluesky mirror.
+ *
+ * @return array<string, array{0:string,1:mixed}>
+ */
+function ap_blog_v2_columns(): array
+{
+    return [
+        'subtitle' => ["TEXT NOT NULL DEFAULT ''", "''::text"],
+        'summary' => ["TEXT NOT NULL DEFAULT ''", "''::text"],
+        'body_html' => ["TEXT NOT NULL DEFAULT ''", "''::text"],
+        'cover_url' => ["TEXT NOT NULL DEFAULT ''", "''::text"],
+        'cover_alt' => ["TEXT NOT NULL DEFAULT ''", "''::text"],
+        'cover_media_id' => ['BIGINT', null],
+        'cover_teaser_media_id' => ['BIGINT', null],
+        'scheduled_at' => ['TEXT', null],
+        'teaser_visibility' => ["TEXT NOT NULL DEFAULT 'public'", "'public'::text"],
+        'teaser_cw' => ['SMALLINT NOT NULL DEFAULT 1', '1'],
+        'teaser_bsky' => ['SMALLINT NOT NULL DEFAULT 1', '1'],
+        'teaser_nostr' => ['SMALLINT NOT NULL DEFAULT 0', '0'],
+        'last_error' => ["TEXT NOT NULL DEFAULT ''", "''::text"],
+    ];
+}
+
 function ap_blog_slug(string $title, string $suffix = ''): string
 {
     $slug = strtolower(trim($title));
@@ -8458,6 +8503,128 @@ function ap_blog_mark_published(string $actorKey, string $slug): bool
         return $st->rowCount() > 0;
     } catch (Throwable $e) {
         return false;
+    }
+}
+
+/**
+ * A blog post's body HTML: the stored Rust render when present, else the
+ * page's original renderer (posts saved before blog composer v2, or while
+ * the worker was down).
+ *
+ * @param array<string, mixed> $post
+ * @param callable(string): string $legacy
+ */
+function ap_blog_body_html(array $post, callable $legacy): string
+{
+    $html = (string) ($post['body_html'] ?? '');
+    return $html !== '' ? $html : $legacy((string) ($post['body_markdown'] ?? ''));
+}
+
+/**
+ * Cover image and subtitle shown above a blog post's body ('' when none).
+ *
+ * @param array<string, mixed> $post
+ */
+function ap_blog_header_html(array $post): string
+{
+    $out = '';
+    $cover = (string) ($post['cover_url'] ?? '');
+    if (str_starts_with($cover, 'https://')) {
+        $out .= '<img class="blog-post-cover" src="' . htmlspecialchars($cover, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8')
+            . '" alt="' . htmlspecialchars((string) ($post['cover_alt'] ?? ''), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '" loading="lazy">';
+    }
+    $sub = trim((string) ($post['subtitle'] ?? ''));
+    if ($sub !== '') {
+        $out .= '<p class="blog-post-subtitle">' . htmlspecialchars($sub, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '</p>';
+    }
+    return $out;
+}
+
+/**
+ * Update whitelisted columns of one owned blog row (any status).
+ *
+ * @param array<string, mixed> $fields
+ */
+function ap_blog_update_fields(int $ownerUserId, string $actorKey, string $slug, array $fields): bool
+{
+    $allowed = [
+        'slug', 'title', 'category', 'tags_json', 'body_markdown', 'excerpt', 'status', 'note_id', 'published_at',
+        'subtitle', 'summary', 'body_html', 'cover_url', 'cover_alt', 'cover_media_id', 'cover_teaser_media_id',
+        'scheduled_at', 'teaser_visibility', 'teaser_cw', 'teaser_bsky', 'teaser_nostr', 'last_error',
+    ];
+    $sets = [];
+    $args = [];
+    foreach ($fields as $column => $value) {
+        if (!in_array($column, $allowed, true)) {
+            continue;
+        }
+        $sets[] = $column . ' = ?';
+        $args[] = $value;
+    }
+    if ($ownerUserId < 1 || $actorKey === '' || $slug === '' || $sets === []) {
+        return false;
+    }
+    $sets[] = 'updated_at = ?';
+    $args[] = ap_db_now();
+    array_push($args, $ownerUserId, $actorKey, $slug);
+    try {
+        $st = ap_db()->prepare('UPDATE vaak_blog_posts SET ' . implode(', ', $sets) . ' WHERE owner_user_id = ? AND actor_key = ? AND slug = ?');
+        $st->execute($args);
+        return $st->rowCount() > 0;
+    } catch (Throwable $e) {
+        error_log('[ap-db] blog update: ' . $e->getMessage());
+        return false;
+    }
+}
+
+/** Atomically move one owned blog row from one status to another. */
+function ap_blog_claim_status(int $ownerUserId, string $actorKey, string $slug, string $from, string $to): bool
+{
+    try {
+        $st = ap_db()->prepare('UPDATE vaak_blog_posts SET status = ?, updated_at = ? WHERE owner_user_id = ? AND actor_key = ? AND slug = ? AND status = ?');
+        $st->execute([$to, ap_db_now(), $ownerUserId, $actorKey, $slug, $from]);
+        return $st->rowCount() === 1;
+    } catch (Throwable $e) {
+        return false;
+    }
+}
+
+function ap_blog_slug_taken(int $ownerUserId, string $slug): bool
+{
+    try {
+        $st = ap_db()->prepare('SELECT 1 FROM vaak_blog_posts WHERE owner_user_id = ? AND slug = ? LIMIT 1');
+        $st->execute([$ownerUserId, $slug]);
+        return (bool) $st->fetchColumn();
+    } catch (Throwable $e) {
+        return true;
+    }
+}
+
+function ap_blog_delete_row(int $ownerUserId, string $actorKey, string $slug): bool
+{
+    try {
+        $st = ap_db()->prepare('DELETE FROM vaak_blog_posts WHERE owner_user_id = ? AND actor_key = ? AND slug = ?');
+        $st->execute([$ownerUserId, $actorKey, $slug]);
+        return $st->rowCount() > 0;
+    } catch (Throwable $e) {
+        error_log('[ap-db] blog delete: ' . $e->getMessage());
+        return false;
+    }
+}
+
+/**
+ * Scheduled rows (and publishes stuck for 10+ minutes), oldest first.
+ *
+ * @return list<array<string, mixed>>
+ */
+function ap_blog_scheduled_rows(int $limit = 50): array
+{
+    try {
+        $st = ap_db()->prepare("SELECT * FROM vaak_blog_posts WHERE status IN ('scheduled', 'publishing') ORDER BY scheduled_at ASC, id ASC LIMIT " . max(1, min(200, $limit)));
+        $st->execute();
+        return $st->fetchAll() ?: [];
+    } catch (Throwable $e) {
+        return [];
     }
 }
 

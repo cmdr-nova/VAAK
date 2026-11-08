@@ -8802,6 +8802,12 @@ function ap_publish_status_text(
                     . ' err=no_bsky_session owner=' . $bskyOwnerId);
                 $bskyOwnerId = 0;
             }
+            // A blog teaser can opt out of its Bluesky mirror (ap-blog.php).
+            if ($bskyOwnerId > 0 && !empty($GLOBALS['ap_publish_skip_bsky'])) {
+                $bsky = ['ok' => true, 'skipped' => true, 'error' => 'Bluesky mirror turned off for this post'];
+                ap_log('bsky_crosspost_skip local_id=' . $localId . ' err=opted_out');
+                $bskyOwnerId = 0;
+            }
             if ($bskyOwnerId > 0) {
                 if ($pollNorm !== null) {
                     $bsky = ['ok' => true, 'skipped' => true, 'error' => 'Polls are Fediverse-only'];
