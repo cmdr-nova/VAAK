@@ -15,10 +15,21 @@ try {
     require_once __DIR__ . '/ap-action-queue.php';
     require_once __DIR__ . '/ap-inbox.php';
     require_once __DIR__ . '/ap-publish-delivery.php';
+    // Backstop inside the run. If a blocking call ignores the signal, the
+    // next scheduled run kills this one (ap_publish_delivery_reap_stale_holder).
+    if (function_exists('pcntl_alarm') && function_exists('pcntl_signal')) {
+        pcntl_async_signals(true);
+        pcntl_signal(SIGALRM, static function (): void {
+            fwrite(STDERR, sprintf("[%s] publish_delivery timeout after %ds\n", gmdate('c'), AP_PUBLISH_DELIVERY_MAX_SECONDS));
+            exit(2);
+        });
+        pcntl_alarm(AP_PUBLISH_DELIVERY_MAX_SECONDS);
+    }
     $stats = ap_publish_delivery_worker_run($limit);
-    fwrite(STDOUT, sprintf("[%s] publish_delivery claimed=%d succeeded=%d retried=%d failed=%d%s\n",
+    fwrite(STDOUT, sprintf("[%s] publish_delivery claimed=%d succeeded=%d retried=%d failed=%d%s%s\n",
         gmdate('c'), $stats['claimed'], $stats['succeeded'], $stats['retried'], $stats['failed'],
-        !empty($stats['busy']) ? ' busy=1' : ''));
+        !empty($stats['reaped']) ? ' reaped_hung=1' : '',
+        !empty($stats['busy']) ? ' busy=1 (' . ($stats['busy_reason'] ?? '') . ')' : ''));
 } catch (Throwable $e) {
     error_log('[ap-publish-delivery-worker] ' . $e->getMessage());
     fwrite(STDERR, sprintf("[%s] publish_delivery worker failed\n", gmdate('c')));

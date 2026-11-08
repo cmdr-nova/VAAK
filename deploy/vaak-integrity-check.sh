@@ -111,6 +111,21 @@ while IFS='|' read -r kind count; do
   if [[ "${kind}" == failed_action && "${count}" -gt 25 ]]; then warn "${count} failed user actions require review"; fi
 done <<<"${q}"
 
+# Publish queue stall: every new post (Fediverse fan-out and the Bluesky mirror)
+# goes through ap_publish_delivery_queue, drained every minute. A post that has
+# never been attempted after VAAK_PUBLISH_STALL_MINUTES means the worker is not
+# running or a hung run holds its lock (2026-11-05: two days of posts stuck).
+stall_min="${VAAK_PUBLISH_STALL_MINUTES:-15}"
+if [[ ! "${stall_min}" =~ ^[0-9]+$ ]] || (( stall_min < 5 || stall_min > 1440 )); then stall_min=15; fi
+stall_cutoff="$(date -u -d "${stall_min} minutes ago" +%Y-%m-%dT%H:%M:%S+00:00 2>/dev/null || true)"
+if [[ "${stall_cutoff}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\+00:00$ ]]; then
+  stalled="$(runuser -u postgres -- psql -d "${DB_NAME}" -At -F '|' -c "SELECT count(*), coalesce(min(created_at),'') FROM ap_publish_delivery_queue WHERE (status='pending' AND attempts=0 AND created_at < '${stall_cutoff}') OR (status='processing' AND claimed_at < '${stall_cutoff}');" 2>/dev/null || true)"
+  stalled_count="${stalled%%|*}"
+  if [[ "${stalled_count}" =~ ^[0-9]+$ ]] && (( stalled_count > 0 )); then
+    warn "${stalled_count} posts stuck in the publish queue over ${stall_min} min (oldest ${stalled#*|}); Bluesky mirror and Fediverse delivery stalled"
+  fi
+fi
+
 if ! df -P / | awk 'NR==2 {gsub(/%/,"",$5); exit ($5 >= 85 ? 1 : 0)}'; then warn "root filesystem is at or above 85%"; fi
 
 if (( CRIT > 0 )); then notify crit; exit 2; fi
