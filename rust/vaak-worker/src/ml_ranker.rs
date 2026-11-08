@@ -5,6 +5,12 @@
 //! order is untouched. Each nightly run holds out the newest positive
 //! interactions, scores the model against a replay of the live signal
 //! formula, and writes a one-row scorecard.
+//!
+//! Version 3 fades old signals (14-day half-life, same as the live formula).
+//! Version 2 summed 90 days at full strength and lost to the live replay on
+//! 12 of 13 nights (2026-10-26..11-07): it kept ranking old favourites above
+//! the accounts she was engaging with now. The scorecard also carries a
+//! small half-life sweep so one week of runs shows which fade fits best.
 
 use std::collections::{HashMap, HashSet};
 
@@ -17,7 +23,7 @@ use tokio_postgres::Client;
 use crate::{config::Config, db, redis_util};
 
 const MODEL_TTL_SECS: u64 = 7 * 86400;
-const MODEL_VERSION: u32 = 2;
+const MODEL_VERSION: u32 = 3;
 const HISTORY_DAYS: i64 = 180;
 const SIGNAL_LOOKBACK_DAYS: i64 = 90;
 const SIGNAL_ROW_LIMIT: i64 = 10_000;
@@ -48,6 +54,22 @@ const TAG_CLAMP: (f64, f64) = (-4.0, 16.0);
 const MIN_ABS_WEIGHT: f64 = 0.05;
 const LIVE_ACTOR_CLAMP: (f64, f64) = (-3.0, 24.0);
 const LIVE_HALF_LIFE_SECS: f64 = 14.0 * 86_400.0;
+/// Shadow fade. Matches the live half-life so the scorecard isolates what the
+/// shadow does differently (dwell buckets, boosts, quotes, impressions,
+/// bookmark hashtags).
+const SHADOW_HALF_LIFE_DAYS: f64 = 14.0;
+/// Extra half-lives scored each night for comparison only. 0 = no fade (v2).
+const SWEEP_HALF_LIFE_DAYS: [f64; 4] = [7.0, 14.0, 30.0, 0.0];
+
+/// Weight multiplier for a signal `age_secs` old. A half-life of 0 or less
+/// means no fade.
+fn fade(age_secs: i64, half_life_days: f64) -> f64 {
+    if half_life_days <= 0.0 {
+        return 1.0;
+    }
+    let half_life_secs = half_life_days * 86_400.0;
+    (-(age_secs.max(0) as f64) / half_life_secs).exp()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShadowModel {
@@ -63,6 +85,8 @@ pub struct ShadowModel {
     pub holdout_count: i64,
     #[serde(default)]
     pub holdout_days: i64,
+    #[serde(default)]
+    pub half_life_days: f64,
     pub actor_weights: HashMap<String, f64>,
     #[serde(default)]
     pub hashtag_weights: HashMap<String, f64>,
@@ -120,6 +144,8 @@ struct Scorecard {
     top_k_jaccard: f64,
     actors: FamilyScore,
     hashtags: FamilyScore,
+    /// Shadow nDCG@20 at other half-lives, same holdout. Comparison only.
+    decay_sweep: Vec<SweepPoint>,
     weights: Value,
     note: String,
 }
@@ -130,6 +156,13 @@ struct FamilyScore {
     shadow: Option<RankScore>,
     live: Option<RankScore>,
     shadow_minus_live_ndcg_at_20: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SweepPoint {
+    half_life_days: f64,
+    actors_ndcg_at_20: Option<f64>,
+    hashtags_ndcg_at_20: Option<f64>,
 }
 
 struct RankMetrics {
@@ -416,7 +449,7 @@ fn is_held_out(signal: &TrainSignal, cutoff: i64) -> bool {
     signal.created_at >= cutoff && is_holdout_label(&signal.kind, signal.stored_weight)
 }
 
-fn fit_shadow(signals: &[TrainSignal], cutoff: i64) -> Fit {
+fn fit_shadow(signals: &[TrainSignal], cutoff: i64, now: i64, half_life_days: f64) -> Fit {
     let mut actors = HashMap::<String, f64>::new();
     let mut tags = HashMap::<String, f64>::new();
     let mut kinds = HashMap::<String, f64>::new();
@@ -430,8 +463,9 @@ fn fit_shadow(signals: &[TrainSignal], cutoff: i64) -> Fit {
             continue;
         }
         trained += 1;
-        let value = shadow_contribution(&signal.kind, signal.stored_weight);
-        if value > 0.0 {
+        let base = shadow_contribution(&signal.kind, signal.stored_weight);
+        let value = base * fade(now - signal.created_at, half_life_days);
+        if base > 0.0 {
             positive += 1;
         } else {
             negative += 1;
@@ -668,7 +702,7 @@ fn family(shadow_scores: &HashMap<String, f64>, live_scores: &HashMap<String, f6
 
 fn build_scorecard(owner_user_id: i64, signals: &[TrainSignal], now: i64, overlap_k: usize) -> (ShadowModel, Scorecard) {
     let cutoff = now - HOLDOUT_DAYS * 86_400;
-    let fit = fit_shadow(signals, cutoff);
+    let fit = fit_shadow(signals, cutoff, now, SHADOW_HALF_LIFE_DAYS);
     let (overlap, jaccard, candidates) = legacy_overlap(signals, overlap_k);
     let live_actors = live_actor_scores(signals, now, cutoff, LIVE_SIGNAL_ROWS);
     let live_tags = live_tag_counts(signals, cutoff);
@@ -676,6 +710,17 @@ fn build_scorecard(owner_user_id: i64, signals: &[TrainSignal], now: i64, overla
     let tag_labels = tag_grades(signals, cutoff);
     let actors = family(&fit.actors, &live_actors, &actor_labels);
     let hashtags = family(&fit.tags, &live_tags, &tag_labels);
+    let decay_sweep = SWEEP_HALF_LIFE_DAYS
+        .iter()
+        .map(|&days| {
+            let swept = fit_shadow(signals, cutoff, now, days);
+            SweepPoint {
+                half_life_days: days,
+                actors_ndcg_at_20: score_side(&swept.actors, &actor_labels).map(|s| s.ndcg_at_20),
+                hashtags_ndcg_at_20: score_side(&swept.tags, &tag_labels).map(|s| s.ndcg_at_20),
+            }
+        })
+        .collect();
     let model = ShadowModel {
         version: MODEL_VERSION,
         owner_user_id,
@@ -686,6 +731,7 @@ fn build_scorecard(owner_user_id: i64, signals: &[TrainSignal], now: i64, overla
         rows_seen: signals.len() as i64,
         holdout_count: fit.holdout,
         holdout_days: HOLDOUT_DAYS,
+        half_life_days: SHADOW_HALF_LIFE_DAYS,
         actor_weights: fit.actors.clone(),
         hashtag_weights: fit.tags.clone(),
         signal_weights: fit.kinds.clone(),
@@ -705,7 +751,9 @@ fn build_scorecard(owner_user_id: i64, signals: &[TrainSignal], now: i64, overla
         top_k_jaccard: round4(jaccard),
         actors,
         hashtags,
+        decay_sweep,
         weights: json!({
+            "half_life_days": SHADOW_HALF_LIFE_DAYS,
             "favourite": WEIGHT_FAVOURITE,
             "bookmark": WEIGHT_BOOKMARK,
             "dwell": WEIGHT_DWELL,
@@ -727,6 +775,29 @@ fn fmt_side(label: &str, score: &Option<RankScore>) -> String {
     }
 }
 
+fn fmt_opt(value: Option<f64>) -> String {
+    value.map(|v| format!("{v:.3}")).unwrap_or_else(|| "-".into())
+}
+
+fn fmt_sweep(sweep: &[SweepPoint]) -> String {
+    let parts: Vec<String> = sweep
+        .iter()
+        .map(|point| {
+            let label = if point.half_life_days > 0.0 {
+                format!("{}d", point.half_life_days)
+            } else {
+                "nofade".into()
+            };
+            format!(
+                "{label} actors={} tags={}",
+                fmt_opt(point.actors_ndcg_at_20),
+                fmt_opt(point.hashtags_ndcg_at_20)
+            )
+        })
+        .collect();
+    format!("  sweep ndcg@20  {}", parts.join(" | "))
+}
+
 fn human_report(card: &Scorecard) -> String {
     let actor_delta = card
         .actors
@@ -739,7 +810,7 @@ fn human_report(card: &Scorecard) -> String {
         .map(|delta| format!(" ndcg_delta={delta:.3}"))
         .unwrap_or_default();
     format!(
-        "ml-shadow scorecard day={} model={} holdout_days={}\n  train={} holdout_positives={} actors={} tags={}\n  overlap@{}={} jaccard={:.3}\n{}\n{}{actor_delta}\n{}\n{}{tag_delta}",
+        "ml-shadow scorecard day={} model={} holdout_days={}\n  train={} holdout_positives={} actors={} tags={}\n  overlap@{}={} jaccard={:.3}\n{}\n{}{actor_delta}\n{}\n{}{tag_delta}\n{}",
         card.run_on,
         card.model_version,
         card.holdout_days,
@@ -754,6 +825,7 @@ fn human_report(card: &Scorecard) -> String {
         fmt_side("actors live", &card.actors.live),
         fmt_side("tags shadow", &card.hashtags.shadow),
         fmt_side("tags live", &card.hashtags.live),
+        fmt_sweep(&card.decay_sweep),
     )
 }
 
@@ -1113,7 +1185,7 @@ mod tests {
             sig("dwell", 4.0, old_at, "https://old.example/users/c", &["nope"]),
             sig("impression", 1.0, old_at, "https://old.example/users/a", &[]),
         ];
-        let fit = fit_shadow(&signals, cutoff);
+        let fit = fit_shadow(&signals, cutoff, now, 0.0);
         assert!(fit.actors.contains_key("https://old.example/users/a"));
         assert!(!fit.actors.contains_key("https://new.example/users/b"));
         assert!(fit.tags.contains_key("cats"));
@@ -1129,6 +1201,31 @@ mod tests {
         assert_eq!(actor_grades(&signals, cutoff)["https://new.example/users/b"], 3.0);
         assert_eq!(tag_grades(&signals, cutoff).get("dogs"), Some(&1.0));
         assert!(!tag_grades(&signals, cutoff).contains_key("cats"));
+    }
+
+    #[test]
+    fn fade_ranks_recent_engagement_above_old_bulk() {
+        let now = 1_700_000_000i64;
+        let cutoff = now - HOLDOUT_DAYS * 86_400;
+        let day = 86_400i64;
+        assert_eq!(fade(10 * day, 0.0), 1.0);
+        assert!((fade(14 * day, 14.0) - (-1.0f64).exp()).abs() < 1e-9);
+        assert_eq!(fade(-5, 14.0), 1.0);
+        // Five likes on an old favourite 80 days ago, two likes on a new
+        // account last week. No fade keeps the old favourite on top; a
+        // 14-day fade puts the new account first.
+        let mut signals = Vec::new();
+        for _ in 0..5 {
+            signals.push(sig("like", 1.0, now - 80 * day, "https://example/old-fave", &[]));
+        }
+        for _ in 0..2 {
+            signals.push(sig("like", 1.0, now - 5 * day, "https://example/new-pal", &[]));
+        }
+        let flat = fit_shadow(&signals, cutoff, now, 0.0);
+        assert!(flat.actors["https://example/old-fave"] > flat.actors["https://example/new-pal"]);
+        let faded = fit_shadow(&signals, cutoff, now, 14.0);
+        assert!(faded.actors["https://example/new-pal"] > faded.actors.get("https://example/old-fave").copied().unwrap_or(0.0));
+        assert_eq!(faded.positive, 7);
     }
 
     #[test]
@@ -1216,7 +1313,11 @@ mod tests {
             sig("bookmark", 1.0, cutoff - 86_400, "https://example/old", &["cats"]),
         ];
         let (model, card) = build_scorecard(7, &signals, now, 20);
-        assert_eq!(model.version, 2);
+        assert_eq!(model.version, 3);
+        assert_eq!(model.half_life_days, SHADOW_HALF_LIFE_DAYS);
+        assert_eq!(card.decay_sweep.len(), SWEEP_HALF_LIFE_DAYS.len());
+        assert!(card.decay_sweep.iter().all(|p| p.actors_ndcg_at_20.is_some()));
+        assert!(human_report(&card).contains("sweep ndcg@20  7d actors="));
         assert!(!model.actor_weights.contains_key("https://example/new"));
         assert!(model.actor_weights.contains_key("https://example/old"));
         assert!(model.hashtag_weights.contains_key("cats"));
