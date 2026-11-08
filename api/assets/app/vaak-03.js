@@ -517,10 +517,19 @@
     }
     return null;
   }
+  // Only in-app paths and https pages: never javascript:/data: from markup.
+  function safeQuoteHref(raw) {
+    if (!raw || raw === '#') return '';
+    let u;
+    try { u = new URL(raw, window.location.href); } catch (e) { return ''; }
+    if (u.protocol !== 'https:' && !(u.protocol === 'http:' && u.origin === window.location.origin)) return '';
+    return raw.charAt(0) === '?' || raw.charAt(0) === '/' ? raw : u.href;
+  }
   function quoteOpenTarget(qb) {
     const anchor = quoteOpenAnchor(qb);
-    const href = qb.getAttribute('data-href') || (anchor ? anchor.getAttribute('href') : '') || '';
-    if (!href || href === '#') return null;
+    const raw = qb.getAttribute('data-href') || (anchor ? anchor.getAttribute('href') : '') || '';
+    const href = safeQuoteHref(raw);
+    if (!href) return null;
     const external = qb.getAttribute('data-quote-external') === '1'
       || (!qb.hasAttribute('data-href') && !!anchor && anchor.target === '_blank');
     return { href, anchor, external };
@@ -545,7 +554,7 @@
       t.anchor.click();
       return true;
     }
-    window.location.assign(t.href);
+    window.location.assign(new URL(t.href, window.location.href).href);
     return true;
   }
   function onQuoteActivate(ev) {
