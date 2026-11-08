@@ -182,6 +182,7 @@ php_tests=(
   api/bin/timeline-quote-boost-smoke.php
   api/bin/quote-media-layout-smoke.php
   api/bin/wafrn-crosspost-smoke.php
+  api/bin/interaction-twin-smoke.php
 )
 
 # Drivers for isolated PHP fixtures. They do not open Postgres or a worker.

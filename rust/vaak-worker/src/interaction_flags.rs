@@ -6,7 +6,7 @@
 //! module is the Rust parity so likes/boosts/bookmarks survive refresh and stay
 //! consistent with Ice Cubes + Bluesky-synced `masto_*` rows.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
@@ -117,6 +117,106 @@ fn scrub_bsky_record(st: &mut Value, key: &str, active: bool, viewer_did: Option
     }
 }
 
+/// Fediverse and Bluesky copies of one post (Wafrn and other dual-publishers
+/// write the Note URL into the Bluesky record's `fediverseId`; VAAK keeps the
+/// pair in `bsky_post_links`). Keyed both ways by slash-trimmed id.
+pub type Twins = HashMap<String, Vec<String>>;
+
+fn remember_twin(twins: &mut Twins, a: &str, b: &str) {
+    let a = trim_slash(a);
+    let b = trim_slash(b);
+    if a.is_empty() || b.is_empty() || a == b {
+        return;
+    }
+    let list = twins.entry(a.to_string()).or_default();
+    if !list.iter().any(|v| v == b) {
+        list.push(b.to_string());
+    }
+}
+
+/// Add the other copy's keys so a like/boost/bookmark on either copy shows
+/// on both (a mention in Notifications is often the fediverse copy while
+/// Home shows the Bluesky one).
+fn expand_twins(twins: &Twins, status_ids: &mut HashSet<String>, object_ids: &mut HashSet<String>) {
+    if twins.is_empty() {
+        return;
+    }
+    let mut extra = Vec::new();
+    for key in object_ids.iter() {
+        if let Some(list) = twins.get(trim_slash(key)) {
+            extra.extend(list.iter().cloned());
+        }
+    }
+    for key in extra {
+        if key.starts_with("at://") {
+            push_key(status_ids, &bsky_status_key(&key));
+        }
+        push_key(object_ids, &key);
+    }
+}
+
+/// Lookup keys for `bsky_post_links`: at:// URIs, and https object ids
+/// (plus Wafrn's Note form of an activity id).
+fn twin_lookup_keys(object_ids: &HashSet<String>) -> (Vec<String>, Vec<String>) {
+    let mut at = HashSet::new();
+    let mut https = HashSet::new();
+    for key in object_ids {
+        let key = trim_slash(key);
+        if key.starts_with("at://") {
+            at.insert(key.to_string());
+        } else if key.starts_with("https://") && !key.starts_with("https://bsky.app/") {
+            https.insert(key.to_string());
+            https.insert(format!("{key}/"));
+            let canonical = crate::wafrn_crosspost::post_identity(key);
+            if !canonical.is_empty() {
+                https.insert(format!("{canonical}/"));
+                https.insert(canonical);
+            }
+        }
+    }
+    (at.into_iter().collect(), https.into_iter().collect())
+}
+
+pub async fn load_twins(db: &Client, object_ids: &HashSet<String>) -> Twins {
+    let mut twins = Twins::new();
+    let (at, https) = twin_lookup_keys(object_ids);
+    if at.is_empty() && https.is_empty() {
+        return twins;
+    }
+    let rows = db
+        .query(
+            "SELECT bsky_uri, fediverse_id FROM bsky_post_links
+             WHERE fediverse_id IS NOT NULL AND fediverse_id <> ''
+               AND (bsky_uri = ANY($1) OR fediverse_id = ANY($2))",
+            &[&at, &https],
+        )
+        .await;
+    let Ok(rows) = rows else {
+        // Missing table on a fresh box: no twins, flags still apply.
+        return twins;
+    };
+    for row in rows {
+        let uri: String = row.get(0);
+        let fedi: Option<String> = row.get(1);
+        let Some(fedi) = fedi else { continue };
+        let fedi = trim_slash(&fedi).to_string();
+        if !uri.starts_with("at://") || !fedi.starts_with("https://") {
+            continue;
+        }
+        remember_twin(&mut twins, &uri, &fedi);
+        remember_twin(&mut twins, &fedi, &uri);
+        // The status may carry Wafrn's activity id; map that form too.
+        for key in object_ids {
+            let key = trim_slash(key);
+            if key.starts_with("https://") && crate::wafrn_crosspost::post_identity(key) == fedi {
+                remember_twin(&mut twins, key, &uri);
+            }
+        }
+    }
+    twins
+}
+
+#[cfg(test)]
 fn apply_one(
     st: &mut Value,
     fav: &HashSet<String>,
@@ -124,9 +224,21 @@ fn apply_one(
     rb: &HashSet<String>,
     viewer_did: Option<&str>,
 ) {
+    apply_one_with_twins(st, fav, bm, rb, viewer_did, &Twins::new());
+}
+
+fn apply_one_with_twins(
+    st: &mut Value,
+    fav: &HashSet<String>,
+    bm: &HashSet<String>,
+    rb: &HashSet<String>,
+    viewer_did: Option<&str>,
+    twins: &Twins,
+) {
     let mut sids = HashSet::new();
     let mut oids = HashSet::new();
     collect_keys(st, &mut sids, &mut oids);
+    expand_twins(twins, &mut sids, &mut oids);
     let favourited = sids.iter().any(|k| fav.contains(k)) || oids.iter().any(|k| fav.contains(k));
     let bookmarked = sids.iter().any(|k| bm.contains(k)) || oids.iter().any(|k| bm.contains(k));
     let reblogged = sids.iter().any(|k| rb.contains(k)) || oids.iter().any(|k| rb.contains(k));
@@ -140,7 +252,7 @@ fn apply_one(
     if let Some(inner) = st.get_mut("reblog").filter(|v| v.is_object()) {
         // Nested original keeps its own viewer flags (PHP applies recursively).
         let mut nested = inner.clone();
-        apply_one(&mut nested, fav, bm, rb, viewer_did);
+        apply_one_with_twins(&mut nested, fav, bm, rb, viewer_did, twins);
         *inner = nested;
     }
 }
@@ -276,22 +388,25 @@ pub async fn apply_to_statuses(db: &Client, owner_user_id: i64, statuses: &mut [
                 }
             }
             if status_ids.is_empty() && object_ids.is_empty() {
-                Ok((HashSet::new(), HashSet::new(), HashSet::new()))
+                Ok::<_, anyhow::Error>((HashSet::new(), HashSet::new(), HashSet::new(), Twins::new()))
             } else {
+                let twins = load_twins(db, &object_ids).await;
+                expand_twins(&twins, &mut status_ids, &mut object_ids);
                 let sid_list: Vec<String> = status_ids.into_iter().collect();
                 let oid_list: Vec<String> = object_ids.into_iter().collect();
-                load_hits(db, owner_user_id, &sid_list, &oid_list).await
+                let (fav, bm, rb) = load_hits(db, owner_user_id, &sid_list, &oid_list).await?;
+                Ok((fav, bm, rb, twins))
             }
         } else {
-            Ok((HashSet::new(), HashSet::new(), HashSet::new()))
+            Ok::<_, anyhow::Error>((HashSet::new(), HashSet::new(), HashSet::new(), Twins::new()))
         }
     };
     let (viewer_did, hits) = tokio::join!(viewer_did_fut, hits_fut);
-    let (fav, bm, rb) = hits?;
+    let (fav, bm, rb, twins) = hits?;
     let did = viewer_did.as_deref();
     for st in statuses.iter_mut() {
         if st.is_object() {
-            apply_one(st, &fav, &bm, &rb, did);
+            apply_one_with_twins(st, &fav, &bm, &rb, did, &twins);
         }
     }
     Ok(())
@@ -405,6 +520,50 @@ mod tests {
         assert!(st.get("vaak_bsky_repost_record").is_none());
         assert_eq!(st["reblog"]["favourited"], json!(false));
         assert_eq!(st["reblog"]["reblogged"], json!(false));
+    }
+
+    #[test]
+    fn twin_copy_shares_like_both_ways() {
+        let fedi = "https://mu.social/fediverse/post/abc";
+        let at = "at://did:plc:wafrn/app.bsky.feed.post/xyz";
+        let mut twins = Twins::new();
+        remember_twin(&mut twins, at, fedi);
+        remember_twin(&mut twins, fedi, at);
+
+        // Liked on Bluesky (Home): the fediverse mention in Notifications shows it.
+        let mut fav = HashSet::new();
+        push_key(&mut fav, &bsky_status_key(at));
+        let mut mention = json!({ "id": "5511", "uri": fedi, "url": fedi });
+        apply_one_with_twins(&mut mention, &fav, &HashSet::new(), &HashSet::new(), None, &twins);
+        assert_eq!(mention["favourited"], json!(true));
+        assert_eq!(mention["reblogged"], json!(false));
+
+        // Bookmarked on the fediverse copy: the Bluesky card shows it.
+        let mut bm = HashSet::new();
+        push_key(&mut bm, fedi);
+        let mut card = json!({ "id": at, "uri": at, "url": "https://bsky.app/profile/did:plc:wafrn/post/xyz" });
+        apply_one_with_twins(&mut card, &HashSet::new(), &bm, &HashSet::new(), None, &twins);
+        assert_eq!(card["bookmarked"], json!(true));
+        assert_eq!(card["favourited"], json!(false));
+
+        // No link, no sharing.
+        let mut other = json!({ "id": "77", "uri": "https://mu.social/fediverse/post/other" });
+        apply_one_with_twins(&mut other, &fav, &bm, &HashSet::new(), None, &twins);
+        assert_eq!(other["favourited"], json!(false));
+        assert_eq!(other["bookmarked"], json!(false));
+    }
+
+    #[test]
+    fn twin_lookup_keys_cover_wafrn_activity_ids() {
+        let mut oids = HashSet::new();
+        push_key(&mut oids, "https://mu.social/fediverse/activity/post/abc");
+        push_key(&mut oids, "at://did:plc:x/app.bsky.feed.post/1");
+        push_key(&mut oids, "https://bsky.app/profile/did:plc:x/post/1");
+        let (at, https) = twin_lookup_keys(&oids);
+        assert_eq!(at, vec!["at://did:plc:x/app.bsky.feed.post/1".to_string()]);
+        assert!(https.contains(&"https://mu.social/fediverse/post/abc".to_string()));
+        assert!(https.contains(&"https://mu.social/fediverse/activity/post/abc".to_string()));
+        assert!(!https.iter().any(|k| k.contains("bsky.app")));
     }
 
     #[test]

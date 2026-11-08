@@ -1668,6 +1668,9 @@ $vaakAdminOnlyActions = [
                         echo json_encode(['ok' => true, 'queued' => true, 'queue_id' => $queue['id'],
                             'revision' => $queue['revision'], 'coalesced' => $queue['coalesced'] ?? false,
                             'kind' => 'reblog', 'active' => $action === 'reblog_status', 'status_id' => $statusId,
+                            'object_id' => $boostObjectId,
+                            // A fediverse boost already mirrors onto the Bluesky twin.
+                            'twin_keys' => function_exists('ap_interaction_twin_keys') ? ap_interaction_twin_keys($boostObjectId) : [],
                             'notice' => ''], JSON_UNESCAPED_SLASHES);
                         exit;
                     }
@@ -1748,6 +1751,15 @@ $vaakAdminOnlyActions = [
                         if ($kind === 'bookmark' && $desired && function_exists('vaak_bookmark_folders_for_status')) {
                             $folderIds = vaak_bookmark_folders_for_status($statusId, $vaakOwnerId);
                         }
+                        // Fediverse and Bluesky copies of one post share state:
+                        // undo clears the twin too, and the client syncs both cards.
+                        $twinKeys = [];
+                        if ($targetKey !== '' && function_exists('ap_interaction_twin_undo')) {
+                            $twinKind = $kind === 'favourite' ? 'like' : 'bookmark';
+                            $twinKeys = $desired
+                                ? ap_interaction_twin_keys($targetKey)
+                                : ap_interaction_twin_undo($vaakOwnerId, $twinKind, $targetKey);
+                        }
                         header('Content-Type: application/json; charset=utf-8');
                         header('Cache-Control: no-store');
                         http_response_code(202);
@@ -1761,6 +1773,7 @@ $vaakAdminOnlyActions = [
                             'active' => $desired,
                             'status_id' => $statusId,
                             'object_id' => $targetKey,
+                            'twin_keys' => $twinKeys,
                             'folder_ids' => $folderIds,
                             'open_folder_picker' => $kind === 'bookmark' && $desired,
                             'notice' => '',
@@ -4278,11 +4291,18 @@ $vaakAdminOnlyActions = [
                             // non-fatal
                         }
                     }
+                    $twinKeys = [];
+                    if (function_exists('ap_interaction_twin_undo')) {
+                        $twinKeys = $desired
+                            ? ap_interaction_twin_keys($subject)
+                            : ap_interaction_twin_undo($vaakOwnerId, $queueKind, $subject);
+                    }
                     header('Content-Type: application/json; charset=utf-8');
                     header('Cache-Control: no-store');
                     http_response_code(202);
                     echo json_encode(['ok' => true, 'queued' => true, 'queue_id' => $queue['id'],
                         'revision' => $queue['revision'], 'coalesced' => $queue['coalesced'] ?? false,
+                        'twin_keys' => $twinKeys,
                         'action' => $action, 'kind' => $queueKind === 'like' ? 'favourite' : ($queueKind === 'boost' ? 'reblog' : 'bookmark'),
                         'uri' => $subject, 'cid' => $cid, 'active' => $desired,
                         'liked' => $queueKind === 'like' ? $desired : null,
@@ -28742,7 +28762,8 @@ function admin_render_notification_card(array $n, array $followingIds, array $fo
     <?php endif; ?>
     <?php if ($nMedia !== [] && !$nEmbedded && !in_array($nType, ['favourite', 'reblog', 'update', 'poll', 'status'], true)): ?><div class="notification-media"><?= admin_media_row_html($nMedia) ?></div><?php endif; ?>
     <div class="tweet-actions">
-      <?php if ($profileHref !== ''): ?>
+      <?php /* The header links the profile; cards that carry a post skip the extra button. */ ?>
+      <?php if ($profileHref !== '' && !is_array($nStatus)): ?>
         <a class="btn btn-ghost" href="<?= h($profileHref) ?>" style="padding:.25rem .7rem;font-size:.8rem">Profile</a>
       <?php endif; ?>
       <?php if (!$nEmbedded && in_array($nType, ['mention', 'quote'], true) && $nStatusUri !== ''): ?>
