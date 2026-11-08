@@ -295,26 +295,31 @@ fn is_public_audience(id: &str) -> bool {
 
 /// The prediction string: the result, then ` {owner} {object_id}` when a
 /// notification row is stored.
-fn interaction_outcome(private: bool, mention: Option<(i64, String)>) -> String {
+/// `local_observe {owner} {object_id}` for a notification row, else
+/// `local_observe {owner}`: the recipient goes along so the drain checks only
+/// that account's rows. One activity delivered to several local inboxes
+/// gives one notification, to the note's owner, and the other recipients'
+/// predictions must not count it against themselves.
+fn interaction_outcome(private: bool, owner: i64, mention: Option<String>) -> String {
     if private {
         return "local_private_interaction_skipped".to_string();
     }
     match mention {
-        Some((owner, id)) => format!("local_observe {owner} {id}"),
-        None => "local_observe".to_string(),
+        Some(id) => format!("local_observe {owner} {id}"),
+        None => format!("local_observe {owner}"),
     }
 }
 
 async fn predict_interaction(db: &Client, it: &Interaction, path: &str) -> anyhow::Result<String> {
     if !it.public && object_is_private(db, &it.object).await? {
-        return Ok(interaction_outcome(true, None));
+        return Ok(interaction_outcome(true, 0, None));
     }
     let (owner, owner_actor) = recipient_owner(db, it, path).await?;
     let actor = it.actor.trim_end_matches('/');
     let ours = format!("{owner_actor}/notes/");
     let mention = (actor != owner_actor && it.object.trim_end_matches('/').starts_with(&ours))
-        .then(|| (owner, crate::inbox_route_undo::stable_interaction_id(&it.object, &it.actor, it.kind)));
-    Ok(interaction_outcome(false, mention))
+        .then(|| crate::inbox_route_undo::stable_interaction_id(&it.object, &it.actor, it.kind));
+    Ok(interaction_outcome(false, owner, mention))
 }
 
 /// `ap_local_object_is_private`.
@@ -520,9 +525,9 @@ mod tests {
 
     #[test]
     fn interaction_outcomes() {
-        assert_eq!(interaction_outcome(true, Some((1, "x".into()))), "local_private_interaction_skipped");
-        assert_eq!(interaction_outcome(false, None), "local_observe");
-        assert_eq!(interaction_outcome(false, Some((3, "https://e/n#like-abc".into()))), "local_observe 3 https://e/n#like-abc");
+        assert_eq!(interaction_outcome(true, 1, Some("x".into())), "local_private_interaction_skipped");
+        assert_eq!(interaction_outcome(false, 7, None), "local_observe 7");
+        assert_eq!(interaction_outcome(false, 3, Some("https://e/n#like-abc".into())), "local_observe 3 https://e/n#like-abc");
         assert_eq!(normalize_visibility(" Followers "), "private");
         assert_eq!(normalize_visibility(""), "public");
         assert_eq!(percent_decode("a%5Fb%zz%4"), "a_b%zz%4");

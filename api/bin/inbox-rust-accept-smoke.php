@@ -241,7 +241,16 @@ $f5Cases = [
         "local_observe {$f5} " . $stable($f5Note, 'reblog')],
     ['shared-inbox like of another account\'s note', '/inbox',
         ['id' => $alice . '#likes/f5-5', 'type' => 'Like', 'actor' => $alice, 'object' => $f5Note . '/'],
-        'local_observe'],
+        'local_observe 1'],
+    // One boost delivered to two local inboxes: only the note's owner is
+    // notified, and the shared-inbox copy must not count that row against
+    // its own recipient.
+    ['fan-in boost, owner\'s inbox', '/users/f5_owner/inbox',
+        ['id' => $alice . '#boost/f5-8', 'type' => 'Announce', 'actor' => $alice, 'object' => $f5Note, 'to' => $public],
+        "local_observe {$f5} " . $stable($f5Note, 'reblog')],
+    ['fan-in boost, shared inbox', '/inbox',
+        ['id' => $alice . '#boost/f5-8', 'type' => 'Announce', 'actor' => $alice, 'object' => $f5Note, 'to' => $public],
+        'local_observe 1'],
     ['like of a private note', '/users/f5_owner/inbox',
         ['id' => $alice . '#likes/f5-6', 'type' => 'Like', 'actor' => $alice, 'object' => $f5Private],
         'local_private_interaction_skipped'],
@@ -252,7 +261,7 @@ foreach ($f5Cases as [$label, $path, $doc, $want]) {
     [$status] = smoke_post($rust, $path, $body, $aliceKey, $priv);
     $check($status === 202, "F5: {$label} is spooled (got {$status})");
     $predicted = $db->query("SELECT r.rust_result FROM ap_inbox_spool s JOIN ap_inbox_route_shadow r ON r.spool_id = s.id
-                             WHERE s.body = " . $db->quote($body))->fetchColumn();
+                             WHERE s.body = " . $db->quote($body) . ' AND s.request_path = ' . $db->quote($path))->fetchColumn();
     $check($predicted === $want, "F5: Rust predicts the {$label} (got " . var_export($predicted, true) . ')');
 }
 // A wrong prediction must be caught: this one names a row PHP never writes.
@@ -262,13 +271,14 @@ $db->exec("UPDATE ap_inbox_route_shadow SET rust_result = 'local_observe 1 https
            WHERE spool_id = (SELECT id FROM ap_inbox_spool WHERE body = " . $db->quote($wrong) . ")");
 shell_exec('VAAK_FPM_POOL_CONF=/nonexistent ' . $cmd);
 foreach ($f5Cases as [$label, $path, $doc, $want]) {
-    $result = $db->query("SELECT result FROM ap_inbox_spool WHERE body = " . $db->quote(json_encode($doc, JSON_UNESCAPED_SLASHES)))->fetchColumn();
+    $result = $db->query("SELECT result FROM ap_inbox_spool WHERE body = " . $db->quote(json_encode($doc, JSON_UNESCAPED_SLASHES))
+        . ' AND request_path = ' . $db->quote($path))->fetchColumn();
     $check($result === explode(' ', $want)[0], "F5: PHP routes the {$label} the same (got " . var_export($result, true) . ')');
 }
 $shadow = $redis->hGetAll('vaak:inbox_route_shadow:stats:v1');
 $check((int) ($shadow['agree'] ?? 0) === count($f5Cases) && !isset($shadow['skipped']),
     'F5: the drain agrees on every result and notification row (' . json_encode($shadow) . ')');
-$check((int) ($shadow['agree:local_observe+mention'] ?? 0) === 4, 'F5: four of them are notifications');
+$check((int) ($shadow['agree:local_observe+mention'] ?? 0) === 5, 'F5: five of them are notifications');
 $check((int) ($shadow['disagree'] ?? 0) === 1 && (int) ($shadow['disagree:local_observe+mention'] ?? 0) === 1,
     'F5: a prediction naming a missing notification row is a disagreement');
 
