@@ -1142,6 +1142,7 @@ pub(crate) fn actor_doc_is_bot(profile: &Value) -> bool {
     typed || profile.get("isBot").and_then(Value::as_bool).unwrap_or(false)
 }
 
+#[derive(Clone, Default)]
 struct OutboxRow {
     id: String,
     published: String,
@@ -2110,14 +2111,13 @@ fn materialize_outbox(
     }
     if !row.quote_object.trim().is_empty() {
         let target = row.quote_object.trim().trim_end_matches('/');
-        let quoted_account = empty_account(
-            target,
-            "quoted",
-            "Quoted post",
-            LOCAL_DEFAULT_AVATAR,
-            target,
-            LOCAL_DEFAULT_AVATAR,
-        );
+        // Placeholder until hydrate_local_quote_targets fills the quoted post.
+        // A local target names its author in the URL, so show that person
+        // rather than an anonymous card.
+        let quoted_account = match local_note_author(target) {
+            Some(user) => local_account_from_profile(&format!("{LOCAL_ACTOR_PREFIX}{user}"), user, profiles),
+            None => empty_account(target, "quoted", "quoted", "Quoted post", target, LOCAL_DEFAULT_AVATAR),
+        };
         let quoted = json!({
             "id": target,
             "uri": target,
@@ -2187,20 +2187,44 @@ pub(crate) async fn hydrate_local_quote_targets(db: &Client, statuses: &mut [Val
     let bsky_quotes = fetch_bsky_map_for_targets(db, &bsky_targets)
         .await
         .unwrap_or_default();
-    let local_targets: Vec<String> = targets
+    // Local notes: the canonical /users/<u>/notes/<id> form, its web alias
+    // (/@<u>/<id>), a stored trailing slash, or the Bluesky copy of a local
+    // post (bsky_crossposts) all resolve to the same outbox row.
+    let crosspost_uris: Vec<String> = targets
         .iter()
-        .filter(|target| target.starts_with(LOCAL_ACTOR_PREFIX))
-        .cloned()
+        .filter_map(|target| bsky_crosspost_key(target))
         .collect();
-    let rows = db.query(
-        "SELECT o.id, COALESCE(o.content,''), COALESCE(o.raw_create_json,''), COALESCE(m.spoiler_text,''), COALESCE(m.sensitive,0)::bigint
-         FROM outbox_notes o LEFT JOIN LATERAL (SELECT spoiler_text,sensitive FROM masto_statuses WHERE note_id=o.id OR note_id=o.id||'/' ORDER BY CASE WHEN note_id=o.id THEN 0 ELSE 1 END,local_id DESC LIMIT 1) m ON true
-         WHERE o.id=ANY($1)",
-        &[&local_targets],
-    ).await.context("select local quote targets")?;
-    let local_keys: Vec<String> = local_targets.iter().filter_map(|uri| uri.strip_prefix(LOCAL_ACTOR_PREFIX).and_then(|rest| rest.split('/').next()).map(str::to_string)).collect();
+    let crossposts: HashMap<String, String> = if crosspost_uris.is_empty() {
+        HashMap::new()
+    } else {
+        db.query(
+            "SELECT bsky_uri, rtrim(note_id,'/') FROM bsky_crossposts WHERE bsky_uri = ANY($1)",
+            &[&crosspost_uris],
+        )
+        .await
+        .map(|rows| rows.iter().map(|row| (row.get::<_, String>(0), row.get::<_, String>(1))).collect())
+        .unwrap_or_default()
+    };
+    let mut local_aliases: HashMap<String, Vec<String>> = HashMap::new();
+    for target in &targets {
+        for note in local_note_candidates(target, &crossposts) {
+            local_aliases.entry(note).or_default().push(target.clone());
+        }
+    }
+    let local_candidates: Vec<String> = local_aliases.keys().cloned().collect();
+    let rows = if local_candidates.is_empty() {
+        Vec::new()
+    } else {
+        db.query(
+            "SELECT o.id, COALESCE(o.content,''), COALESCE(o.raw_create_json,''), COALESCE(m.spoiler_text,''), COALESCE(m.sensitive,0)::bigint
+             FROM outbox_notes o LEFT JOIN LATERAL (SELECT spoiler_text,sensitive FROM masto_statuses WHERE note_id=o.id OR note_id=o.id||'/' ORDER BY CASE WHEN note_id=o.id THEN 0 ELSE 1 END,local_id DESC LIMIT 1) m ON true
+             WHERE o.id=ANY($1) OR o.id=ANY($2)",
+            &[&local_candidates, &local_candidates.iter().map(|id| format!("{id}/")).collect::<Vec<_>>()],
+        ).await.context("select local quote targets")?
+    };
+    let local_keys: Vec<String> = local_candidates.iter().filter_map(|uri| uri.strip_prefix(LOCAL_ACTOR_PREFIX).and_then(|rest| rest.split('/').next()).map(str::to_string)).collect();
     let profiles = fetch_local_profiles_map(db, &local_keys).await?;
-    let mut by_target = HashMap::new();
+    let mut by_target: HashMap<String, Value> = HashMap::new();
     for row in rows {
         let id: String = row.get(0);
         let id = id.trim_end_matches('/').to_string();
@@ -2212,7 +2236,7 @@ pub(crate) async fn hydrate_local_quote_targets(db: &Client, statuses: &mut [Val
         // Explicit current raw empty/false clears older cached presentation.
         let spoiler=object.as_ref().and_then(|value|value.get("summary")).map(|value|value.as_str().unwrap_or("").to_owned()).unwrap_or_else(||row.get::<_,String>(3));
         let sensitive=object.as_ref().and_then(|value|value.get("sensitive")).map(|value|value.as_bool().unwrap_or(false)).unwrap_or_else(||row.get::<_,i64>(4)!=0);
-        by_target.insert(id.clone(), json!({
+        let quoted = json!({
             "id": id,
             "uri": id,
             "url": id,
@@ -2221,7 +2245,10 @@ pub(crate) async fn hydrate_local_quote_targets(db: &Client, statuses: &mut [Val
             "sensitive": sensitive,
             "account": local_account_from_profile(&format!("{LOCAL_ACTOR_PREFIX}{username}"), username, &profiles),
             "media_attachments": media,
-        }));
+        });
+        for target in local_aliases.get(&id).into_iter().flatten() {
+            by_target.insert(target.clone(), quoted.clone());
+        }
     }
     // Remote Fediverse quote targets are durable firehose Create events, not
     // Bluesky rows. Resolve them from the same event/actor caches used by the
@@ -2244,6 +2271,9 @@ pub(crate) async fn hydrate_local_quote_targets(db: &Client, statuses: &mut [Val
         .await
         .unwrap_or_default();
     for (target, event) in fed_quotes {
+        if by_target.contains_key(&target) {
+            continue;
+        }
         let actor = fed_actors.get(event.actor_id.trim_end_matches('/'));
         let mut quoted = if event.event_type == "Announce" {
             materialize_announce(&event, actor, None, &fed_actors)["reblog"].clone()
@@ -2262,6 +2292,9 @@ pub(crate) async fn hydrate_local_quote_targets(db: &Client, statuses: &mut [Val
         by_target.insert(target, quoted);
     }
     for (target, bsky) in bsky_quotes {
+        if by_target.contains_key(&target) {
+            continue;
+        }
         let mut quoted = materialize_bsky(&bsky);
         let internal_url = format!(
             "?view=status&object={}&from=home",
@@ -2384,6 +2417,47 @@ pub(crate) async fn hydrate_local_quote_targets(db: &Client, statuses: &mut [Val
         }
     }
     Ok(())
+}
+
+/// Username in a local note URL (`/users/<u>/notes/<id>` or `/@<u>/<id>`).
+fn local_note_author(target: &str) -> Option<&str> {
+    let rest = target.trim().trim_end_matches('/');
+    let rest = rest
+        .strip_prefix(LOCAL_ACTOR_PREFIX)
+        .and_then(|r| r.split_once("/notes/").map(|(user, _)| user))
+        .or_else(|| {
+            rest.strip_prefix("https://mkultra.monster/@")
+                .and_then(|r| r.split_once('/').map(|(user, _)| user))
+        })?;
+    (!rest.is_empty() && !rest.contains('/') && !rest.contains('@')).then_some(rest)
+}
+
+/// `at://` key of a Bluesky quote target, for bsky_crossposts lookups.
+fn bsky_crosspost_key(target: &str) -> Option<String> {
+    if target.starts_with("at://") {
+        return Some(target.trim_end_matches('/').to_string());
+    }
+    crate::profile_quote_warm::direct_at_uri(target)
+}
+
+/// Canonical local outbox ids a quote target may name: the note itself, its
+/// web alias, or the local original of a crossposted Bluesky copy.
+fn local_note_candidates(target: &str, crossposts: &HashMap<String, String>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    if let Some(note) = bsky_crosspost_key(target).and_then(|key| crossposts.get(&key)) {
+        out.push(note.trim_end_matches('/').to_string());
+    }
+    if local_note_author(target).is_some() {
+        out.extend(
+            quote_object_candidates(target)
+                .into_iter()
+                .filter(|c| c.starts_with(LOCAL_ACTOR_PREFIX) && c.contains("/notes/")),
+        );
+    }
+    out.retain(|c| c.starts_with(LOCAL_ACTOR_PREFIX));
+    out.sort();
+    out.dedup();
+    out
 }
 
 /// Handle of a quote-summary stub author that was never resolved to a real
@@ -6222,6 +6296,42 @@ mod tests {
                 && !facets.contains(" OR "),
             "{facets}"
         );
+    }
+
+    #[test]
+    fn local_quote_targets_resolve_aliases_and_crossposts() {
+        let note = "https://mkultra.monster/users/shana_flux/notes/abc123";
+        assert_eq!(local_note_author(note), Some("shana_flux"));
+        assert_eq!(local_note_author("https://mkultra.monster/@shana_flux/abc123"), Some("shana_flux"));
+        assert_eq!(local_note_author("https://mastodon.social/@alice/1"), None);
+        let none = HashMap::new();
+        assert_eq!(local_note_candidates(note, &none), vec![note.to_string()]);
+        assert_eq!(local_note_candidates(&format!("{note}/"), &none), vec![note.to_string()]);
+        assert!(local_note_candidates("https://mkultra.monster/@shana_flux/abc123", &none).contains(&note.to_string()));
+        assert!(local_note_candidates("https://mastodon.social/@alice/1", &none).is_empty());
+        let at = "at://did:plc:shana/app.bsky.feed.post/3abc";
+        let mut cross = HashMap::new();
+        cross.insert(at.to_string(), note.to_string());
+        assert_eq!(local_note_candidates(at, &cross), vec![note.to_string()]);
+        assert!(local_note_candidates("at://did:plc:other/app.bsky.feed.post/3x", &cross).is_empty());
+    }
+
+    #[test]
+    fn local_quote_stub_names_the_author_not_the_avatar_url() {
+        let mut row = OutboxRow::default();
+        row.id = "https://mkultra.monster/users/cmdr_nova/notes/q1".into();
+        row.quote_object = "https://mkultra.monster/users/shana_flux/notes/abc123".into();
+        let st = materialize_outbox(&row, "cmdr_nova", &HashMap::new());
+        let account = &st["quote"]["quoted_status"]["account"];
+        assert_eq!(account["acct"], "shana_flux");
+        assert_eq!(account["display_name"], "shana_flux");
+        assert!(account["avatar"].as_str().unwrap_or("").starts_with("https://"));
+        let mut remote = row.clone();
+        remote.quote_object = "https://example.social/notes/9".into();
+        let st = materialize_outbox(&remote, "cmdr_nova", &HashMap::new());
+        let account = &st["quote"]["quoted_status"]["account"];
+        assert_eq!(account["display_name"], "Quoted post");
+        assert_eq!(account["acct"], "quoted");
     }
 
     #[test]
