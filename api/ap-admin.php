@@ -26003,11 +26003,8 @@ if ($isPartial && $view === 'status' && isset($_GET['thread'])) {
         ap_masto_status_flags_prefetch($ids);
     }
     if ($wantAncestors) {
-        if ($stAncestors === []) {
-            echo '<div class="meta status-thread-empty">No earlier posts in this thread on this instance.</div>';
-        } else {
-            echo '<div class="meta status-thread-count meta-row">'
-                . count($stAncestors) . ' earlier in thread</div>';
+        // No label and no empty state: earlier posts simply sit above the focus.
+        if ($stAncestors !== []) {
             foreach ($stAncestors as $anc) {
                 if (is_array($anc)) {
                     admin_render_direct_status_card($anc, $followingIds, $stFrom, false, true);
@@ -35753,7 +35750,6 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
           ?>
           <div id="status-thread-ancestors" data-object="<?= h($stObject) ?>" data-from="<?= h($stFrom) ?>" data-need-more="<?= !empty($stMaybeMoreThread) ? '1' : '0' ?>">
             <?php if ($stAncestors): ?>
-              <div class="meta status-thread-count meta-row"><?= count($stAncestors) ?> earlier in thread</div>
               <?php foreach ($stAncestors as $anc): ?>
                 <?php if (is_array($anc)) {
                     admin_render_masto_status_card($anc, $followingIds, $stFrom, false, true);

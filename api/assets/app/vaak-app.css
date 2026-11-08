@@ -2372,8 +2372,6 @@
     .post-action-menu__body .menu-action-disabled:hover { background: transparent; color: var(--muted); }
     .post-action-menu__body .menu-action.danger { color: var(--danger); }
     .tweet.tweet-focus {
-      outline: 2px solid var(--primary);
-      outline-offset: 2px;
       background: transparent;
     }
     /* Breathing room under ← Home / back on detail pages */

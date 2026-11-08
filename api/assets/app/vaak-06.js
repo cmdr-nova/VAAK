@@ -97,7 +97,10 @@ window.vaakBootStatusThread = function () {
         box.dataset.needMore = '0';
         box.dataset.loading = '0';
         if (!html || !html.trim()) {
-          if (loading) loading.textContent = emptyMsg;
+          if (loading) {
+            if (emptyMsg) loading.textContent = emptyMsg;
+            else loading.remove();
+          }
           return;
         }
         // Ancestors insert above the focus post — lock scroll to the focused card.
@@ -178,7 +181,7 @@ window.vaakBootStatusThread = function () {
       loadThreadPart(
         document.getElementById('status-thread-ancestors'),
         'ancestors',
-        'No earlier posts found.',
+        '',
         'Couldn’t load earlier posts.'
       );
       loadThreadPart(
@@ -218,7 +221,7 @@ window.vaakBootStatusThread = function () {
         }
         // Now pull parents (source posts) + replies around the hydrated focus.
         const shells = ensureThreadShells(objectUrl, from);
-        loadThreadPart(shells.anc, 'ancestors', 'No earlier posts found.', 'Couldn’t load earlier posts.');
+        loadThreadPart(shells.anc, 'ancestors', '', 'Couldn’t load earlier posts.');
         loadThreadPart(shells.desc, 'replies', 'No replies found yet.', 'Couldn’t load replies.');
       })
       .catch((err) => {
