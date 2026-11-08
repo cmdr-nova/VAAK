@@ -95,6 +95,15 @@
       if (!m) return null;
       var explicit = String(u.searchParams.get('view') || '').replace(/[^a-z_]/g, '');
       if (explicit && explicit !== 'status') return null;
+      // Reply, Quote and Edit on a focused own post are "?view=status&compose=1…".
+      // On this short path those query-only hrefs resolve back onto the
+      // permalink, and soft-nav would reload the post and drop the composer.
+      if (u.searchParams.has('compose')
+          || ['reply_to', 'quote_object', 'edit_note', 'draft_id'].some(function (k) {
+            return (u.searchParams.get(k) || '') !== '';
+          })) {
+        return null;
+      }
       var object = u.searchParams.get('object') || '';
       if (!/^https:\/\//.test(object)) {
         object = 'https://mkultra.monster/users/' + m[1].toLowerCase() + '/notes/' + m[2];
