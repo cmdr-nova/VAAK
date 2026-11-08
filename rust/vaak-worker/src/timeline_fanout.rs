@@ -933,8 +933,10 @@ async fn process_owner_status(
         return Ok(stats);
     }
     let home_sort = if views.contains(&"home") {
+        // owner_status is always the owner's own compose or boost.
         let weights = load_home_rank_weights(cache, owner).await;
-        Some(home_placement_sort(&weights, &job.actor, job.ts))
+        let created = if job.ts > 0 { job.ts } else { now_unix() };
+        Some(crate::ranked_warm::own_post_sort(created, now_unix(), weights.algorithm))
     } else {
         None
     };

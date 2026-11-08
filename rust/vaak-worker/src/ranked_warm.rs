@@ -153,6 +153,25 @@ pub(crate) fn recommendation_bump(score: f64) -> i64 {
     ((1800.0 * (1.0 + score.max(0.0)).log2()).round() as i64).min(1800)
 }
 
+/// How long the viewer's own new post stays lifted to the top of Home.
+pub(crate) const OWN_POST_FRESH_SECS: i64 = 1800;
+/// One second past the largest author/tag bonus and recommendation bump, so a
+/// boosted item created before the viewer's own post cannot sit above it.
+const OWN_POST_LIFT_SECS: i64 = 1801;
+
+/// Home placement for the viewer's own post or boost. With the algorithm on,
+/// other items can be nudged up to 30 minutes ahead of their real time, which
+/// buried a fresh own post under them. A post younger than
+/// [`OWN_POST_FRESH_SECS`] is ranked as if it had the maximum nudge; older own
+/// posts keep their real time.
+pub(crate) fn own_post_sort(created: i64, now: i64, algorithm_on: bool) -> i64 {
+    if algorithm_on && created >= now - OWN_POST_FRESH_SECS && created <= now + 300 {
+        created + OWN_POST_LIFT_SECS
+    } else {
+        created
+    }
+}
+
 /// PHP `admin_tl_cache_key` for Home.
 fn cache_key_home(owner: i64, algorithm_on: bool, following_actor_ids: &[String]) -> String {
     let mut parts = following_actor_ids.to_vec();
@@ -3340,6 +3359,13 @@ pub async fn warm_home_native(cfg: &Config, owner_user_id: i64) -> Result<String
             .map(|item| item.id.clone())
             .collect()
     };
+    // After every nudge above: the viewer's own fresh posts go on top.
+    let now = chrono::Utc::now().timestamp();
+    for item in timeline.iter_mut() {
+        if item.kind == "outbox" && item.actor_id.trim_end_matches('/') == actor_id.trim_end_matches('/') {
+            item.sort = own_post_sort(item.sort, now, algorithm_on);
+        }
+    }
     let mut ranked = rank_from_timeline_capped(timeline, None);
 
     let own_did = load_own_did(&db, owner_user_id).await?;
@@ -4245,6 +4271,18 @@ pub async fn run_loop(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn own_fresh_post_outranks_max_nudged_older_items() {
+        let now = 1_800_000_000;
+        let own = now - 400;
+        // Another item created a second before, with the largest bonus.
+        let nudged = (own - 1) + affinity_bonus(1e9, 100).max(recommendation_bump(1e9));
+        assert!(own_post_sort(own, now, true) > nudged);
+        // Algorithm off and older own posts keep real time.
+        assert_eq!(own_post_sort(own, now, false), own);
+        assert_eq!(own_post_sort(now - OWN_POST_FRESH_SECS - 1, now, true), now - OWN_POST_FRESH_SECS - 1);
+    }
+
     use super::*;
 
     fn sample_mark(global: bool) -> OwnerWarmMark {
