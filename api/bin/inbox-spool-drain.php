@@ -93,17 +93,21 @@ function inbox_drain_route_shadow_note(int $id, string $rust, string $php): void
 
 /**
  * Cutover F5 shadow: a like or boost of a local note. Rust predicted
- * "local_observe", "local_observe {owner} {object_id}" (a notification row)
- * or "local_private_interaction_skipped". Agree needs the same result and,
- * for a notification, that live mentions row; with no notification
- * predicted, no live row may carry this activity's id. Other PHP outcomes
- * count as skipped.
+ * "local_observe {owner}" (no notification for this recipient),
+ * "local_observe {owner} {object_id}" (a notification row) or
+ * "local_private_interaction_skipped". Agree needs the same result and, for
+ * a notification, that live mentions row; with no notification predicted,
+ * no live row of that recipient may carry this activity's id. Rows of other
+ * accounts are not this delivery's: one activity delivered to several local
+ * inboxes notifies only the note's owner. A bare "local_observe" (a worker
+ * from before the owner was sent) only compares the result. Other PHP
+ * outcomes count as skipped.
  */
 function inbox_drain_interaction_shadow_note(PDO $db, int $id, string $rust, string $php, string $body): void
 {
     $parts = explode(' ', $rust, 3);
     $rustResult = $parts[0];
-    $owner = isset($parts[2]) ? (int) $parts[1] : 0;
+    $owner = isset($parts[1]) ? (int) $parts[1] : 0;
     $mentionId = $parts[2] ?? '';
     $label = $rustResult . ($mentionId !== '' ? '+mention' : '');
     $field = 'skipped';
@@ -122,9 +126,9 @@ function inbox_drain_interaction_shadow_note(PDO $db, int $id, string $rust, str
                 } else {
                     $doc = json_decode($body, true);
                     $activityId = is_array($doc) ? ap_as_id($doc['id'] ?? null) : null;
-                    if (is_string($activityId) && $activityId !== '') {
-                        $st = $db->prepare('SELECT 1 FROM mentions WHERE activity_id = ? AND deleted_at IS NULL LIMIT 1');
-                        $st->execute([$activityId]);
+                    if (is_string($activityId) && $activityId !== '' && $owner > 0) {
+                        $st = $db->prepare('SELECT 1 FROM mentions WHERE activity_id = ? AND owner_user_id = ? AND deleted_at IS NULL LIMIT 1');
+                        $st->execute([$activityId, $owner]);
                         if ($st->fetchColumn() !== false) {
                             $field = 'disagree';
                             $why = 'mention_unexpected';
