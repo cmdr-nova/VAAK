@@ -119,6 +119,17 @@ check(remoteStill.path === '/vaak/' && remoteStill.params.view === 'status'
 const back = win2.vaakShortStatusTarget('https://mkultra.monster/vaak/@shana_flux/eb1e9cc40f1996e6?from=local');
 check(back && back.object === 'https://mkultra.monster/users/shana_flux/notes/eb1e9cc40f1996e6' && back.from === 'local',
   'the short path reconstructs the ActivityPub id');
+// Reply/Quote/Edit on a focused own post are "?view=status&compose=1…"; on the
+// short permalink they resolve onto the same path and must not soft-nav.
+const permalink = 'https://mkultra.monster/vaak/@cmdr_nova/abc123';
+const replyTarget = encodeURIComponent('https://mkultra.monster/users/cmdr_nova/notes/abc123');
+check(win2.vaakShortStatusTarget(permalink + '?view=status&compose=1&reply_to=' + replyTarget) === null
+  && win2.vaakShortStatusTarget(permalink + '?view=status&compose=1&quote_object=' + replyTarget) === null
+  && win2.vaakShortStatusTarget(permalink + '?view=status&compose=1&edit_note=' + replyTarget) === null
+  && win2.vaakShortStatusTarget(permalink + '?reply_to=' + replyTarget) === null,
+  'composer links on a short permalink are not a post navigation');
+check(win2.vaakShortStatusTarget(permalink + '?view=status&from=home') !== null,
+  'a plain view=status short link is still a post navigation');
 check(source.includes('window.vaakShortStatusTarget(u)) return;')
   && source.includes("softNavTo('status', false, '', extra);"),
   'Back onto a short permalink loads the post instead of Home');
