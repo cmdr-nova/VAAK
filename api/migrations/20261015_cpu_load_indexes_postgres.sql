@@ -38,3 +38,15 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_remote_actors_lower_host_username
 CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_events_local_timeline_created
     ON events (created_at DESC, id DESC)
     WHERE action_taken IN ('log', 'local_observe') AND actor_id LIKE 'https://mkultra.monster/users/%';
+-- Engagement counts on every painted card (rust/vaak-worker/src/
+-- engagement_counts.rs) look up replies by events.in_reply_to, VAAK
+-- accounts' likes and boosts by object_id, and stored Nostr replies and
+-- reposts by nostr_events.reply_to.
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_events_in_reply_to
+    ON events (in_reply_to);
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_masto_favourites_object
+    ON masto_favourites (object_id);
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_masto_reblogs_object
+    ON masto_reblogs (object_id);
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_nostr_events_reply_to
+    ON nostr_events (reply_to) WHERE reply_to <> '';

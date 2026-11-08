@@ -1399,22 +1399,51 @@ window.apAdminToast = function (msg, isErr) {
     if (actor) openListPicker(btn, actor);
   });
 
+  // Same labels as PHP admin_format_compact_count and Rust compact_count:
+  // 1.2K, 12.3K, 123K, 3.4M, 2.1B (rounded down).
   function vaakFormatCompactCount(n) {
     n = Math.floor(Number(n) || 0);
     if (n < 1) return '';
     if (n < 1000) return String(n);
-    if (n < 10000) {
-      const tenths = Math.floor(n / 100);
-      const whole = Math.floor(tenths / 10);
-      const frac = tenths % 10;
-      return frac > 0 ? (whole + '.' + frac + 'k') : (whole + 'k');
-    }
-    if (n < 1000000) return String(Math.floor(n / 1000)) + 'k';
-    const tenths = Math.floor(n / 100000);
-    const whole = Math.floor(tenths / 10);
-    const frac = tenths % 10;
-    return frac > 0 ? (whole + '.' + frac + 'M') : (whole + 'M');
+    const unit = n < 1e6 ? 1e3 : (n < 1e9 ? 1e6 : 1e9);
+    const suffix = n < 1e6 ? 'K' : (n < 1e9 ? 'M' : 'B');
+    const whole = Math.floor(n / unit);
+    if (whole >= 100) return whole + suffix;
+    const tenth = Math.floor(((n % unit) * 10) / unit);
+    return tenth > 0 ? (whole + '.' + tenth + suffix) : (whole + suffix);
   }
+  window.vaakFormatCompactCount = vaakFormatCompactCount;
+
+  // Move a like/boost button's count by one when its state flips, keeping
+  // the icon. Bluesky and Nostr buttons call this; their handlers used to
+  // rewrite the button with the icon only, which dropped the number.
+  window.vaakBumpActionCount = function (btn, wasOn, nowOn) {
+    if (!btn || wasOn === nowOn) return;
+    let n = parseInt(btn.getAttribute('data-eng-count') || '0', 10);
+    if (!Number.isFinite(n) || n < 0) n = 0;
+    n = Math.max(0, n + (nowOn ? 1 : -1));
+    btn.setAttribute('data-eng-count', String(n));
+    window.vaakPaintActionCount(btn);
+  };
+  // Draw data-eng-count as the trailing .action-count span (or remove it).
+  window.vaakPaintActionCount = function (btn) {
+    if (!btn) return;
+    const n = parseInt(btn.getAttribute('data-eng-count') || '0', 10) || 0;
+    const label = vaakFormatCompactCount(n);
+    let span = btn.querySelector('.action-count');
+    if (label) {
+      if (!span) {
+        span = document.createElement('span');
+        span.className = 'action-count';
+        span.setAttribute('aria-hidden', 'true');
+        btn.appendChild(span);
+      }
+      span.textContent = label;
+    } else if (span) {
+      span.remove();
+    }
+    btn.classList.toggle('has-count', n > 0);
+  };
   function applyInteractButton(form, data, beforeActive) {
     const btn = form.querySelector('button[type="submit"]');
     const actionInput = form.querySelector('input[name="action"]');

@@ -13,11 +13,11 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tokio_postgres::Client;
 
-fn trim_slash(s: &str) -> &str {
+pub(crate) fn trim_slash(s: &str) -> &str {
     s.trim().trim_end_matches('/')
 }
 
-fn push_key(set: &mut HashSet<String>, raw: &str) {
+pub(crate) fn push_key(set: &mut HashSet<String>, raw: &str) {
     let t = raw.trim();
     if t.is_empty() {
         return;
@@ -55,7 +55,7 @@ fn bsky_permalink(raw: &str) -> Option<(String, String)> {
 }
 
 /// Collect status_id + object_id lookup keys for one status (and nested reblog).
-fn collect_keys(st: &Value, status_ids: &mut HashSet<String>, object_ids: &mut HashSet<String>) {
+pub(crate) fn collect_keys(st: &Value, status_ids: &mut HashSet<String>, object_ids: &mut HashSet<String>) {
     let id = st
         .get("id")
         .and_then(|v| v.as_str())
@@ -173,7 +173,7 @@ fn remember_twin(twins: &mut Twins, a: &str, b: &str) {
 /// Add the other copy's keys so a like/boost/bookmark on either copy shows
 /// on both (a mention in Notifications is often the fediverse copy while
 /// Home shows the Bluesky one).
-fn expand_twins(twins: &Twins, status_ids: &mut HashSet<String>, object_ids: &mut HashSet<String>) {
+pub(crate) fn expand_twins(twins: &Twins, status_ids: &mut HashSet<String>, object_ids: &mut HashSet<String>) {
     if twins.is_empty() {
         return;
     }
@@ -527,6 +527,22 @@ pub async fn apply_to_statuses(db: &Client, owner_user_id: i64, statuses: &mut [
             apply_one_with_twins(st, &fav, &bm, &rb, did, &twins);
         }
     }
+    // Every painter that gets viewer flags also gets the same engagement
+    // totals, so a post shows the same numbers on Home, profiles, threads
+    // and Notifications. Guests (owner 0) load twins here.
+    let twins = if owner_user_id > 0 {
+        twins
+    } else {
+        let mut object_ids = HashSet::new();
+        let mut status_ids = HashSet::new();
+        for st in statuses.iter() {
+            if st.is_object() {
+                collect_keys(st, &mut status_ids, &mut object_ids);
+            }
+        }
+        load_twins(db, &object_ids).await
+    };
+    crate::engagement_counts::apply(db, statuses, &twins).await;
     Ok(())
 }
 

@@ -16194,7 +16194,11 @@ function admin_own_post_overflow(
  *
  * @param array{status_id?:string,spoiler?:string,sensitive?:bool,plain?:string,visibility?:string,boosted?:bool,actor?:string,from?:string} $opts
  */
-/** Compact engagement label: 999 → "999", 1000 → "1k", 1200 → "1.2k", 12000 → "12k". */
+/**
+ * Compact engagement label, shared with Rust compact_count and JS
+ * vaakFormatCompactCount: 999 → "999", 1200 → "1.2K", 12345 → "12.3K",
+ * 123456 → "123K", 3400000 → "3.4M", 2100000000 → "2.1B". Rounds down.
+ */
 function admin_format_compact_count(int $n): string
 {
     if ($n < 1) {
@@ -16203,19 +16207,13 @@ function admin_format_compact_count(int $n): string
     if ($n < 1000) {
         return (string) $n;
     }
-    if ($n < 10000) {
-        $tenths = (int) floor($n / 100);
-        $whole = intdiv($tenths, 10);
-        $frac = $tenths % 10;
-        return $frac > 0 ? ($whole . '.' . $frac . 'k') : ($whole . 'k');
+    [$unit, $suffix] = $n < 1000000 ? [1000, 'K'] : ($n < 1000000000 ? [1000000, 'M'] : [1000000000, 'B']);
+    $whole = intdiv($n, $unit);
+    if ($whole >= 100) {
+        return $whole . $suffix;
     }
-    if ($n < 1000000) {
-        return (string) intdiv($n, 1000) . 'k';
-    }
-    $tenths = (int) floor($n / 100000);
-    $whole = intdiv($tenths, 10);
-    $frac = $tenths % 10;
-    return $frac > 0 ? ($whole . '.' . $frac . 'M') : ($whole . 'M');
+    $tenth = intdiv(($n % $unit) * 10, $unit);
+    return $tenth > 0 ? ($whole . '.' . $tenth . $suffix) : ($whole . $suffix);
 }
 
 /** @return string empty when $n < 1 */

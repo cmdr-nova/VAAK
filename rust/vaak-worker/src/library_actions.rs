@@ -61,12 +61,24 @@ pub fn query(s: &str) -> String {
     out
 }
 
+/// Compact engagement label shared by every painter (PHP
+/// admin_format_compact_count and JS vaakFormatCompactCount match it):
+/// 999 -> "999", 1200 -> "1.2K", 12345 -> "12.3K", 123456 -> "123K",
+/// 3400000 -> "3.4M", 2_100_000_000 -> "2.1B". Rounds down, so a label never
+/// claims more than the real count.
 pub fn compact_count(n: i64) -> String {
+    fn scaled(n: i64, unit: i64, suffix: &str) -> String {
+        // One decimal below 100 of the unit, none above (12.3K, 123K).
+        let whole = n / unit;
+        if whole >= 100 { return format!("{whole}{suffix}"); }
+        let tenth = (n % unit) * 10 / unit;
+        if tenth > 0 { format!("{whole}.{tenth}{suffix}") } else { format!("{whole}{suffix}") }
+    }
     if n < 1 { String::new() }
-    else if n < 1000 { n.to_string() }
-    else if n < 10000 { let tenth = n / 100; if tenth % 10 > 0 { format!("{}.{}k", tenth / 10, tenth % 10) } else { format!("{}k", tenth / 10) } }
-    else if n < 1000000 { format!("{}k", n / 1000) }
-    else { let tenth = n / 100000; if tenth % 10 > 0 { format!("{}.{}M", tenth / 10, tenth % 10) } else { format!("{}M", tenth / 10) } }
+    else if n < 1_000 { n.to_string() }
+    else if n < 1_000_000 { scaled(n, 1_000, "K") }
+    else if n < 1_000_000_000 { scaled(n, 1_000_000, "M") }
+    else { scaled(n, 1_000_000_000, "B") }
 }
 
 fn count_html(n: i64) -> String {
@@ -432,7 +444,7 @@ mod tests {
     #[test]
     fn reply_cw_and_count_format_match_php() {
         assert_eq!(reply_suffix(&[" @a@one ".into(), "@b@two".into()], " warning ", false), "&mention=a%40one%2Cb%40two&cw=warning&sensitive=1");
-        for (n, expected) in [(0, ""), (999, "999"), (1000, "1k"), (1999, "1.9k"), (10999, "10k"), (1000000, "1M"), (1999999, "1.9M")] { assert_eq!(compact_count(n), expected); }
+        for (n, expected) in [(0, ""), (999, "999"), (1000, "1K"), (1200, "1.2K"), (1999, "1.9K"), (10999, "10.9K"), (12345, "12.3K"), (123456, "123K"), (999999, "999K"), (1000000, "1M"), (1999999, "1.9M"), (3400000, "3.4M"), (2_100_000_000, "2.1B")] { assert_eq!(compact_count(n), expected); }
     }
     #[test]
     fn plain_action_tree_matches_actual_complete_php_card() {
