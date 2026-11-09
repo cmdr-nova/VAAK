@@ -12,6 +12,15 @@ anything else bumps the patch number.
 Releases up to **0.9.83** used a two-digit deploy counter (0.9.05, 0.9.83)
 and have no notes here; their tags and GitHub Releases are unchanged.
 
+## [0.62.0](https://github.com/cmdr-nova/VAAK/releases/tag/v0.62.0) - 2026-11-09
+
+### ✨ Features
+* Home: load boosted authors on older timeline pages by @cmdr-nova in https://github.com/cmdr-nova/VAAK/pull/417
+* Open a post when its card is clicked or tapped by @cmdr-nova in https://github.com/cmdr-nova/VAAK/pull/418
+* Profiles: show thread continuations on the Posts tab by @cmdr-nova in https://github.com/cmdr-nova/VAAK/pull/419
+
+**Full Changelog**: https://github.com/cmdr-nova/VAAK/compare/v0.61.0...v0.62.0
+
 ## [0.61.0](https://github.com/cmdr-nova/VAAK/releases/tag/v0.61.0) - 2026-11-09
 
 ### ✨ Features
