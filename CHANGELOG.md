@@ -12,6 +12,14 @@ anything else bumps the patch number.
 Releases up to **0.9.83** used a two-digit deploy counter (0.9.05, 0.9.83)
 and have no notes here; their tags and GitHub Releases are unchanged.
 
+## [0.61.0](https://github.com/cmdr-nova/VAAK/releases/tag/v0.61.0) - 2026-11-09
+
+### ✨ Features
+* Open the composer from Reply on a post's own permalink by @cmdr-nova in https://github.com/cmdr-nova/VAAK/pull/415
+* Home: keep the owner's fresh posts above algorithm-nudged items by @cmdr-nova in https://github.com/cmdr-nova/VAAK/pull/416
+
+**Full Changelog**: https://github.com/cmdr-nova/VAAK/compare/v0.60.0...v0.61.0
+
 ## [0.60.0](https://github.com/cmdr-nova/VAAK/releases/tag/v0.60.0) - 2026-11-08
 
 ### ✨ Features
