@@ -424,6 +424,10 @@ function ap_phyrian_bridge_resolve(int $userId, string $identifyRaw): array
             'avatar' => $avatar,
         ];
     }
+    // Second Life players live on the same strains server; they link below, not here.
+    if (($avatar['world'] ?? '') === 'sl') {
+        return ['ok' => false, 'error' => 'That is a Second Life avatar. Link it under Link Second Life instead.'];
+    }
     // One OpenSim avatar → one VAAK account
     try {
         ap_phyrian_bridge_migrate();
