@@ -25,6 +25,10 @@ impl SelectedProfilePage {
 }
 #[derive(Clone,PartialEq)]
 pub(crate) struct SourceLedger {table:&'static str,rows:Vec<Value>,actor_key:String,source_actor:String,ordinals:Option<Vec<usize>>,secondary:Option<SecondaryLedger>,digest:LedgerDigest}
+impl SourceLedger {
+    /// Primary outbox_notes page rows by ordinal (not pins, Asks or Boosts).
+    pub(crate) fn outbox_thread_rows(&self)->Option<&[Value]>{(self.table=="outbox_notes"&&self.secondary.is_none()&&self.ordinals.is_none()).then_some(self.rows.as_slice())}
+}
 /// Row digests from the first exact check, shared by clones of one page.
 /// Never part of ledger equality.
 #[derive(Clone,Default)]

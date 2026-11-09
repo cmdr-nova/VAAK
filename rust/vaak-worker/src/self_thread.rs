@@ -271,13 +271,19 @@ pub fn paint_lean_self_thread(
 ) -> String {
     let parent_html = paint_card(parent, from, viewer_actor);
     let tip_html = paint_card(tip, from, viewer_actor);
-    let parent_inner = article_inner_html(&parent_html).unwrap_or_else(|| parent_html.clone());
-    let tip_inner = article_inner_html(&tip_html).unwrap_or_else(|| tip_html.clone());
-    let parent_attrs = copied_identity_attrs(&parent_html);
-    let tip_attrs = copied_identity_attrs(&tip_html);
+    compose_self_thread_html(&parent_html, &tip_html)
+}
+
+/// Wrap two already-painted cards as one thread card: parent ancestor above,
+/// tip below, outer identity from the tip.
+pub fn compose_self_thread_html(parent_html: &str, tip_html: &str) -> String {
+    let parent_inner = article_inner_html(parent_html).unwrap_or_else(|| parent_html.to_string());
+    let tip_inner = article_inner_html(tip_html).unwrap_or_else(|| tip_html.to_string());
+    let parent_attrs = copied_identity_attrs(parent_html);
+    let tip_attrs = copied_identity_attrs(tip_html);
     // The outer card's id is the tip. The ancestor keeps its own id so a later
     // page that reaches the parent row is recognized as already on screen.
-    let tip_key = copy_attr(article_open_head(&tip_html), "data-timeline-key").unwrap_or_default();
+    let tip_key = copy_attr(article_open_head(tip_html), "data-timeline-key").unwrap_or_default();
     format!(
         "<article class=\"tweet tweet-thread\"{tip_key}>\
 <div class=\"tweet-thread-seg tweet-thread-seg--ancestor\"{parent_attrs}>{parent_inner}</div>\
@@ -285,6 +291,52 @@ pub fn paint_lean_self_thread(
 <div class=\"tweet-thread-seg tweet-thread-seg--tip\"{tip_attrs}>{tip_inner}</div>\
 </article>"
     )
+}
+
+/// Group already-painted profile cards (source ordinal, html) by self-thread.
+/// `rows` are the page's outbox_notes rows by ordinal. A card whose note
+/// replies to the same author's note painted on this page becomes one thread
+/// card at the tip's ordinal; the parent's own card is folded into it. Order
+/// and ordinals stay ascending, so callers' cursor/slot checks still hold.
+pub fn group_painted_outbox_threads(cards: Vec<(usize, String)>, rows: &[Value]) -> Vec<(usize, String)> {
+    let row_uri = |index: usize| -> Option<String> {
+        rows.get(index)?.get("id")?.as_str().map(|s| s.trim().trim_end_matches('/').to_string())
+    };
+    let mut by_uri: HashMap<String, usize> = HashMap::new();
+    for (pos, (index, _)) in cards.iter().enumerate() {
+        if let Some(uri) = row_uri(*index).filter(|u| !u.is_empty()) {
+            by_uri.entry(uri).or_insert(pos);
+        }
+    }
+    let mut consumed: HashSet<usize> = HashSet::new();
+    let mut out = Vec::with_capacity(cards.len());
+    for (pos, (index, html)) in cards.iter().enumerate() {
+        if consumed.contains(&pos) {
+            continue;
+        }
+        let parent_pos = (|| {
+            let uri = row_uri(*index)?;
+            let parent = rows.get(*index)?.get("in_reply_to")?.as_str()?.trim().trim_end_matches('/').to_string();
+            if parent.is_empty() || parent == uri {
+                return None;
+            }
+            let child_actor = status_actor_url(&uri)?;
+            if status_actor_url(&parent)? != child_actor {
+                return None;
+            }
+            let parent_pos = *by_uri.get(&parent)?;
+            (parent_pos != pos && !consumed.contains(&parent_pos)).then_some(parent_pos)
+        })();
+        consumed.insert(pos);
+        match parent_pos {
+            Some(parent_pos) => {
+                consumed.insert(parent_pos);
+                out.push((*index, compose_self_thread_html(&cards[parent_pos].1, html)));
+            }
+            None => out.push((*index, html.clone())),
+        }
+    }
+    out
 }
 
 pub fn paint_feed_units(
@@ -334,6 +386,34 @@ mod tests {
             st["vaak_self_thread"] = json!(true);
         }
         st
+    }
+
+    #[test]
+    fn groups_painted_profile_cards_by_self_thread() {
+        let base = "https://mkultra.monster/users/cmdr_nova/notes/";
+        let rows = vec![
+            json!({"id": format!("{base}p3"), "in_reply_to": format!("{base}p2")}),
+            json!({"id": format!("{base}other"), "in_reply_to": "https://elsewhere.test/users/ada/notes/1"}),
+            json!({"id": format!("{base}p2"), "in_reply_to": format!(" {base}root/ ")}),
+            json!({"id": format!("{base}root"), "in_reply_to": null}),
+            json!({"id": format!("{base}orphan"), "in_reply_to": format!("{base}offpage")}),
+        ];
+        let card = |name: &str| format!("<article class=\"tweet\" data-timeline-key=\"{name}\"><p>{name}</p></article>");
+        let cards = vec![(0, card("p3")), (1, card("other")), (2, card("p2")), (3, card("root")), (4, card("orphan"))];
+        let out = group_painted_outbox_threads(cards, &rows);
+        let ords: Vec<usize> = out.iter().map(|(i, _)| *i).collect();
+        assert_eq!(ords, vec![0, 1, 3, 4]);
+        assert!(out[0].1.starts_with("<article class=\"tweet tweet-thread\" data-timeline-key=\"p3\""));
+        let ancestor = out[0].1.find("<p>p2</p>").unwrap();
+        let tip = out[0].1.find("<p>p3</p>").unwrap();
+        assert!(ancestor < tip, "parent paints above the tip");
+        assert!(out[0].1.contains("data-timeline-key=\"p2\""), "ancestor keeps its id");
+        assert_eq!(out[1].1, card("other"));
+        assert_eq!(out[2].1, card("root"));
+        assert_eq!(out[3].1, card("orphan"));
+        // A missing (omitted) parent card leaves the tip alone.
+        let out = group_painted_outbox_threads(vec![(0, card("p3")), (3, card("root"))], &rows);
+        assert_eq!(out.len(), 2);
     }
 
     #[test]
