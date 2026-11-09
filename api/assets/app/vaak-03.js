@@ -583,6 +583,97 @@
   }
   document.addEventListener('click', onQuoteActivate, true);
   document.addEventListener('auxclick', onQuoteActivate, true);
+  // Clicking or tapping a post card opens the post, the same target as its
+  // timestamp link (in-app thread; njump in a new tab for Nostr). A card is an
+  // article.tweet or one segment of a grouped self-thread. Wrappers (boost
+  // chrome, notification rows) open the one post they hold. Quote cards have
+  // their own handler above; links, media, buttons, forms, polls and the CW
+  // toggle keep their behavior; a click that ends a text selection does
+  // nothing; the post already open in the thread view stays put.
+  const POST_CARD_SEL = '.tweet-thread-seg, article.tweet';
+  const POST_CARD_SKIP = 'a[href], video, audio, iframe, button, input, textarea, select, label, summary, form, '
+    + '.note-media-trigger, .media-cell, .media-thumb, .tweet-content-more, .tweet-actions, .poll-block, '
+    + '.post-action-menu, .profile-hover-card, [data-profile-hover-actor], [data-copy-value], [data-nostr-act], '
+    + '[role="button"], [onclick], [contenteditable="true"], .quote-block, .quote-post, .tweet-quote';
+  function postCardOwner(el) {
+    return el && el.closest ? el.closest('.quote-block, ' + POST_CARD_SEL) : null;
+  }
+  function postCardOwnAnchor(card) {
+    const links = card.querySelectorAll('a.tweet-time[href]');
+    for (let i = 0; i < links.length; i++) {
+      if (postCardOwner(links[i]) === card) return links[i];
+    }
+    return null;
+  }
+  function postCardOwnTarget(card) {
+    const anchor = postCardOwnAnchor(card);
+    if (anchor) return { raw: anchor.getAttribute('href') || '', anchor, external: anchor.target === '_blank' };
+    // Headerless notification embeds carry their target on the card.
+    const raw = card.getAttribute('data-open-href');
+    if (raw) return { raw, anchor: null, external: card.getAttribute('data-open-external') === '1' };
+    return null;
+  }
+  function postCardTarget(card) {
+    let t = postCardOwnTarget(card);
+    if (!t) {
+      // A wrapper with exactly one post inside it (boost, notification) opens it.
+      let only = null;
+      const kids = card.querySelectorAll(POST_CARD_SEL);
+      for (let i = 0; i < kids.length; i++) {
+        const kid = kids[i];
+        if (!kid.parentElement || postCardOwner(kid.parentElement) !== card) continue;
+        if (only) return null;
+        only = kid;
+      }
+      if (!only || only.closest('#status-focus')) return null;
+      t = postCardOwnTarget(only);
+    }
+    if (!t || (t.anchor && t.anchor.closest('#status-focus'))) return null;
+    const href = safeQuoteHref(t.raw);
+    return href ? { href, anchor: t.anchor, external: t.external } : null;
+  }
+  function postCardHasSelection(card) {
+    const sel = window.getSelection ? window.getSelection() : null;
+    if (!sel || sel.isCollapsed || !sel.rangeCount) return false;
+    if (!String(sel).trim()) return false;
+    const node = sel.getRangeAt(0).commonAncestorContainer;
+    return card.contains(node) || node.contains(card);
+  }
+  function onPostCardActivate(ev) {
+    const t = ev.target;
+    if (!t || !t.closest || ev.defaultPrevented) return;
+    if (ev.type === 'auxclick' && ev.button !== 1) return;
+    if (ev.type === 'click' && ev.button !== 0) return;
+    if (t.closest(POST_CARD_SKIP)) return;
+    const card = t.closest(POST_CARD_SEL);
+    if (!card) return;
+    // The open post in the thread view, and anything inside the composer.
+    if (card.closest('#status-focus') || card.closest('.compose-inline-panel, .compose-modal__panel, #compose-form, #dm-workspace')) return;
+    const target = postCardTarget(card);
+    if (!target) return;
+    if (postCardHasSelection(card)) return;
+    ev.preventDefault();
+    ev.stopPropagation();
+    const newTab = ev.type === 'auxclick' || ev.metaKey || ev.ctrlKey || ev.shiftKey;
+    if (newTab || target.external) {
+      window.open(new URL(target.href, window.location.href).href, '_blank', 'noopener');
+      return;
+    }
+    // The timestamp link goes through soft-nav (vaak-09.js), same as a tap on it.
+    if (target.anchor && target.anchor.getAttribute('href') === target.href) {
+      target.anchor.click();
+      return;
+    }
+    // No link on the card (headerless embed): click a temporary one so the
+    // same soft-nav link handling applies.
+    const a = document.createElement('a');
+    a.href = target.href;
+    a.hidden = true;
+    card.appendChild(a);
+    try { a.click(); } finally { a.remove(); }
+  }
+  document.addEventListener('click', onPostCardActivate, true);
+  document.addEventListener('auxclick', onPostCardActivate, true);
   document.addEventListener('keydown', (ev) => {
     if (ev.key !== 'Enter' && ev.key !== ' ') return;
     const qb = ev.target && ev.target.classList && ev.target.classList.contains('quote-block--openable')
