@@ -3008,6 +3008,14 @@
       border-color: color-mix(in srgb, #7be08f 45%, var(--border));
       color: #b4f2c0; background: rgba(123,224,143,.1);
     }
+    .phyrian-badge--sl {
+      border-color: color-mix(in srgb, #8fb8ff 50%, var(--border));
+      color: #bcd3ff; background: rgba(143,184,255,.1);
+    }
+    .phyrian-badge--hg {
+      border-color: color-mix(in srgb, #c49bff 50%, var(--border));
+      color: #dcc6ff; background: rgba(196,155,255,.1);
+    }
     .phyrian-tier--common {
       border-color: var(--border); color: var(--muted); background: transparent;
     }

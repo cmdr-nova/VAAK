@@ -41,6 +41,7 @@ $check(ap_phyrian_bridge_normalize_lineage([]) === [] && ap_phyrian_bridge_norma
 $db = new PDO('sqlite::memory:');
 $db->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
 $db->exec('CREATE TABLE phyrian_grid_lineage (avatar_uuid TEXT PRIMARY KEY, avatar_name TEXT, parent_uuid TEXT, strain TEXT, generation INTEGER, imprinted_at TEXT, synced_at TEXT)');
+$db->exec('CREATE TABLE phyrian_grid_lineage_worlds (avatar_uuid TEXT PRIMARY KEY, world TEXT NOT NULL DEFAULT \'opensim\')');
 $db->exec("INSERT INTO phyrian_grid_lineage (avatar_uuid, avatar_name, strain, generation) VALUES ('dddddddd-dddd-dddd-dddd-dddddddddddd', 'Stale', 'Old', 1)");
 
 $calls = [];
@@ -48,7 +49,7 @@ $ok = static function (string $action, array $body) use (&$calls, $a, $b): array
     $calls[] = $action;
     return ['ok' => true, 'http' => 200, 'data' => ['ok' => true, 'players' => [
         ['avatar_uuid' => $a, 'avatar_name' => 'Ada', 'parent_uuid' => $b, 'strain' => 'Grid Tide', 'generation' => 3, 'imprinted_at' => '2026-10-18T10:00:00Z'],
-        ['avatar_uuid' => $b, 'avatar_name' => 'Bex', 'strain' => 'Grid Tide', 'generation' => 2],
+        ['avatar_uuid' => $b, 'avatar_name' => 'Bex', 'strain' => 'Grid Tide', 'generation' => 2, 'world' => 'sl'],
     ]]];
 };
 $res = ap_phyrian_bridge_lineage_sync($db, $ok);
@@ -56,6 +57,12 @@ $check(!empty($res['ok']) && $res['rows'] === 2 && $calls === ['vaak_lineage_exp
 $stored = $db->query('SELECT avatar_uuid, parent_uuid FROM phyrian_grid_lineage ORDER BY avatar_uuid')->fetchAll(PDO::FETCH_KEY_PAIR);
 $check(count($stored) === 2 && !isset($stored['dddddddd-dddd-dddd-dddd-dddddddddddd']), 'sync replaces stale rows');
 $check(($stored[$a] ?? '') === strtolower($b), 'parent link is stored');
+$worlds = $db->query('SELECT avatar_uuid, world FROM phyrian_grid_lineage_worlds')->fetchAll(PDO::FETCH_KEY_PAIR);
+$check(($worlds[strtolower($b)] ?? '') === 'sl' && ($worlds[strtolower($a)] ?? '') === 'opensim', 'world is stored, defaulting to opensim');
+$check(($res['worlds'] ?? null) === true, 'sync reports the worlds were stored');
+$check(ap_phyrian_bridge_lineage_world('', 'Visitor Name @hg.osgrid.org') === 'hypergrid', 'an @ name without a world reads as hypergrid');
+$check(ap_phyrian_bridge_lineage_world('mars', 'Plain Name') === 'opensim', 'an unknown world falls back to opensim');
+$check(ap_phyrian_bridge_lineage_world('both', 'Plain Name') === 'both', 'a grid avatar linked to Second Life keeps both');
 
 $missing = static fn (string $action, array $body): array => ['ok' => false, 'http' => 400, 'error' => 'Unknown action.'];
 $res = ap_phyrian_bridge_lineage_sync($db, $missing);

@@ -95,6 +95,7 @@ function ap_phyrian_tree_load(?PDO $db = null): array
             'linked' => $uuid !== '',
             'avatar_uuid' => $uuid,
             'grid_only' => false,
+            'world' => '',
         ];
     }
     // Grid rows first: the join also fills parents on $rows in place.
@@ -109,8 +110,22 @@ function ap_phyrian_tree_load(?PDO $db = null): array
  */
 function ap_phyrian_tree_load_grid(?PDO $db = null): array
 {
+    $pdo = null;
     try {
-        $st = ap_phyrian_tree_db($db)->prepare(
+        $pdo = ap_phyrian_tree_db($db);
+        $st = $pdo->prepare(
+            'SELECT l.avatar_uuid, l.avatar_name, l.parent_uuid, l.strain, l.generation, l.imprinted_at, w.world
+             FROM phyrian_grid_lineage l
+             LEFT JOIN phyrian_grid_lineage_worlds w ON w.avatar_uuid = l.avatar_uuid
+             LIMIT ' . (string) AP_PHYRIAN_TREE_MAX_ROWS
+        );
+        $st->execute();
+        return $st->fetchAll(PDO::FETCH_ASSOC) ?: [];
+    } catch (Throwable $e) {
+        // Before the worlds table migration: same rows without a world.
+    }
+    try {
+        $st = ($pdo ?? ap_phyrian_tree_db($db))->prepare(
             'SELECT avatar_uuid, avatar_name, parent_uuid, strain, generation, imprinted_at
              FROM phyrian_grid_lineage LIMIT ' . (string) AP_PHYRIAN_TREE_MAX_ROWS
         );
@@ -153,8 +168,10 @@ function ap_phyrian_tree_grid_rows(array &$rows, array $grid): array
         }
         $parentUuid = strtolower(trim((string) ($g['parent_uuid'] ?? '')));
         $parentKey = $parentUuid !== '' && $parentUuid !== $uuid ? $keyFor($parentUuid) : '';
+        $world = ap_phyrian_tree_world($g);
         if (isset($byUuid[$uuid])) {
             $i = $byUuid[$uuid];
+            $rows[$i]['world'] = $world;
             if ($rows[$i]['parent_key'] === '' && $parentKey !== $rows[$i]['key']) {
                 $rows[$i]['parent_key'] = $parentKey;
             }
@@ -174,9 +191,21 @@ function ap_phyrian_tree_grid_rows(array &$rows, array $grid): array
             'linked' => false,
             'avatar_uuid' => $uuid,
             'grid_only' => true,
+            'world' => $world,
         ];
     }
     return $extra;
+}
+
+/** World tag of a mirrored grid row ('opensim', 'hypergrid', 'sl' or 'both'). */
+function ap_phyrian_tree_world(array $g): string
+{
+    $world = strtolower(trim((string) ($g['world'] ?? '')));
+    if (in_array($world, ['hypergrid', 'sl', 'both'], true)) {
+        return $world;
+    }
+    // Rows mirrored before the grid sent a world: an @ name is a hypergrid visitor.
+    return str_contains((string) ($g['avatar_name'] ?? ''), '@') ? 'hypergrid' : 'opensim';
 }
 
 /**
@@ -414,10 +443,18 @@ function ap_phyrian_tree_node_html(array $tree, string $id, int $depth, string $
     if ($id === $originKey) {
         $label .= ' <span class="phyrian-badge phyrian-badge--origin">Origin</span>';
     }
+    $world = (string) ($node['world'] ?? '');
     if (!empty($node['linked'])) {
         $label .= ' <span class="phyrian-badge phyrian-badge--grid" title="Stats synced from the NovaLandia grid">Grid-linked</span>';
+    } elseif (!empty($node['grid_only']) && $world === 'sl') {
+        $label .= ' <span class="phyrian-badge phyrian-badge--sl" title="Plays in Second Life, not on VAAK yet">Second Life</span>';
+    } elseif (!empty($node['grid_only']) && $world === 'hypergrid') {
+        $label .= ' <span class="phyrian-badge phyrian-badge--hg" title="Visiting NovaLandia over the hypergrid, not on VAAK yet">Hypergrid</span>';
     } elseif (!empty($node['grid_only'])) {
         $label .= ' <span class="phyrian-badge phyrian-badge--grid" title="On the NovaLandia grid, not on VAAK yet">Grid only</span>';
+    }
+    if ($world === 'both') {
+        $label .= ' <span class="phyrian-badge phyrian-badge--sl" title="Also plays in Second Life">+ Second Life</span>';
     }
     if (isset($newIds[$id])) {
         $label .= ' <span class="phyrian-badge phyrian-badge--new">New this week</span>';

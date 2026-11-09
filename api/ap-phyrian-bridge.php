@@ -1039,9 +1039,24 @@ function ap_phyrian_bridge_normalize_lineage(array $data): array
                 (int) ($p['generation'] ?? 1)
             )),
             'imprinted_at' => $at,
+            'world' => ap_phyrian_bridge_lineage_world((string) ($p['world'] ?? ''), $name),
         ];
     }
     return array_values($out);
+}
+
+/**
+ * World tag for a mirrored carrier. Older grid exports send no world, so a
+ * hypergrid-style name ("First Last @grid.host") still reads as hypergrid.
+ */
+function ap_phyrian_bridge_lineage_world(string $world, string $name): string
+{
+    $world = strtolower(trim($world));
+    if (in_array($world, ['hypergrid', 'sl', 'both'], true)) {
+        return $world;
+    }
+    // Local grid accounts never carry an @, hypergrid visitors always do.
+    return str_contains($name, '@') ? 'hypergrid' : 'opensim';
 }
 
 /**
@@ -1082,5 +1097,32 @@ function ap_phyrian_bridge_lineage_sync(?PDO $db = null, ?callable $call = null)
         }
         return ['ok' => false, 'error' => 'lineage store failed: ' . $e->getMessage()];
     }
-    return ['ok' => true, 'rows' => count($rows)];
+    $worlds = ap_phyrian_bridge_lineage_worlds_store($db, $rows);
+    return ['ok' => true, 'rows' => count($rows), 'worlds' => $worlds];
+}
+
+/**
+ * Replace phyrian_grid_lineage_worlds with each mirrored avatar's world.
+ * Separate from the lineage store so a release that runs before its
+ * migration still keeps the tree; the badges then fall back to names.
+ *
+ * @param list<array<string,mixed>> $rows
+ */
+function ap_phyrian_bridge_lineage_worlds_store(PDO $db, array $rows): bool
+{
+    try {
+        $db->beginTransaction();
+        $db->exec('DELETE FROM phyrian_grid_lineage_worlds');
+        $ins = $db->prepare('INSERT INTO phyrian_grid_lineage_worlds (avatar_uuid, world) VALUES (?, ?)');
+        foreach ($rows as $r) {
+            $ins->execute([$r['avatar_uuid'], $r['world']]);
+        }
+        $db->commit();
+        return true;
+    } catch (Throwable $e) {
+        if ($db->inTransaction()) {
+            $db->rollBack();
+        }
+        return false;
+    }
 }
