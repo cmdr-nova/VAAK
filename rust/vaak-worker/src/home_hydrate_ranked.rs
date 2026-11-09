@@ -3620,6 +3620,58 @@ async fn fetch_events_map(db: &Client, ids: &[i64]) -> Result<HashMap<i64, Event
     Ok(map)
 }
 
+/// Objects whose original Create row a boost card needs (event Announces and
+/// local `masto_reblogs` rows). Shared by the first page and older pages.
+fn announce_object_ids<'a>(
+    events: impl Iterator<Item = &'a EventRow>,
+    boosts: impl Iterator<Item = &'a BoostRow>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for ev in events {
+        if ev.event_type.eq_ignore_ascii_case("announce") && !ev.object_id.is_empty() {
+            out.push(ev.object_id.trim_end_matches('/').to_string());
+        }
+    }
+    for rb in boosts {
+        if !rb.object_id.is_empty() {
+            out.push(rb.object_id.trim_end_matches('/').to_string());
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Every actor a timeline card can name: event authors, the boosted author
+/// (`target_actor`), local boosters, and the original Create's author.
+fn timeline_actor_ids<'a>(
+    events: impl Iterator<Item = &'a EventRow>,
+    boosts: impl Iterator<Item = &'a BoostRow>,
+    creates: impl Iterator<Item = &'a EventRow>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut push = |raw: &str| {
+        let id = raw.trim().trim_end_matches('/');
+        if !id.is_empty() {
+            out.push(id.to_string());
+        }
+    };
+    for ev in events {
+        push(&ev.actor_id);
+        push(&ev.target_actor);
+    }
+    for rb in boosts {
+        push(&rb.owner_actor_id);
+        push(&rb.target_actor);
+    }
+    for crow in creates {
+        push(&crow.actor_id);
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
 async fn fetch_creates_by_object(
     db: &Client,
     object_ids: &[String],
@@ -5395,36 +5447,9 @@ pub async fn warm_view(
     }
 
     // Announce / boost → look up Create for object_id; collect all actor ids.
-    let mut announce_oids = Vec::new();
-    let mut actor_ids = Vec::new();
-    for ev in events_map.values() {
-        actor_ids.push(ev.actor_id.trim_end_matches('/').to_string());
-        if !ev.target_actor.is_empty() {
-            actor_ids.push(ev.target_actor.trim_end_matches('/').to_string());
-        }
-        if ev.event_type.eq_ignore_ascii_case("announce") && !ev.object_id.is_empty() {
-            announce_oids.push(ev.object_id.trim_end_matches('/').to_string());
-        }
-    }
-    for rb in boosts_map.values() {
-        if !rb.owner_actor_id.is_empty() {
-            actor_ids.push(rb.owner_actor_id.trim_end_matches('/').to_string());
-        }
-        if !rb.target_actor.is_empty() {
-            actor_ids.push(rb.target_actor.trim_end_matches('/').to_string());
-        }
-        if !rb.object_id.is_empty() {
-            announce_oids.push(rb.object_id.trim_end_matches('/').to_string());
-        }
-    }
-    announce_oids.sort();
-    announce_oids.dedup();
+    let announce_oids = announce_object_ids(events_map.values(), boosts_map.values());
     let creates_map = fetch_creates_by_object(&db, &announce_oids).await?;
-    for crow in creates_map.values() {
-        actor_ids.push(crow.actor_id.trim_end_matches('/').to_string());
-    }
-    actor_ids.sort();
-    actor_ids.dedup();
+    let actor_ids = timeline_actor_ids(events_map.values(), boosts_map.values(), creates_map.values());
     let actors_map = fetch_actors_map(&db, &actor_ids).await?;
     let actors_map = resolve_missing_actor_labels(&db, &actor_ids, actors_map).await;
     let mut outbox_fetch = outbox_ids.clone();
@@ -6082,23 +6107,19 @@ pub(crate) async fn statuses_for_older_hits(
     }
     let nostr_map = crate::nostr::home::fetch_rows(db, &nostr_ids).await.unwrap_or_default();
     let events_map = fetch_events_map(db, &event_ids).await.unwrap_or_default();
-    let mut actor_ids = Vec::new();
-    let mut create_objects = Vec::new();
-    for ev in events_map.values() {
-        if !ev.actor_id.is_empty() {
-            actor_ids.push(ev.actor_id.trim_end_matches('/').to_string());
-        }
-        if ev.event_type.eq_ignore_ascii_case("announce") && !ev.object_id.is_empty() {
-            create_objects.push(ev.object_id.clone());
-        }
-    }
-    let actors_map = fetch_actors_map(db, &actor_ids).await.unwrap_or_default();
+    let boosts_map = fetch_boosts_map(db, &boost_ids, owner_user_id).await.unwrap_or_default();
+    // Same author set as the first page (warm_view): the boosted author
+    // (target_actor / the original Create's actor) must be loaded too, or an
+    // older-page boost paints its author as the bare host with the default
+    // avatar while the hover card (live remote_actors read) shows the profile.
+    let create_objects = announce_object_ids(events_map.values(), boosts_map.values());
     let creates_map = fetch_creates_by_object(db, &create_objects).await.unwrap_or_default();
+    let actor_ids = timeline_actor_ids(events_map.values(), boosts_map.values(), creates_map.values());
+    let actors_map = fetch_actors_map(db, &actor_ids).await.unwrap_or_default();
     outbox_ids.extend(events_map.values().filter_map(local_note_for_event));
     outbox_ids.sort();
     outbox_ids.dedup();
     let outbox_map = fetch_outbox_map(db, &outbox_ids).await.unwrap_or_default();
-    let boosts_map = fetch_boosts_map(db, &boost_ids, owner_user_id).await.unwrap_or_default();
     let bsky_map = fetch_bsky_map(db, &bsky_uris).await.unwrap_or_default();
     let owner_username: String = db
         .query_opt(
@@ -6788,6 +6809,37 @@ mod tests {
         assert_eq!(inner["username"], "anarchautistic");
         assert_eq!(inner["display_name"], "smoking");
         assert_eq!(inner["acct"], "anarchautistic@girlcock.club");
+    }
+
+    #[test]
+    fn older_pages_load_the_boosted_author_too() {
+        // An older Home page used to load only the booster, so the boosted
+        // author painted as the bare host + default avatar.
+        let (announce, _booster) = snowflake_announce_fixture();
+        let mut create = announce.clone();
+        create.event_type = "Create".into();
+        create.actor_id = "https://mastodon.social/ap/users/115000000000000001/".into();
+        create.target_actor = String::new();
+        let rb = BoostRow {
+            id: 1,
+            owner_user_id: 1,
+            owner_actor_id: "https://mkultra.monster/users/cmdr_nova".into(),
+            status_id: "s1".into(),
+            boost_status_id: String::new(),
+            object_id: "https://example.social/notes/1/".into(),
+            target_actor: "https://example.social/users/alice".into(),
+            announce_activity_id: String::new(),
+            created_at: String::new(),
+        };
+        let ids = timeline_actor_ids([&announce].into_iter(), [&rb].into_iter(), [&create].into_iter());
+        assert!(ids.contains(&announce.actor_id.trim_end_matches('/').to_string()));
+        assert!(ids.contains(&announce.target_actor.trim_end_matches('/').to_string()));
+        assert!(ids.contains(&"https://mastodon.social/ap/users/115000000000000001".to_string()));
+        assert!(ids.contains(&"https://example.social/users/alice".to_string()));
+        assert!(ids.contains(&"https://mkultra.monster/users/cmdr_nova".to_string()));
+        let oids = announce_object_ids([&announce].into_iter(), [&rb].into_iter());
+        assert!(oids.contains(&"https://example.social/notes/1".to_string()), "local reblog rows need their Create too");
+        assert_eq!(announce_object_ids([&announce, &announce].into_iter(), std::iter::empty()).len(), 1);
     }
 
     #[test]
