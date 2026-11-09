@@ -395,9 +395,10 @@ async fn fetch_outbox_tab(
     offset: i64,
 ) -> Result<Vec<OutboxPaintRow>> {
     let like = format!("{prefix}%");
-    // Match the PHP profile page provider and the public reply count.
-    // NULL and blank in_reply_to are posts. Every other value, including a
-    // self-reply, belongs to Replies. LIMIT/OFFSET apply after that predicate.
+    // Match the PHP profile page provider. NULL and blank in_reply_to are
+    // posts, and so is a self-reply (a thread continuation), which the
+    // self-thread planner below groups under its parent. Every reply,
+    // self-replies included, is on Replies. LIMIT/OFFSET apply after that.
     let rows = match tab {
         "media" => {
             db.query(
@@ -433,14 +434,14 @@ async fn fetch_outbox_tab(
         _ => {
             debug_assert_eq!(
                 crate::profile_source::PROFILE_POSTS_REPLY_SQL,
-                "TRIM(COALESCE(in_reply_to, '')) = ''"
+                "(TRIM(COALESCE(in_reply_to, '')) = '' OR TRIM(in_reply_to) LIKE (rtrim($1, '%') || 'notes/%'))"
             );
             db.query(
                 "SELECT id, COALESCE(published::text, ''), COALESCE(content, ''),
                         COALESCE(raw_create_json, ''), COALESCE(in_reply_to, '')
                  FROM outbox_notes
                  WHERE id LIKE $1 AND COALESCE(visibility, 'public') = 'public'
-                   AND TRIM(COALESCE(in_reply_to, '')) = ''
+                   AND (TRIM(COALESCE(in_reply_to, '')) = '' OR TRIM(in_reply_to) LIKE (rtrim($1, '%') || 'notes/%'))
                  ORDER BY published DESC
                  LIMIT $2 OFFSET $3",
                 &[&like, &limit, &offset],

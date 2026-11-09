@@ -58,7 +58,9 @@ queries = source_queries("api/ap-db.php", "function ap_local_profile_tab_page(",
 queries = [q for q in queries if "FROM outbox_notes" in q]
 assert len(queries) == 3
 for sql in queries:
-    rows = db.execute(adapt(sql), (prefix + "%", 10, 0)).fetchall()
+    # The Posts query binds the id prefix twice (self-reply test).
+    prefixes = (prefix + "%",) * (sql.count("?") - 2)
+    rows = db.execute(adapt(sql), prefixes + (10, 0)).fetchall()
     assert rows and all("/public" in row[0] for row in rows), rows
     checks += 1
 print(f"PASS audience source queries: {checks} checks")

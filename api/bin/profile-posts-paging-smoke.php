@@ -54,6 +54,7 @@ reference_load($root . '/api/ap-db.php', [
     'ap_outbox_media_list_page',
     'ap_outbox_media_count',
     'ap_outbox_replies_count',
+    'ap_outbox_self_replies_count',
     'ap_outbox_count_for_actor',
     'ap_outbox_cached_count',
     'ap_outbox_drop_profile_note_caches',
@@ -81,7 +82,7 @@ reference_load($root . '/api/ap-featured.php', [
 
 $postsPredicate = ap_outbox_profile_reply_predicate(false);
 $repliesPredicate = ap_outbox_profile_reply_predicate(true);
-$check($postsPredicate === "TRIM(COALESCE(in_reply_to, '')) = ''", 'posts predicate keeps NULL and blank in_reply_to');
+$check($postsPredicate === "(TRIM(COALESCE(in_reply_to, '')) = '' OR TRIM(in_reply_to) LIKE (rtrim(?, '%') || 'notes/%'))", 'posts predicate keeps NULL and blank in_reply_to plus self-replies');
 $check($repliesPredicate === "TRIM(COALESCE(in_reply_to, '')) <> ''", 'replies predicate is the public reply count rule');
 
 $php = (string) file_get_contents($root . '/api/ap-db.php');
@@ -96,7 +97,9 @@ $rustConst = static function (string $source, string $name): string {
     }
     return $match[1];
 };
-$check($rustConst($rustSource, 'PROFILE_POSTS_REPLY_SQL') === $postsPredicate, 'Rust posts page uses the PHP posts predicate');
+$check(str_replace('$1', '?', $rustConst($rustSource, 'PROFILE_POSTS_REPLY_SQL')) === $postsPredicate, 'Rust posts page uses the PHP posts predicate');
+$check(str_contains($rustHtml, "AND " . str_replace('?', '$1', $postsPredicate)), 'Rust profile HTML posts query uses the shared posts predicate');
+$check(str_contains($php, "AND " . $postsPredicate), 'PHP in-app posts page uses the shared posts predicate');
 $check($rustConst($rustSource, 'PROFILE_REPLIES_REPLY_SQL') === $repliesPredicate, 'Rust replies page uses the PHP replies predicate');
 $check(str_contains($rustSource, 'PROFILE_POSTS_REPLY_SQL') && str_contains($rustSource, 'PROFILE_REPLIES_REPLY_SQL'), 'Rust profile source selects with the shared predicates');
 $check(str_contains($rustHtml, 'PROFILE_POSTS_REPLY_SQL') && str_contains($rustHtml, 'PROFILE_REPLIES_REPLY_SQL'), 'Rust profile HTML selects with the shared predicates');
@@ -113,7 +116,7 @@ $dropStart = strpos($php, 'function ap_outbox_drop_profile_note_caches');
 $dropEnd = strpos($php, 'function ap_local_profile_tab_page');
 $drop = ($dropStart !== false && $dropEnd !== false) ? substr($php, $dropStart, $dropEnd - $dropStart) : '';
 $check(str_contains($store, "function_exists('ap_outbox_drop_profile_note_caches')"), 'storing a note drops profile caches when that helper is loaded');
-$check(str_contains($drop, 'vaak:profile:outbox-count:v2:') && str_contains($drop, 'vaak:profile:reply-count:v2:'), 'a stored note drops the public profile count caches');
+$check(str_contains($drop, 'vaak:profile:outbox-count:v2:') && str_contains($drop, 'vaak:profile:reply-count:v2:') && str_contains($drop, 'vaak:profile:self-replies-count:v1:'), 'a stored note drops the public profile count caches');
 $check(str_contains($drop, 'vaak:profile:media-count:v2:') && str_contains($drop, 'vaak:profile:media-count:v1:'), 'a stored note drops the current and previous media counts');
 $check(str_contains($drop, 'vaak:profile:outbox-shared-count:v1:'), 'a stored note drops the public outbox collection count');
 $check(str_contains($drop, 'ap_public_doc_invalidate_note') && str_contains($drop, 'ap_public_doc_invalidate_actor'), 'a stored note drops the public note and actor documents');
@@ -307,6 +310,25 @@ $tenShifted = ap_local_profile_tab_page($ten, 'https://mkultra.monster/users/' .
 $tenShiftedIds = array_map(static fn(array $row): string => (string) $row['id'], $tenShifted['items']);
 $check($tenShiftedIds === array_slice($tenPosts, 2), 'offset 2 is a later page, not the first page');
 $check($tenIds !== $tenShiftedIds, 'the first page is not the offset-2 page');
+
+// Thread continuations: a reply to the account's own note is on Posts and
+// on Replies. A reply to someone else, or to another local account, is not.
+$thread = 'threadflux';
+$threadPrefix = 'https://mkultra.monster/users/' . $thread . '/notes/';
+$insert->execute([$threadPrefix . 'root', 'thread root', null, 'public', '{}', $stamp(20)]);
+$insert->execute([$threadPrefix . 'part-2', 'thread 2', ' ' . $threadPrefix . 'root ', 'public', '{}', $stamp(21)]);
+$insert->execute([$threadPrefix . 'part-3', 'thread 3', $threadPrefix . 'part-2', 'public', '{}', $stamp(22)]);
+$insert->execute([$threadPrefix . 'to-ada', 'reply to ada', $replyTo('thread'), 'public', '{}', $stamp(23)]);
+$insert->execute([$threadPrefix . 'to-lookalike', 'reply to lookalike', 'https://mkultra.monster/users/threadfluxer/notes/x', 'public', '{}', $stamp(24)]);
+$insert->execute([$threadPrefix . 'private-part', 'private thread part', $threadPrefix . 'root', 'private', '{}', $stamp(25)]);
+$threadPosts = array_map(static fn(array $row): string => (string) $row['id'], ap_local_profile_tab_page($thread, 'https://mkultra.monster/users/' . $thread, 'posts', 12, 0)['items']);
+$check($threadPosts === [$threadPrefix . 'part-3', $threadPrefix . 'part-2', $threadPrefix . 'root'], 'Posts lists thread continuations newest first, got ' . implode(',', $threadPosts));
+$threadReplies = array_map(static fn(array $row): string => (string) $row['id'], ap_local_profile_tab_page($thread, 'https://mkultra.monster/users/' . $thread, 'replies', 12, 0)['items']);
+$check(count($threadReplies) === 4 && in_array($threadPrefix . 'part-2', $threadReplies, true), 'Replies still lists every public reply, self-replies included');
+$check(ap_outbox_self_replies_count($thread) === 2, 'self-reply count is the two public continuations');
+$check(ap_profile_tab_total($thread, 'posts') === 3, 'Posts total counts the root and both continuations');
+$check(ap_profile_tab_total($thread, 'replies') === 4, 'Replies total is unchanged');
+$check(array_map(static fn(array $row): string => (string) $row['id'], ap_outbox_posts_list_page($thread, 12, 0)) === [$threadPrefix . 'root'], 'the /users/ HTML Posts list stays top-level only');
 
 $actorKeyMissing = false;
 try {

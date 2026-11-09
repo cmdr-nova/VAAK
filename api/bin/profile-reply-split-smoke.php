@@ -90,6 +90,9 @@ $totalSql = profile_sql_norm(profile_sql($php, 'vaak:profile:outbox-count:v2:'))
 $allSql = profile_sql_norm(profile_sql($php, 'vaak:profile:outbox-count:v1:'));
 $check($replySql === profile_sql_norm(profile_sql($rust, 'vaak:profile:reply-count:v2:')), 'PHP and Rust reply counts use the same SQL');
 $check($totalSql === profile_sql_norm(profile_sql($rust, 'vaak:profile:outbox-count:v2:')), 'PHP and Rust public totals use the same SQL');
+$selfSql = profile_sql_norm(profile_sql($php, 'vaak:profile:self-replies-count:v1:'));
+$check($selfSql === profile_sql_norm(profile_sql($rust, 'vaak:profile:self-replies-count:v1:')), 'PHP and Rust self-reply counts use the same SQL');
+$check(str_contains($selfSql, "TRIM(in_reply_to)LIKE(rtrim(?,'%')||'notes/%')"), 'self-reply count matches the posts predicate');
 $check(str_contains($replySql, "TRIM(COALESCE(in_reply_to,''))<>''"), 'reply count keeps real in_reply_to rows');
 $check(str_contains($replySql, "COALESCE(visibility,'public')='public'"), 'reply count is public-only');
 $check(str_contains($totalSql, "COALESCE(visibility,'public')='public'"), 'profile total is public-only');

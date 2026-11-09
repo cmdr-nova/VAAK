@@ -104,8 +104,12 @@ pub(crate) fn profile_scroll_status(has_more: bool) -> &'static str {
     if has_more { "Scroll for more…" } else { "End of profile" }
 }
 
-/// Same rule as the public reply count: NULL and blank `in_reply_to` are posts.
-pub(crate) const PROFILE_POSTS_REPLY_SQL: &str = "TRIM(COALESCE(in_reply_to, '')) = ''";
+/// NULL and blank `in_reply_to` are posts, and so is a self-reply: a note
+/// whose parent is one of the same account's own notes (a thread
+/// continuation), like Mastodon and Bluesky profiles. `$1` is the profile's
+/// `https://mkultra.monster/users/{key}/%` id prefix, so the self-reply test
+/// is that prefix plus `notes/`. Self-replies also stay on Replies.
+pub(crate) const PROFILE_POSTS_REPLY_SQL: &str = "(TRIM(COALESCE(in_reply_to, '')) = '' OR TRIM(in_reply_to) LIKE (rtrim($1, '%') || 'notes/%'))";
 /// Any other `in_reply_to` is a reply, including whitespace-padded URLs.
 pub(crate) const PROFILE_REPLIES_REPLY_SQL: &str = "TRIM(COALESCE(in_reply_to, '')) <> ''";
 pub(crate) async fn select(db:&Client,key:&str,actor:&str,tab:&str,limit:i64,offset:i64)->Result<SelectedProfilePage>{
@@ -175,7 +179,7 @@ mod tests {
  }
  #[test]
  fn profile_reply_predicates_match_the_count_rule() {
-  assert_eq!(PROFILE_POSTS_REPLY_SQL, "TRIM(COALESCE(in_reply_to, '')) = ''");
+  assert_eq!(PROFILE_POSTS_REPLY_SQL, "(TRIM(COALESCE(in_reply_to, '')) = '' OR TRIM(in_reply_to) LIKE (rtrim($1, '%') || 'notes/%'))");
   assert_eq!(PROFILE_REPLIES_REPLY_SQL, "TRIM(COALESCE(in_reply_to, '')) <> ''");
   let html = include_str!("profile_html.rs");
   assert!(html.contains(PROFILE_POSTS_REPLY_SQL) && html.contains(PROFILE_REPLIES_REPLY_SQL));
