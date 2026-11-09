@@ -3206,6 +3206,10 @@
       background: var(--panel); border-color: #3a3a3a;
     }
     .quote-block:not(.compose-reply-context):has(a.tweet-time) { cursor: pointer; }
+    /* Post cards open the post on click or tap (vaak-03.js). */
+    article.tweet:not(#status-focus):has(> .tweet-hd a.tweet-time),
+    .tweet-thread-seg:has(> .tweet-hd a.tweet-time),
+    article.tweet:has(> a.tweet-open-link) { cursor: pointer; }
     .quote-block--openable {
       cursor: pointer;
       transition: background .12s ease, border-color .12s ease;

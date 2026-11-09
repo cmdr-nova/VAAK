@@ -4207,8 +4207,33 @@ pub fn paint_lean_embed_from(
     if sort_ts > 0 && !article_attrs.contains(" data-sort=\"") {
         article_attrs.push_str(&format!(" data-sort=\"{sort_ts}\""));
     }
+    // A headerless embed (the notification row is its header) has no
+    // timestamp link, so it carries a hidden one: the browser opens it when
+    // the card is clicked or tapped (vaak-03.js post card handler).
+    let mut open_link = String::new();
+    if hide_header && !uri.is_empty() {
+        if let Some(open) = status
+            .get("url")
+            .and_then(|v| v.as_str())
+            .filter(|u| u.starts_with("https://") && crate::nostr::render::is_nostr_status(status))
+        {
+            open_link = format!(
+                "<a class=\"tweet-open-link\" href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\" hidden tabindex=\"-1\" aria-hidden=\"true\"></a>",
+                esc(open)
+            );
+        } else {
+            let from_q = if from.is_empty() { "mentions" } else { from };
+            let open = crate::library::actions::in_app_status_href(&status_open_ref(status, uri), from_q);
+            if !open.is_empty() && open != "#" {
+                open_link = format!(
+                    "<a class=\"tweet-open-link\" href=\"{}\" hidden tabindex=\"-1\" aria-hidden=\"true\"></a>",
+                    esc(&open)
+                );
+            }
+        }
+    }
 
-    let mut inner = String::new();
+    let mut inner = open_link;
 
     if !hide_header {
         let av = if avatar.starts_with("https://") {
@@ -5837,6 +5862,26 @@ mod tests {
         assert!(html.contains("Quoted post (not cached yet) — open"), "{html}");
         assert!(html.contains(&urlencoding_encode(target)), "in-app open link: {html}");
         assert!(html.contains("Boost CW - Urgent mutual aid"), "CW stays: {html}");
+    }
+
+    #[test]
+    fn headerless_embeds_carry_their_open_target() {
+        let st = json!({
+            "id": "m1", "uri": "https://mastodon.test/notes/m1", "url": "https://mastodon.test/notes/m1",
+            "created_at": "2026-11-09T06:00:00Z", "content": "<p>hi @me</p>",
+            "account": {"acct": "a@mastodon.test", "display_name": "A", "uri": "https://mastodon.test/users/a"},
+            "media_attachments": [],
+        });
+        // The notification row is the header, so the card itself names the post.
+        let bare = paint_lean_embed_from(&st, true, "mentions", "", true);
+        let link = bare.find("class=\"tweet-open-link\" href=\"").expect(&bare) + 30;
+        let at = link;
+        let href = &bare[at..at + bare[at..].find('"').unwrap()];
+        assert!(href.contains("view=status") && href.contains(&urlencoding_encode("https://mastodon.test/notes/m1")), "{bare}");
+        assert!(!bare[link..].split('>').next().unwrap().contains("target="), "{bare}");
+        // A card with a header opens through its timestamp link instead.
+        let full = paint_lean_embed_from(&st, false, "mentions", "", true);
+        assert!(!full.contains("tweet-open-link") && full.contains("tweet-time"), "{full}");
     }
 
     #[test]
