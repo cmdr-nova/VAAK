@@ -3008,6 +3008,21 @@
       border-color: color-mix(in srgb, #7be08f 45%, var(--border));
       color: #b4f2c0; background: rgba(123,224,143,.1);
     }
+    .phyrian-tier--common {
+      border-color: var(--border); color: var(--muted); background: transparent;
+    }
+    .phyrian-tier--uncommon {
+      border-color: color-mix(in srgb, #7be0b5 45%, var(--border));
+      color: #a8efd0; background: rgba(123,224,181,.08);
+    }
+    .phyrian-tier--rare {
+      border-color: color-mix(in srgb, #8fb8ff 50%, var(--border));
+      color: #bcd3ff; background: rgba(143,184,255,.1);
+    }
+    .phyrian-tier--legendary {
+      border-color: color-mix(in srgb, #ffcf5a 55%, var(--border));
+      color: #ffe08f; background: rgba(255,207,90,.12);
+    }
     .phyrian-badge--new {
       border-color: color-mix(in srgb, #f0c060 45%, var(--border));
       color: #f6dc9e; background: rgba(240,192,96,.1);

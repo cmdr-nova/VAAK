@@ -236,6 +236,72 @@ function ap_phyrian_strain_catalog(): array
     ];
 }
 
+/**
+ * Rarity tiers (same lists as the grid strains server STRAIN_TIERS).
+ * A catalog race that is not listed here is Common.
+ *
+ * @return array<string,list<string>>
+ */
+function ap_phyrian_strain_tiers(): array
+{
+    return [
+        'Legendary' => [
+            'Phyrian', 'Red Tower Echo', 'Vast Thing', 'Black Sun Cult', 'Choir of Teeth',
+            'Hungering Star', 'Unspeakable Bloom', 'Last Second',
+        ],
+        'Rare' => [
+            'Quasar Wound', 'Null Communion', 'Starless Brood', 'Hemolymph Crown', 'Cartilage Saint',
+            'Halo Larva', 'Ghost Firmware', 'Iron Dream', 'Neon Marrow', 'Witchlight Signal',
+            'Grave Neon', 'Coral Revenant', 'Trench Oracle', 'Magnetar Saint', 'Photon Heretic',
+            'Crystal Lich', 'Cobalt Monolith', 'Sky Leviathan', 'Ring Shepherd', 'Drone Matriarch',
+            'Swarm Prophet', 'Bloodroot Kin', 'Memory Moth', 'Oneiric Saint', 'Dark Matter Kin',
+            'Horizon Kin', 'Moebius Brood', 'Tesseract Host', 'Basilisk Signal', 'Ice Moon Choir',
+            'Brimstone Choir', 'Hex Daemon', 'Many-Eyed Kin', 'Outer Dark Kin', 'Inner Tenant',
+            'Cathedral Mind', 'Choir Eternal', 'Lost Probe', 'Fog Machine Ghost', 'Quicksilver Larva',
+        ],
+        'Uncommon' => [
+            'Astral Parasite', 'Eclipse Vessel', 'Marrow Signal', 'Spine Choir', 'Moltborn',
+            'Rootmind', 'Twin Pulse', 'Second Skin', 'Machine Spore', 'Signal Lattice',
+            'Ash Gene', 'Afterbody', 'Grey Bloom', 'Obsidian Root', 'Cinder Halo',
+            'Abyssal Choir', 'Pressure Kin', 'Kelp Monarch', 'Siltborn', 'Plasma Seraph',
+            'Helium Ghost', 'Ion Veil', 'Geode Hive', 'Obsidian Choir', 'Mica Swarm',
+            'Cloudwhale Kin', 'Jovian Bloom', 'Methane Seraph', 'Thermal Ghost', 'Carapace Saint',
+            'Locust Halo', 'Stinger Cult', 'Lichen Elder', 'Gloomcap', 'Vine Oracle',
+            'Briar Saint', 'Psi Hollow', 'Lucid Brood', 'Trance Signal', 'Neon Seraph',
+            'Spectral Kin', 'Glimmer Brood', 'Laser Monk', 'Hollow Star', 'Penumbra Host',
+            'Shade Larva', 'Paradox Kin', 'Loop Saint', 'Phase Ghost', 'Wyrmling Kin',
+            'Salamander Host', 'Feral Comet', 'Fang Orchid', 'Glacier Mind', 'Snow Larva',
+            'Sleet Brood', 'Magma Elder', 'Ashwalker', 'Scorch Host', 'Sulfur Bloom',
+            'Servo Saint', 'Overclock Brood', 'Root Access', 'Patchwork Engine', 'Tendril Saint',
+            'Hush Below', 'Skinthief', 'Host Hopper', 'Lung Bloom', 'Seraph Engine',
+            'Starlit Saint', 'Hymn Signal', 'Lumen Prophet', 'Orbit Drifter', 'Exile Signal',
+            'Meteor Kin', 'Synthwave Kin', 'Glowstick Brood', 'Laser Choir', 'Club Static',
+            'Gel Saint', 'Puddle Mind', 'Mucus Host', 'Liquid Halo',
+        ],
+    ];
+}
+
+/** Origin roll odds per tier, in percent. @return array<string,int> */
+function ap_phyrian_strain_tier_weights(): array
+{
+    return ['Common' => 70, 'Uncommon' => 22, 'Rare' => 7, 'Legendary' => 1];
+}
+
+/** Common / Uncommon / Rare / Legendary, or '' for a strain outside the catalog. */
+function ap_phyrian_strain_tier(string $strain): string
+{
+    $strain = trim($strain);
+    if ($strain === '') {
+        return '';
+    }
+    foreach (ap_phyrian_strain_tiers() as $tier => $names) {
+        if (in_array($strain, $names, true)) {
+            return $tier;
+        }
+    }
+    return in_array($strain, ap_phyrian_strain_catalog(), true) ? 'Common' : '';
+}
+
 function ap_phyrian_is_origin_owner(int $ownerUserId): bool
 {
     // Mid-Phase-1 default: operator account id 1 (cmdr_nova) seeds origin imprints.
@@ -276,6 +342,26 @@ function ap_phyrian_pick_strain(): string
     $catalog = ap_phyrian_strain_catalog();
     if ($catalog === []) {
         return 'Phyrian';
+    }
+    // Weighted like the grid: roll a tier first, then an even pick inside it.
+    $pools = [];
+    foreach ($catalog as $name) {
+        $pools[ap_phyrian_strain_tier($name) ?: 'Common'][] = $name;
+    }
+    $weights = array_filter(
+        ap_phyrian_strain_tier_weights(),
+        static fn (string $tier): bool => !empty($pools[$tier]),
+        ARRAY_FILTER_USE_KEY
+    );
+    $total = array_sum($weights);
+    if ($total > 0) {
+        $pick = random_int(1, $total);
+        foreach ($weights as $tier => $weight) {
+            $pick -= $weight;
+            if ($pick <= 0) {
+                return $pools[$tier][random_int(0, count($pools[$tier]) - 1)];
+            }
+        }
     }
     return $catalog[random_int(0, count($catalog) - 1)] ?? 'Phyrian';
 }
@@ -1058,6 +1144,7 @@ function ap_phyrian_dossier(int $ownerUserId): ?array
         'actor_id' => $actorId,
         'status' => $imprinted ? ap_phyrian_stability($player) : 'Unmarked',
         'strain' => $imprinted ? trim((string) ($player['strain'] ?? '')) : '',
+        'strain_tier' => $imprinted ? ap_phyrian_strain_tier((string) ($player['strain'] ?? '')) : '',
         'generation' => $imprinted ? (int) ($player['generation'] ?? 1) : null,
         'max_generation' => AP_PHYRIAN_MAX_GENERATION,
         'lineage_depth' => $imprinted ? $lineageDepth : null,
