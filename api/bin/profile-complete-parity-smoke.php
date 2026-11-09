@@ -246,12 +246,15 @@ try {
     parity_check($postsMore['json']['page']['has_more'] === false, 'second posts page is the last PHP page');
     $ownerPosts = $page('posts', 0, $owner);
     $postsHtml = $posts['html'] . $postsMore['html'];
-    foreach (['BSKY-POST', 'QUOTE-MARKER', 'MEDIA-POST', 'PIN-PUBLIC'] as $marker) {
+    // BSKY-REPLY replies to the account's own BSKY-POST: a thread
+    // continuation, so it is on Posts as well as Replies.
+    parity_check(in_array($notes['bsky-reply']['id'], $postIds, true), 'PHP posts include the self-reply');
+    foreach (['BSKY-POST', 'BSKY-REPLY', 'QUOTE-MARKER', 'MEDIA-POST', 'PIN-PUBLIC'] as $marker) {
         parity_check(str_contains($postsHtml, $marker), 'posts HTML includes ' . $marker);
     }
     parity_check(!in_array($notes['quoted']['id'], array_slice($postIds, 0, 10), true), 'the quoted note itself is outside the first PHP page');
     parity_check(str_contains($ownerPosts['html'], 'QUOTED-BODY'), 'the quote card includes the quoted post');
-    foreach (['BSKY-REPLY', 'PIN-FOLLOWERS', 'PIN-DIRECT', 'HIDDEN-PRIVATE'] as $marker) {
+    foreach (['PIN-FOLLOWERS', 'PIN-DIRECT', 'HIDDEN-PRIVATE'] as $marker) {
         parity_check(!str_contains($postsHtml, $marker), 'posts HTML omits ' . $marker);
     }
 
