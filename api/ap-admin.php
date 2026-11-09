@@ -74,6 +74,7 @@ require_once __DIR__ . '/ap-action-queue.php'; // Durable reversible timeline ac
 require_once __DIR__ . '/ap-rss.php'; // You → RSS → Home mix
 require_once __DIR__ . '/ap-phyrian.php'; // Phyrian Strains web game (Phase 1)
 require_once __DIR__ . '/ap-phyrian-bridge.php'; // OpenSim ↔ VAAK Resonant bridge (Phase 3)
+require_once __DIR__ . '/ap-phyrian-sl.php'; // Second Life avatar joins the grid strain
 // Quote helpers (ap_quote_target_pack, ap_fetch_as2_object, local note docs, etc.)
 if (!defined('AP_INBOX_LIB_ONLY')) {
     define('AP_INBOX_LIB_ONLY', true);
@@ -5700,6 +5701,7 @@ $vaakAdminOnlyActions = [
     } elseif (in_array($action, [
         'phyrian_request', 'phyrian_accept', 'phyrian_deny', 'phyrian_checkin', 'phyrian_self_seed',
         'phyrian_bridge_start', 'phyrian_bridge_verify', 'phyrian_bridge_unlink',
+        'phyrian_sl_start', 'phyrian_sl_verify', 'phyrian_sl_unlink',
     ], true)) {
         $phyReturn = preg_replace('/[^a-z_]/', '', (string) ($_POST['return_view'] ?? 'phyrian')) ?: 'phyrian';
         $view = in_array($phyReturn, ['phyrian', 'mentions'], true) ? $phyReturn : 'phyrian';
@@ -5724,6 +5726,9 @@ $vaakAdminOnlyActions = [
                 : ['ok' => false, 'error' => 'Bridge unavailable'];
             if (!empty($res['ok'])) {
                 $notice = (string) ($res['notice'] ?? 'OpenSim avatar linked.');
+                if (function_exists('ap_phyrian_sl_after_grid_change')) {
+                    ap_phyrian_sl_after_grid_change($ownerId);
+                }
             } else {
                 $error = (string) ($res['error'] ?? 'Could not verify code.');
             }
@@ -5733,8 +5738,26 @@ $vaakAdminOnlyActions = [
                 : ['ok' => false, 'error' => 'Bridge unavailable'];
             if (!empty($res['ok'])) {
                 $notice = (string) ($res['notice'] ?? 'OpenSim avatar unlinked.');
+                if (function_exists('ap_phyrian_sl_after_grid_change')) {
+                    ap_phyrian_sl_after_grid_change($ownerId);
+                }
             } else {
                 $error = (string) ($res['error'] ?? 'Could not unlink.');
+            }
+        } elseif ($action === 'phyrian_sl_start' || $action === 'phyrian_sl_verify' || $action === 'phyrian_sl_unlink') {
+            if (!function_exists('ap_phyrian_sl_start')) {
+                $res = ['ok' => false, 'error' => 'Second Life linking unavailable'];
+            } elseif ($action === 'phyrian_sl_start') {
+                $res = ap_phyrian_sl_start($ownerId, (string) ($_POST['sl_identify'] ?? ''));
+            } elseif ($action === 'phyrian_sl_verify') {
+                $res = ap_phyrian_sl_verify($ownerId, (string) ($_POST['sl_code'] ?? ''));
+            } else {
+                $res = ap_phyrian_sl_unlink($ownerId);
+            }
+            if (!empty($res['ok'])) {
+                $notice = (string) ($res['notice'] ?? 'Saved.');
+            } else {
+                $error = (string) ($res['error'] ?? 'Could not update the Second Life link.');
             }
         } elseif ($action === 'phyrian_self_seed') {
             $res = function_exists('ap_phyrian_origin_self_seed')
@@ -38554,6 +38577,42 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
               </form>
             <?php endif; ?>
           </section>
+          <?php
+            $phySlLink = function_exists('ap_phyrian_sl_link_for_user') ? ap_phyrian_sl_link_for_user((int) $vaakOwnerId) : null;
+            $phySlPending = ($phySlLink === null && function_exists('ap_phyrian_sl_pending')) ? ap_phyrian_sl_pending((int) $vaakOwnerId) : null;
+          ?>
+          <?php if (function_exists('ap_phyrian_sl_start')): ?>
+          <section class="phyrian-bridge composer" aria-label="Link Second Life avatar" style="margin:0 0 1rem">
+            <div class="meta" style="margin-bottom:.75rem">
+              <b style="color:var(--primary)">Link Second Life</b><br>
+              Play your NovaLandia strain in Second Life too. Your SL avatar shares the same strain, resonance, level and lineage, with one daily monolith claim across both worlds.
+            </div>
+            <?php if (!is_array($phyBridgeLink)): ?>
+              <div class="meta">Link your NovaLandia avatar above first. Your Second Life avatar joins that strain.</div>
+            <?php elseif (is_array($phySlLink)): ?>
+              <div class="who" style="margin-bottom:.35rem">Linked as <?= h((string) ($phySlLink['sl_name'] ?? 'avatar')) ?></div>
+              <div class="meta" style="margin-bottom:.75rem">Verified <?= h(function_exists('relative_time') ? relative_time((string) ($phySlLink['verified_at'] ?? '')) : (string) ($phySlLink['verified_at'] ?? '')) ?> · plays as <?= h((string) ($phyBridgeLink['avatar_name'] ?? 'your grid avatar')) ?></div>
+              <form method="post" action="?view=phyrian" onsubmit="return confirm('Unlink this Second Life avatar?');">
+                <input type="hidden" name="action" value="phyrian_sl_unlink">
+                <div class="composer-actions"><span class="meta">One Second Life avatar per VAAK account</span><button class="btn btn-ghost" type="submit" style="color:var(--danger)">Unlink</button></div>
+              </form>
+            <?php else: ?>
+              <?php if (is_array($phySlPending)): ?>
+                <div class="meta" style="margin-bottom:.75rem;color:var(--primary)">Code queued for <code><?= h((string) ($phySlPending['sl_name'] ?? '')) ?></code>. Wear the HUD in Second Life, touch <b>Status</b>, then enter the code below (expires <?= h(function_exists('relative_time') ? relative_time((string) ($phySlPending['expires_at'] ?? '')) : (string) ($phySlPending['expires_at'] ?? '')) ?>).</div>
+                <form method="post" action="?view=phyrian" style="margin-bottom:1rem">
+                  <input type="hidden" name="action" value="phyrian_sl_verify"><label for="sl-strain-code">Claim code</label>
+                  <input id="sl-strain-code" type="text" name="sl_code" required maxlength="16" autocomplete="one-time-code" placeholder="e.g. A7K3MQ" style="text-transform:uppercase;letter-spacing:.08em">
+                  <div class="composer-actions"><span class="meta">From the Second Life HUD message</span><button class="btn btn-primary" type="submit">Confirm link</button></div>
+                </form>
+              <?php endif; ?>
+              <form method="post" action="?view=phyrian">
+                <input type="hidden" name="action" value="phyrian_sl_start"><label for="sl-strain-identify">Second Life avatar</label>
+                <input id="sl-strain-identify" type="text" name="sl_identify" required maxlength="200" placeholder="SL avatar UUID or username" value="<?= h((string) ($phySlPending['sl_name'] ?? '')) ?>">
+                <div class="composer-actions"><span class="meta">Wear the SL HUD and touch Register first</span><button class="btn btn-primary" type="submit"><?= is_array($phySlPending) ? 'Resend claim code' : 'Send claim code' ?></button></div>
+              </form>
+            <?php endif; ?>
+          </section>
+          <?php endif; ?>
           <?php endif; /* hub */ ?>
         </section>
 
