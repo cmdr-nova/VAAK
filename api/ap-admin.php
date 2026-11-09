@@ -5796,9 +5796,14 @@ $vaakAdminOnlyActions = [
             $res = ap_phyrian_request_resolve($ownerId, $reqId, $action === 'phyrian_accept');
             if (!empty($res['ok'])) {
                 if ($action === 'phyrian_accept' && !empty($res['strain'])) {
+                    $acceptTier = function_exists('ap_phyrian_strain_tier') ? ap_phyrian_strain_tier((string) $res['strain']) : '';
                     $notice = 'Imprint accepted. You are now marked by '
                         . (string) $res['strain']
+                        . ($acceptTier !== '' ? ' [' . $acceptTier . ']' : '')
                         . (!empty($res['origin_random']) ? ' (origin roll).' : '.');
+                    if (!empty($res['origin_random']) && ($acceptTier === 'Legendary' || $acceptTier === 'Rare')) {
+                        $notice = 'A ' . strtoupper($acceptTier) . ' strain answers. ' . $notice;
+                    }
                 } elseif ($action === 'phyrian_accept') {
                     $notice = 'Resonance exchange accepted.';
                 } else {
@@ -38156,6 +38161,7 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
               : [];
           $phyStatus = (string) ($phyPlayer['status'] ?? 'unknown');
           $phyStrain = trim((string) ($phyPlayer['strain'] ?? ''));
+          $phyTier = ($phyStrain !== '' && function_exists('ap_phyrian_strain_tier')) ? ap_phyrian_strain_tier($phyStrain) : '';
           $phyResonance = (int) ($phyPlayer['resonance'] ?? 0);
           $phyResPct = max(0, min(100, $phyResonance));
           $phyGen = (int) ($phyPlayer['generation'] ?? 1);
@@ -38271,7 +38277,7 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
                   <p class="meta" style="margin:0 0 .75rem">terminal readout // The Phyrian Strains</p>
                   <dl class="phyrian-dossier-grid">
                     <dt>Status</dt><dd><?= h((string) ($phyDossier['status'] ?? 'Unmarked')) ?></dd>
-                    <dt>Strain</dt><dd><?= h(((string) ($phyDossier['strain'] ?? '')) !== '' ? (string) $phyDossier['strain'] : 'None') ?></dd>
+                    <dt>Strain</dt><dd><?= h(((string) ($phyDossier['strain'] ?? '')) !== '' ? (string) $phyDossier['strain'] : 'None') ?><?php if (((string) ($phyDossier['strain_tier'] ?? '')) !== ''): ?> <span class="phyrian-badge phyrian-tier phyrian-tier--<?= h(strtolower((string) $phyDossier['strain_tier'])) ?>"><?= h((string) $phyDossier['strain_tier']) ?></span><?php endif; ?></dd>
                     <dt>Generation</dt>
                     <dd><?php
                       $g = $phyDossier['generation'] ?? null;
@@ -38361,6 +38367,7 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
               <div class="phyrian-status-row">
                 <?php if ($phyImprinted): ?>
                   <span class="who"><?= h($phyStrain) ?></span>
+                  <?php if ($phyTier !== ''): ?><span class="phyrian-badge phyrian-tier phyrian-tier--<?= h(strtolower($phyTier)) ?>"><?= h($phyTier) ?></span><?php endif; ?>
                   <span class="phyrian-badge">Imprinted</span>
                 <?php else: ?>
                   <span class="who">Unknown Entity</span>
