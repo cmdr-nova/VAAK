@@ -1031,14 +1031,40 @@ function ap_masto_timeline_list(int $listId, int $limit = 40, ?string $maxId = n
         'actor_id IN (' . implode(',', array_fill(0, count($ids), '?')) . ')',
     ];
 
-    if ($maxId !== null && $maxId !== '' && function_exists('ap_masto_event_id_from_status_id')) {
+    // Page by created_at like the other timelines. Rows are ordered by
+    // created_at, so an id cursor skipped or repeated posts whenever outbox
+    // backfill gave older posts newer ids. The id fallback stays for status
+    // ids that do not resolve to a time.
+    $sqlTime = static function (?string $statusId): ?string {
+        if ($statusId === null || $statusId === '' || !function_exists('ap_masto_status_created_at_by_id')) {
+            return null;
+        }
+        $at = ap_masto_status_created_at_by_id((int) $statusId);
+        if ($at === null || $at === '') {
+            return null;
+        }
+        try {
+            return (new DateTimeImmutable($at))->format('c');
+        } catch (Throwable $e) {
+            return null;
+        }
+    };
+    $beforeSql = $sqlTime($maxId);
+    $afterSql = $sqlTime($sinceId);
+    if ($beforeSql !== null) {
+        $where[] = 'created_at < ?';
+        $params[] = $beforeSql;
+    } elseif ($maxId !== null && $maxId !== '' && function_exists('ap_masto_event_id_from_status_id')) {
         $eid = ap_masto_event_id_from_status_id((int) $maxId);
         if ($eid !== null) {
             $where[] = 'id < ?';
             $params[] = $eid;
         }
     }
-    if ($sinceId !== null && $sinceId !== '' && function_exists('ap_masto_event_id_from_status_id')) {
+    if ($afterSql !== null) {
+        $where[] = 'created_at > ?';
+        $params[] = $afterSql;
+    } elseif ($sinceId !== null && $sinceId !== '' && function_exists('ap_masto_event_id_from_status_id')) {
         $eid = ap_masto_event_id_from_status_id((int) $sinceId);
         if ($eid !== null) {
             $where[] = 'id > ?';
@@ -1056,19 +1082,57 @@ function ap_masto_timeline_list(int $listId, int $limit = 40, ?string $maxId = n
         }
     }
 
-    $sql = 'SELECT * FROM events WHERE ' . implode(' AND ', $where)
-        . ' ORDER BY created_at DESC, id DESC LIMIT ' . (int) max($limit * 3, $limit + 20);
-    try {
-        $st = ap_db()->prepare($sql);
-        $st->execute($params);
-        $rows = $st->fetchAll() ?: [];
-    } catch (Throwable $e) {
-        error_log('[ap-lists] timeline: ' . $e->getMessage());
-        return [];
-    }
-
+    // Reply policy and dedupe can thin a window; read up to three windows so
+    // a thin one is not returned as a short page (Ice Cubes stops paging on
+    // any page under 40).
+    $windowSize = (int) max($limit * 3, $limit + 20);
     $out = [];
     $seenUri = [];
+    $keyset = null;
+    for ($window = 0; $window < 3; $window++) {
+        $passWhere = $where;
+        $passParams = $params;
+        if ($keyset !== null) {
+            $passWhere[] = '(created_at, id) < (?, ?)';
+            $passParams[] = $keyset['at'];
+            $passParams[] = $keyset['id'];
+        }
+        $sql = 'SELECT * FROM events WHERE ' . implode(' AND ', $passWhere)
+            . ' ORDER BY created_at DESC, id DESC LIMIT ' . $windowSize;
+        try {
+            $st = ap_db()->prepare($sql);
+            $st->execute($passParams);
+            $rows = $st->fetchAll() ?: [];
+        } catch (Throwable $e) {
+            error_log('[ap-lists] timeline: ' . $e->getMessage());
+            return $out;
+        }
+        if (ap_masto_timeline_list_fill($rows, $out, $seenUri, $limit, $policy, $actorIds, $followedMap)) {
+            break;
+        }
+        if (count($rows) < $windowSize) {
+            break;
+        }
+        $lastRow = $rows[count($rows) - 1];
+        $keyset = ['at' => (string) ($lastRow['created_at'] ?? ''), 'id' => (int) ($lastRow['id'] ?? 0)];
+        if ($keyset['at'] === '') {
+            break;
+        }
+    }
+    return $out;
+}
+
+/**
+ * Append one window of list events to $out. True once $out holds $limit.
+ *
+ * @param list<array<string,mixed>> $rows
+ * @param list<array<string,mixed>> $out
+ * @param array<string,bool> $seenUri
+ * @param array<string,bool> $actorIds
+ * @param array<string,bool> $followedMap
+ */
+function ap_masto_timeline_list_fill(array $rows, array &$out, array &$seenUri, int $limit, string $policy, array $actorIds, array $followedMap): bool
+{
     foreach ($rows as $row) {
         $type = (string) ($row['type'] ?? '');
         $inReplyTo = trim((string) ($row['in_reply_to'] ?? ''));
@@ -1110,10 +1174,10 @@ function ap_masto_timeline_list(int $listId, int $limit = 40, ?string $maxId = n
         }
         $out[] = $status;
         if (count($out) >= $limit) {
-            break;
+            return true;
         }
     }
-    return $out;
+    return false;
 }
 
 function ap_list_parent_actor_for_object(string $objectId): ?string

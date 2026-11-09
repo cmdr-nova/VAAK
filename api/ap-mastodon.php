@@ -2210,9 +2210,17 @@ function ap_masto_api(string $method, string $path): void
     if (preg_match('#^/api/v1/timelines/tag/([^/]+)$#', $path, $tm) && $method === 'GET') {
         ap_masto_require_token('read');
         $tag = rawurldecode($tm[1]);
-        $limit = isset($_GET['limit']) ? (int) $_GET['limit'] : 20;
+        $limit = max(1, min(40, isset($_GET['limit']) ? (int) $_GET['limit'] : 20));
         $maxId = isset($_GET['max_id']) ? (string) $_GET['max_id'] : null;
-        ap_masto_json(ap_masto_timeline_hashtag($tag, $limit, $maxId));
+        $sinceId = isset($_GET['since_id']) ? (string) $_GET['since_id'] : null;
+        if (($sinceId === null || $sinceId === '') && isset($_GET['min_id'])) {
+            $sinceId = (string) $_GET['min_id'];
+        }
+        $tagStatuses = ap_visibility_filter_statuses(
+            ap_masto_timeline_hashtag($tag, $limit, $maxId, $sinceId),
+            (int) ap_db_masto_owner_user_id()
+        );
+        ap_masto_json_timeline($tagStatuses, '/api/v1/timelines/tag/' . rawurlencode($tag), $limit);
         return;
     }
 
@@ -2269,40 +2277,51 @@ function ap_masto_api(string $method, string $path): void
         $local = isset($_GET['local']) && ($_GET['local'] === '1' || $_GET['local'] === 'true');
 
         if ($local) {
-            // Local timeline = this single-user instance's own posts
-            // Fetch past the requested page before applying the cursor; a
-            // head-only query would make page 2 appear empty immediately.
-            $rows = ap_masto_statuses_recent(
-                min(200, max(($limit > 0 ? $limit : 40) * 4, 80)),
-                null,
-                null,
-                null,
-                true
-            );
-            $out = [];
+            // Local timeline = this instance's own posts. The cursor goes
+            // into SQL and thin windows (non-public posts, moderation) read
+            // the next older window. The old head-only fetch capped Local at
+            // the newest 80 rows, and Ice Cubes reads a short page as the end.
+            $limit = max(1, min(80, $limit > 0 ? $limit : 40));
             $before = ($maxId !== null && $maxId !== '') ? ap_masto_status_created_at_by_id((int) $maxId) : null;
             $after = ($sinceId !== null && $sinceId !== '') ? ap_masto_status_created_at_by_id((int) $sinceId) : null;
-            foreach ($rows as $r) {
-                $status = ap_masto_status_from_row($r);
-                if (!ap_visibility_public_status($status)) {
-                    continue;
+            $localOwner = (int) ap_db_masto_owner_user_id();
+            $windowSize = 80;
+            $out = [];
+            $seenLocal = [];
+            $cursor = $before;
+            for ($window = 0; $window < 5; $window++) {
+                $rows = ap_masto_statuses_recent($windowSize, $cursor, $after, null, true);
+                $batch = [];
+                foreach ($rows as $r) {
+                    $status = ap_masto_status_from_row($r);
+                    if (!ap_visibility_public_status($status)) {
+                        continue;
+                    }
+                    if ($onlyMedia && empty($status['media_attachments'])) {
+                        continue;
+                    }
+                    $batch[] = $status;
                 }
-                $ts = (string) ($status['created_at'] ?? '');
-                if ($before !== null && $ts !== '' && strcmp($ts, $before) >= 0) {
-                    continue;
+                foreach (ap_visibility_filter_statuses($batch, $localOwner) as $status) {
+                    $sid = (string) ($status['id'] ?? '');
+                    if ($sid !== '' && isset($seenLocal[$sid])) {
+                        continue;
+                    }
+                    $seenLocal[$sid] = true;
+                    $out[] = $status;
+                    if (count($out) >= $limit) {
+                        break 2;
+                    }
                 }
-                if ($after !== null && $ts !== '' && strcmp($ts, $after) <= 0) {
-                    continue;
-                }
-                if ($onlyMedia && empty($status['media_attachments'])) {
-                    continue;
-                }
-                $out[] = $status;
-                if (count($out) >= $limit) {
+                if (count($rows) < $windowSize) {
                     break;
                 }
+                $nextCursor = (string) ($rows[count($rows) - 1]['published'] ?? '');
+                if ($nextCursor === '' || $nextCursor === $cursor) {
+                    break;
+                }
+                $cursor = $nextCursor;
             }
-            $out = ap_visibility_filter_statuses($out, (int) ap_db_masto_owner_user_id());
             ap_masto_json_timeline($out, '/api/v1/timelines/public', $limit, ['local' => 'true']);
             return;
         }
