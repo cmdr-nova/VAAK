@@ -24108,6 +24108,91 @@ function admin_render_local_self_thread(array $n, array $tip, array $followingId
  *
  * @param array<string,mixed> $n outbox_notes row
  */
+/**
+ * One profile timeline row painted to a string (Bluesky item, Announce,
+ * shared outbox card or plain outbox card), as the profile loops paint it.
+ */
+function admin_profile_row_card_html(array $n, array $followingIds, ?string $boostActor = null): string
+{
+    ob_start();
+    if (isset($n['post']) && is_array($n['post'])) {
+        admin_render_bsky_feed_item($n, 'following', 'remote_profile');
+    } elseif (strtolower((string) ($n['type'] ?? '')) === 'announce') {
+        admin_render_event_tweet($n, $followingIds, 'remote_profile', false, $boostActor);
+    } elseif (!admin_try_render_outbox_shared_card($n, $followingIds, 'remote_profile')) {
+        admin_render_outbox_card($n, 'remote_profile');
+    }
+    return (string) ob_get_clean();
+}
+
+/**
+ * Profile self-threads, same rule as Rust self_thread::group_painted_outbox_threads:
+ * a painted outbox card whose note replies to the same author's note painted
+ * on this page becomes one Home-style thread card at the tip's place; the
+ * parent's own card is folded into it. Rows and cards share keys.
+ *
+ * @param list<array<string,mixed>> $rows
+ * @param list<string> $cards
+ * @return list<string>
+ */
+function admin_profile_group_self_threads(array $rows, array $cards): array
+{
+    $norm = static fn($v): string => rtrim(trim(is_string($v) ? $v : ''), '/');
+    $actorOf = static function (string $uri): string {
+        $parts = explode('/notes/', $uri, 2);
+        return (count($parts) === 2 && str_contains($parts[0], '/users/')) ? $parts[0] : '';
+    };
+    $byUri = [];
+    foreach ($rows as $i => $row) {
+        if (!is_array($row) || isset($row['post']) || !isset($cards[$i]) || trim($cards[$i]) === '') continue;
+        $uri = $norm($row['id'] ?? '');
+        if ($uri !== '' && !isset($byUri[$uri])) $byUri[$uri] = $i;
+    }
+    $consumed = [];
+    $out = [];
+    foreach ($cards as $i => $html) {
+        if (isset($consumed[$i])) continue;
+        $consumed[$i] = true;
+        $row = $rows[$i] ?? null;
+        $parentAt = null;
+        if (is_array($row) && !isset($row['post']) && trim($html) !== '') {
+            $uri = $norm($row['id'] ?? '');
+            $parent = $norm($row['in_reply_to'] ?? '');
+            $actor = $actorOf($uri);
+            if ($parent !== '' && $parent !== $uri && $actor !== '' && $actorOf($parent) === $actor
+                && isset($byUri[$parent]) && !isset($consumed[$byUri[$parent]])) {
+                $parentAt = $byUri[$parent];
+            }
+        }
+        if ($parentAt === null) {
+            $out[] = $html;
+            continue;
+        }
+        $parentHtml = trim((string) $cards[$parentAt]);
+        $tipHtml = trim($html);
+        if (!preg_match('~^<article\b([^>]*)>(.*)</article>$~s', $parentHtml, $pm)
+            || !preg_match('~^<article\b([^>]*)>(.*)</article>$~s', $tipHtml, $tm)) {
+            $out[] = $html;
+            continue;
+        }
+        $consumed[$parentAt] = true;
+        $attrs = static function (string $head): string {
+            $copied = '';
+            foreach (['data-timeline-key', 'data-bsky-uri', 'data-rss-item', 'data-note-id', 'data-status-id', 'data-announce-id', 'data-sort'] as $name) {
+                if (preg_match('~\s' . preg_quote($name, '~') . '="([^"]*)"~', $head, $m)) $copied .= ' ' . $name . '="' . $m[1] . '"';
+            }
+            return $copied;
+        };
+        $tipKey = preg_match('~\sdata-timeline-key="([^"]*)"~', $tm[1], $km) ? ' data-timeline-key="' . $km[1] . '"' : '';
+        $out[] = '<article class="tweet tweet-thread"' . $tipKey . '>'
+            . '<div class="tweet-thread-seg tweet-thread-seg--ancestor"' . $attrs($pm[1]) . '>' . $pm[2] . '</div>'
+            . '<div class="tweet-thread-rail" aria-hidden="true"></div>'
+            . '<div class="tweet-thread-seg tweet-thread-seg--tip"' . $attrs($tm[1]) . '>' . $tm[2] . '</div>'
+            . '</article>';
+    }
+    return $out;
+}
+
 function admin_render_outbox_card(array $n, string $returnView): void
 {
     $actor = vaak_actor_id();
@@ -26792,16 +26877,12 @@ if ($isPartial && $view === 'remote_profile') {
         : !empty($page['has_more']);
     header('X-Has-More: ' . ($profileMore ? '1' : '0'));
     header('X-Next-Offset: ' . $profileNext);
+    $rows = array_values(array_filter($rows, 'is_array'));
+    $cards = [];
     foreach ($rows as $row) {
-        if (!is_array($row)) {
-            continue;
-        }
-        if (strtolower((string) ($row['type'] ?? '')) === 'announce') {
-            admin_render_event_tweet($row, $followingIds, 'remote_profile', false, $profileTab === 'boosts' ? $profileActor : null);
-        } elseif (!admin_try_render_outbox_shared_card($row, $followingIds, 'remote_profile')) {
-            admin_render_outbox_card($row, 'remote_profile');
-        }
+        $cards[] = admin_profile_row_card_html($row, $followingIds, $profileTab === 'boosts' ? $profileActor : null);
     }
+    echo implode('', $profileTab === 'boosts' ? $cards : admin_profile_group_self_threads($rows, $cards));
     exit;
     }
 }
@@ -37632,16 +37713,16 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
                   });
               }
             ?>
-            <?php foreach ($localProfileItems as $n): ?>
-              <?php if (isset($n['post']) && is_array($n['post'])): ?>
-                <?php admin_render_bsky_feed_item($n, 'following', 'remote_profile'); ?>
-              <?php elseif (isset($n['type']) && strtolower((string) $n['type']) === 'announce'): ?>
-                <?php admin_render_event_tweet($n, $followingIds, 'remote_profile', false, $rpIsLocal && $rpTab === 'boosts' ? $rpActor : null); ?>
-              <?php elseif (is_array($n) && admin_try_render_outbox_shared_card($n, $followingIds, 'remote_profile')): ?>
-              <?php else: ?>
-                <?php if (is_array($n)) admin_render_outbox_card($n, 'remote_profile'); ?>
-              <?php endif; ?>
-            <?php endforeach; ?>
+            <?php
+              // Paint each row, then fold self-thread continuations under
+              // their parent like Home (Boosts are not grouped).
+              $localProfileItems = array_values(array_filter($localProfileItems, 'is_array'));
+              $localProfileCards = [];
+              foreach ($localProfileItems as $n) {
+                  $localProfileCards[] = admin_profile_row_card_html($n, $followingIds, $rpIsLocal && $rpTab === 'boosts' ? $rpActor : null);
+              }
+              echo implode('', $rpTab === 'boosts' ? $localProfileCards : admin_profile_group_self_threads($localProfileItems, $localProfileCards));
+            ?>
             <?php endif; ?>
 <?php if (is_array($rpLocalNative ?? null) && is_string($rpLocalNative['feed_close'] ?? null)) { echo $rpLocalNative['feed_close']; } else { ?>
             <?php if ($rpIsLocal): ?></div><div id="timeline-status" class="meta" style="padding:.75rem 0;text-align:center"><?= $rpLocalHasMore ? 'Scroll for more…' : 'End of profile' ?></div><div id="timeline-sentinel" aria-hidden="true" style="height:1px"></div><button type="button" class="feed-top-btn" id="feed-top-btn" title="Back to top" aria-label="Back to top">↑</button>
