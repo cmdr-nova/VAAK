@@ -168,6 +168,86 @@ const ORIGIN_STRAINS: &[&str] = &[
     "Grey Bloom", "Hollow Kin", "Burnt Genome", "Neon Marrow", "Phyrian", "Red Tower Echo",
     "Obsidian Root", "Rose Static", "Violet Drift", "Cinder Halo", "Witchlight Signal",
     "Moonless Colony", "Grave Neon", "Sable Current",
+    // Abyssal
+    "Abyssal Choir", "Brine Saint", "Tidewraith", "Pressure Kin", "Lantern Eel",
+    "Drowned Signal", "Kelp Monarch", "Benthic Bloom", "Pearl Parasite", "Siltborn",
+    "Trench Oracle", "Coral Revenant",
+    // Stellar
+    "Solar Wind Kin", "Corona Drifter", "Plasma Seraph", "Nova Brood", "Pulsar Monk",
+    "Helium Ghost", "Flare Hatchling", "Magnetar Saint", "Redshift Kin", "Ion Veil",
+    "Sunspot Larva", "Photon Heretic",
+    // Crystal
+    "Quartz Mind", "Geode Hive", "Silica Wraith", "Basalt Elder", "Obsidian Choir",
+    "Prism Hatchling", "Salt Oracle", "Mica Swarm", "Crystal Lich", "Garnet Pulse",
+    "Cobalt Monolith", "Shardborn",
+    // Skyborne
+    "Cloudwhale Kin", "Ammonia Drifter", "Storm Choir", "Jovian Bloom", "Sky Leviathan",
+    "Vapor Saint", "Helix Kite", "Methane Seraph", "Gale Brood", "Ring Shepherd",
+    "Aurora Kin", "Thermal Ghost",
+    // Insectoid
+    "Hive Regent", "Mantis Choir", "Carapace Saint", "Swarm Prophet", "Wasp Signal",
+    "Drone Matriarch", "Nymph Brood", "Locust Halo", "Amber Hive", "Silkweaver",
+    "Stinger Cult", "Pupa Saint",
+    // Verdant
+    "Spore Regent", "Lichen Elder", "Thornmind", "Pollen Ghost", "Bloodroot Kin",
+    "Gloomcap", "Orchid Host", "Mossborn", "Vine Oracle", "Rot Garden",
+    "Seedship Kin", "Briar Saint",
+    // Psychic
+    "Dreamwalker", "Mind Lantern", "Psi Hollow", "Echo Mind", "Thought Leech",
+    "Lucid Brood", "Reverie Kin", "Whisper Host", "Oneiric Saint", "Trance Signal",
+    "Memory Moth", "Hush Choir",
+    // Radiant
+    "Glowform", "Neon Seraph", "Halo Engine", "Lumen Wraith", "Spectral Kin",
+    "Ultraviolet Host", "Strobe Saint", "Glimmer Brood", "Radiant Husk", "Afterglow Kin",
+    "Laser Monk", "Photonic Bloom",
+    // Umbral
+    "Umbral Kin", "Hollow Star", "Abyss Gaze", "Eclipse Choir", "Penumbra Host",
+    "Gloom Seraph", "Nightglass", "Shade Larva", "Horizon Kin", "Dark Matter Kin",
+    "Nil Choir", "Black Sun Cult",
+    // Temporal
+    "Chrono Drifter", "Paradox Kin", "Tesseract Host", "Fold Walker", "Rift Spawn",
+    "Loop Saint", "Fractal Choir", "Mirror Kin", "Phase Ghost", "Moebius Brood",
+    "Elsewhere Kin", "Last Second",
+    // Beastkin
+    "Scale Regent", "Wyrmling Kin", "Basilisk Signal", "Gill Saint", "Tusk Elder",
+    "Salamander Host", "Horned Choir", "Quill Brood", "Feral Comet", "Venom Saint",
+    "Claw Monk", "Fang Orchid",
+    // Frost
+    "Cryo Seraph", "Frostborn", "Glacier Mind", "Rime Ghost", "Permafrost Kin",
+    "Snow Larva", "Ice Moon Choir", "Hoarfrost Saint", "Polar Drift", "Sleet Brood",
+    "Cold Star Kin", "Aurora Husk",
+    // Pyre
+    "Magma Elder", "Ember Brood", "Pyre Saint", "Ashwalker", "Caldera Kin",
+    "Brimstone Choir", "Lava Seraph", "Scorch Host", "Furnace Mind", "Kiln Larva",
+    "Sulfur Bloom", "Wildfire Kin",
+    // Cyber
+    "Data Wraith", "Servo Saint", "Cipher Kin", "Kernel Ghost", "Overclock Brood",
+    "Vector Choir", "Glitch Saint", "Hex Daemon", "Root Access", "Byte Larva",
+    "Firewall Kin", "Patchwork Engine",
+    // Eldritch
+    "Many-Eyed Kin", "Elder Static", "Choir of Teeth", "Unspeakable Bloom", "Hungering Star",
+    "Writhing Halo", "Tendril Saint", "Maw Signal", "Outer Dark Kin", "Faceless Host",
+    "Hush Below", "Vast Thing",
+    // Parasitic
+    "Brainfluke", "Hollow Rider", "Skinthief", "Nerve Vine", "Marrow Leech",
+    "Host Hopper", "Spinal Passenger", "Blood Lantern", "Lung Bloom", "Tick Saint",
+    "Puppeteer Kin", "Inner Tenant",
+    // Celestial
+    "Seraph Engine", "Angelic Static", "Halo Swarm", "Choir Eternal", "Starlit Saint",
+    "Sanctum Kin", "Gilded Host", "Hymn Signal", "Cathedral Mind", "Throne Larva",
+    "Psalm Drift", "Lumen Prophet",
+    // Nomad
+    "Comet Nomad", "Dust Pilgrim", "Orbit Drifter", "Driftship Kin", "Wander Star",
+    "Exile Signal", "Caravan Host", "Waystation Saint", "Meteor Kin", "Lost Probe",
+    "Starwake", "Far Shore Kin",
+    // Nightlife
+    "Synthwave Kin", "Rave Seraph", "Subwoofer Saint", "Glowstick Brood", "Afterhours Kin",
+    "Bassline Host", "Laser Choir", "Neon Communion", "Fog Machine Ghost", "Dancefloor Mind",
+    "Club Static", "Midnight Pulse",
+    // Liquid
+    "Ooze Regent", "Gel Saint", "Mercury Kin", "Slick Choir", "Puddle Mind",
+    "Viscous Bloom", "Acid Brood", "Mucus Host", "Quicksilver Larva", "Drip Signal",
+    "Plasm Kin", "Liquid Halo",
 ];
 
 fn configured_origin_owner() -> i64 {
@@ -1125,10 +1205,11 @@ mod tests {
 
     #[test]
     fn origin_catalog_order_matches_php_fixture_shape() {
-        assert_eq!(ORIGIN_STRAINS.len(), 65);
+        assert_eq!(ORIGIN_STRAINS.len(), 305);
         assert_eq!(ORIGIN_STRAINS.first(), Some(&"Cosmic Alien"));
         assert_eq!(ORIGIN_STRAINS[55], "Phyrian");
-        assert_eq!(ORIGIN_STRAINS.last(), Some(&"Sable Current"));
+        assert_eq!(ORIGIN_STRAINS[64], "Sable Current");
+        assert_eq!(ORIGIN_STRAINS.last(), Some(&"Liquid Halo"));
     }
 
     #[test]
