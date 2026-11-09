@@ -152,6 +152,18 @@ $check(str_contains($gHtml, 'Bex &lt;b&gt;Root&lt;/b&gt;'), 'grid names are esca
 $check(!str_contains($gHtml, 'Dee Unmarked'), 'unimprinted grid avatars stay off the tree');
 $gRecap = ap_phyrian_tree_recap($gl['rows'], $gTree, $db, $now);
 $check($gRecap['new_imprints'] === 4, 'recap counts grid-only imprints too');
+// World badges once the grid sends the world column.
+$db->exec("ALTER TABLE phyrian_grid_lineage ADD COLUMN world TEXT NOT NULL DEFAULT 'opensim'");
+$db->prepare('INSERT INTO phyrian_grid_lineage (avatar_uuid, avatar_name, parent_uuid, strain, generation, imprinted_at, world) VALUES (?, ?, ?, ?, ?, ?, ?)')
+    ->execute([$gUuid('e'), 'Sela Resident', $gUuid('c'), 'Grid Tide', 6, $ago(1), 'sl']);
+$db->prepare('INSERT INTO phyrian_grid_lineage (avatar_uuid, avatar_name, parent_uuid, strain, generation, imprinted_at, world) VALUES (?, ?, ?, ?, ?, ?, ?)')
+    ->execute([$gUuid('f'), 'Hop Visitor @hg.osgrid.org', $gUuid('c'), 'Grid Tide', 6, $ago(1), 'opensim']);
+$db->exec("UPDATE phyrian_grid_lineage SET world = 'both' WHERE avatar_uuid = '" . $gUuid('5') . "'");
+$wHtml = ap_phyrian_tree_page_html(4, 'csrf-ok', $db, $now);
+$check((bool) preg_match('/Sela Resident.{0,200}phyrian-badge--sl[^>]*>Second Life</s', $wHtml), 'Second Life avatars get a Second Life badge');
+$check((bool) preg_match('/Hop Visitor.{0,200}phyrian-badge--hg[^>]*>Hypergrid</s', $wHtml), 'hypergrid visitors get a Hypergrid badge');
+$check(str_contains($wHtml, '+ Second Life'), 'a linked avatar that also plays in Second Life is marked');
+$check(str_contains($wHtml, 'Grid only'), 'NovaLandia grid avatars keep the Grid only badge');
 $db->exec('DROP TABLE phyrian_grid_lineage');
 $check(count(ap_phyrian_tree_load($db)['rows'] ?? []) === 9, 'missing grid table leaves the VAAK tree as it was');
 

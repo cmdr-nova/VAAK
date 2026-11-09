@@ -1039,9 +1039,24 @@ function ap_phyrian_bridge_normalize_lineage(array $data): array
                 (int) ($p['generation'] ?? 1)
             )),
             'imprinted_at' => $at,
+            'world' => ap_phyrian_bridge_lineage_world((string) ($p['world'] ?? ''), $name),
         ];
     }
     return array_values($out);
+}
+
+/**
+ * World tag for a mirrored carrier. Older grid exports send no world, so a
+ * hypergrid-style name ("First Last @grid.host") still reads as hypergrid.
+ */
+function ap_phyrian_bridge_lineage_world(string $world, string $name): string
+{
+    $world = strtolower(trim($world));
+    if (in_array($world, ['hypergrid', 'sl', 'both'], true)) {
+        return $world;
+    }
+    // Local grid accounts never carry an @, hypergrid visitors always do.
+    return str_contains($name, '@') ? 'hypergrid' : 'opensim';
 }
 
 /**
@@ -1069,11 +1084,11 @@ function ap_phyrian_bridge_lineage_sync(?PDO $db = null, ?callable $call = null)
         $db->beginTransaction();
         $db->exec('DELETE FROM phyrian_grid_lineage');
         $ins = $db->prepare(
-            'INSERT INTO phyrian_grid_lineage (avatar_uuid, avatar_name, parent_uuid, strain, generation, imprinted_at, synced_at)
-             VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)'
+            'INSERT INTO phyrian_grid_lineage (avatar_uuid, avatar_name, parent_uuid, strain, generation, imprinted_at, world, synced_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)'
         );
         foreach ($rows as $r) {
-            $ins->execute([$r['avatar_uuid'], $r['avatar_name'], $r['parent_uuid'], $r['strain'], $r['generation'], $r['imprinted_at']]);
+            $ins->execute([$r['avatar_uuid'], $r['avatar_name'], $r['parent_uuid'], $r['strain'], $r['generation'], $r['imprinted_at'], $r['world']]);
         }
         $db->commit();
     } catch (Throwable $e) {
