@@ -390,6 +390,22 @@ pub(crate) trait BodyMentionResolver{
 pub(crate) struct DiscoveredBody{source:String,text:String,code:Vec<(String,String)>,mentions:Vec<BodyMention>,self_actor:String}
 impl DiscoveredBody{
  pub(crate) fn source(&self)->&str{&self.source}
+ /// admin_linkify_body_html seeds `$byAcct` with the caller's declared
+ /// mentions before discovery, so a declared acct/username wins over a
+ /// discovered entry for the same name.
+ pub(crate) fn seed_declared(&mut self,declared:&[serde_json::Value]){
+  let mut seeded=Vec::new();
+  for m in declared{
+   let acct=m.get("acct").and_then(|v|v.as_str()).unwrap_or("").trim();
+   let url=m.get("url").or_else(||m.get("uri")).and_then(|v|v.as_str()).unwrap_or("").trim();
+   if acct.is_empty()||!url.starts_with("https://"){continue}
+   let user=m.get("username").and_then(|v|v.as_str()).map(str::trim).filter(|u|!u.is_empty()).unwrap_or_else(||acct.split('@').next().unwrap_or(acct));
+   seeded.push(BodyMention{acct:acct.into(),username:user.into(),url:url.into()});
+  }
+  if seeded.is_empty(){return}
+  self.mentions.retain(|d|!seeded.iter().any(|s|s.acct.eq_ignore_ascii_case(&d.acct)||s.username.eq_ignore_ascii_case(&d.username)));
+  seeded.append(&mut self.mentions);self.mentions=seeded;
+ }
  #[cfg(test)] pub(crate) fn mentions(&self)->&[BodyMention]{&self.mentions}
 }
 /// The html_entity_decode boundary admission and painter both use to pick

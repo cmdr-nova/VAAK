@@ -371,7 +371,7 @@ pub(crate) async fn admit_guest_raw_with_dns(db:&Client,session:&GuestProfileSes
             attachments.iter().any(|item|item.get("url").and_then(Value::as_str).or_else(||item.get("url").and_then(|url|url.get("href")).and_then(Value::as_str))==Some(url.as_str()))
         }).map(|(url,preview)|(url.clone(),preview.clone())).collect();
         let mut raw_facts=crate::profile_raw::RawProfileFacts{card:facts,actor_key:key.clone(),actor:actor.clone(),display_name:profile.get("name").and_then(Value::as_str).unwrap_or(&key).into(),note_dom_id:digest,masto_row:masto.clone(),status_id:String::new(),own_note:false,guest:true,quote_html:String::new(),link_card:None,media_preview_by_url:previews,body_mentions:None};
-        if let Some(intent)=quote_intent.as_ref(){let(html,product,changes)=crate::profile_bridge::timed(crate::profile_bridge::Stage::RawQuote,prepare_raw_quote(db,&crate::profile_materialize::ProfileViewer::Guest(&scoped_session),&page,index,&raw,&status,intent,&raw_facts.card,dns,Some(&bsky))).await?;for change in &changes{for(previous,_)in &mut quote_products{previous.reconcile_account_changes(change)?;}}mapping_changes.extend(changes);let painted=!html.is_empty()&&product.status().is_some();raw_facts.quote_html=html;quote_products.push((product,painted));}
+        if let Some(intent)=quote_intent.as_ref(){let(html,product,changes)=crate::profile_bridge::timed(crate::profile_bridge::Stage::RawQuote,prepare_raw_quote(db,&crate::profile_materialize::ProfileViewer::Guest(&scoped_session),&page,index,&raw,&status,intent,&raw_facts.card,dns,Some(&bsky),QuoteMentioner{self_key:"__guest__",self_actor:"",proofs:&mut mention_proofs})).await?;for change in &changes{for(previous,_)in &mut quote_products{previous.reconcile_account_changes(change)?;}}mapping_changes.extend(changes);let painted=!html.is_empty()&&product.status().is_some();raw_facts.quote_html=html;quote_products.push((product,painted));}
         if crate::profile_raw::root_preview_allowed(&raw,&raw_facts){raw_facts.link_card=crate::profile_bridge::timed(crate::profile_bridge::Stage::RawPreview,crate::direct_preview::resolve_cache_only_guarded(db,dns,&crate::profile_raw::current_plain(&raw,&raw_facts),raw_facts.card.now,Some(stage.as_ref()))).await?;}
         // The public PHP profile renders with vaak_actor_key() '__guest__' and an empty vaak_actor_id().
         let body=crate::profile_raw::current_plain(&raw,&raw_facts);if crate::library::body::needs_discovery(&body){let(found,proof)=crate::profile_bridge::timed(crate::profile_bridge::Stage::RawMentions,crate::profile_materialize::raw_body_mentions(db,0,&body,&raw_facts.card.owner_actor,"__guest__","")).await?;raw_facts.body_mentions=Some(found);mention_proofs.push(proof);}
@@ -608,7 +608,22 @@ async fn external_quote_facts(db:&Client,intent:&RawQuoteIntent,preloaded:Option
  }
  Ok(embedded_stub_facts(intent))
 }
-async fn prepare_raw_quote(db:&Client,viewer:&crate::profile_materialize::ProfileViewer<'_>,page:&ProfilePage,index:usize,raw:&Value,root:&Value,intent:&RawQuoteIntent,facts:&crate::library::card::CardFacts,dns:&dyn crate::direct_preview::PreviewDns,bsky:Option<&std::collections::HashMap<String,(String,String,String)>>)->Result<(String,crate::profile_materialize::ProjectedQuoteTarget,Vec<crate::profile_materialize::AccountMappingChanges>)>{
+/// Quote text gets the same admitted mention discovery as the raw body when
+/// its declared mentions leave an @name unresolved (PHP discovers it in
+/// admin_linkify_body_html); the discovery's cache reads join the batch proof.
+pub(crate) struct QuoteMentioner<'a>{self_key:&'a str,self_actor:&'a str,proofs:&'a mut Vec<crate::profile_materialize::RawBodyMentionProof>}
+impl QuoteMentioner<'_>{
+ async fn render(&mut self,db:&Client,owner:i64,quote:&crate::profile_raw::RawQuoteFacts,facts:&crate::library::card::CardFacts)->Result<String>{
+  let declared=crate::profile_raw::render_quote(quote,facts);
+  let text=crate::library::card::php_trim(&quote.text);
+  if declared.is_ok()||!crate::library::body::needs_discovery(text){return declared}
+  let(mut found,proof)=crate::profile_bridge::timed(crate::profile_bridge::Stage::RawMentions,crate::profile_materialize::raw_body_mentions(db,owner,text,&facts.owner_actor,self.self_key,self.self_actor)).await?;
+  found.seed_declared(&quote.mentions);
+  let html=crate::profile_raw::render_quote_with(quote,facts,Some(&found))?;
+  self.proofs.push(proof);Ok(html)
+ }
+}
+async fn prepare_raw_quote(db:&Client,viewer:&crate::profile_materialize::ProfileViewer<'_>,page:&ProfilePage,index:usize,raw:&Value,root:&Value,intent:&RawQuoteIntent,facts:&crate::library::card::CardFacts,dns:&dyn crate::direct_preview::PreviewDns,bsky:Option<&std::collections::HashMap<String,(String,String,String)>>,mut mentioner:QuoteMentioner<'_>)->Result<(String,crate::profile_materialize::ProjectedQuoteTarget,Vec<crate::profile_materialize::AccountMappingChanges>)>{
  crate::profile_bridge::count_stage(crate::profile_bridge::StageCount::Quote);
  page.require_source_row(index,raw)?;crate::profile_bridge::timed(crate::profile_bridge::Stage::QuoteCurrent,page.require_current_ledger(db)).await?;
  crate::profile_bridge::ensure_budget()?;
@@ -618,14 +633,14 @@ async fn prepare_raw_quote(db:&Client,viewer:&crate::profile_materialize::Profil
  let target=intent.url.as_str();
  if intent.tombstone||crate::profile_materialize::local_key(target).is_none()||crate::profile_materialize::quote_target_is_bluesky(target){
   let quote=crate::profile_bridge::timed(crate::profile_bridge::Stage::QuoteExternal,external_quote_facts(db,intent,bsky)).await?;
-  let html=crate::profile_raw::render_quote(&quote,facts)?;
+  let html=mentioner.render(db,owner,&quote,facts).await?;
   return Ok((html,crate::profile_materialize::ProjectedQuoteTarget::absent(intent.url.clone()),Vec::new()));
  }
  let mut product=crate::profile_bridge::timed(crate::profile_bridge::Stage::QuoteMaterialize,crate::profile_materialize::materialize_quote_target(db,viewer,target)).await?;let mut mapping_changes=Vec::new();
  let Some(child)=product.status().cloned()else{
   crate::profile_bridge::timed(crate::profile_bridge::Stage::QuoteCurrent,product.require_current(db)).await?;
   let quote=crate::profile_bridge::timed(crate::profile_bridge::Stage::QuoteExternal,external_quote_facts(db,intent,bsky)).await?;
-  let html=crate::profile_raw::render_quote(&quote,facts)?;
+  let html=mentioner.render(db,owner,&quote,facts).await?;
   return Ok((html,product,Vec::new()));
  };
  let allowed=crate::profile_bridge::timed(crate::profile_bridge::Stage::QuoteAudience,async{let mut checked=vec![child.clone()];crate::audience::filter_profile_statuses(db,owner,crate::audience::Surface::Direct,&mut checked).await?;anyhow::Ok(checked.len()==1&&crate::direct_context::local_outbox_tree(db,&child,0).await?&&crate::direct_context::current_tree(db,&child,0).await?)}).await?;
@@ -655,7 +670,7 @@ async fn prepare_raw_quote(db:&Client,viewer:&crate::profile_materialize::Profil
  // guard checks first; the check after rendering covers its reads.
  if allowed{crate::profile_bridge::timed(crate::profile_bridge::Stage::QuoteCache,product.complete_cache(db,dns,&grant)).await?;}
  // A resolved quote paints the quoted author (avatar, name, handle) like every other surface.
- let html=if !allowed{String::new()}else if crate::library::card::feed_quote_paintable(product.status().unwrap()){crate::library::card::feed_quote_embed(product.status().unwrap(),facts,false)?}else{crate::profile_raw::render_quote(&raw_quote_facts(product.status().unwrap(),target),facts)?};
+ let html=if !allowed{String::new()}else if crate::library::card::feed_quote_paintable(product.status().unwrap()){crate::library::card::feed_quote_embed(product.status().unwrap(),facts,false)?}else{mentioner.render(db,owner,&raw_quote_facts(product.status().unwrap(),target),facts).await?};
  crate::profile_bridge::timed(crate::profile_bridge::Stage::QuoteCurrent,async{product.require_current(db).await?;page.require_current_ledger(db).await}).await?;
  Ok((html,product,mapping_changes))
 }
@@ -730,7 +745,7 @@ pub(crate) async fn admit_authenticated_raw_with_dns(db:&Client,session:&Authent
         let stage=std::sync::Arc::new(RawStageGrant{proof:RawProfileProof{owner:session.owner,owner_snapshot:Some(owner_snapshot.clone()),key:session.actor_key.clone(),actor:session.canonical_actor.clone(),target:target.clone(),dependencies:vec![(status.clone(),key.clone(),profile.clone(),masto.clone())],quotes:vec![],mapping_changes:vec![],mentions:vec![]},page:page.clone()});
         crate::profile_bridge::ensure_budget()?;let mut scoped_session=session.clone();if let Some(context)=session.warm_context(){scoped_session=scoped_session.with_warm_context(context.bound(stage.clone()));}
         let mut raw_facts=crate::profile_bridge::timed(crate::profile_bridge::Stage::RawFacts,crate::profile_raw_facts::resolve_authenticated(db,&scoped_session,&raw,&actor,&key,&profile)).await?;
-        if let Some(intent)=quote_intent.as_ref(){let(html,product,changes)=crate::profile_bridge::timed(crate::profile_bridge::Stage::RawQuote,prepare_raw_quote(db,&crate::profile_materialize::ProfileViewer::Auth(&scoped_session),&page,index,&raw,&status,intent,&raw_facts.card,dns,None)).await?;for change in &changes{for(previous,_)in &mut quote_products{previous.reconcile_account_changes(change)?;}}mapping_changes.extend(changes);let painted=!html.is_empty()&&product.status().is_some();raw_facts.quote_html=html;quote_products.push((product,painted));}
+        if let Some(intent)=quote_intent.as_ref(){let(html,product,changes)=crate::profile_bridge::timed(crate::profile_bridge::Stage::RawQuote,prepare_raw_quote(db,&crate::profile_materialize::ProfileViewer::Auth(&scoped_session),&page,index,&raw,&status,intent,&raw_facts.card,dns,None,QuoteMentioner{self_key:&self_key,self_actor:&self_actor,proofs:&mut mention_proofs})).await?;for change in &changes{for(previous,_)in &mut quote_products{previous.reconcile_account_changes(change)?;}}mapping_changes.extend(changes);let painted=!html.is_empty()&&product.status().is_some();raw_facts.quote_html=html;quote_products.push((product,painted));}
         if crate::profile_raw::root_preview_allowed(&raw,&raw_facts){raw_facts.link_card=crate::profile_bridge::timed(crate::profile_bridge::Stage::RawPreview,crate::direct_preview::resolve_cache_only_guarded(db,dns,&crate::profile_raw::current_plain(&raw,&raw_facts),raw_facts.card.now,Some(stage.as_ref()))).await?;}
         let body=crate::profile_raw::current_plain(&raw,&raw_facts);if crate::library::body::needs_discovery(&body){let(found,proof)=crate::profile_bridge::timed(crate::profile_bridge::Stage::RawMentions,crate::profile_materialize::raw_body_mentions(db,session.owner,&body,&raw_facts.card.owner_actor,&self_key,&self_actor)).await?;raw_facts.body_mentions=Some(found);mention_proofs.push(proof);}
         dependencies.push((status,key,profile,masto));cards.push((index,AdmittedRawProfileStatus{status:raw,facts:raw_facts}));
