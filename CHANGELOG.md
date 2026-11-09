@@ -12,6 +12,13 @@ anything else bumps the patch number.
 Releases up to **0.9.83** used a two-digit deploy counter (0.9.05, 0.9.83)
 and have no notes here; their tags and GitHub Releases are unchanged.
 
+## [0.63.0](https://github.com/cmdr-nova/VAAK/releases/tag/v0.63.0) - 2026-11-09
+
+### ✨ Features
+* Phyrian Strains: link a Second Life avatar onto the grid strain by @cmdr-nova in https://github.com/cmdr-nova/VAAK/pull/420
+
+**Full Changelog**: https://github.com/cmdr-nova/VAAK/compare/v0.62.0...v0.63.0
+
 ## [0.62.0](https://github.com/cmdr-nova/VAAK/releases/tag/v0.62.0) - 2026-11-09
 
 ### ✨ Features
