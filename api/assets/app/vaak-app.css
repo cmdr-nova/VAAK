@@ -3209,7 +3209,7 @@
     /* Post cards open the post on click or tap (vaak-03.js). */
     article.tweet:not(#status-focus):has(> .tweet-hd a.tweet-time),
     .tweet-thread-seg:has(> .tweet-hd a.tweet-time),
-    article.tweet[data-open-href] { cursor: pointer; }
+    article.tweet:has(> a.tweet-open-link) { cursor: pointer; }
     .quote-block--openable {
       cursor: pointer;
       transition: background .12s ease, border-color .12s ease;

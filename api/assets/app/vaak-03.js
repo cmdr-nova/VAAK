@@ -599,7 +599,9 @@
     return el && el.closest ? el.closest('.quote-block, ' + POST_CARD_SEL) : null;
   }
   function postCardOwnAnchor(card) {
-    const links = card.querySelectorAll('a.tweet-time[href]');
+    // The timestamp link, or the hidden open link a headerless notification
+    // embed carries in its place.
+    const links = card.querySelectorAll('a.tweet-time[href], a.tweet-open-link[href]');
     for (let i = 0; i < links.length; i++) {
       if (postCardOwner(links[i]) === card) return links[i];
     }
@@ -607,11 +609,7 @@
   }
   function postCardOwnTarget(card) {
     const anchor = postCardOwnAnchor(card);
-    if (anchor) return { raw: anchor.getAttribute('href') || '', anchor, external: anchor.target === '_blank' };
-    // Headerless notification embeds carry their target on the card.
-    const raw = card.getAttribute('data-open-href');
-    if (raw) return { raw, anchor: null, external: card.getAttribute('data-open-external') === '1' };
-    return null;
+    return anchor ? { raw: anchor.getAttribute('href') || '', anchor, external: anchor.target === '_blank' } : null;
   }
   function postCardTarget(card) {
     let t = postCardOwnTarget(card);
@@ -659,18 +657,8 @@
       window.open(new URL(target.href, window.location.href).href, '_blank', 'noopener');
       return;
     }
-    // The timestamp link goes through soft-nav (vaak-09.js), same as a tap on it.
-    if (target.anchor && target.anchor.getAttribute('href') === target.href) {
-      target.anchor.click();
-      return;
-    }
-    // No link on the card (headerless embed): click a temporary one so the
-    // same soft-nav link handling applies.
-    const a = document.createElement('a');
-    a.href = target.href;
-    a.hidden = true;
-    card.appendChild(a);
-    try { a.click(); } finally { a.remove(); }
+    // The card's own link goes through soft-nav (vaak-09.js), same as a tap on it.
+    target.anchor.click();
   }
   document.addEventListener('click', onPostCardActivate, true);
   document.addEventListener('auxclick', onPostCardActivate, true);

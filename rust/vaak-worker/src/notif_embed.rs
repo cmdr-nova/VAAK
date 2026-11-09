@@ -4208,25 +4208,32 @@ pub fn paint_lean_embed_from(
         article_attrs.push_str(&format!(" data-sort=\"{sort_ts}\""));
     }
     // A headerless embed (the notification row is its header) has no
-    // timestamp link, so the card carries the target the browser opens when
-    // it is clicked or tapped (vaak-03.js post card handler).
+    // timestamp link, so it carries a hidden one: the browser opens it when
+    // the card is clicked or tapped (vaak-03.js post card handler).
+    let mut open_link = String::new();
     if hide_header && !uri.is_empty() {
         if let Some(open) = status
             .get("url")
             .and_then(|v| v.as_str())
             .filter(|u| u.starts_with("https://") && crate::nostr::render::is_nostr_status(status))
         {
-            article_attrs.push_str(&format!(" data-open-href=\"{}\" data-open-external=\"1\"", esc(open)));
+            open_link = format!(
+                "<a class=\"tweet-open-link\" href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\" hidden tabindex=\"-1\" aria-hidden=\"true\"></a>",
+                esc(open)
+            );
         } else {
             let from_q = if from.is_empty() { "mentions" } else { from };
             let open = crate::library::actions::in_app_status_href(&status_open_ref(status, uri), from_q);
             if !open.is_empty() && open != "#" {
-                article_attrs.push_str(&format!(" data-open-href=\"{}\"", esc(&open)));
+                open_link = format!(
+                    "<a class=\"tweet-open-link\" href=\"{}\" hidden tabindex=\"-1\" aria-hidden=\"true\"></a>",
+                    esc(&open)
+                );
             }
         }
     }
 
-    let mut inner = String::new();
+    let mut inner = open_link;
 
     if !hide_header {
         let av = if avatar.starts_with("https://") {
@@ -5867,13 +5874,14 @@ mod tests {
         });
         // The notification row is the header, so the card itself names the post.
         let bare = paint_lean_embed_from(&st, true, "mentions", "", true);
-        let at = bare.find("data-open-href=\"").expect(&bare) + 16;
+        let link = bare.find("class=\"tweet-open-link\" href=\"").expect(&bare) + 30;
+        let at = link;
         let href = &bare[at..at + bare[at..].find('"').unwrap()];
         assert!(href.contains("view=status") && href.contains(&urlencoding_encode("https://mastodon.test/notes/m1")), "{bare}");
-        assert!(!bare.contains("data-open-external"), "{bare}");
+        assert!(!bare[link..].split('>').next().unwrap().contains("target="), "{bare}");
         // A card with a header opens through its timestamp link instead.
         let full = paint_lean_embed_from(&st, false, "mentions", "", true);
-        assert!(!full.contains("data-open-href") && full.contains("tweet-time"), "{full}");
+        assert!(!full.contains("tweet-open-link") && full.contains("tweet-time"), "{full}");
     }
 
     #[test]
