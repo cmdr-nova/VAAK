@@ -62,7 +62,7 @@ $check(
         '20261103_nostr_note_counts_postgres.sql',
         '20261104_inbox_route_shadow_postgres.sql',
         '20261109_phyrian_sl_links_postgres.sql',
-        '20261109_phyrian_grid_lineage_world_postgres.sql',
+        '20261109_phyrian_grid_lineage_worlds_postgres.sql',
     ],
     'deploy runner picks up the clans migration and the quote-target table'
 );

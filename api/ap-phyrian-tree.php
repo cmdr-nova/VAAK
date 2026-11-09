@@ -114,13 +114,15 @@ function ap_phyrian_tree_load_grid(?PDO $db = null): array
     try {
         $pdo = ap_phyrian_tree_db($db);
         $st = $pdo->prepare(
-            'SELECT avatar_uuid, avatar_name, parent_uuid, strain, generation, imprinted_at, world
-             FROM phyrian_grid_lineage LIMIT ' . (string) AP_PHYRIAN_TREE_MAX_ROWS
+            'SELECT l.avatar_uuid, l.avatar_name, l.parent_uuid, l.strain, l.generation, l.imprinted_at, w.world
+             FROM phyrian_grid_lineage l
+             LEFT JOIN phyrian_grid_lineage_worlds w ON w.avatar_uuid = l.avatar_uuid
+             LIMIT ' . (string) AP_PHYRIAN_TREE_MAX_ROWS
         );
         $st->execute();
         return $st->fetchAll(PDO::FETCH_ASSOC) ?: [];
     } catch (Throwable $e) {
-        // Before the world column migration: same rows without it.
+        // Before the worlds table migration: same rows without a world.
     }
     try {
         $st = ($pdo ?? ap_phyrian_tree_db($db))->prepare(

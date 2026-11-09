@@ -1084,11 +1084,11 @@ function ap_phyrian_bridge_lineage_sync(?PDO $db = null, ?callable $call = null)
         $db->beginTransaction();
         $db->exec('DELETE FROM phyrian_grid_lineage');
         $ins = $db->prepare(
-            'INSERT INTO phyrian_grid_lineage (avatar_uuid, avatar_name, parent_uuid, strain, generation, imprinted_at, world, synced_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)'
+            'INSERT INTO phyrian_grid_lineage (avatar_uuid, avatar_name, parent_uuid, strain, generation, imprinted_at, synced_at)
+             VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)'
         );
         foreach ($rows as $r) {
-            $ins->execute([$r['avatar_uuid'], $r['avatar_name'], $r['parent_uuid'], $r['strain'], $r['generation'], $r['imprinted_at'], $r['world']]);
+            $ins->execute([$r['avatar_uuid'], $r['avatar_name'], $r['parent_uuid'], $r['strain'], $r['generation'], $r['imprinted_at']]);
         }
         $db->commit();
     } catch (Throwable $e) {
@@ -1097,5 +1097,32 @@ function ap_phyrian_bridge_lineage_sync(?PDO $db = null, ?callable $call = null)
         }
         return ['ok' => false, 'error' => 'lineage store failed: ' . $e->getMessage()];
     }
-    return ['ok' => true, 'rows' => count($rows)];
+    $worlds = ap_phyrian_bridge_lineage_worlds_store($db, $rows);
+    return ['ok' => true, 'rows' => count($rows), 'worlds' => $worlds];
+}
+
+/**
+ * Replace phyrian_grid_lineage_worlds with each mirrored avatar's world.
+ * Separate from the lineage store so a release that runs before its
+ * migration still keeps the tree; the badges then fall back to names.
+ *
+ * @param list<array<string,mixed>> $rows
+ */
+function ap_phyrian_bridge_lineage_worlds_store(PDO $db, array $rows): bool
+{
+    try {
+        $db->beginTransaction();
+        $db->exec('DELETE FROM phyrian_grid_lineage_worlds');
+        $ins = $db->prepare('INSERT INTO phyrian_grid_lineage_worlds (avatar_uuid, world) VALUES (?, ?)');
+        foreach ($rows as $r) {
+            $ins->execute([$r['avatar_uuid'], $r['world']]);
+        }
+        $db->commit();
+        return true;
+    } catch (Throwable $e) {
+        if ($db->inTransaction()) {
+            $db->rollBack();
+        }
+        return false;
+    }
 }
