@@ -51,14 +51,18 @@ pub(crate) struct RawQuoteFacts {
  pub(crate) open_label:String,
  pub(crate) open_external:bool,
 }
-pub(crate) fn render_quote(q:&RawQuoteFacts,f:&CardFacts)->Result<String>{
+pub(crate) fn render_quote(q:&RawQuoteFacts,f:&CardFacts)->Result<String>{render_quote_with(q,f,None)}
+/// `found` is admitted discovery for this exact quote text (PHP's quote
+/// block linkifies through admin_linkify_body_html, which discovers @names
+/// the quote's own mentions list does not carry).
+pub(crate) fn render_quote_with(q:&RawQuoteFacts,f:&CardFacts,found:Option<&body::DiscoveredBody>)->Result<String>{
  let text=card::php_trim(&q.text);let url=card::php_trim(&q.url);let acct=card::php_trim(&q.acct);let view=&f.return_view;
  let mapped=if url.starts_with("at://"){bsky_open(url)}else{url.to_owned()};
  let href=if !q.is_rss&&!url.is_empty()&&url!="https://bsky.app/"{status_href(&mapped,view)}else{String::new()};
  let open=!href.is_empty()&&href!="#";
  let mut html=format!("<div class=\"quote-block{}\"{}><span class=\"qt-label\">Quoted</span>",if open{" quote-block--openable"}else{""},if open{format!(" data-href=\"{}\" role=\"link\" tabindex=\"0\" aria-label=\"Open quoted post\"",esc(&href))}else{String::new()});
  if !acct.is_empty(){html.push_str(&format!("<div class=\"meta\" style=\"margin-top:.3rem\">{}</div>",esc(&if q.is_rss||acct.starts_with('@')||acct.starts_with("http"){acct.into()}else{format!("@{acct}")})));}
- if !text.is_empty(){let presentation=json!({"mentions":q.mentions});html.push_str(&format!("<div style=\"margin-top:.25rem;white-space:pre-wrap\">{}</div>",card::linked_body_presentation(text,&presentation,view,&f.owner_actor,&Default::default())?));}
+ if !text.is_empty(){let presentation=json!({"mentions":q.mentions});let linked=match found.filter(|found|card::php_trim(found.source())==text){Some(found)=>card::linked_discovered_presentation(found,&presentation,view,&Default::default())?,None=>card::linked_body_presentation(text,&presentation,view,&f.owner_actor,&Default::default())?};html.push_str(&format!("<div style=\"margin-top:.25rem;white-space:pre-wrap\">{linked}</div>"));}
  if !q.media.is_empty(){
   let mut media=Vec::new();
   for att in &q.media{
@@ -333,6 +337,22 @@ mod tests{
   let html=render_core(&raw,&profile).unwrap();
   assert!(html.contains(&format!("<div class=\"body feed-body\" style=\"white-space:pre-wrap\">{expected}</div>")),"{html}");
   for anchor in ["href=\"/vaak/?view=remote_profile&amp;actor=https%3A%2F%2Fbsky.app%2Fprofile%2Falice.bsky.social&amp;from=remote_profile\">@alice.bsky.social</a>","href=\"/vaak/?view=remote_profile&amp;actor=https%3A%2F%2Fhost.example%2Fusers%2Fuser&amp;from=remote_profile\">@user@host.example</a>","href=\"?view=search&amp;q=%40nobody&amp;type=accounts&amp;resolve=1\">@nobody</a>","(a@b.com)"]{assert!(expected.contains(anchor),"{expected}");}
+ }
+ /// A quoted post whose text names an @handle its mentions list lacks used
+ /// to refuse the whole profile page; admitted discovery now paints it, and
+ /// declared mentions still win for the names they cover.
+ #[tokio::test]
+ async fn raw_quote_text_mentions_use_admitted_discovery(){
+  let mut card=presentation_facts();card.owner_actor.clear();
+  let declared=vec![json!({"acct":"gargron@mastodon.social","username":"gargron","url":"https://mastodon.social/@Gargron"})];
+  let quote=RawQuoteFacts{acct:"@luna.example".into(),text:"cc @gargron and @nobody".into(),url:"https://mastodon.social/@luna/1".into(),media:vec![],card:None,mentions:declared,spoiler:String::new(),sensitive:false,is_rss:false,article_url:String::new(),open_label:"Open quoted".into(),open_external:false};
+  assert_eq!(render_quote(&quote,&card).unwrap_err().to_string(),"canonical current cache mention target unresolved");
+  let mut found=body::discover_mentions(&quote.text,"","__guest__","",&mut ColdCache).await.unwrap();found.seed_declared(&quote.mentions);
+  let html=render_quote_with(&quote,&card,Some(&found)).unwrap();
+  assert!(html.contains("actor=https%3A%2F%2Fmastodon.social%2F%40Gargron")&&html.contains(">@gargron</a>"),"{html}");
+  assert!(html.contains("href=\"?view=search&amp;q=%40nobody&amp;type=accounts&amp;resolve=1\">@nobody</a>"),"{html}");
+  let stale=body::discover_mentions("other text @x","","__guest__","",&mut ColdCache).await.unwrap();
+  assert!(render_quote_with(&quote,&card,Some(&stale)).is_err(),"discovery for other text must not paint this quote");
  }
  /// Pure painter guard for a 50-card guest page. The old per-card regex compile
  /// made this about 1.3s. CI debug runners share the machine with the rest of
