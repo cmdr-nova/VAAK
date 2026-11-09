@@ -153,6 +153,9 @@ impl ProfilePage {
     pub(crate) async fn require_current_ledger(&self,db:&Client)->Result<()>{
         self.ledger.as_ref().context("PHP fallback: profile page lacks current provider binding")?.require_current(db).await
     }
+    /// Outbox rows of a Posts/Replies/Media ledger page, by source ordinal.
+    /// Boosts (events), pins and Asks have no self-thread grouping.
+    pub(crate) fn outbox_thread_rows(&self)->Option<&[Value]>{self.ledger.as_ref().and_then(|ledger|ledger.outbox_thread_rows())}
     pub(crate) fn next_offset(&self)->i64{self.offset+self.selected_count as i64}
     pub(crate) fn source_count(&self)->usize{self.selected_count}
     pub(crate) fn has_more(&self)->bool{self.has_more}
@@ -1004,6 +1007,9 @@ async fn prepare_ordered_profile_page_inner(db:&Client,viewer:&crate::profile_ma
  let timer=std::time::Instant::now();crate::profile_bridge::mark_step("paint");
  let mut cards=Vec::new();for frame in &frames{cards.extend(frame.render_mode(pinned)?);}
  if cards.windows(2).any(|pair|pair[0].0>=pair[1].0){bail!("ordered profile publication lost source positions")}
+ // Thread continuations paint under their parent like Home when both are on
+ // this page. The parent's own slot is folded into the tip card.
+ if !pinned{if let Some(rows)=page.outbox_thread_rows(){cards=crate::self_thread::group_painted_outbox_threads(cards,rows);}}
  profile_perf_stage("paint",crate::profile_bridge::Stage::Paint,0,timer);
  let timer=std::time::Instant::now();crate::profile_bridge::mark_step("final_proof");
  let status_state=crate::direct_preview::PreviewState::from_remaining(initial,remaining,page.source_count())?;
