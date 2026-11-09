@@ -12,6 +12,15 @@ anything else bumps the patch number.
 Releases up to **0.9.83** used a two-digit deploy counter (0.9.05, 0.9.83)
 and have no notes here; their tags and GitHub Releases are unchanged.
 
+## [0.65.0](https://github.com/cmdr-nova/VAAK/releases/tag/v0.65.0) - 2026-11-09
+
+### ✨ Features
+* Profiles: group self-threads in the PHP profile painter too by @cmdr-nova in https://github.com/cmdr-nova/VAAK/pull/422
+* Profiles: discover @mentions in raw quote text instead of refusing by @cmdr-nova in https://github.com/cmdr-nova/VAAK/pull/424
+* Deploy: apply the Phyrian SL links migration by @cmdr-nova in https://github.com/cmdr-nova/VAAK/pull/423
+
+**Full Changelog**: https://github.com/cmdr-nova/VAAK/compare/v0.64.0...v0.65.0
+
 ## [0.64.0](https://github.com/cmdr-nova/VAAK/releases/tag/v0.64.0) - 2026-11-09
 
 ### ✨ Features
