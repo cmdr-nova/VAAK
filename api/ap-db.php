@@ -9106,20 +9106,27 @@ function ap_outbox_note_on_public_profile(array $row): bool
 }
 
 /**
- * Public profile Posts/Replies share the reply-count rule.
- * NULL and blank in_reply_to are posts. Any other value is a reply.
+ * In-app profile Posts/Replies predicates.
+ * Replies: any note with a real in_reply_to (the reply-count rule).
+ * Posts: NULL and blank in_reply_to, plus self-replies (a reply to one of the
+ * same account's own notes, i.e. a thread continuation), like Mastodon and
+ * Bluesky profiles. The placeholder takes the same
+ * `https://mkultra.monster/users/{key}/%` prefix the id LIKE binds.
  * Filtering happens in SQL so a page of replies cannot end the Posts cursor.
  */
 function ap_outbox_profile_reply_predicate(bool $replies): string
 {
     return $replies
         ? "TRIM(COALESCE(in_reply_to, '')) <> ''"
-        : "TRIM(COALESCE(in_reply_to, '')) = ''";
+        : "(TRIM(COALESCE(in_reply_to, '')) = '' OR TRIM(in_reply_to) LIKE (rtrim(?, '%') || 'notes/%'))";
 }
 
 /**
- * One public Posts page. LIMIT/OFFSET apply after the reply-count predicate,
- * so replies between posts do not shorten the page or end the cursor.
+ * One public Posts page for the /users/ HTML profile. Top-level notes only:
+ * that page drops every reply again after this LIMIT, so self-replies stay
+ * off here (the in-app profile uses ap_local_profile_tab_page instead).
+ * LIMIT/OFFSET apply after the reply-count predicate, so replies between
+ * posts do not shorten the page or end the cursor.
  *
  * @return list<array<string,mixed>>
  */
@@ -9290,6 +9297,19 @@ function ap_outbox_count_all_for_actor(string $actorKey): int
     );
 }
 
+/**
+ * Public self-replies (thread continuations). They are on in-app Posts as well
+ * as Replies, so Posts = total - replies + self-replies.
+ */
+function ap_outbox_self_replies_count(string $actorKey): int
+{
+    return ap_outbox_cached_count(
+        $actorKey,
+        'vaak:profile:self-replies-count:v1:',
+        "SELECT COUNT(*) FROM outbox_notes WHERE id LIKE ? AND COALESCE(visibility, 'public') = 'public' AND TRIM(in_reply_to) LIKE (rtrim(?, '%') || 'notes/%')"
+    );
+}
+
 function ap_outbox_cached_count(string $actorKey, string $cachePrefix, string $sql): int
 {
     $actorKey = strtolower(trim($actorKey));
@@ -9306,7 +9326,8 @@ function ap_outbox_cached_count(string $actorKey, string $cachePrefix, string $s
     $prefix = 'https://mkultra.monster/users/' . rawurlencode($actorKey) . '/';
     try {
         $st = ap_db()->prepare($sql);
-        $st->execute([$prefix . '%']);
+        // Every placeholder in these count queries takes the id prefix.
+        $st->execute(array_fill(0, max(1, substr_count($sql, '?')), $prefix . '%'));
         $count = max(0, (int) $st->fetchColumn());
         if (function_exists('ap_redis_json_set')) {
             ap_redis_json_set($key, ['count' => $count], 60);
@@ -9335,6 +9356,7 @@ function ap_outbox_drop_profile_note_caches(array $note): void
             'vaak:profile:outbox-count:v1:' . $storedKey,
             'vaak:profile:outbox-shared-count:v1:' . $storedKey,
             'vaak:profile:reply-count:v2:' . $storedKey,
+            'vaak:profile:self-replies-count:v1:' . $storedKey,
             'vaak:profile:media-count:v2:' . $storedKey,
             'vaak:profile:media-count:v1:' . $storedKey
         );
@@ -9448,13 +9470,15 @@ function ap_local_profile_tab_page(
             $st->execute([$prefix . '%', $limit + 1, $offset]);
             $rows = $st->fetchAll() ?: [];
         } else {
+            // Posts include self-replies (thread continuations); see
+            // ap_outbox_profile_reply_predicate().
             $st = $db->prepare(
                 "SELECT * FROM outbox_notes
                  WHERE id LIKE ? AND COALESCE(visibility, 'public') = 'public'
-                   AND TRIM(COALESCE(in_reply_to, '')) = ''
+                   AND (TRIM(COALESCE(in_reply_to, '')) = '' OR TRIM(in_reply_to) LIKE (rtrim(?, '%') || 'notes/%'))
                  ORDER BY published DESC LIMIT ? OFFSET ?"
             );
-            $st->execute([$prefix . '%', $limit + 1, $offset]);
+            $st->execute([$prefix . '%', $prefix . '%', $limit + 1, $offset]);
             $rows = $st->fetchAll() ?: [];
         }
         $hasMore = count($rows) > $limit;
@@ -9521,7 +9545,8 @@ function ap_profile_tab_total(string $actorKey, string $tab): int
     }
     $total = function_exists('ap_outbox_count_for_actor') ? ap_outbox_count_for_actor($actorKey) : 0;
     $replies = ($total > 0 && function_exists('ap_outbox_replies_count')) ? ap_outbox_replies_count($actorKey) : 0;
-    return max(0, $total - $replies);
+    $selfReplies = ($replies > 0 && function_exists('ap_outbox_self_replies_count')) ? ap_outbox_self_replies_count($actorKey) : 0;
+    return max(0, $total - $replies + $selfReplies);
 }
 
 function ap_follow_lists_cache_gen(bool $bump = false): int

@@ -36110,7 +36110,11 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
                   $rpOutboxRepliesTotal = 0;
                   if ($rpOutboxTotal > 0 && function_exists('ap_outbox_replies_count')) {
                       $rpOutboxRepliesTotal = ap_outbox_replies_count((string) $rpLocalKey);
-                      $rpOutboxTotal = max(0, $rpOutboxTotal - $rpOutboxRepliesTotal);
+                      // Self-replies (thread continuations) are on Posts too.
+                      $rpOutboxSelfReplies = ($rpOutboxRepliesTotal > 0 && function_exists('ap_outbox_self_replies_count'))
+                          ? ap_outbox_self_replies_count((string) $rpLocalKey)
+                          : 0;
+                      $rpOutboxTotal = max(0, $rpOutboxTotal - $rpOutboxRepliesTotal + $rpOutboxSelfReplies);
                   }
                   $rpBskyPostCount = 0;
                   if ($rpBskyDid !== '' && function_exists('ap_bsky_posts_count_for_author')) {

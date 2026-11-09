@@ -157,9 +157,9 @@ try {
     ]);
 
     $phpPosts = $pdo->prepare(
-        "SELECT id FROM outbox_notes WHERE id LIKE ? AND COALESCE(visibility,'public') = 'public' AND TRIM(COALESCE(in_reply_to, '')) = '' ORDER BY published DESC"
+        "SELECT id FROM outbox_notes WHERE id LIKE ? AND COALESCE(visibility,'public') = 'public' AND (TRIM(COALESCE(in_reply_to, '')) = '' OR TRIM(in_reply_to) LIKE (rtrim(?, '%') || 'notes/%')) ORDER BY published DESC"
     );
-    $phpPosts->execute([$actor . '/%']);
+    $phpPosts->execute([$actor . '/%', $actor . '/%']);
     $postIds = $phpPosts->fetchAll(PDO::FETCH_COLUMN);
     $phpReplies = $pdo->prepare(
         "SELECT id FROM outbox_notes WHERE id LIKE ? AND COALESCE(visibility,'public') = 'public' AND TRIM(COALESCE(in_reply_to, '')) <> '' ORDER BY published DESC"
