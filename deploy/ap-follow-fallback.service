@@ -9,5 +9,8 @@ User=www-data
 Group=www-data
 Nice=19
 IOSchedulingClass=idle
+# Type=oneshot has no start timeout by default; stop a hung run before the
+# next 20-minute tick instead of skipping every later one.
+TimeoutStartSec=19min
 ExecStart=/usr/bin/php /srv/mkultra/html/api/ap-follow-fallback.php
 NoNewPrivileges=true

@@ -10236,7 +10236,7 @@ function admin_home_foaf_actor_weights(int $ownerUserId): array
                 if (str_contains($actor, 'bsky.app/') || str_contains($actor, 'relay.fedi.buzz/')) {
                     continue;
                 }
-                $host = function_exists('ap_actor_host') ? (string) (ap_actor_host($actor) ?? '') : '';
+                $host = strtolower((string) (parse_url($actor, PHP_URL_HOST) ?: ''));
                 if (function_exists('ap_row_is_hidden')
                     && ap_row_is_hidden($actor, $host !== '' ? $host : null, $ownerUserId)) {
                     continue;
@@ -10343,8 +10343,10 @@ function admin_home_cached_recommendation_items(
                 return false;
             }
             $host = strtolower(trim((string) ($row['host'] ?? '')));
-            if ($host === '' && $actor !== '' && function_exists('ap_actor_host')) {
-                $host = strtolower((string) (ap_actor_host($actor) ?? ''));
+            // ap_actor_host() never existed, so this fallback was dead and
+            // host-less rows skipped the per-host cap below.
+            if ($host === '' && $actor !== '') {
+                $host = strtolower((string) (parse_url($actor, PHP_URL_HOST) ?: ''));
             }
             // Cold-start fill: also diversify by host so one instance cannot
             // dominate the small discovery budget.
@@ -11605,8 +11607,8 @@ function admin_tl_lean_ranked_warm(string $view, array $following, string $cache
                 continue;
             }
             $host = (string) ($frow['host'] ?? '');
-            if ($host === '' && function_exists('ap_actor_host')) {
-                $host = (string) (ap_actor_host($fa) ?? '');
+            if ($host === '') {
+                $host = strtolower((string) (parse_url($fa, PHP_URL_HOST) ?: ''));
             }
             if (function_exists('ap_row_is_hidden') && ap_row_is_hidden($fa, $host !== '' ? $host : null, $ownerUserId > 0 ? $ownerUserId : null)) {
                 continue;
@@ -13184,9 +13186,6 @@ if (!$wantNewerPoll && !$adminTlFromCache && ($view === 'home' || ($isPartial &&
     }
     if ($homeAlgorithmEnabled && $homeDownrankingEnabled && function_exists('admin_home_apply_temporary_toxicity_downrank')) {
         $homeTimeline = admin_home_apply_temporary_toxicity_downrank($homeTimeline, $homeOwnerId);
-    }
-    if ($homeAlgorithmEnabled && function_exists('admin_pending_timeline_items')) {
-        $homeTimeline = array_merge($homeTimeline, admin_pending_timeline_items($homeOwnerId));
     }
     if ($homeAlgorithmEnabled && function_exists('admin_home_apply_favourite_rank')) {
         $homeTimeline = admin_home_apply_favourite_rank($homeTimeline, $homeOwnerId);

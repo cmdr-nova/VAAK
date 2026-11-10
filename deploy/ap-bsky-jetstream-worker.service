@@ -8,4 +8,9 @@ User=www-data
 WorkingDirectory=/srv/mkultra/html/api
 Environment=AP_DB_DSN=pgsql:dbname=novalandia
 Environment=VAAK_JETSTREAM_STATE=/var/lib/mkultra/ap/jetstream
+# A normal run takes seconds. Type=oneshot has no start timeout by default,
+# and the timer never starts a new run while one is active, so a hung run
+# would stop all Bluesky ingest. A killed run leaves its segment in
+# processing/ and the next run picks it up.
+TimeoutStartSec=15min
 ExecStart=/usr/bin/php /srv/mkultra/html/api/ap-bsky-jetstream-worker.php

@@ -409,12 +409,25 @@ function ap_action_queue_execute(array $row, array $payload, array $receipt): ar
     return ['ok' => false, 'error' => 'Unsupported queued action.'];
 }
 
+// A normal run takes seconds. Matches the 600 s claim lease below, so a
+// reaped run's rows are already eligible for recovery.
+const AP_ACTION_QUEUE_MAX_SECONDS = 600;
+
+function ap_action_queue_lock_path(): string
+{
+    return sys_get_temp_dir() . '/vaak-action-queue.lock';
+}
+
 /** Single-worker bounded batch; network calls happen outside DB transactions. */
 function ap_action_queue_worker_run(int $limit = 20): array
 {
     $stats = ['claimed' => 0, 'succeeded' => 0, 'retried' => 0, 'failed' => 0];
-    $lock = @fopen(sys_get_temp_dir() . '/vaak-action-queue.lock', 'c');
-    if (!$lock || !flock($lock, LOCK_EX | LOCK_NB)) return $stats + ['busy' => 1];
+    require_once __DIR__ . '/ap-worker-lock.php';
+    // A hung holder used to keep likes, boosts and follows queued forever.
+    $taken = ap_worker_lock_take(ap_action_queue_lock_path(), AP_ACTION_QUEUE_MAX_SECONDS, 'ap-action-queue-worker');
+    $lock = $taken['lock'];
+    if (!$lock) return $stats + ['busy' => 1, 'busy_reason' => $taken['busy']];
+    if ($taken['reaped']) $stats['reaped'] = 1;
     try {
         $db = ap_db();
         $limit = max(1, min(50, $limit));
@@ -483,8 +496,7 @@ function ap_action_queue_worker_run(int $limit = 20): array
             }
         }
     } finally {
-        flock($lock, LOCK_UN);
-        fclose($lock);
+        ap_worker_lock_release($lock);
     }
     return $stats;
 }

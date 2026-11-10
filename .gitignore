@@ -55,3 +55,6 @@ __pycache__/
 # Parity harness reports (CI uploads these as artifacts).
 /parity/out/
 /parity-report/
+
+# Local Redis snapshots
+dump.rdb

@@ -35,65 +35,21 @@ foreach ($argv as $arg) {
 // lock every cron run only logs "busy", so no Bluesky notification gets in.
 const BSKY_NOTIF_POLL_MAX_SECONDS = 600;
 
-/**
- * Kill the lock holder when it has outlived the cap. The holder writes
- * "pid start" into the lock file; a holder without that line is left alone.
- *
- * @return string why the lock is still busy, or '' when the holder was killed
- */
-function bsky_notif_poll_reap_stale_holder($lockFh): string
-{
-    rewind($lockFh);
-    $line = trim((string) stream_get_contents($lockFh));
-    if (!preg_match('/^(\d+) (\d+)$/', $line, $m)) {
-        return 'holder unknown';
-    }
-    $pid = (int) $m[1];
-    $age = time() - (int) $m[2];
-    if ($age <= BSKY_NOTIF_POLL_MAX_SECONDS + 60) {
-        return sprintf('pid=%d age=%ds', $pid, $age);
-    }
-    $cmd = (string) @file_get_contents('/proc/' . $pid . '/cmdline');
-    if (!str_contains($cmd, 'ap-bsky-notif-poll') || !function_exists('posix_kill')) {
-        return sprintf('pid=%d age=%ds stale, not killed', $pid, $age);
-    }
-    posix_kill($pid, 9);
-    fwrite(STDOUT, sprintf("[%s] bsky_notif_poll killed hung pid=%d age=%ds\n", gmdate('c'), $pid, $age));
-    return '';
-}
-
-$lockPath = '/tmp/ap-bsky-notif-poll.lock';
-$lockFh = @fopen($lockPath, 'c+');
-if ($lockFh === false) {
-    fwrite(STDOUT, sprintf("[%s] bsky_notif_poll busy (lock file unavailable)\n", gmdate('c')));
+// Lock with the shared hung-holder reaper (ap-worker-lock.php): a holder
+// past the cap is killed when its command line is this poller.
+require_once __DIR__ . '/ap-worker-lock.php';
+$taken = ap_worker_lock_take('/tmp/ap-bsky-notif-poll.lock', BSKY_NOTIF_POLL_MAX_SECONDS, 'ap-bsky-notif-poll');
+$lockFh = $taken['lock'];
+if (!$lockFh) {
+    fwrite(STDOUT, sprintf("[%s] bsky_notif_poll busy %s\n", gmdate('c'), $taken['busy']));
     exit(0);
 }
-if (!flock($lockFh, LOCK_EX | LOCK_NB)) {
-    $busy = bsky_notif_poll_reap_stale_holder($lockFh);
-    $locked = false;
-    for ($i = 0; $busy === '' && $i < 10 && !$locked; $i++) {
-        usleep(500000);
-        $locked = flock($lockFh, LOCK_EX | LOCK_NB);
-    }
-    if (!$locked) {
-        fwrite(STDOUT, sprintf("[%s] bsky_notif_poll busy %s\n", gmdate('c'), $busy !== '' ? $busy : 'after kill'));
-        exit(0);
-    }
+if ($taken['reaped']) {
+    fwrite(STDOUT, sprintf("[%s] bsky_notif_poll reaped a hung run\n", gmdate('c')));
 }
-ftruncate($lockFh, 0);
-rewind($lockFh);
-fwrite($lockFh, getmypid() . ' ' . time());
-fflush($lockFh);
 // Backstop inside the run itself. Each XRPC call has its own timeout, so the
 // alarm fires within one call's length of the cap.
-if (function_exists('pcntl_alarm') && function_exists('pcntl_signal')) {
-    pcntl_async_signals(true);
-    pcntl_signal(SIGALRM, static function (): void {
-        fwrite(STDERR, sprintf("[%s] bsky_notif_poll timeout after %ds\n", gmdate('c'), BSKY_NOTIF_POLL_MAX_SECONDS));
-        exit(2);
-    });
-    pcntl_alarm(BSKY_NOTIF_POLL_MAX_SECONDS);
-}
+ap_worker_lock_alarm(BSKY_NOTIF_POLL_MAX_SECONDS, 'bsky_notif_poll');
 
 try {
     if (!defined('AP_INBOX_LIB_ONLY')) {

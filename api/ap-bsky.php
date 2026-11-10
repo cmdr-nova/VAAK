@@ -88,29 +88,9 @@ function ap_bsky_remote_media_url_allowed(string $url): bool
         || !empty($parts['user']) || !empty($parts['pass'])) {
         return false;
     }
-    $host = strtolower((string) $parts['host']);
-    if ($host === 'localhost' || str_ends_with($host, '.localhost') || str_ends_with($host, '.local')) {
-        return false;
-    }
-    $isPublic = static function (string $ip): bool {
-        return filter_var($ip, FILTER_VALIDATE_IP) !== false
-            && filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE) !== false;
-    };
-    if (filter_var($host, FILTER_VALIDATE_IP)) {
-        return $isPublic($host);
-    }
-    $records = @dns_get_record($host, DNS_A | DNS_AAAA);
-    if (!is_array($records) || $records === []) {
-        $fallback = @gethostbyname($host);
-        return is_string($fallback) && $fallback !== $host && $isPublic($fallback);
-    }
-    foreach ($records as $record) {
-        $ip = $record['ip'] ?? $record['ipv6'] ?? null;
-        if (!is_string($ip) || !$isPublic($ip)) {
-            return false;
-        }
-    }
-    return true;
+    // Shared outbound guard: every A/AAAA answer public, mapped and CGNAT
+    // forms refused. Fetches pin to the vetted addresses (ap_net_curl_exec).
+    return ap_net_host_is_public(strtolower((string) $parts['host']));
 }
 
 function ap_bsky_tab_enabled(): bool
@@ -12778,7 +12758,7 @@ function ap_bsky_fetch_image_bytes(string $url): array
         CURLOPT_TIMEOUT => $dlTimeout,
         CURLOPT_USERAGENT => vaak_user_agent('Bluesky'),
     ]);
-    $bytes = curl_exec($ch);
+    $bytes = ap_net_curl_exec($ch, $url, 0);
     $status = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
     $ctype = (string) curl_getinfo($ch, CURLINFO_CONTENT_TYPE);
     curl_close($ch);
@@ -12947,7 +12927,7 @@ function ap_bsky_fetch_video_bytes(string $url, string $hintMime = ''): array
         CURLOPT_USERAGENT => vaak_user_agent('Bluesky'),
         CURLOPT_ENCODING => 'identity',
     ]);
-    $bytes = curl_exec($ch);
+    $bytes = ap_net_curl_exec($ch, $url, 0);
     $status = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
     $ctype = (string) curl_getinfo($ch, CURLINFO_CONTENT_TYPE);
     curl_close($ch);

@@ -23,12 +23,16 @@ foreach ($argv as $arg) {
     }
 }
 
-$lockPath = '/tmp/ap-bsky-crosspost-retry.lock';
-$lockFh = @fopen($lockPath, 'c+');
-if ($lockFh === false || !flock($lockFh, LOCK_EX | LOCK_NB)) {
-    fwrite(STDOUT, sprintf("[%s] bsky_crosspost_retry busy\n", gmdate('c')));
+// Shared hung-holder reaper (ap-worker-lock.php): a run older than the cap
+// is killed by the next one instead of leaving every later run "busy".
+require_once __DIR__ . '/ap-worker-lock.php';
+$vaakLock = ap_worker_lock_take('/tmp/ap-bsky-crosspost-retry.lock', 900, 'ap-bsky-crosspost-retry');
+$lockFh = $vaakLock['lock'];
+if (!$lockFh) {
+    fwrite(STDOUT, sprintf("[%s] bsky_crosspost_retry busy (%s)\n", gmdate('c'), $vaakLock['busy']));
     exit(0);
 }
+ap_worker_lock_alarm(900, 'bsky_crosspost_retry');
 
 try {
     if (!defined('AP_INBOX_LIB_ONLY')) {

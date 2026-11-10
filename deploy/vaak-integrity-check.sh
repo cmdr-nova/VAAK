@@ -126,6 +126,30 @@ if [[ "${stall_cutoff}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2
   fi
 fi
 
+# Hung PHP CLI workers. A run that hangs holds its lock and every later run
+# only logs "busy" (2026-10-29 Bluesky notifications, 2026-11-05 two days of
+# posts). Per-worker reapers cover the queues; this catches any api/*.php CLI
+# run that has outlived VAAK_WORKER_MAX_MINUTES, whatever the script.
+# Daemons that are meant to run for good are skipped.
+worker_max_min="${VAAK_WORKER_MAX_MINUTES:-20}"
+if [[ ! "${worker_max_min}" =~ ^[0-9]+$ ]] || (( worker_max_min < 5 || worker_max_min > 1440 )); then worker_max_min=20; fi
+worker_long_ok="${VAAK_WORKER_LONG_OK:-ap-redis-queue-worker.php ap-maintain.php ap-follow-import-continue.php}"
+hung="$(ps -eo pid=,etimes=,args= 2>/dev/null | awk -v max="$(( worker_max_min * 60 ))" -v ok="${worker_long_ok}" '
+  BEGIN { n = split(ok, skip, " ") }
+  $3 !~ /(^|\/)php[0-9.]*$/ { next }
+  {
+    script = ""
+    for (i = 4; i <= NF; i++) if ($i ~ /\/api\/.*\.php$/) { script = $i; break }
+    if (script == "" || $2 + 0 <= max) next
+    base = script; sub(/.*\//, "", base)
+    for (j = 1; j <= n; j++) if (base == skip[j]) next
+    printf "%s%s pid=%s %dm", (out ? ", " : ""), base, $1, int($2 / 60); out = 1
+  }
+  END { if (out) print "" }' || true)"
+if [[ -n "${hung}" ]]; then
+  warn "PHP worker running over ${worker_max_min} min (likely hung, holding its lock): ${hung}"
+fi
+
 if ! df -P / | awk 'NR==2 {gsub(/%/,"",$5); exit ($5 >= 85 ? 1 : 0)}'; then warn "root filesystem is at or above 85%"; fi
 
 if (( CRIT > 0 )); then notify crit; exit 2; fi

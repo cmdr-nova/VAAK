@@ -319,8 +319,10 @@ async fn fast_path(cfg: &crate::config::Config, uri: &Uri, headers: &HeaderMap, 
     // hand over the same activity more than once. The inbox path is part of
     // the key because a personal inbox decides which local user it is for.
     // Not for mismatches: any signer can claim any id, and must not be able to
-    // shadow the real delivery.
-    let seen_key = activity_id(body).filter(|_| !mismatch).map(|id| seen_key(uri.path(), &id));
+    // shadow the real delivery. For the same reason the id must live on the
+    // actor's own host: otherwise a valid signer on one server could pre-claim
+    // a guessable id from another server and drop that real delivery for a day.
+    let seen_key = activity_id(body).filter(|id| !mismatch && seen_id_owned(id, &actor)).map(|id| seen_key(uri.path(), &id));
     if let Some(key) = &seen_key {
         let fresh: Option<String> =
             redis::cmd("SET").arg(key).arg(1).arg("NX").arg("EX").arg(SEEN_TTL).query_async(&mut redis).await.map_err(|_| "redis")?;
@@ -386,6 +388,12 @@ const SEEN_TTL: i64 = 86400;
 fn seen_key(path: &str, activity_id: &str) -> String {
     let path = path.trim_end_matches('/');
     format!("vaak:inbox_rust:seen:v1:{}", hex::encode(Sha256::digest(format!("{path}\n{}", activity_id.trim()).as_bytes())))
+}
+
+/// Whether an activity id may mark a delivery as seen: it has to be on the
+/// actor's own host, which the signature check already tied to the signer.
+pub(crate) fn seen_id_owned(activity_id: &str, actor: &str) -> bool {
+    matches!((host_of(activity_id), host_of(actor)), (Some(a), Some(b)) if a == b)
 }
 
 /// The activity's own https id, when it has one.
@@ -663,6 +671,15 @@ mod tests {
         assert_eq!(Accepted::SpooledMismatch(3).stat_field(), "spooled_mismatch");
         assert_eq!(Accepted::Duplicate.stat_field(), "duplicate");
         assert!(Accepted::UnknownSelfDelete.body().contains("ignored"));
+    }
+
+    #[test]
+    fn seen_ids_must_live_on_the_actor_host() {
+        assert!(seen_id_owned("https://a.example/activities/1", "https://a.example/users/x"));
+        assert!(seen_id_owned("https://A.example:443/activities/1", "https://a.example/users/x"));
+        assert!(!seen_id_owned("https://b.example/activities/1", "https://a.example/users/x"));
+        assert!(!seen_id_owned("https://a.example.evil/activities/1", "https://a.example/users/x"));
+        assert!(!seen_id_owned("not a url", "https://a.example/users/x"));
     }
 
     #[test]

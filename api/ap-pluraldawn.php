@@ -634,7 +634,8 @@ function ap_pluraldawn_fetch_image(string $url): ?string
                 return strlen($data);
             },
         ]);
-        curl_exec($ch);
+        // Pinned to the vetted addresses, so a second lookup cannot differ.
+        ap_net_curl_exec($ch, $current, 0);
         curl_close($ch);
         if ($status >= 300 && $status < 400 && $location !== '') {
             $current = ap_pluraldawn_resolve_redirect($current, $location);
@@ -678,29 +679,9 @@ function ap_pluraldawn_url_public(string $url): bool
     if ($port !== 443) {
         return false;
     }
-    $host = strtolower((string) ($parts['host'] ?? ''));
-    if ($host === '' || $host === 'localhost' || str_ends_with($host, '.local') || str_ends_with($host, '.internal')) {
-        return false;
-    }
-    if (filter_var($host, FILTER_VALIDATE_IP)) {
-        return ap_pluraldawn_ip_public($host);
-    }
-    $records = @dns_get_record($host, DNS_A + DNS_AAAA);
-    if (!is_array($records) || $records === []) {
-        return false;
-    }
-    foreach ($records as $record) {
-        $ip = (string) ($record['ip'] ?? $record['ipv6'] ?? '');
-        if ($ip === '' || !ap_pluraldawn_ip_public($ip)) {
-            return false;
-        }
-    }
-    return true;
-}
-
-function ap_pluraldawn_ip_public(string $ip): bool
-{
-    return filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE) !== false;
+    // Shared outbound guard (IPv6, mapped and CGNAT answers included).
+    require_once __DIR__ . '/ap-net-guard.php';
+    return ap_net_host_is_public(strtolower((string) ($parts['host'] ?? '')));
 }
 
 function ap_pluraldawn_http(): void

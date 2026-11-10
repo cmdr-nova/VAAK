@@ -34,12 +34,16 @@ foreach ($argv as $arg) {
     }
 }
 
-$lockPath = '/tmp/ap-deliver-sweep.lock';
-$lockFh = @fopen($lockPath, 'c+');
-if ($lockFh === false || !flock($lockFh, LOCK_EX | LOCK_NB)) {
-    fwrite(STDOUT, sprintf("[%s] deliver_sweep busy\n", gmdate('c')));
+// Shared hung-holder reaper (ap-worker-lock.php): a run older than the cap
+// is killed by the next one instead of leaving every later run "busy".
+require_once __DIR__ . '/ap-worker-lock.php';
+$vaakLock = ap_worker_lock_take('/tmp/ap-deliver-sweep.lock', 900, 'ap-deliver-sweep');
+$lockFh = $vaakLock['lock'];
+if (!$lockFh) {
+    fwrite(STDOUT, sprintf("[%s] deliver_sweep busy (%s)\n", gmdate('c'), $vaakLock['busy']));
     exit(0);
 }
+ap_worker_lock_alarm(900, 'deliver_sweep');
 
 $worker = __DIR__ . '/ap-deliver-worker.php';
 $php = '/usr/bin/php8.3';
