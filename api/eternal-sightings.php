@@ -1,6 +1,6 @@
 <?php
 /**
- * Eternal "chance sightings": the site game (NovaLandia eternal/eternal.html)
+ * Eternal "chance sightings": the game (repo cmdr-nova/eternal)
  * reports where a pilot is flying, and other pilots now and then meet an echo
  * of that ship as traffic. Nothing here is live multiplayer.
  *
@@ -12,7 +12,8 @@
  * Storage is Redis only (one hash per star system, 8 day TTL). Sightings are
  * throwaway flavor, so losing them on a Redis flush is fine. No accounts, no
  * IPs stored: the pilot id is a random token the game keeps in localStorage.
- * Same-origin game, so no CORS headers. Optional ETERNAL_NAME_DENY env:
+ * The game lives at https://eternal.mkultra.monster (and used to be on this
+ * site), so those two origins get CORS headers. Optional ETERNAL_NAME_DENY env:
  * comma-separated words; a callsign containing one is refused.
  */
 declare(strict_types=1);
@@ -28,7 +29,7 @@ const ETERNAL_SIGHT_TTL = 8 * 86400;
 const ETERNAL_SIGHT_MAX_AGE = 7 * 86400;
 const ETERNAL_SIGHT_CAP = 300; // pilots kept per system
 const ETERNAL_SIGHT_MAX_SYSTEM = 63;
-const ETERNAL_SIGHT_ORIGIN = 'https://mkultra.monster';
+const ETERNAL_SIGHT_ORIGINS = ['https://mkultra.monster', 'https://eternal.mkultra.monster'];
 
 function eternal_sight_reply(int $code, array $body): void
 {
@@ -74,12 +75,29 @@ function eternal_sight_name($value): ?string
     return $name;
 }
 
+$method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
+$origin = (string) ($_SERVER['HTTP_ORIGIN'] ?? '');
+if (in_array($origin, ETERNAL_SIGHT_ORIGINS, true)) {
+    header('Access-Control-Allow-Origin: ' . $origin);
+    header('Vary: Origin');
+}
+
+if ($method === 'OPTIONS') {
+    // CORS preflight for the JSON POST.
+    if (!in_array($origin, ETERNAL_SIGHT_ORIGINS, true)) {
+        eternal_sight_reply(403, ['error' => 'wrong origin']);
+    }
+    header('Access-Control-Allow-Methods: GET, POST');
+    header('Access-Control-Allow-Headers: Content-Type');
+    header('Access-Control-Max-Age: 86400');
+    http_response_code(204);
+    exit;
+}
+
 $redis = ap_redis_client('cache');
 if (!$redis) {
     eternal_sight_reply(503, ['error' => 'sightings unavailable']);
 }
-
-$method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
 
 if ($method === 'GET') {
     $system = eternal_sight_system($_GET['system'] ?? null);
@@ -115,13 +133,12 @@ if ($method === 'GET') {
 }
 
 if ($method !== 'POST') {
-    header('Allow: GET, POST');
+    header('Allow: GET, POST, OPTIONS');
     eternal_sight_reply(405, ['error' => 'method not allowed']);
 }
 
-// Only the game on this site should report sightings.
-$origin = (string) ($_SERVER['HTTP_ORIGIN'] ?? '');
-if ($origin !== '' && $origin !== ETERNAL_SIGHT_ORIGIN) {
+// Only the game should report sightings.
+if ($origin !== '' && !in_array($origin, ETERNAL_SIGHT_ORIGINS, true)) {
     eternal_sight_reply(403, ['error' => 'wrong origin']);
 }
 
