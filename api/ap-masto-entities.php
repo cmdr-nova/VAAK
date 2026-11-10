@@ -11135,92 +11135,131 @@ function ap_masto_timeline_events(string $mode, int $limit = 40, ?string $maxId 
     // the old limit*4→800 stampede that made every Home refresh multi-second.
     $sqlLimit = $mode === 'home'
         ? ($mobile
-            ? (int) min(30, max($limit, $limit + 5))
+            ? (int) min(80, $limit + 15)
             : (int) min(240, max($limit * 2, $limit + 40)))
         : (int) min(200, max($limit * 2, $limit + 24));
-    $sql = 'SELECT * FROM events WHERE ' . implode(' AND ', $where)
-        . ' ORDER BY created_at DESC, id DESC LIMIT ' . $sqlLimit;
-    $queryStartedAt = microtime(true);
-    $st = ap_db()->prepare($sql);
-    $st->execute($params);
-    $rows = $st->fetchAll();
-    if (!is_array($rows)) {
-        $rows = [];
-    }
-    // Quote-boost dual publish: same actor Create + Announce of one note → keep Create.
-    if ($mode === 'home' && function_exists('ap_events_collapse_self_announces')) {
-        $rows = ap_events_collapse_self_announces($rows);
-    }
-    $queryMs = (microtime(true) - $queryStartedAt) * 1000.0;
+    // Federated only needs a small overflow for diversity — converting 2×limit was expensive.
+    $hydrateCap = $mode === 'home' ? $limit : $limit + 8;
+    // Mastodon clients treat a short page as the end of the timeline (Ice
+    // Cubes stops paging below 40 statuses). When filters (blocks, mutes,
+    // Bluesky rows on Federated, dedupe) thin a full SQL window, read the
+    // next older window from where this one stopped instead of returning a
+    // short page. Bounded by window count and time so a sparse graph cannot
+    // turn one request into a table scan.
+    $maxWindows = 4;
+    $windowBudgetSec = 2.5;
+    $queryMs = 0.0;
     $hydrateStartedAt = microtime(true);
     $out = [];
     $seenUri = [];
     $ownerUserId = ap_db_masto_owner_user_id();
     $hiddenCount = 0;
-    // Prefetch remote_actors for this window so per-card account builds stay in-memory.
-    if (function_exists('ap_remote_actors_prefetch')) {
-        $prefetchIds = [];
+    $fetchedCount = 0;
+    $windows = 0;
+    $keyset = null;
+    while (true) {
+        $windows++;
+        $passWhere = $where;
+        $passParams = $params;
+        if ($keyset !== null) {
+            // Row comparison seeks the (created_at DESC, id DESC) indexes.
+            $passWhere[] = '(created_at, id) < (?, ?)';
+            $passParams[] = $keyset['at'];
+            $passParams[] = $keyset['id'];
+        }
+        $sql = 'SELECT * FROM events WHERE ' . implode(' AND ', $passWhere)
+            . ' ORDER BY created_at DESC, id DESC LIMIT ' . $sqlLimit;
+        $queryStartedAt = microtime(true);
+        $st = ap_db()->prepare($sql);
+        $st->execute($passParams);
+        $rows = $st->fetchAll();
+        if (!is_array($rows)) {
+            $rows = [];
+        }
+        $queryMs += (microtime(true) - $queryStartedAt) * 1000.0;
+        $fetchedCount += count($rows);
+        $windowFull = count($rows) >= $sqlLimit;
+        if ($rows !== []) {
+            $lastRow = $rows[count($rows) - 1];
+            $keyset = [
+                'at' => (string) ($lastRow['created_at'] ?? ''),
+                'id' => (int) ($lastRow['id'] ?? 0),
+            ];
+            if ($keyset['at'] === '') {
+                $windowFull = false;
+            }
+        }
+        // Quote-boost dual publish: same actor Create + Announce of one note → keep Create.
+        if ($mode === 'home' && function_exists('ap_events_collapse_self_announces')) {
+            $rows = ap_events_collapse_self_announces($rows);
+        }
+        // Prefetch remote_actors for this window so per-card account builds stay in-memory.
+        if (function_exists('ap_remote_actors_prefetch')) {
+            $prefetchIds = [];
+            foreach ($rows as $row) {
+                $aid = rtrim((string) ($row['actor_id'] ?? ''), '/');
+                if ($aid !== '') {
+                    $prefetchIds[$aid] = true;
+                    $prefetchIds[$aid . '/'] = true;
+                }
+            }
+            if ($prefetchIds !== []) {
+                ap_remote_actors_prefetch(array_keys($prefetchIds));
+            }
+        }
         foreach ($rows as $row) {
-            $aid = rtrim((string) ($row['actor_id'] ?? ''), '/');
-            if ($aid !== '') {
-                $prefetchIds[$aid] = true;
-                $prefetchIds[$aid . '/'] = true;
+            $sourceRow = $row;
+            if ($mode !== 'home') {
+                $actor = rtrim(trim((string) ($row['actor_id'] ?? '')), '/');
+                $object = strtolower(rtrim(trim((string) ($row['object_id'] ?? '')), '/'));
+                // Federated is ActivityPub-only. A local ActivityPub Create is
+                // valid; native Bluesky/AT-URI rows are not. Local quote/boost
+                // actions are supplied separately by the merged timeline path.
+                if ($actor === '' || str_starts_with($object, 'at://')
+                    || str_contains($object, 'bsky.app/')
+                    || str_contains($object, 'bsky.mkultra.monster/')) {
+                    continue;
+                }
+                if (function_exists('ap_bsky_is_profile_ref') && ap_bsky_is_profile_ref($actor)) {
+                    continue;
+                }
             }
-        }
-        if ($prefetchIds !== []) {
-            ap_remote_actors_prefetch(array_keys($prefetchIds));
-        }
-    }
-    // Federated only needs a small overflow for diversity — converting 2×limit was expensive.
-    $hydrateCap = $mode === 'home' ? $limit : min(count($rows), $limit + 8);
-    foreach ($rows as $row) {
-        $sourceRow = $row;
-        if ($mode !== 'home') {
-            $actor = rtrim(trim((string) ($row['actor_id'] ?? '')), '/');
-            $object = strtolower(rtrim(trim((string) ($row['object_id'] ?? '')), '/'));
-            // Federated is ActivityPub-only. A local ActivityPub Create is
-            // valid; native Bluesky/AT-URI rows are not. Local quote/boost
-            // actions are supplied separately by the merged timeline path.
-            if ($actor === '' || str_starts_with($object, 'at://')
-                || str_contains($object, 'bsky.app/')
-                || str_contains($object, 'bsky.mkultra.monster/')) {
-                continue;
+            if ($mode === 'home') {
+                if (ap_timeline_row_is_hidden($sourceRow, $ownerUserId)) {
+                    $hiddenCount++;
+                    continue;
+                }
+                $row = ap_masto_peertube_prefer_create_event($row);
             }
-            if (function_exists('ap_bsky_is_profile_ref') && ap_bsky_is_profile_ref($actor)) {
-                continue;
-            }
-        }
-        if ($mode === 'home') {
-            if (ap_timeline_row_is_hidden($sourceRow, $ownerUserId)) {
+            // Apply the authenticated user's personal blocks and mutes to both
+            // sides of a boost: the booster and the original author. This mirrors
+            // Mastodon timeline behavior and prevents blocked originals returning
+            // through someone else's Announce.
+            if (ap_timeline_row_is_hidden($row, $ownerUserId)) {
                 $hiddenCount++;
                 continue;
             }
-            $row = ap_masto_peertube_prefer_create_event($row);
-        }
-        // Apply the authenticated user's personal blocks and mutes to both
-        // sides of a boost: the booster and the original author. This mirrors
-        // Mastodon timeline behavior and prevents blocked originals returning
-        // through someone else's Announce.
-        if (ap_timeline_row_is_hidden($row, $ownerUserId)) {
-            $hiddenCount++;
-            continue;
-        }
-        $status = ap_masto_status_from_event($row);
-        if ($status === null) {
-            continue;
-        }
-        // Dedupe identical AS object URIs (shared-inbox retries)
-        $uri = (string) ($status['uri'] ?? $status['url'] ?? $row['object_id'] ?? '');
-        $uriKey = rtrim($uri, '/');
-        $uriKey = preg_replace('#^http://#i', 'https://', $uriKey) ?? $uriKey;
-        if ($uriKey !== '') {
-            if (isset($seenUri[$uriKey])) {
+            $status = ap_masto_status_from_event($row);
+            if ($status === null) {
                 continue;
             }
-            $seenUri[$uriKey] = true;
+            // Dedupe identical AS object URIs (shared-inbox retries)
+            $uri = (string) ($status['uri'] ?? $status['url'] ?? $row['object_id'] ?? '');
+            $uriKey = rtrim($uri, '/');
+            $uriKey = preg_replace('#^http://#i', 'https://', $uriKey) ?? $uriKey;
+            if ($uriKey !== '') {
+                if (isset($seenUri[$uriKey])) {
+                    continue;
+                }
+                $seenUri[$uriKey] = true;
+            }
+            $out[] = $status;
+            if (count($out) >= $hydrateCap) {
+                break 2;
+            }
         }
-        $out[] = $status;
-        if (count($out) >= $hydrateCap) {
+        if (!$windowFull || $windows >= $maxWindows
+            || (microtime(true) - $startedAt) >= $windowBudgetSec) {
             break;
         }
     }
@@ -11228,7 +11267,8 @@ function ap_masto_timeline_events(string $mode, int $limit = 40, ?string $maxId 
         'mode' => $mode,
         'query_ms' => round($queryMs, 1),
         'hydrate_ms' => round((microtime(true) - $hydrateStartedAt) * 1000.0, 1),
-        'fetched' => count($rows),
+        'fetched' => $fetchedCount,
+        'windows' => $windows,
         'hidden' => $hiddenCount,
         'returned' => count($out),
     ]);
@@ -11481,8 +11521,12 @@ function ap_masto_timeline_home_merged(int $limit = 40, ?string $maxId = null, ?
     // exceed the app's request timeout on a broad follow graph. Keep the
     // mobile compatibility path bounded; the web Home feed has its own
     // ranked/algorithmic budget and is not affected by this cap.
+    // The cap must still reach the requested page size: Ice Cubes reads any
+    // page shorter than 40 as the end of Home, and a 30-status cap ended its
+    // chronological Home after one scroll page. ap_masto_timeline_events now
+    // tops up thin windows itself, so this is the hydrate budget, not a guess.
     $remoteCap = $standardApi
-        ? min(30, max(20, min($limit, 30)))
+        ? min(55, max(20, $limit + 5))
         : max($limit + 10, 40);
     $remote = ap_masto_timeline_events('home', $remoteCap, $maxId, $sinceId, false, $standardApi);
     // Mastodon-compatible clients receive a chronological feed, but connected
@@ -11615,14 +11659,16 @@ function ap_masto_timeline_home_merged(int $limit = 40, ?string $maxId = null, ?
         return '';
     };
 
-    $rankTs = static function (array $status) use ($deprioSet, $deprioPenaltyHours, $statusActorUrl): string {
+    $rankTs = static function (array $status) use ($deprioSet, $deprioPenaltyHours, $statusActorUrl, $standardApi): string {
         $ts = (string) ($status['created_at'] ?? '');
         if ($ts === '') {
             return '';
         }
         $penaltyH = 0;
         // Tag-only posts sort as if ~4h older so follows stay more prominent.
-        if (!empty($status['_from_followed_tag'])) {
+        // Web Home only: Mastodon clients page with the last status's real
+        // created_at, so a shifted sort key would make max_id jump backwards.
+        if (!$standardApi && !empty($status['_from_followed_tag'])) {
             $penaltyH += 4;
         }
         // Overflow "Deprioritize" — Home soft-rank only (Federated uses a different path).
@@ -16647,7 +16693,7 @@ function ap_masto_followed_tag_event_rows(int $limit = 80, ?int $ownerUserId = n
     return $out;
 }
 
-function ap_masto_timeline_hashtag(string $name, int $limit = 20, ?string $maxId = null): array
+function ap_masto_timeline_hashtag(string $name, int $limit = 20, ?string $maxId = null, ?string $sinceId = null): array
 {
     $name = ap_masto_normalize_tag_name($name);
     $limit = max(1, min(40, $limit));
@@ -16656,59 +16702,80 @@ function ap_masto_timeline_hashtag(string $name, int $limit = 20, ?string $maxId
     }
     // Match #tag as a word-ish boundary in HTML/plain text
     $needle = '#' . $name;
-    $out = [];
-    $seenId = [];
+    $like = '%' . str_replace(['%', '_'], ['\\%', '\\_'], mb_strtolower($needle)) . '%';
     $before = ($maxId !== null && $maxId !== '') ? ap_masto_status_created_at_by_id((int) $maxId) : null;
+    $after = ($sinceId !== null && $sinceId !== '') ? ap_masto_status_created_at_by_id((int) $sinceId) : null;
+    $sqlTime = static function (?string $ts): ?string {
+        if ($ts === null || $ts === '') {
+            return null;
+        }
+        try {
+            return (new DateTimeImmutable($ts))->format('c');
+        } catch (Throwable $e) {
+            return null;
+        }
+    };
+    $beforeSql = $sqlTime($before);
+    $afterSql = $sqlTime($after);
+    // Each source pages by its own time column with the cursor in SQL, then
+    // the sources merge newest-first. The old version read the newest rows of
+    // each table with no cursor and appended them source by source, so the
+    // tag page ran dry after a page or two and the next max_id could jump
+    // backwards past newer posts.
+    $bounds = static function (string $column) use ($beforeSql, $afterSql): array {
+        $sql = '';
+        $params = [];
+        if ($beforeSql !== null) {
+            $sql .= ' AND ' . $column . ' < ?';
+            $params[] = $beforeSql;
+        }
+        if ($afterSql !== null) {
+            $sql .= ' AND ' . $column . ' > ?';
+            $params[] = $afterSql;
+        }
+        return [$sql, $params];
+    };
 
-    $push = static function (array $status) use (&$out, &$seenId, $limit, $name, $before): bool {
+    $candidates = [];
+    $accept = static function (array $status) use (&$candidates, $name, $before, $after): void {
         if (!ap_masto_status_has_tag($status, $name)) {
-            return false;
+            return;
         }
         $ts = (string) ($status['created_at'] ?? '');
         if ($before !== null && $ts !== '' && strcmp($ts, $before) >= 0) {
-            return false;
+            return;
         }
-        $sid = (string) ($status['id'] ?? '');
-        if ($sid !== '') {
-            if (isset($seenId[$sid])) {
-                return false;
-            }
-            $seenId[$sid] = true;
+        if ($after !== null && $ts !== '' && strcmp($ts, $after) <= 0) {
+            return;
         }
-        $out[] = $status;
-        return count($out) >= $limit;
+        $candidates[] = $status;
     };
 
     try {
+        [$bSql, $bParams] = $bounds('published');
         $st = ap_db()->prepare(
             "SELECT * FROM masto_statuses
-             WHERE lower(content_text) LIKE ?
-                OR lower(COALESCE(spoiler_text,'')) LIKE ?
-             ORDER BY local_id DESC LIMIT ?"
+             WHERE (lower(content_text) LIKE ? OR lower(COALESCE(spoiler_text,'')) LIKE ?)" . $bSql . "
+             ORDER BY published DESC, local_id DESC LIMIT ?"
         );
-        $like = '%' . str_replace(['%', '_'], ['\\%', '\\_'], mb_strtolower($needle)) . '%';
-        $st->execute([$like, $like, $limit * 3]);
+        $st->execute(array_merge([$like, $like], $bParams, [$limit * 2]));
         foreach ($st->fetchAll() as $row) {
-            if ($push(ap_masto_status_from_row($row))) {
-                return $out;
-            }
+            $accept(ap_masto_status_from_row($row));
         }
     } catch (Throwable $e) {
         // ignore
     }
 
     try {
+        [$bSql, $bParams] = $bounds('created_at');
         $st = ap_db()->prepare(
             "SELECT * FROM mentions
-             WHERE deleted_at IS NULL AND lower(COALESCE(content,'')) LIKE ?
-             ORDER BY id DESC LIMIT ?"
+             WHERE deleted_at IS NULL AND lower(COALESCE(content,'')) LIKE ?" . $bSql . "
+             ORDER BY created_at DESC, id DESC LIMIT ?"
         );
-        $like = '%' . str_replace(['%', '_'], ['\\%', '\\_'], mb_strtolower($needle)) . '%';
-        $st->execute([$like, $limit * 3]);
+        $st->execute(array_merge([$like], $bParams, [$limit * 2]));
         foreach ($st->fetchAll() as $row) {
-            if ($push(ap_masto_status_from_mention($row))) {
-                return $out;
-            }
+            $accept(ap_masto_status_from_mention($row));
         }
     } catch (Throwable $e) {
         // ignore
@@ -16716,33 +16783,58 @@ function ap_masto_timeline_hashtag(string $name, int $limit = 20, ?string $maxId
 
     // Creates + Announces (relay hashtag firehose is mostly Announce)
     try {
+        [$bSql, $bParams] = $bounds('created_at');
         $st = ap_db()->prepare(
             "SELECT * FROM events
              WHERE summary IS NOT NULL AND summary != ''
                AND lower(COALESCE(type,'')) IN ('create','announce','update')
                AND lower(summary) LIKE ?
-               AND (action_taken = 'log' OR action_taken = 'local_observe')
-             ORDER BY id DESC LIMIT ?"
+               AND (action_taken = 'log' OR action_taken = 'local_observe')" . $bSql . "
+             ORDER BY created_at DESC, id DESC LIMIT ?"
         );
-        $like = '%' . str_replace(['%', '_'], ['\\%', '\\_'], mb_strtolower($needle)) . '%';
-        $st->execute([$like, $limit * 4]);
+        $st->execute(array_merge([$like], $bParams, [$limit * 3]));
         foreach ($st->fetchAll() as $row) {
             $sum = html_entity_decode((string) ($row['summary'] ?? ''), ENT_QUOTES | ENT_HTML5, 'UTF-8');
             if (!preg_match('/#' . preg_quote($name, '/') . '\b/ui', $sum)) {
                 continue;
             }
             $status = ap_masto_status_from_event($row);
-            if (!$status) {
-                continue;
-            }
-            if ($push($status)) {
-                break;
+            if ($status) {
+                $accept($status);
             }
         }
     } catch (Throwable $e) {
         // ignore
     }
 
+    usort($candidates, static function (array $a, array $b): int {
+        $cmp = strcmp((string) ($b['created_at'] ?? ''), (string) ($a['created_at'] ?? ''));
+        return $cmp !== 0 ? $cmp : strcmp((string) ($b['id'] ?? ''), (string) ($a['id'] ?? ''));
+    });
+    $out = [];
+    $seenId = [];
+    $seenUri = [];
+    foreach ($candidates as $status) {
+        $sid = (string) ($status['id'] ?? '');
+        if ($sid !== '') {
+            if (isset($seenId[$sid])) {
+                continue;
+            }
+            $seenId[$sid] = true;
+        }
+        $uri = rtrim((string) ($status['uri'] ?? $status['url'] ?? ''), '/');
+        $uri = preg_replace('#^http://#i', 'https://', $uri) ?? $uri;
+        if ($uri !== '') {
+            if (isset($seenUri[$uri])) {
+                continue;
+            }
+            $seenUri[$uri] = true;
+        }
+        $out[] = $status;
+        if (count($out) >= $limit) {
+            break;
+        }
+    }
     return $out;
 }
 
