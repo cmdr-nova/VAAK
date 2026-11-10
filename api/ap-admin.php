@@ -11735,6 +11735,45 @@ function admin_tl_lean_ranked_warm(string $view, array $following, string $cache
 }
 
 /**
+ * Texts of one Bluesky feed item that muted words check: the post itself and
+ * any quoted post, matching what Rust hydrate checks (content + quote).
+ *
+ * @param array<string,mixed> $item feedViewPost-shaped (`post` => PostView)
+ * @return list<string>
+ */
+function admin_bsky_item_muted_texts(array $item): array
+{
+    $post = is_array($item['post'] ?? null) ? $item['post'] : $item;
+    $texts = [];
+    $record = is_array($post['record'] ?? null) ? $post['record'] : [];
+    $texts[] = (string) ($record['text'] ?? ($post['text'] ?? ''));
+    $embed = is_array($post['embed'] ?? null) ? $post['embed'] : [];
+    $quoted = is_array($embed['record'] ?? null) ? $embed['record'] : [];
+    // recordWithMedia nests the quoted view one level deeper.
+    if (is_array($quoted['record'] ?? null)) {
+        $quoted = $quoted['record'];
+    }
+    if (is_array($quoted['value'] ?? null)) {
+        $texts[] = (string) ($quoted['value']['text'] ?? '');
+    }
+    return array_values(array_filter($texts, static fn(string $t): bool => trim($t) !== ''));
+}
+
+/** @param array<string,mixed> $item */
+function admin_bsky_item_muted_by_words(array $item): bool
+{
+    if (!function_exists('ap_muted_words_match')) {
+        return false;
+    }
+    $owner = admin_owner_user_id();
+    if ($owner < 1) {
+        return false;
+    }
+    $texts = admin_bsky_item_muted_texts($item);
+    return $texts !== [] && ap_muted_words_match($owner, ...$texts) !== null;
+}
+
+/**
  * Timeline item hidden by Admin muted words/phrases.
  *
  * @param array{kind?:string,row?:array<string,mixed>} $item
@@ -11748,6 +11787,11 @@ function admin_timeline_item_muted_by_words(array $item): bool
     $row = $item['row'] ?? null;
     if (!is_array($row)) {
         return false;
+    }
+    if ($kind === 'bsky') {
+        // Bluesky rows carry their text in post.record, not in the event
+        // columns below, so they never matched here.
+        return admin_bsky_item_muted_by_words($row);
     }
     if ($kind === 'rss') {
         $blob = trim((string) ($row['title'] ?? '') . "\n" . (string) ($row['summary_text'] ?? ''));
@@ -24858,6 +24902,11 @@ function admin_render_bsky_feed_item(array $item, string $feedKey = 'following',
     $returnView = admin_bsky_context_return_view($context);
     if (in_array($returnView, ['bookmarks', 'favourites'], true)
         && !admin_library_bsky_item_allowed($item, admin_owner_user_id())) {
+        return;
+    }
+    // Muted words hide Bluesky posts on every PHP-painted surface (Home
+    // fallback, Bluesky tab, Library), the same as the Rust painters.
+    if (admin_bsky_item_muted_by_words($item)) {
         return;
     }
     $followingIds = is_array($GLOBALS['vaak_following_ids'] ?? null)

@@ -1854,6 +1854,7 @@ async fn write_home_rank_weights(
     redis: &mut redis::aio::MultiplexedConnection,
     owner: i64,
     algorithm_on: bool,
+    downranking_on: bool,
     actor_weights: &HashMap<String, f64>,
     tag_weights: &HashMap<String, i32>,
     deprioritized: &HashSet<String>,
@@ -1862,6 +1863,9 @@ async fn write_home_rank_weights(
     deprioritized_actors.sort();
     let payload = json!({
         "algorithm": algorithm_on,
+        // Live fan-out reads this so a new post gets the same toxicity
+        // downrank a full rebuild would give it (algorithm and downranking on).
+        "downranking": downranking_on,
         "actors": serde_json::to_value(actor_weights).unwrap_or_else(|_| json!({})),
         "tags": serde_json::to_value(tag_weights).unwrap_or_else(|_| json!({})),
         "deprioritized": deprioritized_actors,
@@ -2485,6 +2489,39 @@ async fn apply_toxicity_downrank(
         }
     }
     Ok(())
+}
+
+/// Seconds a live fan-out placement should drop for one new post, using the
+/// same rule as `apply_toxicity_downrank` on a full Home rebuild: a match
+/// records suppression for the author, and an author under active
+/// suppression is pushed down. Without this a new post sat at its
+/// un-penalized spot until the next full rebuild.
+pub(crate) async fn fanout_downrank_penalty(
+    db: &Client,
+    owner: i64,
+    actor: &str,
+    text: &str,
+    visibility: &str,
+    object_id: &str,
+) -> i64 {
+    let mut items = [TimelineItem::event(
+        object_id.to_string(),
+        0,
+        actor.to_string(),
+        actor.to_string(),
+        text.to_string(),
+        visibility.to_string(),
+        object_id.to_string(),
+        "Create".into(),
+        "fanout",
+    )];
+    match apply_toxicity_downrank(db, owner, &mut items).await {
+        Ok(()) => (-items[0].sort).max(0),
+        Err(e) => {
+            tracing::debug!(owner, error = %format!("{e:#}"), "fanout downrank skipped");
+            0
+        }
+    }
 }
 
 async fn load_favourite_actor_weights(db: &Client, owner: i64) -> HashMap<String, f64> {
@@ -3514,7 +3551,7 @@ pub async fn warm_home_native(cfg: &Config, owner_user_id: i64) -> Result<String
                 let weights = load_nostr_actor_weights(&db, owner_user_id).await;
                 stamp_nostr_affinity(&mut keys, &weights, chrono::Utc::now().timestamp());
             }
-            if downranking_on {
+            if algorithm_on && downranking_on {
                 if let Err(e) = apply_nostr_toxicity_downrank(&db, owner_user_id, &mut keys).await {
                     tracing::warn!(
                         owner = owner_user_id,
@@ -3575,6 +3612,7 @@ pub async fn warm_home_native(cfg: &Config, owner_user_id: i64) -> Result<String
         &mut redis,
         owner_user_id,
         algorithm_on,
+        algorithm_on && downranking_on,
         &actor_weights,
         &tag_weights,
         &weight_deprioritized,
