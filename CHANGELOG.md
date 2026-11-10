@@ -12,6 +12,13 @@ anything else bumps the patch number.
 Releases up to **0.9.83** used a two-digit deploy counter (0.9.05, 0.9.83)
 and have no notes here; their tags and GitHub Releases are unchanged.
 
+## [0.71.0](https://github.com/cmdr-nova/VAAK/releases/tag/v0.71.0) - 2026-11-10
+
+### ✨ Features
+* Eternal sightings: allow the game at eternal.mkultra.monster (CORS) by @cmdr-nova in https://github.com/cmdr-nova/VAAK/pull/432
+
+**Full Changelog**: https://github.com/cmdr-nova/VAAK/compare/v0.70.0...v0.71.0
+
 ## [0.70.0](https://github.com/cmdr-nova/VAAK/releases/tag/v0.70.0) - 2026-11-10
 
 ### ✨ Features
