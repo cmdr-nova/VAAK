@@ -33,6 +33,7 @@ fi
 
 php_tests=(
   api/bin/blog-service-smoke.php
+  api/bin/bsky-muted-words-smoke.php
   api/bin/masto-timeline-paging-smoke.php
   api/bin/account-acct-key-error-smoke.php
   api/bin/avatar-refresh-smoke.php

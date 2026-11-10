@@ -316,6 +316,8 @@ fn place_ranked_rows(
 #[derive(Debug, Default)]
 struct HomeRankWeights {
     algorithm: bool,
+    /// Algorithm and downranking both on (written by the Home rebuild).
+    downranking: bool,
     actors: HashMap<String, f64>,
     deprioritized: HashSet<String>,
 }
@@ -330,6 +332,7 @@ async fn load_home_rank_weights(
     };
     let mut weights = HomeRankWeights {
         algorithm: value.get("algorithm").and_then(|v| v.as_bool()).unwrap_or(false),
+        downranking: value.get("downranking").and_then(|v| v.as_bool()).unwrap_or(false),
         ..HomeRankWeights::default()
     };
     if let Some(map) = value.get("actors").and_then(|v| v.as_object()) {
@@ -726,6 +729,47 @@ impl HiddenCache {
     }
 }
 
+/// The fields the Home rebuild ranks an event by (`fetch_home_events`).
+struct FanoutEventText {
+    pref_actor: String,
+    summary: String,
+    visibility: String,
+    object_id: String,
+}
+
+async fn fanout_event_text(db: &Client, id: &str) -> Option<FanoutEventText> {
+    let id: i64 = id.parse().ok()?;
+    let row = db
+        .query_opt(
+            "SELECT COALESCE(type, ''), COALESCE(actor_id, ''), COALESCE(target_actor, ''),
+                    COALESCE(summary, ''), COALESCE(visibility, ''), COALESCE(object_id, '')
+             FROM events WHERE id = $1",
+            &[&id],
+        )
+        .await
+        .ok()??;
+    let event_type: String = row.get(0);
+    let actor = row.get::<_, String>(1).trim_end_matches('/').to_string();
+    let target = row.get::<_, String>(2).trim_end_matches('/').to_string();
+    // Boosts rank by the boosted author, same as the rebuild.
+    let pref_actor = if event_type.eq_ignore_ascii_case("announce") && !target.is_empty() { target } else { actor };
+    Some(FanoutEventText {
+        pref_actor,
+        summary: row.get(3),
+        visibility: row.get(4),
+        object_id: row.get::<_, String>(5).trim_end_matches('/').to_string(),
+    })
+}
+
+async fn fanout_bsky_text(db: &Client, uri: &str) -> String {
+    db.query_opt("SELECT COALESCE(text, '') FROM bsky_posts WHERE bsky_uri = $1", &[&uri])
+        .await
+        .ok()
+        .flatten()
+        .map(|row| row.get::<_, String>(0))
+        .unwrap_or_default()
+}
+
 async fn process_home_followers(
     cfg: &Config,
     db: &Client,
@@ -747,13 +791,26 @@ async fn process_home_followers(
         return Ok(stats);
     }
     let do_rewarm = rewarm_max() > 0 && owners.len() <= rewarm_max();
+    // Read once, only when some owner has downranking on.
+    let mut event_text: Option<Option<FanoutEventText>> = None;
     for owner in &owners {
         if hidden_cache.get(db, *owner).await.is_hidden(&actor) {
             stats.skipped += 1;
             continue;
         }
         let weights = load_home_rank_weights(cache, *owner).await;
-        let sort = home_placement_sort(&weights, &actor, job.ts);
+        let mut sort = home_placement_sort(&weights, &actor, job.ts);
+        if weights.algorithm && weights.downranking {
+            if event_text.is_none() {
+                event_text = Some(fanout_event_text(db, id).await);
+            }
+            if let Some(Some(ev)) = event_text.as_ref() {
+                sort -= crate::ranked_warm::fanout_downrank_penalty(
+                    db, *owner, &ev.pref_actor, &ev.summary, &ev.visibility, &ev.object_id,
+                )
+                .await;
+            }
+        }
         let n = prepend_owner(cache, *owner, k, id, s, &["home"], Some(sort)).await?;
         if n > 0 {
             stats.touched_owners += 1;
@@ -808,6 +865,7 @@ async fn process_home_bsky(
     // post. Owners who follow that fediverse account get the ActivityPub copy
     // through their own fan-out, so the Bluesky twin never enters their Home.
     let twin_owners = home_bsky_twin_owners(db, uri, did).await.unwrap_or_default();
+    let mut bsky_text: Option<String> = None;
     for owner in &owners {
         if twin_owners.contains(owner) {
             stats.skipped += 1;
@@ -833,6 +891,17 @@ async fn process_home_bsky(
             && weights.deprioritized.contains(&bsky_profile.to_ascii_lowercase())
         {
             sort -= 6 * 3600;
+        }
+        if weights.algorithm && weights.downranking {
+            if bsky_text.is_none() {
+                bsky_text = Some(fanout_bsky_text(db, uri).await);
+            }
+            if let Some(text) = bsky_text.as_deref().filter(|t| !t.trim().is_empty()) {
+                sort -= crate::ranked_warm::fanout_downrank_penalty(
+                    db, *owner, &bsky_profile, text, "public", uri,
+                )
+                .await;
+            }
         }
         let n = prepend_owner(cache, *owner, k, uri, s, &["home"], Some(sort)).await?;
         if n > 0 {
