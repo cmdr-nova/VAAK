@@ -30784,6 +30784,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
             <span class="ico">◈</span><span class="label">Phyrian Strains</span>
             <span class="nav-badge" id="nav-phyrian-badge"<?= $phyrianPendingNav > 0 ? '' : ' hidden' ?>><?= $phyrianPendingNav > 99 ? '99+' : (string) (int) $phyrianPendingNav ?></span>
           </a>
+          <a href="https://eternal.mkultra.monster/" target="_blank" rel="noopener"><span class="ico"><i class="ph ph-planet" aria-hidden="true"></i></span><span class="label">Eternal</span></a>
           <a href="https://hustle.mkultra.monster/" target="_blank" rel="noopener"><span class="ico"><i class="ph ph-briefcase" aria-hidden="true"></i></span><span class="label">Mafia Hustle</span></a>
         </div>
       </details>
