@@ -4141,7 +4141,7 @@ function ap_profile_url_redirects_to(string $url, string $target): bool
         CURLOPT_PROTOCOLS => CURLPROTO_HTTPS,
         CURLOPT_REDIR_PROTOCOLS => CURLPROTO_HTTPS,
     ]);
-    $raw = (string) curl_exec($ch);
+    $raw = (string) ap_net_curl_exec($ch, $url, 0);
     curl_close($ch);
     if ($raw === '' || !preg_match('/^Location:\s*(\S+)/mi', $raw, $lm)) {
         return false;

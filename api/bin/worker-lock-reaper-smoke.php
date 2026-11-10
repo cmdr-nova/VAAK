@@ -60,5 +60,21 @@ check(str_contains($queue, "ap_worker_lock_take(ap_action_queue_lock_path(), AP_
 $cli = (string) file_get_contents(dirname(__DIR__) . '/ap-action-queue-worker.php');
 check(str_contains($cli, 'ap_worker_lock_alarm(AP_ACTION_QUEUE_MAX_SECONDS'), 'action queue CLI arms a run-time alarm');
 
+// Every minute-cron worker that holds a single-run lock goes through the
+// shared reaper, so one hang cannot stop its job for good.
+foreach ([
+    'ap-bsky-notif-poll.php' => 'ap-bsky-notif-poll',
+    'ap-publish-delivery.php' => 'ap-publish-delivery-worker',
+    'ap-deliver-sweep.php' => 'ap-deliver-sweep',
+    'ap-queue-publish.php' => 'ap-queue-publish',
+    'ap-bsky-crosspost-retry.php' => 'ap-bsky-crosspost-retry',
+    'ap-bsky-tl-warm.php' => 'ap-bsky-tl-warm',
+    'ap-defederation-monitor.php' => 'ap-defederation-monitor',
+] as $file => $needle) {
+    $src = (string) file_get_contents(dirname(__DIR__) . '/' . $file);
+    check(str_contains($src, 'ap_worker_lock_take(') && str_contains($src, "'" . $needle . "'"), $file . ' uses the reaping lock');
+    check(!preg_match('/flock\(\$lock(?:Fh)?, LOCK_EX \| LOCK_NB\)/', $src), $file . ' has no bare non-blocking flock left');
+}
+
 echo $fail === 0 ? "worker-lock-reaper-smoke: ok\n" : "worker-lock-reaper-smoke: $fail failed\n";
 exit($fail === 0 ? 0 : 1);

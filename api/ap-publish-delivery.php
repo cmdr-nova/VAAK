@@ -221,52 +221,26 @@ function ap_publish_delivery_lock_path(): string
 }
 
 /**
- * Kill the lock holder when it has outlived the cap. The holder writes
- * "pid start" into the lock file; a holder without that line (a run from
- * before this change) is left alone.
+ * Kill the lock holder when it has outlived the cap (shared rule in
+ * ap-worker-lock.php). A holder without a "pid start" line is left alone.
  *
  * @param resource $lock
  * @return string why the lock is still busy, or '' when the holder was killed
  */
 function ap_publish_delivery_reap_stale_holder($lock, ?int $now = null): string
 {
-    rewind($lock);
-    $line = trim((string) stream_get_contents($lock));
-    if (!preg_match('/^(\d+) (\d+)$/', $line, $m)) return 'holder unknown';
-    $pid = (int) $m[1];
-    $age = ($now ?? time()) - (int) $m[2];
-    if ($age <= AP_PUBLISH_DELIVERY_MAX_SECONDS + 60) return sprintf('pid=%d age=%ds', $pid, $age);
-    $cmd = (string) @file_get_contents('/proc/' . $pid . '/cmdline');
-    if (!str_contains($cmd, 'ap-publish-delivery-worker') || !function_exists('posix_kill')) {
-        return sprintf('pid=%d age=%ds stale, not killed', $pid, $age);
-    }
-    posix_kill($pid, 9);
-    error_log(sprintf('[ap-publish-delivery] killed hung worker pid=%d age=%ds', $pid, $age));
-    return '';
+    require_once __DIR__ . '/ap-worker-lock.php';
+    return ap_worker_lock_reap_stale_holder($lock, AP_PUBLISH_DELIVERY_MAX_SECONDS, 'ap-publish-delivery-worker', $now);
 }
 
 function ap_publish_delivery_worker_run(int $limit = 10): array
 {
     $stats = ['claimed' => 0, 'succeeded' => 0, 'retried' => 0, 'failed' => 0];
-    $lock = @fopen(ap_publish_delivery_lock_path(), 'c+');
-    if (!$lock) return $stats + ['busy' => 1, 'busy_reason' => 'lock file unavailable'];
-    if (!flock($lock, LOCK_EX | LOCK_NB)) {
-        $busy = ap_publish_delivery_reap_stale_holder($lock);
-        $locked = false;
-        for ($i = 0; $busy === '' && $i < 10 && !$locked; $i++) {
-            usleep(500000);
-            $locked = flock($lock, LOCK_EX | LOCK_NB);
-        }
-        if (!$locked) {
-            fclose($lock);
-            return $stats + ['busy' => 1, 'busy_reason' => $busy !== '' ? $busy : 'after kill'];
-        }
-        $stats['reaped'] = 1;
-    }
-    ftruncate($lock, 0);
-    rewind($lock);
-    fwrite($lock, getmypid() . ' ' . time());
-    fflush($lock);
+    require_once __DIR__ . '/ap-worker-lock.php';
+    $taken = ap_worker_lock_take(ap_publish_delivery_lock_path(), AP_PUBLISH_DELIVERY_MAX_SECONDS, 'ap-publish-delivery-worker');
+    $lock = $taken['lock'];
+    if (!$lock) return $stats + ['busy' => 1, 'busy_reason' => $taken['busy']];
+    if ($taken['reaped']) $stats['reaped'] = 1;
     try {
         $db = ap_db();
         $limit = max(1, min(50, $limit));
@@ -303,6 +277,6 @@ function ap_publish_delivery_worker_run(int $limit = 10): array
                 $stats[$terminal ? 'failed' : 'retried']++;
             }
         }
-    } finally { flock($lock, LOCK_UN); fclose($lock); }
+    } finally { ap_worker_lock_release($lock); }
     return $stats;
 }

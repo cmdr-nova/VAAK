@@ -20,9 +20,6 @@ function ap_visibility_actor_hidden(string $actor, int $ownerUserId): bool
         return false;
     }
     if (str_starts_with(strtolower($actor), 'did:')) {
-        if (function_exists('ap_bsky_hide_did_reasons') && ap_bsky_hide_did_reasons($ownerUserId, $actor) !== []) {
-            return true;
-        }
         if (function_exists('ap_bsky_hide_did_set')) {
             $set = ap_bsky_hide_did_set($ownerUserId);
             if (isset($set[$actor]) || isset($set[strtolower($actor)])) {

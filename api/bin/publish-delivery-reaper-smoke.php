@@ -43,9 +43,9 @@ if (!function_exists('posix_kill') || !is_dir('/proc/self')) {
 }
 
 $src = (string) file_get_contents(dirname(__DIR__) . '/ap-publish-delivery.php');
-check(str_contains($src, "fwrite(\$lock, getmypid() . ' ' . time())"), 'lock holder records "pid start"');
+check(str_contains($src, "ap_worker_lock_take(ap_publish_delivery_lock_path(), AP_PUBLISH_DELIVERY_MAX_SECONDS, 'ap-publish-delivery-worker')"), 'worker takes the shared reaping lock (records "pid start")');
 $cli = (string) file_get_contents(dirname(__DIR__) . '/ap-publish-delivery-worker.php');
-check(str_contains($cli, 'pcntl_alarm(AP_PUBLISH_DELIVERY_MAX_SECONDS)'), 'CLI worker arms a run-time alarm');
+check(str_contains($cli, 'ap_worker_lock_alarm(AP_PUBLISH_DELIVERY_MAX_SECONDS'), 'CLI worker arms a run-time alarm');
 
 echo $fail === 0 ? "publish-delivery-reaper-smoke: ok\n" : "publish-delivery-reaper-smoke: $fail failed\n";
 exit($fail === 0 ? 0 : 1);

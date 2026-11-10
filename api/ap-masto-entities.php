@@ -13102,9 +13102,7 @@ function ap_masto_trend_actor_hidden(string $actor, int $ownerUserId, bool $incl
         static $bskyHidden = [];
         $cacheKey = $ownerUserId . ':' . $actor;
         if (!array_key_exists($cacheKey, $bskyHidden)) {
-            if (function_exists('ap_bsky_hide_did_reasons')) {
-                $bskyHidden[$cacheKey] = ap_bsky_hide_did_reasons($ownerUserId, $actor) !== [];
-            } elseif (function_exists('ap_bsky_hide_did_set')) {
+            if (function_exists('ap_bsky_hide_did_set')) {
                 $set = ap_bsky_hide_did_set($ownerUserId);
                 $bskyHidden[$cacheKey] = isset($set[$actor]) || isset($set[strtolower($actor)]);
             } else {

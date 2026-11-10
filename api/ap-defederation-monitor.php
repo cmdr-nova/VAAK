@@ -54,11 +54,16 @@ $badspaceExportUrls = [
     'https://tweaking.thebad.space/exports/mastodon/50',
 ];
 
-$lockFh = @fopen(AP_DEFED_LOCK, 'c+');
-if ($lockFh === false || !flock($lockFh, LOCK_EX | LOCK_NB)) {
-    fwrite(STDOUT, sprintf("[%s] defederation monitor busy\n", gmdate('c')));
+// Shared hung-holder reaper (ap-worker-lock.php): a run older than the cap
+// is killed by the next one instead of leaving every later run "busy".
+require_once __DIR__ . '/ap-worker-lock.php';
+$vaakLock = ap_worker_lock_take(AP_DEFED_LOCK, 900, 'ap-defederation-monitor');
+$lockFh = $vaakLock['lock'];
+if (!$lockFh) {
+    fwrite(STDOUT, sprintf("[%s] defederation monitor busy (%s)\n", gmdate('c'), $vaakLock['busy']));
     exit(0);
 }
+ap_worker_lock_alarm(900, 'defederation_monitor');
 
 function ap_defed_log(string $msg): void
 {

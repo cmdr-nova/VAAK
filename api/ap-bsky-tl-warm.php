@@ -51,12 +51,16 @@ foreach ($argv as $arg) {
     }
 }
 
-$lockPath = '/tmp/ap-bsky-tl-warm.lock';
-$lockFh = @fopen($lockPath, 'c+');
-if ($lockFh === false || !flock($lockFh, LOCK_EX | LOCK_NB)) {
-    fwrite(STDOUT, sprintf("[%s] bsky_tl_warm busy\n", gmdate('c')));
+// Shared hung-holder reaper (ap-worker-lock.php): a run older than the cap
+// is killed by the next one instead of leaving every later run "busy".
+require_once __DIR__ . '/ap-worker-lock.php';
+$vaakLock = ap_worker_lock_take('/tmp/ap-bsky-tl-warm.lock', 900, 'ap-bsky-tl-warm');
+$lockFh = $vaakLock['lock'];
+if (!$lockFh) {
+    fwrite(STDOUT, sprintf("[%s] bsky_tl_warm busy (%s)\n", gmdate('c'), $vaakLock['busy']));
     exit(0);
 }
+ap_worker_lock_alarm(900, 'bsky_tl_warm');
 
 try {
     if (!defined('AP_INBOX_LIB_ONLY')) {
