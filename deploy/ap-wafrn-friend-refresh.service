@@ -6,4 +6,7 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 User=www-data
+# Type=oneshot has no start timeout by default; a hung fetch would block
+# every later daily refresh.
+TimeoutStartSec=10min
 ExecStart=/usr/bin/php /srv/mkultra/html/api/ap-wafrn-friend-refresh.php

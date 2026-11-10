@@ -19,10 +19,13 @@ try {
     require_once __DIR__ . '/ap-r2.php';
     require_once __DIR__ . '/ap-bsky.php';
     require_once __DIR__ . '/ap-action-queue.php';
+    require_once __DIR__ . '/ap-worker-lock.php';
+    ap_worker_lock_alarm(AP_ACTION_QUEUE_MAX_SECONDS, 'action_queue');
     $stats = ap_action_queue_worker_run($limit);
-    fwrite(STDOUT, sprintf("[%s] action_queue claimed=%d succeeded=%d retried=%d failed=%d%s\n",
+    fwrite(STDOUT, sprintf("[%s] action_queue claimed=%d succeeded=%d retried=%d failed=%d%s%s\n",
         gmdate('c'), $stats['claimed'], $stats['succeeded'], $stats['retried'], $stats['failed'],
-        !empty($stats['busy']) ? ' busy=1' : ''));
+        !empty($stats['reaped']) ? ' reaped_hung=1' : '',
+        !empty($stats['busy']) ? ' busy=1 (' . ($stats['busy_reason'] ?? '') . ')' : ''));
 } catch (Throwable $e) {
     error_log('[ap-action-queue-worker] ' . $e->getMessage());
     fwrite(STDERR, sprintf("[%s] action_queue worker failed\n", gmdate('c')));

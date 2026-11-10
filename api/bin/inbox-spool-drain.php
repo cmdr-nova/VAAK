@@ -207,7 +207,9 @@ while (time() < $deadline) {
         }
         $db->exec("DELETE FROM ap_inbox_spool WHERE id IN (
                        SELECT id FROM ap_inbox_spool
-                       WHERE finished_at < now() - interval '7 days' AND state IN ('done', 'dropped')
+                       WHERE (finished_at < now() - interval '7 days' AND state IN ('done', 'dropped'))
+                          -- Failed rows stay longer for debugging, but not forever.
+                          OR (finished_at < now() - interval '30 days' AND state = 'failed')
                        LIMIT 5000)");
     }
     $claim->execute();

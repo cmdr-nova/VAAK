@@ -7,6 +7,12 @@ require_once __DIR__ . '/ap-db.php';
 
 const AP_WEBMENTION_HOST = 'mkultra.monster';
 const AP_WEBMENTION_MAX_SOURCE_BYTES = 524288;
+// Each POST does a DNS lookup and up to a 10 s fetch inside a php-fpm
+// worker, on a CPU-bound 4-core box. Webmentions are rare, so cap them per
+// source host and overall. Redis down means no cap (fail open).
+const AP_WEBMENTION_RATE_WINDOW = 900;
+const AP_WEBMENTION_RATE_PER_HOST = 10;
+const AP_WEBMENTION_RATE_TOTAL = 120;
 
 $method = strtoupper((string) ($_SERVER['REQUEST_METHOD'] ?? 'GET'));
 if ($method === 'OPTIONS') {
@@ -54,6 +60,10 @@ if (!ap_webmention_public_host($sourceHost)) {
 }
 if (function_exists('ap_is_blocked_host') && ap_is_blocked_host($sourceHost)) {
     ap_webmention_error('source host is blocked', 403);
+}
+if (!ap_webmention_rate_ok($sourceHost)) {
+    header('Retry-After: ' . AP_WEBMENTION_RATE_WINDOW);
+    ap_webmention_error('Too many Webmentions, try again later', 429);
 }
 
 $targetCheck = ap_webmention_target_exists($target);
@@ -199,21 +209,27 @@ function ap_webmention_target_exists(string $target): bool
     return is_array($row) && (string) ($row['visibility'] ?? 'public') === 'public';
 }
 
+/**
+ * The shared outbound guard (ap-net-guard.php): IPv6 answers, IPv4-mapped
+ * forms and CGNAT are refused too. The old local check only looked at A
+ * records, so a name with a public A and a loopback AAAA passed.
+ */
 function ap_webmention_public_host(string $host): bool
 {
-    if ($host === '' || $host === 'localhost' || str_ends_with($host, '.local') || str_ends_with($host, '.internal')) {
+    return ap_net_host_is_public($host);
+}
+
+function ap_webmention_rate_ok(string $sourceHost): bool
+{
+    if (!function_exists('ap_redis_rate_count')) {
+        return true;
+    }
+    $host = ap_redis_rate_count('webmention:host:' . strtolower($sourceHost), AP_WEBMENTION_RATE_WINDOW);
+    if ($host !== null && $host > AP_WEBMENTION_RATE_PER_HOST) {
         return false;
     }
-    $ips = filter_var($host, FILTER_VALIDATE_IP) ? [$host] : (gethostbynamel($host) ?: []);
-    if (!$ips) {
-        return false;
-    }
-    foreach ($ips as $ip) {
-        if (filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE) === false) {
-            return false;
-        }
-    }
-    return true;
+    $total = ap_redis_rate_count('webmention:total', AP_WEBMENTION_RATE_WINDOW);
+    return $total === null || $total <= AP_WEBMENTION_RATE_TOTAL;
 }
 
 function ap_webmention_fetch_source(string $url): ?string
@@ -226,6 +242,7 @@ function ap_webmention_fetch_source(string $url): ?string
     curl_setopt_array($ch, [
         CURLOPT_RETURNTRANSFER => false,
         CURLOPT_FOLLOWLOCATION => false,
+        CURLOPT_PROTOCOLS => CURLPROTO_HTTPS,
         CURLOPT_CONNECTTIMEOUT => 5,
         CURLOPT_TIMEOUT => 10,
         CURLOPT_USERAGENT => 'Vaak-Webmention/1.0 (+https://mkultra.monster/)',
@@ -239,7 +256,9 @@ function ap_webmention_fetch_source(string $url): ?string
             return strlen($chunk) <= $remaining ? strlen($chunk) : 0;
         },
     ]);
-    $ok = curl_exec($ch);
+    // Pinned to the addresses the guard vetted, so curl cannot resolve the
+    // name again to something private (DNS rebinding).
+    $ok = ap_net_curl_exec($ch, $url, 0);
     $status = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
     $type = strtolower((string) curl_getinfo($ch, CURLINFO_CONTENT_TYPE));
     curl_close($ch);

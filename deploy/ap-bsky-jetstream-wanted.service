@@ -8,4 +8,7 @@ User=www-data
 WorkingDirectory=/srv/mkultra/html/api
 Environment=AP_DB_DSN=pgsql:dbname=novalandia
 Environment=VAAK_JETSTREAM_STATE=/var/lib/mkultra/ap/jetstream
+# Type=oneshot has no start timeout by default; a hung run would freeze the
+# wanted-DID filter (the timer waits for it).
+TimeoutStartSec=5min
 ExecStart=/usr/bin/php /srv/mkultra/html/api/ap-bsky-jetstream-wanted.php

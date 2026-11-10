@@ -100,6 +100,9 @@ php_tests=(
   api/bin/fanout-sync-rust-smoke.php
   api/bin/fanout-actions-rust-smoke.php
   api/bin/publish-delivery-reaper-smoke.php
+  api/bin/worker-lock-reaper-smoke.php
+  api/bin/notif-paging-smoke.php
+  api/bin/pachli-refresh-smoke.php
   api/bin/listenbrainz-smoke.php
   api/bin/nostr-smoke.php
   api/bin/home-bsky-index-smoke.php
@@ -226,6 +229,7 @@ node_tests=(
   api/bin/soft-nav-address-regression.js
   api/bin/paste-media-regression.js
   api/bin/home-feed-chip-regression.js
+  api/bin/compose-quote-reset-regression.js
 )
 for test in "${node_tests[@]}"; do
   echo "==> ${test}"
