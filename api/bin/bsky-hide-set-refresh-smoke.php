@@ -3,7 +3,9 @@ declare(strict_types=1);
 /**
  * A Bluesky hide-set refresh that cannot reach the AppView must keep the
  * blocks, mutes and list members it already had. Only parts that fetched
- * completely drop rows the pull no longer returns.
+ * completely drop rows the pull no longer returns. A block that is new since
+ * the last pull (direct, or on the owner's own block list) ends the follow;
+ * subscribed lists never do.
  * SQLite in memory; no network.
  */
 $api = getenv('VAAK_BSKY_HIDE_API') ?: dirname(__DIR__);
@@ -37,8 +39,13 @@ function ap_bsky_xrpc(string $base, string $nsid, string $method = 'GET', ?array
     return $j === null ? ['ok' => false, 'status' => 500, 'error' => 'InternalServerError'] : ['ok' => true, 'status' => 200, 'json' => $j];
 }
 
+$GLOBALS['follow_edges'] = ['did:plc:newblock' => true, 'did:plc:ownlisted' => true, 'did:plc:sublisted' => true, 'did:plc:oldblock' => true];
+$GLOBALS['dropped'] = [];
+function ap_bsky_graph_sync_get(int $o, string $kind, string $did): ?array { return isset($GLOBALS['follow_edges'][$did]) ? ['bsky_uri' => 'at://x'] : null; }
+function ap_bsky_drop_follow_for_block(int $o, string $did, ?array $repo = null): array { $GLOBALS['dropped'][] = $did; unset($GLOBALS['follow_edges'][$did]); return ['ok' => true, 'deleted' => 1]; }
+
 reference_load($api . '/ap-bsky.php', [
-    'ap_bsky_hide_did_add', 'ap_bsky_hide_did_set_clear_cache', 'ap_bsky_refresh_hide_set',
+    'ap_bsky_hide_did_add', 'ap_bsky_hide_did_set_clear_cache', 'ap_bsky_refresh_hide_set', 'ap_bsky_list_is_own',
 ]);
 
 $checks = 0;
@@ -89,6 +96,7 @@ hs_check(empty($res['ok']), 'a partial pull reports not ok');
 hs_check(hs_dids('block') === ['did:plc:newblock'], 'complete getBlocks replaces blocks');
 hs_check(hs_dids('mute') === ['did:plc:oldmute'], 'failed getMutes still keeps mutes');
 hs_check(hs_dids('listblock') === ['did:plc:gone', 'did:plc:listed'], 'failed list keeps its members');
+hs_check($GLOBALS['dropped'] === ['did:plc:newblock'], 'a new direct block ends its follow; the old one is left alone');
 
 // Everything fetches: rows the pull no longer returns are dropped.
 $GLOBALS['xrpc'] = [
@@ -103,6 +111,20 @@ hs_check(!empty($res['ok']), 'a full pull reports ok');
 hs_check(hs_dids('block') === ['did:plc:newblock'], 'full pull keeps current block');
 hs_check(hs_dids('mute') === [], 'full pull drops an unmuted account');
 hs_check(hs_dids('listblock') === ['did:plc:listed'], 'full pull drops an unsubscribed list');
+
+// New members of your own block list end the follow; a subscribed list does not.
+$GLOBALS['dropped'] = [];
+$GLOBALS['xrpc'] = [
+    'app.bsky.graph.getBlocks' => ['blocks' => [['did' => 'did:plc:newblock']]],
+    'app.bsky.graph.getMutes' => ['mutes' => []],
+    'app.bsky.graph.getListBlocks' => ['lists' => [['uri' => 'at://list/a'], ['uri' => 'at://did:plc:valerie/app.bsky.graph.list/own']]],
+    'app.bsky.graph.getList at://list/a' => ['items' => [['subject' => ['did' => 'did:plc:listed']], ['subject' => ['did' => 'did:plc:sublisted']]]],
+    'app.bsky.graph.getList at://did:plc:valerie/app.bsky.graph.list/own' => ['items' => [['subject' => ['did' => 'did:plc:ownlisted']]]],
+];
+$res = ap_bsky_refresh_hide_set(1, true);
+hs_check(!empty($res['ok']), 'list pull ok');
+hs_check($GLOBALS['dropped'] === ['did:plc:ownlisted'], 'own block list ends the follow, subscribed list does not');
+hs_check(isset($GLOBALS['follow_edges']['did:plc:sublisted']), 'subscribed list member still followed');
 
 @unlink(sys_get_temp_dir() . '/vaak-bsky-hide-1.json');
 echo "bsky-hide-set-refresh-smoke: ok ({$checks} checks)\n";

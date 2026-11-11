@@ -651,6 +651,12 @@ function ap_list_add_account(int $listId, string $actorId, bool $followIfNeeded 
         if ($isBsky && !empty($list['bsky_list_uri']) && in_array((string) ($list['bsky_moderation_action'] ?? 'none'), ['mute', 'block'], true)) {
             ap_list_bsky_hide_set_mark_stale($ownerUserId);
         }
+        // Putting someone on your own block list blocks them, and a block ends
+        // the follow (Bluesky would otherwise keep the follow record).
+        if ($isBsky && $isModeration && (string) ($list['bsky_moderation_action'] ?? 'none') === 'block'
+            && function_exists('ap_bsky_drop_follow_for_block')) {
+            ap_bsky_drop_follow_for_block($ownerUserId, (string) $bskyDid);
+        }
         ap_db()->prepare('UPDATE masto_lists SET updated_at = ? WHERE id = ?')->execute([$now, $listId]);
         ap_lists_moderation_cache_clear($ownerUserId);
         return ['ok' => true, 'followed' => $followed];
