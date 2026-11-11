@@ -607,9 +607,46 @@
     }
     return null;
   }
+  // Some painters (PHP fallbacks, Library/Search cards, own-profile rows,
+  // Bluesky cards) show the time as plain text. Those cards still carry the
+  // overflow menu's Open link or Copy link value, or the post's URI.
+  function postCardMenuTarget(card) {
+    const menus = card.querySelectorAll('.post-action-menu');
+    let external = null;
+    for (let i = 0; i < menus.length; i++) {
+      if (postCardOwner(menus[i]) !== card) continue;
+      const opens = menus[i].querySelectorAll('a.menu-action[href]');
+      for (let j = 0; j < opens.length; j++) {
+        const a = opens[j];
+        if ((a.textContent || '').trim() !== 'Open') continue;
+        if (a.target !== '_blank') return { raw: a.getAttribute('href') || '', anchor: a, external: false };
+        if (!external) external = { raw: a.getAttribute('href') || '', anchor: null, external: true };
+      }
+      const copy = menus[i].querySelector('[data-copy-value]');
+      const raw = copy ? copy.getAttribute('data-copy-value') || '' : '';
+      if (raw) {
+        try {
+          const u = new URL(raw, window.location.href);
+          if (u.origin === window.location.origin) return { raw: u.pathname + u.search, anchor: null, external: false };
+        } catch (e) { /* not a URL */ }
+      }
+    }
+    if (external) return external;
+    const note = card.getAttribute('data-note-id') || card.getAttribute('data-bsky-uri') || '';
+    if (/^(https|at):\/\//.test(note)) {
+      const from = new URL(window.location.href).searchParams.get('view') || 'home';
+      return {
+        raw: '?view=status&object=' + encodeURIComponent(note) + '&from=' + encodeURIComponent(from.replace(/[^a-z_]/g, '') || 'home'),
+        anchor: null,
+        external: false,
+      };
+    }
+    return null;
+  }
   function postCardOwnTarget(card) {
     const anchor = postCardOwnAnchor(card);
-    return anchor ? { raw: anchor.getAttribute('href') || '', anchor, external: anchor.target === '_blank' } : null;
+    if (anchor) return { raw: anchor.getAttribute('href') || '', anchor, external: anchor.target === '_blank' };
+    return postCardMenuTarget(card);
   }
   function postCardTarget(card) {
     let t = postCardOwnTarget(card);
@@ -658,7 +695,11 @@
       return;
     }
     // The card's own link goes through soft-nav (vaak-09.js), same as a tap on it.
-    target.anchor.click();
+    if (target.anchor && target.anchor.getAttribute('href') === target.href) {
+      target.anchor.click();
+      return;
+    }
+    window.location.assign(new URL(target.href, window.location.href).href);
   }
   document.addEventListener('click', onPostCardActivate, true);
   document.addEventListener('auxclick', onPostCardActivate, true);
