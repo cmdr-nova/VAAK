@@ -11733,6 +11733,106 @@ function ap_bsky_unfollow_actor(int $ownerUserId, string $didOrRef): array
 }
 
 /**
+ * Follow record URIs in the owner's own repo, keyed by subject DID
+ * (com.atproto.repo.listRecords, the same source as the follow sync).
+ *
+ * @return array<string,list<string>>|null null when the repo could not be read in full
+ */
+function ap_bsky_follow_record_uris(int $ownerUserId): ?array
+{
+    $session = ap_bsky_session_row($ownerUserId);
+    $repo = trim((string) ($session['did'] ?? ''));
+    if (!str_starts_with($repo, 'did:')) {
+        return null;
+    }
+    $out = [];
+    $cursor = null;
+    for ($page = 0; $page < 25; $page++) {
+        $query = ['repo' => $repo, 'collection' => 'app.bsky.graph.follow', 'limit' => 100];
+        if (is_string($cursor) && $cursor !== '') {
+            $query['cursor'] = $cursor;
+        }
+        $res = ap_bsky_account_xrpc($ownerUserId, 'com.atproto.repo.listRecords', 'GET', $query);
+        if (empty($res['ok']) || !is_array($res['json'] ?? null)) {
+            return null;
+        }
+        foreach ((array) ($res['json']['records'] ?? []) as $record) {
+            $subject = is_array($record) ? trim((string) ($record['value']['subject'] ?? '')) : '';
+            $uri = is_array($record) ? trim((string) ($record['uri'] ?? '')) : '';
+            if (str_starts_with($subject, 'did:') && $uri !== '') {
+                $out[$subject][] = $uri;
+            }
+        }
+        $cursor = isset($res['json']['cursor']) && is_string($res['json']['cursor']) && $res['json']['cursor'] !== ''
+            ? $res['json']['cursor'] : null;
+        if ($cursor === null) {
+            return $out;
+        }
+    }
+    return null;
+}
+
+/**
+ * True when a Bluesky moderation list belongs to the owner's own account
+ * (at://<owner did>/app.bsky.graph.list/...), not a subscribed list.
+ */
+function ap_bsky_list_is_own(int $ownerUserId, string $listUri): bool
+{
+    $session = ap_bsky_session_row($ownerUserId);
+    $did = trim((string) ($session['did'] ?? ''));
+    return $did !== '' && str_starts_with($listUri, 'at://' . $did . '/');
+}
+
+/**
+ * A block ends the follow. Bluesky keeps the follow record of an account you
+ * block (the AppView only hides it), and the follow sync reads the repo, so
+ * VAAK kept showing "Following". Delete the owner's follow record(s) for the
+ * DID and the cached edge. Records come from the cached edge, or from
+ * $repoFollows (ap_bsky_follow_record_uris) when the caller has the map.
+ * A failed delete keeps the edge so the state stays visible and retryable.
+ *
+ * @param array<string,list<string>>|null $repoFollows
+ * @return array{ok:bool,deleted:int,error?:string}
+ */
+function ap_bsky_drop_follow_for_block(int $ownerUserId, string $did, ?array $repoFollows = null): array
+{
+    if ($ownerUserId < 1 || !str_starts_with($did, 'did:')) {
+        return ['ok' => false, 'deleted' => 0, 'error' => 'DID required'];
+    }
+    $edge = ap_bsky_graph_sync_get($ownerUserId, 'follow', $did);
+    $uris = $repoFollows !== null ? ($repoFollows[$did] ?? []) : [];
+    $edgeUri = is_array($edge) ? trim((string) ($edge['bsky_uri'] ?? '')) : '';
+    if ($edgeUri !== '') {
+        $uris[] = $edgeUri;
+    }
+    $deleted = 0;
+    $error = null;
+    if ($uris !== [] && ap_bsky_session_row($ownerUserId) !== null) {
+        foreach (array_values(array_unique($uris)) as $uri) {
+            if (!preg_match('~^at://[^/]+/app\.bsky\.graph\.follow/[^/]+$~', $uri)) {
+                continue;
+            }
+            $res = ap_bsky_delete_record_uri($ownerUserId, $uri);
+            if (!empty($res['ok'])) {
+                $deleted++;
+            } else {
+                $error = (string) ($res['error'] ?? 'delete failed');
+            }
+        }
+    }
+    if ($error !== null) {
+        error_log('[ap-bsky] block unfollow ' . $did . ': ' . $error);
+        return ['ok' => false, 'deleted' => $deleted, 'error' => $error];
+    }
+    if (is_array($edge) || $deleted > 0) {
+        ap_bsky_graph_sync_delete($ownerUserId, 'follow', $did);
+        ap_bsky_actor_viewer_cache_update($ownerUserId, $did, null);
+        ap_bsky_tl_cache_clear_owner($ownerUserId);
+    }
+    return ['ok' => true, 'deleted' => $deleted];
+}
+
+/**
  * @return array{ok:bool,error?:string,skipped?:bool}
  */
 function ap_bsky_mute_actor(int $ownerUserId, string $did): array
@@ -11832,6 +11932,7 @@ function ap_bsky_block_actor(int $ownerUserId, string $did): array
     $existing = ap_bsky_graph_sync_get($ownerUserId, 'block', $did);
     if (is_array($existing) && !empty($existing['bsky_uri'])) {
         ap_bsky_hide_did_add($ownerUserId, $did, 'block');
+        ap_bsky_drop_follow_for_block($ownerUserId, $did);
         ap_bsky_hide_notifications_touch($ownerUserId);
         return ['ok' => true, 'uri' => (string) $existing['bsky_uri'], 'skipped' => true];
     }
@@ -11867,6 +11968,7 @@ function ap_bsky_block_actor(int $ownerUserId, string $did): array
     $uri = (string) ($put['json']['uri'] ?? '');
     ap_bsky_graph_sync_upsert($ownerUserId, 'block', $did, $uri !== '' ? $uri : null, 'vaak');
     ap_bsky_hide_did_add($ownerUserId, $did, 'block');
+    ap_bsky_drop_follow_for_block($ownerUserId, $did);
     ap_bsky_tl_cache_clear_owner($ownerUserId);
     ap_bsky_hide_notifications_touch($ownerUserId);
     return ['ok' => true, 'uri' => $uri];
@@ -12113,6 +12215,19 @@ function ap_bsky_refresh_hide_set(int $ownerUserId, bool $force = false): array
     $complete = ['block' => true, 'mute' => true, 'listblock' => true, 'listmute' => true];
     $failedLists = [];
 
+    // Blocks that appear since the last pull end their follow (see below).
+    $prevBlocked = [];
+    try {
+        $prev = ap_db()->prepare("SELECT reason, did FROM bsky_hide_dids WHERE owner_user_id = ? AND reason IN ('block', 'listblock')");
+        $prev->execute([$ownerUserId]);
+        while ($r = $prev->fetch()) {
+            $prevBlocked[(string) $r['reason'] . '|' . (string) $r['did']] = true;
+        }
+    } catch (Throwable $e) {
+        $prevBlocked = null;
+    }
+    $newBlocks = [];
+
     // Blocks
     $cursor = null;
     for ($page = 0; $page < 20; $page++) {
@@ -12131,6 +12246,9 @@ function ap_bsky_refresh_hide_set(int $ownerUserId, bool $force = false): array
                 continue;
             }
             ap_bsky_hide_did_add($ownerUserId, $did, 'block');
+            if (is_array($prevBlocked) && !isset($prevBlocked['block|' . $did])) {
+                $newBlocks[$did] = true;
+            }
             $blockCount++;
         }
         $cursor = isset($j['cursor']) && is_string($j['cursor']) ? $j['cursor'] : null;
@@ -12177,7 +12295,9 @@ function ap_bsky_refresh_hide_set(int $ownerUserId, bool $force = false): array
         &$listBlockCount,
         &$listMuteCount,
         &$complete,
-        &$failedLists
+        &$failedLists,
+        $prevBlocked,
+        &$newBlocks
     ): void {
         $listUris = [];
         $cursor = null;
@@ -12221,6 +12341,11 @@ function ap_bsky_refresh_hide_set(int $ownerUserId, bool $force = false): array
                         continue;
                     }
                     ap_bsky_hide_did_add($ownerUserId, $did, $reason, $listUri);
+                    // Your own block list is your block; a subscribed list is not.
+                    if ($reason === 'listblock' && is_array($prevBlocked) && !isset($prevBlocked['listblock|' . $did])
+                        && ap_bsky_list_is_own($ownerUserId, $listUri)) {
+                        $newBlocks[$did] = true;
+                    }
                     if ($reason === 'listmute') {
                         $listMuteCount++;
                     } else {
@@ -12256,6 +12381,21 @@ function ap_bsky_refresh_hide_set(int $ownerUserId, bool $force = false): array
         }
     }
     $partial = in_array(false, $complete, true) || $failedLists !== [];
+
+    // Bluesky keeps the follow record of an account you block, so a block made
+    // since the last pull (in the Bluesky app, or by adding someone to your own
+    // block list) ends the follow here. Capped so a first pull or a re-listed
+    // block list never unfollows in bulk; older stale follows are handled by
+    // api/bin/bsky-block-follow-cleanup.php.
+    if (count($newBlocks) > 25) {
+        error_log('[ap-bsky] hide set: ' . count($newBlocks) . ' new blocks for owner ' . $ownerUserId . ', follows left for bsky-block-follow-cleanup.php');
+    } else {
+        foreach (array_keys($newBlocks) as $did) {
+            if (is_array(ap_bsky_graph_sync_get($ownerUserId, 'follow', (string) $did))) {
+                ap_bsky_drop_follow_for_block($ownerUserId, (string) $did);
+            }
+        }
+    }
 
     $listCount = $listBlockCount + $listMuteCount;
     @file_put_contents($cachePath, json_encode([

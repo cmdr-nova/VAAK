@@ -363,6 +363,14 @@ fn status_hidden_at(status: &Value, hidden: &HiddenSets, depth: usize, profile_r
             if hidden.actor_hidden(did, profile_root && depth == 0) { return true; }
         }
     }
+    // A boost or quote whose card has no Bluesky account (thin fallback,
+    // Bridgy convert URL, older cached envelope) still names its author in
+    // the post URL: bsky.app/profile/<who>/post/... or an embedded at://did.
+    for field in ["uri", "url"] {
+        if let Some(author) = status.get(field).and_then(Value::as_str).and_then(bsky_post_ref_author) {
+            if hidden.actor_hidden(&author, profile_root && depth == 0) { return true; }
+        }
+    }
     if let Some(account) = status.get("account") {
         if ["uri", "url", "id"].iter().any(|field| account.get(field).and_then(Value::as_str).is_some_and(|actor| hidden.actor_hidden(actor, profile_root && depth == 0))) {
             return true;
@@ -386,6 +394,20 @@ fn status_hidden_at(status: &Value, hidden: &HiddenSets, depth: usize, profile_r
         }
     }
     false
+}
+
+/// The Bluesky author named by a post reference: the DID of an `at://did:...`
+/// record (also inside Bridgy `bsky.brid.gy/convert/ap/at://...` URLs), or
+/// `https://bsky.app/profile/<who>` for a bsky.app post permalink.
+fn bsky_post_ref_author(reference: &str) -> Option<String> {
+    let reference = reference.trim();
+    if let Some(at) = reference.find("at://did:") {
+        let did = reference[at + 5..].split(['/', '#', '?']).next().unwrap_or("");
+        return (did.len() > 4 && !did.contains('@')).then(|| did.to_owned());
+    }
+    let rest = reference.get(..25).filter(|p| p.eq_ignore_ascii_case("https://bsky.app/profile/")).map(|_| &reference[25..])?;
+    let (who, tail) = rest.split_once('/')?;
+    (!who.is_empty() && tail.starts_with("post/")).then(|| format!("https://bsky.app/profile/{who}"))
 }
 
 fn normalize_muted_text(text: &str) -> String {
@@ -690,6 +712,11 @@ pub async fn load_timeline_hidden_sets(db: &Client, owner_user_id: i64) -> Resul
     if owner_user_id < 1 {
         return Ok(sets);
     }
+    // VAAK rows keep whichever form was blocked (handle URL from a profile,
+    // DID from a card), and Bluesky pulls (blocks, mutes, block/mute lists)
+    // store DIDs only. Boosts and thin cards often carry only the handle,
+    // so resolve the missing half. Cached per owner; capped for huge lists.
+    let (mut dids, handles) = bsky_moderation_refs(&sets);
     match db.query(BSKY_HIDE_REASONS_SQL, &[&owner_user_id]).await {
         Ok(rows) => {
             let pairs: Vec<(String, String)> = rows
@@ -700,11 +727,34 @@ pub async fn load_timeline_hidden_sets(db: &Client, owner_user_id: i64) -> Resul
                     (did.unwrap_or_default(), reason.unwrap_or_default())
                 })
                 .collect();
+            dids.extend(bsky_hide_expand_dids(&pairs));
             apply_bsky_hide_rows(&mut sets, &pairs);
         }
         Err(error) => tracing::warn!(%error, "timeline bsky hide set skipped"),
     }
+    match timeline_identity_pairs(db, owner_user_id, dids, handles).await {
+        Ok(pairs) => apply_bsky_identity_pairs(&mut sets, &pairs),
+        Err(error) => tracing::warn!(%error, "timeline bsky identity lookup skipped"),
+    }
     Ok(sets)
+}
+
+/// Most hide DIDs a Home render resolves to handles (direct blocks and
+/// mutes first, then list members).
+const TIMELINE_EXPAND_MAX: usize = 5000;
+
+fn bsky_hide_expand_dids(rows: &[(String, String)]) -> Vec<String> {
+    let mut direct = Vec::new();
+    let mut lists = Vec::new();
+    for (did, reason) in rows {
+        let did = did.trim();
+        if !did.starts_with("did:") { continue; }
+        if matches!(reason.trim(), "block" | "mute") { direct.push(did.to_owned()); } else { lists.push(did.to_owned()); }
+    }
+    direct.extend(lists);
+    direct.dedup();
+    direct.truncate(TIMELINE_EXPAND_MAX);
+    direct
 }
 
 pub const BSKY_HIDE_REASONS_SQL: &str =
@@ -744,17 +794,23 @@ fn bsky_moderation_refs(sets: &HiddenSets) -> (Vec<String>, Vec<String>) {
 
 /// Add both halves of each known (DID, handle) pair to every set naming either half.
 fn apply_bsky_identity_pairs(sets: &mut HiddenSets, pairs: &[(String, String)]) {
+    if pairs.is_empty() { return; }
+    // Lowercased copies, built once: a per-pair scan of each set was
+    // pairs x members string compares on every Home render.
+    let lower = |set: &HashSet<String>| set.iter().map(|a| a.to_ascii_lowercase()).collect::<HashSet<String>>();
+    let lowered = [lower(&sets.muted_actors), lower(&sets.user_blocked_actors), lower(&sets.instance_blocked_actors), lower(&sets.instance_muted_actors)];
     for (did, handle) in pairs {
         let handle = handle.to_ascii_lowercase();
         let handle_url = format!("https://bsky.app/profile/{handle}");
         let mut forms: Vec<String> = actor_aliases(did);
         forms.extend(actor_aliases(&handle_url));
-        let names = |set: &HashSet<String>| forms.iter().any(|form| set.contains(form) || set.contains(&form.to_ascii_lowercase()))
-            || set.iter().any(|alias| alias.eq_ignore_ascii_case(&handle) || alias.eq_ignore_ascii_case(&handle_url));
-        for set in [&mut sets.muted_actors, &mut sets.user_blocked_actors, &mut sets.instance_blocked_actors] {
-            if names(set) { insert_actor_aliases(set, did); insert_actor_aliases(set, &handle_url); }
+        let names = |lc: &HashSet<String>| lc.contains(&handle)
+            || forms.iter().any(|form| lc.contains(&form.to_ascii_lowercase()));
+        let hits: Vec<bool> = lowered.iter().map(names).collect();
+        for (index, set) in [&mut sets.muted_actors, &mut sets.user_blocked_actors, &mut sets.instance_blocked_actors].into_iter().enumerate() {
+            if hits[index] { insert_actor_aliases(set, did); insert_actor_aliases(set, &handle_url); }
         }
-        if names(&sets.instance_muted_actors) {
+        if hits[3] {
             for alias in forms.iter() { sets.instance_muted_actors.insert(alias.to_ascii_lowercase()); }
         }
     }
@@ -767,51 +823,91 @@ fn apply_bsky_identity_pairs(sets: &mut HiddenSets, pairs: &[(String, String)]) 
 /// Best effort: a failed lookup keeps the syntactic aliases.
 pub async fn expand_bsky_identities(db: &Client, sets: &mut HiddenSets) {
     let (dids, handles) = bsky_moderation_refs(sets);
-    if dids.is_empty() && handles.is_empty() { return; }
-    let lookup = async {
-        let mut pairs = Vec::new();
-        let handle_urls: Vec<String> = handles.iter().map(|h| format!("https://bsky.app/profile/{h}")).collect();
-        let (post_rows, profile_rows) = tokio::try_join!(
-            async {
-                db.query(
-                    "SELECT d, (SELECT lower(author_handle) FROM bsky_posts WHERE author_did = d AND author_handle IS NOT NULL AND author_handle <> '' LIMIT 1)
-                     FROM unnest($1::text[]) AS d
-                     UNION ALL
-                     SELECT (SELECT author_did FROM bsky_posts WHERE lower(author_handle) = h AND author_did LIKE 'did:%' LIMIT 1), h
-                     FROM unnest($2::text[]) AS h",
-                    &[&dids, &handles],
-                ).await.context("bsky moderation identities")
-            },
-            async {
-                db.query(
-                    "SELECT did, profile_json FROM bsky_actor_profiles
-                     WHERE did = ANY($1) OR lower(actor_ref) = ANY($2) OR lower(actor_ref) = ANY($3)",
-                    &[&dids, &handles, &handle_urls],
-                ).await.context("bsky moderation profiles")
-            },
-        )?;
-        for row in post_rows {
-            let did: Option<String> = row.get(0);
-            let handle: Option<String> = row.get(1);
-            if let (Some(did), Some(handle)) = (did, handle) {
-                if did.starts_with("did:") && !handle.is_empty() { pairs.push((did, handle)); }
-            }
-        }
-        for row in profile_rows {
-            let profile: Value = serde_json::from_str(&row.get::<_, String>(1)).unwrap_or(Value::Null);
-            let did = row.get::<_, Option<String>>(0).filter(|d| d.starts_with("did:"))
-                .or_else(|| profile.get("did").and_then(Value::as_str).map(str::to_owned));
-            let handle = profile.get("handle").and_then(Value::as_str).map(str::to_ascii_lowercase);
-            if let (Some(did), Some(handle)) = (did, handle) {
-                if did.starts_with("did:") && !handle.is_empty() { pairs.push((did, handle)); }
-            }
-        }
-        anyhow::Ok(pairs)
-    };
-    match lookup.await {
+    match lookup_bsky_identity_pairs(db, &dids, &handles).await {
         Ok(pairs) => apply_bsky_identity_pairs(sets, &pairs),
         Err(error) => tracing::warn!(%error, "bsky moderation identity lookup failed"),
     }
+}
+
+/// Known (DID, lowercased handle) pairs for the given DIDs and handles, from
+/// `bsky_posts` and `bsky_actor_profiles`.
+async fn lookup_bsky_identity_pairs(db: &Client, dids: &[String], handles: &[String]) -> Result<Vec<(String, String)>> {
+    if dids.is_empty() && handles.is_empty() { return Ok(Vec::new()); }
+    let mut pairs = Vec::new();
+    let handle_urls: Vec<String> = handles.iter().map(|h| format!("https://bsky.app/profile/{h}")).collect();
+    let (post_rows, profile_rows) = tokio::try_join!(
+        async {
+            db.query(
+                "SELECT d, (SELECT lower(author_handle) FROM bsky_posts WHERE author_did = d AND author_handle IS NOT NULL AND author_handle <> '' LIMIT 1)
+                 FROM unnest($1::text[]) AS d
+                 UNION ALL
+                 SELECT (SELECT author_did FROM bsky_posts WHERE lower(author_handle) = h AND author_did LIKE 'did:%' LIMIT 1), h
+                 FROM unnest($2::text[]) AS h",
+                &[&dids, &handles],
+            ).await.context("bsky moderation identities")
+        },
+        async {
+            db.query(
+                "SELECT did, profile_json FROM bsky_actor_profiles
+                 WHERE did = ANY($1) OR lower(actor_ref) = ANY($2) OR lower(actor_ref) = ANY($3)",
+                &[&dids, &handles, &handle_urls],
+            ).await.context("bsky moderation profiles")
+        },
+    )?;
+    for row in post_rows {
+        let did: Option<String> = row.get(0);
+        let handle: Option<String> = row.get(1);
+        if let (Some(did), Some(handle)) = (did, handle) {
+            if did.starts_with("did:") && !handle.is_empty() { pairs.push((did, handle)); }
+        }
+    }
+    for row in profile_rows {
+        let profile: Value = serde_json::from_str(&row.get::<_, String>(1)).unwrap_or(Value::Null);
+        let did = row.get::<_, Option<String>>(0).filter(|d| d.starts_with("did:"))
+            .or_else(|| profile.get("did").and_then(Value::as_str).map(str::to_owned));
+        let handle = profile.get("handle").and_then(Value::as_str).map(str::to_ascii_lowercase);
+        if let (Some(did), Some(handle)) = (did, handle) {
+            if did.starts_with("did:") && !handle.is_empty() { pairs.push((did, handle)); }
+        }
+    }
+    Ok(pairs)
+}
+
+/// How long Home reuses an owner's DID/handle pairs. A new block is still
+/// applied at once in its own stored form; only the other half waits.
+const TIMELINE_IDENTITY_TTL: Duration = Duration::from_secs(60);
+
+struct IdentityPairsEntry {
+    at: Instant,
+    key: u64,
+    pairs: Vec<(String, String)>,
+}
+
+fn timeline_identity_cache() -> &'static Mutex<HashMap<i64, IdentityPairsEntry>> {
+    static CACHE: OnceLock<Mutex<HashMap<i64, IdentityPairsEntry>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Pairs for the timeline refs, cached per owner while the refs are unchanged.
+async fn timeline_identity_pairs(db: &Client, owner: i64, mut dids: Vec<String>, mut handles: Vec<String>) -> Result<Vec<(String, String)>> {
+    use std::hash::{Hash, Hasher};
+    dids.sort(); dids.dedup(); handles.sort(); handles.dedup();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    (&dids, &handles).hash(&mut hasher);
+    let key = hasher.finish();
+    {
+        let guard = timeline_identity_cache().lock().unwrap_or_else(|err| err.into_inner());
+        if let Some(hit) = guard.get(&owner) {
+            if hit.key == key && hit.at.elapsed() < TIMELINE_IDENTITY_TTL {
+                return Ok(hit.pairs.clone());
+            }
+        }
+    }
+    let pairs = lookup_bsky_identity_pairs(db, &dids, &handles).await?;
+    let mut guard = timeline_identity_cache().lock().unwrap_or_else(|err| err.into_inner());
+    if guard.len() > 64 { guard.clear(); }
+    guard.insert(owner, IdentityPairsEntry { at: Instant::now(), key, pairs: pairs.clone() });
+    Ok(pairs)
 }
 
 /// Library reads are authenticated and additionally obey the owner's durable
@@ -1521,6 +1617,41 @@ mod tests {
         assert!(!sets.is_hidden("did:plc:other"));
         let notification = serde_json::json!({"type":"favourite","account":{"uri":format!("https://bsky.app/profile/{handle}"),"url":format!("https://bsky.app/profile/{handle}")}});
         assert!(status_hidden(&notification, &sets));
+    }
+
+    #[test]
+    fn blocked_bsky_author_hidden_in_thin_boosts_and_quotes() {
+        let did = "did:plc:blockedalice";
+        let mut sets = HiddenSets::default();
+        apply_bsky_hide_rows(&mut sets, &[(did.into(), "listblock".into())]);
+        // Bridgy convert URL and at:// object ids name the DID directly.
+        let bridgy = serde_json::json!({"account":{"uri":"https://mastodon.example/users/friend"},
+            "reblog":{"uri":format!("https://bsky.brid.gy/convert/ap/at://{did}/app.bsky.feed.post/3abc"),"account":{"uri":"https://mastodon.example/users/unknown"}}});
+        assert!(status_hidden(&bridgy, &sets));
+        // A bsky.app permalink carries the handle; Home learns the pair.
+        let thin = serde_json::json!({"account":{"uri":"https://mkultra.monster/users/juno_flux"},
+            "reblog":{"url":"https://bsky.app/profile/alice.example.com/post/3xyz","account":{"uri":"https://mkultra.monster/"}}});
+        assert!(!status_hidden(&thin, &sets));
+        apply_bsky_identity_pairs(&mut sets, &[(did.into(), "Alice.Example.com".into())]);
+        assert!(status_hidden(&thin, &sets));
+        let quote = serde_json::json!({"account":{"uri":"https://bsky.app/profile/friend.example"},
+            "quote":{"quoted_status":{"url":"https://bsky.app/profile/alice.example.com/post/3q","account":{}}}});
+        assert!(status_hidden(&quote, &sets));
+        // A plain profile link is not a post reference, and others stay visible.
+        assert_eq!(bsky_post_ref_author("https://bsky.app/profile/alice.example.com"), None);
+        let other = serde_json::json!({"account":{"uri":"https://bsky.app/profile/friend.example"},"url":"https://bsky.app/profile/friend.example/post/1"});
+        assert!(!status_hidden(&other, &sets));
+    }
+
+    #[test]
+    fn bsky_hide_expand_dids_put_direct_rows_first() {
+        let rows = vec![
+            ("did:plc:c".to_string(), "listblock".to_string()),
+            ("did:plc:a".to_string(), "block".to_string()),
+            ("did:plc:b".to_string(), "mute".to_string()),
+            ("bad".to_string(), "block".to_string()),
+        ];
+        assert_eq!(bsky_hide_expand_dids(&rows), vec!["did:plc:a".to_string(), "did:plc:b".to_string(), "did:plc:c".to_string()]);
     }
 
     #[test]

@@ -19,6 +19,12 @@ function ap_visibility_actor_hidden(string $actor, int $ownerUserId): bool
     if ($ownerUserId < 1) {
         return false;
     }
+    // Bluesky hide rows (blocks, mutes, block/mute lists) are DIDs, while
+    // cards usually name the author by handle URL. Check the DID behind it.
+    $bskyDid = function_exists('ap_visibility_bsky_profile_did') ? ap_visibility_bsky_profile_did($actor) : null;
+    if ($bskyDid !== null && ap_visibility_actor_hidden($bskyDid, $ownerUserId)) {
+        return true;
+    }
     if (str_starts_with(strtolower($actor), 'did:')) {
         if (function_exists('ap_bsky_hide_did_set')) {
             $set = ap_bsky_hide_did_set($ownerUserId);
@@ -47,6 +53,43 @@ function ap_visibility_actor_hidden(string $actor, int $ownerUserId): bool
         return false; // deprioritization is ranking, not visibility.
     }
     return function_exists('ap_row_is_hidden') && ap_row_is_hidden($actor, $host, $ownerUserId);
+}
+
+/**
+ * DID behind a https://bsky.app/profile/<did|handle> actor (handles via the
+ * memoized local cache), or null.
+ */
+function ap_visibility_bsky_profile_did(string $actor): ?string
+{
+    if (!preg_match('~^https://bsky\.app/profile/([^/?#]+)$~i', $actor, $m)) {
+        return null;
+    }
+    $part = rawurldecode($m[1]);
+    if (str_starts_with($part, 'did:')) {
+        return $part;
+    }
+    $handle = strtolower(ltrim($part, '@'));
+    if ($handle === '' || !function_exists('ap_notifications_bsky_handle_did_map')) {
+        return null;
+    }
+    $did = ap_notifications_bsky_handle_did_map([$handle])[$handle] ?? null;
+    return is_string($did) && str_starts_with($did, 'did:') ? $did : null;
+}
+
+/**
+ * Bluesky author named by a post reference: at://did/... (also inside Bridgy
+ * convert URLs) or https://bsky.app/profile/<who>/post/..., or null.
+ */
+function ap_visibility_bsky_post_author(string $ref): ?string
+{
+    $ref = trim($ref);
+    if (preg_match('~at://(did:[^/#?@]+)~', $ref, $m)) {
+        return $m[1];
+    }
+    if (preg_match('~^https://bsky\.app/profile/([^/?#]+)/post/~i', $ref, $m)) {
+        return 'https://bsky.app/profile/' . $m[1];
+    }
+    return null;
 }
 
 /** Stable key for the same post represented by ActivityPub, Bluesky, or a wrapper. */
@@ -114,6 +157,13 @@ function ap_visibility_status_hidden(array $status, int $ownerUserId, int $depth
     foreach (['uri', 'url', 'id'] as $field) {
         $actor = trim((string) ($status['account'][$field] ?? ''));
         if ($actor !== '' && ap_visibility_actor_hidden($actor, $ownerUserId)) {
+            return true;
+        }
+    }
+    // Thin boost/quote cards may only name their author in the post URL.
+    foreach (function_exists('ap_visibility_bsky_post_author') ? ['uri', 'url'] : [] as $field) {
+        $author = ap_visibility_bsky_post_author((string) ($status[$field] ?? ''));
+        if ($author !== null && ap_visibility_actor_hidden($author, $ownerUserId)) {
             return true;
         }
     }
