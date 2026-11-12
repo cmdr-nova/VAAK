@@ -323,7 +323,7 @@ async fn predict_interaction(db: &Client, it: &Interaction, path: &str) -> anyho
 }
 
 /// `ap_local_object_is_private`.
-async fn object_is_private(db: &Client, object: &str) -> anyhow::Result<bool> {
+pub(crate) async fn object_is_private(db: &Client, object: &str) -> anyhow::Result<bool> {
     let id = object.trim().trim_end_matches('/');
     let slash = format!("{id}/");
     let dm = db
@@ -360,7 +360,7 @@ fn normalize_visibility(v: &str) -> &'static str {
 /// `ap_inbox_recipient_owner` as the drain runs it: the personal inbox's
 /// user, else cmdr_nova, then local actors the activity addresses; the first
 /// active account wins, else cmdr_nova's user id.
-async fn recipient_owner(db: &Client, it: &Interaction, path: &str) -> anyhow::Result<(i64, String)> {
+pub(crate) async fn recipient_owner(db: &Client, it: &Interaction, path: &str) -> anyhow::Result<(i64, String)> {
     const CMDR: &str = "https://mkultra.monster/users/cmdr_nova";
     let mut candidates: Vec<String> = Vec::new();
     match crate::inbox_accept::personal_inbox_user(path) {

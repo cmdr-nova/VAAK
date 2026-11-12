@@ -104,6 +104,7 @@ impl Accepted {
             Accepted::Routed(_, "local_undo_like") => "routed_local_undo_like",
             Accepted::Routed(_, "local_undo_reblog") => "routed_local_undo_reblog",
             Accepted::Routed(_, "local_undo_quote") => "routed_local_undo_quote",
+            Accepted::Routed(_, "local_observe") => "routed_local_observe",
             Accepted::Routed(_, _) => "routed_delete_noop",
         }
     }
@@ -118,7 +119,7 @@ impl Accepted {
 }
 
 /// One reconnecting connection per Redis URL, shared by every request.
-async fn redis_conn(url: &str) -> Result<redis::aio::ConnectionManager> {
+pub(crate) async fn redis_conn(url: &str) -> Result<redis::aio::ConnectionManager> {
     static CONNS: LazyLock<tokio::sync::Mutex<HashMap<String, redis::aio::ConnectionManager>>> = LazyLock::new(Default::default);
     let mut conns = CONNS.lock().await;
     if let Some(conn) = conns.get(url) {
@@ -340,6 +341,22 @@ async fn fast_path(cfg: &crate::config::Config, uri: &Uri, headers: &HeaderMap, 
                 crate::inbox_route_delete::route(&mut db, &mut redis, &cfg.notif_cache_dir, &blocked, &ip, &key_id, uri.path(), &sig_path, &kind, body)
                     .await,
             ),
+            "Like" | "EmojiReact" if crate::inbox_route_like::enabled() => Some(
+                crate::inbox_route_like::route(
+                    &mut db,
+                    &mut redis,
+                    &cfg.redis_queue_url,
+                    &cfg.notif_cache_dir,
+                    &blocked,
+                    &ip,
+                    &key_id,
+                    uri.path(),
+                    &sig_path,
+                    &kind,
+                    body,
+                )
+                .await,
+            ),
             "Undo" if crate::inbox_route_undo::enabled() => Some(
                 crate::inbox_route_undo::route(&mut db, &mut redis, &cfg.notif_cache_dir, &blocked, &ip, &key_id, uri.path(), &sig_path, &kind, body)
                     .await,
@@ -351,7 +368,7 @@ async fn fast_path(cfg: &crate::config::Config, uri: &Uri, headers: &HeaderMap, 
                 idle_return(db);
                 return Ok(Accepted::Routed(spool_id, result));
             }
-            Some(Routed::Defer(why)) if why != "not_delete" && why != "not_undo" => {
+            Some(Routed::Defer(why)) if why != "not_delete" && why != "not_undo" && why != "not_like" => {
                 stat(cfg, &format!("route_defer_{why}")).await;
             }
             _ => {}

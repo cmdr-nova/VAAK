@@ -12,6 +12,10 @@
 //!   `vaak:shadow:notifications:v1:unread:{owner}:*` and the
 //!   `notif_unread_{owner}_*.json` files in the notification cache directory.
 //!
+//! - `ap_notification_projection_invalidate_owner` (a new mention row): the
+//!   same for one owner, `vaak:notifications:epoch:v1:{owner}` and
+//!   `vaak:notifications:v1..v4:{owner}:*`.
+//!
 //! All of it is best effort, like PHP: a failure is logged, never returned.
 
 use std::path::Path;
@@ -47,6 +51,24 @@ pub(crate) async fn delete_pattern(redis: &mut ConnectionManager, pattern: &str)
             return;
         }
         cursor = next;
+    }
+}
+
+/// `ap_notification_list_epoch_bump($owner)`, before that owner's projection
+/// rows go.
+pub(crate) async fn bump_owner_epoch(redis: &mut ConnectionManager, owner: i64) {
+    let key = format!("vaak:notifications:epoch:v1:{owner}");
+    let r: redis::RedisResult<()> = redis::pipe().incr(&key, 1).ignore().expire(&key, 86_400 * 30).ignore().query_async(redis).await;
+    if let Err(e) = r {
+        tracing::warn!(error = %e, "notification owner epoch bump failed");
+    }
+}
+
+/// The Redis side of `ap_notification_projection_invalidate_owner`, after the
+/// owner's projection rows are gone.
+pub(crate) async fn drop_owner_list_caches(redis: &mut ConnectionManager, owner: i64) {
+    for v in 1..=4 {
+        delete_pattern(redis, &format!("vaak:notifications:v{v}:{owner}:*")).await;
     }
 }
 

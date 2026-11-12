@@ -108,6 +108,7 @@ mod fanout_delivery;
 mod inbox_key_fetch;
 mod inbox_origin;
 mod inbox_route_delete;
+mod inbox_route_like;
 mod inbox_route_shadow;
 mod inbox_route_undo;
 mod inbox_sig_shadow;
