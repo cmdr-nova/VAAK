@@ -12,6 +12,17 @@ anything else bumps the patch number.
 Releases up to **0.9.83** used a two-digit deploy counter (0.9.05, 0.9.83)
 and have no notes here; their tags and GitHub Releases are unchanged.
 
+## [0.74.0](https://github.com/cmdr-nova/VAAK/releases/tag/v0.74.0) - 2026-11-12
+
+### ✨ Features
+* Open posts on click even when the card has no timestamp link by @cmdr-nova in https://github.com/cmdr-nova/VAAK/pull/435
+* Hide "📷 Image" placeholder on image-only quotes by @cmdr-nova in https://github.com/cmdr-nova/VAAK/pull/437
+* Inbox F5: Rust records likes of local posts by @cmdr-nova in https://github.com/cmdr-nova/VAAK/pull/438
+### 🧹 Maintenance
+* Bump uuid from 1.29.0 to 1.29.1 in /rust in the cargo-minor-patch group by @dependabot[bot] in https://github.com/cmdr-nova/VAAK/pull/436
+
+**Full Changelog**: https://github.com/cmdr-nova/VAAK/compare/v0.73.0...v0.74.0
+
 ## [0.73.0](https://github.com/cmdr-nova/VAAK/releases/tag/v0.73.0) - 2026-11-11
 
 ### ✨ Features
