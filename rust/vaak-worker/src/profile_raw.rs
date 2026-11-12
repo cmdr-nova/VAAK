@@ -56,7 +56,7 @@ pub(crate) fn render_quote(q:&RawQuoteFacts,f:&CardFacts)->Result<String>{render
 /// block linkifies through admin_linkify_body_html, which discovers @names
 /// the quote's own mentions list does not carry).
 pub(crate) fn render_quote_with(q:&RawQuoteFacts,f:&CardFacts,found:Option<&body::DiscoveredBody>)->Result<String>{
- let text=card::php_trim(&q.text);let url=card::php_trim(&q.url);let acct=card::php_trim(&q.acct);let view=&f.return_view;
+ let text=if card::quote_placeholder_hidden(&q.text,!q.media.is_empty()){""}else{card::php_trim(&q.text)};let url=card::php_trim(&q.url);let acct=card::php_trim(&q.acct);let view=&f.return_view;
  let mapped=if url.starts_with("at://"){bsky_open(url)}else{url.to_owned()};
  let href=if !q.is_rss&&!url.is_empty()&&url!="https://bsky.app/"{status_href(&mapped,view)}else{String::new()};
  let open=!href.is_empty()&&href!="#";

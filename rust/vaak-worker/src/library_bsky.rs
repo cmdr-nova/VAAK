@@ -175,6 +175,8 @@ fn legacy_quote(post:&Value,facts:&CardFacts)->Result<Option<String>>{
     }
     if text.is_empty()&&!media.is_empty(){text="📷 Image".into()}
     if text.is_empty()&&handle.is_empty()&&media.is_empty(){return Ok(None)}
+    // The placeholder only stands in for a missing body; with media painting it is stray text.
+    if super::card::quote_placeholder_hidden(&text,!media.is_empty()){text.clear();}
     let uri=s(record,"uri");let url=if uri.is_empty(){"https://bsky.app/".into()}else if handle.is_empty(){https_uri(uri)?}else{format!("https://bsky.app/profile/{handle}/post/{}",uri.rsplit('/').next().unwrap_or(""))};
     let href=format!("?view=status&object={}&from=bluesky",query(&url));let open=url!="https://bsky.app/";
     let mut html=format!("<div class=\"quote-block{}\"{}><span class=\"qt-label\">Quoted</span>",if open{" quote-block--openable"}else{""},if open{format!(" data-href=\"{}\" role=\"link\" tabindex=\"0\" aria-label=\"Open quoted post\"",esc(&href))}else{String::new()});

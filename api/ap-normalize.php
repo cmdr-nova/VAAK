@@ -488,6 +488,10 @@ function ap_normalize_from_bsky_post(array $postOrItem): ?array
                 // Thin preview without full PostView — synthesize a minimal status.
                 $qHandle = trim((string) ($qPrev['handle'] ?? ''));
                 $qText = trim((string) ($qPrev['text'] ?? ''));
+                // "📷 Image" / "🎬 Video" only stand in for a missing body; the
+                // attachments below already show the media, so don't publish
+                // the label as the quoted post's text (VAAK + Mastodon clients).
+                $qBody = ($prevMedia !== [] && in_array($qText, ['📷 Image', '🎬 Video'], true)) ? '' : $qText;
                 $qUrl = trim((string) ($qPrev['url'] ?? ''));
                 $qAvatar = trim((string) ($qPrev['avatar'] ?? ''));
                 if (!str_starts_with($qAvatar, 'https://')) {
@@ -498,8 +502,8 @@ function ap_normalize_from_bsky_post(array $postOrItem): ?array
                     'id' => $synthId,
                     'uri' => $qUrl,
                     'url' => $qUrl,
-                    'content' => $qText !== ''
-                        ? ('<p>' . nl2br(htmlspecialchars($qText, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'), false) . '</p>')
+                    'content' => $qBody !== ''
+                        ? ('<p>' . nl2br(htmlspecialchars($qBody, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'), false) . '</p>')
                         : '',
                     'created_at' => trim((string) ($qPrev['created_at'] ?? '')) !== ''
                         ? (string) $qPrev['created_at']

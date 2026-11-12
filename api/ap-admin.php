@@ -16634,6 +16634,18 @@ function admin_quote_status_from_bsky_preview(array $prev, string $fallbackUrl =
  * @param array<string,mixed> $st
  * @param array<string,mixed> $opts
  */
+/**
+ * Bluesky quote previews use "📷 Image" / "🎬 Video" as a stand-in body when
+ * the quoted post has no text. Once the media itself paints, that label is
+ * just stray text above the picture, so painters drop it.
+ *
+ * @param array<int|string,mixed> $media
+ */
+function admin_quote_placeholder_hidden(string $text, array $media): bool
+{
+    return $media !== [] && in_array(trim($text), ['📷 Image', '🎬 Video'], true);
+}
+
 function admin_feed_quote_embed_html(array $st, string $returnView, array $opts): string
 {
     if (function_exists('ap_masto_quoted_display_status')) {
@@ -16702,6 +16714,9 @@ function admin_feed_quote_embed_html(array $st, string $returnView, array $opts)
     $text = trim((string) ($opts['text'] ?? ''));
     $mentions = is_array($opts['mentions'] ?? null) ? $opts['mentions'] : [];
     $body = '';
+    if (admin_quote_placeholder_hidden($text, is_array($opts['media'] ?? null) ? $opts['media'] : [])) {
+        $text = '';
+    }
     if ($text !== '') {
         $body .= '<div class="body feed-body" style="white-space:pre-wrap">'
             . admin_linkify_body_html($text, $from, $mentions, $actor !== '' ? $actor : null) . '</div>';
@@ -16806,6 +16821,9 @@ function admin_quote_card_html(array $opts, string $returnView = 'home'): string
     $media = is_array($opts['media'] ?? null) ? $opts['media'] : [];
     $card = is_array($opts['card'] ?? null) ? $opts['card'] : null;
     $mentions = is_array($opts['mentions'] ?? null) ? $opts['mentions'] : [];
+    if (admin_quote_placeholder_hidden($text, $media)) {
+        $text = '';
+    }
     $openLabel = trim((string) ($opts['open_label'] ?? 'Open quoted'));
     $openExternal = !empty($opts['open_external']);
     $isRss = !empty($opts['is_rss']);
