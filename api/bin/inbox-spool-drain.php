@@ -156,6 +156,62 @@ function inbox_drain_interaction_shadow_note(PDO $db, int $id, string $rust, str
     }
 }
 
+/**
+ * Cutover F5: a like Rust routed itself leaves the phone push to PHP as a job
+ * on vaak:queue:inbox_webpush (rust/vaak-worker/src/inbox_route_like.rs). Same
+ * call ap_local_observe makes after storing the mention row.
+ */
+function inbox_drain_webpush_job(PDO $db, string $raw): void
+{
+    $job = json_decode($raw, true);
+    if (!is_array($job)) {
+        return;
+    }
+    $type = (string) ($job['type'] ?? '');
+    $actor = (string) ($job['actor'] ?? '');
+    $objectId = (string) ($job['object_id'] ?? '');
+    $owner = (int) ($job['owner_user_id'] ?? 0);
+    if ($type !== 'favourite' || $actor === '' || $objectId === '' || $owner < 1) {
+        return;
+    }
+    try {
+        require_once dirname(__DIR__) . '/ap-webpush.php';
+        if (!function_exists('ap_masto_notification_id_for_mention')) {
+            require_once dirname(__DIR__) . '/ap-r2.php';
+            require_once dirname(__DIR__) . '/ap-masto-entities.php';
+        }
+        $nid = null;
+        $st = $db->prepare('SELECT id, created_at FROM mentions WHERE object_id = ? LIMIT 1');
+        $st->execute([$objectId]);
+        $row = $st->fetch(PDO::FETCH_ASSOC);
+        if (is_array($row) && function_exists('ap_masto_notification_id_for_mention')) {
+            $nid = ap_masto_notification_id_for_mention((int) $row['id'], isset($row['created_at']) ? (string) $row['created_at'] : null);
+        }
+        ap_webpush_notify_event($type, $actor, $nid, null, $owner);
+    } catch (Throwable $e) {
+        error_log('[ap-webpush] rust like hook: ' . $e->getMessage());
+    }
+}
+
+/** Send the queued Web Push jobs (at most $max per call). */
+function inbox_drain_webpush_jobs($queue, PDO $db, int $max = 20): void
+{
+    if (!$queue) {
+        return;
+    }
+    for ($i = 0; $i < $max; $i++) {
+        try {
+            $raw = $queue->rPop('vaak:queue:inbox_webpush');
+        } catch (Throwable $e) {
+            return;
+        }
+        if (!is_string($raw) || $raw === '') {
+            return;
+        }
+        inbox_drain_webpush_job($db, $raw);
+    }
+}
+
 $poolConf = getenv('VAAK_FPM_POOL_CONF') ?: '/etc/php/8.3/fpm/pool.d/www.conf';
 inbox_drain_load_pool_env($poolConf);
 
@@ -212,6 +268,7 @@ while (time() < $deadline) {
                           OR (finished_at < now() - interval '30 days' AND state = 'failed')
                        LIMIT 5000)");
     }
+    inbox_drain_webpush_jobs($queue, $db);
     $claim->execute();
     $row = $claim->fetch(PDO::FETCH_ASSOC);
     if (!is_array($row)) {
@@ -220,7 +277,11 @@ while (time() < $deadline) {
         }
         try {
             if ($queue) {
-                $queue->brPop(['vaak:queue:inbox_spool'], 5);
+                // A push job wakes the loop too; send it right away.
+                $woke = $queue->brPop(['vaak:queue:inbox_spool', 'vaak:queue:inbox_webpush'], 5);
+                if (is_array($woke) && ($woke[0] ?? '') === 'vaak:queue:inbox_webpush' && is_string($woke[1] ?? null)) {
+                    inbox_drain_webpush_job($db, $woke[1]);
+                }
             } else {
                 sleep(2);
             }
