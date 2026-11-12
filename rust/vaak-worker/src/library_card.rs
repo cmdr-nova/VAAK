@@ -320,6 +320,13 @@ pub(crate) fn status_urls_equivalent(a:&str,b:&str)->bool {
 
 /// A resolved quote names its author. Cold, unavailable and preview stubs
 /// carry their own footer label and stay on [`quote_card`].
+/// Bluesky quote previews stand in "📷 Image" / "🎬 Video" for an empty body.
+/// Once the media row paints, the label is stray text, so painters drop it
+/// (same rule as PHP admin_quote_placeholder_hidden).
+pub(crate) fn quote_placeholder_hidden(text: &str, has_media: bool) -> bool {
+    has_media && matches!(php_trim(text), "📷 Image" | "🎬 Video")
+}
+
 pub(crate) fn feed_quote_paintable(status: &Value) -> bool {
     if status.get("vaak_quote_open_label").is_some() { return false; }
     let account = status.get("account").unwrap_or(&Value::Null);
@@ -369,7 +376,8 @@ pub(crate) fn feed_quote_embed(status: &Value, facts: &CardFacts, silent: bool) 
     } else { format!("<span class=\"meta\"> · {}</span>", esc(&rel)) };
     let header = format!("<div class=\"tweet-hd\">{av_block}<div class=\"tweet-hd-main tweet-hd-main--fedi\"><div>{who}{when}</div></div></div>");
     let scrubbed = super::body::scrub_as2(&plain(string(status, "content")));
-    let text = php_trim(&scrubbed);
+    let has_media = status.get("media_attachments").and_then(Value::as_array).is_some_and(|m| !m.is_empty());
+    let text = if quote_placeholder_hidden(&scrubbed, has_media) { "" } else { php_trim(&scrubbed) };
     let mut body = String::new();
     if !text.is_empty() { body.push_str(&format!("<div class=\"body feed-body\" style=\"white-space:pre-wrap\">{}</div>", body_text(&text, view, status.get("mentions").and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[]), &facts.owner_actor)?)); }
     let media = status.get("media_attachments").and_then(Value::as_array).cloned().unwrap_or_default();
@@ -431,6 +439,7 @@ fn quote_card_mode(status: &Value, facts: &CardFacts,silent:bool) -> Result<Stri
     let view = &facts.return_view;
     let media = status.get("media_attachments").and_then(Value::as_array).cloned().unwrap_or_default();
     let text = super::body::scrub_as2(&plain(string(status, "content")));
+    let text = if quote_placeholder_hidden(&text, !media.is_empty()) { String::new() } else { text };
     // Supplied quotes keep the openable in-app chrome. Cold, deleted, and
     // Bluesky previews set an open label or external flag and follow the
     // shared PHP footer (in-app label, then "Open original" when external).
@@ -1093,6 +1102,19 @@ mod tests {
             assert!(vaak_types::check_timeline_status(&st).is_empty());
             let html = render(&st, &facts()).unwrap();
             assert!(html.contains(IMG), "{html}");
+        }
+
+        #[test]
+        fn image_only_quote_drops_placeholder_label() {
+            let mut quoted = status(json!([{"id":"q1","type":"image","url":QIMG,"preview_url":QIMG,"description":""}]));
+            quoted["content"] = json!("<p>📷 Image</p>");
+            for html in [quote_card(&quoted, &facts()).unwrap(), feed_quote_embed(&quoted, &facts(), false).unwrap()] {
+                assert!(html.contains(QIMG), "{html}");
+                assert!(!html.contains("📷 Image"), "media-only quote must not paint the placeholder: {html}");
+            }
+            let mut bare = status(json!([]));
+            bare["content"] = json!("<p>📷 Image</p>");
+            assert!(quote_card(&bare, &facts()).unwrap().contains("📷 Image"), "no media: label still stands in");
         }
 
         #[test]
