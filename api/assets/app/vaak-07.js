@@ -524,6 +524,26 @@
       try { window.vaakRenderInboxTitle(); } catch (e) {}
     }
   }
+  // Placeholder that keeps the in-flow bar's height while the bar floats as a
+  // pinned pill. It is also what tells us when to unpin on the way back up.
+  function newBtnSpacer(want) {
+    let spacer = document.getElementById('feed-new-spacer');
+    if (!want) {
+      if (spacer) spacer.remove();
+      return null;
+    }
+    if (!newBtn || !newBtn.parentElement) return null;
+    if (!spacer) {
+      spacer = document.createElement('div');
+      spacer.id = 'feed-new-spacer';
+      spacer.className = 'feed-new-spacer';
+      spacer.setAttribute('aria-hidden', 'true');
+    }
+    if (spacer.parentElement !== newBtn.parentElement || spacer.nextSibling !== newBtn) {
+      newBtn.parentElement.insertBefore(spacer, newBtn);
+    }
+    return spacer;
+  }
   function updateNewBtn() {
     let liveBtn = document.getElementById('feed-new-btn');
     if ((!liveBtn || !liveBtn.isConnected) && pendingCount > 0) ensureNewPostsBtn();
@@ -534,6 +554,7 @@
       return;
     }
     if (pendingCount <= 0) {
+      newBtnSpacer(false);
       newBtn.hidden = true;
       newBtn.classList.remove('show', 'is-pinned');
       newBtn.style.top = '';
@@ -546,20 +567,40 @@
     newBtn.hidden = false;
     newBtn.classList.add('show');
     newBtn.textContent = pendingCount === 1 ? '1 new post' : (pendingCount + ' new posts');
-    const pin = !nearTop();
+    const feed = document.querySelector('.feed') || root;
+    const bar = document.querySelector('.main > .topbar');
+    const feedBox = feed ? feed.getBoundingClientRect() : { top: 0, left: 0, width: window.innerWidth };
+    const barBottom = bar ? bar.getBoundingClientRect().bottom : feedBox.top;
+    const viewTop = Math.max(barBottom, feedBox.top);
+    // Where the in-flow bar sits. While pinned, the spacer holds its place.
+    const wasPinned = newBtn.classList.contains('is-pinned');
+    const spacer = wasPinned ? newBtnSpacer(true) : null;
+    const flowBox = (spacer && spacer.isConnected ? spacer : newBtn).getBoundingClientRect();
+    // Pin once the in-flow bar is mostly scrolled under the top bar, not only
+    // past a fixed 120px. With a short composer the bar left the screen
+    // around 60px but did not pin until 120px, so it vanished and came back
+    // as the reader scrolled.
+    const flowHidden = flowBox.height > 0 && flowBox.bottom < viewTop + (flowBox.height / 2);
+    const pin = !nearTop() || flowHidden;
+    if (pin && !wasPinned) {
+      // Keep the bar's height in the feed so pinning does not pull the cards
+      // up under the reader (and back down again on the way up).
+      const cs = window.getComputedStyle ? window.getComputedStyle(newBtn) : null;
+      const margin = cs ? (parseFloat(cs.marginBottom) || 0) + (parseFloat(cs.marginTop) || 0) : 0;
+      const h = Math.round(flowBox.height + margin);
+      const holder = newBtnSpacer(true);
+      if (holder) holder.style.height = h > 0 ? (h + 'px') : '0px';
+    }
     newBtn.classList.toggle('is-pinned', pin);
     if (!pin) {
+      newBtnSpacer(false);
       newBtn.style.top = '';
       newBtn.style.left = '';
       newBtn.style.transform = '';
       syncPendingPostTitle();
       return;
     }
-    const feed = document.querySelector('.feed') || root;
-    const bar = document.querySelector('.main > .topbar');
-    const feedBox = feed ? feed.getBoundingClientRect() : { top: 0, left: 0, width: window.innerWidth };
-    const barBottom = bar ? bar.getBoundingClientRect().bottom : feedBox.top;
-    const top = Math.max(barBottom, feedBox.top) + 8;
+    const top = viewTop + 8;
     const center = feedBox.left + (feedBox.width / 2);
     newBtn.style.top = Math.round(top) + 'px';
     newBtn.style.left = Math.round(center) + 'px';

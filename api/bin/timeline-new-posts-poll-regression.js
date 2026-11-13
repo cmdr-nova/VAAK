@@ -532,6 +532,20 @@ function check(ok, label) {
   check(held.items.children.length === 0, 'a returned card is held instead of inserted');
   check(held.newBtn().hidden === false && held.newBtn().textContent === '1 new post' && held.newBtn().classList.contains('show'), 'the bar counts the held card');
   check(held.newBtn().classList.contains('is-pinned'), 'the bar becomes the floating pill while scrolled down');
+  const heldSpacer = () => held.doc.getElementById('feed-new-spacer');
+  check(heldSpacer() && heldSpacer().style.height === '80px', 'pinning leaves a spacer the height of the bar so cards do not jump');
+  // A short composer puts the in-flow bar under the top bar well before
+  // 120px. It used to vanish there and come back pinned at 120px.
+  held.win.scrollY = 80;
+  heldSpacer().getBoundingClientRect = () => ({ top: 820, bottom: 860, left: 0, right: 640, width: 640, height: 40 });
+  held.win.emit('scroll', {});
+  check(held.newBtn().classList.contains('is-pinned') && !held.newBtn().hidden, 'the pill stays pinned while the in-flow spot is scrolled out of view');
+  heldSpacer().getBoundingClientRect = () => ({ top: 900, bottom: 980, left: 0, right: 640, width: 640, height: 80 });
+  held.win.emit('scroll', {});
+  check(!held.newBtn().classList.contains('is-pinned') && !held.newBtn().hidden && !heldSpacer(), 'the bar drops back into the feed once its spot is on screen');
+  held.win.scrollY = 480;
+  held.win.emit('scroll', {});
+  check(held.newBtn().classList.contains('is-pinned') && heldSpacer(), 'scrolling down pins it again');
   check(held.items.dataset.newest === '1100', 'data-sort caps an X-Newest that is ahead of the card');
 
   // The boot timer is armed at t=0 and the first check is at 5s, so the
