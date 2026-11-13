@@ -304,7 +304,8 @@ async fn fast_path(cfg: &crate::config::Config, uri: &Uri, headers: &HeaderMap, 
     // A verified signer who is not the actor is not a rejection yet: PHP
     // takes followed accounts' forwards and recovers the rest from the
     // actor's server, so the drain decides.
-    let mismatch = !actor_matches_key(&key_id, &actor, owner.as_deref()) && !relay_forwardable(relay, &kind);
+    let signer_is_actor = actor_matches_key(&key_id, &actor, owner.as_deref());
+    let mismatch = !signer_is_actor && !relay_forwardable(relay, &kind);
     // ap-user.php answers 404 for a personal inbox with no active local user;
     // leave those (and any odd user path) to PHP.
     if let Some(user) = personal_inbox_user(uri.path()) {
@@ -332,7 +333,7 @@ async fn fast_path(cfg: &crate::config::Config, uri: &Uri, headers: &HeaderMap, 
             return Ok(Accepted::Duplicate);
         }
     }
-    // Cutover F3/F4: Rust routes a Delete or an Undo itself when every guard
+    // Cutover F3/F4/F5: Rust routes a Delete, an Undo, a like or a boost itself when every guard
     // holds; anything else, or any deferral, is spooled for the drain.
     if !mismatch {
         use crate::inbox_route_delete::Routed;
@@ -342,6 +343,23 @@ async fn fast_path(cfg: &crate::config::Config, uri: &Uri, headers: &HeaderMap, 
                     .await,
             ),
             "Like" | "EmojiReact" if crate::inbox_route_like::enabled() => Some(
+                crate::inbox_route_like::route(
+                    &mut db,
+                    &mut redis,
+                    &cfg.redis_queue_url,
+                    &cfg.notif_cache_dir,
+                    &blocked,
+                    &ip,
+                    &key_id,
+                    uri.path(),
+                    &sig_path,
+                    &kind,
+                    body,
+                )
+                .await,
+            ),
+            // Relay and follow forwards of a boost stay PHP's (forward checks).
+            "Announce" if signer_is_actor && crate::inbox_route_like::boost_enabled() => Some(
                 crate::inbox_route_like::route(
                     &mut db,
                     &mut redis,

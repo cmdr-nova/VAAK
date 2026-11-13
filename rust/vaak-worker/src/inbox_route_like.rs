@@ -1,4 +1,4 @@
-//! Rust routes incoming likes of local posts itself (cutover F5).
+//! Rust routes incoming likes (F5) and boosts (F5b) of local posts itself.
 //!
 //! With `VAAK_INBOX_ROUTE_LIKE=1`, a `Like` or `EmojiReact` the front door
 //! would spool (signer is the actor) whose object is a local note is routed
@@ -18,6 +18,21 @@
 //!   `ap_masto_notifications_unread_invalidate`);
 //! - the phone push stays PHP's: a job goes on the queue Redis list
 //!   `vaak:queue:inbox_webpush`, which `inbox-spool-drain.php` sends.
+//!
+//! With `VAAK_INBOX_ROUTE_BOOST=1`, an `Announce` signed by its own actor
+//! (not a relay or follow forward) of a local note goes the same way, plus
+//! what `ap_metrics_record` does for a boost:
+//!
+//! - the events row's target is the note's author;
+//! - only the first `Announce` events row per object is inserted (PHP's
+//!   firehose dedupe); a later one only narrows its visibility label;
+//! - a new row gets `ap_timeline_notify` and the timeline fan-out jobs
+//!   (`home_followers`, and `public_feed` when public) on
+//!   `vaak:queue:timeline_fanout`, which this worker already consumes;
+//! - the push job is a `reblog`.
+//!
+//! Boosts defer as `fanout_off` when this worker's env turns the ingest
+//! fan-out or its Rust queue off (PHP would then do it in-process).
 //!
 //! It defers to PHP (spooled as before) for anything else: an EmojiReact or
 //! Misskey Like carrying `content` (PHP keeps it as the event text), an
@@ -41,10 +56,31 @@ pub(crate) fn enabled() -> bool {
     std::env::var("VAAK_INBOX_ROUTE_LIKE").is_ok_and(|v| v.trim() == "1")
 }
 
-/// The like to route, or the reason it stays PHP's.
+pub(crate) fn boost_enabled() -> bool {
+    std::env::var("VAAK_INBOX_ROUTE_BOOST").is_ok_and(|v| v.trim() == "1")
+}
+
+fn env_on(names: &[&str]) -> bool {
+    for name in names {
+        if let Ok(v) = std::env::var(name) {
+            if !v.trim().is_empty() {
+                return !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off" | "no");
+            }
+        }
+    }
+    true
+}
+
+/// `ap_timeline_fanout_ingest_enabled` && `ap_timeline_fanout_rust_enabled`.
+fn fanout_queue_on() -> bool {
+    env_on(&["VAAK_HOME_FANOUT_INGEST", "VAAK_FEATURE_HOME_FANOUT_INGEST"])
+        && env_on(&["VAAK_TIMELINE_FANOUT_RUST", "VAAK_FEATURE_TIMELINE_FANOUT_RUST"])
+}
+
+/// The like or boost to route, or the reason it stays PHP's.
 pub(crate) fn plan(doc: &Value) -> std::result::Result<Interaction, &'static str> {
     let it = crate::inbox_route_shadow::interaction(doc).ok_or("not_like")?;
-    if it.kind != "like" {
+    if it.kind != "like" && it.kind != "reblog" {
         return Err("not_like");
     }
     if !matches!(doc.get("object"), Some(Value::String(_))) {
@@ -90,10 +126,28 @@ pub(crate) fn visibility(doc: &Value) -> &'static str {
     }
 }
 
+/// `ap_announce_original_actor_from_activity` for a local note URL.
+fn note_author(object: &str) -> String {
+    let o = object.trim_end_matches('/');
+    if o.starts_with(&format!("{LOCAL_ACTOR}/")) {
+        return LOCAL_ACTOR.to_string();
+    }
+    let rest = o.strip_prefix("https://mkultra.monster/users/").unwrap_or("");
+    let key = rest.split('/').next().unwrap_or("");
+    format!("https://mkultra.monster/users/{key}")
+}
+
 /// A notification stored, for the push job and the cache clears.
 struct Stored {
     owner: i64,
     object_id: String,
+}
+
+struct Applied {
+    spool_id: i64,
+    stored: Option<Stored>,
+    /// New events row id (None when PHP's boost dedupe kept the old one).
+    event_id: Option<i64>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -115,6 +169,9 @@ pub(crate) async fn route(
         Ok(it) => it,
         Err(why) => return Routed::Defer(why),
     };
+    if it.kind == "reblog" && !fanout_queue_on() {
+        return Routed::Defer("fanout_off");
+    }
     let actor_host = crate::inbox_accept::host_of(&it.actor).unwrap_or_default();
     if actor_host.is_empty() || crate::inbox_route_delete::is_bridgy_host(&actor_host) {
         return Routed::Defer("actor_host");
@@ -139,28 +196,98 @@ pub(crate) async fn route(
     }
     let activity_id = as_id(&doc);
     match apply(db, redis, &it, &doc, activity_id.as_deref(), vis, ip, key_id, path, sig_path, kind, body).await {
-        Ok((spool_id, stored)) => {
+        Ok(Applied { spool_id, stored, event_id }) => {
             if let Some(s) = &stored {
                 crate::notif_invalidate::drop_owner_list_caches(redis, s.owner).await;
                 crate::notif_invalidate::unread_owners(redis, cache_dir, &[s.owner]).await;
-                push_job(queue_url, &it.actor, s).await;
+                let push = if it.kind == "reblog" { "reblog" } else { "favourite" };
+                push_job(queue_url, push, &it.actor, s).await;
             }
-            crate::inbox_route_delete::notes_after_commit(db, key_id, kind, kind, &it.actor, Some(it.object.as_str())).await;
+            let notify = event_id.map(|_| kind);
+            crate::inbox_route_delete::notes_after_commit(db, key_id, kind, notify, &it.actor, Some(it.object.as_str())).await;
+            if let (Some(eid), true) = (event_id, it.kind == "reblog") {
+                fanout_jobs(db, redis, queue_url, eid, kind, &it.actor, &it.object, vis).await;
+            }
             let who = crate::inbox_route_delete::short(&it.actor);
             let n = stored.as_ref().map_or(0, |s| s.owner);
             crate::inbox_route_delete::log_routed(spool_id, kind, body.len(), key_id, format!("local_observe actor={who} owner={n}"));
             Routed::Done { spool_id, result: "local_observe" }
         }
         Err(e) => {
-            tracing::warn!(error = %e, "inbox Like routing failed; spooling for PHP");
+            tracing::warn!(error = %e, kind, "inbox Like/Announce routing failed; spooling for PHP");
             Routed::Defer("error")
         }
     }
 }
 
-/// `ap_webpush_notify_event('favourite', …)` is PHP's; hand it the job.
-async fn push_job(queue_url: &str, actor: &str, s: &Stored) {
-    let job = serde_json::json!({"type": "favourite", "actor": actor, "object_id": s.object_id, "owner_user_id": s.owner}).to_string();
+/// `ap_timeline_fanout_followers_home` + `ap_timeline_fanout_public_local_feed`
+/// for a new boost row: the queue jobs PHP would push (the Rust queue path).
+#[allow(clippy::too_many_arguments)]
+async fn fanout_jobs(
+    db: &Client,
+    redis: &mut redis::aio::ConnectionManager,
+    queue_url: &str,
+    event_id: i64,
+    kind: &str,
+    actor: &str,
+    object: &str,
+    vis: &str,
+) {
+    let actor = actor.trim().trim_end_matches('/');
+    let oid = object.trim_end_matches('/');
+    let slash_actor = format!("{actor}/");
+    let slash_oid = format!("{oid}/");
+    // Skip the Home fan-out of a boost whose booster also has a Create of it.
+    let self_create = db
+        .query_opt(
+            "SELECT 1 FROM events WHERE actor_id IN ($1, $2) AND (object_id = $3 OR object_id = $4)
+               AND type IN ('Create', 'Quote', 'QuotePost', 'Update') AND action_taken IN ('log', 'local_observe') LIMIT 1",
+            &[&actor, &slash_actor, &oid, &slash_oid],
+        )
+        .await
+        .map(|r| r.is_some())
+        .unwrap_or(false);
+    let ts = crate::inbox_route_delete::now_unix();
+    let id = event_id.to_string();
+    let mut jobs = Vec::new();
+    if !self_create {
+        jobs.push(serde_json::json!({"op": "home_followers", "k": "event", "id": id, "s": "fediverse", "actor": actor, "type": kind, "ts": ts}));
+    }
+    if vis == "public" {
+        jobs.push(serde_json::json!({"op": "public_feed", "k": "event", "id": id, "s": "fediverse", "actor": actor, "type": kind, "visibility": vis, "ts": ts}));
+    }
+    if jobs.is_empty() {
+        return;
+    }
+    let mut c = match crate::inbox_accept::redis_conn(queue_url).await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(error = %e, "boost fan-out jobs not queued");
+            return;
+        }
+    };
+    let key = format!("vaak:queue:{}", crate::timeline_fanout::QUEUE_NAME);
+    for job in &jobs {
+        let r: redis::RedisResult<()> =
+            redis::pipe().lpush(&key, job.to_string()).ignore().expire(&key, 86_400).ignore().query_async(&mut c).await;
+        if let Err(e) = r {
+            tracing::warn!(error = %e, "boost fan-out job not queued");
+            return;
+        }
+        // ap_redis_metric_inc('queue_push') on the cache Redis.
+        let _: redis::RedisResult<()> = redis::pipe()
+            .incr("vaak:metric:queue_push", 1)
+            .ignore()
+            .expire("vaak:metric:queue_push", 604_800)
+            .ignore()
+            .query_async(redis)
+            .await;
+    }
+}
+
+/// `ap_webpush_notify_event('favourite'|'reblog', …)` is PHP's; hand it the job.
+async fn push_job(queue_url: &str, push: &str, actor: &str, s: &Stored) {
+    let job = serde_json::json!({"type": push, "actor": actor, "object_id": s.object_id, "owner_user_id": s.owner}).to_string();
     let mut c = match crate::inbox_accept::redis_conn(queue_url).await {
         Ok(c) => c,
         Err(e) => {
@@ -189,7 +316,7 @@ async fn apply(
     sig_path: &str,
     kind: &str,
     body: &[u8],
-) -> Result<(i64, Option<Stored>)> {
+) -> Result<Applied> {
     let text = std::str::from_utf8(body)?;
     let (owner, owner_actor) = crate::inbox_route_shadow::recipient_owner(db, it, path).await?;
     let actor = it.actor.trim_end_matches('/');
@@ -243,15 +370,46 @@ async fn apply(
     }
     let host = crate::inbox_accept::host_of(&it.actor);
     let bytes = body.len() as i64;
-    tx.execute(
-        "INSERT INTO events (created_at, type, actor_id, object_id, target_actor, host, bytes, action_taken, summary, media_urls, in_reply_to, spoiler_text, sensitive, visibility)
-         VALUES ($1, $2, $3, $4, $5, $6, $7::bigint, 'local_observe', NULL, NULL, NULL, '', 0, $8)",
-        &[&now, &kind, &it.actor, &it.object, &LOCAL_ACTOR, &host, &bytes, &vis],
-    )
-    .await?;
+    let target = if it.kind == "reblog" { note_author(&it.object) } else { LOCAL_ACTOR.to_string() };
+    // ap_metrics_record's firehose dedupe: one Announce row per object.
+    let existing = if it.kind == "reblog" {
+        tx.query_opt("SELECT id, visibility FROM events WHERE type = $1 AND object_id = $2 LIMIT 1", &[&kind, &it.object]).await?
+    } else {
+        None
+    };
+    let event_id = match existing {
+        Some(row) => {
+            let id: i64 = row.get(0);
+            let old: Option<String> = row.get(1);
+            if vis != "public" && normalize_visibility(old.as_deref().unwrap_or("")) == "public" {
+                tx.execute("UPDATE events SET visibility = $1 WHERE id = $2", &[&vis, &id]).await?;
+            }
+            None
+        }
+        None => {
+            let row = tx
+                .query_one(
+                    "INSERT INTO events (created_at, type, actor_id, object_id, target_actor, host, bytes, action_taken, summary, media_urls, in_reply_to, spoiler_text, sensitive, visibility)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7::bigint, 'local_observe', NULL, NULL, NULL, '', 0, $8) RETURNING id",
+                    &[&now, &kind, &it.actor, &it.object, &target, &host, &bytes, &vis],
+                )
+                .await?;
+            Some(row.get::<_, i64>(0))
+        }
+    };
     let spool_id = crate::inbox_route_delete::insert_spool_done(&tx, ip, key_id, path, sig_path, kind, text, "local_observe").await?;
     tx.commit().await?;
-    Ok((spool_id, stored))
+    Ok(Applied { spool_id, stored, event_id })
+}
+
+/// `ap_normalize_visibility`.
+fn normalize_visibility(v: &str) -> &'static str {
+    match v.trim().to_ascii_lowercase().as_str() {
+        "local" | "local_only" | "instance" | "instance_only" => "local",
+        "unlisted" | "silent" | "silent_public" => "unlisted",
+        "private" | "followers" | "followers_only" => "private",
+        _ => "public",
+    }
 }
 
 #[cfg(test)]
@@ -279,8 +437,18 @@ mod tests {
         assert_eq!(plan(&like(json!({"content": ":blobcat:"}))).unwrap_err(), "content");
         assert_eq!(plan(&like(json!({"object": {"id": "https://mkultra.monster/users/cmdr_nova/notes/abc"}}))).unwrap_err(), "embedded");
         assert_eq!(plan(&like(json!({"actor": "https://mkultra.monster/users/luna"}))).unwrap_err(), "local_actor");
-        assert_eq!(plan(&like(json!({"type": "Announce"}))).unwrap_err(), "not_like");
+        assert_eq!(plan(&like(json!({"type": "Announce", "object": {"object": "https://mkultra.monster/users/cmdr_nova/notes/abc"}}))).unwrap_err(), "not_like");
         assert_eq!(plan(&like(json!({"object": "https://m.test/notes/1"}))).unwrap_err(), "not_like");
+    }
+
+    #[test]
+    fn plain_boosts_are_routed() {
+        let it = plan(&like(json!({"type": "Announce"}))).unwrap();
+        assert_eq!(it.kind, "reblog");
+        assert_eq!(note_author("https://mkultra.monster/users/cmdr_nova/notes/abc"), LOCAL_ACTOR);
+        assert_eq!(note_author("https://mkultra.monster/users/shana_flux/notes/x1/"), "https://mkultra.monster/users/shana_flux");
+        assert_eq!(normalize_visibility("followers"), "private");
+        assert_eq!(normalize_visibility(""), "public");
     }
 
     #[test]

@@ -334,7 +334,7 @@ pub(crate) async fn route(
                 crate::notif_invalidate::drop_list_caches(redis).await;
                 crate::notif_invalidate::unread_owners(redis, cache_dir, &done.owners).await;
             }
-            notes_after_commit(db, key_id, kind, "Delete", &plan.actor, plan.object_id.as_deref()).await;
+            notes_after_commit(db, key_id, kind, Some("Delete"), &plan.actor, plan.object_id.as_deref()).await;
             let object = short(plan.object_id.as_deref().unwrap_or(""));
             let line = if done.result == "delete_noop" {
                 format!("delete_noop object={object}")
@@ -474,16 +474,19 @@ async fn apply(
 /// What the drain does around routing, after commit: `ap_timeline_notify`,
 /// `ap_inbox_host_seen_note` and `ap_fanout_host_note_inbound` for the key
 /// host (at most every 5 minutes per host).
-pub(crate) async fn notes_after_commit(db: &Client, key_id: &str, kind: &str, notify_type: &str, actor: &str, object: Option<&str>) {
+/// `notify_type` None skips `ap_timeline_notify` (no events row was inserted).
+pub(crate) async fn notes_after_commit(db: &Client, key_id: &str, kind: &str, notify_type: Option<&str>, actor: &str, object: Option<&str>) {
     let now = crate::fanout_delivery::iso(now_unix());
-    let payload = serde_json::json!({
-        "type": notify_type,
-        "actor": actor.trim_end_matches('/'),
-        "object": object.unwrap_or("").trim_end_matches('/'),
-        "at": now,
-    })
-    .to_string();
-    let _ = db.execute("SELECT pg_notify('vaak_timeline_events', $1)", &[&payload]).await;
+    if let Some(notify_type) = notify_type {
+        let payload = serde_json::json!({
+            "type": notify_type,
+            "actor": actor.trim_end_matches('/'),
+            "object": object.unwrap_or("").trim_end_matches('/'),
+            "at": now,
+        })
+        .to_string();
+        let _ = db.execute("SELECT pg_notify('vaak_timeline_events', $1)", &[&payload]).await;
+    }
     let key_host = crate::inbox_accept::host_of(key_id).unwrap_or_default();
     if !key_host.is_empty() && key_host != "mkultra.monster" && host_note_due(&key_host) {
         let seen = seen_type(kind);
