@@ -157,7 +157,7 @@ function inbox_drain_interaction_shadow_note(PDO $db, int $id, string $rust, str
 }
 
 /**
- * Cutover F5: a like Rust routed itself leaves the phone push to PHP as a job
+ * Cutover F5/F5b: a like or boost Rust routed itself leaves the phone push to PHP as a job
  * on vaak:queue:inbox_webpush (rust/vaak-worker/src/inbox_route_like.rs). Same
  * call ap_local_observe makes after storing the mention row.
  */
@@ -171,7 +171,7 @@ function inbox_drain_webpush_job(PDO $db, string $raw): void
     $actor = (string) ($job['actor'] ?? '');
     $objectId = (string) ($job['object_id'] ?? '');
     $owner = (int) ($job['owner_user_id'] ?? 0);
-    if ($type !== 'favourite' || $actor === '' || $objectId === '' || $owner < 1) {
+    if (!in_array($type, ['favourite', 'reblog'], true) || $actor === '' || $objectId === '' || $owner < 1) {
         return;
     }
     try {
@@ -189,7 +189,7 @@ function inbox_drain_webpush_job(PDO $db, string $raw): void
         }
         ap_webpush_notify_event($type, $actor, $nid, null, $owner);
     } catch (Throwable $e) {
-        error_log('[ap-webpush] rust like hook: ' . $e->getMessage());
+        error_log('[ap-webpush] rust like/boost hook: ' . $e->getMessage());
     }
 }
 

@@ -225,7 +225,7 @@ wait "$inbox_pid" 2>/dev/null || true
 
 # Rust Undo and mention-Delete routing (cutover F4): a third worker with them on.
 VAAK_ENV_FILE=/nonexistent VAAK_PHYRIAN_BRIDGE_ENV_FILE=/nonexistent \
-  VAAK_INBOX_RUST_ACCEPT=1 VAAK_INBOX_ROUTE_DELETE=1 VAAK_INBOX_ROUTE_DELETE_MENTIONS=1 VAAK_INBOX_ROUTE_UNDO=1 VAAK_INBOX_ROUTE_LIKE=1 \
+  VAAK_INBOX_RUST_ACCEPT=1 VAAK_INBOX_ROUTE_DELETE=1 VAAK_INBOX_ROUTE_DELETE_MENTIONS=1 VAAK_INBOX_ROUTE_UNDO=1 VAAK_INBOX_ROUTE_LIKE=1 VAAK_INBOX_ROUTE_BOOST=1 \
   VAAK_AP_SIGNING_KEY=/nonexistent VAAK_INBOX_PHP_URL="http://127.0.0.1:${stub_port}" \
   VAAK_DATABASE_URL="postgresql://${PGUSER}@${PGHOST}:${PGPORT}/${db}" \
   VAAK_REDIS_URL="redis://${redis_hostport}/0" VAAK_REDIS_QUEUE_URL="redis://${redis_hostport}/1" \
@@ -244,6 +244,7 @@ for _ in $(seq 1 60); do
 done
 VAAK_INBOX_RUST_URL="$inbox_url" run "$runner" api/bin/inbox-route-undo-smoke.php
 VAAK_INBOX_RUST_URL="$inbox_url" run "$runner" api/bin/inbox-route-like-smoke.php
+VAAK_INBOX_RUST_URL="$inbox_url" run "$runner" api/bin/inbox-route-boost-smoke.php
 
 # Rust fan-out delivery (cutover D2): seed the queue, then a worker with the
 # switch on works it. Nothing it is given resolves, so no request leaves CI.

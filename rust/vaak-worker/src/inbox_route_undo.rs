@@ -135,7 +135,7 @@ pub(crate) async fn route(
                 crate::notif_invalidate::drop_list_caches(redis).await;
                 crate::notif_invalidate::unread_owners(redis, cache_dir, &owners).await;
             }
-            crate::inbox_route_delete::notes_after_commit(db, key_id, kind, "Undo", &plan.actor, plan.object_id.as_deref()).await;
+            crate::inbox_route_delete::notes_after_commit(db, key_id, kind, Some("Undo"), &plan.actor, plan.object_id.as_deref()).await;
             let who = crate::inbox_route_delete::short(plan.who.as_deref().unwrap_or(""));
             crate::inbox_route_delete::log_routed(spool_id, kind, body.len(), key_id, format!("{result} actor={who} n={touched}"));
             Routed::Done { spool_id, result }
