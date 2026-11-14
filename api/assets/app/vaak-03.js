@@ -1030,8 +1030,63 @@
     return out;
   }
 
+  function sameKey(buf, b64) {
+    if (!buf || !b64) return true; // can't tell; keep the subscription
+    const a = new Uint8Array(buf);
+    const b = urlBase64ToUint8Array(b64);
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+    return true;
+  }
+
+  // RFC 8291 aes128gcm works everywhere current, and Apple's push service
+  // (Home Screen app on iPhone, macOS Safari) takes nothing else.
+  function contentEncoding() {
+    const list = (window.PushManager && PushManager.supportedContentEncodings) || ['aes128gcm'];
+    return list.indexOf('aes128gcm') !== -1 ? 'aes128gcm' : 'aesgcm';
+  }
+
+  function jsonHeaders() {
+    return {
+      'Content-Type': 'application/json',
+      'Accept': 'application/json',
+      'X-Requested-With': 'XMLHttpRequest',
+      'X-VAAK-CSRF': window.VAAK_CSRF || '',
+    };
+  }
+
   async function ensureSw() {
     return navigator.serviceWorker.register('/vaak/sw.js', { scope: '/vaak/' });
+  }
+
+  async function localSubscription() {
+    const reg = await navigator.serviceWorker.getRegistration('/vaak/');
+    return reg ? reg.pushManager.getSubscription() : null;
+  }
+
+  async function serverStatus(sub) {
+    const res = await fetch('?ajax=push_status', {
+      method: 'POST',
+      credentials: 'same-origin',
+      cache: 'no-store',
+      headers: jsonHeaders(),
+      body: JSON.stringify({ endpoint: sub ? sub.endpoint : '', csrf: window.VAAK_CSRF || '' }),
+    });
+    return res.json().catch(() => null);
+  }
+
+  async function saveSubscription(sub) {
+    const res = await fetch('?ajax=push_subscribe', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: jsonHeaders(),
+      body: JSON.stringify({
+        subscription: sub.toJSON(),
+        content_encoding: contentEncoding(),
+        csrf: window.VAAK_CSRF || '',
+      }),
+    });
+    return res.json().catch(() => null);
   }
 
   function setStatus(text, subscribed) {
@@ -1053,15 +1108,17 @@
       return;
     }
     try {
-      const res = await fetch('?ajax=push_status', { credentials: 'same-origin', cache: 'no-store' });
-      const data = await res.json().catch(() => null);
       const perm = Notification.permission;
-      if (data && data.subscribed) {
-        setStatus('Enabled (' + perm + '). Background alerts are on for this account.', true);
-      } else if (perm === 'denied') {
+      if (perm === 'denied') {
         setStatus('Blocked by the browser — reset notification permission for mkultra.monster, then try Enable again.', false);
+        return;
+      }
+      const sub = perm === 'granted' ? await localSubscription() : null;
+      const data = sub ? await serverStatus(sub) : null;
+      if (sub && data && data.subscribed) {
+        setStatus('Enabled on this browser. Each phone or computer needs its own Enable.', true);
       } else {
-        setStatus('Off. Tap Enable to allow alerts while VAAK is in the background.', false);
+        setStatus('Off on this browser. Tap Enable to get alerts while VAAK is in the background.', false);
       }
     } catch (e) {
       setStatus('Could not check push status.', false);
@@ -1101,30 +1158,24 @@
         return;
       }
       let sub = await reg.pushManager.getSubscription();
+      // A subscription made under an older VAPID key can never be delivered.
+      if (sub && !sameKey(sub.options && sub.options.applicationServerKey, vapid.publicKey)) {
+        await sub.unsubscribe().catch(() => {});
+        sub = null;
+      }
       if (!sub) {
         sub = await reg.pushManager.subscribe({
           userVisibleOnly: true,
           applicationServerKey: urlBase64ToUint8Array(vapid.publicKey),
         });
       }
-      const res = await fetch('?ajax=push_subscribe', {
-        method: 'POST',
-        credentials: 'same-origin',
-        headers: {
-          'Content-Type': 'application/json',
-          'Accept': 'application/json',
-          'X-Requested-With': 'XMLHttpRequest',
-          'X-VAAK-CSRF': window.VAAK_CSRF || '',
-        },
-        body: JSON.stringify({ subscription: sub.toJSON(), csrf: window.VAAK_CSRF || '' }),
-      });
-      const data = await res.json().catch(() => null);
+      const data = await saveSubscription(sub);
       if (!data || !data.ok) {
         setStatus((data && data.error) || 'Subscribe failed.', false);
         if (window.apAdminToast) window.apAdminToast((data && data.error) || 'Push subscribe failed.', true);
         return;
       }
-      setStatus('Enabled. You’ll get alerts while VAAK is in the background.', true);
+      setStatus('Enabled on this browser. Each phone or computer needs its own Enable.', true);
       if (window.apAdminToast) window.apAdminToast('Browser notifications enabled.');
     } catch (e) {
       setStatus('Could not enable notifications.', false);
@@ -1137,16 +1188,14 @@
   async function disablePush() {
     try {
       if (disableBtn) disableBtn.disabled = true;
-      const reg = await navigator.serviceWorker.getRegistration('/vaak/');
-      const sub = reg ? await reg.pushManager.getSubscription() : null;
+      const sub = await localSubscription();
+      const endpoint = sub ? sub.endpoint : '';
       if (sub) await sub.unsubscribe();
-      const fd = new FormData();
-      fd.set('csrf', window.VAAK_CSRF || '');
       await fetch('?ajax=push_unsubscribe', {
         method: 'POST',
         credentials: 'same-origin',
-        headers: { 'Accept': 'application/json', 'X-Requested-With': 'XMLHttpRequest', 'X-VAAK-CSRF': window.VAAK_CSRF || '' },
-        body: fd,
+        headers: jsonHeaders(),
+        body: JSON.stringify({ endpoint, csrf: window.VAAK_CSRF || '' }),
       });
       setStatus('Disabled for this browser.', false);
       if (window.apAdminToast) window.apAdminToast('Browser notifications disabled.');
@@ -1157,17 +1206,25 @@
     }
   }
 
+  // Every visit from a browser that kept its subscription: tell the server
+  // (keeps the token alive) and re-save it if the server lost it, e.g. after
+  // the browser rotated its endpoint or the token was purged.
+  async function quietSync() {
+    if (!supported || Notification.permission !== 'granted') return;
+    const sub = await localSubscription();
+    if (!sub) return;
+    const data = await serverStatus(sub);
+    if (data && data.ok && !data.subscribed) {
+      await saveSubscription(sub);
+      if (statusEl || enableBtn) refreshStatus();
+    }
+  }
+
   if (window.vaakGuestProfile) return;
   if (enableBtn) enableBtn.addEventListener('click', () => { enablePush(); });
   if (disableBtn) disableBtn.addEventListener('click', () => { disablePush(); });
   if (statusEl || enableBtn) refreshStatus();
-  // Quietly register SW if already subscribed so push clicks work from any view.
-  if (supported) {
-    fetch('?ajax=push_status', { credentials: 'same-origin', cache: 'no-store' })
-      .then((r) => r.json())
-      .then((d) => { if (d && d.subscribed) ensureSw().catch(() => {}); })
-      .catch(() => {});
-  }
+  quietSync().catch(() => {});
 })();
 
 window.apAdminToast = function (msg, isErr) {

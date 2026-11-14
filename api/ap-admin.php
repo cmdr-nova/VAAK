@@ -7386,13 +7386,31 @@ if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'push_vapid') {
     exit;
 }
 if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'push_status') {
+    // "Enabled" means THIS browser's subscription is saved. It used to count
+    // any subscription on the account, so an Ice Cubes login made the card
+    // say Enabled (and hide the button) on browsers that never subscribed.
     header('Content-Type: application/json; charset=utf-8');
     header('Cache-Control: no-store');
     $uid = function_exists('admin_owner_user_id') ? admin_owner_user_id() : (int) ($vaakUser['id'] ?? 0);
-    $enabled = $uid > 0 && function_exists('ap_webpush_user_has_subscription')
-        ? ap_webpush_user_has_subscription($uid)
-        : false;
-    echo json_encode(['ok' => true, 'subscribed' => $enabled], JSON_UNESCAPED_SLASHES);
+    $endpoint = '';
+    $raw = ($_SERVER['REQUEST_METHOD'] ?? '') === 'POST' ? file_get_contents('php://input') : '';
+    if (is_string($raw) && $raw !== '') {
+        $decoded = json_decode($raw, true);
+        if (is_array($decoded)) {
+            $endpoint = trim((string) ($decoded['endpoint'] ?? ''));
+        }
+    }
+    $row = $uid > 0 && $endpoint !== '' && function_exists('ap_webpush_browser_subscription')
+        ? ap_webpush_browser_subscription($uid, $endpoint)
+        : null;
+    if (is_array($row)) {
+        ap_webpush_browser_touch((int) $row['token_id']);
+    }
+    echo json_encode([
+        'ok' => true,
+        'subscribed' => is_array($row),
+        'encoding' => is_array($row) ? (string) ($row['content_encoding'] ?? '') : null,
+    ], JSON_UNESCAPED_SLASHES);
     exit;
 }
 if (
@@ -7402,7 +7420,15 @@ if (
 ) {
     header('Content-Type: application/json; charset=utf-8');
     header('Cache-Control: no-store');
-    $csrfTok = (string) ($_POST['csrf'] ?? $_SERVER['HTTP_X_VAAK_CSRF'] ?? '');
+    $raw = file_get_contents('php://input');
+    $in = [];
+    if (is_string($raw) && $raw !== '' && str_starts_with(ltrim($raw), '{')) {
+        $decoded = json_decode($raw, true);
+        if (is_array($decoded)) {
+            $in = $decoded;
+        }
+    }
+    $csrfTok = (string) ($_POST['csrf'] ?? $in['csrf'] ?? $_SERVER['HTTP_X_VAAK_CSRF'] ?? '');
     if (!ap_auth_csrf_ok($csrfTok)) {
         http_response_code(403);
         echo json_encode(['ok' => false, 'error' => 'Session expired — refresh and try again.']);
@@ -7417,41 +7443,24 @@ if (
     $ajaxPush = (string) $_GET['ajax'];
     try {
         if ($ajaxPush === 'push_unsubscribe') {
-            $tokPack = ap_webpush_vaak_web_token_for_user($uid);
-            if (!empty($tokPack['ok']) && !empty($tokPack['token_row']['id'])) {
-                ap_webpush_subscription_delete((int) $tokPack['token_row']['id']);
-            }
+            $endpoint = trim((string) ($in['endpoint'] ?? $_POST['endpoint'] ?? ''));
+            ap_webpush_browser_unsubscribe($uid, $endpoint);
             echo json_encode(['ok' => true, 'subscribed' => false]);
             exit;
         }
-        $raw = file_get_contents('php://input');
-        $in = [];
-        if (is_string($raw) && $raw !== '' && str_starts_with(ltrim($raw), '{')) {
-            $decoded = json_decode($raw, true);
-            if (is_array($decoded)) {
-                $in = $decoded;
-            }
+        $sub = $in['subscription'] ?? null;
+        if (!is_array($sub) && !empty($_POST['subscription']) && is_string($_POST['subscription'])) {
+            $sub = json_decode($_POST['subscription'], true);
         }
-        if ($in === [] && !empty($_POST['subscription'])) {
-            $subRaw = $_POST['subscription'];
-            if (is_string($subRaw)) {
-                $decoded = json_decode($subRaw, true);
-                if (is_array($decoded)) {
-                    $in['subscription'] = $decoded;
-                }
-            } elseif (is_array($subRaw)) {
-                $in['subscription'] = $subRaw;
-            }
-        }
-        $tokPack = ap_webpush_vaak_web_token_for_user($uid);
-        if (empty($tokPack['ok'])) {
-            echo json_encode(['ok' => false, 'error' => $tokPack['error'] ?? 'Could not mint push token.']);
+        if (!is_array($sub)) {
+            http_response_code(400);
+            echo json_encode(['ok' => false, 'error' => 'Browser sent no subscription.']);
             exit;
         }
-        $entity = ap_webpush_subscription_upsert(
-            $tokPack['token_row'],
-            (string) $tokPack['access_token'],
-            $in
+        $entity = ap_webpush_browser_subscribe(
+            $uid,
+            $sub,
+            (string) ($in['content_encoding'] ?? 'aes128gcm')
         );
         echo json_encode(['ok' => true, 'subscribed' => true, 'subscription' => $entity], JSON_UNESCAPED_SLASHES);
     } catch (Throwable $e) {

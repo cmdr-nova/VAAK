@@ -584,11 +584,70 @@ function ap_webpush_ensure_vaak_web_app(): ?array
 }
 
 /**
- * Mint or reuse a VAAK Web oauth token for browser push.
+ * This browser's saved subscription (VAAK Web token, matched by endpoint).
+ * Ice Cubes and other app subscriptions never count here.
+ *
+ * @return array<string,mixed>|null push_subscriptions row
+ */
+function ap_webpush_browser_subscription(int $userId, string $endpoint): ?array
+{
+    $endpoint = trim($endpoint);
+    if ($userId < 1 || $endpoint === '') {
+        return null;
+    }
+    try {
+        ap_webpush_migrate();
+        $st = ap_db()->prepare(
+            'SELECT s.* FROM push_subscriptions s
+             INNER JOIN oauth_tokens t ON t.id = s.token_id
+             WHERE t.user_id = ? AND t.client_id = ? AND t.revoked_at IS NULL
+               AND s.endpoint = ?
+             ORDER BY s.id DESC LIMIT 1'
+        );
+        $st->execute([$userId, AP_WEBPUSH_VAAK_WEB_CLIENT_ID, $endpoint]);
+        $row = $st->fetch();
+        return is_array($row) ? $row : null;
+    } catch (Throwable $e) {
+        error_log('[ap-webpush] browser subscription lookup: ' . $e->getMessage());
+        return null;
+    }
+}
+
+/**
+ * Browsers never refresh their OAuth token, so the daily purge used to
+ * delete it after 180 days and the subscription went silent. Each visit
+ * from a subscribed browser pushes the expiry out again.
+ */
+function ap_webpush_browser_touch(int $tokenId): void
+{
+    if ($tokenId < 1) {
+        return;
+    }
+    try {
+        $now = time();
+        ap_db()->prepare(
+            'UPDATE oauth_tokens SET expires_at = ?, refresh_expires_at = ?
+             WHERE id = ? AND client_id = ? AND revoked_at IS NULL'
+        )->execute([
+            gmdate('c', $now + ap_oauth_token_ttl_seconds()),
+            gmdate('c', $now + ap_oauth_refresh_ttl_seconds()),
+            $tokenId,
+            AP_WEBPUSH_VAAK_WEB_CLIENT_ID,
+        ]);
+    } catch (Throwable $e) {
+        error_log('[ap-webpush] browser touch: ' . $e->getMessage());
+    }
+}
+
+/**
+ * Mint or reuse the VAAK Web oauth token for ONE browser (by endpoint).
+ * Each browser/device gets its own token, because push_subscriptions has one
+ * row per token: a shared token meant enabling on the phone replaced the
+ * desktop subscription.
  *
  * @return array{ok:bool,error?:string,token_row?:array,access_token?:string}
  */
-function ap_webpush_vaak_web_token_for_user(int $userId): array
+function ap_webpush_vaak_web_token_for_user(int $userId, string $endpoint = ''): array
 {
     if ($userId < 1) {
         return ['ok' => false, 'error' => 'Not signed in.'];
@@ -599,32 +658,27 @@ function ap_webpush_vaak_web_token_for_user(int $userId): array
         return ['ok' => false, 'error' => 'Could not provision VAAK Web push app.'];
     }
     $clientId = AP_WEBPUSH_VAAK_WEB_CLIENT_ID;
-    // Prefer an existing non-revoked token that already has a push subscription
-    // (we still have the plain access_token there).
-    try {
-        $st = ap_db()->prepare(
-            'SELECT t.*, s.access_token AS push_access_token
-             FROM oauth_tokens t
-             LEFT JOIN push_subscriptions s ON s.token_id = t.id
-             WHERE t.user_id = ? AND t.client_id = ? AND t.revoked_at IS NULL
-             ORDER BY t.id DESC LIMIT 5'
-        );
-        $st->execute([$userId, $clientId]);
-        foreach ($st->fetchAll() ?: [] as $row) {
-            if (!is_array($row)) {
-                continue;
-            }
-            $plain = trim((string) ($row['push_access_token'] ?? ''));
-            if ($plain !== '') {
-                return ['ok' => true, 'token_row' => $row, 'access_token' => $plain];
-            }
+    $existing = ap_webpush_browser_subscription($userId, $endpoint);
+    if (is_array($existing)) {
+        $plain = trim((string) ($existing['access_token'] ?? ''));
+        $st = ap_db()->prepare('SELECT * FROM oauth_tokens WHERE id = ? LIMIT 1');
+        $st->execute([(int) $existing['token_id']]);
+        $row = $st->fetch();
+        if ($plain !== '' && is_array($row)) {
+            return ['ok' => true, 'token_row' => $row, 'access_token' => $plain];
         }
-        // No reusable plain token — revoke leftovers and mint a fresh one.
+    }
+    try {
+        // Leftover tokens with no subscription (a subscribe that failed half
+        // way). Ten minutes of grace so two devices enabling at once never
+        // revoke each other's fresh token.
         ap_db()->prepare(
-            'UPDATE oauth_tokens SET revoked_at = ? WHERE user_id = ? AND client_id = ? AND revoked_at IS NULL'
-        )->execute([ap_db_now(), $userId, $clientId]);
+            'UPDATE oauth_tokens SET revoked_at = ?
+             WHERE user_id = ? AND client_id = ? AND revoked_at IS NULL AND created_at < ?
+               AND NOT EXISTS (SELECT 1 FROM push_subscriptions s WHERE s.token_id = oauth_tokens.id)'
+        )->execute([ap_db_now(), $userId, $clientId, gmdate('c', time() - 600)]);
     } catch (Throwable $e) {
-        error_log('[ap-webpush] vaak web token lookup: ' . $e->getMessage());
+        error_log('[ap-webpush] vaak web orphan revoke: ' . $e->getMessage());
     }
     if (!function_exists('ap_oauth_token_create')) {
         return ['ok' => false, 'error' => 'OAuth unavailable.'];
@@ -642,6 +696,62 @@ function ap_webpush_vaak_web_token_for_user(int $userId): array
         return ['ok' => false, 'error' => 'Token created but not found.'];
     }
     return ['ok' => true, 'token_row' => $tokenRow, 'access_token' => $plain];
+}
+
+/**
+ * Save this browser's PushManager subscription for $userId.
+ * A browser belongs to one account: the same endpoint saved earlier under
+ * another VAAK login is dropped, so its alerts stop landing here.
+ *
+ * @param array<string,mixed> $subscription PushSubscription.toJSON()
+ * @return array<string,mixed> WebPushSubscription entity
+ */
+function ap_webpush_browser_subscribe(int $userId, array $subscription, string $contentEncoding = 'aes128gcm'): array
+{
+    $endpoint = trim((string) ($subscription['endpoint'] ?? ''));
+    if ($endpoint === '') {
+        throw new InvalidArgumentException('subscription endpoint required');
+    }
+    $tokPack = ap_webpush_vaak_web_token_for_user($userId, $endpoint);
+    if (empty($tokPack['ok'])) {
+        throw new RuntimeException((string) ($tokPack['error'] ?? 'Could not mint push token.'));
+    }
+    $tokenId = (int) $tokPack['token_row']['id'];
+    $st = ap_db()->prepare(
+        'SELECT s.token_id FROM push_subscriptions s
+         INNER JOIN oauth_tokens t ON t.id = s.token_id
+         WHERE s.endpoint = ? AND t.client_id = ? AND s.token_id <> ?'
+    );
+    $st->execute([$endpoint, AP_WEBPUSH_VAAK_WEB_CLIENT_ID, $tokenId]);
+    foreach ($st->fetchAll(PDO::FETCH_COLUMN) ?: [] as $staleTokenId) {
+        ap_webpush_subscription_delete((int) $staleTokenId);
+        ap_db()->prepare('UPDATE oauth_tokens SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL')
+            ->execute([ap_db_now(), (int) $staleTokenId]);
+    }
+    // RFC 8291 aes128gcm is what every current browser speaks, and the only
+    // one Apple's push service (iPhone Home Screen app, macOS Safari) takes.
+    $subscription['standard'] = $contentEncoding !== 'aesgcm';
+    $entity = ap_webpush_subscription_upsert(
+        $tokPack['token_row'],
+        (string) $tokPack['access_token'],
+        ['subscription' => $subscription]
+    );
+    ap_webpush_browser_touch($tokenId);
+    return $entity;
+}
+
+/** Forget this browser's subscription (and revoke its token). */
+function ap_webpush_browser_unsubscribe(int $userId, string $endpoint): bool
+{
+    $row = ap_webpush_browser_subscription($userId, $endpoint);
+    if (!is_array($row)) {
+        return false;
+    }
+    $tokenId = (int) $row['token_id'];
+    ap_webpush_subscription_delete($tokenId);
+    ap_db()->prepare('UPDATE oauth_tokens SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL')
+        ->execute([ap_db_now(), $tokenId]);
+    return true;
 }
 
 /**
