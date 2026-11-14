@@ -12,6 +12,13 @@ anything else bumps the patch number.
 Releases up to **0.9.83** used a two-digit deploy counter (0.9.05, 0.9.83)
 and have no notes here; their tags and GitHub Releases are unchanged.
 
+## [0.77.0](https://github.com/cmdr-nova/VAAK/releases/tag/v0.77.0) - 2026-11-14
+
+### ✨ Features
+* Make VAAK browser push actually subscribe each browser by @cmdr-nova in https://github.com/cmdr-nova/VAAK/pull/441
+
+**Full Changelog**: https://github.com/cmdr-nova/VAAK/compare/v0.76.0...v0.77.0
+
 ## [0.76.0](https://github.com/cmdr-nova/VAAK/releases/tag/v0.76.0) - 2026-11-13
 
 ### ✨ Features
