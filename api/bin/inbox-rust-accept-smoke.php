@@ -282,4 +282,66 @@ $check((int) ($shadow['agree:local_observe+mention'] ?? 0) === 5, 'F5: five of t
 $check((int) ($shadow['disagree'] ?? 0) === 1 && (int) ($shadow['disagree:local_observe+mention'] ?? 0) === 1,
     'F5: a prediction naming a missing notification row is a disagreement');
 
+// Cutover F6 shadow: follows of local accounts. Rust predicts the result
+// and the owner; PHP still records the follow (the actor document comes from
+// the Redis cache, the Accept delivery fails offline); the drain agrees.
+$db->exec("INSERT INTO ap_users (username, email, password_hash, actor_key, actor_id, is_admin, created_at, updated_at)
+           VALUES ('f6_private', 'f6@vaak.test', 'unused', 'f6_private', 'https://mkultra.monster/users/f6_private', 0,
+                   '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')");
+$f6 = (int) $db->query("SELECT id FROM ap_users WHERE username = 'f6_private'")->fetchColumn();
+$db->exec("INSERT INTO actor_profile (actor_key, name, summary, attachment_json, manually_approves, discoverable, updated_at)
+           VALUES ('f6_private', 'F6', '', '[]', 1, 0, '2026-01-01T00:00:00Z')");
+$aliceDoc = ['id' => $alice, 'type' => 'Person', 'inbox' => $alice . '/inbox', 'preferredUsername' => 'alice'];
+$seedAlice = static function () use ($alice, $aliceDoc): void {
+    foreach (ap_key_fetch_candidates($alice) as $url) {
+        ap_redis_json_set('vaak:actor-doc:' . hash('sha256', rtrim($url, '/')), $aliceDoc, 300);
+    }
+};
+$seedAlice();
+$f6Cases = [
+    // [label, inbox path, activity, predicted result or null (no prediction)]
+    ['follow of an open account', '/inbox',
+        ['id' => $alice . '#follows/f6-1', 'type' => 'Follow', 'actor' => $alice, 'object' => 'https://mkultra.monster/users/f5_owner'],
+        "local_accept_followback {$f5}"],
+    ['follow of a private account (one-element list)', '/users/f6_private/inbox',
+        ['id' => $alice . '#follows/f6-2', 'type' => 'Follow', 'actor' => $alice, 'object' => ['https://mkultra.monster/users/f6_private/']],
+        "local_follow_pending {$f6}"],
+    ['follow of an unknown local account', '/inbox',
+        ['id' => $alice . '#follows/f6-3', 'type' => 'Follow', 'actor' => $alice, 'object' => 'https://mkultra.monster/users/nobody_here'],
+        null],
+];
+$redis->del('vaak:inbox_route_shadow:stats:v1');
+foreach ($f6Cases as [$label, $path, $doc, $want]) {
+    $body = json_encode($doc, JSON_UNESCAPED_SLASHES);
+    [$status] = smoke_post($rust, $path, $body, $aliceKey, $priv);
+    $check($status === 202, "F6: {$label} is spooled (got {$status})");
+    $predicted = $db->query("SELECT r.rust_result FROM ap_inbox_spool s JOIN ap_inbox_route_shadow r ON r.spool_id = s.id
+                             WHERE s.body = " . $db->quote($body))->fetchColumn();
+    $check($predicted === ($want ?? false), "F6: Rust predicts the {$label} (got " . var_export($predicted, true) . ')');
+}
+shell_exec('VAAK_FPM_POOL_CONF=/nonexistent ' . $cmd);
+foreach ($f6Cases as [$label, $path, $doc, $want]) {
+    if ($want === null) {
+        continue;
+    }
+    $result = $db->query("SELECT result FROM ap_inbox_spool WHERE body = " . $db->quote(json_encode($doc, JSON_UNESCAPED_SLASHES)))->fetchColumn();
+    $check($result === explode(' ', $want)[0], "F6: PHP routes the {$label} the same (got " . var_export($result, true) . ')');
+}
+$shadow = $redis->hGetAll('vaak:inbox_route_shadow:stats:v1');
+$check((int) ($shadow['agree:local_accept_followback'] ?? 0) === 1 && (int) ($shadow['agree:local_follow_pending'] ?? 0) === 1
+    && !isset($shadow['disagree']), 'F6: the drain agrees on the result and the follower/request row (' . json_encode($shadow) . ')');
+// When PHP cannot fetch the follower, it is a disagreement the soak shows.
+foreach (ap_key_fetch_candidates($alice) as $url) {
+    $redis->del('vaak:actor-doc:' . hash('sha256', rtrim($url, '/')));
+}
+$db->prepare('DELETE FROM followers WHERE actor_id = ?')->execute([$alice]);
+$failBody = json_encode(['id' => $alice . '#follows/f6-4', 'type' => 'Follow', 'actor' => $alice, 'object' => 'https://mkultra.monster/users/f5_owner'], JSON_UNESCAPED_SLASHES);
+[$status] = smoke_post($rust, '/inbox', $failBody, $aliceKey, $priv);
+$redis->del('vaak:inbox_route_shadow:stats:v1');
+shell_exec('VAAK_FPM_POOL_CONF=/nonexistent ' . $cmd);
+$shadow = $redis->hGetAll('vaak:inbox_route_shadow:stats:v1');
+$check((int) ($shadow['disagree:local_accept_followback'] ?? 0) === 1,
+    'F6: a follow PHP could not complete is a disagreement (' . json_encode($shadow) . ')');
+$seedAlice();
+
 echo "inbox-rust-accept: {$n} checks passed\n";

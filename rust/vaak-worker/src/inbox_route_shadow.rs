@@ -22,6 +22,12 @@
 //! notification by ` {owner_user_id} {mention object_id}`: the row
 //! `ap_local_observe` stores through `ap_mention_store`. The drain checks the
 //! result and that row.
+//!
+//! Cutover F6 adds an incoming `Follow` of a local account
+//! (`ap_resolve_local_follow_target`): `local_follow_pending {owner_user_id}`
+//! when that account approves followers by hand (`actor_profile.
+//! manually_approves`), else `local_accept_followback {owner_user_id}`. The
+//! drain checks the result and the `ap_follow_requests` or `followers` row.
 
 use std::time::Duration;
 
@@ -154,6 +160,17 @@ async fn query(db: &Client, ids: &[String]) -> anyhow::Result<&'static str> {
 /// or is slow. `path` is the inbox path (a personal inbox picks the owner).
 pub(crate) async fn predict(db: &Client, body: &[u8], path: &str) -> Option<String> {
     let doc: Value = serde_json::from_slice(body).ok()?;
+    if let Some(target) = follow_target(&doc) {
+        // None from the lookup: no active local account (PHP falls through).
+        return match tokio::time::timeout(PREDICT_TIMEOUT, predict_follow(db, &target)).await {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "inbox route shadow follow lookup failed");
+                None
+            }
+            Err(_) => None,
+        };
+    }
     let looked_up = if let Some((_, ids)) = delete_targets(&doc) {
         if ids.is_empty() {
             return Some("delete_noop".to_string());
@@ -413,6 +430,62 @@ pub(crate) async fn recipient_owner(db: &Client, it: &Interaction, path: &str) -
     Ok((id, CMDR.to_string()))
 }
 
+/// `ap_resolve_local_follow_target`'s id: the object of a `Follow` with an
+/// actor, unwrapped from a one-element list or an embedded Follow, trailing
+/// slash trimmed, on `https://mkultra.monster/users/`. None for anything else.
+pub(crate) fn follow_target(doc: &Value) -> Option<String> {
+    if doc.get("type")?.as_str()? != "Follow" {
+        return None;
+    }
+    doc.get("actor").and_then(as_id)?;
+    fn resolve(v: &Value, depth: u8) -> Option<String> {
+        let v = match v {
+            Value::Array(list) if list.len() == 1 => &list[0],
+            other => other,
+        };
+        let id = match v {
+            Value::String(s) => s.clone(),
+            Value::Object(o) if o.get("type").and_then(Value::as_str) == Some("Follow") => {
+                return if depth < 8 { resolve(o.get("object").unwrap_or(&Value::Null), depth + 1) } else { None };
+            }
+            Value::Object(_) => as_id(v)?,
+            _ => return None,
+        };
+        let id = id.trim_end_matches('/').to_string();
+        (!id.is_empty() && id.starts_with("https://mkultra.monster/users/")).then_some(id)
+    }
+    resolve(doc.get("object")?, 0)
+}
+
+/// `ap_local_user_by_actor_id` + `ap_profile_get(...)['manually_approves']`.
+async fn predict_follow(db: &Client, target: &str) -> anyhow::Result<Option<String>> {
+    let slash = format!("{target}/");
+    let path = target.strip_prefix("https://mkultra.monster").unwrap_or("");
+    let base = path.rsplit('/').next().unwrap_or("");
+    let key = percent_decode(base);
+    let Some(row) = db
+        .query_opt(
+            "SELECT id::bigint, actor_key FROM ap_users
+             WHERE disabled_at IS NULL AND (actor_id = $1 OR actor_id = $2 OR lower(actor_key) = lower($3)) LIMIT 1",
+            &[&target, &slash, &key],
+        )
+        .await?
+    else {
+        return Ok(None);
+    };
+    let owner: i64 = row.get(0);
+    let actor_key: String = row.get(1);
+    let manual = db
+        .query_opt(
+            "SELECT COALESCE(manually_approves::text, '0') NOT IN ('0', 'false', 'f') FROM actor_profile WHERE actor_key = $1",
+            &[&actor_key],
+        )
+        .await?
+        .is_some_and(|r| r.get::<_, bool>(0));
+    let result = if manual { "local_follow_pending" } else { "local_accept_followback" };
+    Ok(Some(format!("{result} {owner}")))
+}
+
 /// `rawurldecode` for a path segment.
 fn percent_decode(s: &str) -> String {
     let b = s.as_bytes();
@@ -430,6 +503,27 @@ fn percent_decode(s: &str) -> String {
         i += 1;
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+#[cfg(test)]
+mod follow_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn follow_targets() {
+        let f = |o: Value| follow_target(&json!({"type": "Follow", "actor": "https://m.test/users/a", "object": o}));
+        assert_eq!(f(json!("https://mkultra.monster/users/cmdr_nova/")).as_deref(), Some("https://mkultra.monster/users/cmdr_nova"));
+        assert_eq!(f(json!(["https://mkultra.monster/users/luna"])).as_deref(), Some("https://mkultra.monster/users/luna"));
+        assert_eq!(f(json!({"id": "https://mkultra.monster/users/luna"})).as_deref(), Some("https://mkultra.monster/users/luna"));
+        assert_eq!(
+            f(json!({"type": "Follow", "object": "https://mkultra.monster/users/luna"})).as_deref(),
+            Some("https://mkultra.monster/users/luna")
+        );
+        assert_eq!(f(json!("https://m.test/users/b")), None);
+        assert_eq!(follow_target(&json!({"type": "Follow", "object": "https://mkultra.monster/users/luna"})), None);
+        assert_eq!(follow_target(&json!({"type": "Like", "actor": "https://m.test/users/a", "object": "https://mkultra.monster/users/luna"})), None);
+    }
 }
 
 #[cfg(test)]
