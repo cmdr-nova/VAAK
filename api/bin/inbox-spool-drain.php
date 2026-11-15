@@ -157,6 +157,61 @@ function inbox_drain_interaction_shadow_note(PDO $db, int $id, string $rust, str
 }
 
 /**
+ * Cutover F6 shadow: a Follow of a local account. Rust predicted
+ * "local_accept_followback {owner}" or "local_follow_pending {owner}". Agree
+ * needs the same result and that owner's followers row for the actor (a
+ * pending follow: a pending ap_follow_requests row). PHP's other Follow
+ * result, local_follow_fail (the follower's actor document or inbox could not
+ * be fetched), is a disagreement; anything else counts as skipped.
+ */
+function inbox_drain_follow_shadow_note(PDO $db, int $id, string $rust, string $php, string $body): void
+{
+    $parts = explode(' ', $rust, 2);
+    $rustResult = $parts[0];
+    $owner = isset($parts[1]) ? (int) $parts[1] : 0;
+    $field = 'skipped';
+    if (in_array($php, ['local_accept_followback', 'local_follow_pending', 'local_follow_fail'], true)) {
+        $field = $php === $rustResult ? 'agree' : 'disagree';
+        $why = $field === 'disagree' ? 'result' : '';
+        if ($field === 'agree') {
+            try {
+                $doc = json_decode($body, true);
+                $actor = is_array($doc) ? rtrim((string) (ap_as_id($doc['actor'] ?? null) ?? ''), '/') : '';
+                $ownerActor = (string) ($db->query('SELECT actor_id FROM ap_users WHERE id = ' . (int) $owner)->fetchColumn() ?: '');
+                $ownerActor = rtrim($ownerActor, '/');
+                if ($php === 'local_follow_pending') {
+                    $st = $db->prepare("SELECT 1 FROM ap_follow_requests WHERE owner_actor_id = ? AND actor_id = ? AND status = 'pending' LIMIT 1");
+                } else {
+                    $st = $db->prepare('SELECT 1 FROM followers WHERE owner_actor_id = ? AND actor_id = ? LIMIT 1');
+                }
+                $st->execute([$ownerActor, $actor]);
+                if ($actor === '' || $ownerActor === '' || $st->fetchColumn() === false) {
+                    // The actor document can name a canonical id (Bridgy): worth a look.
+                    $field = 'disagree';
+                    $why = $php === 'local_follow_pending' ? 'request_missing' : 'follower_missing';
+                }
+            } catch (Throwable $e) {
+                $field = 'skipped';
+            }
+        }
+        if ($field === 'disagree') {
+            ap_log(sprintf('route_shadow_disagree id=%d rust=%s php=%s why=%s', $id, $rustResult, $php, $why));
+        }
+    }
+    $redis = function_exists('ap_redis_client') ? ap_redis_client() : null;
+    if (!$redis) {
+        return;
+    }
+    try {
+        $redis->hIncrBy('vaak:inbox_route_shadow:stats:v1', $field, 1);
+        $redis->hIncrBy('vaak:inbox_route_shadow:stats:v1', $field . ':' . $rustResult, 1);
+        $redis->expire('vaak:inbox_route_shadow:stats:v1', 14 * 86400);
+    } catch (Throwable $e) {
+        // Shadow stats only.
+    }
+}
+
+/**
  * Cutover F5/F5b: a like or boost Rust routed itself leaves the phone push to PHP as a job
  * on vaak:queue:inbox_webpush (rust/vaak-worker/src/inbox_route_like.rs). Same
  * call ap_local_observe makes after storing the mention row.
@@ -306,6 +361,11 @@ while (time() < $deadline) {
             $rust = inbox_drain_route_shadow_result($db, $id);
             if ($rust !== null) {
                 inbox_drain_interaction_shadow_note($db, $id, $rust, (string) $out['result'], (string) $row['body']);
+            }
+        } elseif ($shadowType === 'follow') {
+            $rust = inbox_drain_route_shadow_result($db, $id);
+            if ($rust !== null) {
+                inbox_drain_follow_shadow_note($db, $id, $rust, (string) $out['result'], (string) $row['body']);
             }
         }
     } catch (Throwable $e) {
