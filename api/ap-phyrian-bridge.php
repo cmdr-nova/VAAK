@@ -117,17 +117,11 @@ function ap_phyrian_bridge_migrate(?PDO $db = null): void
             'CREATE INDEX IF NOT EXISTS phyrian_bridge_challenges_owner_idx
              ON phyrian_bridge_challenges (owner_user_id, expires_at DESC)'
         );
-        foreach ([
-            'last_synced_at TIMESTAMPTZ',
-        ] as $colDef) {
+        if (!ap_column_exists($db, 'phyrian_bridge_links', 'last_synced_at')) {
             try {
-                $db->exec('ALTER TABLE phyrian_bridge_links ADD COLUMN IF NOT EXISTS ' . $colDef);
+                $db->exec('ALTER TABLE phyrian_bridge_links ADD COLUMN IF NOT EXISTS last_synced_at TIMESTAMPTZ');
             } catch (Throwable $e) {
-                try {
-                    $db->exec('ALTER TABLE phyrian_bridge_links ADD COLUMN ' . $colDef);
-                } catch (Throwable $e2) {
-                    // Column already exists.
-                }
+                // No DDL privilege, or the column was added concurrently.
             }
         }
     } catch (Throwable $e) {
@@ -849,7 +843,9 @@ function ap_phyrian_bridge_apply_opensim_player(int $ownerUserId, array $osPlaye
 
     // Optional lineage depth column (OpenSim-shaped dossier).
     try {
-        ap_db()->exec('ALTER TABLE phyrian_players ADD COLUMN IF NOT EXISTS lineage_depth INTEGER');
+        if (!ap_column_exists(ap_db(), 'phyrian_players', 'lineage_depth')) {
+            ap_db()->exec('ALTER TABLE phyrian_players ADD COLUMN IF NOT EXISTS lineage_depth INTEGER');
+        }
     } catch (Throwable $e) {
     }
     if ($lineageDepth > 0) {

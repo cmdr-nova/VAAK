@@ -125,23 +125,22 @@ function ap_phyrian_migrate(?PDO $db = null): void
         'CREATE INDEX IF NOT EXISTS phyrian_requests_to_pending_idx
          ON phyrian_requests (to_owner_id, status, created_at DESC)'
     );
-    // OpenSim-parity counters for the dossier readout (safe if already present).
+    // OpenSim-parity counters for the dossier readout. ALTER only when the
+    // column is missing: IF NOT EXISTS still takes ACCESS EXCLUSIVE.
     foreach ([
-        'banked_resonance INTEGER NOT NULL DEFAULT 0',
-        'resonance_exchanges INTEGER NOT NULL DEFAULT 0',
-        'inductions_given INTEGER NOT NULL DEFAULT 0',
-        'lineage_depth INTEGER',
-        'daily_resonance_decay INTEGER NOT NULL DEFAULT 5',
-    ] as $colDef) {
+        'banked_resonance' => 'INTEGER NOT NULL DEFAULT 0',
+        'resonance_exchanges' => 'INTEGER NOT NULL DEFAULT 0',
+        'inductions_given' => 'INTEGER NOT NULL DEFAULT 0',
+        'lineage_depth' => 'INTEGER',
+        'daily_resonance_decay' => 'INTEGER NOT NULL DEFAULT 5',
+    ] as $column => $definition) {
+        if (ap_column_exists($db, 'phyrian_players', $column)) {
+            continue;
+        }
         try {
-            $db->exec('ALTER TABLE phyrian_players ADD COLUMN IF NOT EXISTS ' . $colDef);
+            $db->exec('ALTER TABLE phyrian_players ADD COLUMN IF NOT EXISTS ' . $column . ' ' . $definition);
         } catch (Throwable $e) {
-            // Older PG without IF NOT EXISTS — ignore duplicate_column.
-            try {
-                $db->exec('ALTER TABLE phyrian_players ADD COLUMN ' . $colDef);
-            } catch (Throwable $e2) {
-                // Column already exists.
-            }
+            // No DDL privilege, or the column was added concurrently.
         }
     }
     $done = true;

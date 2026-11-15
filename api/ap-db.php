@@ -557,6 +557,70 @@ function ap_schema_has_column(PDO $db, string $table, string $column): bool
     return is_array($columns) && array_key_exists($column, $columns);
 }
 
+/**
+ * Whether $table.$column is already present.
+ *
+ * Catalog read only: the schema snapshot already bound to this connection,
+ * or information_schema / PRAGMA table_info. Those take ACCESS SHARE, not
+ * the ACCESS EXCLUSIVE lock ALTER TABLE needs, so a column that already
+ * exists does not wait out lock_timeout behind pg_dump. A positive answer
+ * is cached for this process. A miss is not, so a column added later in
+ * the same process is still visible.
+ */
+function ap_column_exists(PDO $db, string $table, string $column): bool
+{
+    static $yes = [];
+    if (!preg_match('/^[A-Za-z_][A-Za-z0-9_]*$/', $table)
+        || !preg_match('/^[A-Za-z_][A-Za-z0-9_]*$/', $column)) {
+        throw new InvalidArgumentException('ap_column_exists: invalid identifier');
+    }
+    $key = spl_object_id($db) . "\0" . $table . "\0" . $column;
+    if (isset($yes[$key])) {
+        return true;
+    }
+    if (ap_db_driver($db) === 'pgsql') {
+        $store = &ap_schema_store();
+        $conn = spl_object_id($db);
+        $snapKey = $store['local'][$conn] ?? null;
+        if (is_string($snapKey)
+            && isset($store['snap'][$snapKey]['columns'][$table])
+            && is_array($store['snap'][$snapKey]['columns'][$table])
+            && array_key_exists($column, $store['snap'][$snapKey]['columns'][$table])) {
+            $yes[$key] = true;
+            return true;
+        }
+        $st = $db->prepare(
+            'SELECT 1 FROM information_schema.columns
+             WHERE table_schema = current_schema()
+               AND table_name = ?
+               AND column_name = ?'
+        );
+        $st->execute([$table, $column]);
+        if (!$st->fetchColumn()) {
+            return false;
+        }
+    } else {
+        $rows = $db->query('PRAGMA table_info("' . $table . '")')->fetchAll();
+        $found = false;
+        foreach ($rows as $row) {
+            if (!is_array($row)) {
+                continue;
+            }
+            // name is index 1 when the connection is not in associative fetch mode.
+            $name = (string) ($row['name'] ?? $row[1] ?? '');
+            if ($name === $column) {
+                $found = true;
+                break;
+            }
+        }
+        if (!$found) {
+            return false;
+        }
+    }
+    $yes[$key] = true;
+    return true;
+}
+
 /** False when the column is absent. Null is a real SQL default of NULL. */
 function ap_schema_column_default(PDO $db, string $table, string $column): mixed
 {
@@ -1345,6 +1409,32 @@ function ap_db_is_locked_exception(Throwable $e): bool
     return str_contains($msg, 'database is locked')
         || str_contains($msg, 'SQLITE_BUSY')
         || str_contains($msg, 'SQLSTATE[HY000]: General error: 5');
+}
+
+/**
+ * PostgreSQL lock_timeout (55P03), deadlock (40P01), or serialization
+ * failure (40001). Statement timeout is a different error and stays fatal.
+ */
+function ap_db_is_lock_timeout(Throwable $e): bool
+{
+    $codes = ['55P03', '40P01', '40001'];
+    if (in_array((string) $e->getCode(), $codes, true)) {
+        return true;
+    }
+    if ($e instanceof PDOException) {
+        $state = (string) ($e->errorInfo[0] ?? '');
+        if (in_array($state, $codes, true)) {
+            return true;
+        }
+    }
+    $msg = $e->getMessage();
+    return stripos($msg, '55P03') !== false
+        || stripos($msg, '40P01') !== false
+        || stripos($msg, '40001') !== false
+        || stripos($msg, 'lock timeout') !== false
+        || stripos($msg, 'lock not available') !== false
+        || stripos($msg, 'could not obtain lock') !== false
+        || stripos($msg, 'deadlock detected') !== false;
 }
 
 /**

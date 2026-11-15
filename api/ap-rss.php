@@ -61,14 +61,23 @@ function ap_rss_migrate(): void
     if ($db->getAttribute(PDO::ATTR_DRIVER_NAME) === 'pgsql') try {
         // Playable media (Reddit video, gifs, galleries) and the source's own
         // NSFW/spoiler flags. Readers go through to_jsonb(i) or i.* so an
-        // older table without these columns still paints.
-        $db->exec("ALTER TABLE rss_items ADD COLUMN IF NOT EXISTS media_json TEXT NOT NULL DEFAULT ''");
-        $db->exec('ALTER TABLE rss_items ADD COLUMN IF NOT EXISTS sensitive BOOLEAN NOT NULL DEFAULT FALSE');
-        $db->exec("ALTER TABLE rss_items ADD COLUMN IF NOT EXISTS spoiler_text TEXT NOT NULL DEFAULT ''");
+        // older table without these columns still paints. ALTER only when a
+        // column is missing: IF NOT EXISTS still takes ACCESS EXCLUSIVE.
+        foreach ([
+            'media_json' => "ALTER TABLE rss_items ADD COLUMN IF NOT EXISTS media_json TEXT NOT NULL DEFAULT ''",
+            'sensitive' => 'ALTER TABLE rss_items ADD COLUMN IF NOT EXISTS sensitive BOOLEAN NOT NULL DEFAULT FALSE',
+            'spoiler_text' => "ALTER TABLE rss_items ADD COLUMN IF NOT EXISTS spoiler_text TEXT NOT NULL DEFAULT ''",
+        ] as $column => $sql) {
+            if (!ap_column_exists($db, 'rss_items', $column)) {
+                $db->exec($sql);
+            }
+        }
     } catch (Throwable $e) {
         // A table owned by another role refuses ALTER; items then stay image/link only.
+        // lock_timeout while pg_dump holds ACCESS SHARE is the same kind of skip.
         if (stripos($e->getMessage(), 'permission denied') === false
-            && stripos($e->getMessage(), 'must be owner') === false) {
+            && stripos($e->getMessage(), 'must be owner') === false
+            && !ap_db_is_lock_timeout($e)) {
             throw $e;
         }
     }

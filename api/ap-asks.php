@@ -22,8 +22,13 @@ function ap_asks_migrate(): void
             updated_at TEXT NOT NULL
         )");
         // Portable upgrade for databases created before Ask answers were linked
-        // to their resulting public post.
-        try { ap_db()->exec('ALTER TABLE ap_asks ADD COLUMN answer_note_id TEXT'); } catch (Throwable $e) { /* already exists */ }
+        // to their resulting public post. Skip when the column is already
+        // there: ADD COLUMN takes ACCESS EXCLUSIVE even if it is a no-op.
+        try {
+            if (!ap_column_exists(ap_db(), 'ap_asks', 'answer_note_id')) {
+                ap_db()->exec('ALTER TABLE ap_asks ADD COLUMN answer_note_id TEXT');
+            }
+        } catch (Throwable $e) { /* already exists */ }
         ap_db()->exec('CREATE INDEX IF NOT EXISTS idx_ap_asks_owner ON ap_asks(owner_user_id, answered, created_at DESC)');
         ap_db()->exec("CREATE TABLE IF NOT EXISTS ap_wafrn_friend_servers (
             host TEXT PRIMARY KEY, enabled INTEGER NOT NULL DEFAULT 1,
