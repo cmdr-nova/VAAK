@@ -16,6 +16,9 @@
 #
 # Schema: .github/scripts/pg-ci-schema.php stages the legacy tables, then
 # deploy/remote/migrate.php applies the PostgreSQL migrations as on deploy.
+# recommendation-index-parallel-smoke.php then builds the recommendation
+# indexes on this server with parallel maintenance workers forced on,
+# including the invalid-index rebuild.
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -100,6 +103,9 @@ SELECT setval(pg_get_serial_sequence('ap_users', 'id'), 1);
 INSERT INTO actor_profile (actor_key, name, summary, updated_at)
 VALUES ('ci_owner', 'CI owner', '', '2026-01-01T00:00:00Z');
 SQL
+
+echo "==> api/bin/recommendation-index-parallel-smoke.php"
+"$runner" api/bin/recommendation-index-parallel-smoke.php
 
 echo "==> vaak-worker serve"
 mkdir -p "${work}/worker"
@@ -265,4 +271,4 @@ VAAK_SMOKE_DSN="$AP_DB_DSN" run "$runner" api/bin/banned-account-server-block-sm
 # Last: it empties the Nostr tables of this disposable database.
 NOSTR_E2E_PG_DSN="$AP_DB_DSN" run "$runner" api/bin/nostr-trend-tags-smoke.php
 
-echo "db smokes: 17 passed"
+echo "db smokes: 18 passed"

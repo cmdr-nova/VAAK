@@ -79,12 +79,58 @@ foreach ($functions as $statement) {
 }
 $functionSql = implode("\n", $functions);
 $check(
-    str_contains($functionSql, 'CREATE OR REPLACE FUNCTION vaak_reco_quote_key')
-        && str_contains($functionSql, 'CREATE OR REPLACE FUNCTION vaak_reco_signal_key'),
-    'existing recommendation helpers are replaced, not created again'
+    str_contains($functionSql, 'CREATE OR REPLACE FUNCTION vaak_reco_quote_key(raw text) RETURNS text')
+        && str_contains($functionSql, 'CREATE OR REPLACE FUNCTION vaak_reco_signal_key(raw text, field text) RETURNS text'),
+    'existing recommendation helpers are replaced with the same signature'
 );
 $check(str_contains($functionSql, "doc #>> '{object,quote}'") && str_contains($functionSql, "doc #>> '{object,quoteUrl}'") && str_contains($functionSql, "doc #>> '{object,_misskey_quote}'"), 'quote helper reads the same three fields as the old document');
-$check(substr_count($functionSql, 'EXCEPTION WHEN others THEN') === 2 && str_contains($functionSql, 'IMMUTABLE'), 'helpers stay immutable and ignore invalid JSON');
+$check(str_contains($functionSql, 'doc ->> field') && str_contains($functionSql, 'RETURN rtrim(val, \'/\')'), 'signal helper still returns the trimmed field');
+$check(
+    !str_contains($functionSql, 'EXCEPTION')
+        && substr_count($functionSql, 'pg_catalog.pg_input_is_valid(raw, \'jsonb\')') === 2
+        && substr_count($functionSql, 'IMMUTABLE') === 2
+        && substr_count($functionSql, 'PARALLEL SAFE') === 2,
+    'helpers stay immutable and parallel safe without a subtransaction'
+);
+$planActions = [];
+foreach (array_keys($specs) as $indexName) {
+    $planActions[$indexName] = 'skip';
+}
+$planActions['idx_reco_outbox_quote_key'] = 'rebuild';
+$planActions['idx_reco_signals_owner_meta_uri'] = 'create';
+$plan = vaak_migrate_recommendation_statements($planActions);
+$flatPlan = array_map(static fn (string $sql): string => preg_replace('/\s+/', ' ', trim($sql)) ?: $sql, $plan);
+$dropAt = null;
+$replaceQuoteAt = null;
+$replaceSignalAt = null;
+$createQuoteAt = null;
+$createSignalAt = null;
+foreach ($flatPlan as $i => $sql) {
+    if (str_starts_with($sql, 'DROP INDEX CONCURRENTLY IF EXISTS idx_reco_outbox_quote_key')) {
+        $dropAt = $i;
+    }
+    if (str_starts_with($sql, 'CREATE OR REPLACE FUNCTION vaak_reco_quote_key')) {
+        $replaceQuoteAt = $i;
+    }
+    if (str_starts_with($sql, 'CREATE OR REPLACE FUNCTION vaak_reco_signal_key')) {
+        $replaceSignalAt = $i;
+    }
+    if (str_starts_with($sql, 'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_reco_outbox_quote_key')) {
+        $createQuoteAt = $i;
+    }
+    if (str_starts_with($sql, 'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_reco_signals_owner_meta_uri')) {
+        $createSignalAt = $i;
+    }
+}
+$check(
+    $dropAt !== null && $replaceQuoteAt !== null && $replaceSignalAt !== null && $createQuoteAt !== null && $createSignalAt !== null
+        && $dropAt < $replaceQuoteAt && $dropAt < $replaceSignalAt
+        && $replaceQuoteAt < $createQuoteAt && $replaceSignalAt < $createQuoteAt
+        && $replaceSignalAt < $createSignalAt,
+    'invalid quote index is dropped before either helper is replaced, then rebuilt'
+);
+$skipPlan = vaak_migrate_recommendation_statements(array_fill_keys(array_keys($specs), 'skip'));
+$check(count($skipPlan) === 2 && !str_contains(implode("\n", $skipPlan), 'INDEX'), 'valid indexes are left in place while the helpers are replaced');
 $check(str_contains($specs['idx_reco_signals_owner_target']['create'], 'WHERE weight>0 AND signal_type IN (' . ap_home_recommendation_signal_types_sql() . ')'), 'signal index repeats the positive-signal predicate');
 $check(vaak_migrate_notification_index_plan(false, null) === 'missing-table', 'a missing table does not pretend the index exists');
 $files = array_map('basename', vaak_migrate_deploy_sql_files($api));
