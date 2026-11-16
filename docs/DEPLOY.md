@@ -327,6 +327,7 @@ python3 deploy/test_release_commit.py
 python3 deploy/test_restart_plan.py
 python3 deploy/bump_version.py --check
 bash deploy/assemble-release.sh --self-test
+bash deploy/test_migrate_includes.sh
 bash deploy/remote/vaak-release-activate.sh --self-test
 ```
 
