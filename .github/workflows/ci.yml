@@ -26,8 +26,9 @@
 #                     Covers normalize-fixture-smoke.php (the ActivityPub
 #                     normalize fixtures), the *-client smokes against
 #                     `vaak-worker serve`, admin-safety, downrank-parity,
-#                     search-parity, direct-partial-blocks, and the
-#                     PostgreSQL copy of search-direct-undo-smoke.php.
+#                     search-parity, direct-partial-blocks, the PostgreSQL
+#                     copy of search-direct-undo-smoke.php, and the
+#                     recommendation index build with parallel workers on.
 
 name: CI
 

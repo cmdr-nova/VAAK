@@ -1,11 +1,15 @@
--- Same statements as vaak_migrate_recommendation_indexes() in
--- deploy/remote/migrate.php. Deploy runs them automatically, outside a
--- transaction. CREATE INDEX CONCURRENTLY cannot run inside the additive
--- loop (vaak_migrate_deploy_sql_files), which also refuses indexes on
--- existing tables. Re-running is a no-op once an index is valid. The
--- helpers match the old quote/signal extraction on valid JSON. Invalid
--- JSON yields no key, so one bad row cannot fail the index build.
--- A page load must not build these indexes.
+-- Helper and CREATE INDEX text for the recommendation probes.
+-- Deploy does not run this file (it is not in vaak_migrate_deploy_sql_files).
+-- deploy/remote/migrate.php runs the same helpers and CREATE INDEX
+-- statements outside a transaction. A failed CREATE INDEX CONCURRENTLY
+-- leaves an INVALID index, and IF NOT EXISTS below would skip it forever.
+-- migrate.php checks pg_index.indisvalid, drops that index, and only then
+-- replaces the helpers, so the replace is not blocked by the dependency.
+-- The helpers stay IMMUTABLE and PARALLEL SAFE. They do not use an
+-- EXCEPTION block: entering one starts a subtransaction, and a parallel
+-- index build cannot. Invalid JSON is rejected with pg_input_is_valid
+-- (PostgreSQL 16). Results match the previous helpers. A page load must
+-- not build these indexes.
 CREATE OR REPLACE FUNCTION vaak_reco_quote_key(raw text) RETURNS text
 LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE
 SET search_path = pg_catalog
@@ -16,11 +20,10 @@ BEGIN
   IF raw IS NULL OR strpos(raw, 'quote') <= 0 THEN
     RETURN '';
   END IF;
-  BEGIN
-    doc := raw::jsonb;
-  EXCEPTION WHEN others THEN
+  IF NOT pg_catalog.pg_input_is_valid(raw, 'jsonb') THEN
     RETURN '';
-  END;
+  END IF;
+  doc := raw::jsonb;
   RETURN rtrim(COALESCE(doc #>> '{object,quote}', doc #>> '{object,quoteUrl}', doc #>> '{object,_misskey_quote}', ''), '/');
 END;
 $fn$;
@@ -35,11 +38,10 @@ BEGIN
   IF raw IS NULL OR raw = '' OR field IS NULL OR field = '' THEN
     RETURN NULL;
   END IF;
-  BEGIN
-    doc := raw::jsonb;
-  EXCEPTION WHEN others THEN
+  IF NOT pg_catalog.pg_input_is_valid(raw, 'jsonb') THEN
     RETURN NULL;
-  END;
+  END IF;
+  doc := raw::jsonb;
   val := doc ->> field;
   IF val IS NULL THEN
     RETURN NULL;

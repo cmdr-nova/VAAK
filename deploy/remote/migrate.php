@@ -486,12 +486,21 @@ function vaak_migrate_home_bsky_indexes(PDO $db): void
  * outside a transaction. A valid index is left untouched. An invalid leftover
  * is dropped and created again. A page load must not build them.
  *
- * The helpers are CREATE OR REPLACE and each index is CREATE INDEX
- * CONCURRENTLY IF NOT EXISTS. A deploy that stops after the helpers leaves
- * vaak_reco_quote_key and vaak_reco_signal_key in place while the nine
- * idx_reco_* indexes are still absent; the next run replaces the helpers
- * and creates only the missing indexes. A valid index from an earlier step,
- * including idx_bsky_actor_profiles_did, is skipped by its own plan.
+ * The helpers are CREATE OR REPLACE (signature unchanged) and each index is
+ * CREATE INDEX CONCURRENTLY IF NOT EXISTS. A failed concurrent build leaves
+ * an INVALID index that still depends on the helper, and IF NOT EXISTS would
+ * skip that index forever. The drop runs before the helpers are replaced, so
+ * a server that refuses CREATE OR REPLACE FUNCTION while that dependency
+ * exists can still install the new bodies. Valid indexes are not rebuilt:
+ * the helper results are unchanged, so an index already built on them stays
+ * correct and the next deploy replaces the same signature in place.
+ *
+ * Both helpers stay IMMUTABLE and PARALLEL SAFE. A PL/pgSQL EXCEPTION block
+ * starts a subtransaction, which a parallel index build cannot do (PostgreSQL
+ * 16 raises SQLSTATE 25000 inside the maintenance worker). Invalid JSON is
+ * rejected with pg_input_is_valid instead. That function exists on PostgreSQL
+ * 16; CI uses postgres:16. The expressions stay vaak_reco_quote_key and
+ * vaak_reco_signal_key, so the recommendation queries match these indexes.
  */
 /** @return list<string> */
 function vaak_migrate_recommendation_function_statements(): array
@@ -508,11 +517,10 @@ BEGIN
   IF raw IS NULL OR strpos(raw, 'quote') <= 0 THEN
     RETURN '';
   END IF;
-  BEGIN
-    doc := raw::jsonb;
-  EXCEPTION WHEN others THEN
+  IF NOT pg_catalog.pg_input_is_valid(raw, 'jsonb') THEN
     RETURN '';
-  END;
+  END IF;
+  doc := raw::jsonb;
   RETURN rtrim(COALESCE(doc #>> '{object,quote}', doc #>> '{object,quoteUrl}', doc #>> '{object,_misskey_quote}', ''), '/');
 END;
 $fn$
@@ -529,11 +537,10 @@ BEGIN
   IF raw IS NULL OR raw = '' OR field IS NULL OR field = '' THEN
     RETURN NULL;
   END IF;
-  BEGIN
-    doc := raw::jsonb;
-  EXCEPTION WHEN others THEN
+  IF NOT pg_catalog.pg_input_is_valid(raw, 'jsonb') THEN
     RETURN NULL;
-  END;
+  END IF;
+  doc := raw::jsonb;
   val := doc ->> field;
   IF val IS NULL THEN
     RETURN NULL;
@@ -653,14 +660,45 @@ function vaak_migrate_recommendation_index_statements(string $name, string $acti
     throw new RuntimeException('recommendation index was not created');
 }
 
+/**
+ * Drops of invalid indexes, then the helper replace, then creates.
+ *
+ * @param array<string, string> $actions name => skip|create|rebuild
+ * @return list<string>
+ */
+function vaak_migrate_recommendation_statements(array $actions, ?string $apiRoot = null): array
+{
+    $drops = [];
+    $creates = [];
+    foreach ($actions as $name => $action) {
+        if ($action === 'skip') {
+            continue;
+        }
+        $statements = vaak_migrate_recommendation_index_statements($name, $action, $apiRoot);
+        if ($action === 'rebuild') {
+            $drops[] = $statements[0];
+            $creates[] = $statements[1];
+            continue;
+        }
+        if ($action === 'create') {
+            $creates[] = $statements[0];
+            continue;
+        }
+        throw new RuntimeException('recommendation index was not created');
+    }
+    return array_merge($drops, vaak_migrate_recommendation_function_statements(), $creates);
+}
+
 function vaak_migrate_recommendation_indexes(PDO $db, ?string $apiRoot = null): void
 {
     if ($db->inTransaction()) {
         throw new RuntimeException('recommendation indexes must not run inside a transaction');
     }
-    foreach (vaak_migrate_recommendation_function_statements() as $statement) {
-        $db->exec($statement);
+    $version = trim((string) $db->query('SHOW server_version_num')->fetchColumn());
+    if (!ctype_digit($version) || (int) $version < 160000) {
+        throw new RuntimeException('recommendation helpers need PostgreSQL 16 (pg_input_is_valid)');
     }
+    $actions = [];
     foreach (vaak_migrate_recommendation_index_specs($apiRoot) as $name => $spec) {
         $table = $db->prepare(
             'SELECT 1 FROM pg_tables WHERE schemaname = current_schema() AND tablename = ?'
@@ -683,9 +721,10 @@ function vaak_migrate_recommendation_indexes(PDO $db, ?string $apiRoot = null): 
         if ($action === 'missing-table') {
             throw new RuntimeException($spec['table'] . ' is missing; recommendation index was not created');
         }
-        foreach (vaak_migrate_recommendation_index_statements($name, $action, $apiRoot) as $statement) {
-            $db->exec($statement);
-        }
+        $actions[$name] = $action;
+    }
+    foreach (vaak_migrate_recommendation_statements($actions, $apiRoot) as $statement) {
+        $db->exec($statement);
     }
 }
 

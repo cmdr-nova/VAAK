@@ -10,6 +10,7 @@
 #   direct-partial-blocks-smoke.php (PostgreSQL over a Unix socket)
 #   search-direct-undo-smoke.php's PostgreSQL copy (LIBRARY_FIXTURE_SOCKET set;
 #     the SQLite path below runs here too)
+#   recommendation-index-parallel-smoke.php (PostgreSQL parallel index build)
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/../.." && pwd)"
