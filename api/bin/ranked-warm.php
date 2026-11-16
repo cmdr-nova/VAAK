@@ -8,8 +8,9 @@ declare(strict_types=1);
  *
  * HTML soft-nav still warms via in-process `admin_tl_lean_ranked_warm` in
  * ap-admin.php. That cold path builds Home for whoever is loading it,
- * including an account the Rust loop skipped as idle. Do not re-enable
- * this CLI bridge.
+ * including an account the Rust loop skipped as idle. It is not a periodic
+ * loop, so it does not use the Rust input-marker skip: a missing cache is
+ * built. Do not re-enable this CLI bridge.
  */
 fwrite(STDERR, "ranked-warm.php retired — use: vaak-worker ranked-warm --once --owner-id=N\n");
 exit(3);

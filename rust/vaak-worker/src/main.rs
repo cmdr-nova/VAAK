@@ -65,6 +65,7 @@ mod phyrian;
 mod phyrian_card;
 mod ranked;
 mod ranked_warm;
+mod ranked_warm_marker;
 mod recommendations;
 mod redis_util;
 mod self_thread;
