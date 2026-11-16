@@ -42,6 +42,11 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_events_local_timeline_created
 -- engagement_counts.rs) look up replies by events.in_reply_to, VAAK
 -- accounts' likes and boosts by object_id, and stored Nostr replies and
 -- reposts by nostr_events.reply_to.
+-- idx_nostr_events_reply_to is partial (reply_to <> ''). A lookup uses it
+-- only when the query also requires reply_to <> ''. The nostr-sync ranking
+-- counts do (rust/vaak-worker/src/nostr/counts.rs). Empty reply_to is the
+-- default for a row with no parent, and note ids are never '', so that
+-- predicate does not change which rows match.
 CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_events_in_reply_to
     ON events (in_reply_to);
 CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_masto_favourites_object
