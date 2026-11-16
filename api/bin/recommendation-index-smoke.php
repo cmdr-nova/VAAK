@@ -30,7 +30,17 @@ $rust = (string) file_get_contents($root . '/rust/vaak-worker/src/recommendation
 $pgsql = ap_home_recommendation_interacted_sql(true, 2);
 $sqlite = ap_home_recommendation_interacted_sql(false, 1);
 
-$check(str_contains($migrate, 'vaak_migrate_recommendation_indexes($lock)'), 'migrate.php builds the recommendation indexes on its autocommit connection');
+$check(str_contains($migrate, 'vaak_migrate_recommendation_indexes($lock, $apiRoot)'), 'migrate.php builds the recommendation indexes on its autocommit connection');
+$check(vaak_migrate_recommendations_php($api) === $api . '/ap-recommendations.php', 'a passed api root is the file migrate requires');
+$check(vaak_migrate_recommendations_php(null) === $api . '/ap-recommendations.php', 'an omitted api root still finds the git checkout');
+$missingRoot = false;
+try {
+    vaak_migrate_recommendations_php($api . '/missing-release');
+} catch (RuntimeException $e) {
+    $missingRoot = str_contains($e->getMessage(), 'ap-recommendations.php')
+        && str_contains($e->getMessage(), 'missing-release');
+}
+$check($missingRoot, 'a release api directory without ap-recommendations.php fails clearly and does not fall back');
 $check(!preg_match('/CREATE\s+INDEX\b[^;]*idx_reco_/', $schema), 'a page load does not build the recommendation indexes');
 $check(!str_contains($pgsql, 'AS MATERIALIZED') && !str_contains($sqlite, 'AS MATERIALIZED'), 'the lookup does not materialize notes or signals');
 $check(str_contains($pgsql, 'EXISTS') && str_contains($pgsql, 'LIMIT 1'), 'postgres lookup probes one candidate and stops');
@@ -68,6 +78,11 @@ foreach ($functions as $statement) {
     $check(str_contains($flatSql, $flatStatement), 'helper SQL matches the migration file');
 }
 $functionSql = implode("\n", $functions);
+$check(
+    str_contains($functionSql, 'CREATE OR REPLACE FUNCTION vaak_reco_quote_key')
+        && str_contains($functionSql, 'CREATE OR REPLACE FUNCTION vaak_reco_signal_key'),
+    'existing recommendation helpers are replaced, not created again'
+);
 $check(str_contains($functionSql, "doc #>> '{object,quote}'") && str_contains($functionSql, "doc #>> '{object,quoteUrl}'") && str_contains($functionSql, "doc #>> '{object,_misskey_quote}'"), 'quote helper reads the same three fields as the old document');
 $check(substr_count($functionSql, 'EXCEPTION WHEN others THEN') === 2 && str_contains($functionSql, 'IMMUTABLE'), 'helpers stay immutable and ignore invalid JSON');
 $check(str_contains($specs['idx_reco_signals_owner_target']['create'], 'WHERE weight>0 AND signal_type IN (' . ap_home_recommendation_signal_types_sql() . ')'), 'signal index repeats the positive-signal predicate');

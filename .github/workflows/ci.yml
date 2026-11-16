@@ -5,8 +5,8 @@
 #   rust            — cargo build, clippy, and cargo test (including vaak-types
 #                     fixture_roundtrip). Many Rust tests shell out to
 #                     api/bin/php-policy-test, so this job installs PHP too.
-#   deploy-scripts  — SemVer bump + CHANGELOG, release-commit gate, release notes, restart plan, and
-#                     the production runner job guard
+#   deploy-scripts  — SemVer bump + CHANGELOG, release-commit gate, release notes, restart plan,
+#                     the production runner job guard, and assembled migrate.php include resolution
 #   cargo-audit     — RustSec advisories against rust/Cargo.lock. Fails on
 #                     vulnerabilities only; unmaintained and yanked warnings
 #                     are printed and do not fail the job.
@@ -55,6 +55,11 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
+      - name: Install PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.3"
+          coverage: none
       - name: Version, release commit, and restart plan
         run: |
           set -euo pipefail
@@ -67,6 +72,7 @@ jobs:
           python3 deploy/test_ask_jsonld_guard.py
           python3 deploy/bump_version.py --check
           bash deploy/assemble-release.sh --self-test
+          bash deploy/test_migrate_includes.sh
           bash deploy/test_runner_job_guard.sh
           bash deploy/test_backup_restore_drill.sh
           bash deploy/test_alert_notify.sh

@@ -486,7 +486,12 @@ function vaak_migrate_home_bsky_indexes(PDO $db): void
  * outside a transaction. A valid index is left untouched. An invalid leftover
  * is dropped and created again. A page load must not build them.
  *
- * @return array<string, array{table: string, create: string, drop: string}>
+ * The helpers are CREATE OR REPLACE and each index is CREATE INDEX
+ * CONCURRENTLY IF NOT EXISTS. A deploy that stops after the helpers leaves
+ * vaak_reco_quote_key and vaak_reco_signal_key in place while the nine
+ * idx_reco_* indexes are still absent; the next run replaces the helpers
+ * and creates only the missing indexes. A valid index from an earlier step,
+ * including idx_bsky_actor_profiles_did, is skipped by its own plan.
  */
 /** @return list<string> */
 function vaak_migrate_recommendation_function_statements(): array
@@ -540,9 +545,41 @@ SQL,
     ];
 }
 
-function vaak_migrate_recommendation_index_specs(): array
+/**
+ * ap-recommendations.php for the index expressions.
+ *
+ * Production passes the --api-root directory vaak_migrate_main() already
+ * checked. assemble-release.sh copies this script to the release root, next
+ * to api/, so dirname(__DIR__, 2) is above that tree and must not be the
+ * require. Callers that omit the directory (smokes, a direct function call)
+ * try the assembled layout first, then this checkout.
+ */
+function vaak_migrate_recommendations_php(?string $apiRoot = null): string
 {
-    require_once dirname(__DIR__, 2) . '/api/ap-recommendations.php';
+    if (is_string($apiRoot) && $apiRoot !== '') {
+        $path = rtrim($apiRoot, '/') . '/ap-recommendations.php';
+        if (!is_file($path)) {
+            throw new RuntimeException('ap-recommendations.php is missing from the release api directory: ' . $path);
+        }
+        return $path;
+    }
+    $assembled = __DIR__ . '/api/ap-recommendations.php';
+    if (is_file($assembled)) {
+        return $assembled;
+    }
+    $repo = dirname(__DIR__, 2) . '/api/ap-recommendations.php';
+    if (is_file($repo)) {
+        return $repo;
+    }
+    throw new RuntimeException(
+        'ap-recommendations.php was not found for recommendation indexes (tried ' . $assembled . ' and ' . $repo . ')'
+    );
+}
+
+/** @return array<string, array{table: string, create: string, drop: string}> */
+function vaak_migrate_recommendation_index_specs(?string $apiRoot = null): array
+{
+    require_once vaak_migrate_recommendations_php($apiRoot);
     $quote = ap_home_recommendation_pgsql_quote_key('raw_create_json');
     $metaObject = ap_home_recommendation_pgsql_signal_key('metadata_json', 'object_id');
     $metaUri = ap_home_recommendation_pgsql_signal_key('metadata_json', 'uri');
@@ -598,9 +635,9 @@ function vaak_migrate_recommendation_index_specs(): array
 }
 
 /** @return list<string> */
-function vaak_migrate_recommendation_index_statements(string $name, string $action): array
+function vaak_migrate_recommendation_index_statements(string $name, string $action, ?string $apiRoot = null): array
 {
-    $specs = vaak_migrate_recommendation_index_specs();
+    $specs = vaak_migrate_recommendation_index_specs($apiRoot);
     if (!isset($specs[$name])) {
         throw new RuntimeException('unknown recommendation index');
     }
@@ -616,7 +653,7 @@ function vaak_migrate_recommendation_index_statements(string $name, string $acti
     throw new RuntimeException('recommendation index was not created');
 }
 
-function vaak_migrate_recommendation_indexes(PDO $db): void
+function vaak_migrate_recommendation_indexes(PDO $db, ?string $apiRoot = null): void
 {
     if ($db->inTransaction()) {
         throw new RuntimeException('recommendation indexes must not run inside a transaction');
@@ -624,7 +661,7 @@ function vaak_migrate_recommendation_indexes(PDO $db): void
     foreach (vaak_migrate_recommendation_function_statements() as $statement) {
         $db->exec($statement);
     }
-    foreach (vaak_migrate_recommendation_index_specs() as $name => $spec) {
+    foreach (vaak_migrate_recommendation_index_specs($apiRoot) as $name => $spec) {
         $table = $db->prepare(
             'SELECT 1 FROM pg_tables WHERE schemaname = current_schema() AND tablename = ?'
         );
@@ -646,7 +683,7 @@ function vaak_migrate_recommendation_indexes(PDO $db): void
         if ($action === 'missing-table') {
             throw new RuntimeException($spec['table'] . ' is missing; recommendation index was not created');
         }
-        foreach (vaak_migrate_recommendation_index_statements($name, $action) as $statement) {
+        foreach (vaak_migrate_recommendation_index_statements($name, $action, $apiRoot) as $statement) {
             $db->exec($statement);
         }
     }
@@ -1277,7 +1314,7 @@ function vaak_migrate_main(array $argv): void
         vaak_migrate_notification_read_indexes($lock);
         vaak_migrate_home_bsky_indexes($lock);
         vaak_migrate_cpu_indexes($lock);
-        vaak_migrate_recommendation_indexes($lock);
+        vaak_migrate_recommendation_indexes($lock, $apiRoot);
         vaak_migrate_events_action_actor_indexes($lock);
         vaak_migrate_wafrn_crosspost_indexes($lock);
         $quoteTargets = vaak_migrate_event_quote_targets($lock);
