@@ -32,4 +32,9 @@ ap_home_recommendation_record_publication(['id'=>'https://mkultra.monster/users/
 $history=ap_home_recommendation_interacted_objects(201,['https://remote.test/posts/deleted-reply','https://remote.test/posts/deleted-quote']);
 if (count($history)!==2) throw new RuntimeException('durable reply/quote history');$count++;
 if (ap_home_recommendation_interacted_objects(202,['https://remote.test/posts/deleted-reply','https://remote.test/posts/deleted-quote'])!==[]) throw new RuntimeException('publication owner isolation');$count++;
+$pgsql = ap_home_recommendation_interacted_sql(true, 2);
+$sqliteSql = ap_home_recommendation_interacted_sql(false, 1);
+if (str_contains($pgsql, 'AS MATERIALIZED') || str_contains($sqliteSql, 'AS MATERIALIZED')) throw new RuntimeException('lookup still materializes the owner history');$count++;
+if (!str_contains($pgsql, 'EXISTS') || !str_contains($pgsql, 'LIMIT 1') || !str_contains($pgsql, "o.id ^@ (v.actor || '/notes/')")) throw new RuntimeException('postgres lookup is not a bounded prefix probe');$count++;
+if (str_contains($pgsql, ' LIKE ')) throw new RuntimeException('actor prefix must not use LIKE');$count++;
 echo "recommendations-behavior: PASS ($count checks; isolated SQLite, no network)\n";

@@ -474,6 +474,185 @@ function vaak_migrate_home_bsky_indexes(PDO $db): void
 }
 
 /**
+ * Indexes for the recommendation interaction lookup.
+ *
+ * The lookup used to materialize every note and signal an owner had stored,
+ * then hash-join that set to a small candidate list. work_mem is 16MB, so
+ * the hash spilled to temp files. The rewritten lookup probes one candidate
+ * at a time. These expressions are the probes (owner plus trimmed object id,
+ * note id prefix plus trimmed reply or quote, requester plus trimmed quote
+ * target, owner plus trimmed signal key). Existing tables, so they are not
+ * part of vaak_migrate_deploy_sql_files(). CREATE INDEX CONCURRENTLY runs
+ * outside a transaction. A valid index is left untouched. An invalid leftover
+ * is dropped and created again. A page load must not build them.
+ *
+ * @return array<string, array{table: string, create: string, drop: string}>
+ */
+/** @return list<string> */
+function vaak_migrate_recommendation_function_statements(): array
+{
+    return [
+        <<<'SQL'
+CREATE OR REPLACE FUNCTION vaak_reco_quote_key(raw text) RETURNS text
+LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE
+SET search_path = pg_catalog
+AS $fn$
+DECLARE
+  doc jsonb;
+BEGIN
+  IF raw IS NULL OR strpos(raw, 'quote') <= 0 THEN
+    RETURN '';
+  END IF;
+  BEGIN
+    doc := raw::jsonb;
+  EXCEPTION WHEN others THEN
+    RETURN '';
+  END;
+  RETURN rtrim(COALESCE(doc #>> '{object,quote}', doc #>> '{object,quoteUrl}', doc #>> '{object,_misskey_quote}', ''), '/');
+END;
+$fn$
+SQL,
+        <<<'SQL'
+CREATE OR REPLACE FUNCTION vaak_reco_signal_key(raw text, field text) RETURNS text
+LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE
+SET search_path = pg_catalog
+AS $fn$
+DECLARE
+  doc jsonb;
+  val text;
+BEGIN
+  IF raw IS NULL OR raw = '' OR field IS NULL OR field = '' THEN
+    RETURN NULL;
+  END IF;
+  BEGIN
+    doc := raw::jsonb;
+  EXCEPTION WHEN others THEN
+    RETURN NULL;
+  END;
+  val := doc ->> field;
+  IF val IS NULL THEN
+    RETURN NULL;
+  END IF;
+  RETURN rtrim(val, '/');
+END;
+$fn$
+SQL,
+    ];
+}
+
+function vaak_migrate_recommendation_index_specs(): array
+{
+    require_once dirname(__DIR__, 2) . '/api/ap-recommendations.php';
+    $quote = ap_home_recommendation_pgsql_quote_key('raw_create_json');
+    $metaObject = ap_home_recommendation_pgsql_signal_key('metadata_json', 'object_id');
+    $metaUri = ap_home_recommendation_pgsql_signal_key('metadata_json', 'uri');
+    $types = ap_home_recommendation_signal_types_sql();
+    $signalWhere = "WHERE weight>0 AND signal_type IN ($types)";
+    return [
+        'idx_reco_favourites_owner_object' => [
+            'table' => 'masto_favourites',
+            'create' => "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_reco_favourites_owner_object ON masto_favourites (owner_user_id, (rtrim(object_id,'/')))",
+            'drop' => 'DROP INDEX CONCURRENTLY IF EXISTS idx_reco_favourites_owner_object',
+        ],
+        'idx_reco_bookmarks_owner_object' => [
+            'table' => 'masto_bookmarks',
+            'create' => "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_reco_bookmarks_owner_object ON masto_bookmarks (owner_user_id, (rtrim(object_id,'/')))",
+            'drop' => 'DROP INDEX CONCURRENTLY IF EXISTS idx_reco_bookmarks_owner_object',
+        ],
+        'idx_reco_reblogs_owner_object' => [
+            'table' => 'masto_reblogs',
+            'create' => "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_reco_reblogs_owner_object ON masto_reblogs (owner_user_id, (rtrim(object_id,'/')))",
+            'drop' => 'DROP INDEX CONCURRENTLY IF EXISTS idx_reco_reblogs_owner_object',
+        ],
+        'idx_reco_outbox_reply_key' => [
+            'table' => 'outbox_notes',
+            'create' => "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_reco_outbox_reply_key ON outbox_notes ((rtrim(in_reply_to,'/')), id)",
+            'drop' => 'DROP INDEX CONCURRENTLY IF EXISTS idx_reco_outbox_reply_key',
+        ],
+        'idx_reco_outbox_quote_key' => [
+            'table' => 'outbox_notes',
+            'create' => "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_reco_outbox_quote_key ON outbox_notes (($quote), id) WHERE strpos(raw_create_json,'quote')>0 AND $quote<>''",
+            'drop' => 'DROP INDEX CONCURRENTLY IF EXISTS idx_reco_outbox_quote_key',
+        ],
+        'idx_reco_quote_auth_actor_target' => [
+            'table' => 'quote_authorizations',
+            'create' => "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_reco_quote_auth_actor_target ON quote_authorizations ((rtrim(requester_actor,'/')), (rtrim(quoted_note_id,'/')))",
+            'drop' => 'DROP INDEX CONCURRENTLY IF EXISTS idx_reco_quote_auth_actor_target',
+        ],
+        'idx_reco_signals_owner_target' => [
+            'table' => 'ap_user_signals',
+            'create' => "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_reco_signals_owner_target ON ap_user_signals (owner_user_id, (rtrim(target_key,'/'))) $signalWhere",
+            'drop' => 'DROP INDEX CONCURRENTLY IF EXISTS idx_reco_signals_owner_target',
+        ],
+        'idx_reco_signals_owner_meta_object' => [
+            'table' => 'ap_user_signals',
+            'create' => "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_reco_signals_owner_meta_object ON ap_user_signals (owner_user_id, ($metaObject)) $signalWhere",
+            'drop' => 'DROP INDEX CONCURRENTLY IF EXISTS idx_reco_signals_owner_meta_object',
+        ],
+        'idx_reco_signals_owner_meta_uri' => [
+            'table' => 'ap_user_signals',
+            'create' => "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_reco_signals_owner_meta_uri ON ap_user_signals (owner_user_id, ($metaUri)) $signalWhere",
+            'drop' => 'DROP INDEX CONCURRENTLY IF EXISTS idx_reco_signals_owner_meta_uri',
+        ],
+    ];
+}
+
+/** @return list<string> */
+function vaak_migrate_recommendation_index_statements(string $name, string $action): array
+{
+    $specs = vaak_migrate_recommendation_index_specs();
+    if (!isset($specs[$name])) {
+        throw new RuntimeException('unknown recommendation index');
+    }
+    if ($action === 'skip') {
+        return [];
+    }
+    if ($action === 'create') {
+        return [$specs[$name]['create']];
+    }
+    if ($action === 'rebuild') {
+        return [$specs[$name]['drop'], $specs[$name]['create']];
+    }
+    throw new RuntimeException('recommendation index was not created');
+}
+
+function vaak_migrate_recommendation_indexes(PDO $db): void
+{
+    if ($db->inTransaction()) {
+        throw new RuntimeException('recommendation indexes must not run inside a transaction');
+    }
+    foreach (vaak_migrate_recommendation_function_statements() as $statement) {
+        $db->exec($statement);
+    }
+    foreach (vaak_migrate_recommendation_index_specs() as $name => $spec) {
+        $table = $db->prepare(
+            'SELECT 1 FROM pg_tables WHERE schemaname = current_schema() AND tablename = ?'
+        );
+        $table->execute([$spec['table']]);
+        $tableExists = $table->fetchColumn() !== false;
+        $index = $db->prepare(
+            'SELECT i.indisvalid FROM pg_class c
+             JOIN pg_index i ON i.indexrelid = c.oid
+             JOIN pg_namespace n ON n.oid = c.relnamespace
+             WHERE n.nspname = current_schema() AND c.relname = ?'
+        );
+        $index->execute([$name]);
+        $row = $index->fetch();
+        $valid = is_array($row) ? vaak_migrate_pg_bool($row['indisvalid'] ?? null) : null;
+        if (is_array($row) && $valid === null) {
+            throw new RuntimeException('recommendation index validity is unknown');
+        }
+        $action = vaak_migrate_notification_index_plan($tableExists, $valid);
+        if ($action === 'missing-table') {
+            throw new RuntimeException($spec['table'] . ' is missing; recommendation index was not created');
+        }
+        foreach (vaak_migrate_recommendation_index_statements($name, $action) as $statement) {
+            $db->exec($statement);
+        }
+    }
+}
+
+/**
  * Indexes that make the hot Bluesky reads and the observation sync index
  * range scans. Existing tables, so they are not part of
  * vaak_migrate_deploy_sql_files(). CREATE INDEX CONCURRENTLY runs outside a
@@ -1098,6 +1277,7 @@ function vaak_migrate_main(array $argv): void
         vaak_migrate_notification_read_indexes($lock);
         vaak_migrate_home_bsky_indexes($lock);
         vaak_migrate_cpu_indexes($lock);
+        vaak_migrate_recommendation_indexes($lock);
         vaak_migrate_events_action_actor_indexes($lock);
         vaak_migrate_wafrn_crosspost_indexes($lock);
         $quoteTargets = vaak_migrate_event_quote_targets($lock);
