@@ -65,6 +65,8 @@ Units: `deploy/vaak-worker-notif.service`, `deploy/vaak-worker-notif-list.servic
 | `VAAK_SHADOW_HTTP` | `http://127.0.0.1:8787` | Axum shadow base for Mentions M5 + Home Axum-primary (loopback only) |
 | `VAAK_RANKED_NATIVE_HOME` | `1` (default) | Home ranked rebuild in Rust (incl. FoF/cold-start recommendations); `0` skips Home warm |
 | `VAAK_RANKED_NATIVE_LOCAL_FEED` | `1` (default) | Local + Federated ranked rebuild in Rust; `0` skips those views |
+| `VAAK_RANKED_WARM_ACTIVE_SECS` | `86400` | Multi-account ranked-warm loop only rebuilds accounts with a session, Home signal, OAuth token create/refresh, or post inside this many seconds. `0` warms every non-disabled account. A positive `--owner-id` is not filtered |
+| `VAAK_AUTH_SESSION_PATH` | `/var/lib/mkultra/ap/sessions` | PHP session dir read for `_vaak_last_seen` when choosing whom to prewarm |
 | `VAAK_HOME_HYDRATE_WARM` | `1` (default) | After non-empty Home ranked write, warm ranked→hydrate envelopes (15/40/80) in-process; `0` disables |
 | `VAAK_HOME_HYDRATE_WARM_COOLDOWN_SECS` | `60` | Redis cooldown between Home hydrate spawns per owner (30–600) |
 | `VAAK_TIMELINE_FANOUT_RUST` | `1` (default) | PHP enqueues timeline fan-out to Rust; `0` forces in-process PHP Redis prepend |

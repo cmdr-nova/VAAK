@@ -23,7 +23,9 @@ Environment=VAAK_RANKED_NATIVE_HOME=1
 Environment=VAAK_RANKED_NATIVE_LOCAL_FEED=1
 Environment=VAAK_FEATURE_BLUESKY_TAB=1
 Environment=RUST_LOG=info
-# owner-id 0 = every non-disabled ap_users row each tick.
+# owner-id 0 = non-disabled accounts active inside VAAK_RANKED_WARM_ACTIVE_SECS
+# (default 86400). Set that to 0 in vaak.env to warm every account again.
+# A Home load still builds an idle account on demand.
 ExecStart=/usr/local/bin/vaak-worker ranked-warm --loop --interval-secs 60 --owner-id 0 --views home,local,feed
 Restart=always
 RestartSec=10
