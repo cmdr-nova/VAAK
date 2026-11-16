@@ -17,14 +17,36 @@ $GLOBALS['db'] = new PDO('sqlite::memory:', null, null, [PDO::ATTR_ERRMODE => PD
 function ap_db(): PDO { return $GLOBALS['db']; }
 function ap_db_driver(?PDO $db = null): string { return 'sqlite'; }
 $GLOBALS['redis'] = [];
+$GLOBALS['redis_scalar'] = [];
+$GLOBALS['pattern_deletes'] = 0;
 function ap_redis_json_get(string $key): ?array { return $GLOBALS['redis'][$key] ?? null; }
 function ap_redis_json_set(string $key, array $value, int $ttl): bool { $GLOBALS['redis'][$key] = $value; return true; }
 function ap_redis_delete_pattern(string $pattern): void
 {
+    $GLOBALS['pattern_deletes']++;
     $prefix = rtrim($pattern, '*');
     foreach (array_keys($GLOBALS['redis']) as $k) {
         if (str_starts_with($k, $prefix)) unset($GLOBALS['redis'][$k]);
     }
+}
+function ap_redis_client(string $purpose = 'cache'): object
+{
+    return new class {
+        public function get(string $key): mixed
+        {
+            return $GLOBALS['redis_scalar'][$key] ?? false;
+        }
+        public function incr(string $key): int
+        {
+            $n = (int) ($GLOBALS['redis_scalar'][$key] ?? 0) + 1;
+            $GLOBALS['redis_scalar'][$key] = (string) $n;
+            return $n;
+        }
+        public function expire(string $key, int $ttl): bool
+        {
+            return true;
+        }
+    };
 }
 function ap_bsky_access_token(int $owner, bool $force): array { return ['ok' => true, 'access' => 'tok']; }
 function ap_bsky_session_row(int $owner): ?array { return ['pds_host' => 'https://pds.example', 'did' => 'did:plc:owner', 'handle' => 'owner.test']; }
@@ -54,6 +76,9 @@ reference_load($api . '/ap-bsky.php', [
     'ap_bsky_budget_begin', 'ap_bsky_budget_clear', 'ap_bsky_budget_remaining', 'ap_bsky_budget_exceeded', 'ap_bsky_effective_timeout',
     'ap_bsky_is_profile_ref', 'ap_bsky_get_profile', 'ap_bsky_actor_refresh_migrate', 'ap_bsky_actor_profile_cache_get',
     'ap_bsky_actor_profile_cache_upsert', 'ap_bsky_get_author_feed', 'ap_bsky_actor_profile_cold_fill', 'ap_bsky_actor_viewer_cache_update',
+    'ap_bsky_profile_cache_scope', 'ap_bsky_profile_cache_version_key', 'ap_bsky_profile_cache_version_memo',
+    'ap_bsky_profile_cache_version', 'ap_bsky_profile_cache_key', 'ap_bsky_profile_cache_invalidate',
+    'ap_bsky_sql_text_in', 'ap_bsky_pg_text_array', 'ap_bsky_actor_viewer_cache_update_many', 'ap_bsky_actor_viewer_cache_apply_chunk',
 ]);
 
 $checks = 0;
@@ -114,6 +139,38 @@ ap_bsky_actor_viewer_cache_update(1, 'did:plc:later', 'at://did:plc:owner/app.bs
 cold_check((ap_bsky_actor_profile_cache_get($laterRef, 1)['viewer']['following'] ?? '') === 'at://did:plc:owner/app.bsky.graph.follow/y', 'handle-keyed viewer row follows after a follow');
 ap_bsky_actor_viewer_cache_update(1, 'did:plc:later', null);
 cold_check((ap_bsky_actor_profile_cache_get($laterRef, 1)['viewer']['following'] ?? '') === '', 'unfollow clears it again');
+cold_check($GLOBALS['pattern_deletes'] === 0, 'profile cache bumps a generation instead of scanning Redis');
+cold_check(($GLOBALS['redis_scalar']['vaak:profile:v1:bsky:1:ver'] ?? '') !== '', 'owner generation key was incremented');
+$_SERVER['REQUEST_TIME_FLOAT'] = (string) microtime(true);
+$GLOBALS['redis_scalar']['vaak:profile:v1:bsky:1:ver'] = '4';
+ap_bsky_actor_profile_cache_get($laterRef, 1);
+$staleKey = null;
+foreach ($GLOBALS['redis'] as $key => $value) {
+    if (is_string($key) && str_starts_with($key, 'vaak:profile:v1:bsky:1:4:')) {
+        $GLOBALS['redis'][$key]['viewer']['following'] = 'stale';
+        $staleKey = $key;
+    }
+}
+cold_check($staleKey !== null, 'reader writes the generation into the profile cache key');
+$_SERVER['REQUEST_TIME_FLOAT'] = (string) (microtime(true) + 1);
+$GLOBALS['redis_scalar']['vaak:profile:v1:bsky:1:ver'] = '5';
+cold_check((ap_bsky_actor_profile_cache_get($laterRef, 1)['viewer']['following'] ?? '') === '', 'a bumped generation does not read the previous cache entry');
+$bumpsBefore = (int) $GLOBALS['redis_scalar']['vaak:profile:v1:bsky:1:ver'];
+$batchDb = ap_db();
+$batchDb->prepare('INSERT INTO bsky_actor_profiles (actor_ref, did, profile_json, updated_at) VALUES (?,?,?,?)')->execute(['https://bsky.app/profile/batch.test', 'did:plc:batch', '{}', gmdate('c')]);
+$batchDb->prepare('INSERT INTO bsky_actor_viewers (owner_user_id, actor_ref, following_uri, followed_by, updated_at) VALUES (?,?,?,?,?)')->execute([1, 'did:plc:batch', null, 1, gmdate('c')]);
+ap_bsky_actor_viewer_cache_update_many(1, ['did:plc:batch' => 'at://did:plc:owner/app.bsky.graph.follow/batch', 'did:plc:other' => null], true);
+cold_check((int) $GLOBALS['redis_scalar']['vaak:profile:v1:bsky:1:ver'] === $bumpsBefore + 1, 'a multi-DID viewer update bumps the generation once');
+$batchRow = $batchDb->prepare('SELECT following_uri, followed_by FROM bsky_actor_viewers WHERE owner_user_id = 1 AND actor_ref = ?');
+$batchRow->execute(['did:plc:batch']);
+$batchGot = $batchRow->fetch();
+cold_check(is_array($batchGot) && ($batchGot['following_uri'] ?? '') === 'at://did:plc:owner/app.bsky.graph.follow/batch' && (int) $batchGot['followed_by'] === 1, 'batch update keeps followed_by and sets the follow uri');
+$batchRow->execute(['https://bsky.app/profile/batch.test']);
+$batchAlias = $batchRow->fetch();
+cold_check(is_array($batchAlias) && ($batchAlias['following_uri'] ?? '') === 'at://did:plc:owner/app.bsky.graph.follow/batch', 'batch update writes the handle alias from one did lookup');
+$bskySource = (string) file_get_contents($api . '/ap-bsky.php');
+cold_check(str_contains($bskySource, '= ANY(CAST(? AS text[]))'), 'postgres loads profile aliases with did = ANY');
+cold_check(!str_contains($bskySource, "ap_redis_delete_pattern('vaak:profile:v1:bsky:"), 'profile invalidation does not scan Redis');
 
 // Kill switch and non-Bluesky refs.
 $GLOBALS['calls'] = [];

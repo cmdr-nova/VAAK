@@ -32,9 +32,12 @@ async fn connection(cfg:Option<&Config>)->Option<Conn>{
 impl Conn{
  fn forget(&self){if self.shared{if let Ok(mut g)=SHARED.lock(){if g.as_ref().is_some_and(|(url,_)|*url==self.url){*g=None;}}}}
  async fn get(&mut self,key:&str)->Option<Value>{let started=std::time::Instant::now();let r=tokio::time::timeout(std::time::Duration::from_millis(80),redis_util::json_get(&mut self.conn,key)).await;crate::profile_bridge::record_stage(crate::profile_bridge::Stage::HeaderRedis,started);match r{Ok(Ok(v))=>v,_=>{self.forget();None}}}
+ async fn get_raw(&mut self,key:&str)->Option<String>{let started=std::time::Instant::now();let r=tokio::time::timeout(std::time::Duration::from_millis(80),redis_util::get_string(&mut self.conn,key)).await;crate::profile_bridge::record_stage(crate::profile_bridge::Stage::HeaderRedis,started);match r{Ok(Ok(v))=>v,_=>{self.forget();None}}}
  async fn set(&mut self,key:&str,value:&Value,ttl:u64){let started=std::time::Instant::now();let r=tokio::time::timeout(std::time::Duration::from_millis(80),redis_util::json_set(&mut self.conn,key,value,ttl)).await;crate::profile_bridge::record_stage(crate::profile_bridge::Stage::HeaderRedis,started);if !matches!(r,Ok(Ok(()))){self.forget();}}
 }
 pub(crate) async fn read_json(cfg:&Config,key:&str)->Option<Value>{connection(Some(cfg)).await?.get(key).await}
+/// Plain GET for the Bluesky profile-cache generation (`INCR` stores a decimal string, not JSON).
+pub(crate) async fn read_string(cfg:&Config,key:&str)->Option<String>{connection(Some(cfg)).await?.get_raw(key).await}
 pub(crate) async fn write_json(cfg:&Config,key:&str,value:&Value,ttl:u64){if let Some(mut conn)=connection(Some(cfg)).await{conn.set(key,value,ttl).await;}}
 pub(super) async fn profile(cfg:Option<&Config>,key:&str,current:&Value)->Value{
  let cache_key=format!("vaak:profile:v1:{}",digest(card::php_trim(key)));let mut conn=connection(cfg).await;

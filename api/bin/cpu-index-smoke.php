@@ -32,8 +32,16 @@ $indexSql = (string) file_get_contents($api . '/migrations/20261015_cpu_load_ind
 $check(str_contains($migrate, 'vaak_migrate_cpu_indexes($lock)'), 'migrate.php builds the cpu indexes on its autocommit connection');
 $check(!preg_match('/CREATE\s+INDEX\b[^;]*idx_bsky_posts_lower_author_did/', $schema), 'a page load does not build the author-did expression index');
 $check(!preg_match('/CREATE\s+INDEX\b[^;]*idx_bsky_posts_lower_author_did/', $bsky), 'Bluesky setup does not build the author-did expression index');
+$check(!preg_match('/CREATE\s+INDEX\b[^;]*idx_bsky_actor_profiles_did/', $bsky), 'Bluesky setup does not build the actor profile did index');
+$check(str_contains($migrate, "\$spec['table'] === 'bsky_actor_profiles'"), 'a database without bsky_actor_profiles still migrates');
 
 $specs = vaak_migrate_cpu_index_specs();
+$check(
+    isset($specs['idx_bsky_actor_profiles_did'])
+        && str_contains($specs['idx_bsky_actor_profiles_did']['create'], 'ON bsky_actor_profiles (did)')
+        && !str_contains($specs['idx_bsky_actor_profiles_did']['create'], 'UNIQUE'),
+    'actor profile did index is a plain concurrent index'
+);
 $check(
     isset(
         $specs['idx_bsky_posts_lower_author_did'],

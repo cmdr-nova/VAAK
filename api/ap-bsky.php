@@ -10933,6 +10933,138 @@ SQL);
     }
 }
 
+/**
+ * Owner scope for the Bluesky profile Redis cache.
+ * Owner 0 is the shared public generation; it is not bumped by a signed-in sync.
+ */
+function ap_bsky_profile_cache_scope(int $ownerUserId): string
+{
+    return $ownerUserId > 0 ? (string) $ownerUserId : 'public';
+}
+
+/** Redis INCR key. Readers put this generation in the cache key so a bump drops every entry without SCAN. */
+function ap_bsky_profile_cache_version_key(int $ownerUserId): string
+{
+    return 'vaak:profile:v1:bsky:' . ap_bsky_profile_cache_scope($ownerUserId) . ':ver';
+}
+
+/**
+ * Request-scoped memo of one generation. A bare static would outlive the
+ * request on a reused PHP worker and keep serving the generation from the
+ * previous follow sync. REQUEST_TIME_FLOAT changes on each request. An empty
+ * mark is not memoized.
+ */
+function ap_bsky_profile_cache_version_memo(string $scope, ?string $set = null, bool $unset = false): ?string
+{
+    $mark = isset($_SERVER['REQUEST_TIME_FLOAT']) ? (string) $_SERVER['REQUEST_TIME_FLOAT'] : '';
+    if ($mark === '') {
+        return $unset ? null : $set;
+    }
+    if (($GLOBALS['ap_bsky_profile_cache_ver_mark'] ?? null) !== $mark) {
+        $GLOBALS['ap_bsky_profile_cache_ver'] = [];
+        $GLOBALS['ap_bsky_profile_cache_ver_mark'] = $mark;
+    }
+    if ($unset) {
+        unset($GLOBALS['ap_bsky_profile_cache_ver'][$scope]);
+        return null;
+    }
+    if ($set !== null) {
+        $GLOBALS['ap_bsky_profile_cache_ver'][$scope] = $set;
+        return $set;
+    }
+    $stored = $GLOBALS['ap_bsky_profile_cache_ver'][$scope] ?? null;
+    return is_string($stored) ? $stored : null;
+}
+
+/** Current generation, or "0" when Redis has no key yet. Missing Redis is a miss, not a shared stale view. */
+function ap_bsky_profile_cache_version(int $ownerUserId): string
+{
+    $scope = ap_bsky_profile_cache_scope($ownerUserId);
+    $cached = ap_bsky_profile_cache_version_memo($scope);
+    if ($cached !== null) {
+        return $cached;
+    }
+    $ver = '0';
+    if (function_exists('ap_redis_client')) {
+        $redis = ap_redis_client('cache');
+        if ($redis) {
+            try {
+                $raw = $redis->get(ap_bsky_profile_cache_version_key($ownerUserId));
+                if (is_int($raw) && $raw >= 0) {
+                    $ver = (string) $raw;
+                } elseif (is_string($raw) && $raw !== '' && ctype_digit($raw)) {
+                    $ver = $raw;
+                }
+            } catch (Throwable $e) {
+                error_log('[ap-bsky] profile cache version read failed: ' . $e->getMessage());
+            }
+        }
+    }
+    return ap_bsky_profile_cache_version_memo($scope, $ver) ?? $ver;
+}
+
+function ap_bsky_profile_cache_key(int $ownerUserId, string $hash): string
+{
+    return 'vaak:profile:v1:bsky:' . ap_bsky_profile_cache_scope($ownerUserId)
+        . ':' . ap_bsky_profile_cache_version($ownerUserId) . ':' . $hash;
+}
+
+/**
+ * Drop every cached Bluesky profile for this owner. One INCR; readers miss
+ * because the generation is part of the key. Old keys expire on their TTL.
+ */
+function ap_bsky_profile_cache_invalidate(int $ownerUserId): void
+{
+    if ($ownerUserId < 1) {
+        return;
+    }
+    $scope = ap_bsky_profile_cache_scope($ownerUserId);
+    ap_bsky_profile_cache_version_memo($scope, null, true);
+    if (!function_exists('ap_redis_client')) {
+        return;
+    }
+    $redis = ap_redis_client('cache');
+    if (!$redis) {
+        return;
+    }
+    try {
+        $next = $redis->incr(ap_bsky_profile_cache_version_key($ownerUserId));
+        $redis->expire(ap_bsky_profile_cache_version_key($ownerUserId), 86400 * 30);
+        if (is_int($next) || (is_string($next) && ctype_digit($next))) {
+            ap_bsky_profile_cache_version_memo($scope, (string) $next);
+        }
+    } catch (Throwable $e) {
+        error_log('[ap-bsky] profile cache version bump failed: ' . $e->getMessage());
+    }
+}
+
+/**
+ * `column = ANY(CAST(? AS text[]))` on Postgres, `column IN (?,?,?)` on SQLite.
+ * DID values are bound, not interpolated.
+ *
+ * @param list<string> $values
+ * @return array{0:string,1:list<string>}
+ */
+function ap_bsky_sql_text_in(PDO $db, array $values): array
+{
+    $values = array_values($values);
+    $driver = function_exists('ap_db_driver') ? ap_db_driver($db) : 'sqlite';
+    if ($driver === 'pgsql') {
+        return ['= ANY(CAST(? AS text[]))', [ap_bsky_pg_text_array($values)]];
+    }
+    return ['IN (' . implode(',', array_fill(0, count($values), '?')) . ')', $values];
+}
+
+/** @param list<string> $values */
+function ap_bsky_pg_text_array(array $values): string
+{
+    $parts = [];
+    foreach ($values as $value) {
+        $parts[] = '"' . str_replace(['\\', '"'], ['\\\\', '\\"'], (string) $value) . '"';
+    }
+    return '{' . implode(',', $parts) . '}';
+}
+
 /** @return array{profile:array<string,mixed>,did:?string,updated_at:string,viewer?:array<string,mixed>}|null */
 function ap_bsky_actor_profile_cache_get(string $actorRef, int $ownerUserId = 0, ?PDO $db = null): ?array
 {
@@ -10954,8 +11086,7 @@ function ap_bsky_actor_profile_cache_get(string $actorRef, int $ownerUserId = 0,
         $keys[] = 'https://bsky.app/profile/' . rawurlencode($actorRef);
     }
     $keys = array_values(array_unique(array_filter($keys)));
-    $redisKey = 'vaak:profile:v1:bsky:' . ($ownerUserId > 0 ? $ownerUserId . ':' : 'public:')
-        . hash('sha256', implode("\n", $keys));
+    $redisKey = ap_bsky_profile_cache_key($ownerUserId, hash('sha256', implode("\n", $keys)));
     if (function_exists('ap_redis_json_get')) {
         $redisCached = ap_redis_json_get($redisKey);
         if (is_array($redisCached)) return $redisCached;
@@ -11026,9 +11157,6 @@ function ap_bsky_actor_profile_cache_upsert(string $actorRef, int $ownerUserId, 
     $json = json_encode($profile, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
     if (!is_string($json)) return;
     $now = gmdate('c');
-    if (function_exists('ap_redis_delete_pattern')) {
-        ap_redis_delete_pattern('vaak:profile:v1:bsky:' . ($ownerUserId > 0 ? $ownerUserId . ':' : 'public:') . '*');
-    }
     try {
         $st = $db->prepare('INSERT INTO bsky_actor_profiles (actor_ref, did, profile_json, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT (actor_ref) DO UPDATE SET did = excluded.did, profile_json = excluded.profile_json, updated_at = excluded.updated_at');
         $st->execute([$actorRef, $did !== '' ? $did : null, $json, $now]);
@@ -11040,44 +11168,117 @@ function ap_bsky_actor_profile_cache_upsert(string $actorRef, int $ownerUserId, 
         }
     } catch (Throwable $e) {
         error_log('[ap-bsky] actor profile cache write failed');
+        return;
     }
+    // After the rows commit, so a reader that misses cannot refill the new generation from the old row.
+    ap_bsky_profile_cache_invalidate($ownerUserId);
 }
 
 /** Keep cached viewer state aligned with queued Follow/Unfollow completions. */
 function ap_bsky_actor_viewer_cache_update(int $ownerUserId, string $did, ?string $followingUri): void
 {
     if ($ownerUserId < 1 || !str_starts_with($did, 'did:')) return;
+    ap_bsky_actor_viewer_cache_update_many($ownerUserId, [$did => $followingUri], true);
+}
+
+/**
+ * Apply viewer rows for many DIDs. Aliases are loaded with one
+ * `did = ANY(?)` (or IN on SQLite) per chunk, and each chunk commits on its
+ * own. The owner profile cache is bumped once after the last chunk when
+ * $invalidate is set, not once per DID.
+ *
+ * @param array<string,?string> $followingByDid
+ */
+function ap_bsky_actor_viewer_cache_update_many(int $ownerUserId, array $followingByDid, bool $invalidate = true): void
+{
+    if ($ownerUserId < 1 || $followingByDid === []) return;
     $db = ap_db();
     if (!ap_bsky_actor_refresh_migrate($db)) return;
-    $now = gmdate('c');
-    $refs = [$did, 'https://bsky.app/profile/' . rawurlencode($did)];
-    // Profiles opened by handle are cached under the handle URL too; keep
-    // those viewer rows in step, or the page reads a stale "not following".
+    $pending = [];
+    foreach ($followingByDid as $did => $uri) {
+        $did = (string) $did;
+        if (!str_starts_with($did, 'did:')) continue;
+        $pending[$did] = is_string($uri) ? $uri : null;
+    }
+    if ($pending === []) return;
+    foreach (array_chunk($pending, 200, true) as $chunk) {
+        ap_bsky_actor_viewer_cache_apply_chunk($db, $ownerUserId, $chunk);
+    }
+    if ($invalidate) {
+        ap_bsky_profile_cache_invalidate($ownerUserId);
+    }
+}
+
+/**
+ * @param array<string,?string> $followingByDid
+ */
+function ap_bsky_actor_viewer_cache_apply_chunk(PDO $db, int $ownerUserId, array $followingByDid): void
+{
+    if ($followingByDid === []) return;
+    $own = !$db->inTransaction();
+    if ($own) $db->beginTransaction();
     try {
-        $aliases = $db->prepare('SELECT actor_ref FROM bsky_actor_profiles WHERE did = ? LIMIT 20');
-        $aliases->execute([$did]);
-        foreach ($aliases->fetchAll(PDO::FETCH_COLUMN) ?: [] as $alias) {
-            $alias = trim((string) $alias);
-            if ($alias !== '' && !in_array($alias, $refs, true)) {
-                $refs[] = $alias;
+        $dids = array_keys($followingByDid);
+        $aliasesByDid = [];
+        try {
+            [$op, $params] = ap_bsky_sql_text_in($db, $dids);
+            $aliases = $db->prepare('SELECT did, actor_ref FROM bsky_actor_profiles WHERE did ' . $op);
+            $aliases->execute($params);
+            foreach ($aliases->fetchAll() ?: [] as $row) {
+                if (!is_array($row)) continue;
+                $did = (string) ($row['did'] ?? '');
+                $alias = trim((string) ($row['actor_ref'] ?? ''));
+                // array_key_exists: a null follow URI is an unfollow, and isset treats null as missing.
+                if ($did === '' || $alias === '' || !array_key_exists($did, $followingByDid)) continue;
+                if (!isset($aliasesByDid[$did])) $aliasesByDid[$did] = [];
+                // Same cap as the old per-DID `LIMIT 20`.
+                if (count($aliasesByDid[$did]) >= 20 || in_array($alias, $aliasesByDid[$did], true)) continue;
+                $aliasesByDid[$did][] = $alias;
+            }
+        } catch (Throwable $e) {
+            // A failed statement aborts a Postgres transaction. Roll our chunk
+            // back and continue with the DID refs only, as the per-DID path did.
+            error_log('[ap-bsky] viewer alias lookup failed: ' . $e->getMessage());
+            if (!$own) throw $e;
+            if ($db->inTransaction()) $db->rollBack();
+            $aliasesByDid = [];
+            $db->beginTransaction();
+        }
+        $refsByDid = [];
+        $allRefs = [];
+        foreach ($followingByDid as $did => $uri) {
+            $refs = [$did, 'https://bsky.app/profile/' . rawurlencode($did)];
+            foreach ($aliasesByDid[$did] ?? [] as $alias) {
+                if (!in_array($alias, $refs, true)) $refs[] = $alias;
+            }
+            $refsByDid[$did] = $refs;
+            foreach ($refs as $ref) $allRefs[$ref] = true;
+        }
+        $followedBy = [];
+        if ($allRefs !== []) {
+            [$op, $params] = ap_bsky_sql_text_in($db, array_keys($allRefs));
+            $st = $db->prepare('SELECT actor_ref, followed_by FROM bsky_actor_viewers WHERE owner_user_id = ? AND actor_ref ' . $op);
+            $st->execute(array_merge([$ownerUserId], $params));
+            foreach ($st->fetchAll() ?: [] as $row) {
+                if (!is_array($row)) continue;
+                $followedBy[(string) ($row['actor_ref'] ?? '')] = $row['followed_by'];
             }
         }
-    } catch (Throwable $e) {
-        // Fall back to the DID refs above.
-    }
-    if (function_exists('ap_redis_delete_pattern')) {
-        ap_redis_delete_pattern('vaak:profile:v1:bsky:' . $ownerUserId . ':*');
-    }
-    foreach ($refs as $ref) {
-        try {
-            $st = $db->prepare('SELECT followed_by FROM bsky_actor_viewers WHERE owner_user_id = ? AND actor_ref = ? LIMIT 1');
-            $st->execute([$ownerUserId, $ref]);
-            $followsYou = $st->fetchColumn();
-            $up = $db->prepare('INSERT INTO bsky_actor_viewers (owner_user_id, actor_ref, following_uri, followed_by, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT (owner_user_id, actor_ref) DO UPDATE SET following_uri = excluded.following_uri, updated_at = excluded.updated_at');
-            $up->execute([$ownerUserId, $ref, $followingUri, $followsYou === false ? 0 : (int) $followsYou, $now]);
-        } catch (Throwable $e) {
-            // The action queue remains authoritative if this optional cache is unavailable.
+        $now = gmdate('c');
+        $up = $db->prepare('INSERT INTO bsky_actor_viewers (owner_user_id, actor_ref, following_uri, followed_by, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT (owner_user_id, actor_ref) DO UPDATE SET following_uri = excluded.following_uri, updated_at = excluded.updated_at');
+        foreach ($refsByDid as $did => $refs) {
+            $followingUri = $followingByDid[$did];
+            foreach ($refs as $ref) {
+                $followsYou = array_key_exists($ref, $followedBy) ? $followedBy[$ref] : false;
+                $up->execute([$ownerUserId, $ref, $followingUri, $followsYou === false ? 0 : (int) $followsYou, $now]);
+            }
         }
+        if ($own) $db->commit();
+    } catch (Throwable $e) {
+        if ($own && $db->inTransaction()) $db->rollBack();
+        if (!$own) throw $e;
+        // This chunk rolls back. Later chunks still run; the sync retries the rest.
+        error_log('[ap-bsky] viewer cache chunk failed: ' . $e->getMessage());
     }
 }
 
@@ -11202,34 +11403,75 @@ function ap_bsky_follow_sync_worker(int $ownerUserId): array
     ap_bsky_graph_sync_migrate();
     $db = ap_db();
     try {
-        $db->beginTransaction();
+        // Reads stay outside a write transaction. Upserts and deletes commit
+        // every 200 rows so a large graph does not hold one transaction open
+        // across the AppView count fetch or the viewer pass below. A retry
+        // reconciles any chunk that did not finish: upserts are idempotent,
+        // and removals run only after that kind's upserts have committed.
         $existing = $db->prepare("SELECT target_did FROM bsky_graph_sync WHERE owner_user_id = ? AND kind = 'follow'");
         $existing->execute([$ownerUserId]);
         $existingDids = array_map('strval', $existing->fetchAll(PDO::FETCH_COLUMN) ?: []);
-        foreach ($follows as $did => $uri) {
-            ap_bsky_graph_sync_upsert($ownerUserId, 'follow', $did, $uri, 'pull');
-        }
-        foreach ($existingDids as $did) {
-            if (!array_key_exists($did, $follows)) {
-                ap_bsky_graph_sync_delete($ownerUserId, 'follow', $did);
-            }
-        }
-
         $existingF = $db->prepare("SELECT target_did FROM bsky_graph_sync WHERE owner_user_id = ? AND kind = 'follower'");
         $existingF->execute([$ownerUserId]);
         $existingFollowerDids = array_map('strval', $existingF->fetchAll(PDO::FETCH_COLUMN) ?: []);
-        foreach ($followers as $did => $_uri) {
-            ap_bsky_graph_sync_upsert($ownerUserId, 'follower', $did, null, 'pull');
+
+        $writeChunk = static function (PDO $db, array $steps): void {
+            if ($steps === []) return;
+            $db->beginTransaction();
+            $pending = 0;
+            try {
+                foreach ($steps as $step) {
+                    $step();
+                    $pending++;
+                    if ($pending < 200) continue;
+                    $db->commit();
+                    $db->beginTransaction();
+                    $pending = 0;
+                }
+                if ($db->inTransaction()) $db->commit();
+            } catch (Throwable $e) {
+                if ($db->inTransaction()) $db->rollBack();
+                throw $e;
+            }
+        };
+        $followSteps = [];
+        foreach ($follows as $did => $uri) {
+            $followSteps[] = static function () use ($ownerUserId, $did, $uri): void {
+                ap_bsky_graph_sync_upsert($ownerUserId, 'follow', (string) $did, $uri, 'pull');
+            };
         }
+        $writeChunk($db, $followSteps);
+        $followDrops = [];
+        foreach ($existingDids as $did) {
+            if (!array_key_exists($did, $follows)) {
+                $followDrops[] = static function () use ($ownerUserId, $did): void {
+                    ap_bsky_graph_sync_delete($ownerUserId, 'follow', $did);
+                };
+            }
+        }
+        $writeChunk($db, $followDrops);
+
+        $followerSteps = [];
+        foreach ($followers as $did => $_uri) {
+            $followerSteps[] = static function () use ($ownerUserId, $did): void {
+                ap_bsky_graph_sync_upsert($ownerUserId, 'follower', (string) $did, null, 'pull');
+            };
+        }
+        $writeChunk($db, $followerSteps);
         // A partial follower list (AppView error mid-paging) must not prune
         // cached followers, or the profile count dips until the next sync.
+        $followerDrops = [];
         if (!$followersPartial) {
             foreach ($existingFollowerDids as $did) {
                 if (!array_key_exists($did, $followers)) {
-                    ap_bsky_graph_sync_delete($ownerUserId, 'follower', $did);
+                    $followerDrops[] = static function () use ($ownerUserId, $did): void {
+                        ap_bsky_graph_sync_delete($ownerUserId, 'follower', $did);
+                    };
                 }
             }
         }
+        $writeChunk($db, $followerDrops);
+
         $edgeFollowers = $followersPartial
             ? count(array_unique(array_merge($existingFollowerDids, array_map('strval', array_keys($followers)))))
             : count($followers);
@@ -11270,12 +11512,14 @@ function ap_bsky_follow_sync_worker(int $ownerUserId): array
 
         $profiles = $db->prepare('SELECT DISTINCT did FROM bsky_actor_profiles WHERE did IS NOT NULL AND did <> ?');
         $profiles->execute(['']);
+        $followingByDid = [];
         foreach ($profiles->fetchAll(PDO::FETCH_COLUMN) ?: [] as $did) {
             if (is_string($did) && str_starts_with($did, 'did:')) {
-                ap_bsky_actor_viewer_cache_update($ownerUserId, $did, $follows[$did] ?? null);
+                $followingByDid[$did] = $follows[$did] ?? null;
             }
         }
-        $db->commit();
+        // Chunks commit on their own. One generation bump covers every DID.
+        ap_bsky_actor_viewer_cache_update_many($ownerUserId, $followingByDid, true);
 
         // Keep the short AppView counts file warm so any leftover readers stay consistent.
         $handle = '';

@@ -50,3 +50,10 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_masto_reblogs_object
     ON masto_reblogs (object_id);
 CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_nostr_events_reply_to
     ON nostr_events (reply_to) WHERE reply_to <> '';
+-- Follow-sync and profile reads look up bsky_actor_profiles by did
+-- (`WHERE did = ?`, `WHERE did = ANY(?)`). actor_ref is the primary key and
+-- several refs share one did, so this index is not unique. Deploy builds it
+-- with CREATE INDEX CONCURRENTLY from vaak_migrate_cpu_indexes(); a page
+-- load does not. Rust has no separate schema migrator for this table.
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_bsky_actor_profiles_did
+    ON bsky_actor_profiles (did);
