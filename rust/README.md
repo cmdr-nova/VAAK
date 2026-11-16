@@ -66,6 +66,8 @@ Units: `deploy/vaak-worker-notif.service`, `deploy/vaak-worker-notif-list.servic
 | `VAAK_RANKED_NATIVE_HOME` | `1` (default) | Home ranked rebuild in Rust (incl. FoF/cold-start recommendations); `0` skips Home warm |
 | `VAAK_RANKED_NATIVE_LOCAL_FEED` | `1` (default) | Local + Federated ranked rebuild in Rust; `0` skips those views |
 | `VAAK_RANKED_WARM_ACTIVE_SECS` | `86400` | Multi-account ranked-warm loop only rebuilds accounts with a session, Home signal, OAuth token create/refresh, or post inside this many seconds. `0` warms every non-disabled account. A positive `--owner-id` is not filtered |
+| `VAAK_RANKED_WARM_INPUT_MARKER` | `1` | Skip a Home/Local/Federated rebuild when a per-owner input fingerprint matches the last build and the ranked Redis key is still present. `0` restores the table-stat watermark. PHP `bin/ranked-warm.php` is retired; `admin_tl_lean_ranked_warm` is the cold fill and always builds |
+| `VAAK_RANKED_WARM_MAX_AGE_SECS` | `600` | With the input marker on, rebuild at least this often so time-decay scores move. `0` does not force that refresh |
 | `VAAK_AUTH_SESSION_PATH` | `/var/lib/mkultra/ap/sessions` | PHP session dir read for `_vaak_last_seen` when choosing whom to prewarm |
 | `VAAK_HOME_HYDRATE_WARM` | `1` (default) | After non-empty Home ranked write, warm ranked→hydrate envelopes (15/40/80) in-process; `0` disables |
 | `VAAK_HOME_HYDRATE_WARM_COOLDOWN_SECS` | `60` | Redis cooldown between Home hydrate spawns per owner (30–600) |

@@ -26,6 +26,12 @@ Environment=RUST_LOG=info
 # owner-id 0 = non-disabled accounts active inside VAAK_RANKED_WARM_ACTIVE_SECS
 # (default 86400). Set that to 0 in vaak.env to warm every account again.
 # A Home load still builds an idle account on demand.
+#
+# VAAK_RANKED_WARM_INPUT_MARKER=1 (default) skips a view when a cheap
+# per-owner fingerprint of its inputs matches the last build and the ranked
+# cache is still present. Set 0 to use the older table-stat watermark.
+# VAAK_RANKED_WARM_MAX_AGE_SECS=600 forces a rebuild at least this often so
+# time-decay scores move. 0 disables that cap.
 ExecStart=/usr/local/bin/vaak-worker ranked-warm --loop --interval-secs 60 --owner-id 0 --views home,local,feed
 Restart=always
 RestartSec=10

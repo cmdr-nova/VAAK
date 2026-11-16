@@ -29,6 +29,15 @@
 //!   events id, so a remote firehose insert does not rebuild every Home.
 //!   Local and Federated still follow the tables they actually read. Idle
 //!   ticks only refresh Redis TTLs for accounts that were actually built.
+//! - `VAAK_RANKED_WARM_INPUT_MARKER` (default on) replaces that table-stat
+//!   watermark with a per-owner/view marker of the rows the rebuild reads
+//!   (max ids and set hashes from indexed lookups). The marker is stored next
+//!   to the ranked cache. A view is skipped when the marker matches, the
+//!   ranked key is still present, and the last build is younger than
+//!   `VAAK_RANKED_WARM_MAX_AGE_SECS` (default 600) so time-decay scores still
+//!   move. Set the marker flag to `0` to restore the table-stat watermark.
+//!   PHP `bin/ranked-warm.php` stays retired. `admin_tl_lean_ranked_warm` is
+//!   the on-demand cold fill for a missing cache, so it always builds.
 //!
 //!
 //! Cache key parity with PHP `admin_tl_cache_key` (v13).
@@ -47,17 +56,17 @@ use crate::home_hydrate_ranked;
 use crate::notif;
 use crate::redis_util;
 
-const CACHE_VERSION: &str = "v13";
+pub(crate) const CACHE_VERSION: &str = "v13";
 // Home mix guardrails. Followed accounts on both networks all contribute
 // their recent posts (PER_ACTOR_CAP). RSS stays a smaller later-page share.
 // Ranking, hashtags, the federated floor, and blocks still apply.
 const HOME_RSS_MAX_RATIO: f64 = 0.28;
 const HOME_FOLLOWED_TAG_CAP: usize = 72;
-const HOME_TTL_SECS: u64 = 600;
+pub(crate) const HOME_TTL_SECS: u64 = 600;
 /// When a follow graph has fewer than this many posts from the last two days,
 /// fill the rest with recent public federated posts.
-const HOME_FLOOR_MIN_FRESH: usize = 40;
-const HOME_FLOOR_FRESH_SECS: i64 = 48 * 3600;
+pub(crate) const HOME_FLOOR_MIN_FRESH: usize = 40;
+pub(crate) const HOME_FLOOR_FRESH_SECS: i64 = 48 * 3600;
 const HOME_FLOOR_TARGET: usize = 80;
 const HOME_FLOOR_PER_ACTOR: usize = 2;
 const HOME_FLOOR_PER_HOST: usize = 3;
@@ -69,7 +78,7 @@ const MAX_TIMELINE: usize = 400;
 /// Every followed account's recent posts, plus hashtags, the floor, and own notes.
 /// Fan-out uses the same ceiling so a new post does not chop the follow set back down.
 pub(crate) const HOME_MAX_TIMELINE: usize = 16_000;
-const PER_ACTOR_CAP: usize = 25;
+pub(crate) const PER_ACTOR_CAP: usize = 25;
 
 fn env_flag_default_true(name: &str) -> bool {
     match std::env::var(name) {
@@ -81,7 +90,7 @@ fn env_flag_default_true(name: &str) -> bool {
 }
 
 /// `VAAK_HOME_BURST_SPREAD=0` turns author burst spreading off.
-fn burst_spread_enabled() -> bool {
+pub(crate) fn burst_spread_enabled() -> bool {
     env_flag_default_true("VAAK_HOME_BURST_SPREAD")
 }
 
@@ -4483,6 +4492,122 @@ async fn filter_ranked_warm_owners(
     ))
 }
 
+enum MarkerOutcome {
+    Skip,
+    Rebuild {
+        reason: &'static str,
+        marker: Option<String>,
+    },
+}
+
+/// Input-marker skip. A failed read rebuilds and does not store a fingerprint.
+async fn apply_input_marker(
+    cfg: &Config,
+    db: Option<&Client>,
+    redis: &mut Option<redis::aio::MultiplexedConnection>,
+    shared: Option<&crate::ranked_warm_marker::SharedInputs>,
+    owner: i64,
+    view: &str,
+    max_age: u64,
+) -> MarkerOutcome {
+    use crate::ranked_warm_marker::{
+        age_secs, decide, load_view_marker, marker_ttl_secs, parse_stored, redis_key, MarkerDecision,
+    };
+    let (Some(db), Some(shared)) = (db, shared) else {
+        return MarkerOutcome::Rebuild {
+            reason: "unavailable",
+            marker: None,
+        };
+    };
+    if redis.is_none() {
+        *redis = redis_util::connect(&cfg.redis_url).await.ok();
+    }
+    if redis.is_none() {
+        return MarkerOutcome::Rebuild {
+            reason: "unavailable",
+            marker: None,
+        };
+    }
+    let marker = load_view_marker(db, redis.as_mut(), owner, view, shared)
+        .await
+        .ok();
+    let stored = match redis.as_mut() {
+        Some(conn) => redis_util::json_get(conn, &redis_key(owner, view))
+            .await
+            .ok()
+            .flatten()
+            .and_then(|value| parse_stored(&value)),
+        None => None,
+    };
+    let now = chrono::Utc::now().timestamp();
+    let built_secs_ago = stored
+        .as_ref()
+        .map(|row| age_secs(row.built_at, now))
+        .unwrap_or(u64::MAX);
+    let cache_present = match stored.as_ref().filter(|row| !row.logical.is_empty()) {
+        Some(row) => match redis.as_mut() {
+            Some(conn) => {
+                let key = ranked_redis_key(&row.logical);
+                let exists: i64 = redis::cmd("EXISTS")
+                    .arg(&key)
+                    .query_async(conn)
+                    .await
+                    .unwrap_or(0);
+                exists > 0
+            }
+            None => false,
+        },
+        None => false,
+    };
+    let decision = decide(
+        stored.as_ref().map(|row| row.marker.as_str()),
+        marker.as_deref(),
+        cache_present,
+        built_secs_ago,
+        max_age,
+    );
+    if decision != MarkerDecision::Skip {
+        let reason = match decision {
+            MarkerDecision::Rebuild(reason) => reason,
+            MarkerDecision::Skip => "skip",
+        };
+        return MarkerOutcome::Rebuild { reason, marker };
+    }
+    let Some(logical) = stored.map(|row| row.logical) else {
+        return MarkerOutcome::Rebuild {
+            reason: "cache_miss",
+            marker,
+        };
+    };
+    let touch = match redis.as_mut() {
+        Some(conn) => touch_warm_ttl(conn, view, owner, &logical).await.ok(),
+        None => None,
+    };
+    let Some(touch) = touch else {
+        return MarkerOutcome::Rebuild {
+            reason: "cache_miss",
+            marker,
+        };
+    };
+    if touch.rebuild_ranked {
+        return MarkerOutcome::Rebuild {
+            reason: "cache_miss",
+            marker,
+        };
+    }
+    if let Some(conn) = redis.as_mut() {
+        let _: Result<i64, _> = redis::cmd("EXPIRE")
+            .arg(redis_key(owner, view))
+            .arg(marker_ttl_secs(max_age))
+            .query_async(conn)
+            .await;
+        if touch.hydrate_missing {
+            let _ = home_hydrate_ranked::maybe_warm_after_ranked_view(conn, cfg, owner, view).await;
+        }
+    }
+    MarkerOutcome::Skip
+}
+
 pub async fn run_loop(
     cfg: &Config,
     owner_user_id: i64,
@@ -4495,20 +4620,28 @@ pub async fn run_loop(
     let mut warned_stats = false;
     let mut warned_owner = false;
     let mut warned_activity = false;
+    let mut warned_marker = false;
     let mut last_active: Option<Vec<i64>> = None;
     loop {
-        let (owners, inputs): (Vec<i64>, Option<WarmInputs>) = if owner_user_id > 0 {
+        let marker_on = crate::ranked_warm_marker::enabled();
+        let max_age = crate::ranked_warm_marker::max_age_secs();
+        let (owners, inputs, db_hold): (Vec<i64>, Option<WarmInputs>, Option<Client>) = if owner_user_id > 0 {
             match crate::db::connect(&cfg.database_url).await {
                 Ok(db) => {
-                    let mut inputs = load_warm_inputs(&db).await.ok();
-                    if let Some(inputs) = inputs.as_mut() {
-                        inputs.owners = load_owner_marks(&db, &[owner_user_id]).await;
-                    }
-                    (vec![owner_user_id], inputs)
+                    let inputs = if marker_on {
+                        None
+                    } else {
+                        let mut inputs = load_warm_inputs(&db).await.ok();
+                        if let Some(inputs) = inputs.as_mut() {
+                            inputs.owners = load_owner_marks(&db, &[owner_user_id]).await;
+                        }
+                        inputs
+                    };
+                    (vec![owner_user_id], inputs, Some(db))
                 }
                 Err(e) => {
                     tracing::error!(error = %e, "ranked-warm loop: db connect failed");
-                    (vec![owner_user_id], None)
+                    (vec![owner_user_id], None, None)
                 }
             }
         } else {
@@ -4556,7 +4689,7 @@ pub async fn run_loop(
                             }
                         }
                     };
-                    let inputs = if owners.is_empty() {
+                    let inputs = if marker_on || owners.is_empty() {
                         None
                     } else {
                         match load_warm_inputs(&db).await {
@@ -4567,19 +4700,20 @@ pub async fn run_loop(
                             Err(_) => None,
                         }
                     };
-                    (owners, inputs)
+                    (owners, inputs, Some(db))
                 }
                 Err(e) => {
                     tracing::error!(error = %e, "ranked-warm loop: db connect failed");
-                    (vec![], None)
+                    (vec![], None, None)
                 }
             }
         };
-        if inputs.is_none() && !owners.is_empty() && !warned_stats {
+        if !marker_on && inputs.is_none() && !owners.is_empty() && !warned_stats {
             tracing::warn!("ranked-warm loop: change watermark unavailable; warming every view");
             warned_stats = true;
         }
-        if inputs.as_ref().is_some_and(|inputs| inputs.owners.is_empty())
+        if !marker_on
+            && inputs.as_ref().is_some_and(|inputs| inputs.owners.is_empty())
             && !owners.is_empty()
             && parse_views(&views_owned).iter().any(|view| *view == "home")
             && !warned_owner
@@ -4587,57 +4721,125 @@ pub async fn run_loop(
             tracing::warn!("ranked-warm loop: owner watermark unavailable; warming home");
             warned_owner = true;
         }
+        let shared = if marker_on {
+            match db_hold.as_ref() {
+                Some(db) => match crate::ranked_warm_marker::load_shared(db).await {
+                    Ok(shared) => Some(shared),
+                    Err(e) => {
+                        if !warned_marker {
+                            tracing::warn!(error = %e, "ranked-warm input marker unavailable; rebuilding");
+                            warned_marker = true;
+                        }
+                        None
+                    }
+                },
+                None => None,
+            }
+        } else {
+            None
+        };
         let hour = chrono::Utc::now().timestamp().div_euclid(3600);
         let mut skipped = 0usize;
         let mut warmed = 0usize;
         let mut redis = None;
-        for owner in owners {
+        let mut marker_counts = crate::ranked_warm_marker::MarkerCounts::default();
+        for owner in owners.iter().copied() {
             for view in parse_views(&views_owned) {
-                let token = inputs
-                    .as_ref()
-                    .and_then(|inputs| view_warm_token(view, inputs, owner, hour));
                 let key = (owner, view.to_string());
-                let previous_token = memory.get(&key).map(|state| state.token.clone());
-                let previous_logical = memory.get(&key).and_then(|state| state.logical.clone());
-                let built_secs_ago = memory.get(&key).map(|state| state.built_at.elapsed().as_secs()).unwrap_or(u64::MAX);
-                if warm_should_skip_aged(previous_token.as_deref(), token.as_deref(), built_secs_ago) {
-                    if let Some(logical) = previous_logical {
-                        if redis.is_none() {
-                            redis = redis_util::connect(&cfg.redis_url).await.ok();
+                let mut pending_marker: Option<String> = None;
+                if marker_on {
+                    match apply_input_marker(
+                        cfg,
+                        db_hold.as_ref(),
+                        &mut redis,
+                        shared.as_ref(),
+                        owner,
+                        view,
+                        max_age,
+                    )
+                    .await
+                    {
+                        MarkerOutcome::Skip => {
+                            marker_counts.skipped += 1;
+                            tracing::debug!(owner, view, "ranked-warm skipped unchanged inputs");
+                            continue;
                         }
-                        let touch = match redis.as_mut() {
-                            Some(conn) => touch_warm_ttl(conn, view, owner, &logical).await.ok(),
-                            None => None,
-                        };
-                        if let Some(touch) = touch {
-                            if !touch.rebuild_ranked {
-                                if touch.hydrate_missing {
-                                    if let Some(conn) = redis.as_mut() {
-                                        let _ = home_hydrate_ranked::maybe_warm_after_ranked_view(
-                                            conn, cfg, owner, view,
-                                        )
-                                        .await;
-                                    }
-                                }
-                                skipped += 1;
-                                tracing::debug!(owner, view, "ranked-warm skipped unchanged");
-                                continue;
-                            }
+                        MarkerOutcome::Rebuild { reason, marker } => {
+                            marker_counts.record_rebuild(reason);
+                            pending_marker = marker;
+                            tracing::debug!(owner, view, reason, "ranked-warm rebuilding");
                         }
-                    } else {
-                        skipped += 1;
-                        tracing::debug!(owner, view, "ranked-warm skipped unchanged");
-                        continue;
                     }
+                } else {
+                    let token = inputs
+                        .as_ref()
+                        .and_then(|inputs| view_warm_token(view, inputs, owner, hour));
+                    let previous_token = memory.get(&key).map(|state| state.token.clone());
+                    let previous_logical = memory.get(&key).and_then(|state| state.logical.clone());
+                    let built_secs_ago = memory
+                        .get(&key)
+                        .map(|state| state.built_at.elapsed().as_secs())
+                        .unwrap_or(u64::MAX);
+                    if warm_should_skip_aged(previous_token.as_deref(), token.as_deref(), built_secs_ago)
+                    {
+                        if let Some(logical) = previous_logical {
+                            if redis.is_none() {
+                                redis = redis_util::connect(&cfg.redis_url).await.ok();
+                            }
+                            let touch = match redis.as_mut() {
+                                Some(conn) => touch_warm_ttl(conn, view, owner, &logical).await.ok(),
+                                None => None,
+                            };
+                            if let Some(touch) = touch {
+                                if !touch.rebuild_ranked {
+                                    if touch.hydrate_missing {
+                                        if let Some(conn) = redis.as_mut() {
+                                            let _ = home_hydrate_ranked::maybe_warm_after_ranked_view(
+                                                conn, cfg, owner, view,
+                                            )
+                                            .await;
+                                        }
+                                    }
+                                    skipped += 1;
+                                    tracing::debug!(owner, view, "ranked-warm skipped unchanged");
+                                    continue;
+                                }
+                            }
+                        } else {
+                            skipped += 1;
+                            tracing::debug!(owner, view, "ranked-warm skipped unchanged");
+                            continue;
+                        }
+                    }
+                    pending_marker = token;
                 }
+                let legacy_token = if marker_on { None } else { pending_marker.clone() };
                 match warm_one_view(cfg, owner, view).await {
                     Ok(line) => {
                         if line.is_empty() {
                             continue;
                         }
-                        if line.contains("skipped=flag-off") {
+                        if marker_on {
+                            if let (Some(marker), Some(logical)) =
+                                (pending_marker.as_deref(), warm_line_logical(&line))
+                            {
+                                if redis.is_none() {
+                                    redis = redis_util::connect(&cfg.redis_url).await.ok();
+                                }
+                                if let Some(conn) = redis.as_mut() {
+                                    let now = chrono::Utc::now().timestamp();
+                                    let _ = redis_util::json_set(
+                                        conn,
+                                        &crate::ranked_warm_marker::redis_key(owner, view),
+                                        &crate::ranked_warm_marker::stored_value(marker, &logical, now),
+                                        crate::ranked_warm_marker::marker_ttl_secs(max_age),
+                                    )
+                                    .await;
+                                }
+                            }
+                        } else if line.contains("skipped=flag-off") {
                             memory.remove(&key);
-                        } else if let Some(token) = token {
+                        } else if let Some(token) = legacy_token {
                             memory.insert(
                                 key,
                                 StoredWarm {
@@ -4656,7 +4858,19 @@ pub async fn run_loop(
                 }
             }
         }
-        if warmed == 0 && skipped > 0 {
+        if marker_on && !owners.is_empty() {
+            tracing::info!(
+                skipped = marker_counts.skipped,
+                rebuilt = marker_counts.rebuilt,
+                cold = marker_counts.cold,
+                changed = marker_counts.changed,
+                cache_miss = marker_counts.cache_miss,
+                stale = marker_counts.stale,
+                unavailable = marker_counts.unavailable,
+                max_age_secs = max_age,
+                "ranked-warm marker"
+            );
+        } else if warmed == 0 && skipped > 0 {
             tracing::info!(skipped, "ranked-warm idle");
         }
         tokio::time::sleep(interval).await;
