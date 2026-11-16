@@ -12,12 +12,24 @@
 //! - **Local / Federated:** outbox+local boosts / firehose events with v13 key
 //!   parity. Flag `VAAK_RANKED_NATIVE_LOCAL_FEED=1` (default on; `0` skips).
 //! - Empty timelines soft-skip (no Redis write). PHP `bin/ranked-warm.php` is
-//!   retired; HTML soft-nav still uses in-process `admin_tl_lean_ranked_warm`.
+//!   retired; HTML soft-nav still uses in-process `admin_tl_lean_ranked_warm`,
+//!   which is the cold path for an account this loop is not prewarming.
+//! - `--owner-id 0` prewarms only accounts active inside
+//!   `VAAK_RANKED_WARM_ACTIVE_SECS` (default 86400). `0` keeps every
+//!   non-disabled account. Activity is read from data that is already written:
+//!   the PHP session stamp `_vaak_last_seen`, `ap_user_signals.created_at`
+//!   (Home impressions, clicks, dwells, and interactions), a non-revoked
+//!   OAuth token created or refreshed in the window (`expires_at` is issued
+//!   at `now + 90 days`, matching `ap_oauth_token_ttl_seconds`), or an
+//!   `outbox_notes.published` post. A positive `--owner-id`, account-switch,
+//!   and fan-out rewarm always build that account. A failed activity read
+//!   warms every account rather than dropping them.
 //! - The loop skips a view when that owner's inputs are unchanged. Home uses a
 //!   watermark over followed actors and the owner's own posts, not the global
 //!   events id, so a remote firehose insert does not rebuild every Home.
 //!   Local and Federated still follow the tables they actually read. Idle
-//!   ticks only refresh Redis TTLs.
+//!   ticks only refresh Redis TTLs for accounts that were actually built.
+//!
 //!
 //! Cache key parity with PHP `admin_tl_cache_key` (v13).
 
@@ -4227,6 +4239,250 @@ pub async fn run_once(cfg: &Config, owner_user_id: i64, views: &str) -> Result<(
     Ok(())
 }
 
+/// How far back the multi-account loop looks for an existing activity stamp.
+/// `0` disables the filter. Unset, blank, or unparseable values use 24 hours.
+const DEFAULT_ACTIVE_WINDOW_SECS: i64 = 24 * 3600;
+/// Access-token lifetime in `ap_oauth_token_ttl_seconds`. A refresh or browser
+/// touch rewrites `expires_at` to now plus this, so the stamp of that write is
+/// `expires_at` minus this lifetime. No extra column is updated on token use.
+const OAUTH_ACCESS_TTL_SECS: i64 = 90 * 86400;
+/// PHP `ap_auth_session_save_path`. Overridable for a relocated session dir.
+const DEFAULT_SESSION_DIR: &str = "/var/lib/mkultra/ap/sessions";
+const SESSION_READ_MAX: u64 = 256 * 1024;
+/// Session clocks a few minutes ahead of this host still count as current.
+const SESSION_FUTURE_SLACK_SECS: i64 = 300;
+
+fn parse_active_window_secs(raw: Option<&str>) -> i64 {
+    match raw.map(str::trim).filter(|v| !v.is_empty()) {
+        Some(v) => v
+            .parse::<i64>()
+            .ok()
+            .filter(|n| *n >= 0)
+            .unwrap_or(DEFAULT_ACTIVE_WINDOW_SECS),
+        None => DEFAULT_ACTIVE_WINDOW_SECS,
+    }
+}
+
+fn ranked_warm_active_window_secs() -> i64 {
+    parse_active_window_secs(
+        std::env::var("VAAK_RANKED_WARM_ACTIVE_SECS")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn unix_to_rfc3339(unix: i64) -> String {
+    chrono::DateTime::<chrono::Utc>::from_timestamp(unix.max(0), 0)
+        .map(|stamp| stamp.to_rfc3339())
+        .unwrap_or_else(|| "1970-01-01T00:00:00+00:00".to_string())
+}
+
+fn token_expires_cutoff_unix(now: i64, window_secs: i64) -> i64 {
+    now.saturating_sub(window_secs)
+        .saturating_add(OAUTH_ACCESS_TTL_SECS)
+}
+
+/// Keep `owners` order. A database hit or a live web session is enough.
+fn retain_ranked_warm_owners(
+    owners: &[i64],
+    db_active: &HashSet<i64>,
+    session_active: &HashSet<i64>,
+) -> Vec<i64> {
+    owners
+        .iter()
+        .copied()
+        .filter(|id| db_active.contains(id) || session_active.contains(id))
+        .collect()
+}
+
+fn skip_php_serialized(body: &[u8], i: usize) -> Option<usize> {
+    if body.get(i..i + 2) == Some(b"N;") {
+        return Some(i + 2);
+    }
+    if body.get(i..i + 2) == Some(b"b:") {
+        return Some(i + 4);
+    }
+    if body.get(i..i + 2) == Some(b"i:") || body.get(i..i + 2) == Some(b"d:") {
+        let semi = body[i + 2..].iter().position(|byte| *byte == b';')?;
+        return Some(i + 2 + semi + 1);
+    }
+    if body.get(i..i + 2) == Some(b"s:") {
+        let rest = &body[i + 2..];
+        let colon = rest.iter().position(|byte| *byte == b':')?;
+        let len: usize = std::str::from_utf8(&rest[..colon]).ok()?.parse().ok()?;
+        let quote = i + 2 + colon + 1;
+        if body.get(quote) != Some(&b'"') {
+            return None;
+        }
+        let end = quote + 1 + len;
+        if body.get(end) != Some(&b'"') || body.get(end + 1) != Some(&b';') {
+            return None;
+        }
+        return Some(end + 2);
+    }
+    if body.get(i..i + 2) == Some(b"a:") {
+        let rest = &body[i + 2..];
+        let colon = rest.iter().position(|byte| *byte == b':')?;
+        let count: usize = std::str::from_utf8(&rest[..colon]).ok()?.parse().ok()?;
+        let mut next = i + 2 + colon + 1;
+        if body.get(next) != Some(&b'{') {
+            return None;
+        }
+        next += 1;
+        for _ in 0..count {
+            next = skip_php_serialized(body, next)?;
+            next = skip_php_serialized(body, next)?;
+        }
+        if body.get(next) != Some(&b'}') {
+            return None;
+        }
+        return Some(next + 1);
+    }
+    None
+}
+
+/// Integer fields from a PHP session file (`key|i:N;...`). String and array
+/// values are skipped by their declared length so a copied stamp inside a
+/// string cannot become a user id.
+fn php_session_ints(body: &[u8]) -> HashMap<String, i64> {
+    let mut out = HashMap::new();
+    let mut i = 0;
+    while i < body.len() {
+        let Some(bar) = body[i..].iter().position(|byte| *byte == b'|') else {
+            break;
+        };
+        let key = String::from_utf8_lossy(&body[i..i + bar]).into_owned();
+        let value = i + bar + 1;
+        if body.get(value..value + 2) == Some(b"i:") {
+            if let Some(semi) = body[value + 2..].iter().position(|byte| *byte == b';') {
+                if let Ok(number) = std::str::from_utf8(&body[value + 2..value + 2 + semi])
+                    .unwrap_or("")
+                    .parse::<i64>()
+                {
+                    out.insert(key, number);
+                }
+            }
+        }
+        i = match skip_php_serialized(body, value) {
+            Some(next) => next,
+            None => break,
+        };
+    }
+    out
+}
+
+fn session_active_owner_ids(dir: &std::path::Path, now: i64, window_secs: i64) -> HashSet<i64> {
+    let mut active = HashSet::new();
+    if window_secs <= 0 {
+        return active;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return active;
+    };
+    let cutoff = now.saturating_sub(window_secs);
+    let latest = now.saturating_add(SESSION_FUTURE_SLACK_SECS);
+    for entry in entries.flatten() {
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if !name.starts_with("sess_") {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        if !meta.is_file() || meta.len() > SESSION_READ_MAX {
+            continue;
+        }
+        // The session file is rewritten when `_vaak_last_seen` is. Skip files
+        // the filesystem has not touched inside the window.
+        if let Some(modified) = meta.modified().ok().and_then(|stamp| {
+            stamp
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()
+                .map(|d| d.as_secs() as i64)
+        }) {
+            if modified < cutoff.saturating_sub(SESSION_FUTURE_SLACK_SECS) || modified > latest {
+                continue;
+            }
+        }
+        let Ok(bytes) = std::fs::read(entry.path()) else {
+            continue;
+        };
+        let fields = php_session_ints(&bytes);
+        let (Some(&user), Some(&seen)) =
+            (fields.get("vaak_user_id"), fields.get("_vaak_last_seen"))
+        else {
+            continue;
+        };
+        if user > 0 && seen >= cutoff && seen <= latest {
+            active.insert(user);
+        }
+    }
+    active
+}
+
+fn session_dir() -> std::path::PathBuf {
+    std::path::PathBuf::from(
+        std::env::var("VAAK_AUTH_SESSION_PATH").unwrap_or_else(|_| DEFAULT_SESSION_DIR.to_string()),
+    )
+}
+
+/// Accounts in `owners` with a recent Home/API/post/session stamp.
+/// Reads only. `window_secs == 0` returns `owners` unchanged.
+async fn filter_ranked_warm_owners(
+    db: &Client,
+    owners: &[i64],
+    window_secs: i64,
+) -> Result<Vec<i64>> {
+    if window_secs == 0 || owners.is_empty() {
+        return Ok(owners.to_vec());
+    }
+    let now = chrono::Utc::now().timestamp();
+    let cutoff = unix_to_rfc3339(now.saturating_sub(window_secs));
+    let expires_cutoff = unix_to_rfc3339(token_expires_cutoff_unix(now, window_secs));
+    let ids = owners.to_vec();
+    let rows = db
+        .query(
+            "SELECT u.id::bigint
+             FROM ap_users u
+             WHERE u.disabled_at IS NULL
+               AND u.id::bigint = ANY($1::bigint[])
+               AND (
+                 EXISTS (
+                   SELECT 1 FROM ap_user_signals s
+                   WHERE s.owner_user_id::bigint = u.id::bigint
+                     AND s.created_at >= $2
+                 )
+                 OR EXISTS (
+                   SELECT 1 FROM outbox_notes n
+                   WHERE n.published >= $2
+                     AND n.id LIKE rtrim(u.actor_id, '/') || '/notes/%'
+                 )
+                 OR EXISTS (
+                   SELECT 1 FROM oauth_tokens t
+                   WHERE t.user_id::bigint = u.id::bigint
+                     AND t.revoked_at IS NULL
+                     AND (
+                       t.created_at >= $2
+                       OR (t.expires_at IS NOT NULL AND t.expires_at >= $3)
+                     )
+                 )
+               )
+             ORDER BY u.id::bigint ASC",
+            &[&ids, &cutoff, &expires_cutoff],
+        )
+        .await
+        .context("ranked-warm activity")?;
+    let db_active: HashSet<i64> = rows.iter().map(|row| row.get(0)).collect();
+    let session_active = session_active_owner_ids(&session_dir(), now, window_secs);
+    Ok(retain_ranked_warm_owners(
+        owners,
+        &db_active,
+        &session_active,
+    ))
+}
+
 pub async fn run_loop(
     cfg: &Config,
     owner_user_id: i64,
@@ -4238,6 +4494,8 @@ pub async fn run_loop(
     let mut memory: HashMap<(i64, String), StoredWarm> = HashMap::new();
     let mut warned_stats = false;
     let mut warned_owner = false;
+    let mut warned_activity = false;
+    let mut last_active: Option<Vec<i64>> = None;
     loop {
         let (owners, inputs): (Vec<i64>, Option<WarmInputs>) = if owner_user_id > 0 {
             match crate::db::connect(&cfg.database_url).await {
@@ -4265,6 +4523,37 @@ pub async fn run_loop(
                         Err(e) => {
                             tracing::error!(error = %e, "ranked-warm loop: list owners failed");
                             vec![]
+                        }
+                    };
+                    let window_secs = ranked_warm_active_window_secs();
+                    let owners = if owners.is_empty() {
+                        owners
+                    } else {
+                        match filter_ranked_warm_owners(&db, &owners, window_secs).await {
+                            Ok(active) => {
+                                let skipped = owners.len().saturating_sub(active.len());
+                                if last_active.as_deref() != Some(active.as_slice()) {
+                                    tracing::info!(
+                                        active = active.len(),
+                                        skipped,
+                                        window_secs,
+                                        "ranked-warm activity window"
+                                    );
+                                    last_active = Some(active.clone());
+                                }
+                                active
+                            }
+                            Err(e) => {
+                                if !warned_activity {
+                                    tracing::warn!(
+                                        error = %e,
+                                        "ranked-warm activity filter unavailable; warming every account"
+                                    );
+                                    warned_activity = true;
+                                }
+                                last_active = None;
+                                owners
+                            }
                         }
                     };
                     let inputs = if owners.is_empty() {
@@ -4541,6 +4830,95 @@ mod tests {
         assert!(warm_line_logical(empty).is_none());
         let written = "owner=1 view=home key=v13_home_u1_aon_abc ranked=4 ms=8 source=vaak-worker-native algo=on";
         assert_eq!(warm_line_logical(written).as_deref(), Some("v13_home_u1_aon_abc"));
+    }
+
+    #[test]
+    fn active_window_defaults_to_one_day_and_zero_disables_it() {
+        assert_eq!(parse_active_window_secs(None), 24 * 3600);
+        assert_eq!(parse_active_window_secs(Some("")), 24 * 3600);
+        assert_eq!(parse_active_window_secs(Some("  ")), 24 * 3600);
+        assert_eq!(parse_active_window_secs(Some("nope")), 24 * 3600);
+        assert_eq!(parse_active_window_secs(Some("-5")), 24 * 3600);
+        assert_eq!(parse_active_window_secs(Some("3600")), 3600);
+        assert_eq!(parse_active_window_secs(Some("0")), 0);
+        let now = 1_700_000_000;
+        assert_eq!(
+            token_expires_cutoff_unix(now, 86_400),
+            now - 86_400 + OAUTH_ACCESS_TTL_SECS
+        );
+        let cutoff = unix_to_rfc3339(now - 86_400);
+        let expires_cutoff = unix_to_rfc3339(token_expires_cutoff_unix(now, 86_400));
+        assert!(cutoff < unix_to_rfc3339(now));
+        assert!(expires_cutoff > unix_to_rfc3339(now));
+        // A refresh writes expires_at = touch + 90 days. That lands on the
+        // cutoff only when the touch itself is inside the window.
+        let fresh = unix_to_rfc3339(now - 3600 + OAUTH_ACCESS_TTL_SECS);
+        let stale = unix_to_rfc3339(now - 3 * 86_400 + OAUTH_ACCESS_TTL_SECS);
+        assert!(fresh >= expires_cutoff);
+        assert!(stale < expires_cutoff);
+    }
+
+    #[test]
+    fn idle_accounts_drop_out_and_a_session_keeps_one_in() {
+        let owners = [1, 2, 14];
+        let db_active = HashSet::from([2]);
+        let session_active = HashSet::from([14, 99]);
+        assert_eq!(
+            retain_ranked_warm_owners(&owners, &db_active, &session_active),
+            vec![2, 14]
+        );
+        assert!(retain_ranked_warm_owners(&owners, &HashSet::new(), &HashSet::new()).is_empty());
+    }
+
+    #[test]
+    fn php_session_stamp_ignores_a_forged_id_inside_a_string() {
+        let now = 1_700_000_000_i64;
+        let forged = "vaak_user_id|i:99;";
+        let body = format!(
+            "prefs|a:1:{{s:4:\"skin\";s:4:\"dark\";}}vaak_user_id|i:4;_vaak_last_seen|i:{now};note|s:{}:\"{forged}\";",
+            forged.len()
+        );
+        let fields = php_session_ints(body.as_bytes());
+        assert_eq!(fields.get("vaak_user_id"), Some(&4));
+        assert_eq!(fields.get("_vaak_last_seen"), Some(&now));
+        let dir = std::env::temp_dir().join(format!(
+            "vaak-ranked-warm-sessions-{}-{}",
+            std::process::id(),
+            now_unix_for_test()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let live = dir.join("sess_live");
+        std::fs::write(&live, &body).unwrap();
+        touch_unix(&live, now);
+        let stale_seen = now - 86_400 - 5;
+        let stale = dir.join("sess_stale");
+        std::fs::write(
+            &stale,
+            format!("vaak_user_id|i:8;_vaak_last_seen|i:{stale_seen};"),
+        )
+        .unwrap();
+        touch_unix(&stale, stale_seen);
+        std::fs::write(
+            dir.join("not-a-session"),
+            format!("vaak_user_id|i:3;_vaak_last_seen|i:{now};"),
+        )
+        .unwrap();
+        let active = session_active_owner_ids(&dir, now, 86_400);
+        assert_eq!(active, HashSet::from([4]));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn touch_unix(path: &std::path::Path, unix: i64) {
+        let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        let stamp = std::time::UNIX_EPOCH + std::time::Duration::from_secs(unix.max(0) as u64);
+        file.set_modified(stamp).unwrap();
+    }
+
+    fn now_unix_for_test() -> u128 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
     }
 
     #[test]

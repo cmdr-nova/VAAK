@@ -8,6 +8,8 @@ declare(strict_types=1);
  *
  * Primed by `vaak-worker ranked-warm` after a successful Home rebuild (0.6.67),
  * or on demand / HTML Axum miss (`ap_masto_timeline_home_hydrate_warm_async`).
+ * This is a single-owner cold path. It is not limited by the ranked-warm
+ * activity window.
  *
  * Usage:
  *   sudo -u www-data env AP_DB_DSN='pgsql:dbname=novalandia' \

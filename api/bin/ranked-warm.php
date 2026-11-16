@@ -7,7 +7,9 @@ declare(strict_types=1);
  * `vaak-worker ranked-warm` (`source=vaak-worker-native`).
  *
  * HTML soft-nav still warms via in-process `admin_tl_lean_ranked_warm` in
- * ap-admin.php. Do not re-enable this CLI bridge.
+ * ap-admin.php. That cold path builds Home for whoever is loading it,
+ * including an account the Rust loop skipped as idle. Do not re-enable
+ * this CLI bridge.
  */
 fwrite(STDERR, "ranked-warm.php retired — use: vaak-worker ranked-warm --once --owner-id=N\n");
 exit(3);
