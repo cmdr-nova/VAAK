@@ -1,11 +1,17 @@
 {
   "users": [[201,"https://mkultra.monster/users/alice_1"],[202,"https://mkultra.monster/users/alicex1"]],
-  "favourites": [[201,"https://remote.test/posts/favourite/"],[202,"https://remote.test/posts/other-owner"]],
+  "favourites": [[201,"https://remote.test/posts/favourite/"],[201,"https://remote.test/posts/slashes///"],[202,"https://remote.test/posts/other-owner"]],
   "bookmarks": [[201,"https://remote.test/posts/bookmark"]],
   "reblogs": [[201,"https://remote.test/posts/boost"]],
   "outbox": [
     ["https://mkultra.monster/users/alice_1/notes/reply","https://remote.test/posts/reply/","{}"],
     ["https://mkultra.monster/users/alice_1/notes/quote",null,"{\"object\":{\"quote\":\"https://remote.test/posts/quote\"}}"],
+    ["https://mkultra.monster/users/alice_1/notes/quote-url",null,"{\"object\":{\"quoteUrl\":\"https://remote.test/posts/quote-url\"}}"],
+    ["https://mkultra.monster/users/alice_1/notes/misskey",null,"{\"object\":{\"_misskey_quote\":\"https://remote.test/posts/misskey-quote/\"}}"],
+    ["https://mkultra.monster/users/alice_1/notes/prefer",null,"{\"object\":{\"quote\":\"https://remote.test/posts/quote-wins\",\"quoteUrl\":\"https://remote.test/posts/quote-url-loses\"}}"],
+    ["https://mkultra.monster/users/alice_1/notes/decoy",null,"{\"object\":{\"content\":\"quote https://remote.test/posts/decoy-url\",\"quote\":\"https://remote.test/posts/real-quote\"}}"],
+    ["https://mkultra.monster/users/alice_10/notes/reply","https://remote.test/posts/alice10-reply","{}"],
+    ["https://mkultra.monster/users/alice_10/notes/quote",null,"{\"object\":{\"quote\":\"https://remote.test/posts/alice10-quote\"}}"],
     ["https://mkultra.monster/users/alicex1/notes/quote",null,"{\"object\":{\"quote\":\"https://remote.test/posts/other-quote\"}}"]
   ],
   "authorizations": [["https://mkultra.monster/users/alice_1","https://remote.test/posts/authorized-quote"]],
@@ -21,6 +27,6 @@
     [201,"like","https://remote.test/posts/undo-only",-1,"{}"],
     [202,"like","https://remote.test/posts/other-signal",1,"{}"]
   ],
-  "consumed": ["favourite","bookmark","boost","reply","quote","authorized-quote","queued","metadata","uri"],
-  "unseen": ["passive","click","dwell","follow","undo-only","other-owner","other-quote","other-signal","unseen"]
+  "consumed": ["favourite","slashes","bookmark","boost","reply","quote","quote-url","misskey-quote","quote-wins","real-quote","authorized-quote","queued","metadata","uri"],
+  "unseen": ["passive","click","dwell","follow","undo-only","other-owner","other-quote","other-signal","quote-url-loses","decoy-url","alice10-reply","alice10-quote","unseen"]
 }

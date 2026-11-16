@@ -1,6 +1,83 @@
 <?php
 declare(strict_types=1);
 
+/** Signal types that consume a recommendation. Passive views are not in this list. */
+function ap_home_recommendation_signal_types_sql(): string
+{
+    return "'like','favourite','boost','reblog','reply','quote','bookmark'";
+}
+
+/**
+ * Quote URL stored on a note, or '' when it has none.
+ * vaak_reco_quote_key (created by deploy/remote/migrate.php) is the same
+ * CASE as the old note document: skip the parse unless the text contains
+ * "quote", then COALESCE object.quote, object.quoteUrl, object._misskey_quote.
+ * Invalid JSON yields '' so one bad row cannot fail the index build.
+ */
+function ap_home_recommendation_pgsql_quote_key(string $column): string
+{
+    return "vaak_reco_quote_key($column)";
+}
+
+/**
+ * One trimmed metadata field, or NULL when the field is absent.
+ * NULL (not '') keeps an empty candidate from matching every signal.
+ */
+function ap_home_recommendation_pgsql_signal_key(string $column, string $field): string
+{
+    if ($field !== 'object_id' && $field !== 'uri') {
+        throw new InvalidArgumentException('unsupported signal field');
+    }
+    return "vaak_reco_signal_key($column,'$field')";
+}
+
+/**
+ * Candidate lookup. Each branch is an EXISTS that stops at the first hit
+ * (LIMIT 1) and filters by this owner, so Postgres can index-probe the
+ * candidate instead of hashing every note, favourite, and signal the owner
+ * has ever stored. work_mem is 16MB; that hash spilled to temp files.
+ */
+function ap_home_recommendation_interacted_sql(bool $pgsql, int $candidateCount): string
+{
+    if ($candidateCount < 1) {
+        throw new InvalidArgumentException('recommendation lookup needs a candidate');
+    }
+    $candidates = implode(' UNION ALL ', array_fill(0, $candidateCount, "SELECT rtrim(?,'/') AS object_id"));
+    $quote = $pgsql
+        ? ap_home_recommendation_pgsql_quote_key('o.raw_create_json')
+        : "rtrim(COALESCE(json_extract(NULLIF(o.raw_create_json,''), '$.object.quote'),json_extract(NULLIF(o.raw_create_json,''), '$.object.quoteUrl'),json_extract(NULLIF(o.raw_create_json,''), '$.object._misskey_quote'), ''), '/')";
+    $signalObject = $pgsql
+        ? ap_home_recommendation_pgsql_signal_key('s.metadata_json', 'object_id')
+        : "rtrim(json_extract(NULLIF(s.metadata_json,''), '$.object_id'), '/')";
+    $signalUri = $pgsql
+        ? ap_home_recommendation_pgsql_signal_key('s.metadata_json', 'uri')
+        : "rtrim(json_extract(NULLIF(s.metadata_json,''), '$.uri'), '/')";
+    // starts-with, not LIKE: '_' in an actor name is a literal character.
+    $prefix = $pgsql
+        ? "o.id ^@ (v.actor || '/notes/')"
+        : "substr(o.id,1,length(v.actor || '/notes/'))=v.actor || '/notes/'";
+    $signals = 's.owner_user_id=v.id AND s.weight>0 AND s.signal_type IN (' . ap_home_recommendation_signal_types_sql() . ')';
+    // A non-empty hit implies the document contains "quote", so that arm can
+    // use the partial index. An empty candidate still matches a note whose
+    // quote extraction is empty, including notes that never mention quote.
+    $quoteArms = $pgsql
+        ? "OR (c.object_id<>'' AND EXISTS (SELECT 1 FROM outbox_notes o, viewer v WHERE $prefix AND strpos(o.raw_create_json,'quote')>0 AND ($quote)<>'' AND ($quote)=c.object_id LIMIT 1))
+OR (c.object_id='' AND EXISTS (SELECT 1 FROM outbox_notes o, viewer v WHERE $prefix AND ($quote)='' LIMIT 1))"
+        : "OR EXISTS (SELECT 1 FROM outbox_notes o, viewer v WHERE $prefix AND ($quote)=c.object_id LIMIT 1)";
+    return "WITH candidates AS ($candidates),
+viewer AS (SELECT id, rtrim(actor_id,'/') AS actor FROM ap_users WHERE id=?)
+SELECT DISTINCT c.object_id FROM candidates c
+WHERE EXISTS (SELECT 1 FROM masto_favourites f, viewer v WHERE f.owner_user_id=v.id AND rtrim(f.object_id,'/')=c.object_id LIMIT 1)
+OR EXISTS (SELECT 1 FROM masto_bookmarks b, viewer v WHERE b.owner_user_id=v.id AND rtrim(b.object_id,'/')=c.object_id LIMIT 1)
+OR EXISTS (SELECT 1 FROM masto_reblogs b, viewer v WHERE b.owner_user_id=v.id AND rtrim(b.object_id,'/')=c.object_id LIMIT 1)
+OR EXISTS (SELECT 1 FROM outbox_notes o, viewer v WHERE $prefix AND rtrim(o.in_reply_to,'/')=c.object_id LIMIT 1)
+$quoteArms
+OR EXISTS (SELECT 1 FROM quote_authorizations q, viewer v WHERE rtrim(q.requester_actor,'/')=v.actor AND rtrim(q.quoted_note_id,'/')=c.object_id LIMIT 1)
+OR EXISTS (SELECT 1 FROM ap_user_signals s, viewer v WHERE $signals AND rtrim(s.target_key,'/')=c.object_id LIMIT 1)
+OR EXISTS (SELECT 1 FROM ap_user_signals s, viewer v WHERE $signals AND ($signalObject)=c.object_id LIMIT 1)
+OR EXISTS (SELECT 1 FROM ap_user_signals s, viewer v WHERE $signals AND ($signalUri)=c.object_id LIMIT 1)";
+}
+
 /** Explicit actions consume recommendation slots; passive views do not. No remote fetches. */
 function ap_home_recommendation_interacted_objects(int $owner, array $objects): array
 {
@@ -8,46 +85,9 @@ function ap_home_recommendation_interacted_objects(int $owner, array $objects): 
     if ($owner < 1 || !$objects) return [];
     $db = ap_db();
     $pgsql = $db->getAttribute(PDO::ATTR_DRIVER_NAME) === 'pgsql';
-    $json = static fn(string $column, string $path): string => $pgsql
-        ? "$column #>> '{" . str_replace('.', ',', $path) . "}'"
-        : "json_extract(NULLIF($column,''), '$.$path')";
-    $doc = static fn(string $column): string => $pgsql ? "NULLIF($column,'')::jsonb" : "NULLIF($column,'')";
-    // Only quote fields are read from the note document. Skip the parse for
-    // notes whose JSON never mentions "quote": it kept a jsonb copy of every
-    // own note in the CTE, which spilled to temp files on each call.
-    $noteDoc = $pgsql
-        ? "CASE WHEN strpos(o.raw_create_json,'quote')>0 THEN " . $doc('o.raw_create_json') . ' END'
-        : $doc('o.raw_create_json');
-    $signalDoc = $doc('s.metadata_json');
-    $quote = 'COALESCE(' . $json('n.doc', 'object.quote') . ',' . $json('n.doc', 'object.quoteUrl') . ',' . $json('n.doc', 'object._misskey_quote') . ", '')";
-    $signalObject = $json('s.doc', 'object_id');
-    $signalUri = $json('s.doc', 'uri');
     $consumed = [];
     foreach (array_chunk($objects, 200) as $chunk) {
-        $candidates = implode(' UNION ALL ', array_fill(0, count($chunk), 'SELECT ? AS object_id'));
-        $sql = "WITH candidates AS ($candidates), viewer AS (SELECT id,actor_id FROM ap_users WHERE id=?),
-            own_notes AS MATERIALIZED (
-                SELECT o.in_reply_to,$noteDoc AS doc FROM outbox_notes o, viewer v
-                WHERE substr(o.id,1,length(rtrim(v.actor_id,'/') || '/notes/'))=rtrim(v.actor_id,'/') || '/notes/'
-            ),
-            signals AS MATERIALIZED (
-                SELECT s.target_key,$signalDoc AS doc FROM ap_user_signals s, viewer v
-                WHERE s.owner_user_id=v.id AND s.weight>0
-                  AND s.signal_type IN ('like','favourite','boost','reblog','reply','quote','bookmark')
-            ),
-            interactions AS MATERIALIZED (
-                SELECT rtrim(f.object_id,'/') AS object_id FROM masto_favourites f, viewer v WHERE f.owner_user_id=v.id
-                UNION ALL SELECT rtrim(b.object_id,'/') FROM masto_bookmarks b, viewer v WHERE b.owner_user_id=v.id
-                UNION ALL SELECT rtrim(b.object_id,'/') FROM masto_reblogs b, viewer v WHERE b.owner_user_id=v.id
-                UNION ALL SELECT rtrim(n.in_reply_to,'/') FROM own_notes n
-                UNION ALL SELECT rtrim($quote,'/') FROM own_notes n
-                UNION ALL SELECT rtrim(q.quoted_note_id,'/') FROM quote_authorizations q, viewer v WHERE rtrim(q.requester_actor,'/')=rtrim(v.actor_id,'/')
-                UNION ALL SELECT rtrim(s.target_key,'/') FROM signals s
-                UNION ALL SELECT rtrim($signalObject,'/') FROM signals s
-                UNION ALL SELECT rtrim($signalUri,'/') FROM signals s
-            )
-            SELECT DISTINCT c.object_id FROM candidates c JOIN interactions i ON i.object_id=c.object_id";
-        $st = $db->prepare($sql);
+        $st = $db->prepare(ap_home_recommendation_interacted_sql($pgsql, count($chunk)));
         $st->execute([...$chunk, $owner]);
         foreach ($st->fetchAll(PDO::FETCH_COLUMN) as $object) $consumed[(string) $object] = true;
     }

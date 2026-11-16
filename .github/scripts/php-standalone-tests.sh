@@ -173,6 +173,7 @@ php_tests=(
   api/bin/quote-avatar-behavior-smoke.php
   api/bin/quote-target-count-smoke.php
   api/bin/recommendations-behavior-smoke.php
+  api/bin/recommendation-index-smoke.php
   api/bin/search-direct-undo-smoke.php
   api/bin/search-indexing-behavior-smoke.php
   api/bin/search-native-bridge-smoke.php
