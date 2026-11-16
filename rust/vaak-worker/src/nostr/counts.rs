@@ -48,8 +48,16 @@ fn notes_per_run() -> i64 {
 
 /// Engagement SQL shared by the pick and the read: in-graph reposts and
 /// replies VAAK stores, for note `e`.
-const LOCAL_REPOSTS: &str = "(SELECT COUNT(DISTINCT r.pubkey) FROM nostr_events r WHERE r.kind = 6 AND r.reply_to = e.id)";
-const LOCAL_REPLIES: &str = "(SELECT COUNT(DISTINCT r.pubkey) FROM nostr_events r WHERE r.kind = 1 AND r.reply_to = e.id AND r.pubkey <> e.pubkey)";
+///
+/// `idx_nostr_events_reply_to` indexes `reply_to` only where
+/// `reply_to <> ''`. Postgres uses that partial index only when the query
+/// implies the same predicate. `reply_to` is `''` exactly when the row has
+/// no parent (the column is `NOT NULL DEFAULT ''`), and a stored note id is
+/// 64 hex characters, so `reply_to = e.id` already excludes those rows.
+/// Repeating `reply_to <> ''` does not change the count. Without it the
+/// planner cannot prove the index applies and scans `nostr_events` instead.
+const LOCAL_REPOSTS: &str = "(SELECT COUNT(DISTINCT r.pubkey) FROM nostr_events r WHERE r.kind = 6 AND r.reply_to <> '' AND r.reply_to = e.id)";
+const LOCAL_REPLIES: &str = "(SELECT COUNT(DISTINCT r.pubkey) FROM nostr_events r WHERE r.kind = 1 AND r.reply_to <> '' AND r.reply_to = e.id AND r.pubkey <> e.pubkey)";
 
 #[derive(Debug, Default)]
 pub struct Report {
@@ -324,6 +332,18 @@ mod tests {
         // Counted notes wait 30 minutes before the next count.
         let again = refresh(&db, &s, now + 60, Instant::now() + std::time::Duration::from_secs(10)).await.unwrap();
         assert_eq!(again.notes, 0);
+    }
+
+    /// The partial index is `WHERE reply_to <> ''`. Dropping that predicate
+    /// from either count makes nostr-sync's ranking scan `nostr_events`.
+    #[test]
+    fn ranking_counts_match_the_partial_reply_to_index() {
+        for sql in [LOCAL_REPOSTS, LOCAL_REPLIES] {
+            assert!(
+                sql.contains("r.reply_to <> ''") && sql.contains("r.reply_to = e.id"),
+                "ranking count must match the partial reply_to index: {sql}"
+            );
+        }
     }
 
     #[test]
