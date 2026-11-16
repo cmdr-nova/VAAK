@@ -34,6 +34,14 @@ pub async fn json_set(
     Ok(())
 }
 
+pub async fn get_string(
+    conn: &mut redis::aio::MultiplexedConnection,
+    key: &str,
+) -> Result<Option<String>> {
+    let raw: Option<String> = conn.get(key).await.with_context(|| format!("redis GET {key}"))?;
+    Ok(raw)
+}
+
 pub async fn json_get(
     conn: &mut redis::aio::MultiplexedConnection,
     key: &str,

@@ -486,6 +486,12 @@ function vaak_migrate_home_bsky_indexes(PDO $db): void
  * idx_bsky_post_observations_last_seen matches the fresh-window predicate.
  * idx_remote_actors_lower_host_username matches the actor alias lookup
  * `lower(COALESCE(host,'')) = ? AND lower(COALESCE(username,'')) = ?`.
+ * idx_bsky_actor_profiles_did matches `WHERE did = ?` / `WHERE did = ANY(?)`
+ * on bsky_actor_profiles. did is not unique: one account is stored under the
+ * DID and under each profile URL, so this is a plain index, not a unique one.
+ * The table is created by owner provisioning, not by an additive migration,
+ * so a database that does not have it yet skips this index instead of failing
+ * the deploy.
  *
  * @return array<string, array{table: string, create: string, drop: string}>
  */
@@ -536,6 +542,11 @@ function vaak_migrate_cpu_index_specs(): array
             'table' => 'nostr_events',
             'create' => "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_nostr_events_reply_to ON nostr_events (reply_to) WHERE reply_to <> ''",
             'drop' => 'DROP INDEX CONCURRENTLY IF EXISTS idx_nostr_events_reply_to',
+        ],
+        'idx_bsky_actor_profiles_did' => [
+            'table' => 'bsky_actor_profiles',
+            'create' => 'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_bsky_actor_profiles_did ON bsky_actor_profiles (did)',
+            'drop' => 'DROP INDEX CONCURRENTLY IF EXISTS idx_bsky_actor_profiles_did',
         ],
     ];
 }
@@ -687,7 +698,7 @@ function vaak_migrate_cpu_indexes(PDO $db): void
         if ($action === 'missing-table') {
             // bsky_posts is already required by the home Bluesky indexes.
             // Observations are created on first Bluesky use; skip until then.
-            if ($spec['table'] === 'bsky_post_observations' || $spec['table'] === 'nostr_events') {
+            if ($spec['table'] === 'bsky_post_observations' || $spec['table'] === 'nostr_events' || $spec['table'] === 'bsky_actor_profiles') {
                 continue;
             }
             throw new RuntimeException($spec['table'] . ' is missing; cpu index was not created');

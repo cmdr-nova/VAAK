@@ -116,10 +116,28 @@ fn url_looks_like_media(url:&str)->bool{
 pub(super) struct BskyBuilder<'a>{
     db:&'a Client,owner:i64,cfg:Option<&'a crate::config::Config>,warm:Option<&'a crate::profile_enrichment::WarmContext>,
     flat:HashMap<String,Option<Value>>,profiles:HashMap<String,Option<Value>>,authors:HashMap<String,Option<Value>>,avatars:HashMap<String,String>,refreshed:std::collections::HashSet<String>,
+    profile_ver:Option<String>,
+}
+/// PHP `ap_bsky_profile_cache_key`: generation sits between the owner scope and the hash.
+fn profile_cache_redis_key(owner:i64,version:&str,hash:&str)->String{
+    let scope=if owner>0{owner.to_string()}else{"public".into()};
+    format!("vaak:profile:v1:bsky:{scope}:{version}:{hash}")
 }
 impl<'a> BskyBuilder<'a>{
     pub(super) fn new(db:&'a Client,owner:i64,cfg:Option<&'a crate::config::Config>,warm:Option<&'a crate::profile_enrichment::WarmContext>)->Self{
-        Self{db,owner,cfg,warm,flat:HashMap::new(),profiles:HashMap::new(),authors:HashMap::new(),avatars:HashMap::new(),refreshed:std::collections::HashSet::new()}
+        Self{db,owner,cfg,warm,flat:HashMap::new(),profiles:HashMap::new(),authors:HashMap::new(),avatars:HashMap::new(),refreshed:std::collections::HashSet::new(),profile_ver:None}
+    }
+    /// PHP `ap_bsky_profile_cache_version`. Missing key and a Redis miss are generation 0.
+    async fn profile_cache_version(&mut self)->String{
+        if let Some(ver)=&self.profile_ver{return ver.clone()}
+        let scope=if self.owner>0{self.owner.to_string()}else{"public".into()};
+        let key=format!("vaak:profile:v1:bsky:{scope}:ver");
+        let ver=match self.cfg{
+            Some(cfg)=>crate::profile_header::cache::read_string(cfg,&key).await.filter(|raw|!raw.is_empty()&&raw.bytes().all(|b|b.is_ascii_digit())).unwrap_or_else(||"0".into()),
+            None=>"0".into(),
+        };
+        self.profile_ver=Some(ver.clone());
+        ver
     }
     async fn redis_json(&self,key:&str)->Option<Value>{
         let cfg=self.cfg?;crate::profile_header::cache::read_json(cfg,key).await.filter(|v|v.is_object()||v.is_array())
@@ -137,7 +155,8 @@ impl<'a> BskyBuilder<'a>{
         }else if actor_ref.starts_with("did:"){keys.push(format!("https://bsky.app/profile/{actor_ref}"));keys.push(format!("https://bsky.app/profile/{}",rawurlencode(&actor_ref)));}
         let mut unique:Vec<String>=Vec::new();for k in keys{if !k.is_empty()&&!unique.contains(&k){unique.push(k)}}
         use sha2::Digest;
-        let redis_key=format!("vaak:profile:v1:bsky:{}{}",if self.owner>0{format!("{}:",self.owner)}else{"public:".into()},hex::encode(sha2::Sha256::digest(unique.join("\n").as_bytes())));
+        let ver=self.profile_cache_version().await;
+        let redis_key=profile_cache_redis_key(self.owner,&ver,&hex::encode(sha2::Sha256::digest(unique.join("\n").as_bytes())));
         let mut out=self.redis_json(&redis_key).await;
         if out.is_none(){
             let mut row=None;let mut matched=actor_ref.clone();
@@ -353,6 +372,9 @@ impl<'a> BskyBuilder<'a>{
 mod tests{
     use super::*;
     #[test]fn php_string_helpers(){
+        assert_eq!(profile_cache_redis_key(7,"3","abc"),"vaak:profile:v1:bsky:7:3:abc");
+        assert_eq!(profile_cache_redis_key(0,"0","abc"),"vaak:profile:v1:bsky:public:0:abc");
+        assert_ne!(profile_cache_redis_key(7,"0","abc"),profile_cache_redis_key(7,"1","abc"));
         assert_eq!(nl2br("a\nb\r\nc\n\rd\re"),"a<br>\nb<br>\r\nc<br>\n\rd<br>\re");
         assert_eq!(nl2br("a\n\nb"),"a<br>\n<br>\nb");
         assert_eq!(actor_profile_url("@alice.bsky.social"),"https://bsky.app/profile/alice.bsky.social");
