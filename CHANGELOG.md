@@ -12,6 +12,19 @@ anything else bumps the patch number.
 Releases up to **0.9.83** used a two-digit deploy counter (0.9.05, 0.9.83)
 and have no notes here; their tags and GitHub Releases are unchanged.
 
+## [0.81.0](https://github.com/cmdr-nova/VAAK/releases/tag/v0.81.0) - 2026-11-16
+
+### ✨ Features
+* Prewarm ranked Home only for recently active accounts by @cmdr-nova in https://github.com/cmdr-nova/VAAK/pull/444
+* Cut Bluesky follow-sync Redis scans and DID lookups by @cmdr-nova in https://github.com/cmdr-nova/VAAK/pull/445
+* Let nostr-sync ranking counts use the partial reply_to index by @cmdr-nova in https://github.com/cmdr-nova/VAAK/pull/447
+* Keep recommendation index builds out of parallel subtransactions by @cmdr-nova in https://github.com/cmdr-nova/VAAK/pull/449
+### 🐛 Fixes
+* Stop recommendation lookups from spilling temp files by @cmdr-nova in https://github.com/cmdr-nova/VAAK/pull/446
+* Fix migrate require path for assembled releases by @cmdr-nova in https://github.com/cmdr-nova/VAAK/pull/448
+
+**Full Changelog**: https://github.com/cmdr-nova/VAAK/compare/v0.78.1...v0.81.0
+
 ## [0.80.0](https://github.com/cmdr-nova/VAAK/releases/tag/v0.80.0) - 2026-11-16
 
 ### ✨ Features
