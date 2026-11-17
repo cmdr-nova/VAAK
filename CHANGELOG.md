@@ -12,6 +12,13 @@ anything else bumps the patch number.
 Releases up to **0.9.83** used a two-digit deploy counter (0.9.05, 0.9.83)
 and have no notes here; their tags and GitHub Releases are unchanged.
 
+## [0.83.0](https://github.com/cmdr-nova/VAAK/releases/tag/v0.83.0) - 2026-11-17
+
+### ✨ Features
+* Inbox: Rust fetches unknown keys for personal inboxes by @cmdr-nova in https://github.com/cmdr-nova/VAAK/pull/451
+
+**Full Changelog**: https://github.com/cmdr-nova/VAAK/compare/v0.82.0...v0.83.0
+
 ## [0.82.0](https://github.com/cmdr-nova/VAAK/releases/tag/v0.82.0) - 2026-11-16
 
 ### ✨ Features
