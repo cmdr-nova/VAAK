@@ -124,6 +124,10 @@ $carolKey = 'https://other.test/users/carol#main-key';
 ap_key_neg_cache_set($carolKey, 'http_410', 410);
 [$status] = smoke_post($rust, '/inbox', smoke_like('https://other.test/users/carol', '11'), $carolKey, $priv);
 $check($status === 418, 'a key in the shared negative cache is left to PHP without a fetch');
+[$status] = smoke_post($rust, '/users/ci_owner/inbox', smoke_like('https://other.test/users/carol', '13'), $carolKey, $priv);
+$check($status === 418, 'on a personal inbox too (the fetch would sign as that account)');
+[$status] = smoke_post($rust, '/users/nobody_here/inbox', smoke_like('https://other.test/users/frank', '14'), 'https://other.test/users/frank#main-key', $priv);
+$check($status === 418, 'an unknown key on an unknown personal inbox stays PHP\'s');
 [$status] = smoke_post($rust, '/inbox', smoke_like('https://blocked.test/users/dan', '12'), 'https://blocked.test/users/dan#main-key', $priv);
 $check($status === 418, 'an unknown key on a blocked host is not fetched');
 $erinKey = 'https://other.test/users/erin#main-key';
@@ -180,7 +184,7 @@ $spooled = (int) $db->query("SELECT count(*) FROM ap_inbox_spool WHERE key_id <>
 $check($spooled === 6, 'only the six signed deliveries were spooled');
 $stats = $redis->hGetAll('vaak:inbox_rust:stats:v1');
 $check((int) ($stats['spooled'] ?? 0) === 4 && (int) ($stats['spooled_mismatch'] ?? 0) === 2 && (int) ($stats['fwd_key_not_public'] ?? 0) === 1
-    && (int) ($stats['fwd_key_negative'] ?? 0) === 1 && (int) ($stats['fwd_blocked'] ?? 0) === 2 && !isset($stats['fwd_actor_mismatch']) && (int) ($stats['fwd_signature'] ?? 0) === 1 && (int) ($stats['fwd_unknown_user'] ?? 0) === 1, 'stats count each outcome');
+    && (int) ($stats['fwd_key_negative'] ?? 0) === 2 && (int) ($stats['fwd_blocked'] ?? 0) === 2 && !isset($stats['fwd_actor_mismatch']) && (int) ($stats['fwd_signature'] ?? 0) === 1 && (int) ($stats['fwd_unknown_user'] ?? 0) === 1, 'stats count each outcome ' . json_encode($stats));
 
 // Cutover F3 shadow (the worker runs with VAAK_INBOX_ROUTE_SHADOW=1): each
 // spooled Delete carries the result Rust predicts, and the drain agrees.

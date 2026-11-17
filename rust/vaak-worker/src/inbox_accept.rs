@@ -233,8 +233,7 @@ async fn fast_path(cfg: &crate::config::Config, uri: &Uri, headers: &HeaderMap, 
     let mirrored: Option<String> = redis::cmd("GET").arg(key_mirror_key(&key_id)).query_async(&mut redis).await.map_err(|_| "redis")?;
     let mirrored: Value = match mirrored.and_then(|raw| serde_json::from_str(&raw).ok()) {
         Some(record) => record,
-        // A personal inbox signs its key fetch as that user; PHP keeps those.
-        None if !crate::inbox_key_fetch::enabled() || personal_inbox_user(uri.path()).is_some() => return Err("no_key"),
+        None if !crate::inbox_key_fetch::enabled() => return Err("no_key"),
         None => {
             // Admission and blocks before the fetch, which is the costly part.
             let (count, _): (i64, bool) =
@@ -248,7 +247,25 @@ async fn fast_path(cfg: &crate::config::Config, uri: &Uri, headers: &HeaderMap, 
             if host_of(&key_id).is_none_or(|h| host_blocked(&h, &blocked)) {
                 return Err("blocked");
             }
-            let fetched = crate::inbox_key_fetch::fetch(&mut redis, &db, &key_id).await;
+            // A personal inbox signs its key fetch as that account (PHP's
+            // ap_inbox_bootstrap_request_actor); an unknown one stays PHP's.
+            let as_actor = match personal_inbox_user(uri.path()) {
+                None => None,
+                Some(user) => {
+                    let row = db
+                        .query_opt("SELECT actor_key FROM ap_users WHERE lower(username) = $1 AND disabled_at IS NULL LIMIT 1", &[&user])
+                        .await
+                        .map_err(|_| "db")?;
+                    match row.map(|r| r.get::<_, Option<String>>(0).unwrap_or_default()).filter(|k| !user.is_empty() && !k.is_empty()) {
+                        Some(k) => Some(k),
+                        None => {
+                            idle_return(db);
+                            return Err("no_key");
+                        }
+                    }
+                }
+            };
+            let fetched = crate::inbox_key_fetch::fetch(&mut redis, &db, &key_id, as_actor.as_deref()).await;
             idle_return(db);
             let record = fetched.map_err(|miss| miss.reason())?;
             stat(cfg, "key_fetched").await;
