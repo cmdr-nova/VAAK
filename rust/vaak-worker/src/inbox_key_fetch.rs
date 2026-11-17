@@ -8,6 +8,12 @@
 //! addresses the public-address check passed, follows no redirects and reads
 //! at most 256 KiB. A found key is written to the same mirror PHP fills after
 //! a verified delivery. Any failure leaves the delivery to PHP.
+//!
+//! On a personal inbox PHP signs the fetch as that inbox's account
+//! (`ap_inbox_bootstrap_request_actor`, `ap_actor_key_paths`); so does this,
+//! with `/etc/mkultra/ap-inbox/{actor_key}_private.pem`
+//! (`VAAK_AP_KEY_DIR` overrides the directory). An unreadable key leaves the
+//! delivery to PHP.
 
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
@@ -237,7 +243,30 @@ fn user_agent() -> String {
     std::env::var("VAAK_HTTP_USER_AGENT").unwrap_or_else(|_| "VAAK-worker (inbox-key; mkultra.monster; +https://github.com/cmdr-nova/VAAK)".to_string())
 }
 
-fn signer() -> Option<Signer> {
+/// `ap_actor_key_paths` + `ap_request_actor_set`: the private key path and
+/// key id of a local account, or None for an empty key.
+fn actor_key_paths(actor_key: &str, dir: &str) -> Option<(String, String)> {
+    let key: String = actor_key.trim().to_ascii_lowercase().chars().filter(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '_').collect();
+    if key.is_empty() {
+        return None;
+    }
+    Some((format!("{}/{key}_private.pem", dir.trim_end_matches('/')), format!("https://mkultra.monster/users/{key}#main-key")))
+}
+
+/// The fetch signer: the personal inbox's account when given, else the
+/// instance owner.
+fn signer(as_actor: Option<&str>) -> Option<Signer> {
+    if let Some(key) = as_actor {
+        let dir = std::env::var("VAAK_AP_KEY_DIR").unwrap_or_else(|_| "/etc/mkultra/ap-inbox".to_string());
+        let (path, key_id) = actor_key_paths(key, &dir)?;
+        return match Signer::load(&path, &key_id) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                tracing::warn!(error = %e, actor = %key, "inbox key fetch: no signing key for the personal inbox");
+                None
+            }
+        };
+    }
     let path = std::env::var("VAAK_AP_SIGNING_KEY").unwrap_or_else(|_| "/etc/mkultra/ap-inbox/cmdr_nova_private.pem".to_string());
     let key_id = std::env::var("VAAK_AP_SIGNING_KEY_ID").unwrap_or_else(|_| "https://mkultra.monster/users/cmdr_nova#main-key".to_string());
     match Signer::load(&path, &key_id) {
@@ -251,7 +280,14 @@ fn signer() -> Option<Signer> {
 
 /// The key record for `key_id` (`{pem, owner, relay}`, as in the mirror),
 /// fetched and mirrored, or why not.
-pub(crate) async fn fetch(redis: &mut redis::aio::ConnectionManager, db: &tokio_postgres::Client, key_id: &str) -> std::result::Result<Value, Miss> {
+/// `as_actor`: the personal inbox's `actor_key` (signs the GET), None for the
+/// shared inbox.
+pub(crate) async fn fetch(
+    redis: &mut redis::aio::ConnectionManager,
+    db: &tokio_postgres::Client,
+    key_id: &str,
+    as_actor: Option<&str>,
+) -> std::result::Result<Value, Miss> {
     if !enabled() {
         return Err(Miss::Disabled);
     }
@@ -270,7 +306,7 @@ pub(crate) async fn fetch(redis: &mut redis::aio::ConnectionManager, db: &tokio_
     if public_addrs(&key_host).await.is_none() {
         return Err(Miss::NotPublic);
     }
-    let signer = signer().ok_or(Miss::Failed)?;
+    let signer = signer(as_actor).ok_or(Miss::Failed)?;
 
     let mut last_http: u16 = 0;
     let mut last_reason = "no_candidate".to_string();
@@ -354,6 +390,16 @@ fn short(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn personal_inbox_signer_paths_follow_php() {
+        assert_eq!(
+            actor_key_paths("Juno_Flux", "/etc/mkultra/ap-inbox/"),
+            Some(("/etc/mkultra/ap-inbox/juno_flux_private.pem".to_string(), "https://mkultra.monster/users/juno_flux#main-key".to_string()))
+        );
+        assert_eq!(actor_key_paths("../x", "/k").map(|p| p.0), Some("/k/x_private.pem".to_string()));
+        assert_eq!(actor_key_paths("--", "/k"), None);
+    }
 
     #[test]
     fn candidates_follow_php() {
