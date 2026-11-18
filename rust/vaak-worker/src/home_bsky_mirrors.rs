@@ -67,7 +67,6 @@ pub async fn filter_statuses(db:&Client,owner:i64,statuses:&mut Vec<Value>)->Res
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sha2::{Digest,Sha256};
     fn sql(v:&Value)->String {if v.is_null(){"NULL".into()}else if let Some(n)=v.as_i64(){n.to_string()}else{format!("'{}'",v.as_str().unwrap().replace('\'',"''"))}}
     #[tokio::test]
     #[ignore = "owned actual PostgreSQL/Redis fixture, PHP PDO captured oracle"]
@@ -88,7 +87,7 @@ mod tests {
                     let mut fanout_assertions=0;
                     if ["record_before_link","peer_independent","peer_local_mirror","split_tip","local_note_deleted","peer_profile_import","legacy_profile_import","deleted_profile_import","explicit_vaak_hash_conflict","own_tail_before_map","peer_quote_local","deleted_split_root","deleted_split_middle","deleted_split_sibling","deleted_split_foreign"].contains(&text(case,"case")) {
                         db.batch_execute("DELETE FROM bsky_graph_sync;INSERT INTO bsky_graph_sync VALUES(1,'follow','did:plc:peer'),(2,'follow','did:plc:a'),(1,'follow','did:plc:foreign'),(2,'follow','did:plc:foreign')").await?;
-                        let mut owned_keys=Vec::new();for owner in [1i64,2] {let logical=format!("v13_home_u{owner}_fixture_{}_{}",std::process::id(),width);let index=format!("vaak:timeline:owner-index:v1:{owner}");let key=format!("vaak:timeline:ranked:v2:{}",hex::encode(Sha256::digest(logical.as_bytes())));crate::redis_util::json_set(&mut cache,&index,&serde_json::json!([logical]),60).await?;crate::redis_util::json_set(&mut cache,&key,&serde_json::json!({"ranked":[{"k":"outbox","id":"https://mkultra.monster/users/a/notes/one","s":"outbox"}],"ts":chrono::Utc::now().timestamp()}),60).await?;owned_keys.push((owner,index,key));}
+                        let mut owned_keys=Vec::new();for owner in [1i64,2] {let logical=format!("v13_home_u{owner}_fixture_{}_{}",std::process::id(),width);let index=format!("vaak:timeline:owner-index:v1:{owner}");let epoch=crate::redis_util::generation(&mut cache,crate::redis_util::RANKED_EPOCH_KEY).await?;let key=crate::redis_util::ranked_redis_key(&epoch,&logical);crate::redis_util::json_set(&mut cache,&index,&serde_json::json!([logical]),60).await?;crate::redis_util::json_set(&mut cache,&key,&serde_json::json!({"ranked":[{"k":"outbox","id":"https://mkultra.monster/users/a/notes/one","s":"outbox"}],"ts":chrono::Utc::now().timestamp()}),60).await?;owned_keys.push((owner,index,key));}
                         let cfg=crate::config::Config{database_url:format!("{dsn} options='-csearch_path={schema}'"),redis_url:redis_url.clone(),redis_queue_url:redis_url.clone(),jetstream_state:"/tmp/unused-mirror".into(),default_owner_id:1,bsky_public_api:"http://127.0.0.1:1".into(),notif_cache_dir:"/tmp/unused-mirror".into(),phyrian_mutation_token:None,phyrian_bridge_url:String::new(),phyrian_bridge_secret:None};
                         let actor=did(&uri).unwrap().to_owned();let job=crate::timeline_fanout::FanoutJob{op:"home_bsky".into(),k:"bsky".into(),id:uri.clone(),s:"bluesky".into(),actor:actor.clone(),type_name:String::new(),type_alt:String::new(),visibility:"public".into(),owner:0,views:vec![],hydrate:false,ts:chrono::Utc::now().timestamp()};
                         let _=crate::timeline_fanout::process_job(&cfg,&job).await?;

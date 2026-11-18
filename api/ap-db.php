@@ -1485,11 +1485,11 @@ function ap_notification_projection_invalidate_owner(int $ownerUserId): void
             ap_notification_list_epoch_bump($ownerUserId);
         }
         ap_db()->prepare('DELETE FROM ap_notification_projection WHERE owner_user_id = ?')->execute([$ownerUserId]);
-        if (function_exists('ap_redis_delete_pattern')) {
-            ap_redis_delete_pattern('vaak:notifications:v1:' . $ownerUserId . ':*');
-            ap_redis_delete_pattern('vaak:notifications:v2:' . $ownerUserId . ':*');
-            ap_redis_delete_pattern('vaak:notifications:v3:' . $ownerUserId . ':*');
-            ap_redis_delete_pattern('vaak:notifications:v4:' . $ownerUserId . ':*');
+        // The list epoch bumped above is part of the cache key, so the old
+        // pages are unreachable without scanning the keyspace. Drop the page
+        // index so embed lookup does not walk stale members.
+        if (function_exists('ap_redis_delete') && function_exists('ap_notification_page_index_key')) {
+            ap_redis_delete(ap_notification_page_index_key($ownerUserId));
         }
     } catch (Throwable $e) {
         error_log('[ap-db] notification projection owner invalidation skipped: ' . $e->getMessage());
@@ -1514,12 +1514,7 @@ function ap_notification_projection_invalidate_all(): void
             ap_notification_list_epoch_bump(null);
         }
         ap_db()->exec('DELETE FROM ap_notification_projection');
-        if (function_exists('ap_redis_delete_pattern')) {
-            ap_redis_delete_pattern('vaak:notifications:v1:*');
-            ap_redis_delete_pattern('vaak:notifications:v2:*');
-            ap_redis_delete_pattern('vaak:notifications:v3:*');
-            ap_redis_delete_pattern('vaak:notifications:v4:*');
-        }
+        // Server epoch is part of every list key. Old pages expire by TTL.
     } catch (Throwable $e) {
         error_log('[ap-db] notification projection global invalidation skipped: ' . $e->getMessage());
     }
@@ -6669,9 +6664,8 @@ function ap_masto_notifications_unread_invalidate(?int $ownerUserId = null): voi
         return;
     }
     try {
-        if (function_exists('ap_redis_delete_pattern')) {
-            ap_redis_delete_pattern('vaak:notifications:v1:unread:' . $ownerUserId . ':*');
-            ap_redis_delete_pattern('vaak:shadow:notifications:v1:unread:' . $ownerUserId . ':*');
+        if (function_exists('ap_notification_unread_epoch_bump')) {
+            ap_notification_unread_epoch_bump($ownerUserId);
         }
         $cacheDir = '/var/lib/mkultra/ap';
         if (!is_dir($cacheDir) || !is_writable($cacheDir)) {
@@ -10391,23 +10385,36 @@ function ap_following_id_set_invalidate_owner(int $ownerUserId): void
 /** Best-effort targeted invalidation for an owner's materialized timeline views. */
 function ap_timeline_cache_invalidate_owner(int $ownerUserId): void
 {
-    if ($ownerUserId > 0 && function_exists('admin_tl_cache_clear_owner')) {
+    if ($ownerUserId < 1) {
+        return;
+    }
+    if (function_exists('admin_tl_cache_clear_owner')) {
         admin_tl_cache_clear_owner($ownerUserId);
-    } elseif ($ownerUserId > 0 && function_exists('ap_redis_json_get')) {
+        return;
+    }
+    if (function_exists('ap_fragment_tl_invalidate')) {
+        ap_fragment_tl_invalidate($ownerUserId);
+    }
+    if (function_exists('ap_redis_json_get')) {
         $indexKey = 'vaak:timeline:owner-index:v1:' . $ownerUserId;
         foreach (ap_redis_json_get($indexKey) ?? [] as $logical) {
-            if (is_string($logical) && function_exists('ap_redis_delete')) {
+            if (is_string($logical) && $logical !== '' && function_exists('ap_redis_delete')) {
                 ap_redis_delete(ap_timeline_ranked_redis_key($logical));
             }
         }
-        ap_redis_delete($indexKey);
+        if (function_exists('ap_redis_delete')) {
+            ap_redis_delete($indexKey);
+        }
     }
 }
 
 /** Redis key for ranked ID list (parity with admin_tl_redis_key / ranked-warm). */
 function ap_timeline_ranked_redis_key(string $logical): string
 {
-    return 'vaak:timeline:ranked:v2:' . hash('sha256', $logical);
+    if (function_exists('ap_redis_ranked_key')) {
+        return ap_redis_ranked_key($logical);
+    }
+    return 'vaak:timeline:ranked:v2:0:' . hash('sha256', $logical);
 }
 
 /**

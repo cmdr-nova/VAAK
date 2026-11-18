@@ -154,8 +154,8 @@ async fn clear(cfg:&crate::config::Config,db:&tokio_postgres::Client,owner:i64,m
  }
 }
 /// ap_muted_words_cache_clear($owner) when `muted`, then admin_tl_cache_clear().
-/// The owner-index walk in admin_tl_cache_clear_owner only removes keys and
-/// files the global clear removes too, so only its fragment pattern is kept.
+/// Global clear bumps the ranked generation. The owner walk still deletes this
+/// owner's current ranked keys and index, which the generation bump does not.
 /// Every check runs before the first Redis write, so a refusal leaves all of
 /// it to PHP rather than half of it.
 async fn clear_inner(cfg:&crate::config::Config,db:&tokio_postgres::Client,owner:i64,muted:bool)->Result<()>{
@@ -170,12 +170,22 @@ async fn clear_inner(cfg:&crate::config::Config,db:&tokio_postgres::Client,owner
   // ap_muted_words_phrases_cached(owner, true) deletes the key and, finding it
   // gone, stores the fresh list again.
   let _:()=redis::cmd("SET").arg(format!("vaak:moderation:muted-words:{owner}")).arg(refill.as_deref().unwrap_or("[]")).arg("EX").arg(relset_ttl()).query_async(&mut cache).await?;
-  crate::redis_util::delete_pattern(&mut cache,&format!("vaak:fragment:tl:v1:{owner}:*")).await?;
+  // admin_tl_cache_clear_owner: fragment generation, then this owner's ranked
+  // keys at the generation readers are using, then the owner index.
+  crate::redis_util::bump_generation(&mut cache,&crate::redis_util::fragment_tl_epoch_key(owner)).await?;
   let key=format!("vaak:trends:policy-epoch:v1:{owner}");
   let _:i64=redis::cmd("INCR").arg(&key).query_async(&mut cache).await?;
   let _:i64=redis::cmd("EXPIRE").arg(&key).arg(86400*30).query_async(&mut cache).await?;
+  let epoch=crate::redis_util::generation(&mut cache,crate::redis_util::RANKED_EPOCH_KEY).await?;
+  let index=format!("vaak:timeline:owner-index:v1:{owner}");
+  let logicals=match crate::redis_util::json_get(&mut cache,&index).await?{Some(serde_json::Value::Array(keys))=>keys,_=>Vec::new()};
+  for logical in logicals.iter().filter_map(|v|v.as_str()).filter(|k|!k.is_empty()){
+   let _:i64=redis::cmd("DEL").arg(crate::redis_util::ranked_redis_key(&epoch,logical)).query_async(&mut cache).await?;
+  }
+  let _:i64=redis::cmd("DEL").arg(&index).query_async(&mut cache).await?;
  }
- for pattern in ["vaak:timeline:ranked:v1:*","vaak:timeline:ranked:v2:*","vaak:timeline:owner-index:v1:*"]{crate::redis_util::delete_pattern(&mut cache,pattern).await?;}
+ // admin_tl_cache_clear: one server generation, not a SCAN of every ranked key.
+ crate::redis_util::bump_generation(&mut cache,crate::redis_util::RANKED_EPOCH_KEY).await?;
  for entry in std::fs::read_dir(&dir)?{
   let entry=entry?;let name=entry.file_name();let name=name.to_string_lossy();
   if name.starts_with("tl_")&&name.ends_with(".json"){let _=std::fs::remove_file(entry.path());}

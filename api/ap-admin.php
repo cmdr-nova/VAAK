@@ -9194,8 +9194,10 @@ if (
     $shellNext = $shellLimit;
     $shellCursor = '';
     $shellCache = 'miss';
-    $shellFragmentKey = 'vaak:fragment:tl-shell:v1:' . (int) $vaakOwnerId . ':'
-        . $view . ':' . $shellLimit . ':' . substr(hash('sha256', $adminTlCacheKey), 0, 16);
+    $shellSuffix = $view . ':' . $shellLimit . ':' . substr(hash('sha256', $adminTlCacheKey), 0, 16);
+    $shellFragmentKey = function_exists('ap_fragment_tl_shell_key')
+        ? ap_fragment_tl_shell_key((int) $vaakOwnerId, $shellSuffix)
+        : 'vaak:fragment:tl-shell:v1:' . (int) $vaakOwnerId . ':0:' . $shellSuffix;
     if (function_exists('ap_redis_json_get')) {
         $cachedShell = ap_redis_json_get($shellFragmentKey);
         if (is_array($cachedShell) && is_string($cachedShell['html'] ?? null) && $cachedShell['html'] !== '') {
@@ -9520,8 +9522,12 @@ function admin_tl_cache_dir(): string
 /** Redis key for the short-lived ranked timeline index (IDs only, no card HTML). */
 function admin_tl_redis_key(string $key): string
 {
-    // v2: RSS surfaces after ~8 posts (was v1 ~15).
-    return 'vaak:timeline:ranked:v2:' . hash('sha256', $key);
+    // v2: RSS surfaces after ~8 posts (was v1 ~15). The generation is part of
+    // the key so a global clear is one INCR, not a SCAN of every ranked list.
+    if (function_exists('ap_redis_ranked_key')) {
+        return ap_redis_ranked_key($key);
+    }
+    return 'vaak:timeline:ranked:v2:0:' . hash('sha256', $key);
 }
 
 function admin_tl_owner_index_key(int $ownerUserId): string
@@ -9571,8 +9577,8 @@ function admin_tl_cache_clear_owner(int $ownerUserId): void
     if (function_exists('ap_redis_delete')) {
         ap_redis_delete($indexKey);
     }
-    if (function_exists('ap_redis_delete_pattern')) {
-        ap_redis_delete_pattern('vaak:fragment:tl:v1:' . $ownerUserId . ':*');
+    if (function_exists('ap_fragment_tl_invalidate')) {
+        ap_fragment_tl_invalidate($ownerUserId);
     }
 }
 
@@ -11414,10 +11420,10 @@ function admin_home_rank_pref_rewarm(int $ownerUserId): void
 
 function admin_tl_cache_clear(): void
 {
-    if (function_exists('ap_redis_delete_pattern')) {
-        ap_redis_delete_pattern('vaak:timeline:ranked:v1:*');
-        ap_redis_delete_pattern('vaak:timeline:ranked:v2:*');
-        ap_redis_delete_pattern('vaak:timeline:owner-index:v1:*');
+    // One generation covers every ranked payload. v1 keys are unread and
+    // expire on their own; owner indexes still name the logical keys.
+    if (function_exists('ap_timeline_ranked_epoch_bump')) {
+        ap_timeline_ranked_epoch_bump();
     }
     $dir = admin_tl_cache_dir();
     foreach (glob($dir . '/tl_*.json') ?: [] as $path) {
@@ -27679,7 +27685,9 @@ if ($isPartial && in_array($view, ['home', 'feed', 'local'], true)) {
             }
             $fragIdentity .= '|' . hash('sha256', implode(',', $headIds));
         }
-        $adminTlFragmentKey = 'vaak:fragment:tl:v1:' . $fragOwner . ':' . hash('sha256', $fragIdentity);
+        $adminTlFragmentKey = function_exists('ap_fragment_tl_key')
+            ? ap_fragment_tl_key($fragOwner, hash('sha256', $fragIdentity))
+            : 'vaak:fragment:tl:v1:' . $fragOwner . ':0:' . hash('sha256', $fragIdentity);
         $fragCached = ap_redis_json_get($adminTlFragmentKey);
         if (is_array($fragCached) && is_string($fragCached['html'] ?? null) && $fragCached['html'] !== '') {
             $adminTlPerfTotalMs = (microtime(true) - $adminTlPerfT0) * 1000.0;

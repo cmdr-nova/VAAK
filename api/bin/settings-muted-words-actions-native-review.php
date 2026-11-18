@@ -202,7 +202,9 @@ rename($tlDir . '.moved', $tlDir);
 check(!$r['fell_back'] && $r['notice'] !== null && $r['error'] === null, 'missing cache dir still saves natively');
 check($db->query("SELECT count(*) FROM ap_muted_words WHERE phrase = 'cache later'")->fetchColumn() == 1, 'missing cache dir saved one row');
 check(str_contains((string) $redis->get('vaak:moderation:muted-words:' . $id(2)), 'cache later') && $redis->get('vaak:trends:policy-epoch:v1:' . $id(2)) === '5'
-    && $redis->get('vaak:timeline:ranked:v1:legacy') === false && $redis->get("vaak:fragment:tl:v1:{$id(2)}:x") === false, 'PHP redid the cache clear');
+    && (int) $redis->get('vaak:timeline:ranked:epoch:v1') >= 1
+    && (int) $redis->get('vaak:fragment:tl:epoch:v1:' . $id(2)) >= 1
+    && $redis->get("vaak:fragment:tl:v1:{$id(2)}9:y") === 'neighbour', 'PHP redid the cache clear');
 
 // The bridge validator.
 $owner = 2 + $big;

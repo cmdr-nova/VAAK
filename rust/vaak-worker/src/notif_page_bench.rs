@@ -296,7 +296,8 @@ async fn notif_page_bench() {
     db.batch_execute("ANALYZE").await.expect("analyze");
 
     let mut redis = crate::redis_util::connect(&redis_url).await.expect("redis");
-    let key = notifications_list_redis_key(OWNER, 40, None, None, &[], &[]);
+    let epoch = crate::notif_list::list_epoch(&mut redis, OWNER).await.unwrap_or_else(|| "0:0".into());
+    let key = notifications_list_redis_key(OWNER, 40, None, None, &[], &[], &epoch);
     let payload = json!({"ts": 1, "items": page_items(), "source": "bench-projection"});
     crate::redis_util::json_set(&mut redis, &key, &payload, 600).await.expect("redis set");
 

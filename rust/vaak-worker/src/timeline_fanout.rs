@@ -1,7 +1,7 @@
 //! Timeline ranked fan-out (0.6.73) — Rust primary via Redis queue.
 //!
 //! Queue: `vaak:queue:timeline_fanout` (Redis DB1). PHP enqueues; this worker
-//! prepends into `vaak:timeline:ranked:v2:*`, invalidates Home hydrate, and
+//! prepends into `vaak:timeline:ranked:v2:{epoch}:{sha256}`, invalidates Home hydrate, and
 //! optionally warms ranked→hydrate envelopes for small Home fan-outs.
 //!
 //! Job `op` values:
@@ -19,7 +19,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
-use sha2::{Digest, Sha256};
 use tokio_postgres::Client;
 
 use crate::config::Config;
@@ -98,14 +97,8 @@ fn rewarm_max() -> usize {
         .clamp(0, 32)
 }
 
-fn sha256_hex(s: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(s.as_bytes());
-    hex::encode(hasher.finalize())
-}
-
-fn ranked_redis_key(logical: &str) -> String {
-    format!("vaak:timeline:ranked:v2:{}", sha256_hex(logical))
+fn ranked_redis_key(epoch: &str, logical: &str) -> String {
+    crate::redis_util::ranked_redis_key(epoch, logical)
 }
 
 fn owner_index_key(owner: i64) -> String {
@@ -435,6 +428,7 @@ async fn prepend_owner(
     let prefix_home = format!("v13_home_u{owner}_");
     let prefix_local = format!("v13_local_u{owner}_");
     let prefix_feed = format!("v13_feed_u{owner}_");
+    let ranked_epoch = redis_util::generation(cache, redis_util::RANKED_EPOCH_KEY).await?;
     let mut touched = 0usize;
 
     for logical_v in logicals {
@@ -452,7 +446,7 @@ async fn prepend_owner(
             continue;
         };
 
-        let redis_key = ranked_redis_key(logical);
+        let redis_key = ranked_redis_key(&ranked_epoch, logical);
         let env = match redis_util::json_get(cache, &redis_key).await? {
             Some(v) => v,
             None => continue,
@@ -1059,12 +1053,8 @@ async fn owner_rewarm(cfg: &Config, owner: i64) -> Result<()> {
         del.arg(home_hydrate_redis_key(owner, limit));
     }
     let _: Result<i64, _> = del.query_async(&mut cache).await;
-    for pattern in [
-        format!("vaak:fragment:tl:v1:{owner}:*"),
-        format!("vaak:fragment:tl-shell:v1:{owner}:*"),
-    ] {
-        let _ = redis_util::delete_pattern(&mut cache, &pattern).await;
-    }
+    // Page body and soft-nav shell share one per-owner generation.
+    let _ = redis_util::bump_generation(&mut cache, &redis_util::fragment_tl_epoch_key(owner)).await;
     maybe_spawn_home_hydrate_warm(cfg, owner, true).await;
     tracing::info!(
         op = "owner_rewarm",

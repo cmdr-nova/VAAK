@@ -959,12 +959,13 @@ async fn html_page_selected(
     types: &[String],
     max_id: Option<&str>,
 ) -> Result<Option<HtmlPage>> {
-    let exact = crate::notif_list::notifications_list_redis_key(owner, limit, max_id, None, types, &[]);
+    let epoch = crate::notif_list::list_epoch(redis, owner).await.unwrap_or_default();
+    let exact = crate::notif_list::notifications_list_redis_key(owner, limit, max_id, None, types, &[], &epoch);
     let mut keys = vec![exact.clone()];
     let mut heads = Vec::new();
     for alt in crate::notif_list::warm_head_limits(limit) {
         if max_id.is_none() && alt == limit { continue; }
-        let key = crate::notif_list::notifications_list_redis_key(owner, alt, None, None, types, &[]);
+        let key = crate::notif_list::notifications_list_redis_key(owner, alt, None, None, types, &[], &epoch);
         heads.push(key.clone());
         keys.push(key);
     }

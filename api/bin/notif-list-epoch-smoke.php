@@ -48,7 +48,7 @@ reference_load($api . '/ap-db.php', [
 
 ap_notification_projection_invalidate_owner(7);
 epoch_check(($GLOBALS['calls'][0] ?? '') === 'bump:7', 'owner invalidation bumps the epoch before deleting');
-epoch_check(in_array('del:vaak:notifications:v4:7:*', $GLOBALS['calls'], true), 'owner invalidation still drops v4 pages');
+epoch_check(!in_array('del:vaak:notifications:v4:7:*', $GLOBALS['calls'], true), 'owner invalidation does not SCAN v4 pages');
 $left = $db->query('SELECT owner_user_id FROM ap_notification_projection ORDER BY owner_user_id')->fetchAll(PDO::FETCH_COLUMN);
 epoch_check($left === [8] || $left === ['8'], 'only the invalidated owner loses projection rows');
 

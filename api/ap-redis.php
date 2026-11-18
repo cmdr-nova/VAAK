@@ -7,17 +7,88 @@ declare(strict_types=1);
  * Redis is never authoritative for VAAK data. Every helper is best-effort and
  * returns a neutral result when the extension, configuration, or service is
  * unavailable so callers can fall back to the database/filesystem paths.
+ *
+ * A read timeout must never be 0: phpredis treats 0 as "block forever". On
+ * 2026-11-18 the host's disk latency pushed replies past the 80ms budget.
+ * phpredis raised "read error on connection", then the cached socket sat in
+ * poll() with no timeout and two CLI workers (listenbrainz, notification
+ * projection fill) held their flock until they were killed. Web requests keep
+ * the 80ms budget so a slow Redis is a cache miss. CLI workers are not on the
+ * request path and hold a lock across many calls, so they wait 0.40s: long
+ * enough to absorb a brief provider stall that has already exceeded 80ms
+ * (those spikes land in the low hundreds of milliseconds, not many seconds)
+ * and short enough that a dead Redis cannot pin the lock. 0.40s is inside
+ * the 0.25–0.5s range; 0.25s would still trip on the same class of stall,
+ * and 0.5s would make every call in a tight worker loop wait the full half
+ * second while Redis is gone.
  */
+function ap_redis_read_timeout(): float
+{
+    $timeout = PHP_SAPI === 'cli' ? 0.40 : 0.08;
+    return $timeout > 0.0 ? $timeout : 0.08;
+}
+
+/**
+ * @return array{clients:array<string,Redis|null>,attempted:array<string,bool>}
+ */
+function &ap_redis_runtime(): array
+{
+    static $state = [
+        'clients' => [],
+        'attempted' => [],
+    ];
+    return $state;
+}
+
+function ap_redis_purpose(string $purpose): string
+{
+    return $purpose === 'queue' ? 'queue' : 'cache';
+}
+
+/**
+ * Close a broken socket and forget it. The next ap_redis_client() call dials
+ * again instead of reusing the connection that just raised a read error.
+ */
+function ap_redis_discard_client(string $purpose): void
+{
+    $purpose = ap_redis_purpose($purpose);
+    $state = &ap_redis_runtime();
+    $client = $state['clients'][$purpose] ?? null;
+    if ($client instanceof Redis) {
+        try {
+            $client->close();
+        } catch (Throwable $e) {
+            // The socket is already dead.
+        }
+    }
+    unset($state['clients'][$purpose], $state['attempted'][$purpose]);
+}
+
+function ap_redis_fail(string $purpose, Throwable $e, string $op): void
+{
+    error_log('[ap-redis] ' . $op . ' failed: ' . $e->getMessage());
+    ap_redis_discard_client($purpose);
+}
+
+function ap_redis_apply_read_timeout(Redis $redis, float $seconds): void
+{
+    if ($seconds <= 0.0) {
+        $seconds = ap_redis_read_timeout();
+    }
+    if (defined('Redis::OPT_READ_TIMEOUT')) {
+        $redis->setOption(Redis::OPT_READ_TIMEOUT, $seconds);
+    }
+}
+
 function ap_redis_client(string $purpose = 'cache'): ?Redis
 {
-    static $clients = [];
-    static $attempted = [];
-    $purpose = $purpose === 'queue' ? 'queue' : 'cache';
-    if (($attempted[$purpose] ?? false) === true) {
-        $client = $clients[$purpose] ?? null;
+    $state = &ap_redis_runtime();
+    $purpose = ap_redis_purpose($purpose);
+    if (($state['attempted'][$purpose] ?? false) === true) {
+        $client = $state['clients'][$purpose] ?? null;
         return $client instanceof Redis ? $client : null;
     }
-    $attempted[$purpose] = true;
+    $state['attempted'][$purpose] = true;
     if (!class_exists('Redis')) {
         return null;
     }
@@ -38,27 +109,34 @@ function ap_redis_client(string $purpose = 'cache'): ?Redis
     $queueDb = max(0, (int) (getenv('VAAK_REDIS_QUEUE_DB') !== false ? getenv('VAAK_REDIS_QUEUE_DB') : ($cacheDb + 1)));
     $db = $purpose === 'queue' ? $queueDb : $cacheDb;
     $password = isset($parts['pass']) ? rawurldecode((string) $parts['pass']) : null;
+    $timeout = ap_redis_read_timeout();
     try {
         $redis = new Redis();
-        if (!@$redis->connect($host, $port, 0.08, null, 50, 0.08)) {
+        // Connect timeout stays at the fast 80ms budget. The read timeout is
+        // what a stalled reply waits on, and it is never 0.
+        if (!@$redis->connect($host, $port, 0.08, null, 50, $timeout)) {
             error_log('[ap-redis] ' . $purpose . ' connection unavailable; falling back to authoritative DB/filesystem paths');
             return null;
         }
         if ($password !== null && $password !== '' && !@$redis->auth($password)) {
             error_log('[ap-redis] ' . $purpose . ' authentication failed; acceleration disabled for this request');
+            try { $redis->close(); } catch (Throwable $ignored) {}
             return null;
         }
         if ($db > 0 && !@$redis->select($db)) {
             error_log('[ap-redis] ' . $purpose . ' database selection failed; acceleration disabled for this request');
+            try { $redis->close(); } catch (Throwable $ignored) {}
             return null;
         }
         $redis->setOption(Redis::OPT_SERIALIZER, Redis::SERIALIZER_NONE);
-        $clients[$purpose] = $redis;
+        ap_redis_apply_read_timeout($redis, $timeout);
+        $state['clients'][$purpose] = $redis;
     } catch (Throwable $e) {
         error_log('[ap-redis] connect failed: ' . $e->getMessage());
-        $clients[$purpose] = null;
+        $state['clients'][$purpose] = null;
     }
-    return $clients[$purpose] instanceof Redis ? $clients[$purpose] : null;
+    $client = $state['clients'][$purpose] ?? null;
+    return $client instanceof Redis ? $client : null;
 }
 
 /**
@@ -93,6 +171,7 @@ function ap_redis_health_check(string $purpose = 'cache'): array
             $out['warnings'][] = 'Redis PING failed';
         }
     } catch (Throwable $e) {
+        ap_redis_fail($purpose, $e, 'ping');
         $out['warnings'][] = 'Redis PING failed: ' . substr($e->getMessage(), 0, 160);
         return $out;
     }
@@ -104,7 +183,11 @@ function ap_redis_health_check(string $purpose = 'cache'): array
             $out['acl']['error'] = 'ACL WHOAMI returned no username';
         }
     } catch (Throwable $e) {
-        $out['acl']['error'] = substr($e->getMessage(), 0, 160);
+        $message = $e->getMessage();
+        if (stripos($message, 'read error') !== false || stripos($message, 'connection') !== false || stripos($message, 'timed out') !== false) {
+            ap_redis_discard_client($purpose);
+        }
+        $out['acl']['error'] = substr($message, 0, 160);
         $out['warnings'][] = 'ACL WHOAMI unavailable; verify the Redis user permissions';
     }
     return $out;
@@ -119,7 +202,7 @@ function ap_redis_json_get(string $key): ?array
         $decoded = is_string($raw) ? json_decode($raw, true) : null;
         return is_array($decoded) ? $decoded : null;
     } catch (Throwable $e) {
-        error_log('[ap-redis] get failed: ' . $e->getMessage());
+        ap_redis_fail('cache', $e, 'get');
         return null;
     }
 }
@@ -133,7 +216,7 @@ function ap_redis_json_set(string $key, array $value, int $ttlSeconds): bool
     try {
         return (bool) $redis->set($key, $encoded, ['ex' => $ttlSeconds]);
     } catch (Throwable $e) {
-        error_log('[ap-redis] set failed: ' . $e->getMessage());
+        ap_redis_fail('cache', $e, 'set');
         return false;
     }
 }
@@ -143,7 +226,7 @@ function ap_redis_delete(string ...$keys): void
     $redis = ap_redis_client('cache');
     $keys = array_values(array_filter($keys, static fn($key): bool => is_string($key) && $key !== ''));
     if (!$redis || $keys === []) return;
-    try { $redis->del($keys); } catch (Throwable $e) { error_log('[ap-redis] delete failed: ' . $e->getMessage()); }
+    try { $redis->del($keys); } catch (Throwable $e) { ap_redis_fail('cache', $e, 'delete'); }
 }
 
 /**
@@ -163,7 +246,7 @@ function ap_trends_policy_epoch(?int $ownerUserId = null): string
         if (!preg_match('/^\d+$/', $user)) $user = '0';
         return $server . ':' . $user;
     } catch (Throwable $e) {
-        error_log('[ap-redis] trends epoch read failed: ' . $e->getMessage());
+        ap_redis_fail('cache', $e, 'trends epoch read');
         return '0:0';
     }
 }
@@ -182,7 +265,7 @@ function ap_trends_policy_epoch_bump(?int $ownerUserId = null): void
         $redis->incr($key);
         $redis->expire($key, 86400 * 30);
     } catch (Throwable $e) {
-        error_log('[ap-redis] trends epoch bump failed: ' . $e->getMessage());
+        ap_redis_fail('cache', $e, 'trends epoch bump');
     }
 }
 
@@ -201,7 +284,7 @@ function ap_notification_list_epoch(int $ownerUserId): string
         $user = (string) ($redis->get('vaak:notifications:epoch:v1:' . $ownerUserId) ?: '0');
         return $server . ':' . $user;
     } catch (Throwable $e) {
-        error_log('[ap-redis] notification epoch read failed: ' . $e->getMessage());
+        ap_redis_fail('cache', $e, 'notification epoch read');
         return '';
     }
 }
@@ -221,7 +304,7 @@ function ap_notif_stream_token(int $ownerUserId): string
         $redis->set('vaak:notif_stream:token:v1:' . hash('sha256', $token), (string) $ownerUserId, ['ex' => 43200]);
         return $token;
     } catch (Throwable $e) {
-        error_log('[ap-redis] notif stream token failed: ' . $e->getMessage());
+        ap_redis_fail('cache', $e, 'notif stream token');
         return '';
     }
 }
@@ -237,22 +320,143 @@ function ap_notification_list_epoch_bump(?int $ownerUserId = null): void
         $redis->incr($key);
         $redis->expire($key, 86400 * 30);
     } catch (Throwable $e) {
-        error_log('[ap-redis] notification epoch bump failed: ' . $e->getMessage());
+        ap_redis_fail('cache', $e, 'notification epoch bump');
     }
 }
 
+/**
+ * Decimal generation counter. '' means the read failed (do not alias generation
+ * 0: the client was just discarded and the next command may reconnect).
+ * '0' means the key is absent.
+ */
+function ap_redis_generation(string $key): string
+{
+    $redis = ap_redis_client('cache');
+    if (!$redis || $key === '') {
+        return '0';
+    }
+    try {
+        $value = $redis->get($key);
+        if ($value === false || $value === null) {
+            return '0';
+        }
+        $value = (string) $value;
+        return preg_match('/^\d+$/', $value) ? $value : '0';
+    } catch (Throwable $e) {
+        ap_redis_fail('cache', $e, 'generation read');
+        return '';
+    }
+}
+
+function ap_redis_generation_bump(string $key, string $op = 'generation bump'): void
+{
+    $redis = ap_redis_client('cache');
+    if (!$redis || $key === '') {
+        return;
+    }
+    try {
+        $redis->incr($key);
+        $redis->expire($key, 86400 * 30);
+    } catch (Throwable $e) {
+        ap_redis_fail('cache', $e, $op);
+    }
+}
+
+function ap_redis_generation_token(string $raw): string
+{
+    return preg_match('/^\d+$/', $raw) ? $raw : 'x';
+}
+
+/**
+ * True at most once per pattern per minute, and at most once globally per 5s.
+ * A hot loop cannot put SCAN back on the CPU the way 2026-11-18 did.
+ */
+function ap_redis_pattern_scan_allowed(string $pattern, ?float $now = null): bool
+{
+    static $last = [];
+    static $global = 0.0;
+    if ($pattern === '') {
+        return false;
+    }
+    $now = $now ?? microtime(true);
+    if (($now - $global) < 5.0) {
+        return false;
+    }
+    $prev = $last[$pattern] ?? 0.0;
+    if (($now - $prev) < 60.0) {
+        return false;
+    }
+    $last[$pattern] = $now;
+    $global = $now;
+    return true;
+}
+
+/**
+ * SCAN fallback for a pattern that is not a per-user generation or an exact
+ * key. Hot invalidation does not call this. It is rate-limited so a stray
+ * caller cannot sweep the keyspace on every notification.
+ */
 function ap_redis_delete_pattern(string $pattern): void
 {
     $redis = ap_redis_client('cache');
-    if (!$redis || $pattern === '') return;
+    if (!$redis || $pattern === '') {
+        return;
+    }
+    if (!ap_redis_pattern_scan_allowed($pattern)) {
+        error_log('[ap-redis] pattern delete skipped (rate limit): ' . $pattern);
+        return;
+    }
     try {
         $iterator = null;
         while (($keys = $redis->scan($iterator, $pattern, 100)) !== false) {
-            if ($keys !== []) $redis->del($keys);
-            if ($iterator === 0) break;
+            if ($keys !== []) {
+                $redis->del($keys);
+            }
+            if ($iterator === 0) {
+                break;
+            }
         }
     } catch (Throwable $e) {
-        error_log('[ap-redis] pattern delete failed: ' . $e->getMessage());
+        ap_redis_fail('cache', $e, 'pattern delete');
+    }
+}
+
+function ap_redis_set_add(string $setKey, string $member, int $ttlSeconds): void
+{
+    $redis = ap_redis_client('cache');
+    if (!$redis || $setKey === '' || $member === '') {
+        return;
+    }
+    try {
+        $redis->sAdd($setKey, $member);
+        $redis->expire($setKey, max(1, $ttlSeconds));
+    } catch (Throwable $e) {
+        ap_redis_fail('cache', $e, 'set add');
+    }
+}
+
+/** @return list<string> */
+function ap_redis_set_members(string $setKey): array
+{
+    $redis = ap_redis_client('cache');
+    if (!$redis || $setKey === '') {
+        return [];
+    }
+    try {
+        $members = $redis->sMembers($setKey);
+        if (!is_array($members)) {
+            return [];
+        }
+        $out = [];
+        foreach ($members as $member) {
+            if (is_string($member) && $member !== '') {
+                $out[] = $member;
+            }
+        }
+        return $out;
+    } catch (Throwable $e) {
+        ap_redis_fail('cache', $e, 'set members');
+        return [];
     }
 }
 
@@ -268,7 +472,7 @@ function ap_redis_rate_count(string $bucket, int $windowSeconds = 900): ?int
         if ($count === 1) $redis->expire($key, max(1, $windowSeconds));
         return $count;
     } catch (Throwable $e) {
-        error_log('[ap-redis] rate counter failed: ' . $e->getMessage());
+        ap_redis_fail('cache', $e, 'rate counter');
         return null;
     }
 }
@@ -278,7 +482,7 @@ function ap_redis_rate_clear(string $bucket): void
     $redis = ap_redis_client('cache');
     $bucket = trim($bucket);
     if (!$redis || $bucket === '') return;
-    try { $redis->del('vaak:rate:' . hash('sha256', $bucket)); } catch (Throwable $e) { /* best effort */ }
+    try { $redis->del('vaak:rate:' . hash('sha256', $bucket)); } catch (Throwable $e) { ap_redis_fail('cache', $e, 'rate clear'); }
 }
 
 function ap_redis_rate_get(string $bucket): ?int
@@ -290,6 +494,7 @@ function ap_redis_rate_get(string $bucket): ?int
         $value = $redis->get('vaak:rate:' . hash('sha256', $bucket));
         return $value === false ? 0 : (int) $value;
     } catch (Throwable $e) {
+        ap_redis_fail('cache', $e, 'rate get');
         return null;
     }
 }
@@ -351,7 +556,7 @@ function ap_provider_circuit_failure(string $provider, int $cooldown = 60): void
             'updated_at' => time(),
         ], 1800);
     } catch (Throwable $e) {
-        // Circuit state must never turn an upstream failure into an app failure.
+        ap_redis_discard_client('cache');
     }
 }
 
@@ -365,7 +570,7 @@ function ap_redis_metric_inc(string $name, int $amount = 1): void
         $key = 'vaak:metric:' . $name;
         $redis->incrBy($key, $amount);
         $redis->expire($key, 604800);
-    } catch (Throwable $e) { /* metrics must never affect requests */ }
+    } catch (Throwable $e) { ap_redis_discard_client('cache'); }
 }
 
 /**
@@ -428,10 +633,25 @@ function ap_redis_search_ttl(): int
 /**
  * @param 'favourites_bsky'|'bookmarks_bsky'|'favourites_fedi' $kind
  */
-function ap_redis_library_html_key(string $kind, int $ownerUserId, string $suffix): string
-{
+function ap_redis_library_html_key(
+    string $kind,
+    int $ownerUserId,
+    string $suffix,
+    ?string $ownerEpoch = null,
+    ?string $kindEpoch = null
+): string {
     $kind = preg_replace('/[^a-z0-9_]/', '', strtolower($kind)) ?: 'frag';
-    return 'vaak:fragment:lib:v1:' . $kind . ':' . max(0, $ownerUserId) . ':' . hash('sha256', $suffix);
+    $ownerUserId = max(0, $ownerUserId);
+    if ($ownerEpoch === null) {
+        $ownerEpoch = ap_redis_generation('vaak:fragment:lib:epoch:v1:' . $ownerUserId);
+    }
+    if ($kindEpoch === null) {
+        $kindEpoch = ap_redis_generation('vaak:fragment:lib:epoch:v1:' . $ownerUserId . ':' . $kind);
+    }
+    return 'vaak:fragment:lib:v1:' . $kind . ':' . $ownerUserId . ':'
+        . ap_redis_generation_token($ownerEpoch) . ':'
+        . ap_redis_generation_token($kindEpoch) . ':'
+        . hash('sha256', $suffix);
 }
 
 /**
@@ -475,19 +695,123 @@ function ap_redis_library_html_set(
 /** Drop Favourites/Bookmarks rendered HTML for an owner (all offsets/folders). */
 function ap_redis_library_html_invalidate(int $ownerUserId, ?string $kind = null): void
 {
-    if ($ownerUserId < 1 || !function_exists('ap_redis_delete_pattern')) {
+    if ($ownerUserId < 1) {
         return;
     }
     if ($kind !== null && $kind !== '') {
         $kind = preg_replace('/[^a-z0-9_]/', '', strtolower($kind)) ?: '';
         if ($kind !== '') {
-            ap_redis_delete_pattern('vaak:fragment:lib:v1:' . $kind . ':' . $ownerUserId . ':*');
+            // One kind: bump that kind's generation. Other library pages stay.
+            ap_redis_generation_bump('vaak:fragment:lib:epoch:v1:' . $ownerUserId . ':' . $kind, 'library fragment invalidate');
             ap_redis_metric_inc('fragment_invalidate');
             return;
         }
     }
-    ap_redis_delete_pattern('vaak:fragment:lib:v1:*:' . $ownerUserId . ':*');
+    ap_redis_generation_bump('vaak:fragment:lib:epoch:v1:' . $ownerUserId, 'library fragment invalidate');
     ap_redis_metric_inc('fragment_invalidate');
+}
+
+/**
+ * Timeline HTML fragments (page body and soft-nav shell) share one per-owner
+ * generation. Invalidation is a single INCR; readers bake it into the key.
+ */
+function ap_fragment_tl_invalidate(int $ownerUserId): void
+{
+    if ($ownerUserId < 1) {
+        return;
+    }
+    ap_redis_generation_bump('vaak:fragment:tl:epoch:v1:' . $ownerUserId, 'timeline fragment invalidate');
+}
+
+function ap_fragment_tl_epoch_token(int $ownerUserId): string
+{
+    if ($ownerUserId < 1) {
+        return '0';
+    }
+    return ap_redis_generation_token(ap_redis_generation('vaak:fragment:tl:epoch:v1:' . $ownerUserId));
+}
+
+function ap_fragment_tl_key(int $ownerUserId, string $suffix): string
+{
+    return 'vaak:fragment:tl:v1:' . max(0, $ownerUserId) . ':' . ap_fragment_tl_epoch_token($ownerUserId) . ':' . $suffix;
+}
+
+function ap_fragment_tl_shell_key(int $ownerUserId, string $suffix): string
+{
+    return 'vaak:fragment:tl-shell:v1:' . max(0, $ownerUserId) . ':' . ap_fragment_tl_epoch_token($ownerUserId) . ':' . $suffix;
+}
+
+/** Server generation for ranked timeline payloads. Global clear is one INCR. */
+function ap_timeline_ranked_epoch_bump(): void
+{
+    ap_redis_generation_bump('vaak:timeline:ranked:epoch:v1', 'ranked epoch bump');
+}
+
+function ap_redis_ranked_key(string $logical, ?string $epoch = null): string
+{
+    if ($epoch === null) {
+        $epoch = ap_redis_generation('vaak:timeline:ranked:epoch:v1');
+    }
+    return 'vaak:timeline:ranked:v2:' . ap_redis_generation_token($epoch) . ':' . hash('sha256', $logical);
+}
+
+/**
+ * Badge caches. Separate from the list epoch so marking read does not rebuild
+ * every Mentions page. Both the live key and the shadow key include it.
+ */
+function ap_notification_unread_epoch(int $ownerUserId): string
+{
+    if ($ownerUserId < 1) {
+        return '';
+    }
+    return ap_redis_generation('vaak:notifications:unread-epoch:v1:' . $ownerUserId);
+}
+
+function ap_notification_unread_epoch_bump(int $ownerUserId): void
+{
+    if ($ownerUserId < 1) {
+        return;
+    }
+    ap_redis_generation_bump('vaak:notifications:unread-epoch:v1:' . $ownerUserId, 'unread epoch bump');
+}
+
+function ap_notification_unread_redis_key(int $ownerUserId, int $scan, string $lastRead, ?string $epoch = null, bool $shadow = false): string
+{
+    if ($epoch === null) {
+        $epoch = ap_notification_unread_epoch($ownerUserId);
+    }
+    $prefix = $shadow ? 'vaak:shadow:notifications:v1:unread:' : 'vaak:notifications:v1:unread:';
+    return $prefix . $ownerUserId . ':' . ap_redis_generation_token($epoch) . ':' . $scan . ':' . hash('sha256', $lastRead);
+}
+
+/** @return array{0:string,1:string} server, user */
+function ap_notification_list_epoch_parts(string $epoch): array
+{
+    if ($epoch === '') {
+        return ['x', 'x'];
+    }
+    $bits = explode(':', $epoch, 2);
+    $server = preg_match('/^\d+$/', $bits[0] ?? '') ? $bits[0] : '0';
+    $user = preg_match('/^\d+$/', $bits[1] ?? '') ? $bits[1] : '0';
+    return [$server, $user];
+}
+
+function ap_notification_page_index_key(int $ownerUserId): string
+{
+    return 'vaak:notifications:v4:index:' . max(0, $ownerUserId);
+}
+
+function ap_notification_page_index_add(string $key, int $ttlSeconds = 600): void
+{
+    if (!str_starts_with($key, 'vaak:notifications:v4:')) {
+        return;
+    }
+    $rest = substr($key, strlen('vaak:notifications:v4:'));
+    $owner = strstr($rest, ':', true);
+    if ($owner === false || !ctype_digit($owner)) {
+        return;
+    }
+    ap_redis_set_add(ap_notification_page_index_key((int) $owner), $key, $ttlSeconds);
 }
 
 /** Record a relationship-cache hit/miss/invalidate for ops dashboards. */
@@ -515,7 +839,10 @@ function ap_redis_metric_snapshot(): array
             }
             if ($it === 0) break;
         }
-    } catch (Throwable $e) { return []; }
+    } catch (Throwable $e) {
+        ap_redis_fail('cache', $e, 'metric snapshot');
+        return [];
+    }
     ksort($out);
     return $out;
 }
@@ -542,7 +869,7 @@ function ap_timing_record(string $name, float $milliseconds): void
         $redis->lTrim($sampleKey, 0, 255);
         $redis->expire($sampleKey, 86400);
     } catch (Throwable $e) {
-        // Telemetry must never affect request execution.
+        ap_redis_discard_client('cache');
     }
 }
 
@@ -584,6 +911,7 @@ function ap_redis_timing_snapshot(): array
             if ($it === 0) break;
         }
     } catch (Throwable $e) {
+        ap_redis_discard_client('cache');
         return [];
     }
     ksort($out);
@@ -608,7 +936,7 @@ function ap_slow_route_record(string $route, float $milliseconds, float $thresho
         ]);
         $redis->expire($key, 86400);
     } catch (Throwable $e) {
-        // Diagnostics must never affect request execution.
+        ap_redis_discard_client('cache');
     }
 }
 
@@ -637,6 +965,7 @@ function ap_slow_route_snapshot(int $limit = 20): array
         usort($out, static fn(array $a, array $b): int => $b['max_ms'] <=> $a['max_ms']);
         return array_slice($out, 0, max(1, min(100, $limit)));
     } catch (Throwable $e) {
+        ap_redis_discard_client('cache');
         return [];
     }
 }
@@ -662,7 +991,7 @@ function ap_redis_lock(string $key, int $ttlSeconds = 30): bool
         ap_redis_metric_inc($ok ? 'lock_acquired' : 'lock_contended');
         return $ok;
     } catch (Throwable $e) {
-        error_log('[ap-redis] lock failed: ' . $e->getMessage());
+        ap_redis_fail('queue', $e, 'lock');
         return false;
     }
 }
@@ -681,7 +1010,7 @@ function ap_redis_unlock(string $key): void
             $redis->del($full);
         }
     } catch (Throwable $e) {
-        // unlock must never affect requests
+        ap_redis_discard_client('queue');
     }
 }
 
@@ -741,6 +1070,7 @@ function ap_fanout_rust_worker_active(): bool
         $beat = $redis->get('vaak:fanout_delivery:rust:v1');
         $active = is_string($beat) && ctype_digit($beat) && ($now - (int) $beat) <= 30;
     } catch (Throwable $e) {
+        ap_redis_discard_client('cache');
         $active = false;
     }
     return $active;
@@ -774,6 +1104,7 @@ function ap_fanout_rust_sync_active(): bool
         $beat = $redis->get('vaak:fanout_delivery:rust_sync:v1');
         $active = is_string($beat) && ctype_digit($beat) && ($now - (int) $beat) <= 30;
     } catch (Throwable $e) {
+        ap_redis_discard_client('cache');
         $active = false;
     }
     return $active;
@@ -807,6 +1138,7 @@ function ap_fanout_rust_actions_active(): bool
         $beat = $redis->get('vaak:fanout_delivery:rust_actions:v1');
         $active = is_string($beat) && ctype_digit($beat) && ($now - (int) $beat) <= 30;
     } catch (Throwable $e) {
+        ap_redis_discard_client('cache');
         $active = false;
     }
     return $active;
@@ -824,7 +1156,7 @@ function ap_redis_queue_push(string $queue, string|int $item): bool
         ap_redis_metric_inc('queue_push');
         return true;
     } catch (Throwable $e) {
-        error_log('[ap-redis] queue push failed: ' . $e->getMessage());
+        ap_redis_fail('queue', $e, 'queue push');
         return false;
     }
 }
@@ -839,18 +1171,21 @@ function ap_redis_queue_pop_any(array $queues, int $timeoutSeconds = 5): ?array
         if ($clean !== '') $keys[] = 'vaak:queue:' . $clean;
     }
     if (!$redis || $keys === []) return null;
+    $blockFor = max(1, min(30, $timeoutSeconds));
     try {
-        // The client uses a short timeout for request-time cache reads; a
-        // blocking queue wait needs a matching read timeout instead.
-        $redis->setOption(Redis::OPT_READ_TIMEOUT, max(1, $timeoutSeconds + 1));
-        $row = $redis->brPop($keys, max(1, min(30, $timeoutSeconds)));
-        $redis->setOption(Redis::OPT_READ_TIMEOUT, 0.08);
+        // BRPOP is a bounded wait, not an infinite poll. The read timeout has
+        // to cover that wait or phpredis aborts a live block. Restore the
+        // purpose default afterwards. A failure discards the socket: putting
+        // the short timeout back on a connection that just read-errored is
+        // how the 2026-11-18 workers stuck in poll().
+        ap_redis_apply_read_timeout($redis, (float) ($blockFor + 1));
+        $row = $redis->brPop($keys, $blockFor);
+        ap_redis_apply_read_timeout($redis, ap_redis_read_timeout());
         if (!is_array($row) || count($row) < 2) return null;
         ap_redis_metric_inc('queue_pop');
         return ['queue' => substr((string) $row[0], strlen('vaak:queue:')), 'item' => (string) $row[1]];
     } catch (Throwable $e) {
-        try { $redis->setOption(Redis::OPT_READ_TIMEOUT, 0.08); } catch (Throwable $ignored) {}
-        error_log('[ap-redis] queue pop failed: ' . $e->getMessage());
+        ap_redis_fail('cache', $e, 'queue pop');
         return null;
     }
 }

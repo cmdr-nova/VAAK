@@ -7635,9 +7635,21 @@ function ap_masto_notifications_list_redis_key(
     ?string $maxId,
     ?string $sinceId,
     array $want,
-    array $exclude = []
+    array $exclude = [],
+    ?string $epoch = null
 ): string {
-    return 'vaak:notifications:v4:' . $ownerUserId . ':' . hash('sha256', json_encode([
+    if ($epoch === null) {
+        $epoch = function_exists('ap_notification_list_epoch') ? ap_notification_list_epoch($ownerUserId) : '';
+    }
+    if (function_exists('ap_notification_list_epoch_parts')) {
+        [$server, $user] = ap_notification_list_epoch_parts($epoch);
+    } else {
+        $server = '0';
+        $user = '0';
+    }
+    // The hash payload is unchanged so PHP and Rust stay on the same digest.
+    // The epoch is a path segment: a bump makes every old page a miss.
+    return 'vaak:notifications:v4:' . $ownerUserId . ':' . $server . ':' . $user . ':' . hash('sha256', json_encode([
         // Include exclusions so an Ice Cubes request using exclude_types cannot
         // reuse a cache entry built for a different notification filter.
         'limit' => $limit, 'max' => $maxId, 'since' => $sinceId, 'types' => $want, 'exclude' => $exclude,
@@ -7721,7 +7733,10 @@ function ap_masto_notifications_list_cache_put(
         $source = ap_masto_notifications_list_warm_mode() ? 'vaak-worker-live' : 'php';
     }
     $ttl = $listRustPrimary ? 600 : 300;
-    ap_redis_json_set($redisKey, ['ts' => time(), 'items' => array_values($items), 'source' => $source], $ttl);
+    if (ap_redis_json_set($redisKey, ['ts' => time(), 'items' => array_values($items), 'source' => $source], $ttl)
+        && function_exists('ap_notification_page_index_add')) {
+        ap_notification_page_index_add($redisKey, $ttl);
+    }
     return $redisKey;
 }
 
@@ -9213,11 +9228,13 @@ function ap_masto_notifications_fetch(int $limit = 40, ?string $maxId = null, ?s
             ? ap_notifications_apply_viewer_filters($rows, (int) $ownerUserId)
             : $rows;
     };
-    $redisKey = ap_masto_notifications_list_redis_key($ownerUserId, $limit, $maxId, $sinceId, $want, $exclude);
-    // Read before any source query. A hydrate takes seconds; if a follow or
-    // mention invalidated the caches meanwhile, this page is already older
-    // than the badge and must not be written back (see $listEpochCurrent).
+    // Read before any source query and before the cache key is built. A hydrate
+    // takes seconds; if a follow or mention invalidated the caches meanwhile,
+    // this page is already older than the badge and must not be written back
+    // (see $listEpochCurrent). The epoch is part of the key, so the write also
+    // lands on a page new readers will not open.
     $listEpoch = function_exists('ap_notification_list_epoch') ? ap_notification_list_epoch($ownerUserId) : '';
+    $redisKey = ap_masto_notifications_list_redis_key($ownerUserId, $limit, $maxId, $sinceId, $want, $exclude, $listEpoch);
     $listEpochCurrent = static function () use ($listEpoch, $ownerUserId): bool {
         return $listEpoch === '' || !function_exists('ap_notification_list_epoch')
             || ap_notification_list_epoch($ownerUserId) === $listEpoch;
@@ -9352,7 +9369,10 @@ function ap_masto_notifications_fetch(int $limit = 40, ?string $maxId = null, ?s
             $recordNotifTiming('projection_hit', $projectionStartedAt);
             $GLOBALS['ap_notif_list_has_more'] = true;
             if (function_exists('ap_redis_json_set') && $listEpochCurrent()) {
-                ap_redis_json_set($redisKey, ['ts' => time(), 'items' => $projected, 'source' => 'php-projection'], 300);
+                if (ap_redis_json_set($redisKey, ['ts' => time(), 'items' => $projected, 'source' => 'php-projection'], 300)
+                    && function_exists('ap_notification_page_index_add')) {
+                    ap_notification_page_index_add($redisKey, 300);
+                }
             }
             $recordNotifTiming('total', $notifStartedAt);
             return $presentNotifications($projected);
@@ -9380,13 +9400,15 @@ function ap_masto_notifications_fetch(int $limit = 40, ?string $maxId = null, ?s
         $source = $listWarmMode ? 'vaak-worker-live' : 'php';
         // Keep 5–10 minutes for stale-while-revalidate; freshness is gated by ts.
         $ttl = $listRustPrimary ? 600 : 300;
-        ap_redis_json_set($redisKey, [
+        if (ap_redis_json_set($redisKey, [
             'ts' => time(),
             'items' => $out,
             'source' => $source,
             'has_more' => (bool) ($GLOBALS['ap_notif_list_has_more'] ?? false),
             'next_cursor' => (string) ($GLOBALS['ap_notif_list_next_cursor'] ?? ''),
-        ], $ttl);
+        ], $ttl) && function_exists('ap_notification_page_index_add')) {
+            ap_notification_page_index_add($redisKey, $ttl);
+        }
     }
     if ($holdNotifLock && $notifStampedeLock !== '' && function_exists('ap_redis_unlock')) {
         ap_redis_unlock($notifStampedeLock);
@@ -9543,7 +9565,10 @@ function ap_masto_notifications_unread_state(int $scan = 80, bool $bypassCache =
     }
     // Badge polls every ~12s; keep Redis/file hot longer so rebuilds stay rare.
     $cacheTtl = $bypassCache ? 0 : 45;
-    $redisKey = 'vaak:notifications:v1:unread:' . $ownerUserId . ':' . $scan . ':' . hash('sha256', $lastRead);
+    $unreadEpoch = function_exists('ap_notification_unread_epoch') ? ap_notification_unread_epoch($ownerUserId) : '0';
+    $redisKey = function_exists('ap_notification_unread_redis_key')
+        ? ap_notification_unread_redis_key($ownerUserId, $scan, $lastRead, $unreadEpoch)
+        : 'vaak:notifications:v1:unread:' . $ownerUserId . ':0:' . $scan . ':' . hash('sha256', $lastRead);
     $unreadStampedeLock = '';
     $holdUnreadLock = false;
     $cacheDir = '/var/lib/mkultra/ap';
@@ -15904,14 +15929,13 @@ function ap_masto_suggestions_cache_clear(?int $ownerUserId = null): void
         return;
     }
     $lastClear[$memoKey] = $nowClear;
-    // Limits are clamped to 1..80, so one DEL covers every key for the owner.
-    if ($ownerUserId !== null && function_exists('ap_redis_delete')) {
-        ap_redis_delete(...array_map(
-            static fn(int $n): string => 'vaak:recommend:v1:suggestions:' . $ownerUserId . ':' . $n,
-            range(1, 80)
-        ));
-    } elseif ($ownerUserId === null && function_exists('ap_redis_delete_pattern')) {
-        ap_redis_delete_pattern('vaak:recommend:v1:suggestions:*');
+    // Suggestions keys include a server generation and a per-owner generation.
+    // Either bump makes the cached pages unreachable. Limits are 1..80, so a
+    // SCAN of every suggestion key is not required.
+    if ($ownerUserId !== null && function_exists('ap_redis_generation_bump')) {
+        ap_redis_generation_bump('vaak:recommend:epoch:v1:' . $ownerUserId, 'suggestions invalidate');
+    } elseif ($ownerUserId === null && function_exists('ap_redis_generation_bump')) {
+        ap_redis_generation_bump('vaak:recommend:epoch:v1:server', 'suggestions invalidate');
     }
     $dir = '/var/lib/mkultra/ap/suggestions';
     if (!is_dir($dir) || !is_readable($dir)) {
@@ -16398,7 +16422,11 @@ function ap_masto_suggestions_v2(int $limit = 40): array
 {
     $limit = max(1, min(80, $limit));
     $owner = function_exists('ap_db_masto_owner_user_id') ? (int) ap_db_masto_owner_user_id() : 0;
-    $redisKey = 'vaak:recommend:v1:suggestions:' . $owner . ':' . $limit;
+    $suggestServer = function_exists('ap_redis_generation') ? ap_redis_generation('vaak:recommend:epoch:v1:server') : '0';
+    $suggestOwner = function_exists('ap_redis_generation') ? ap_redis_generation('vaak:recommend:epoch:v1:' . $owner) : '0';
+    $suggestServer = function_exists('ap_redis_generation_token') ? ap_redis_generation_token($suggestServer) : '0';
+    $suggestOwner = function_exists('ap_redis_generation_token') ? ap_redis_generation_token($suggestOwner) : '0';
+    $redisKey = 'vaak:recommend:v1:suggestions:' . $owner . ':' . $suggestServer . ':' . $suggestOwner . ':' . $limit;
     if (function_exists('ap_redis_json_get')) {
         $redisCached = ap_redis_json_get($redisKey);
         if (is_array($redisCached) && isset($redisCached['created_at'], $redisCached['items'])

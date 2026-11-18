@@ -634,6 +634,7 @@ pub async fn home_since(
     }
 
     let mut redis = redis_util::connect(&cfg.redis_url).await?;
+    let ranked_epoch = redis_util::generation(&mut redis, redis_util::RANKED_EPOCH_KEY).await?;
     let index_key = format!("vaak:timeline:owner-index:v1:{owner_user_id}");
     let index = redis_util::json_get(&mut redis, &index_key).await?;
     // The owner index lists older Home logicals ahead of the one warm just
@@ -645,7 +646,7 @@ pub async fn home_since(
     }
     let mut best: Option<(String, Value, usize, i64)> = None;
     for logical in &logicals {
-        let rk = ranked_redis_key(logical);
+        let rk = ranked_redis_key(&ranked_epoch, logical);
         let Some(env) = redis_util::json_get(&mut redis, &rk).await? else {
             continue;
         };
@@ -657,11 +658,11 @@ pub async fn home_since(
         }
     }
     let Some((logical, ranked_env, _, _)) = best else {
-        report.ranked_key = logicals.first().map(|logical| ranked_redis_key(logical));
+        report.ranked_key = logicals.first().map(|logical| ranked_redis_key(&ranked_epoch, logical));
         report.note = "ranked home envelope miss";
         return Ok(report);
     };
-    report.ranked_key = Some(ranked_redis_key(&logical));
+    report.ranked_key = Some(ranked_redis_key(&ranked_epoch, &logical));
     let ranked_rows = ranked_env
         .get("ranked")
         .and_then(|v| v.as_array())
@@ -773,27 +774,18 @@ pub async fn chrono_since(
 pub async fn home_shadow(cfg: &Config, owner_user_id: i64, limit: usize) -> Result<HomeShadowReport> {
     let limit = limit.clamp(1, 40);
     let mut redis = redis_util::connect(&cfg.redis_url).await?;
+    let ranked_epoch = redis_util::generation(&mut redis, redis_util::RANKED_EPOCH_KEY).await?;
     let index_key = format!("vaak:timeline:owner-index:v1:{owner_user_id}");
     let index = redis_util::json_get(&mut redis, &index_key).await?;
 
     let logical = pick_home_logical_key(index.as_ref());
     let (redis_key, payload) = if let Some(ref logical) = logical {
-        let rk = ranked_redis_key(logical);
+        let rk = ranked_redis_key(&ranked_epoch, logical);
         let payload = redis_util::json_get(&mut redis, &rk).await?;
         (Some(rk), payload)
     } else {
-        // Fallback: first ranked key on this Redis (dev/soak).
-        let keys: Vec<String> = redis::cmd("KEYS")
-            .arg("vaak:timeline:ranked:v2:*")
-            .query_async(&mut redis)
-            .await
-            .unwrap_or_default();
-        if let Some(rk) = keys.into_iter().next() {
-            let payload = redis_util::json_get(&mut redis, &rk).await?;
-            (Some(rk), payload)
-        } else {
-            (None, None)
-        }
+        // No owner index: do not KEYS the whole database. A miss is a miss.
+        (None, None)
     };
 
     // Probe hydrate for the requested limit; also try 40 (Ice Cubes default head).
@@ -994,10 +986,8 @@ fn ranked_score_wins(best: Option<(usize, i64)>, n: usize, ts: i64) -> bool {
     }
 }
 
-fn ranked_redis_key(logical: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(logical.as_bytes());
-    format!("vaak:timeline:ranked:v2:{}", hex::encode(hasher.finalize()))
+fn ranked_redis_key(epoch: &str, logical: &str) -> String {
+    crate::redis_util::ranked_redis_key(epoch, logical)
 }
 
 #[cfg(test)]

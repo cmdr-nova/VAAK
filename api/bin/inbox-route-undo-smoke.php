@@ -113,13 +113,15 @@ foreach (['rust', 'php'] as $side) {
     $body = json_encode(['id' => $yuki . '#undo/like-' . $side, 'type' => 'Undo', 'actor' => $yuki,
         'object' => ['id' => $likeId, 'type' => 'Like', 'actor' => $yuki, 'object' => $target]], JSON_UNESCAPED_SLASHES);
     $epoch = (int) $redis->get('vaak:notifications:epoch:v1:server');
+    $unreadEpoch = (int) $redis->get('vaak:notifications:unread-epoch:v1:1');
     $result = $run($side, $body);
     $ev = $normalize($activityEvent('Undo', $likeId), $side, $body);
     $out[$side] = [
         'result' => $result,
         'mention' => $mentionState('activity_id = ?', [$likeId]),
         'event' => $ev,
-        'caches_gone' => !$redis->exists('vaak:notifications:v2:1:smoke-' . $side) && !$redis->exists('vaak:notifications:v1:unread:1:smoke-' . $side),
+        'caches_gone' => (int) $redis->get('vaak:notifications:epoch:v1:server') > $epoch
+            && (int) $redis->get('vaak:notifications:unread-epoch:v1:1') > $unreadEpoch,
         'epoch_bumped' => (int) $redis->get('vaak:notifications:epoch:v1:server') > $epoch,
     ];
 }

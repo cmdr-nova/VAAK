@@ -849,10 +849,8 @@ fn bsky_media_and_card(embed_json: &str, status_id: &str) -> (Vec<Value>, Option
     (media, card)
 }
 
-fn ranked_redis_key(logical: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(logical.as_bytes());
-    format!("vaak:timeline:ranked:v2:{}", hex::encode(hasher.finalize()))
+fn ranked_redis_key(epoch: &str, logical: &str) -> String {
+    crate::redis_util::ranked_redis_key(epoch, logical)
 }
 
 /// Collect ranked logical keys for a view from the owner index.
@@ -2819,10 +2817,11 @@ async fn load_ranked_head_for_view(
     // Owner index can list several follow-fingerprint keys. Prefer the deepest
     // envelope (then newest warm_ts) so hydrate/HTML deep scroll is not stuck
     // on a stale 160-item fan-out head while a fresh 400+ ranked warm exists.
+    let ranked_epoch = redis_util::generation(redis, redis_util::RANKED_EPOCH_KEY).await?;
     let mut best: Option<(String, Value, usize, i64)> = None;
     for logical in &logicals {
         if view == "home" && !home_logical_matches_algorithm(logical, algorithm_on) { continue; }
-        let rk = ranked_redis_key(logical);
+        let rk = ranked_redis_key(&ranked_epoch, logical);
         let Some(env) = redis_util::json_get(redis, &rk).await? else {
             continue;
         };
