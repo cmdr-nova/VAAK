@@ -31,13 +31,19 @@
 //!   ticks only refresh Redis TTLs for accounts that were actually built.
 //! - `VAAK_RANKED_WARM_INPUT_MARKER` (default on) replaces that table-stat
 //!   watermark with a per-owner/view marker of the rows the rebuild reads
-//!   (max ids and set hashes from indexed lookups). The marker is stored next
-//!   to the ranked cache. A view is skipped when the marker matches, the
-//!   ranked key is still present, and the last build is younger than
-//!   `VAAK_RANKED_WARM_MAX_AGE_SECS` (default 600) so time-decay scores still
-//!   move. Set the marker flag to `0` to restore the table-stat watermark.
-//!   PHP `bin/ranked-warm.php` stays retired. `admin_tl_lean_ranked_warm` is
-//!   the on-demand cold fill for a missing cache, so it always builds.
+//!   (max ids and set hashes from indexed lookups). Ingest timestamps are
+//!   bucketed to five minutes, and Bluesky `updated_at` is not part of the
+//!   hash, so a jetstream like or a Nostr reaction does not rebuild Home.
+//!   The marker is stored next to the ranked cache. A view is skipped when
+//!   the marker matches, the ranked key is still present, and the last build
+//!   is younger than `VAAK_RANKED_WARM_MAX_AGE_SECS` (default 600) so
+//!   time-decay scores still move. A changed marker still waits out
+//!   `VAAK_RANKED_WARM_MIN_REBUILD_SECS` (default 180; per-view overrides
+//!   `_HOME`, `_LOCAL`, `_FEED`; `0` disables the floor). The max-age cap
+//!   still forces a rebuild. Set the marker flag to `0` to restore the
+//!   table-stat watermark. PHP `bin/ranked-warm.php` stays retired.
+//!   `admin_tl_lean_ranked_warm` is the on-demand cold fill for a missing
+//!   cache, so it always builds.
 //!
 //!
 //! Cache key parity with PHP `admin_tl_cache_key` (v13).
@@ -4493,7 +4499,9 @@ async fn filter_ranked_warm_owners(
 }
 
 enum MarkerOutcome {
-    Skip,
+    Skip {
+        reason: &'static str,
+    },
     Rebuild {
         reason: &'static str,
         marker: Option<String>,
@@ -4509,9 +4517,11 @@ async fn apply_input_marker(
     owner: i64,
     view: &str,
     max_age: u64,
+    min_rebuild: u64,
 ) -> MarkerOutcome {
     use crate::ranked_warm_marker::{
-        age_secs, decide, load_view_marker, marker_ttl_secs, parse_stored, redis_key, MarkerDecision,
+        age_secs, changed_components, decide, load_view_marker, marker_ttl_secs, parse_stored,
+        redis_key, MarkerDecision,
     };
     let (Some(db), Some(shared)) = (db, shared) else {
         return MarkerOutcome::Rebuild {
@@ -4559,20 +4569,36 @@ async fn apply_input_marker(
         },
         None => false,
     };
+    let previous_marker = stored.as_ref().map(|row| row.marker.clone());
     let decision = decide(
         stored.as_ref().map(|row| row.marker.as_str()),
         marker.as_deref(),
         cache_present,
         built_secs_ago,
         max_age,
+        min_rebuild,
     );
-    if decision != MarkerDecision::Skip {
-        let reason = match decision {
-            MarkerDecision::Rebuild(reason) => reason,
-            MarkerDecision::Skip => "skip",
-        };
-        return MarkerOutcome::Rebuild { reason, marker };
-    }
+    let skip_reason = match decision {
+        MarkerDecision::Rebuild(reason) => {
+            if reason == "changed" {
+                if let (Some(previous), Some(next)) = (previous_marker.as_deref(), marker.as_deref())
+                {
+                    let parts = changed_components(previous, next);
+                    if !parts.is_empty() {
+                        tracing::info!(
+                            owner,
+                            view,
+                            reason,
+                            parts = %parts,
+                            "ranked-warm fingerprint"
+                        );
+                    }
+                }
+            }
+            return MarkerOutcome::Rebuild { reason, marker };
+        }
+        MarkerDecision::Skip(reason) => reason,
+    };
     let Some(logical) = stored.map(|row| row.logical) else {
         return MarkerOutcome::Rebuild {
             reason: "cache_miss",
@@ -4605,7 +4631,7 @@ async fn apply_input_marker(
             let _ = home_hydrate_ranked::maybe_warm_after_ranked_view(conn, cfg, owner, view).await;
         }
     }
-    MarkerOutcome::Skip
+    MarkerOutcome::Skip { reason: skip_reason }
 }
 
 pub async fn run_loop(
@@ -4756,12 +4782,13 @@ pub async fn run_loop(
                         owner,
                         view,
                         max_age,
+                        crate::ranked_warm_marker::min_rebuild_secs(view),
                     )
                     .await
                     {
-                        MarkerOutcome::Skip => {
-                            marker_counts.skipped += 1;
-                            tracing::debug!(owner, view, "ranked-warm skipped unchanged inputs");
+                        MarkerOutcome::Skip { reason } => {
+                            marker_counts.record_skip(reason);
+                            tracing::debug!(owner, view, reason, "ranked-warm skipped");
                             continue;
                         }
                         MarkerOutcome::Rebuild { reason, marker } => {
@@ -4867,7 +4894,9 @@ pub async fn run_loop(
                 cache_miss = marker_counts.cache_miss,
                 stale = marker_counts.stale,
                 unavailable = marker_counts.unavailable,
+                min_interval = marker_counts.min_interval,
                 max_age_secs = max_age,
+                min_rebuild_secs = crate::ranked_warm_marker::min_rebuild_secs("home"),
                 "ranked-warm marker"
             );
         } else if warmed == 0 && skipped > 0 {
