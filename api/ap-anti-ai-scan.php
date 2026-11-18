@@ -24,6 +24,11 @@ if (PHP_SAPI !== 'cli') {
     exit(1);
 }
 
+require_once __DIR__ . '/ap-worker-lock.php';
+ap_worker_cli_max_runtime(
+    ap_worker_cli_seconds_from_env('VAAK_ANTI_AI_SCAN_MAX_SECONDS', 7200, 60, 14400),
+    'anti_ai_scan'
+);
 require_once __DIR__ . '/ap-db.php';
 
 $dryRun = false;

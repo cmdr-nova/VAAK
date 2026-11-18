@@ -4,7 +4,10 @@
 //! `ap_notification_projection` → Redis `vaak:notifications:v4:{owner}:{hash}`.
 //! When the projection window is thin/empty, spawn temporary PHP
 //! `bin/notif-projection-fill.php` (local PG hydrate → projection + Redis)
-//! then retry native materialize. HTTP Mentions still falls back to PHP
+//! then retry native materialize. The child is killed if it runs past
+//! `VAAK_NOTIF_PROJECTION_FILL_TIMEOUT_SECS` (default 120s, then
+//! `VAAK_PHP_CHILD_TIMEOUT_SECS`) so one hung fill cannot stall the loop.
+//! HTTP Mentions still falls back to PHP
 //! hydrate on total miss. Quiet accounts with empty `vaak-worker-projection`
 //! / `vaak-worker-live` envelopes skip-fresh / quiet_restamp (0.6.52).
 //! Axum `:8787` reads the same Redis keys (M3/M5).
@@ -25,6 +28,7 @@ use tokio_postgres::Client;
 
 use crate::config::Config;
 use crate::notif;
+use crate::php_child;
 use crate::redis_util;
 
 // Bluesky hide-set filter for every notification page this worker serves.
@@ -190,6 +194,12 @@ async fn maybe_fill_projection(
     let lock_name = format!("notif-proj-fill:{owner_user_id}");
     let holder = format!("vaak-worker-{}", std::process::id());
     let cooldown = projection_fill_cooldown_secs();
+    let budget = php_child::Budget::from_env(
+        "notif-projection-fill",
+        Some("VAAK_NOTIF_PROJECTION_FILL_TIMEOUT_SECS"),
+        120,
+        true,
+    );
 
     let cooling: Option<String> = redis::cmd("GET")
         .arg(&cooldown_key)
@@ -202,7 +212,12 @@ async fn maybe_fill_projection(
         )));
     }
 
-    if !redis_util::lock(redis, &lock_name, 120, &holder).await? {
+    let lock_ttl = budget
+        .limit
+        .as_secs()
+        .saturating_add(budget.grace.as_secs())
+        .saturating_add(30);
+    if !redis_util::lock(redis, &lock_name, lock_ttl, &holder).await? {
         return Ok(Some(format!("owner={owner_user_id} fill=skip_locked")));
     }
 
@@ -227,10 +242,7 @@ async fn maybe_fill_projection(
         cmd.env("AP_DB_DSN", dsn);
     }
 
-    let output = cmd
-        .output()
-        .await
-        .with_context(|| format!("spawn {} {}", php_bin.display(), script.display()));
+    let ran = php_child::output_bounded(&mut cmd, budget).await;
     let _ = redis_util::unlock(redis, &lock_name, &holder).await;
     // Always arm cooldown after an attempt so failures cannot loop every tick.
     let _: Result<(), _> = redis::cmd("SET")
@@ -241,7 +253,25 @@ async fn maybe_fill_projection(
         .query_async(redis)
         .await;
 
-    let output = output?;
+    let output = match ran {
+        Ok(output) => output,
+        Err(e) if php_child::TimeoutExceeded::is(&e) => {
+            let ms = t0.elapsed().as_millis();
+            tracing::warn!(
+                owner = owner_user_id,
+                ms,
+                error = %e,
+                "notif projection fill timed out; continuing with the next owner"
+            );
+            return Ok(Some(format!(
+                "owner={owner_user_id} fill=timeout ms={ms} limit={}",
+                budget.limit.as_secs()
+            )));
+        }
+        Err(e) => {
+            return Err(e).with_context(|| format!("spawn {} {}", php_bin.display(), script.display()));
+        }
+    };
     let ms = t0.elapsed().as_millis();
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);

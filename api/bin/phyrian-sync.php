@@ -43,6 +43,11 @@ if (getenv('AP_DB_DSN') === false || getenv('AP_DB_DSN') === '') {
 }
 
 $apiDir = dirname(__DIR__);
+require_once $apiDir . '/ap-worker-lock.php';
+ap_worker_cli_max_runtime(
+    ap_worker_cli_seconds_from_env('VAAK_PHYRIAN_SYNC_MAX_SECONDS', 540, 60, 3600),
+    'phyrian_sync'
+);
 require $apiDir . '/ap-db.php';
 require_once $apiDir . '/ap-phyrian.php';
 require_once $apiDir . '/ap-phyrian-bridge.php';

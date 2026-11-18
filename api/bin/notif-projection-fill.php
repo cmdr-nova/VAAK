@@ -16,6 +16,9 @@ declare(strict_types=1);
  * Usage:
  *   sudo -u www-data env AP_DB_DSN='pgsql:dbname=novalandia' VAAK_NOTIF_LIST_WARM=1 \
  *     php api/bin/notif-projection-fill.php --owner-id=1 [--limit=80]
+ *
+ * The Rust parent kills this process at VAAK_NOTIF_PROJECTION_FILL_TIMEOUT_SECS
+ * (default 120). The alarm below tries to exit a few seconds earlier.
  */
 
 $opts = getopt('', ['owner-id:', 'limit:', 'help']);
@@ -42,6 +45,12 @@ $_ENV['VAAK_NOTIF_LIST_WARM'] = '1';
 $_SERVER['VAAK_NOTIF_LIST_WARM'] = '1';
 
 $apiDir = dirname(__DIR__);
+require_once $apiDir . '/ap-worker-lock.php';
+$fillCap = ap_worker_cli_seconds_from_env('VAAK_NOTIF_PROJECTION_FILL_TIMEOUT_SECS', 0, 0, 3600);
+if ($fillCap < 1) {
+    $fillCap = ap_worker_cli_seconds_from_env('VAAK_PHP_CHILD_TIMEOUT_SECS', 120, 30, 3600);
+}
+ap_worker_cli_max_runtime(max(20, $fillCap - 10), 'notif-projection-fill');
 require $apiDir . '/ap-db.php';
 require_once $apiDir . '/ap-action-queue.php';
 if (!function_exists('ap_action_queue_bind_owner') || !ap_action_queue_bind_owner($ownerId)) {

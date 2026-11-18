@@ -170,8 +170,12 @@ impl ProcessWarmTransport {
     fn launch(&self, script: &str, argument: &str) -> bool {
         let mut command = Command::new("nohup");
         command.arg(&self.php).arg(self.api_root.join(script)).arg(argument).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        crate::php_child::prepare(&mut command);
         match command.spawn() {
-            Ok(mut child) => { tokio::spawn(async move { let _ = child.wait().await; }); true }
+            Ok(child) => {
+                crate::php_child::supervise(child, crate::php_child::detached_budget(script));
+                true
+            }
             Err(_) => false,
         }
     }
@@ -184,7 +188,8 @@ impl ProcessWarmTransport {
             .filter(|path| !path.is_empty())
             .map(PathBuf::from)
             .unwrap_or_else(|| self.temp_root.join("vaak-media-warm-worker.lock"));
-        let mut child = match Command::new("flock")
+        let mut command = Command::new("flock");
+        command
             .arg("-n")
             .arg("-E")
             .arg("2")
@@ -196,9 +201,9 @@ impl ProcessWarmTransport {
             .arg("--limit=3")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-        {
+            .stderr(Stdio::null());
+        crate::php_child::prepare(&mut command);
+        let mut child = match command.spawn() {
             Ok(child) => child,
             Err(_) => return false,
         };
@@ -206,7 +211,9 @@ impl ProcessWarmTransport {
             Ok(Ok(status)) => status.code() != Some(2) && status.success(),
             Ok(Err(_)) => false,
             Err(_) => {
-                tokio::spawn(async move { let _ = child.wait().await; });
+                // Still running after the nudge window. Kill it if the
+                // download batch hangs (default 10 min, not the 120s cap).
+                crate::php_child::supervise(child, crate::php_child::detached_budget("ap-media-warm-worker.php"));
                 true
             }
         }

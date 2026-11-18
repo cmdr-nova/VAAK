@@ -21,6 +21,7 @@ use tokio::process::Command;
 use tokio::sync::Semaphore;
 
 use crate::config::Config;
+use crate::php_child;
 use crate::redis_util;
 
 pub const QUEUE_NAME: &str = "ap_actor_warm";
@@ -312,6 +313,7 @@ async fn spawn_php_warm(paths: &WarmPaths, actor_id: &str, force: bool) -> Resul
     let mut cmd = Command::new(&paths.php_bin);
     cmd.arg(&paths.script)
         .arg(actor_id)
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
@@ -321,8 +323,15 @@ async fn spawn_php_warm(paths: &WarmPaths, actor_id: &str, force: bool) -> Resul
     if std::env::var_os("AP_DB_DSN").is_none() {
         cmd.env("AP_DB_DSN", "pgsql:dbname=novalandia");
     }
-    let output = cmd
-        .output()
+    // A signed fetch that never returns used to pin a batch slot until the
+    // process was restarted. Same cap as notif-projection-fill unless raised.
+    let budget = php_child::Budget::from_env(
+        "ap-actor-warm",
+        Some("VAAK_AP_ACTOR_WARM_TIMEOUT_SECS"),
+        120,
+        true,
+    );
+    let output = php_child::output_bounded(&mut cmd, budget)
         .await
         .with_context(|| format!("spawn {} {}", paths.php_bin.display(), paths.script.display()))?;
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();

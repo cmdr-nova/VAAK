@@ -43,6 +43,7 @@ use tokio::process::Command;
 use tokio::time::Instant;
 
 use crate::config::Config;
+use crate::php_child;
 
 pub const KEY_TAGS: &str = "vaak:trends:net:v1:tags";
 pub const KEY_STATUSES: &str = "vaak:trends:net:v1:statuses";
@@ -203,17 +204,33 @@ async fn run_local() -> Result<()> {
         bail!("missing {}", script.display());
     }
     let mut cmd = Command::new(&php);
-    cmd.arg(&script).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
+    cmd.arg(&script)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
     if let Some(dir) = api.parent() {
         cmd.current_dir(dir);
     }
     if std::env::var_os("AP_DB_DSN").is_none() {
         cmd.env("AP_DB_DSN", "pgsql:dbname=novalandia");
     }
-    let out = tokio::time::timeout(LOCAL_TIMEOUT, cmd.output())
-        .await
-        .context("trends-warm.php timed out")?
-        .context("spawn trends-warm.php")?;
+    // Keep the existing 240s budget. The shared helper adds SIGTERM then
+    // SIGKILL; `VAAK_TRENDS_PHP_TIMEOUT_SECS` overrides it. The global
+    // notif-fill knob does not, so a 120s cap cannot cut a real recompute.
+    let budget = php_child::Budget::from_env(
+        "trends-warm",
+        Some("VAAK_TRENDS_PHP_TIMEOUT_SECS"),
+        LOCAL_TIMEOUT.as_secs(),
+        false,
+    );
+    let out = match php_child::output_bounded(&mut cmd, budget).await {
+        Ok(out) => out,
+        Err(e) if php_child::TimeoutExceeded::is(&e) => {
+            bail!("trends-warm.php timed out after {}s", budget.limit.as_secs());
+        }
+        Err(e) => return Err(e).context("spawn trends-warm.php"),
+    };
     let stderr = String::from_utf8_lossy(&out.stderr).trim().chars().take(600).collect::<String>();
     if !out.status.success() {
         bail!("trends-warm.php exit={} {stderr}", out.status.code().unwrap_or(-1));
