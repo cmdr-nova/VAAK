@@ -313,11 +313,10 @@ pub(crate) fn kick(misses: &[Claim]) {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .kill_on_drop(false);
+    crate::php_child::prepare(&mut cmd);
     match cmd.spawn() {
-        Ok(mut child) => {
-            tokio::spawn(async move {
-                let _ = child.wait().await;
-            });
+        Ok(child) => {
+            crate::php_child::supervise(child, crate::php_child::detached_budget("bsky-bluemoji-warm.php"));
         }
         Err(e) => tracing::debug!(error = %e, "bluemoji warm spawn"),
     }

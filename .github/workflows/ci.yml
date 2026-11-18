@@ -78,6 +78,7 @@ jobs:
           bash deploy/test_backup_restore_drill.sh
           bash deploy/test_alert_notify.sh
           bash deploy/test_cpu_tiers.sh
+          bash deploy/test_php_worker_timeout.sh
 
   cargo-audit:
     name: Cargo audit

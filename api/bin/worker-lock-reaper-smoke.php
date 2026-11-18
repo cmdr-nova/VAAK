@@ -76,5 +76,45 @@ foreach ([
     check(!preg_match('/flock\(\$lock(?:Fh)?, LOCK_EX \| LOCK_NB\)/', $src), $file . ' has no bare non-blocking flock left');
 }
 
+// 2026-11-18: flock(1) outside PHP, and the Rust notif-list child, do not go
+// through the reaper. Those workers arm a wall-clock cap themselves.
+$root = dirname(__DIR__, 2);
+foreach ([
+    'api/bin/notif-projection-fill.php' => 'notif-projection-fill',
+    'api/ap-listenbrainz-worker.php' => 'listenbrainz',
+    'api/ap-actor-refresh-worker.php' => 'actor_refresh',
+    'api/bin/phyrian-sync.php' => 'phyrian_sync',
+    'api/bin/phyrian-decay.php' => 'phyrian_decay',
+    'api/ap-anti-ai-scan.php' => 'anti_ai_scan',
+] as $rel => $label) {
+    $src = (string) file_get_contents($root . '/' . $rel);
+    check(str_contains($src, 'ap_worker_cli_max_runtime('), $rel . ' arms a CLI runtime cap');
+    check(str_contains($src, "'" . $label . "'") || str_contains($src, '"' . $label . '"'), $rel . ' names ' . $label);
+}
+foreach ([
+    'deploy/mkultra-ap-listenbrainz' => 'ap-listenbrainz-worker.php',
+    'deploy/mkultra-ap-actor-refresh' => 'ap-actor-refresh-worker.php',
+    'deploy/mkultra-ap-phyrian-decay' => 'phyrian-decay.php',
+    'ops/mkultra-phyrian-sync.cron' => 'phyrian-sync.php',
+] as $rel => $script) {
+    $line = '';
+    foreach (file($root . '/' . $rel) ?: [] as $cronLine) {
+        if (str_contains($cronLine, $script)) {
+            $line = $cronLine;
+            break;
+        }
+    }
+    check($line !== '' && str_contains($line, '/usr/bin/timeout -k 30 10m'), $rel . ' wraps the worker with timeout');
+    $timeoutAt = strpos($line, '/usr/bin/timeout');
+    $phpAt = strpos($line, '/usr/bin/php');
+    check($timeoutAt !== false && $phpAt !== false && $timeoutAt < $phpAt, $rel . ' applies timeout before php');
+}
+
+ap_worker_cli_max_runtime(3600, 'worker-lock-smoke');
+if (function_exists('pcntl_alarm')) {
+    pcntl_alarm(0);
+}
+check(true, 'cli max runtime can be armed and cancelled');
+
 echo $fail === 0 ? "worker-lock-reaper-smoke: ok\n" : "worker-lock-reaper-smoke: $fail failed\n";
 exit($fail === 0 ? 0 : 1);

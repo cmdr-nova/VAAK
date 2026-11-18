@@ -586,19 +586,26 @@ async fn ingest(db: &Client) -> String {
     cmd.arg(format!("{root}/bin/nostr-notif-ingest.php"))
         .env("AP_DB_DSN", std::env::var("AP_DB_DSN").unwrap_or_else(|_| "pgsql:dbname=novalandia".to_string()))
         .stdin(std::process::Stdio::null())
-        .kill_on_drop(true);
-    match tokio::time::timeout(INGEST_TIMEOUT, cmd.output()).await {
-        Ok(Ok(out)) if out.status.success() => String::from_utf8_lossy(&out.stdout).lines().last().unwrap_or("").trim().to_string(),
-        Ok(Ok(out)) => {
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let budget = crate::php_child::Budget::from_env(
+        "nostr-notif-ingest",
+        Some("VAAK_NOSTR_INGEST_TIMEOUT_SECS"),
+        INGEST_TIMEOUT.as_secs(),
+        false,
+    );
+    match crate::php_child::output_bounded(&mut cmd, budget).await {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).lines().last().unwrap_or("").trim().to_string(),
+        Ok(out) => {
             let err = String::from_utf8_lossy(&out.stderr);
             tracing::warn!(pending, stderr = %err.trim(), "nostr notif ingest failed");
             format!("failed:{pending}")
         }
-        Ok(Err(e)) => {
+        Err(e) if crate::php_child::TimeoutExceeded::is(&e) => format!("timeout:{pending}"),
+        Err(e) => {
             tracing::warn!(pending, error = %e, "nostr notif ingest did not start");
             format!("failed:{pending}")
         }
-        Err(_) => format!("timeout:{pending}"),
     }
 }
 

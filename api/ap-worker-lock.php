@@ -16,6 +16,13 @@ declare(strict_types=1);
  *
  * A holder without the "pid start" line (a run from before this change) is
  * left alone.
+ *
+ * ap_worker_cli_max_runtime() is the in-process cap for a CLI run whose lock
+ * is held outside this process (cron `flock`, or a Rust parent). set_time_limit()
+ * does not count a blocked socket read on Linux, which is how a dead Redis
+ * connection hung workers on 2026-11-18. The alarm is the wall clock. The
+ * parent `timeout` or Rust child limit is the hard stop when the socket
+ * ignores the signal.
  */
 
 /**
@@ -99,4 +106,27 @@ function ap_worker_lock_alarm(int $seconds, string $label): void
         exit(2);
     });
     pcntl_alarm($seconds);
+}
+
+/**
+ * Cap a CLI run. set_time_limit() is the CPU budget. The alarm is the wall
+ * clock, which is what a blocked Redis or HTTP call actually needs.
+ */
+function ap_worker_cli_max_runtime(int $seconds, string $label): void
+{
+    if (PHP_SAPI !== 'cli' || $seconds < 1) {
+        return;
+    }
+    @set_time_limit($seconds);
+    ap_worker_lock_alarm($seconds, $label);
+}
+
+/** Integer env override, or $default when the variable is unset or not an integer. */
+function ap_worker_cli_seconds_from_env(string $name, int $default, int $min, int $max): int
+{
+    $raw = getenv($name);
+    if (!is_string($raw) || !preg_match('/^\d+$/', trim($raw))) {
+        return $default;
+    }
+    return max($min, min($max, (int) trim($raw)));
 }

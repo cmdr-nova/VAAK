@@ -14,6 +14,12 @@ foreach ($argv as $arg) {
     }
 }
 
+require_once __DIR__ . '/ap-worker-lock.php';
+ap_worker_cli_max_runtime(
+    ap_worker_cli_seconds_from_env('VAAK_ACTOR_REFRESH_MAX_SECONDS', 540, 60, 3600),
+    'actor_refresh'
+);
+
 try {
     if (!defined('AP_INBOX_LIB_ONLY')) define('AP_INBOX_LIB_ONLY', true);
     require_once __DIR__ . '/ap-db.php';

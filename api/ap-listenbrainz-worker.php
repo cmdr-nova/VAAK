@@ -5,7 +5,9 @@
  *
  *   php ap-listenbrainz-worker.php [--limit=20]
  *
- * Cron: deploy/mkultra-ap-listenbrainz (every minute, flock, Nice 10).
+ * Cron: deploy/mkultra-ap-listenbrainz (every minute, flock, Nice 10,
+ * `timeout -k 30 10m`). The flock is outside this process, so a hang cannot
+ * be reaped from here. The alarm is the in-process backstop.
  * Each run handles at most --limit due users and spaces requests at least
  * 1.1 s apart (ListenBrainz asks for one call per second). A 429 ends the run.
  * Kill switch: VAAK_LISTENBRAINZ=0. Missing table: exits quietly.
@@ -19,6 +21,11 @@ if (PHP_SAPI !== 'cli') {
     exit(1);
 }
 
+require_once __DIR__ . '/ap-worker-lock.php';
+ap_worker_cli_max_runtime(
+    ap_worker_cli_seconds_from_env('VAAK_LISTENBRAINZ_MAX_SECONDS', 540, 30, 3600),
+    'listenbrainz'
+);
 require_once __DIR__ . '/ap-db.php';
 require_once __DIR__ . '/ap-net-guard.php';
 require_once __DIR__ . '/ap-listenbrainz.php';

@@ -9,6 +9,8 @@ use std::path::PathBuf;
 use tokio::io::AsyncReadExt;
 #[derive(Deserialize)] #[serde(deny_unknown_fields)] struct MediaReply{protocol_version:u8,actor:String,avatar:Option<String>,cache_receipts:Vec<CacheReceipt>}
 #[derive(Deserialize)] #[serde(deny_unknown_fields)] struct CacheReceipt{table:String,before:Vec<Value>,after:Vec<Value>}
+// PHP helper wait stays local: 15s, kill-on-drop, and a 64 KiB stdout cap.
+// php_child::output_bounded would drop that cap, so this path does not use it.
 async fn retained_media(db:&Client,header:&AdmittedProfileHeader,snapshots:&mut [Snapshot],actor:&str)->Result<Option<String>>{
  header.require_current(db).await?;for s in snapshots.iter(){s.current(db).await?;}
  let php=std::env::var_os("VAAK_PHP_BIN").map(PathBuf::from).unwrap_or_else(||"/usr/bin/php".into());let root=std::env::var_os("VAAK_API_ROOT").map(PathBuf::from).unwrap_or_else(||"/srv/mkultra/html/api".into());let helper=root.join("ap-profile-featured-media.php");if !helper.is_file(){bail!("retained Featured media helper unavailable")}
