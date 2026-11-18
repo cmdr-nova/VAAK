@@ -8,6 +8,19 @@
 //! (affinity, burst spread, own-post lift, suppression expiry) move on that
 //! cap even when no row changed.
 //!
+//! Ingest timestamps are bucketed to [`INGEST_BUCKET_SECS`] (five minutes),
+//! and Bluesky rows older than [`MARKER_HEAD_WINDOW_SECS`] are left out of the
+//! hash. Jetstream rewrites `updated_at` on likes and reposts, and Nostr
+//! reaction clocks move on every like; neither changes who is in the cached
+//! head. A new post still changes the fingerprint. Live fan-out prepends
+//! Bluesky and fediverse posts between rebuilds. Nostr has no fan-out, so a
+//! new note waits for the next rebuild.
+//!
+//! [`min_rebuild_secs`](crate::ranked_warm_marker::min_rebuild_secs) is a
+//! per-view floor: a view with a live cache is not rebuilt more often than
+//! that, even when the fingerprint changed. The max-age cap still forces a
+//! rebuild, and a missing cache still rebuilds immediately.
+//!
 //! Each lookup is an index probe or a `LIMIT 1` / `LIMIT n` on an index the
 //! rebuild already uses. A miss or a failed read does not skip: the view is
 //! rebuilt. `VAAK_RANKED_WARM_INPUT_MARKER=0` leaves the older table-stat
@@ -29,10 +42,24 @@ use crate::ranked_warm::{
 };
 use crate::redis_util;
 
-/// Bump when ranking math changes without an input-row change, so the next
-/// tick rebuilds instead of serving the previous order.
-pub const RANK_INPUT_VERSION: &str = "1";
+/// Bump when the fingerprint shape changes, so the next tick rebuilds instead
+/// of comparing a new hash to the previous one. v2 buckets ingest timestamps
+/// and stops hashing Bluesky `updated_at`.
+pub const RANK_INPUT_VERSION: &str = "2";
 const DEFAULT_MAX_AGE_SECS: u64 = 600;
+/// Five minutes. Jetstream and Nostr rewrite clocks inside this window
+/// without changing the ranked head.
+pub const INGEST_BUCKET_SECS: i64 = 300;
+/// How far back a Bluesky or Nostr row can still be new to the cached head.
+/// Affinity and recommendation lifts are at most 30 minutes, and the rebuild
+/// itself is forced every [`DEFAULT_MAX_AGE_SECS`]. Two hours covers that
+/// lift plus a quiet gap. Older rows stay in the Redis scrollback from the
+/// last rebuild; hashing them made every like rebuild Home.
+pub const MARKER_HEAD_WINDOW_SECS: i64 = 2 * 3600;
+/// Home was the expensive rebuild (about 20s, thousands of candidates).
+/// Local and Federated use the same floor unless overridden: fan-out still
+/// prepends new posts, and a firehose tick was rebuilding them every pass.
+const DEFAULT_MIN_REBUILD_SECS: u64 = 180;
 
 /// `VAAK_RANKED_WARM_INPUT_MARKER`. Unset means on. `0`, `false`, `off`, `no` disable it.
 pub fn enabled_from(raw: Option<&str>) -> bool {
@@ -71,6 +98,105 @@ pub fn max_age_secs() -> u64 {
             .ok()
             .as_deref(),
     )
+}
+
+fn parse_nonneg(raw: Option<&str>) -> Option<u64> {
+    let value = raw.map(str::trim).filter(|v| !v.is_empty())?;
+    match value.parse::<i64>() {
+        Ok(n) if n >= 0 => Some(n as u64),
+        _ => None,
+    }
+}
+
+/// `VAAK_RANKED_WARM_MIN_REBUILD_SECS`, with a per-view override
+/// (`VAAK_RANKED_WARM_MIN_REBUILD_SECS_HOME`, `_LOCAL`, `_FEED`) winning.
+/// Unset uses 180 seconds for every view. `0` disables the floor. An
+/// unparseable value is ignored so the next source still applies.
+pub fn min_rebuild_from(global: Option<&str>, view_specific: Option<&str>) -> u64 {
+    if let Some(n) = parse_nonneg(view_specific) {
+        return n;
+    }
+    if let Some(n) = parse_nonneg(global) {
+        return n;
+    }
+    DEFAULT_MIN_REBUILD_SECS
+}
+
+pub fn min_rebuild_secs(view: &str) -> u64 {
+    let specific_name = format!(
+        "VAAK_RANKED_WARM_MIN_REBUILD_SECS_{}",
+        view.to_ascii_uppercase()
+    );
+    let specific = std::env::var(&specific_name).ok();
+    let global = std::env::var("VAAK_RANKED_WARM_MIN_REBUILD_SECS").ok();
+    min_rebuild_from(global.as_deref(), specific.as_deref())
+}
+
+/// Floor `ts` to `bucket` seconds. `bucket` <= 1 leaves `ts` alone.
+/// Negative timestamps floor toward -inf so a clock skew does not round up
+/// into the current bucket.
+pub fn bucket_unix(ts: i64, bucket: i64) -> i64 {
+    if bucket <= 1 {
+        return ts;
+    }
+    ts.div_euclid(bucket) * bucket
+}
+
+/// Five-minute label for an RFC3339 (or `YYYY-MM-DD HH:MM:SS`) stamp.
+/// `2026-11-18T17:04:12Z` and `2026-11-18T17:04:59+00:00` share a label;
+/// `17:05` starts the next one. This is the same truncation the Bluesky
+/// marker SQL applies with `left` / `substring`, so a jetstream rewrite of
+/// the fraction or the timezone suffix does not change the fingerprint.
+/// Returns `None` when the text is not a timestamp we know how to bucket.
+pub fn bucket_rfc3339(raw: &str) -> Option<String> {
+    let bytes = raw.as_bytes();
+    // `2026-11-18T17:04:12Z`
+    //  012345678901234567
+    // minute tens is index 14, minute ones is index 15.
+    if bytes.len() < 16
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || (bytes[10] != b'T' && bytes[10] != b' ')
+        || bytes[13] != b':'
+        || !bytes[14].is_ascii_digit()
+        || !bytes[15].is_ascii_digit()
+    {
+        return None;
+    }
+    let snapped = if bytes[15] < b'5' { b'0' } else { b'5' };
+    let mut out = raw[..15].to_string();
+    out.push(snapped as char);
+    Some(out)
+}
+
+/// Observation stamps are the timestamp, optionally `timestamp|uri` from an
+/// older marker shape. The uri of the newest observation changes on every
+/// jetstream refresh, which is not a ranking change.
+pub fn coarse_ingest_stamp(raw: &str) -> String {
+    let stamp = raw.split('|').next().unwrap_or(raw).trim();
+    if stamp.is_empty() {
+        return String::new();
+    }
+    bucket_rfc3339(stamp).unwrap_or_else(|| stamp.to_string())
+}
+
+pub fn head_cutoff_unix(now: i64) -> i64 {
+    now.saturating_sub(MARKER_HEAD_WINDOW_SECS)
+}
+
+/// Bucket label of `now - MARKER_HEAD_WINDOW_SECS`. The Bluesky marker keeps
+/// a row when its bucket label is >= this string. Fixed-width labels sort
+/// chronologically.
+pub fn head_window_cutoff_label(now: i64) -> String {
+    let ts = head_cutoff_unix(now);
+    let rfc = chrono::DateTime::<chrono::Utc>::from_timestamp(ts, 0)
+        .map(|t| t.to_rfc3339())
+        .unwrap_or_default();
+    bucket_rfc3339(&rfc).unwrap_or(rfc)
+}
+
+pub fn in_head_window(ts: i64, now: i64) -> bool {
+    ts >= head_cutoff_unix(now)
 }
 
 pub fn marker_ttl_secs(max_age: u64) -> u64 {
@@ -116,19 +242,27 @@ pub fn age_secs(built_at: i64, now: i64) -> u64 {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MarkerDecision {
-    Skip,
+    /// `unchanged` or `min_interval` (fingerprint changed, but the last build
+    /// is younger than the per-view floor).
+    Skip(&'static str),
     /// `cold` (no stored marker), `changed`, `cache_miss`, `stale`, `unavailable`.
     Rebuild(&'static str),
 }
 
 /// `None` is not used. A disabled flag is handled by the caller, which keeps
 /// the table-stat watermark instead of calling this.
+///
+/// A missing cache, a cold marker, and a failed read always rebuild. The
+/// max-age cap is checked before the minimum interval, so a long floor cannot
+/// freeze time-decay scores. The floor only holds a rebuild whose fingerprint
+/// changed; an unchanged marker still skips as `unchanged`.
 pub fn decide(
     previous: Option<&str>,
     next: Option<&str>,
     cache_present: bool,
     built_secs_ago: u64,
     max_age_secs: u64,
+    min_rebuild_secs: u64,
 ) -> MarkerDecision {
     let Some(next) = next.filter(|marker| !marker.is_empty()) else {
         return MarkerDecision::Rebuild("unavailable");
@@ -136,16 +270,47 @@ pub fn decide(
     let Some(previous) = previous.filter(|marker| !marker.is_empty()) else {
         return MarkerDecision::Rebuild("cold");
     };
-    if previous != next {
-        return MarkerDecision::Rebuild("changed");
-    }
     if !cache_present {
         return MarkerDecision::Rebuild("cache_miss");
     }
     if max_age_secs > 0 && built_secs_ago >= max_age_secs {
         return MarkerDecision::Rebuild("stale");
     }
-    MarkerDecision::Skip
+    if previous == next {
+        return MarkerDecision::Skip("unchanged");
+    }
+    if min_rebuild_secs > 0 && built_secs_ago < min_rebuild_secs {
+        return MarkerDecision::Skip("min_interval");
+    }
+    MarkerDecision::Rebuild("changed")
+}
+
+fn marker_parts(marker: &str) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    for part in marker.split(';') {
+        if part.is_empty() {
+            continue;
+        }
+        let (key, value) = part.split_once('=').unwrap_or((part, ""));
+        out.insert(key.to_string(), value.to_string());
+    }
+    out
+}
+
+/// Comma-separated fingerprint keys whose values differ. Empty when every
+/// `key=value` part matches, including when the two strings list those parts
+/// in a different order.
+pub fn changed_components(previous: &str, next: &str) -> String {
+    let prev = marker_parts(previous);
+    let next_parts = marker_parts(next);
+    let mut keys: Vec<&str> = Vec::new();
+    for key in prev.keys().chain(next_parts.keys()) {
+        if prev.get(key) != next_parts.get(key) && !keys.contains(&key.as_str()) {
+            keys.push(key.as_str());
+        }
+    }
+    keys.sort_unstable();
+    keys.join(",")
 }
 
 #[derive(Default, Clone, Debug)]
@@ -157,6 +322,9 @@ pub struct MarkerCounts {
     pub cache_miss: u64,
     pub stale: u64,
     pub unavailable: u64,
+    /// Skips whose fingerprint changed but the last build was inside the
+    /// per-view minimum interval. Already included in `skipped`.
+    pub min_interval: u64,
 }
 
 impl MarkerCounts {
@@ -168,6 +336,13 @@ impl MarkerCounts {
             "cache_miss" => self.cache_miss += 1,
             "stale" => self.stale += 1,
             _ => self.unavailable += 1,
+        }
+    }
+
+    pub fn record_skip(&mut self, reason: &str) {
+        self.skipped += 1;
+        if reason == "min_interval" {
+            self.min_interval += 1;
         }
     }
 }
@@ -260,6 +435,9 @@ const TERMS_SQL: &str = "SELECT COALESCE(MAX(id), 0)::bigint, COALESCE(MAX(updat
 /// `idx_ap_user_signals_owner_time` `(owner_user_id, created_at DESC, id DESC)`,
 /// `idx_reco_favourites_owner_object`, `masto_followed_tags` primary key,
 /// `ap_home_suppression` primary key, `idx_bsky_post_observations_owner_time`.
+/// The observation value is that newest `last_seen_at` only. Rust buckets it
+/// to five minutes and drops the uri: jetstream changes the newest uri on
+/// every refresh, which was rebuilding Home when the ranked head had not.
 const OWNER_LIGHT_SQL: &str = "SELECT
     (SELECT COUNT(*)::bigint FROM following WHERE owner_actor_id = $1 OR owner_actor_id = $2),
     COALESCE((SELECT md5(string_agg(rtrim(actor_id, '/'), ',' ORDER BY rtrim(actor_id, '/')))
@@ -289,7 +467,7 @@ const OWNER_LIGHT_SQL: &str = "SELECT
               FROM masto_followed_tags WHERE owner_user_id = $4::bigint), ''),
     (SELECT COUNT(*)::bigint FROM ap_home_suppression WHERE owner_user_id = $4::bigint),
     COALESCE((SELECT MAX(updated_at) FROM ap_home_suppression WHERE owner_user_id = $4::bigint), ''),
-    COALESCE((SELECT COALESCE(last_seen_at, '') || '|' || COALESCE(bsky_uri, '')
+    COALESCE((SELECT last_seen_at
               FROM bsky_post_observations WHERE owner_user_id = $4::bigint
               ORDER BY last_seen_at DESC LIMIT 1), '')";
 
@@ -347,28 +525,45 @@ const OWN_OUTBOX_SQL: &str = "SELECT COUNT(*)::bigint,
         LIMIT 40
      ) own";
 
-/// Newest `PER_ACTOR_CAP` posts per followed DID. `bsky_graph_sync` primary key
-/// finds the follows. `idx_bsky_posts_author_idx` (author_did, indexed_at DESC)
-/// serves the lateral limit. Link and crosspost joins are primary-key lookups
-/// on `bsky_uri`, so a mirror mapping changes the fingerprint.
+/// Newest `PER_ACTOR_CAP` posts per followed DID, hashed only when the post's
+/// indexed-at bucket is still inside the head window (`$4`, a
+/// [`bucket_rfc3339`](crate::ranked_warm_marker::bucket_rfc3339) label).
+/// `bsky_graph_sync` primary key finds the follows. `idx_bsky_posts_author_idx`
+/// (author_did, indexed_at DESC) serves the lateral limit; the bucket filter
+/// runs on those rows, not as a scan. Link and crosspost joins are primary-key
+/// lookups on `bsky_uri`, so a mirror mapping of a recent post changes the
+/// fingerprint. `updated_at` is not hashed: jetstream rewrites it on likes and
+/// reposts, and Home ranks by `indexed_at`.
 const BSKY_WINDOW_SQL: &str = "SELECT COALESCE(md5(string_agg(
-        p.bsky_uri || '|' || COALESCE(p.indexed_at, '') || '|' || COALESCE(p.updated_at, '')
-        || '|' || COALESCE(l.fediverse_id, '') || '|' || COALESCE(c.note_id, ''),
-        ',' ORDER BY p.bsky_uri)), '')
-     FROM bsky_graph_sync g
-     JOIN LATERAL (
-        SELECT bsky_uri, indexed_at, updated_at
-        FROM bsky_posts
-        WHERE author_did = g.target_did
-          AND text IS NOT NULL
-        ORDER BY indexed_at DESC
-        LIMIT $3
-     ) p ON true
-     LEFT JOIN bsky_post_links l ON l.bsky_uri = p.bsky_uri
-     LEFT JOIN bsky_crossposts c ON c.bsky_uri = p.bsky_uri
-     WHERE g.owner_user_id = $1::bigint
-       AND g.kind = 'follow'
-       AND ($2 = '' OR g.target_did <> $2)";
+        bsky_uri || '|' || indexed_bucket || '|' || COALESCE(fediverse_id, '') || '|' || COALESCE(note_id, ''),
+        ',' ORDER BY bsky_uri)), '')
+     FROM (
+        SELECT p.bsky_uri,
+               CASE
+                 WHEN length(p.indexed_at) >= 16
+                  AND substring(p.indexed_at from 11 for 1) IN ('T', ' ')
+                  AND substring(p.indexed_at from 14 for 1) = ':'
+                 THEN left(p.indexed_at, 15) || CASE WHEN substring(p.indexed_at from 16 for 1) < '5' THEN '0' ELSE '5' END
+                 ELSE COALESCE(p.indexed_at, '')
+               END AS indexed_bucket,
+               l.fediverse_id,
+               c.note_id
+        FROM bsky_graph_sync g
+        JOIN LATERAL (
+           SELECT bsky_uri, indexed_at
+           FROM bsky_posts
+           WHERE author_did = g.target_did
+             AND text IS NOT NULL
+           ORDER BY indexed_at DESC
+           LIMIT $3
+        ) p ON true
+        LEFT JOIN bsky_post_links l ON l.bsky_uri = p.bsky_uri
+        LEFT JOIN bsky_crossposts c ON c.bsky_uri = p.bsky_uri
+        WHERE g.owner_user_id = $1::bigint
+          AND g.kind = 'follow'
+          AND ($2 = '' OR g.target_did <> $2)
+     ) recent
+     WHERE indexed_bucket >= $4";
 
 /// `idx_rss_feeds_owner` (owner_user_id, enabled) and
 /// `idx_rss_items_feed_pub` (feed_id, published_at DESC).
@@ -392,12 +587,19 @@ const NOSTR_LINK_SQL: &str =
 const NOSTR_FOLLOWS_SQL: &str = "SELECT COALESCE(md5(string_agg(pubkey, ',' ORDER BY pubkey)), '')
      FROM nostr_follows WHERE owner_user_id = $1::bigint";
 
-/// `idx_nostr_events_pubkey_created` (pubkey, created_at DESC).
+/// Newest note per followed pubkey that can still land in the cached head.
+/// `idx_nostr_events_pubkey_created` (pubkey, created_at DESC) serves the
+/// `created_at >= $2` range plus `LIMIT 1`. `$2` is a unix cutoff
+/// ([`head_cutoff_unix`](crate::ranked_warm_marker::head_cutoff_unix)). An
+/// older backfill does not change the fingerprint. The id stays in the hash
+/// so a new note is visible; the minimum rebuild interval is what keeps a
+/// busy follow list from rebuilding every pass. Nostr has no live fan-out.
 const NOSTR_EVENTS_SQL: &str = "SELECT COALESCE(md5(string_agg(e.id, ',' ORDER BY e.id)), '')
      FROM nostr_follows f
      JOIN LATERAL (
         SELECT id FROM nostr_events
         WHERE pubkey = f.pubkey AND kind IN (1, 6)
+          AND created_at >= $2
         ORDER BY created_at DESC
         LIMIT 1
      ) e ON true
@@ -576,6 +778,7 @@ async fn load_owner_actor(db: &Client, owner: i64) -> Result<(String, String)> {
 }
 
 fn light_from_row(row: &tokio_postgres::Row) -> OwnerLight {
+    let seen: String = row.get(24);
     OwnerLight {
         follow_count: row.get(0),
         follow_hash: row.get(1),
@@ -594,7 +797,7 @@ fn light_from_row(row: &tokio_postgres::Row) -> OwnerLight {
         tag_count: row.get(20),
         tag_hash: row.get(21),
         suppression: format!("{}:{}", row.get::<_, i64>(22), row.get::<_, String>(23)),
-        observation: row.get(24),
+        observation: coarse_ingest_stamp(&seen),
     }
 }
 
@@ -644,14 +847,19 @@ async fn nostr_marker(db: &Client, owner: i64) -> Result<String> {
         return Ok(format!("off:{pubkey}"));
     }
     let follows = optional_aggregate(db, NOSTR_FOLLOWS_SQL, owner).await?;
-    let events = optional_aggregate(db, NOSTR_EVENTS_SQL, owner).await?;
+    let cutoff = head_cutoff_unix(chrono::Utc::now().timestamp());
+    let events = match db.query_one(NOSTR_EVENTS_SQL, &[&owner, &cutoff]).await {
+        Ok(row) => row.get::<_, Option<String>>(0).unwrap_or_default(),
+        Err(err) if missing_relation(&err) => "absent".into(),
+        Err(err) => return Err(err).context("ranked-warm marker nostr events"),
+    };
     let reactions: i64 = match db.query_one(NOSTR_REACTIONS_SQL, &[&owner]).await {
-        Ok(row) => row.get(0),
+        Ok(row) => bucket_unix(row.get(0), INGEST_BUCKET_SECS),
         Err(err) if missing_relation(&err) => 0,
         Err(err) => return Err(err).context("ranked-warm marker nostr reactions"),
     };
     let shares: i64 = match db.query_one(NOSTR_SHARES_SQL, &[&owner]).await {
-        Ok(row) => row.get(0),
+        Ok(row) => bucket_unix(row.get(0), INGEST_BUCKET_SECS),
         Err(err) if missing_relation(&err) => 0,
         Err(err) => return Err(err).context("ranked-warm marker nostr shares"),
     };
@@ -763,8 +971,12 @@ pub async fn load_view_marker(
         .query_one(OWN_OUTBOX_SQL, &[&like])
         .await
         .context("ranked-warm marker own notes")?;
+    let bsky_cutoff = head_window_cutoff_label(chrono::Utc::now().timestamp());
     let bsky = db
-        .query_one(BSKY_WINDOW_SQL, &[&owner, &light.did, &per_actor])
+        .query_one(
+            BSKY_WINDOW_SQL,
+            &[&owner, &light.did, &per_actor, &bsky_cutoff],
+        )
         .await
         .context("ranked-warm marker bluesky")?;
     let rss = optional_aggregate(db, RSS_SQL, owner).await?;
@@ -841,49 +1053,175 @@ mod tests {
     }
 
     #[test]
+    fn min_rebuild_defaults_to_three_minutes_and_zero_disables_it() {
+        assert_eq!(min_rebuild_from(None, None), 180);
+        assert_eq!(min_rebuild_from(Some(""), Some("")), 180);
+        assert_eq!(min_rebuild_from(Some("nope"), None), 180);
+        assert_eq!(min_rebuild_from(Some("-5"), None), 180);
+        assert_eq!(min_rebuild_from(Some("0"), None), 0);
+        assert_eq!(min_rebuild_from(Some("90"), None), 90);
+        assert_eq!(min_rebuild_from(Some("90"), Some("240")), 240);
+        assert_eq!(min_rebuild_from(Some("90"), Some("0")), 0);
+        assert_eq!(min_rebuild_from(Some("90"), Some("nope")), 90);
+        assert_eq!(DEFAULT_MIN_REBUILD_SECS, 180);
+    }
+
+    #[test]
     fn matching_fresh_marker_skips_and_every_other_case_rebuilds() {
-        let marker = "v=1;cache=v13;events=10";
+        let marker = "v=2;cache=v13;events=10";
         assert_eq!(
-            decide(Some(marker), Some(marker), true, 30, 600),
-            MarkerDecision::Skip
+            decide(Some(marker), Some(marker), true, 30, 600, 0),
+            MarkerDecision::Skip("unchanged")
         );
         assert_eq!(
-            decide(Some(marker), Some(marker), true, 599, 600),
-            MarkerDecision::Skip
+            decide(Some(marker), Some(marker), true, 599, 600, 180),
+            MarkerDecision::Skip("unchanged")
         );
         assert_eq!(
-            decide(Some(marker), Some(marker), true, 600, 600),
+            decide(Some(marker), Some(marker), true, 600, 600, 180),
             MarkerDecision::Rebuild("stale")
         );
         assert_eq!(
-            decide(Some(marker), Some(marker), true, u64::MAX, 0),
-            MarkerDecision::Skip,
+            decide(Some(marker), Some(marker), true, u64::MAX, 0, 180),
+            MarkerDecision::Skip("unchanged"),
             "a zero cap does not force a time-decay rebuild"
         );
         assert_eq!(
-            decide(Some(marker), Some("v=1;cache=v13;events=11"), true, 1, 600),
+            decide(
+                Some(marker),
+                Some("v=2;cache=v13;events=11"),
+                true,
+                200,
+                600,
+                180
+            ),
             MarkerDecision::Rebuild("changed")
         );
         assert_eq!(
-            decide(Some(marker), Some(marker), false, 1, 600),
+            decide(Some(marker), Some(marker), false, 1, 600, 180),
             MarkerDecision::Rebuild("cache_miss")
         );
         assert_eq!(
-            decide(None, Some(marker), true, 1, 600),
+            decide(None, Some(marker), true, 1, 600, 180),
             MarkerDecision::Rebuild("cold")
         );
         assert_eq!(
-            decide(Some(marker), None, true, 1, 600),
+            decide(Some(marker), None, true, 1, 600, 180),
             MarkerDecision::Rebuild("unavailable")
         );
         assert_eq!(
-            decide(Some(""), Some(marker), true, 1, 600),
+            decide(Some(""), Some(marker), true, 1, 600, 180),
             MarkerDecision::Rebuild("cold")
         );
         assert_eq!(
-            decide(Some(marker), Some(""), true, 1, 600),
+            decide(Some(marker), Some(""), true, 1, 600, 180),
             MarkerDecision::Rebuild("unavailable")
         );
+    }
+
+    #[test]
+    fn min_interval_holds_a_changed_fingerprint_until_the_floor() {
+        let previous = "bsky=aaa;nostr=1";
+        let next = "bsky=bbb;nostr=1";
+        assert_eq!(
+            decide(Some(previous), Some(next), true, 0, 600, 180),
+            MarkerDecision::Skip("min_interval")
+        );
+        assert_eq!(
+            decide(Some(previous), Some(next), true, 179, 600, 180),
+            MarkerDecision::Skip("min_interval")
+        );
+        assert_eq!(
+            decide(Some(previous), Some(next), true, 180, 600, 180),
+            MarkerDecision::Rebuild("changed")
+        );
+        assert_eq!(
+            decide(Some(previous), Some(next), true, 30, 600, 0),
+            MarkerDecision::Rebuild("changed"),
+            "a zero floor does not hold a real input change"
+        );
+        assert_eq!(
+            decide(Some(previous), Some(next), false, 10, 600, 180),
+            MarkerDecision::Rebuild("cache_miss"),
+            "a missing cache is not held"
+        );
+        assert_eq!(
+            decide(None, Some(next), true, 10, 600, 180),
+            MarkerDecision::Rebuild("cold")
+        );
+        assert_eq!(
+            decide(Some(previous), Some(next), true, 600, 600, 900),
+            MarkerDecision::Rebuild("stale"),
+            "max age forces a rebuild even when the floor is longer"
+        );
+        assert_eq!(
+            decide(Some(previous), Some(previous), true, 10, 600, 180),
+            MarkerDecision::Skip("unchanged")
+        );
+    }
+
+    #[test]
+    fn ingest_timestamps_bucket_to_five_minutes() {
+        assert_eq!(INGEST_BUCKET_SECS, 300);
+        assert_eq!(bucket_unix(0, 300), 0);
+        assert_eq!(bucket_unix(299, 300), 0);
+        assert_eq!(bucket_unix(300, 300), 300);
+        assert_eq!(bucket_unix(301, 300), 300);
+        assert_eq!(bucket_unix(599, 300), 300);
+        assert_eq!(bucket_unix(600, 300), 600);
+        assert_eq!(bucket_unix(-1, 300), -300);
+        assert_eq!(bucket_unix(1_700_000_100, 1), 1_700_000_100);
+
+        let early = bucket_rfc3339("2026-11-18T17:04:12.123Z").unwrap();
+        let late = bucket_rfc3339("2026-11-18T17:04:59+00:00").unwrap();
+        let next = bucket_rfc3339("2026-11-18T17:05:00Z").unwrap();
+        let spaced = bucket_rfc3339("2026-11-18 17:09:01").unwrap();
+        assert_eq!(early, "2026-11-18T17:00");
+        assert_eq!(late, early);
+        assert_eq!(next, "2026-11-18T17:05");
+        assert_ne!(early, next);
+        assert_eq!(spaced, "2026-11-18 17:05");
+        assert_eq!(bucket_rfc3339("not-a-time"), None);
+        assert_eq!(bucket_rfc3339(""), None);
+        assert_eq!(
+            coarse_ingest_stamp("2026-11-18T17:07:01+00:00|at://did/app.bsky.feed.post/abc"),
+            "2026-11-18T17:05"
+        );
+        assert_eq!(coarse_ingest_stamp(""), "");
+        assert_eq!(coarse_ingest_stamp("   "), "");
+    }
+
+    #[test]
+    fn head_window_drops_rows_that_cannot_newly_enter_the_cache() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-11-18T17:07:30+00:00")
+            .unwrap()
+            .timestamp();
+        assert!(in_head_window(now - 60, now));
+        assert!(in_head_window(now - MARKER_HEAD_WINDOW_SECS, now));
+        assert!(!in_head_window(now - MARKER_HEAD_WINDOW_SECS - 1, now));
+        assert_eq!(MARKER_HEAD_WINDOW_SECS, 7_200);
+
+        let cutoff = head_window_cutoff_label(now);
+        let recent = bucket_rfc3339("2026-11-18T17:04:01Z").unwrap();
+        let on_edge = bucket_rfc3339("2026-11-18T15:06:00Z").unwrap();
+        let just_outside = bucket_rfc3339("2026-11-18T15:04:59Z").unwrap();
+        let old = bucket_rfc3339("2026-11-18T14:00:00Z").unwrap();
+        assert!(recent >= cutoff);
+        assert!(on_edge >= cutoff);
+        assert!(just_outside < cutoff);
+        assert!(old < cutoff);
+        assert_eq!(cutoff, "2026-11-18T15:05");
+    }
+
+    #[test]
+    fn changed_components_names_only_the_keys_that_moved() {
+        let previous = "bsky=aaa;events=10;nostr=on:pk:f:e:100:200;obs=2026-11-18T17:00;v=2";
+        let same = "v=2;obs=2026-11-18T17:00;nostr=on:pk:f:e:100:200;events=10;bsky=aaa";
+        assert_eq!(changed_components(previous, same), "");
+        let next = "bsky=bbb;events=10;nostr=on:pk:f:e:400:200;obs=2026-11-18T17:05;v=2;rss=1";
+        assert_eq!(changed_components(previous, next), "bsky,nostr,obs,rss");
+        assert_eq!(changed_components("a=1;", "a=1"), "");
+        assert_eq!(changed_components(previous, previous), "");
     }
 
     #[test]
@@ -976,6 +1314,7 @@ mod tests {
                 || OWNER_LIGHT_SQL.contains("owner_user_id = $4::bigint")
         );
         assert!(OWNER_LIGHT_SQL.contains("ORDER BY last_seen_at DESC LIMIT 1"));
+        assert!(!OWNER_LIGHT_SQL.contains("bsky_uri"));
         assert!(OWNER_LIGHT_SQL.contains("kind = 'follow'"));
         assert!(FOLLOW_EVENTS_SQL.contains("actor_id IN (f.actor_id, f.actor_id || '/')"));
         assert!(FOLLOW_EVENTS_SQL.contains("ORDER BY created_at DESC, id DESC"));
@@ -988,12 +1327,17 @@ mod tests {
         assert!(BSKY_WINDOW_SQL.contains("LIMIT $3"));
         assert!(BSKY_WINDOW_SQL.contains("l.bsky_uri = p.bsky_uri"));
         assert!(BSKY_WINDOW_SQL.contains("c.bsky_uri = p.bsky_uri"));
-        assert!(!BSKY_WINDOW_SQL.contains("MAX(updated_at) FROM bsky_posts"));
+        assert!(BSKY_WINDOW_SQL.contains("substring(p.indexed_at from 16 for 1)"));
+        assert!(BSKY_WINDOW_SQL.contains("left(p.indexed_at, 15)"));
+        assert!(BSKY_WINDOW_SQL.contains("indexed_bucket >= $4"));
+        assert!(!BSKY_WINDOW_SQL.contains("updated_at"));
         assert!(RSS_SQL.contains("feed_id = f.id"));
         assert!(RSS_SQL.contains("ORDER BY published_at DESC NULLS LAST"));
         assert!(RSS_SQL.contains("owner_user_id = $1::bigint AND f.enabled"));
         assert!(NOSTR_EVENTS_SQL.contains("pubkey = f.pubkey"));
+        assert!(NOSTR_EVENTS_SQL.contains("created_at >= $2"));
         assert!(NOSTR_EVENTS_SQL.contains("ORDER BY created_at DESC"));
+        assert!(NOSTR_EVENTS_SQL.contains("LIMIT 1"));
         assert!(NOSTR_BOOST_SQL.contains("owner_user_id::bigint = ANY($1::bigint[])"));
         assert!(NOSTR_BOOST_SQL.contains("ORDER BY created_at DESC"));
         assert!(TERMS_SQL.contains("WHERE enabled = 1"));
