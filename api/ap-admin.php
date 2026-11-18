@@ -39469,6 +39469,21 @@ $showComposeFab = empty($GLOBALS['vaak_guest_profile'])
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape' && box.classList.contains('open')) closeLb();
   });
+  // While an image is open, nothing behind it scrolls: no wheel/trackpad
+  // (incl. momentum and Firefox wheel transactions latched on the feed),
+  // no one-finger swipe, no scroll keys. Two-finger pinch zoom still works.
+  // Capture phase, so the page-margin wheel forwarder never sees it either.
+  const lbOpen = () => box.classList.contains('open');
+  document.addEventListener('wheel', (e) => {
+    if (lbOpen() && !e.ctrlKey) e.preventDefault();
+  }, { capture: true, passive: false });
+  document.addEventListener('touchmove', (e) => {
+    if (lbOpen() && e.touches.length < 2) e.preventDefault();
+  }, { capture: true, passive: false });
+  const scrollKeys = new Set([' ', 'PageUp', 'PageDown', 'Home', 'End', 'ArrowUp', 'ArrowDown']);
+  document.addEventListener('keydown', (e) => {
+    if (lbOpen() && scrollKeys.has(e.key) && !(e.key === ' ' && e.target === closeBtn)) e.preventDefault();
+  }, true);
 })();
 </script>
 <?php if ($showComposeFab): ?>
