@@ -12,6 +12,13 @@ anything else bumps the patch number.
 Releases up to **0.9.83** used a two-digit deploy counter (0.9.05, 0.9.83)
 and have no notes here; their tags and GitHub Releases are unchanged.
 
+## [0.85.0](https://github.com/cmdr-nova/VAAK/releases/tag/v0.85.0) - 2026-11-18
+
+### ✨ Features
+* Lock feed scroll while an image is open in the lightbox by @cmdr-nova in https://github.com/cmdr-nova/VAAK/pull/453
+
+**Full Changelog**: https://github.com/cmdr-nova/VAAK/compare/v0.84.0...v0.85.0
+
 ## [0.84.0](https://github.com/cmdr-nova/VAAK/releases/tag/v0.84.0) - 2026-11-18
 
 ### ✨ Features
