@@ -7054,11 +7054,12 @@ function ap_bsky_tombstone_uri(string $uri, ?int $ownerUserId = null): bool
             if (function_exists('ap_bsky_tl_cache_clear_owner')) {
                 ap_bsky_tl_cache_clear_owner((int) $oid);
             }
-            if (function_exists('admin_tl_cache_clear_owner')) {
+            if (function_exists('ap_timeline_cache_invalidate_owner')) {
+                ap_timeline_cache_invalidate_owner((int) $oid);
+            } elseif (function_exists('admin_tl_cache_clear_owner')) {
                 admin_tl_cache_clear_owner((int) $oid);
-            } elseif (function_exists('ap_redis_delete_pattern')) {
-                ap_redis_delete_pattern('vaak:fragment:tl:v1:' . (int) $oid . ':*');
-                ap_redis_delete_pattern('vaak:timeline:ranked:v1:*');
+            } elseif (function_exists('ap_fragment_tl_invalidate')) {
+                ap_fragment_tl_invalidate((int) $oid);
             }
         }
     }

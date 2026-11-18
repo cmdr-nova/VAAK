@@ -650,18 +650,20 @@ pub(crate) fn parse_epoch_secs(s: &str) -> Option<i64> {
     None
 }
 
-fn live_redis_key(owner_user_id: i64, scan: i64, last_read: &str) -> String {
+fn live_redis_key(owner_user_id: i64, scan: i64, last_read: &str, epoch: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(last_read.as_bytes());
     let hash = hex::encode(hasher.finalize());
-    format!("vaak:notifications:v1:unread:{owner_user_id}:{scan}:{hash}")
+    let epoch = crate::redis_util::generation_token(epoch);
+    format!("vaak:notifications:v1:unread:{owner_user_id}:{epoch}:{scan}:{hash}")
 }
 
-fn shadow_redis_key(owner_user_id: i64, scan: i64, last_read: &str) -> String {
+fn shadow_redis_key(owner_user_id: i64, scan: i64, last_read: &str, epoch: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(last_read.as_bytes());
     let hash = hex::encode(hasher.finalize());
-    format!("vaak:shadow:notifications:v1:unread:{owner_user_id}:{scan}:{hash}")
+    let epoch = crate::redis_util::generation_token(epoch);
+    format!("vaak:shadow:notifications:v1:unread:{owner_user_id}:{epoch}:{scan}:{hash}")
 }
 
 fn digits_only(raw: &str) -> String {
@@ -718,12 +720,18 @@ pub async fn compute_and_cache(
     load_owner_actor_id(&db, owner_user_id).await?;
     anyhow::ensure!(load_last_read_id(&db, owner_user_id).await? == state.last_read_id,
         "notification read marker changed during scan");
+    let unread_epoch = redis_util::generation(
+        &mut redis,
+        &redis_util::notification_unread_epoch_key(owner_user_id),
+    )
+    .await
+    .unwrap_or_default();
     let raw_state = state.clone();
     let shadow_payload = unread_cache_payload(&raw_state);
-    let shadow_key = shadow_redis_key(owner_user_id, raw_state.scan, &raw_state.last_read_id);
+    let shadow_key = shadow_redis_key(owner_user_id, raw_state.scan, &raw_state.last_read_id, &unread_epoch);
     redis_util::json_set(&mut redis, &shadow_key, &shadow_payload, 120).await?;
 
-    let live_key = live_redis_key(owner_user_id, state.scan, &state.last_read_id);
+    let live_key = live_redis_key(owner_user_id, state.scan, &state.last_read_id, &unread_epoch);
     if live {
         let payload = unread_cache_payload(&state);
         redis_util::json_set(&mut redis, &live_key, &payload, 45).await?;

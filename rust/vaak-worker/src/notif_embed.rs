@@ -47,14 +47,21 @@ pub async fn find_status_in_notif_envelopes(
     owner_id: i64,
     uri: &str,
 ) -> Result<Option<Value>> {
-    let pattern = format!("vaak:notifications:v4:{owner_id}:*");
-    // Owners keep a handful of Mentions keys — KEYS is fine at this scale.
-    let keys: Vec<String> = redis::cmd("KEYS")
-        .arg(&pattern)
+    let epoch = crate::notif_list::list_epoch(redis, owner_id)
+        .await
+        .unwrap_or_default();
+    let (server, user) = crate::notif_list::epoch_parts(&epoch);
+    let prefix = format!("vaak:notifications:v4:{owner_id}:{server}:{user}:");
+    // The index is the owner's current pages. KEYS would walk the whole DB.
+    let keys: Vec<String> = redis::cmd("SMEMBERS")
+        .arg(crate::redis_util::notification_list_index_key(owner_id))
         .query_async(redis)
         .await
         .unwrap_or_default();
     for key in keys {
+        if !key.starts_with(&prefix) {
+            continue;
+        }
         if key.contains(":unread:") {
             continue;
         }

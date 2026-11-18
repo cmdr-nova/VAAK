@@ -5,16 +5,15 @@
 //!   `vaak:notifications:epoch:v1:server` (before the projection rows go, so a
 //!   hydrate already in flight skips its write-back), delete every
 //!   `ap_notification_projection` row (done by the caller inside its
-//!   transaction), then drop `vaak:notifications:v1..v4:*`.
+//!   transaction). List keys include that epoch, so old pages are not scanned.
 //! - `ap_notification_unread_invalidate_owners` /
-//!   `ap_masto_notifications_unread_invalidate`: per owner, drop
-//!   `vaak:notifications:v1:unread:{owner}:*`,
-//!   `vaak:shadow:notifications:v1:unread:{owner}:*` and the
-//!   `notif_unread_{owner}_*.json` files in the notification cache directory.
+//!   `ap_masto_notifications_unread_invalidate`: per owner, bump
+//!   `vaak:notifications:unread-epoch:v1:{owner}` (live and shadow badge keys
+//!   include it) and remove the `notif_unread_{owner}_*.json` files.
 //!
 //! - `ap_notification_projection_invalidate_owner` (a new mention row): the
-//!   same for one owner, `vaak:notifications:epoch:v1:{owner}` and
-//!   `vaak:notifications:v1..v4:{owner}:*`.
+//!   same for one owner, `vaak:notifications:epoch:v1:{owner}`, plus DEL of
+//!   `vaak:notifications:v4:index:{owner}`.
 //!
 //! All of it is best effort, like PHP: a failure is logged, never returned.
 
@@ -31,29 +30,6 @@ pub(crate) async fn bump_server_epoch(redis: &mut ConnectionManager) {
     }
 }
 
-/// `ap_redis_delete_pattern`: SCAN in batches of 100 and DEL what matches.
-pub(crate) async fn delete_pattern(redis: &mut ConnectionManager, pattern: &str) {
-    let mut cursor: u64 = 0;
-    loop {
-        let r: redis::RedisResult<(u64, Vec<String>)> =
-            redis::cmd("SCAN").arg(cursor).arg("MATCH").arg(pattern).arg("COUNT").arg(100).query_async(redis).await;
-        let (next, keys) = match r {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!(error = %e, pattern, "notification cache pattern delete failed");
-                return;
-            }
-        };
-        if !keys.is_empty() {
-            let _: redis::RedisResult<()> = redis::cmd("DEL").arg(&keys).query_async(redis).await;
-        }
-        if next == 0 {
-            return;
-        }
-        cursor = next;
-    }
-}
-
 /// `ap_notification_list_epoch_bump($owner)`, before that owner's projection
 /// rows go.
 pub(crate) async fn bump_owner_epoch(redis: &mut ConnectionManager, owner: i64) {
@@ -65,20 +41,16 @@ pub(crate) async fn bump_owner_epoch(redis: &mut ConnectionManager, owner: i64) 
 }
 
 /// The Redis side of `ap_notification_projection_invalidate_owner`, after the
-/// owner's projection rows are gone.
+/// owner's projection rows are gone. The owner epoch is already part of the
+/// list key, so the pages themselves are not scanned. The index is one key.
 pub(crate) async fn drop_owner_list_caches(redis: &mut ConnectionManager, owner: i64) {
-    for v in 1..=4 {
-        delete_pattern(redis, &format!("vaak:notifications:v{v}:{owner}:*")).await;
-    }
+    let index = format!("vaak:notifications:v4:index:{owner}");
+    let _: redis::RedisResult<()> = redis::cmd("DEL").arg(&index).query_async(redis).await;
 }
 
 /// The Redis side of `ap_notification_projection_invalidate_all`, after the
-/// projection rows are gone.
-pub(crate) async fn drop_list_caches(redis: &mut ConnectionManager) {
-    for v in 1..=4 {
-        delete_pattern(redis, &format!("vaak:notifications:v{v}:*")).await;
-    }
-}
+/// projection rows are gone. The server epoch bump is the invalidation.
+pub(crate) async fn drop_list_caches(_redis: &mut ConnectionManager) {}
 
 /// `ap_notification_unread_invalidate_owners`.
 pub(crate) async fn unread_owners(redis: &mut ConnectionManager, cache_dir: &Path, owners: &[i64]) {
@@ -88,8 +60,11 @@ pub(crate) async fn unread_owners(redis: &mut ConnectionManager, cache_dir: &Pat
             continue;
         }
         seen.push(owner);
-        delete_pattern(redis, &format!("vaak:notifications:v1:unread:{owner}:*")).await;
-        delete_pattern(redis, &format!("vaak:shadow:notifications:v1:unread:{owner}:*")).await;
+        let key = format!("vaak:notifications:unread-epoch:v1:{owner}");
+        let r: redis::RedisResult<()> = redis::pipe().incr(&key, 1).ignore().expire(&key, 86_400 * 30).ignore().query_async(redis).await;
+        if let Err(e) = r {
+            tracing::warn!(error = %e, owner, "notification unread epoch bump failed");
+        }
         remove_unread_files(cache_dir, owner);
     }
 }

@@ -157,6 +157,7 @@ foreach ($cases as $i => [$label, $path, $noteOf, $boosts, $notified, $ops]) {
                 $redis->set("vaak:notifications:v4:{$notified}:smoke-{$side}", 'x');
             }
             $epoch = $notified > 0 ? (int) $redis->get("vaak:notifications:epoch:v1:{$notified}") : 0;
+            $unreadEpoch = $notified > 0 ? (int) $redis->get("vaak:notifications:unread-epoch:v1:{$notified}") : 0;
             $pushes = (int) $queue->lLen('vaak:queue:inbox_webpush');
             $jobsBefore = (int) $queue->lLen('vaak:queue:timeline_fanout');
             [$state, $result] = $run($side, $who, $path, $body);
@@ -164,7 +165,9 @@ foreach ($cases as $i => [$label, $path, $noteOf, $boosts, $notified, $ops]) {
                 'state' => $state,
                 'result' => $result,
                 'mention' => $mention($activityId, $side),
-                'caches_gone' => $notified > 0 && !$redis->exists("vaak:notifications:v4:{$notified}:smoke-{$side}"),
+                'caches_gone' => $notified > 0
+                    && (int) $redis->get("vaak:notifications:epoch:v1:{$notified}") > $epoch
+                    && (int) $redis->get("vaak:notifications:unread-epoch:v1:{$notified}") > $unreadEpoch,
                 'epoch_bumped' => $notified > 0 && (int) $redis->get("vaak:notifications:epoch:v1:{$notified}") > $epoch,
                 'push_jobs' => (int) $queue->lLen('vaak:queue:inbox_webpush') - $pushes,
                 'fanout' => $fanout($jobsBefore),

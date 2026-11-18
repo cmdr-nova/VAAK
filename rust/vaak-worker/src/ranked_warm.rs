@@ -1,6 +1,6 @@
 //! Home / Local / Federated **ranked** warm (loading-plan slice 2 → native).
 //!
-//! - **Home:** rebuilds `vaak:timeline:ranked:v2:{sha256(logical)}` + owner
+//! - **Home:** rebuilds `vaak:timeline:ranked:v2:{epoch}:{sha256(logical)}` + owner
 //!   index from Postgres (follow events, own outbox, FoF/cold-start
 //!   recommendations, favourite/toxicity nudges when algorithm on, Bluesky
 //!   merge, RSS spacing). Source `vaak-worker-native`. Flag
@@ -132,13 +132,8 @@ fn parse_views(views: &str) -> Vec<&'static str> {
     out
 }
 
-fn ranked_redis_key(logical: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(logical.as_bytes());
-    format!(
-        "vaak:timeline:ranked:v2:{}",
-        hex::encode(hasher.finalize())
-    )
+fn ranked_redis_key(epoch: &str, logical: &str) -> String {
+    crate::redis_util::ranked_redis_key(epoch, logical)
 }
 
 fn owner_index_key(owner: i64) -> String {
@@ -1911,7 +1906,8 @@ async fn write_ranked_cache(
     if ranked.is_empty() {
         bail!("refusing to write empty ranked cache");
     }
-    let redis_key = ranked_redis_key(logical);
+    let ranked_epoch = redis_util::generation(redis, redis_util::RANKED_EPOCH_KEY).await?;
+    let redis_key = ranked_redis_key(&ranked_epoch, logical);
     let now = chrono::Utc::now().timestamp();
     let payload = json!({
         "ts": now,
@@ -4169,9 +4165,9 @@ fn warm_touch_outcome(results: impl IntoIterator<Item = (WarmKeyKind, i64)>) -> 
 }
 
 /// (redis key, ttl seconds, how a miss is handled).
-fn warm_cache_keys(view: &str, owner: i64, logical: &str) -> Vec<(String, u64, WarmKeyKind)> {
+fn warm_cache_keys(epoch: &str, view: &str, owner: i64, logical: &str) -> Vec<(String, u64, WarmKeyKind)> {
     let mut keys = vec![
-        (ranked_redis_key(logical), HOME_TTL_SECS, WarmKeyKind::Ranked),
+        (ranked_redis_key(epoch, logical), HOME_TTL_SECS, WarmKeyKind::Ranked),
         (owner_index_key(owner), HOME_TTL_SECS, WarmKeyKind::Optional),
     ];
     if view == "home" {
@@ -4200,8 +4196,9 @@ async fn touch_warm_ttl(
     owner: i64,
     logical: &str,
 ) -> Result<WarmTouch> {
+    let ranked_epoch = redis_util::generation(conn, redis_util::RANKED_EPOCH_KEY).await?;
     let mut results = Vec::new();
-    for (key, ttl, kind) in warm_cache_keys(view, owner, logical) {
+    for (key, ttl, kind) in warm_cache_keys(&ranked_epoch, view, owner, logical) {
         let n: i64 = redis::cmd("EXPIRE")
             .arg(&key)
             .arg(ttl.max(1))
@@ -4547,7 +4544,8 @@ async fn apply_input_marker(
     let cache_present = match stored.as_ref().filter(|row| !row.logical.is_empty()) {
         Some(row) => match redis.as_mut() {
             Some(conn) => {
-                let key = ranked_redis_key(&row.logical);
+                let ranked_epoch = redis_util::generation(conn, redis_util::RANKED_EPOCH_KEY).await.unwrap_or_else(|_| "x".into());
+                let key = ranked_redis_key(&ranked_epoch, &row.logical);
                 let exists: i64 = redis::cmd("EXISTS")
                     .arg(&key)
                     .query_async(conn)

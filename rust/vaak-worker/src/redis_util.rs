@@ -2,6 +2,104 @@
 
 use anyhow::{Context, Result};
 use redis::AsyncCommands;
+use sha2::{Digest, Sha256};
+
+/// Server generation baked into `vaak:timeline:ranked:v2:{epoch}:{sha256}`.
+pub const RANKED_EPOCH_KEY: &str = "vaak:timeline:ranked:epoch:v1";
+
+pub fn fragment_tl_epoch_key(owner: i64) -> String {
+    format!("vaak:fragment:tl:epoch:v1:{}", owner.max(0))
+}
+
+pub fn notification_list_index_key(owner: i64) -> String {
+    format!("vaak:notifications:v4:index:{}", owner.max(0))
+}
+
+pub fn notification_unread_epoch_key(owner: i64) -> String {
+    format!("vaak:notifications:unread-epoch:v1:{}", owner.max(0))
+}
+
+/// PHP `ap_redis_generation_token`: a non-decimal read is not generation 0.
+pub fn generation_token(raw: &str) -> &str {
+    if !raw.is_empty() && raw.bytes().all(|b| b.is_ascii_digit()) {
+        raw
+    } else {
+        "x"
+    }
+}
+
+/// PHP `ap_redis_ranked_key`. `epoch` is the decimal generation, or "" when the
+/// read failed (token `x`, so a reconnect cannot alias generation 0).
+pub fn ranked_redis_key(epoch: &str, logical: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(logical.as_bytes());
+    format!(
+        "vaak:timeline:ranked:v2:{}:{}",
+        generation_token(epoch),
+        hex::encode(hasher.finalize())
+    )
+}
+
+/// Absent key is generation 0. A transport error is returned so the caller
+/// does not read or write generation 0 by mistake.
+pub async fn generation(conn: &mut redis::aio::MultiplexedConnection, key: &str) -> Result<String> {
+    let raw: Option<String> = redis::cmd("GET")
+        .arg(key)
+        .query_async(conn)
+        .await
+        .with_context(|| format!("redis GET {key}"))?;
+    match raw {
+        Some(value) if !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()) => Ok(value),
+        _ => Ok("0".into()),
+    }
+}
+
+/// PHP `ap_redis_generation_bump`: INCR plus a 30-day expiry.
+pub async fn bump_generation(conn: &mut redis::aio::MultiplexedConnection, key: &str) -> Result<()> {
+    let _: i64 = redis::cmd("INCR")
+        .arg(key)
+        .query_async(conn)
+        .await
+        .with_context(|| format!("redis INCR {key}"))?;
+    let _: i64 = redis::cmd("EXPIRE")
+        .arg(key)
+        .arg(86_400i64 * 30)
+        .query_async(conn)
+        .await
+        .with_context(|| format!("redis EXPIRE {key}"))?;
+    Ok(())
+}
+
+/// SADD a notification list key so embed lookup is O(pages for that owner).
+pub async fn remember_notification_page(
+    conn: &mut redis::aio::MultiplexedConnection,
+    key: &str,
+    ttl_secs: i64,
+) -> Result<()> {
+    let Some(rest) = key.strip_prefix("vaak:notifications:v4:") else {
+        return Ok(());
+    };
+    let Some(owner) = rest.split(':').next() else {
+        return Ok(());
+    };
+    if owner.is_empty() || !owner.bytes().all(|b| b.is_ascii_digit()) {
+        return Ok(());
+    }
+    let index = format!("vaak:notifications:v4:index:{owner}");
+    let _: i64 = redis::cmd("SADD")
+        .arg(&index)
+        .arg(key)
+        .query_async(conn)
+        .await
+        .with_context(|| format!("redis SADD {index}"))?;
+    let _: i64 = redis::cmd("EXPIRE")
+        .arg(&index)
+        .arg(ttl_secs.max(1))
+        .query_async(conn)
+        .await
+        .unwrap_or(0);
+    Ok(())
+}
 
 pub async fn connect(redis_url: &str) -> Result<redis::aio::MultiplexedConnection> {
     let client = redis::Client::open(redis_url).context("parse redis url")?;
@@ -70,7 +168,11 @@ pub async fn json_mget(
     Ok(raws.into_iter().map(|raw| raw.and_then(|s| serde_json::from_str(&s).ok())).collect())
 }
 
-/// PHP `ap_redis_delete_pattern`: SCAN in batches of 100 and DEL each batch.
+/// SCAN in batches of 100 and DEL each batch.
+///
+/// Production invalidation does not call this. Notification pages, timeline
+/// fragments, and ranked lists use a generation counter. This remains so a
+/// test can delete the private prefix it created.
 pub async fn delete_pattern(conn: &mut redis::aio::MultiplexedConnection, pattern: &str) -> Result<usize> {
     let mut cursor: u64 = 0;
     let mut deleted = 0usize;
@@ -173,6 +275,20 @@ mod tests {
     use super::*;
     use redis::AsyncCommands;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn ranked_key_includes_generation() {
+        let absent = ranked_redis_key("0", "v13_home_u1_a");
+        let next = ranked_redis_key("4", "v13_home_u1_a");
+        let unreadable = ranked_redis_key("", "v13_home_u1_a");
+        assert!(absent.starts_with("vaak:timeline:ranked:v2:0:"));
+        assert!(next.starts_with("vaak:timeline:ranked:v2:4:"));
+        assert!(unreadable.starts_with("vaak:timeline:ranked:v2:x:"));
+        assert_ne!(absent, next);
+        assert_eq!(generation_token("12"), "12");
+        assert_eq!(generation_token(""), "x");
+        assert_eq!(generation_token("nope"), "x");
+    }
 
     fn redis_test_url() -> Option<String> {
         match std::env::var("VAAK_TEST_REDIS_URL") {

@@ -1,7 +1,7 @@
 //! Mentions / Ice Cubes notification **list** warm + Axum shadow read.
 //!
 //! Warm path (10.5 / 0.6.66): native Rust materialize from
-//! `ap_notification_projection` → Redis `vaak:notifications:v4:{owner}:{hash}`.
+//! `ap_notification_projection` → Redis `vaak:notifications:v4:{owner}:{server}:{user}:{hash}`.
 //! When the projection window is thin/empty, spawn temporary PHP
 //! `bin/notif-projection-fill.php` (local PG hydrate → projection + Redis)
 //! then retry native materialize. HTTP Mentions still falls back to PHP
@@ -339,7 +339,7 @@ async fn projection_page(
 
 /// PHP `ap_notification_list_epoch`: bumped by every list invalidation. `None`
 /// when Redis cannot answer, which disables the guard rather than the warm.
-async fn list_epoch(redis: &mut redis::aio::MultiplexedConnection, owner_user_id: i64) -> Option<String> {
+pub(crate) async fn list_epoch(redis: &mut redis::aio::MultiplexedConnection, owner_user_id: i64) -> Option<String> {
     let keys = [
         "vaak:notifications:epoch:v1:server".to_string(),
         format!("vaak:notifications:epoch:v1:{owner_user_id}"),
@@ -409,7 +409,11 @@ async fn write_list_envelope(
         "items": items,
         "source": "vaak-worker-projection",
     });
-    redis_util::json_set(redis, key, &payload, 600).await
+    redis_util::json_set(redis, key, &payload, 600).await?;
+    if let Err(err) = redis_util::remember_notification_page(redis, key, 600).await {
+        tracing::warn!(error = %err, "notification page index skipped");
+    }
+    Ok(())
 }
 
 /// A valid local owner with nothing to list, versus a miss that PHP must hydrate.
@@ -690,7 +694,15 @@ pub async fn warm_owner(cfg: &Config, owner_user_id: i64, limit: i64) -> Result<
 
     for job in &jobs {
         let want = expand_types(&job.types);
-        let key = notifications_list_redis_key(owner_user_id, job.limit, None, None, &want, &[]);
+        let key = notifications_list_redis_key(
+            owner_user_id,
+            job.limit,
+            None,
+            None,
+            &want,
+            &[],
+            epoch.as_deref().unwrap_or(""),
+        );
 
         if epoch.is_some() && list_epoch(&mut redis, owner_user_id).await != epoch {
             lines.push(format!(
@@ -874,10 +886,27 @@ fn expand_types(types: &[String]) -> Vec<String> {
     all.into_iter().filter(|t| set.contains(t.as_str())).collect()
 }
 
+/// `server:user` from `list_epoch`. Empty or a failed read is `x:x`, which
+/// does not alias a real generation of `0:0`.
+pub(crate) fn epoch_parts(epoch: &str) -> (String, String) {
+    if epoch.is_empty() {
+        return ("x".into(), "x".into());
+    }
+    let mut bits = epoch.splitn(2, ':');
+    let server = bits.next().unwrap_or("0");
+    let user = bits.next().unwrap_or("0");
+    let digit = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    (
+        if digit(server) { server.to_string() } else { "0".into() },
+        if digit(user) { user.to_string() } else { "0".into() },
+    )
+}
+
 /// Mirror PHP `hash('sha256', json_encode([limit,max,since,types,exclude], JSON_UNESCAPED_SLASHES))`.
 ///
 /// Key order must match PHP insertion order (`limit,max,since,types,exclude`). Default
 /// `serde_json::Map` is a BTreeMap and alphabetizes keys, which breaks Redis parity.
+/// `epoch` is `server:user` and is a path segment, not part of the hash.
 pub fn notifications_list_redis_key(
     owner_user_id: i64,
     limit: i64,
@@ -885,6 +914,7 @@ pub fn notifications_list_redis_key(
     since_id: Option<&str>,
     types: &[String],
     exclude: &[String],
+    epoch: &str,
 ) -> String {
     let mut want = expand_types(types);
     if !exclude.is_empty() {
@@ -905,8 +935,9 @@ pub fn notifications_list_redis_key(
     );
     let mut hasher = Sha256::new();
     hasher.update(encoded.as_bytes());
+    let (server, user) = epoch_parts(epoch);
     format!(
-        "vaak:notifications:v4:{owner_user_id}:{}",
+        "vaak:notifications:v4:{owner_user_id}:{server}:{user}:{}",
         hex::encode(hasher.finalize())
     )
 }
@@ -932,7 +963,8 @@ async fn read_notification_envelope(
     max_id: Option<&str>,
     since_id: Option<&str>,
 ) -> Result<NotificationEnvelope> {
-    let redis_key = notifications_list_redis_key(owner_user_id, limit, max_id, since_id, types, exclude);
+    let epoch = list_epoch(redis, owner_user_id).await.unwrap_or_default();
+    let redis_key = notifications_list_redis_key(owner_user_id, limit, max_id, since_id, types, exclude, &epoch);
     let cached = redis_util::json_get(redis, &redis_key).await?;
     if let Some(payload) = cached {
         let items = payload
@@ -1280,7 +1312,7 @@ async fn answer_from_database(
             owner_user_id,
             limit,
             types: want,
-            redis_key: notifications_list_redis_key(owner_user_id, limit, max_id, since_id, types, exclude),
+            redis_key: notifications_list_redis_key(owner_user_id, limit, max_id, since_id, types, exclude, ""),
             cache_hit: false,
             cache_ts: None,
             cache_age_secs: None,
@@ -1296,8 +1328,13 @@ async fn answer_from_database(
         }),
         crate::notif_page::PageOutcome::Page { items, has_more, next_cursor } => {
             let now = chrono::Utc::now().timestamp();
-            let key = notifications_list_redis_key(owner_user_id, limit, max_id, since_id, types, exclude);
-            if let Ok(mut redis) = redis_util::connect(&cfg.redis_url).await {
+            let mut redis_conn = redis_util::connect(&cfg.redis_url).await.ok();
+            let epoch = match redis_conn.as_mut() {
+                Some(conn) => list_epoch(conn, owner_user_id).await.unwrap_or_default(),
+                None => String::new(),
+            };
+            let key = notifications_list_redis_key(owner_user_id, limit, max_id, since_id, types, exclude, &epoch);
+            if let Some(redis) = redis_conn.as_mut() {
                 let envelope = json!({
                     "ts": now,
                     "items": items,
@@ -1305,8 +1342,10 @@ async fn answer_from_database(
                     "has_more": has_more,
                     "next_cursor": next_cursor,
                 });
-                if let Err(err) = redis_util::json_set(&mut redis, &key, &envelope, 600).await {
+                if let Err(err) = redis_util::json_set(redis, &key, &envelope, 600).await {
                     tracing::warn!(error = %err, "notification db page cache write skipped");
+                } else if let Err(err) = redis_util::remember_notification_page(redis, &key, 600).await {
+                    tracing::warn!(error = %err, "notification page index skipped");
                 }
             }
             Ok(NotificationsShadowReport {
@@ -1500,6 +1539,23 @@ pub async fn run_loop(cfg: &Config, owner_user_id: i64, interval_secs: u64, limi
             }
         }
         tokio::time::sleep(interval).await;
+    }
+}
+
+#[cfg(test)]
+mod list_key_generation {
+    use super::notifications_list_redis_key;
+
+    #[test]
+    fn epoch_is_a_path_segment_and_the_v4_prefix_stays() {
+        let types = vec!["mention".to_string()];
+        let older = notifications_list_redis_key(1, 30, None, None, &types, &[], "2:7");
+        let newer = notifications_list_redis_key(1, 30, None, None, &types, &[], "2:8");
+        assert!(older.starts_with("vaak:notifications:v4:1:2:7:"));
+        assert!(newer.starts_with("vaak:notifications:v4:1:2:8:"));
+        assert_ne!(older, newer);
+        let failed = notifications_list_redis_key(1, 30, None, None, &types, &[], "");
+        assert!(failed.starts_with("vaak:notifications:v4:1:x:x:"));
     }
 }
 

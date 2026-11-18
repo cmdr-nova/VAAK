@@ -60,28 +60,22 @@ if ($ownerId < 1) {
     exit(2);
 }
 
-$patterns = [];
-$add = static function (string $pattern) use (&$patterns): void {
-    if (!in_array($pattern, $patterns, true)) $patterns[] = $pattern;
+$actions = [];
+$add = static function (string $action) use (&$actions): void {
+    if (!in_array($action, $actions, true)) $actions[] = $action;
 };
 if ($scope === 'notifications' || $scope === 'all') {
-    $add('vaak:notifications:v1:' . $ownerId . ':*');
-    $add('vaak:notifications:v2:' . $ownerId . ':*');
-    $add('vaak:notifications:v3:' . $ownerId . ':*');
-    $add('vaak:notifications:v4:' . $ownerId . ':*');
-    $add('vaak:notifications:v1:unread:' . $ownerId . ':*');
+    $add('notification-list-epoch:' . $ownerId);
+    $add('notification-unread-epoch:' . $ownerId);
 }
 if ($scope === 'timelines' || $scope === 'all') {
-    $add('vaak:fragment:tl:v1:' . $ownerId . ':*');
-    $add('vaak:fragment:tl-shell:v1:' . $ownerId . ':*');
-    $add('vaak:timeline:owner-index:v1:' . $ownerId);
+    $add('timeline-owner:' . $ownerId);
 }
 if ($scope === 'library' || $scope === 'all') {
-    $add('vaak:fragment:lib:v1:*:' . $ownerId . ':*');
+    $add('library-epoch:' . $ownerId);
 }
 if ($scope === 'relationships' || $scope === 'all') {
-    $add('vaak:relset:v1:*:' . $ownerId . '*');
-    $add('vaak:bsky:followed-handles:' . $ownerId);
+    $add('relationships:' . $ownerId);
 }
 
 fwrite(STDOUT, sprintf("scope=%s owner_id=%d apply=%s\n", $scope, $ownerId, $apply ? 'yes' : 'no'));
@@ -96,13 +90,34 @@ $statusRecord = [
 if (function_exists('ap_redis_json_set')) {
     ap_redis_json_set($statusKey, $statusRecord, 604800);
 }
-foreach ($patterns as $pattern) {
-    fwrite(STDOUT, "pattern={$pattern}\n");
-    if ($apply) ap_redis_delete_pattern($pattern);
+foreach ($actions as $action) {
+    fwrite(STDOUT, "action={$action}\n");
+    if (!$apply) {
+        continue;
+    }
+    if (str_starts_with($action, 'notification-list-epoch:') && function_exists('ap_notification_list_epoch_bump')) {
+        ap_notification_list_epoch_bump($ownerId);
+        if (function_exists('ap_redis_delete') && function_exists('ap_notification_page_index_key')) {
+            ap_redis_delete(ap_notification_page_index_key($ownerId));
+        }
+    } elseif (str_starts_with($action, 'notification-unread-epoch:') && function_exists('ap_notification_unread_epoch_bump')) {
+        ap_notification_unread_epoch_bump($ownerId);
+    } elseif (str_starts_with($action, 'timeline-owner:') && function_exists('ap_timeline_cache_invalidate_owner')) {
+        ap_timeline_cache_invalidate_owner($ownerId);
+    } elseif (str_starts_with($action, 'library-epoch:') && function_exists('ap_redis_library_html_invalidate')) {
+        ap_redis_library_html_invalidate($ownerId);
+    } elseif (str_starts_with($action, 'relationships:')) {
+        if (function_exists('ap_following_id_set_invalidate_owner')) {
+            ap_following_id_set_invalidate_owner($ownerId);
+        }
+        if (function_exists('ap_redis_delete')) {
+            ap_redis_delete('vaak:bsky:followed-handles:' . $ownerId);
+        }
+    }
 }
 $statusRecord['finished_at'] = gmdate('c');
 $statusRecord['status'] = 'completed';
-$statusRecord['patterns'] = count($patterns);
+$statusRecord['patterns'] = count($actions);
 if (function_exists('ap_redis_json_set')) {
     ap_redis_json_set($statusKey, $statusRecord, 604800);
 }

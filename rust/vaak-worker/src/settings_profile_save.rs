@@ -119,15 +119,16 @@ async fn after_save(cfg:&crate::config::Config,db:&tokio_postgres::Client,actor_
  if algorithm&&owner>0{
   let index=format!("vaak:timeline:owner-index:v1:{owner}");
   let dir=std::env::var("VAAK_ADMIN_TL_CACHE_DIR").unwrap_or_else(|_|"/var/lib/mkultra/ap/admin-tl-cache".into());
+  let epoch=crate::redis_util::generation(&mut cache,crate::redis_util::RANKED_EPOCH_KEY).await?;
   let keys=match crate::redis_util::json_get(&mut cache,&index).await?{Some(Value::Array(keys))=>keys,Some(Value::Object(map))=>map.into_iter().map(|(_,v)|v).collect(),_=>Vec::new()};
   for key in keys.iter().filter_map(Value::as_str).filter(|k|!k.is_empty()){
-   let _:i64=redis::cmd("DEL").arg(format!("vaak:timeline:ranked:v2:{}",sha256(key))).query_async(&mut cache).await?;
+   let _:i64=redis::cmd("DEL").arg(crate::redis_util::ranked_redis_key(&epoch,key)).query_async(&mut cache).await?;
    let safe=key.chars().filter(|c|c.is_ascii_lowercase()||c.is_ascii_digit()||*c=='_').collect::<String>();
    let safe=if safe.is_empty()||safe=="0"{"tl".to_owned()}else{safe};
    let _=std::fs::remove_file(std::path::Path::new(&dir).join(format!("tl_{safe}.json")));
   }
   let _:i64=redis::cmd("DEL").arg(&index).query_async(&mut cache).await?;
-  crate::redis_util::delete_pattern(&mut cache,&format!("vaak:fragment:tl:v1:{owner}:*")).await?;
+  crate::redis_util::bump_generation(&mut cache,&crate::redis_util::fragment_tl_epoch_key(owner)).await?;
   let mut del=redis::cmd("DEL");
   for limit in [15,40,50,80,160,240,20,30]{del.arg(crate::timeline::home_timeline_redis_key(owner,limit,None));}
   let _:i64=del.query_async(&mut cache).await?;

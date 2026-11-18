@@ -134,6 +134,7 @@ foreach ($cases as $i => [$label, $path, $noteOf, $extra, $owner]) {
             $redis->set("vaak:notifications:v1:unread:{$owner}:smoke-{$side}", '3');
         }
         $epoch = $owner > 0 ? (int) $redis->get("vaak:notifications:epoch:v1:{$owner}") : 0;
+        $unreadEpoch = $owner > 0 ? (int) $redis->get("vaak:notifications:unread-epoch:v1:{$owner}") : 0;
         $queued = (int) $queue->lLen('vaak:queue:inbox_webpush');
         [$state, $result] = $run($side, $path, $body);
         $out[$side] = [
@@ -141,8 +142,11 @@ foreach ($cases as $i => [$label, $path, $noteOf, $extra, $owner]) {
             'result' => $result,
             'event' => $event($doc['type'], $note, $side, $body),
             'mention' => $mention($activityId, $side),
-            'caches_gone' => $owner > 0 && !$redis->exists("vaak:notifications:v4:{$owner}:smoke-{$side}")
-                && !$redis->exists("vaak:notifications:v1:unread:{$owner}:smoke-{$side}"),
+            // List and badge generations make the old pages unreachable. The
+            // smoke sentinels are not real cache keys and are left to expire.
+            'caches_gone' => $owner > 0
+                && (int) $redis->get("vaak:notifications:epoch:v1:{$owner}") > $epoch
+                && (int) $redis->get("vaak:notifications:unread-epoch:v1:{$owner}") > $unreadEpoch,
             'epoch_bumped' => $owner > 0 && (int) $redis->get("vaak:notifications:epoch:v1:{$owner}") > $epoch,
             'push_jobs' => (int) $queue->lLen('vaak:queue:inbox_webpush') - $queued,
         ];
