@@ -215,11 +215,14 @@
 
   // Desktop: .feed is the scroll container. Mobile: body/window scrolls and
   // .feed is overflow:visible — IntersectionObserver must use the viewport.
+  // Decide by CSS alone, not by current height. A Home shell that boots with
+  // a short first page (needs-fill, soft-nav skeleton) used to pick window
+  // mode on desktop and keep it after the feed filled. Window scrolls are a
+  // no-op there, so the pinned "N new posts" pill inserted the posts but
+  // never scrolled the reader up to them, and nearTop() was always true.
   function feedIsScrollContainer() {
-    const style = window.getComputedStyle(root);
-    const oy = style.overflowY;
-    if (oy !== 'auto' && oy !== 'scroll') return false;
-    return root.scrollHeight > root.clientHeight + 2;
+    const oy = window.getComputedStyle(root).overflowY;
+    return oy === 'auto' || oy === 'scroll';
   }
   function scrollApi() {
     if (feedIsScrollContainer()) {
@@ -1094,20 +1097,25 @@
     updateTopBtn();
   }, { passive: true, capture: true });
 
+  let lastScrollY = 0;
   function updateTopBtn() {
     const y = sc.top();
     if (topBtn) {
       if (y > 280) topBtn.classList.add('show');
       else topBtn.classList.remove('show');
     }
-    // User scrolled away from the top on purpose — drop the pin.
-    if (stickToTop && y > NEAR_TOP_PX + 80) {
+    // User scrolled back down on purpose: drop the pin. The smooth scroll
+    // up to the top passes through large y values too, so only a move
+    // downward counts. (This used to read an undefined constant and threw
+    // on every scroll while the pin was armed.)
+    if (stickToTop && y > AT_TOP_PX + 80 && y > lastScrollY + 2) {
       stickToTop = false;
       if (stickToTopTimer) {
         window.clearTimeout(stickToTopTimer);
         stickToTopTimer = 0;
       }
     }
+    lastScrollY = y;
     updateNewBtn();
   }
   sc.onScroll(updateTopBtn);
