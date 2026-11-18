@@ -31,13 +31,77 @@ pub fn generation_token(raw: &str) -> &str {
 /// PHP `ap_redis_ranked_key`. `epoch` is the decimal generation, or "" when the
 /// read failed (token `x`, so a reconnect cannot alias generation 0).
 pub fn ranked_redis_key(epoch: &str, logical: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(logical.as_bytes());
     format!(
         "vaak:timeline:ranked:v2:{}:{}",
         generation_token(epoch),
-        hex::encode(hasher.finalize())
+        ranked_digest(logical)
     )
+}
+
+/// Key written before the generation segment existed (`vaak:timeline:ranked:v2:{sha256}`).
+pub fn ranked_legacy_key(logical: &str) -> String {
+    format!("vaak:timeline:ranked:v2:{}", ranked_digest(logical))
+}
+
+fn ranked_digest(logical: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(logical.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+/// Keys a reader may use, newest first.
+///
+/// Generation 0 means the counter has never been bumped. Lists written by
+/// 0.85.0 still live at the legacy key, and treating that as a miss makes
+/// ranked-warm rebuild every view on the deploy that introduced the segment.
+/// A real INCR (generation 1+) must not fall back, or invalidation would
+/// keep serving the list it just retired.
+pub fn ranked_read_keys(epoch: &str, logical: &str) -> Vec<String> {
+    let current = ranked_redis_key(epoch, logical);
+    if generation_token(epoch) != "0" {
+        return vec![current];
+    }
+    let legacy = ranked_legacy_key(logical);
+    if legacy == current {
+        vec![current]
+    } else {
+        vec![current, legacy]
+    }
+}
+
+pub async fn ranked_json_get(
+    conn: &mut redis::aio::MultiplexedConnection,
+    epoch: &str,
+    logical: &str,
+) -> Result<Option<serde_json::Value>> {
+    for key in ranked_read_keys(epoch, logical) {
+        if let Some(value) = json_get(conn, &key).await? {
+            return Ok(Some(value));
+        }
+    }
+    Ok(None)
+}
+
+pub async fn ranked_touch(
+    conn: &mut redis::aio::MultiplexedConnection,
+    epoch: &str,
+    logical: &str,
+    ttl_secs: u64,
+) -> Result<i64> {
+    let mut lived = 0i64;
+    for key in ranked_read_keys(epoch, logical) {
+        let n: i64 = redis::cmd("EXPIRE")
+            .arg(&key)
+            .arg(ttl_secs.max(1))
+            .query_async(conn)
+            .await
+            .with_context(|| format!("EXPIRE {key}"))?;
+        if n > 0 {
+            lived = n;
+            break;
+        }
+    }
+    Ok(lived)
 }
 
 /// Absent key is generation 0. A transport error is returned so the caller
@@ -288,6 +352,24 @@ mod tests {
         assert_eq!(generation_token("12"), "12");
         assert_eq!(generation_token(""), "x");
         assert_eq!(generation_token("nope"), "x");
+    }
+
+    /// 0.86.0 looked only at `v2:{epoch}:{hash}`. Production lists were still
+    /// at `v2:{hash}`, so every view looked empty the moment the new worker
+    /// started and Local HTML had nothing to paint.
+    #[test]
+    fn generation_zero_still_reads_the_pre_epoch_ranked_key() {
+        let logical = "v13_local_u1_follows";
+        let keys = ranked_read_keys("0", logical);
+        assert_eq!(keys.len(), 2, "{keys:?}");
+        assert!(keys[0].starts_with("vaak:timeline:ranked:v2:0:"));
+        assert_eq!(keys[1], ranked_legacy_key(logical));
+        assert!(!keys[1].contains(":0:"));
+        let bumped = ranked_read_keys("1", logical);
+        assert_eq!(bumped, vec![ranked_redis_key("1", logical)]);
+        assert!(!bumped.iter().any(|key| key == &ranked_legacy_key(logical)));
+        let unreadable = ranked_read_keys("", logical);
+        assert_eq!(unreadable, vec![ranked_redis_key("", logical)]);
     }
 
     fn redis_test_url() -> Option<String> {

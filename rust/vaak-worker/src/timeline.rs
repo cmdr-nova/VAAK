@@ -646,8 +646,7 @@ pub async fn home_since(
     }
     let mut best: Option<(String, Value, usize, i64)> = None;
     for logical in &logicals {
-        let rk = ranked_redis_key(&ranked_epoch, logical);
-        let Some(env) = redis_util::json_get(&mut redis, &rk).await? else {
+        let Some(env) = redis_util::ranked_json_get(&mut redis, &ranked_epoch, logical).await? else {
             continue;
         };
         let Some((n, ts)) = ranked_envelope_score(&env) else {
@@ -780,9 +779,8 @@ pub async fn home_shadow(cfg: &Config, owner_user_id: i64, limit: usize) -> Resu
 
     let logical = pick_home_logical_key(index.as_ref());
     let (redis_key, payload) = if let Some(ref logical) = logical {
-        let rk = ranked_redis_key(&ranked_epoch, logical);
-        let payload = redis_util::json_get(&mut redis, &rk).await?;
-        (Some(rk), payload)
+        let payload = redis_util::ranked_json_get(&mut redis, &ranked_epoch, logical).await?;
+        (Some(ranked_redis_key(&ranked_epoch, logical)), payload)
     } else {
         // No owner index: do not KEYS the whole database. A miss is a miss.
         (None, None)

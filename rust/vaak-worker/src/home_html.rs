@@ -230,6 +230,12 @@ pub async fn tl_html_fill(
         }
     }
     if !report.cache_hit || report.items.is_empty() || report.items.len() <= offset {
+        // A cold or just-invalidated Local hydrate must render, not answer
+        // 200 with an empty body. Home and Federated keep the miss so PHP
+        // paints them; their cached heads were fine on the 0.86.0 canary.
+        if view == "local" {
+            return tl_html_older(cfg, owner_user_id, view, limit, "").await;
+        }
         return Ok(None);
     }
 
@@ -278,7 +284,10 @@ pub async fn tl_html_fill(
         paint_lean_feed_card_opts(st, from, viewer)
     };
     let (html, painted) = paint_feed_units(&units, view, &viewer_actor, &paint);
-    if painted == 0 {
+    if painted == 0 || !timeline_html_servable(&html) {
+        if view == "local" {
+            return tl_html_older(cfg, owner_user_id, view, limit, "").await;
+        }
         return Ok(None);
     }
 
@@ -315,8 +324,14 @@ async fn tl_html_older(
     limit: usize,
     before: &str,
 ) -> Result<Option<HomeHtmlReport>> {
-    let Some(cursor) = crate::timeline_cursor::unpack(before) else {
-        return Ok(None);
+    // Empty `before` is the head, used when Local's hydrate envelope is missing.
+    let cursor = if before.is_empty() {
+        None
+    } else {
+        match crate::timeline_cursor::unpack(before) {
+            Some(cursor) => Some(cursor),
+            None => return Ok(None),
+        }
     };
     let Ok(db) = db::timeline_reused(&cfg.database_url).await else {
         return Ok(None);
@@ -358,7 +373,7 @@ async fn tl_html_older(
                 .await
             }
         },
-        Some(cursor),
+        cursor,
         limit,
         crate::timeline_cursor::OLDER_MAX_WINDOWS,
     )
@@ -617,10 +632,23 @@ fn content_is_empty(content: &str) -> bool {
     text.trim().is_empty()
 }
 
+/// Card HTML the Axum timeline route may return as 200. Blank markup is a miss
+/// so PHP paints the page instead of shipping an empty 200.
+pub fn timeline_html_servable(html: &str) -> bool {
+    !html.trim().is_empty()
+}
+
 #[cfg(test)]
 mod tests {
     use crate::notif_embed::paint_lean_feed_card;
     use serde_json::json;
+
+    #[test]
+    fn blank_local_html_is_not_a_successful_render() {
+        assert!(!super::timeline_html_servable(""));
+        assert!(!super::timeline_html_servable(" \n\t"));
+        assert!(super::timeline_html_servable("<article class=\"tweet\">local</article>"));
+    }
 
     #[test]
     fn paints_boost_wrapper() {

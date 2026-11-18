@@ -2821,8 +2821,7 @@ async fn load_ranked_head_for_view(
     let mut best: Option<(String, Value, usize, i64)> = None;
     for logical in &logicals {
         if view == "home" && !home_logical_matches_algorithm(logical, algorithm_on) { continue; }
-        let rk = ranked_redis_key(&ranked_epoch, logical);
-        let Some(env) = redis_util::json_get(redis, &rk).await? else {
+        let Some(env) = redis_util::ranked_json_get(redis, &ranked_epoch, logical).await? else {
             continue;
         };
         let n = env

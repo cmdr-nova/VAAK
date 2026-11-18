@@ -446,8 +446,7 @@ async fn prepend_owner(
             continue;
         };
 
-        let redis_key = ranked_redis_key(&ranked_epoch, logical);
-        let env = match redis_util::json_get(cache, &redis_key).await? {
+        let env = match redis_util::ranked_json_get(cache, &ranked_epoch, logical).await? {
             Some(v) => v,
             None => continue,
         };
@@ -503,6 +502,7 @@ async fn prepend_owner(
                 "fanout_src": "vaak-worker",
             },
         });
+        let redis_key = ranked_redis_key(&ranked_epoch, logical);
         redis_util::json_set(cache, &redis_key, &payload, RANKED_TTL_SECS).await?;
         touched += 1;
     }
