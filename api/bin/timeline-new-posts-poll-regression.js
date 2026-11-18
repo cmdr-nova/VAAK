@@ -737,6 +737,13 @@ function check(ok, label) {
   check(parked.newBtn().textContent === '2 new posts', 'the held post is still counted after the parked timeline resumes');
   check(parked.items === parkedItems && parked.items.children.length === 0, 'resuming still waits for a tap before inserting');
 
+  // Desktop scroll mode must come from CSS, not the feed's height at boot.
+  // A short first page picked window mode and the pinned pill's tap never
+  // scrolled the feed back to the new posts.
+  const scrollFn = js.slice(js.indexOf('function feedIsScrollContainer'), js.indexOf('function scrollApi'));
+  check(scrollFn.length > 0 && !/scrollHeight|clientHeight/.test(scrollFn), 'feed scroll mode does not depend on the first page height');
+  check(!/\bNEAR_TOP_PX\b/.test(js), 'scroll handler does not read an undefined constant');
+
   console.log(JSON.stringify({ file, checks: result.length, passed: true, labels: result }, null, 2));
 })().catch((error) => {
   console.error(error && error.stack ? error.stack : error);
