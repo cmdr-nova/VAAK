@@ -9,6 +9,9 @@ WorkingDirectory=/srv/mkultra/html/api
 # Same database as PHP-FPM; the script also copies the pool's env[] lines.
 Environment=AP_DB_DSN=pgsql:dbname=novalandia
 ExecStart=/usr/bin/php /srv/mkultra/html/api/bin/inbox-spool-drain.php --budget=300
+# Backstop for a run the PHP alarm cannot stop. Normal runs exit after
+# --budget (300 s); systemd kills anything past 15 minutes and restarts it.
+RuntimeMaxSec=900
 Restart=always
 RestartSec=2
 NoNewPrivileges=true
