@@ -272,6 +272,16 @@ inbox_drain_load_pool_env($poolConf);
 
 define('AP_INBOX_LIB_ONLY', true);
 require_once dirname(__DIR__) . '/ap-inbox.php';
+require_once dirname(__DIR__) . '/ap-worker-lock.php';
+
+// Hard wall-clock cap. The loop exits on its own at the budget, but on
+// 2026-11-18 a dead Redis socket left one run polling for 18 hours while
+// 21k deliveries waited. The alarm ends the process so systemd restarts it.
+// A row caught mid-process goes back to pending after 10 minutes.
+if (!$once) {
+    $hardCap = ap_worker_cli_seconds_from_env('VAAK_INBOX_DRAIN_MAX_SECONDS', $budget + 300, $budget + 60, 86400);
+    ap_worker_cli_max_runtime($hardCap, 'inbox-spool-drain');
+}
 
 $db = ap_db();
 if (ap_db_driver($db) !== 'pgsql') {

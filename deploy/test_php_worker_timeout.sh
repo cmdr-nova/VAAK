@@ -37,4 +37,11 @@ do
   fi
 done
 
+# The drain restarts every --budget; RuntimeMaxSec kills a run that hangs
+# past it (2026-11-18: one run polled a dead Redis socket for 18 hours).
+grep -qE '^RuntimeMaxSec=[0-9]+' "$root/deploy/vaak-inbox-spool-drain.service" \
+  || fail "vaak-inbox-spool-drain.service needs RuntimeMaxSec"
+grep -q "ap_worker_cli_max_runtime" "$root/api/bin/inbox-spool-drain.php" \
+  || fail "inbox-spool-drain.php must arm ap_worker_cli_max_runtime"
+
 echo "php worker timeout cron: ok"
