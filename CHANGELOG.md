@@ -12,6 +12,19 @@ anything else bumps the patch number.
 Releases up to **0.9.83** used a two-digit deploy counter (0.9.05, 0.9.83)
 and have no notes here; their tags and GitHub Releases are unchanged.
 
+## [0.87.0](https://github.com/cmdr-nova/VAAK/releases/tag/v0.87.0) - 2026-11-19
+
+### ✨ Features
+* Kill hung PHP workers instead of waiting on them by @cmdr-nova in https://github.com/cmdr-nova/VAAK/pull/454
+* Throttle ranked-warm rebuilds when ingest clocks churn by @cmdr-nova in https://github.com/cmdr-nova/VAAK/pull/455
+* Keep Local timeline HTML rendering after the ranked-key change by @cmdr-nova in https://github.com/cmdr-nova/VAAK/pull/457
+### 🐛 Fixes
+* Stop Redis read errors from pinning workers, and retire hot-path SCAN by @cmdr-nova in https://github.com/cmdr-nova/VAAK/pull/456
+### 🧹 Maintenance
+* Bump the cargo-minor-patch group in /rust with 4 updates by @dependabot[bot] in https://github.com/cmdr-nova/VAAK/pull/458
+
+**Full Changelog**: https://github.com/cmdr-nova/VAAK/compare/v0.85.0...v0.87.0
+
 ## [0.86.0](https://github.com/cmdr-nova/VAAK/releases/tag/v0.86.0) - 2026-11-18
 
 ### ✨ Features
