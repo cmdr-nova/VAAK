@@ -180,7 +180,9 @@ async fn clear_inner(cfg:&crate::config::Config,db:&tokio_postgres::Client,owner
   let index=format!("vaak:timeline:owner-index:v1:{owner}");
   let logicals=match crate::redis_util::json_get(&mut cache,&index).await?{Some(serde_json::Value::Array(keys))=>keys,_=>Vec::new()};
   for logical in logicals.iter().filter_map(|v|v.as_str()).filter(|k|!k.is_empty()){
-   let _:i64=redis::cmd("DEL").arg(crate::redis_util::ranked_redis_key(&epoch,logical)).query_async(&mut cache).await?;
+   for key in crate::redis_util::ranked_read_keys(&epoch,logical){
+    let _:i64=redis::cmd("DEL").arg(key).query_async(&mut cache).await?;
+   }
   }
   let _:i64=redis::cmd("DEL").arg(&index).query_async(&mut cache).await?;
  }

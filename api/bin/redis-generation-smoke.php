@@ -31,6 +31,12 @@ redis_gen_check(ap_redis_generation_token('nope') === 'x', 'a corrupt generation
 
 redis_gen_check(ap_redis_ranked_key('home', '0') === 'vaak:timeline:ranked:v2:0:' . hash('sha256', 'home'), 'ranked key includes generation 0');
 redis_gen_check(ap_redis_ranked_key('home', '3') !== ap_redis_ranked_key('home', '4'), 'a ranked generation bump changes the key');
+$local = 'v13_local_u1_follows';
+$cold = ap_redis_ranked_read_keys($local, '0');
+redis_gen_check($cold === [ap_redis_ranked_key($local, '0'), ap_redis_ranked_legacy_key($local)], 'generation 0 still reads the pre-epoch local ranked list');
+redis_gen_check(!str_contains($cold[1], ':0:'), 'the legacy local key has no generation segment');
+$bumped = ap_redis_ranked_read_keys($local, '1');
+redis_gen_check($bumped === [ap_redis_ranked_key($local, '1')], 'a real bump does not serve the retired local list');
 redis_gen_check(str_starts_with(ap_redis_ranked_key('home', ''), 'vaak:timeline:ranked:v2:x:'), 'an unreadable ranked generation misses');
 
 redis_gen_check(

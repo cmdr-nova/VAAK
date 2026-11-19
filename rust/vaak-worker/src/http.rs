@@ -640,7 +640,7 @@ async fn shadow_tl_html(
         crate::home_html::tl_html_fill(&state.cfg, owner, view, limit, offset, before).await
     };
     match filled {
-        Ok(Some(report)) => {
+        Ok(Some(report)) if crate::home_html::timeline_html_servable(&report.html) => {
             let mut headers = axum::http::HeaderMap::new();
             headers.insert(
                 axum::http::header::CONTENT_TYPE,
@@ -681,7 +681,7 @@ async fn shadow_tl_html(
             }
             (StatusCode::OK, headers, report.html).into_response()
         }
-        Ok(None) => (
+        Ok(Some(_)) | Ok(None) => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({
                 "error": miss_error,

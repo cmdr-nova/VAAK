@@ -9568,7 +9568,10 @@ function admin_tl_cache_clear_owner(int $ownerUserId): void
                 continue;
             }
             if (function_exists('ap_redis_delete')) {
-                ap_redis_delete(admin_tl_redis_key($cacheKey));
+                $drop = function_exists('ap_redis_ranked_read_keys')
+                    ? ap_redis_ranked_read_keys($cacheKey)
+                    : [admin_tl_redis_key($cacheKey)];
+                ap_redis_delete(...$drop);
             }
             $safe = preg_replace('/[^a-z0-9_]/', '', $cacheKey) ?: 'tl';
             @unlink(admin_tl_cache_dir() . '/tl_' . $safe . '.json');
@@ -12072,7 +12075,17 @@ function admin_tl_cache_get(string $key, int $ttlSec = 300): ?array
     // Check the shared Redis cache before touching disk. Redis TTL bounds the
     // entry, while the embedded timestamp keeps the fallback semantics equal.
     if (function_exists('ap_redis_json_get')) {
-        $cached = ap_redis_json_get(admin_tl_redis_key($key));
+        $cached = null;
+        $redisKeys = function_exists('ap_redis_ranked_read_keys')
+            ? ap_redis_ranked_read_keys($key)
+            : [admin_tl_redis_key($key)];
+        foreach ($redisKeys as $redisKey) {
+            $cached = ap_redis_json_get($redisKey);
+            if (is_array($cached) && isset($cached['ranked']) && is_array($cached['ranked'])) {
+                break;
+            }
+            $cached = null;
+        }
         if (is_array($cached) && isset($cached['ranked']) && is_array($cached['ranked'])) {
             $ts = (int) ($cached['ts'] ?? 0);
             if ($ts > 0 && (time() - $ts) <= $ttlSec) {

@@ -10399,7 +10399,10 @@ function ap_timeline_cache_invalidate_owner(int $ownerUserId): void
         $indexKey = 'vaak:timeline:owner-index:v1:' . $ownerUserId;
         foreach (ap_redis_json_get($indexKey) ?? [] as $logical) {
             if (is_string($logical) && $logical !== '' && function_exists('ap_redis_delete')) {
-                ap_redis_delete(ap_timeline_ranked_redis_key($logical));
+                $drop = function_exists('ap_redis_ranked_read_keys')
+                    ? ap_redis_ranked_read_keys($logical)
+                    : [ap_timeline_ranked_redis_key($logical)];
+                ap_redis_delete(...$drop);
             }
         }
         if (function_exists('ap_redis_delete')) {
@@ -10567,7 +10570,17 @@ function ap_timeline_ranked_prepend_owner(int $ownerUserId, array $entry, array 
         }
 
         $redisKey = ap_timeline_ranked_redis_key($logical);
-        $env = ap_redis_json_get($redisKey);
+        $env = null;
+        $readKeys = function_exists('ap_redis_ranked_read_keys')
+            ? ap_redis_ranked_read_keys($logical)
+            : [$redisKey];
+        foreach ($readKeys as $candidate) {
+            $env = ap_redis_json_get($candidate);
+            if (is_array($env) && isset($env['ranked']) && is_array($env['ranked'])) {
+                break;
+            }
+            $env = null;
+        }
         if (!is_array($env) || !isset($env['ranked']) || !is_array($env['ranked'])) {
             continue;
         }

@@ -755,6 +755,31 @@ function ap_redis_ranked_key(string $logical, ?string $epoch = null): string
     return 'vaak:timeline:ranked:v2:' . ap_redis_generation_token($epoch) . ':' . hash('sha256', $logical);
 }
 
+/** Key written before the generation segment (`v2:{sha256}` only). */
+function ap_redis_ranked_legacy_key(string $logical): string
+{
+    return 'vaak:timeline:ranked:v2:' . hash('sha256', $logical);
+}
+
+/**
+ * Readers try the current key, then the pre-generation key while the counter
+ * is still 0. After a real bump the old key is stale and must not be served.
+ *
+ * @return list<string>
+ */
+function ap_redis_ranked_read_keys(string $logical, ?string $epoch = null): array
+{
+    if ($epoch === null) {
+        $epoch = ap_redis_generation('vaak:timeline:ranked:epoch:v1');
+    }
+    $current = ap_redis_ranked_key($logical, $epoch);
+    if (ap_redis_generation_token($epoch) !== '0') {
+        return [$current];
+    }
+    $legacy = ap_redis_ranked_legacy_key($logical);
+    return $current === $legacy ? [$current] : [$current, $legacy];
+}
+
 /**
  * Badge caches. Separate from the list epoch so marking read does not rebuild
  * every Mentions page. Both the live key and the shadow key include it.

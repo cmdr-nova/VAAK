@@ -122,7 +122,9 @@ async fn after_save(cfg:&crate::config::Config,db:&tokio_postgres::Client,actor_
   let epoch=crate::redis_util::generation(&mut cache,crate::redis_util::RANKED_EPOCH_KEY).await?;
   let keys=match crate::redis_util::json_get(&mut cache,&index).await?{Some(Value::Array(keys))=>keys,Some(Value::Object(map))=>map.into_iter().map(|(_,v)|v).collect(),_=>Vec::new()};
   for key in keys.iter().filter_map(Value::as_str).filter(|k|!k.is_empty()){
-   let _:i64=redis::cmd("DEL").arg(crate::redis_util::ranked_redis_key(&epoch,key)).query_async(&mut cache).await?;
+   for redis_key in crate::redis_util::ranked_read_keys(&epoch,key){
+    let _:i64=redis::cmd("DEL").arg(redis_key).query_async(&mut cache).await?;
+   }
    let safe=key.chars().filter(|c|c.is_ascii_lowercase()||c.is_ascii_digit()||*c=='_').collect::<String>();
    let safe=if safe.is_empty()||safe=="0"{"tl".to_owned()}else{safe};
    let _=std::fs::remove_file(std::path::Path::new(&dir).join(format!("tl_{safe}.json")));

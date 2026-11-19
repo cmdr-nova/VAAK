@@ -4205,12 +4205,16 @@ async fn touch_warm_ttl(
     let ranked_epoch = redis_util::generation(conn, redis_util::RANKED_EPOCH_KEY).await?;
     let mut results = Vec::new();
     for (key, ttl, kind) in warm_cache_keys(&ranked_epoch, view, owner, logical) {
-        let n: i64 = redis::cmd("EXPIRE")
-            .arg(&key)
-            .arg(ttl.max(1))
-            .query_async(conn)
-            .await
-            .with_context(|| format!("EXPIRE {key}"))?;
+        let n: i64 = if kind == WarmKeyKind::Ranked {
+            redis_util::ranked_touch(conn, &ranked_epoch, logical, ttl).await?
+        } else {
+            redis::cmd("EXPIRE")
+                .arg(&key)
+                .arg(ttl.max(1))
+                .query_async(conn)
+                .await
+                .with_context(|| format!("EXPIRE {key}"))?
+        };
         results.push((kind, n));
     }
     Ok(warm_touch_outcome(results))
@@ -4554,14 +4558,22 @@ async fn apply_input_marker(
     let cache_present = match stored.as_ref().filter(|row| !row.logical.is_empty()) {
         Some(row) => match redis.as_mut() {
             Some(conn) => {
-                let ranked_epoch = redis_util::generation(conn, redis_util::RANKED_EPOCH_KEY).await.unwrap_or_else(|_| "x".into());
-                let key = ranked_redis_key(&ranked_epoch, &row.logical);
-                let exists: i64 = redis::cmd("EXISTS")
-                    .arg(&key)
-                    .query_async(conn)
+                let ranked_epoch = redis_util::generation(conn, redis_util::RANKED_EPOCH_KEY)
                     .await
-                    .unwrap_or(0);
-                exists > 0
+                    .unwrap_or_else(|_| "x".into());
+                let mut alive = false;
+                for key in redis_util::ranked_read_keys(&ranked_epoch, &row.logical) {
+                    let exists: i64 = redis::cmd("EXISTS")
+                        .arg(&key)
+                        .query_async(conn)
+                        .await
+                        .unwrap_or(0);
+                    if exists > 0 {
+                        alive = true;
+                        break;
+                    }
+                }
+                alive
             }
             None => false,
         },
