@@ -228,6 +228,7 @@
     if (feedIsScrollContainer()) {
       return {
         mode: 'feed',
+        target: root,
         ioRoot: root,
         top: () => root.scrollTop,
         height: () => root.scrollHeight,
@@ -237,6 +238,7 @@
     }
     return {
       mode: 'window',
+      target: window,
       ioRoot: null,
       top: () => window.scrollY || document.documentElement.scrollTop || 0,
       height: () => document.documentElement.scrollHeight,
@@ -1052,14 +1054,36 @@
     }
   }
 
+  // Soft-nav replaces section.main's HTML, so the .feed this closure saw at
+  // boot is detached by the time Home comes back. A detached node has no
+  // computed overflow, which put desktop in window mode again: the new posts
+  // pill (and ↑) scrolled the window, which never moves there. Follow the
+  // live .feed and listen on whatever actually scrolls now.
+  const boundScrollTargets = new WeakSet();
+  function syncScrollRoot() {
+    const liveFeed = (items && items.isConnected && items.closest && items.closest('.feed'))
+      || document.querySelector('.feed');
+    if (liveFeed) {
+      root = liveFeed;
+      feedRoot = liveFeed;
+    }
+    sc = scrollApi();
+    const target = sc.target;
+    if (target && !boundScrollTargets.has(target)) {
+      boundScrollTargets.add(target);
+      target.addEventListener('scroll', () => updateTopBtn(), { passive: true });
+      target.addEventListener('scroll', () => syncTimelineStreamVisibility(), { passive: true });
+    }
+  }
+
   let io = null;
   function bindInfiniteScrollObserver() {
     if (io) {
       try { io.disconnect(); } catch (e) {}
       io = null;
     }
+    syncScrollRoot();
     if (!sentinel) return;
-    sc = scrollApi();
     io = new IntersectionObserver((entries) => {
       if (stickToTop) return;
       if (entries.some((en) => en.isIntersecting)) loadMore();
@@ -1086,14 +1110,11 @@
   // Re-bind observer if layout flips (rotate / resize across the mobile breakpoint).
   window.addEventListener('resize', () => {
     const next = scrollApi();
-    if (next.mode === sc.mode) {
+    if (next.mode === sc.mode && next.target === sc.target) {
       maybeLoadMoreIfNeeded();
       return;
     }
-    sc = next;
     bindInfiniteScrollObserver();
-    sc.onScroll(updateTopBtn);
-    sc.onScroll(syncTimelineStreamVisibility);
     updateTopBtn();
   }, { passive: true, capture: true });
 
@@ -1118,7 +1139,6 @@
     lastScrollY = y;
     updateNewBtn();
   }
-  sc.onScroll(updateTopBtn);
   updateTopBtn();
   function bindTopBtn() {
     topBtn = document.getElementById('feed-top-btn');
@@ -1705,7 +1725,6 @@
     }
     startTimelineStream();
   }
-  sc.onScroll(syncTimelineStreamVisibility);
   setTimeout(() => { pollTimelineAutomatically(); syncTimelineStreamVisibility(); }, 5000);
   window.novaPollTimeline = pollNewer;
   window.novaInsertPendingTimeline = insertPending;
