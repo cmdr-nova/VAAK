@@ -743,6 +743,11 @@ function check(ok, label) {
   const scrollFn = js.slice(js.indexOf('function feedIsScrollContainer'), js.indexOf('function scrollApi'));
   check(scrollFn.length > 0 && !/scrollHeight|clientHeight/.test(scrollFn), 'feed scroll mode does not depend on the first page height');
   check(!/\bNEAR_TOP_PX\b/.test(js), 'scroll handler does not read an undefined constant');
+  // Soft-nav swaps section.main, so the boot-time .feed is detached when Home
+  // comes back. The observer rebind must re-read the live .feed first.
+  const rebind = js.slice(js.indexOf('function bindInfiniteScrollObserver'), js.indexOf('bindInfiniteScrollObserver();'));
+  const syncRoot = js.slice(js.indexOf('function syncScrollRoot'), js.indexOf('let io = null;'));
+  check(/syncScrollRoot\(\)/.test(rebind) && /closest\('\.feed'\)/.test(syncRoot) && /root = liveFeed/.test(syncRoot), 'timeline rebind follows the live .feed after soft-nav');
 
   console.log(JSON.stringify({ file, checks: result.length, passed: true, labels: result }, null, 2));
 })().catch((error) => {
