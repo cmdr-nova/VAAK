@@ -853,7 +853,7 @@ impl Projector<'_>{
         let mut mentions=json!([]);let mut tags=json!([]);
         if !plain_for_entities.is_empty()&&(plain_for_entities.contains('@')||plain_for_entities.contains('#')){
             let pack=self.canonical_pack_with_actors(&plain_for_entities,&parent_actors).await?;mentions=pack["mentions"].clone();tags=pack["tags"].clone();
-            let markup=content.contains("class=\"u-url mention\"")||content.contains("class='u-url mention'")||content.contains("class=\"mention\"");
+            let markup=content.contains("class=\"u-url mention\"")||content.contains("class='u-url mention'")||content.contains("class=\"mention\"")||content.contains("data-vaak-facet=");
             if !markup&&!s(&pack,"content").is_empty(){content=s(&pack,"content").into()}
             else if !content.is_empty()&&content.contains('<'){let(html,found)=entities::html_tags(&content);content=html;if !found.is_empty(){tags=json!(found)}}
             else if !s(&pack,"content").is_empty(){content=s(&pack,"content").into()}
