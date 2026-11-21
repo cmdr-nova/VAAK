@@ -22,7 +22,7 @@ if (PHP_SAPI !== 'cli') {
 }
 
 $user = '';
-$limit = 2000;
+$limit = 10000;
 $dryRun = false;
 foreach (array_slice($argv, 1) as $arg) {
     if ($arg === '--dry-run') {
@@ -41,7 +41,7 @@ foreach (array_slice($argv, 1) as $arg) {
     exit(1);
 }
 if ($user === '') {
-    fwrite(STDERR, "Usage: bsky-import-links-backfill.php --user=NAME [--limit=2000] [--dry-run]\n");
+    fwrite(STDERR, "Usage: bsky-import-links-backfill.php --user=NAME [--limit=10000] [--dry-run]\n");
     exit(1);
 }
 
@@ -92,14 +92,36 @@ foreach (array_keys($byUri) as $uri) {
     }
 }
 $fetched = 0;
+$failedBatches = 0;
+$firstError = '';
 foreach (array_chunk($missing, 25) as $chunk) {
-    $got = ap_bsky_xrpc(AP_BSKY_PUBLIC_API, 'app.bsky.feed.getPosts', 'GET', [
-        'uris' => implode(',', $chunk),
-    ], null, null, 10);
-    if (empty($got['ok']) || !is_array($got['json']['posts'] ?? null)) {
+    // getPosts wants repeated uris= params. A comma-joined value (or
+    // http_build_query's uris[0]=) is rejected, which fetched nothing.
+    $qs = implode('&', array_map(static fn(string $u): string => 'uris=' . rawurlencode($u), $chunk));
+    $ch = curl_init(rtrim(AP_BSKY_PUBLIC_API, '/') . '/xrpc/app.bsky.feed.getPosts?' . $qs);
+    if ($ch === false) {
+        $failedBatches++;
         continue;
     }
-    foreach ($got['json']['posts'] as $post) {
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_TIMEOUT => 15,
+        CURLOPT_CONNECTTIMEOUT => 5,
+        CURLOPT_HTTPHEADER => ['Accept: application/json', 'User-Agent: ' . vaak_user_agent('Bluesky')],
+    ]);
+    $body = curl_exec($ch);
+    $status = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+    $curlError = curl_error($ch);
+    curl_close($ch);
+    $json = is_string($body) ? json_decode($body, true) : null;
+    if ($status !== 200 || !is_array($json['posts'] ?? null)) {
+        $failedBatches++;
+        if ($firstError === '') {
+            $firstError = 'HTTP ' . $status . ' ' . ($curlError !== '' ? $curlError : substr(is_string($body) ? $body : '', 0, 200));
+        }
+        continue;
+    }
+    foreach ($json['posts'] as $post) {
         $uri = is_array($post) ? trim((string) ($post['uri'] ?? '')) : '';
         if ($uri !== '' && isset($byUri[$uri])) {
             $posts[$uri] = $post;
@@ -129,17 +151,21 @@ if (!$dryRun && $updated !== []) {
 }
 
 fwrite(STDOUT, sprintf(
-    "bsky-import-links-backfill user=%s dry_run=%d imported_rows=%d with_uri=%d found=%d appview_fetched=%d %s=%d errors=%d\n",
+    "bsky-import-links-backfill user=%s dry_run=%d imported_rows=%d with_uri=%d found=%d appview_fetched=%d failed_batches=%d %s=%d errors=%d\n",
     $user,
     $dryRun ? 1 : 0,
     $rows,
     count($byUri),
     count($posts),
     $fetched,
+    $failedBatches,
     $dryRun ? 'would_update' : 'updated',
     count($updated),
     $errors
 ));
+if ($firstError !== '') {
+    fwrite(STDOUT, "  first AppView error: {$firstError}\n");
+}
 foreach (array_slice($updated, 0, 20) as $id) {
     fwrite(STDOUT, "  {$id}\n");
 }
