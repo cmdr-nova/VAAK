@@ -972,7 +972,9 @@ function ap_masto_status_from_row(array $row, bool $attachQuote = true, bool $al
     }
     $hasMentionMarkup = str_contains($html, 'class="u-url mention"')
         || str_contains($html, "class='u-url mention'")
-        || str_contains($html, 'class="mention"');
+        || str_contains($html, 'class="mention"')
+        // Imported Bluesky posts: facet links hold URLs the plain text shortens.
+        || str_contains($html, 'data-vaak-facet=');
     if ($plainForEntities !== '' && (str_contains($plainForEntities, '@') || str_contains($plainForEntities, '#'))) {
         $packLocal = ap_masto_content_with_mentions($plainForEntities, $extraActors);
         $status['mentions'] = $packLocal['mentions'] ?? [];

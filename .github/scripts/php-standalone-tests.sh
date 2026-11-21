@@ -91,6 +91,7 @@ php_tests=(
   api/bin/bsky-jetstream-media-smoke.php
   api/bin/jetstream-worker-smoke.php
   api/bin/bsky-backfill-no-federation-smoke.php
+  api/bin/bsky-import-facets-smoke.php
   api/bin/media-warm-lock-smoke.php
   api/bin/media-magick-coder-smoke.php
   api/bin/net-guard-smoke.php

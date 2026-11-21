@@ -5361,6 +5361,177 @@ function ap_bsky_repair_imported_note_quote(string $noteId, array $post, int $ow
 }
 
 /**
+ * Bluesky post text + app.bsky.richtext.facet list -> stored note HTML.
+ *
+ * Bluesky clients shorten link text ("example.com/some-pa...") and keep the
+ * real URL only in the link facet, so ap_plain_text_to_html left those as
+ * dead text. Facet offsets are UTF-8 byte offsets, which is what PHP substr
+ * uses. Links keep the record's visible label; mentions get Mastodon h-card
+ * markup; tags become local /tags/ links like VAAK-composed posts.
+ * Every facet anchor carries data-vaak-facet so the Mastodon status builders
+ * keep this HTML instead of rebuilding it from the (shortened) plain text.
+ */
+function ap_bsky_record_text_html(string $text, array $facets): string
+{
+    $text = str_replace(["\r\n", "\r"], ["\n ", ' '], $text);
+    $lead = strlen($text) - strlen(ltrim($text));
+    $text = trim($text);
+    if ($text === '') {
+        return '';
+    }
+    $max = strlen($text);
+    $ranges = [];
+    foreach ($facets as $facet) {
+        if (!is_array($facet) || !is_array($facet['index'] ?? null)) {
+            continue;
+        }
+        $start = (int) ($facet['index']['byteStart'] ?? -1) - $lead;
+        $end = (int) ($facet['index']['byteEnd'] ?? -1) - $lead;
+        if ($start < 0 || $end <= $start || $end > $max) {
+            continue;
+        }
+        $label = substr($text, $start, $end - $start);
+        if (!mb_check_encoding($label, 'UTF-8')) {
+            continue; // offsets not on character boundaries
+        }
+        foreach ((array) ($facet['features'] ?? []) as $feat) {
+            if (!is_array($feat)) {
+                continue;
+            }
+            $type = (string) ($feat['$type'] ?? '');
+            if (str_ends_with($type, '#link')) {
+                $uri = trim((string) ($feat['uri'] ?? ''));
+                if (preg_match('~^https?://\S+$~i', $uri)) {
+                    $ranges[] = [$start, $end, 'link', $uri, $label];
+                    break;
+                }
+            } elseif (str_ends_with($type, '#mention')) {
+                $did = trim((string) ($feat['did'] ?? ''));
+                if (preg_match('~^did:[a-z]+:[A-Za-z0-9._:%-]+$~', $did)) {
+                    $ranges[] = [$start, $end, 'mention', $did, $label];
+                    break;
+                }
+            } elseif (str_ends_with($type, '#tag')) {
+                $tag = ltrim(trim((string) ($feat['tag'] ?? '')), '#');
+                if ($tag !== '' && preg_match('/\p{L}/u', $tag) === 1) {
+                    $ranges[] = [$start, $end, 'tag', $tag, $label];
+                    break;
+                }
+            }
+        }
+    }
+    if ($ranges === []) {
+        return function_exists('ap_plain_text_to_html') ? ap_plain_text_to_html($text) : '<p>' . htmlspecialchars($text, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '</p>';
+    }
+    usort($ranges, static fn(array $a, array $b): int => $a[0] <=> $b[0]);
+
+    $esc = static fn(string $s): string => htmlspecialchars($s, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+    // Plain stretch: escape, autolink bare https URLs, keep paragraph breaks.
+    $plain = static function (string $s) use ($esc): string {
+        $out = $esc($s);
+        $out = preg_replace_callback(
+            '#https://[^\s<>"\']+#u',
+            static function (array $m): string {
+                $url = rtrim($m[0], '.,);]!?\'"');
+                $trail = substr($m[0], strlen($url));
+                return '<a href="' . $url . '" target="_blank" rel="nofollow noopener noreferrer">' . $url . '</a>' . $trail;
+            },
+            $out
+        ) ?? $out;
+        $out = preg_replace("/\n{2,}/", "\x00", $out) ?? $out;
+        return str_replace(["\n", "\x00"], ['<br>', "</p>\n<p>"], $out);
+    };
+    $html = '';
+    $cursor = 0;
+    foreach ($ranges as [$start, $end, $kind, $value, $label]) {
+        if ($start < $cursor) {
+            continue; // overlapping facet
+        }
+        $html .= $plain(substr($text, $cursor, $start - $cursor));
+        $labelText = str_replace("\n", ' ', $label);
+        if ($kind === 'link') {
+            $html .= '<a href="' . $esc($value) . '" target="_blank" rel="nofollow noopener noreferrer" data-vaak-facet="link">'
+                . $esc($labelText) . '</a>';
+        } elseif ($kind === 'mention') {
+            $handle = ltrim($labelText, '@');
+            $html .= '<span class="h-card"><a href="https://bsky.app/profile/' . $esc($value)
+                . '" class="u-url mention" data-vaak-facet="mention">@<span>' . $esc($handle) . '</span></a></span>';
+        } else {
+            $norm = function_exists('ap_masto_normalize_tag_name') ? ap_masto_normalize_tag_name($value) : mb_strtolower($value);
+            $url = function_exists('ap_masto_tag_url') ? ap_masto_tag_url($norm) : 'https://mkultra.monster/tags/' . rawurlencode($norm);
+            $html .= '<a href="' . $esc($url) . '" class="mention hashtag" rel="tag" data-vaak-facet="tag">#<span>'
+                . $esc(ltrim($labelText, '#')) . '</span></a>';
+        }
+        $cursor = $end;
+    }
+    $html .= $plain(substr($text, $cursor));
+    return '<p>' . $html . '</p>';
+}
+
+/** Note HTML for an imported own post (record text + facets). */
+function ap_bsky_import_content_html(array $post): string
+{
+    $record = is_array($post['record'] ?? null) ? $post['record'] : [];
+    $text = (string) ($record['text'] ?? '');
+    $facets = is_array($record['facets'] ?? null) ? $record['facets'] : [];
+    if (!function_exists('ap_masto_tag_url') && is_file(__DIR__ . '/ap-masto-entities.php')) {
+        require_once __DIR__ . '/ap-masto-entities.php';
+    }
+    return ap_bsky_record_text_html($text, $facets);
+}
+
+/**
+ * Rewrite the stored HTML of an earlier import whose content lost its facet
+ * links. Only touches vaakOrigin=bluesky notes. Returns updated=true when the
+ * content changed.
+ *
+ * @return array{ok:bool,updated:bool,error?:string}
+ */
+function ap_bsky_repair_imported_note_content(string $noteId, array $post, bool $dryRun = false): array
+{
+    $noteId = rtrim(trim($noteId), '/');
+    if ($noteId === '') {
+        return ['ok' => false, 'updated' => false, 'error' => 'No note'];
+    }
+    $facets = $post['record']['facets'] ?? null;
+    if (!is_array($facets) || $facets === []) {
+        return ['ok' => true, 'updated' => false];
+    }
+    try {
+        $st = ap_db()->prepare('SELECT id, content, raw_create_json, create_id FROM outbox_notes WHERE id = ? OR id = ? LIMIT 1');
+        $st->execute([$noteId, $noteId . '/']);
+        $row = $st->fetch(PDO::FETCH_ASSOC);
+        if (!is_array($row)) {
+            return ['ok' => false, 'updated' => false, 'error' => 'Note missing'];
+        }
+        $create = json_decode((string) ($row['raw_create_json'] ?? ''), true);
+        if (!is_array($create) || !is_array($create['object'] ?? null)
+            || (string) ($create['object']['vaakOrigin'] ?? '') !== 'bluesky') {
+            return ['ok' => true, 'updated' => false];
+        }
+        $html = ap_bsky_import_content_html($post);
+        if ($html === '' || $html === (string) ($row['content'] ?? '')) {
+            return ['ok' => true, 'updated' => false];
+        }
+        if ($dryRun) {
+            return ['ok' => true, 'updated' => true];
+        }
+        $create['object']['content'] = $html;
+        ap_db()->prepare('UPDATE outbox_notes SET content = ?, raw_create_json = ? WHERE id = ?')->execute([
+            $html,
+            json_encode($create, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE),
+            (string) $row['id'],
+        ]);
+        if (function_exists('ap_public_doc_invalidate_note')) {
+            ap_public_doc_invalidate_note($noteId, (string) ($row['create_id'] ?? '') ?: null);
+        }
+        return ['ok' => true, 'updated' => true];
+    } catch (Throwable $e) {
+        return ['ok' => false, 'updated' => false, 'error' => $e->getMessage()];
+    }
+}
+
+/**
  * Import a Bluesky-native post (authored by the connected account) as a local
  * VAAK outbox note for Your Posts + HTML profile. Does NOT federate Create.
  *
@@ -5392,6 +5563,12 @@ function ap_bsky_import_own_post_as_local(int $ownerUserId, array $post, int $de
     if (is_string($existing) && str_starts_with($existing, 'https://')) {
         $existing = rtrim($existing, '/');
         $repaired = ap_bsky_repair_imported_note_quote($existing, $post, $ownerUserId);
+        $relinked = ap_bsky_repair_imported_note_content($existing, $post);
+        if (!empty($relinked['updated'])) {
+            if (function_exists('ap_timeline_cache_invalidate_owner')) {
+                ap_timeline_cache_invalidate_owner($ownerUserId);
+            }
+        }
         return [
             'ok' => true,
             'skipped' => true,
@@ -5433,6 +5610,12 @@ function ap_bsky_import_own_post_as_local(int $ownerUserId, array $post, int $de
             ap_bsky_crosspost_save($noteId, $uri, $cid !== '' ? $cid : null, $ownerUserId);
             // Repair quote context on earlier imports that dropped the embed.
             $repaired = ap_bsky_repair_imported_note_quote($noteId, $post, $ownerUserId);
+            $relinked = ap_bsky_repair_imported_note_content($noteId, $post);
+            if (!empty($relinked['updated'])) {
+                if (function_exists('ap_timeline_cache_invalidate_owner')) {
+                    ap_timeline_cache_invalidate_owner($ownerUserId);
+                }
+            }
             return [
                 'ok' => true,
                 'skipped' => true,
@@ -5471,12 +5654,7 @@ function ap_bsky_import_own_post_as_local(int $ownerUserId, array $post, int $de
     if ($published === '') {
         $published = gmdate('c');
     }
-    $contentHtml = function_exists('ap_plain_text_to_html')
-        ? ap_plain_text_to_html($text !== '' ? $text : '')
-        : ('<p>' . htmlspecialchars($text, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '</p>');
-    if ($text === '' && $contentHtml === '<p></p>') {
-        $contentHtml = '<p></p>';
-    }
+    $contentHtml = ap_bsky_import_content_html($post);
 
     $attachments = [];
     if (function_exists('ap_bsky_post_image_urls')) {
@@ -12658,7 +12836,9 @@ function ap_bsky_refresh_hide_set(int $ownerUserId, bool $force = false): array
     // drops the stale projection and Redis pages.
     ap_bsky_hide_did_set_clear_cache($ownerUserId);
     if (function_exists('ap_timeline_cache_invalidate_owner')) {
-        ap_timeline_cache_invalidate_owner($ownerUserId);
+        if (function_exists('ap_timeline_cache_invalidate_owner')) {
+            ap_timeline_cache_invalidate_owner($ownerUserId);
+        }
     }
     if (function_exists('ap_notification_projection_invalidate_owner')) {
         ap_notification_projection_invalidate_owner($ownerUserId);

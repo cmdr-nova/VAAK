@@ -781,7 +781,7 @@ fn apply_content_pack(status: &mut Value, plain: &str, html: &str, extras: &[Str
     }
     if source.contains('@') || source.contains('#') {
         let (packed, mentions, tags) = pack_text(&source, extras, facts, owner);
-        let markup = html.contains("class=\"u-url mention\"") || html.contains("class='u-url mention'") || html.contains("class=\"mention\"");
+        let markup = html.contains("class=\"u-url mention\"") || html.contains("class='u-url mention'") || html.contains("class=\"mention\"") || html.contains("data-vaak-facet=");
         if !markup && !packed.is_empty() {
             status["content"] = json!(packed);
         } else if html.contains('<') && html.contains('#') {
