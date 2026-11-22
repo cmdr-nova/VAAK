@@ -2605,7 +2605,7 @@ const SIGNAL_ACTOR_WEIGHTS_SQL: &str = "(SELECT signal_type, weight::float8, met
         ORDER BY id DESC LIMIT 500)";
 
 /// Author DID of `at://did:.../collection/rkey`, or "" for anything else.
-fn signal_did_from_at_uri(uri: &str) -> String {
+pub(crate) fn signal_did_from_at_uri(uri: &str) -> String {
     let Some(rest) = uri.trim().strip_prefix("at://") else {
         return String::new();
     };
@@ -3424,7 +3424,18 @@ pub async fn warm_home_native(cfg: &Config, owner_user_id: i64) -> Result<String
     if algorithm_on {
         // Match PHP order: recommendations → toxicity → favourite.
         actor_weights = load_favourite_actor_weights(&db, owner_user_id).await;
-        for (actor, weight) in load_signal_actor_weights(&db, owner_user_id).await {
+        // VAAK_HOME_SHADOW_ACTORS: the shadow model's account weights replace
+        // the live signal formula for listed owners. Falls back to live.
+        let shadow = if crate::ml_ranker::serving_enabled_for(owner_user_id) {
+            crate::ml_ranker::serving_actor_weights(cfg, &db, owner_user_id).await
+        } else {
+            None
+        };
+        let signal_weights = match shadow {
+            Some(weights) => weights,
+            None => load_signal_actor_weights(&db, owner_user_id).await,
+        };
+        for (actor, weight) in signal_weights {
             let entry = actor_weights.entry(actor).or_insert(0.0);
             *entry = (*entry + weight).min(64.0);
         }

@@ -304,7 +304,11 @@ fn actor_from_metadata(meta: &Value) -> String {
             return format!("https://bsky.app/profile/{handle}");
         }
     }
-    String::new()
+    // Older Bluesky rows carry only the post AT-URI, same fallback as live Home.
+    meta.get("uri")
+        .and_then(Value::as_str)
+        .map(crate::ranked_warm::signal_did_from_at_uri)
+        .unwrap_or_default()
 }
 
 fn strip_tags_lower(text: &str) -> String {
@@ -970,6 +974,12 @@ async fn lookup_texts(db: &Client, keys: &[String]) -> HashMap<String, String> {
 }
 
 async fn load_signals(db: &Client, owner_user_id: i64) -> Result<Vec<TrainSignal>> {
+    load_signals_opts(db, owner_user_id, true).await
+}
+
+/// `with_text` = false skips the post-text lookups (hashtags), for callers
+/// that only need account weights.
+async fn load_signals_opts(db: &Client, owner_user_id: i64, with_text: bool) -> Result<Vec<TrainSignal>> {
     let since = (Utc::now() - chrono::Duration::days(SIGNAL_LOOKBACK_DAYS)).to_rfc3339();
     let rows = db
         .query(
@@ -1010,7 +1020,8 @@ async fn load_signals(db: &Client, owner_user_id: i64) -> Result<Vec<TrainSignal
             .flatten()
             .unwrap_or_default();
         let canonical = canonical_signal_kind(&kind).to_string();
-        let wants_text = stored_weight > 0.0
+        let wants_text = with_text
+            && stored_weight > 0.0
             && matches!(canonical.as_str(), "favourite" | "bookmark")
             && lookup.len() < LOOKUP_KEY_LIMIT;
         let keys = content_keys(&target_key, &meta);
@@ -1124,6 +1135,75 @@ pub async fn compare(cfg: &Config, owner_user_id: i64, limit: usize) -> Result<(
     Ok(())
 }
 
+/// Owners whose live Home uses the shadow model's account weights.
+/// `VAAK_HOME_SHADOW_ACTORS`: unset/empty/0 = nobody, `all` = everyone,
+/// otherwise a comma list of owner ids (e.g. `1` or `1,12`).
+pub fn serving_enabled_for(owner_user_id: i64) -> bool {
+    serving_enabled_in(std::env::var("VAAK_HOME_SHADOW_ACTORS").ok().as_deref(), owner_user_id)
+}
+
+fn serving_enabled_in(raw: Option<&str>, owner_user_id: i64) -> bool {
+    let Some(raw) = raw else { return false };
+    let raw = raw.trim().to_ascii_lowercase();
+    if raw.is_empty() || matches!(raw.as_str(), "0" | "off" | "false" | "no") {
+        return false;
+    }
+    if raw == "all" {
+        return owner_user_id > 0;
+    }
+    raw.split(',')
+        .filter_map(|part| part.trim().parse::<i64>().ok())
+        .any(|id| id > 0 && id == owner_user_id)
+}
+
+const SERVE_CACHE_TTL_SECS: u64 = 600;
+
+/// Shadow account weights fit on ALL signals (nothing held out), clamped to
+/// the live signal range so they drop into the same slot in Home ranking.
+fn serving_weights(signals: &[TrainSignal], now: i64) -> HashMap<String, f64> {
+    let fit = fit_shadow(signals, i64::MAX, now, SHADOW_HALF_LIFE_DAYS);
+    fit.actors
+        .into_iter()
+        .map(|(actor, weight)| (actor, weight.clamp(LIVE_ACTOR_CLAMP.0, LIVE_ACTOR_CLAMP.1)))
+        .collect()
+}
+
+/// Account weights for live Home from the shadow model. Recomputed from
+/// `ap_user_signals` at most every 10 minutes per owner (Redis cache), so a
+/// new like shows up on the next rebuild after that. `None` = no signals or
+/// a load error; the caller then uses the live formula.
+pub async fn serving_actor_weights(cfg: &Config, db: &Client, owner_user_id: i64) -> Option<HashMap<String, f64>> {
+    if owner_user_id < 1 {
+        return None;
+    }
+    let key = format!("vaak:ml:serve:actors:v1:{owner_user_id}");
+    let mut redis = redis_util::connect(&cfg.redis_url).await.ok();
+    if let Some(conn) = redis.as_mut() {
+        if let Ok(Some(raw)) = redis_util::json_get(conn, &key).await {
+            if let Ok(weights) = serde_json::from_value::<HashMap<String, f64>>(raw) {
+                return Some(weights);
+            }
+        }
+    }
+    let signals = match load_signals_opts(db, owner_user_id, false).await {
+        Ok(signals) => signals,
+        Err(err) => {
+            tracing::warn!(owner = owner_user_id, error = %format!("{err:#}"), "shadow serving weights unavailable");
+            return None;
+        }
+    };
+    if signals.is_empty() {
+        return None;
+    }
+    let weights = serving_weights(&signals, Utc::now().timestamp());
+    if let Some(conn) = redis.as_mut() {
+        if let Ok(value) = serde_json::to_value(&weights) {
+            let _ = redis_util::json_set(conn, &key, &value, SERVE_CACHE_TTL_SECS).await;
+        }
+    }
+    Some(weights)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1226,6 +1306,43 @@ mod tests {
         let faded = fit_shadow(&signals, cutoff, now, 14.0);
         assert!(faded.actors["https://example/new-pal"] > faded.actors.get("https://example/old-fave").copied().unwrap_or(0.0));
         assert_eq!(faded.positive, 7);
+    }
+
+    #[test]
+    fn serving_flag_reads_owner_lists() {
+        assert!(!serving_enabled_in(None, 1));
+        assert!(!serving_enabled_in(Some(""), 1));
+        assert!(!serving_enabled_in(Some("0"), 1));
+        assert!(!serving_enabled_in(Some("off"), 1));
+        assert!(serving_enabled_in(Some("1"), 1));
+        assert!(!serving_enabled_in(Some("1"), 12));
+        assert!(serving_enabled_in(Some(" 1, 12 "), 12));
+        assert!(serving_enabled_in(Some("ALL"), 14));
+        assert!(!serving_enabled_in(Some("all"), 0));
+    }
+
+    #[test]
+    fn serving_weights_use_every_signal_and_the_live_range() {
+        let now = 1_700_000_000i64;
+        let mut signals = vec![sig("like", 1.0, now - 60, "https://example/today", &[])];
+        for _ in 0..40 {
+            signals.push(sig("like", 1.0, now - 3_600, "https://example/fave", &[]));
+        }
+        for _ in 0..200 {
+            signals.push(sig("impression", 1.0, now - 3_600, "https://example/skipped", &[]));
+        }
+        let weights = serving_weights(&signals, now);
+        // Not held out: today's like counts when serving.
+        assert!(weights["https://example/today"] > 1.3);
+        assert_eq!(weights["https://example/fave"], LIVE_ACTOR_CLAMP.1);
+        assert_eq!(weights["https://example/skipped"], LIVE_ACTOR_CLAMP.0);
+    }
+
+    #[test]
+    fn actor_falls_back_to_the_at_uri_author() {
+        let meta = json!({"uri": "at://did:plc:abc123xyz/app.bsky.feed.post/3k"});
+        assert_eq!(actor_from_metadata(&meta), "did:plc:abc123xyz");
+        assert_eq!(actor_from_metadata(&json!({})), "");
     }
 
     #[test]

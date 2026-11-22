@@ -14,7 +14,7 @@ Native Search rendering is enabled after separate user authorization and verifie
 | `actor-warm --loop` | **LIVE** | Drains `vaak:queue:bsky_actor_warm` (Redis DB1); `getProfiles` → `bsky_actor_profiles` + flat DID Redis |
 | `ap-actor-warm --loop` | **LIVE** | Drains `vaak:queue:ap_actor_warm` (Redis DB1); spawns PHP signed AS2 fetch → `remote_actors` + flat AP Redis |
 | `timeline-fanout --loop` | **LIVE** | Drains `vaak:queue:timeline_fanout` (Redis DB1); ranked prepend + Home hydrate invalidate (0.6.73); PHP enqueue with in-process fallback |
-| `ml-train` | shadow | Nightly owner ranker (model v3: 14-day signal fade). Holds out recent positives, writes `ap_ml_shadow_scorecard` with a half-life sweep (7d, 14d, 30d, no fade), logs overlap@20. Does not change Home order. Timer: `deploy/vaak-ml-shadow.timer` (23:50 America/New_York). |
+| `ml-train` | shadow | Nightly owner ranker (model v3: 14-day signal fade). Holds out recent positives, writes `ap_ml_shadow_scorecard` with a half-life sweep (7d, 14d, 30d, no fade), logs overlap@20. Does not change Home order (see `VAAK_HOME_SHADOW_ACTORS` to serve it). Timer: `deploy/vaak-ml-shadow.timer` (23:50 America/New_York). |
 | `ml-compare` | shadow | Reprint the scorecard without saving a model. Requires a trained Redis model. |
 | `notif-badge` / `ranked-newer` / … | shadow | Parity / soak helpers |
 | `serve` | shadow HTTP | Localhost `/shadow/*` + Mastodon-shaped `/api/v1/timelines/home` (hydrate Redis), `/api/v1/notifications` (Redis-read) |
@@ -49,6 +49,7 @@ Units: `deploy/vaak-worker-notif.service`, `deploy/vaak-worker-notif-list.servic
 | `VAAK_DATABASE_URL` | peer `novalandia` | www-data |
 | `VAAK_REDIS_URL` | `redis://127.0.0.1/0` | cache DB |
 | `VAAK_REDIS_QUEUE_URL` | `redis://127.0.0.1/1` | queue DB (PHP `ap_redis_client('queue')`) |
+| `VAAK_HOME_SHADOW_ACTORS` | unset (off) | Owners whose Home uses the shadow ranker's account weights instead of the live signal formula: `1`, `1,12`, or `all`. Hashtag ranking stays live. Weights are recomputed at most every 10 min (`vaak:ml:serve:actors:v1:{owner}`). Missing signals fall back to live. Restart the worker after changing it. |
 | `VAAK_NOTIF_RUST_PRIMARY` | `1` (PHP) | longer stampede wait + stale file preference for Rust-covered owners |
 | `VAAK_NOTIF_RUST_OWNER_ID` | `0` (PHP) | `0` = all local users covered by Rust loop; positive = single-owner long-stale shortcut only |
 | `VAAK_NOTIF_LIST_RUST_PRIMARY` | `1` (PHP) | Mentions list Redis fresh 120s / stale 600s; skip request-path stale rebuild + look-ahead on cache hit |
