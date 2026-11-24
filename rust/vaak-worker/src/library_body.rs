@@ -192,7 +192,7 @@ pub(crate) fn strip_raw_quotes(input:&str,quoted:Option<&str>)->String {
 pub(crate) fn linked_text(text: &str, view: &str) -> Result<String> {
     let text = crate::home_hydrate_ranked::html_entity_decode(super::card::php_trim(text));
     let url = static_regex!(r#"(?i)^(?:https?://[^\s<]+|www\.[^\s<]+|(?:[a-z0-9-]+\.)+[a-z]{2,}/[^\s<>\"']+)"#);
-    let tag = static_regex!(r"^#([\p{L}\p{N}_]{1,100})");
+    let tag = static_regex!(r"^#([\p{L}\p{N}_]{1,100}(?:-[\p{L}\p{N}_]+)*)");
     let mut output = String::new();
     let mut index = 0;
     while index < text.len() {
@@ -666,7 +666,7 @@ mod tests {
         for fixture in reference["status_links"].as_array().unwrap(){assert_eq!(linked_text(fixture["url"].as_str().unwrap(),"bookmarks").unwrap(),fixture["html"].as_str().unwrap(),"actual PHP status URL classification");}
         for fixture in reference["html_plain"].as_array().unwrap(){assert_eq!(html_to_plain(fixture["input"].as_str().unwrap()),fixture["plain"].as_str().unwrap(),"actual PHP HTML-to-text");}
         for fixture in reference["raw_quotes"].as_array().unwrap(){let input=fixture["input"].as_str().unwrap();assert_eq!(looks_like_as2(input),fixture["looks"].as_bool().unwrap(),"actual AS2 recognition");assert_eq!(scrub_as2(input),fixture["scrub"].as_str().unwrap(),"actual AS2 scrub");assert_eq!(strip_raw_quotes(input,fixture["quoted"].as_str()),fixture["plain"].as_str().unwrap(),"actual raw quote strip");}
-        assert_eq!(count, 12);
+        assert_eq!(count, 13);
         assert!(linked_text("@uncachedperson", "bookmarks").is_err());
     }
     /// The PHP fixture's rows, read with the same SQL semantics in memory.
