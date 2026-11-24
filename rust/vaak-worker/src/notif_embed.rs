@@ -429,10 +429,11 @@ fn parse_bare_handle(after: &str) -> Option<&str> {
 }
 
 fn parse_hashtag_token(after: &str) -> Option<&str> {
+    let tag_char = |c: char| c.is_alphanumeric() || c == '_';
     let mut len = 0usize;
     let mut chars = 0usize;
     for (i, c) in after.char_indices() {
-        if c.is_alphanumeric() || c == '_' {
+        if tag_char(c) {
             len = i + c.len_utf8();
             chars += 1;
             if chars > 100 {
@@ -444,6 +445,14 @@ fn parse_hashtag_token(after: &str) -> Option<&str> {
     }
     if chars == 0 {
         return None;
+    }
+    // Bluesky tags may hold inner hyphens (#valerie-flux): keep each
+    // "-word" run, like the PHP painter, but never a trailing hyphen.
+    while after[len..].starts_with('-') && after[len + 1..].chars().next().is_some_and(tag_char) {
+        len += 1;
+        while let Some(c) = after[len..].chars().next().filter(|c| tag_char(*c)) {
+            len += c.len_utf8();
+        }
     }
     Some(&after[..len])
 }
@@ -5240,6 +5249,15 @@ mod tests {
         );
         assert!(out.contains("class=\"hashtag\"") && out.contains("#fediverse"), "{out}");
         assert!(out.contains("view=search") && out.contains("type=statuses"), "{out}");
+    }
+
+    #[test]
+    fn hyphenated_hashtags_stay_whole() {
+        let out = linkify_text_segment("#valerie-flux #opensim #trail- end", "home");
+        assert!(out.contains("q=%23valerie-flux") && out.contains(">#valerie-flux</a>"), "{out}");
+        assert!(out.contains(">#trail</a>- end"), "{out}");
+        assert_eq!(parse_hashtag_token("a-b-c d"), Some("a-b-c"));
+        assert_eq!(parse_hashtag_token("abc--d"), Some("abc"));
     }
 
     #[test]

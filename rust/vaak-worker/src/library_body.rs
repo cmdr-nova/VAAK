@@ -611,7 +611,7 @@ pub(crate) fn linked_discovered(body:&DiscoveredBody,view:&str)->Result<String>{
    out.push_str(&escaped[copied..]);escaped=out;
   }
  }
- escaped=static_regex!(r"(^|[^A-Za-z0-9_&/%])#([\p{L}\p{N}_]{1,100})").replace_all(&escaped,|cap:&regex::Captures|{
+ escaped=static_regex!(r"(^|[^A-Za-z0-9_&/%])#([\p{L}\p{N}_]{1,100}(?:-[\p{L}\p{N}_]+)*)").replace_all(&escaped,|cap:&regex::Captures|{
   let href=format!("?view=search&q={}&type=statuses",query(&format!("#{}",&cap[2])));
   let key=format!("\u{1}H{}\u{1}",hold.len());hold.push((key.clone(),format!("<a class=\"hashtag\" href=\"{}\">#{}</a>",esc(&href),esc(&cap[2])),false));format!("{}{key}",&cap[1])
  }).into_owned();

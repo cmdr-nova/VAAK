@@ -5481,6 +5481,305 @@ function ap_bsky_import_content_html(array $post): string
 }
 
 /**
+ * Media of an own Bluesky post, in the order Bluesky shows it, for the local
+ * import: images (with alt text and size), else a video, else a direct GIF
+ * link card. 'attachment_url' is the URL the stored Create has always used.
+ *
+ * @param array<string,mixed> $post
+ * @return list<array{url:string,preview:string,attachment_url:string,mime:string,kind:string,alt:string,width:int,height:int}>
+ */
+function ap_bsky_import_media_items(array $post): array
+{
+    $record = is_array($post['record'] ?? null) ? $post['record'] : [];
+    $embed = is_array($post['embed'] ?? null) ? $post['embed'] : null;
+    $out = [];
+    $images = [];
+    if (is_array($embed)) {
+        $type = (string) ($embed['$type'] ?? '');
+        if (str_contains($type, 'images') && is_array($embed['images'] ?? null)) {
+            $images = $embed['images'];
+        } elseif (str_contains($type, 'gallery') && is_array($embed['items'] ?? null)) {
+            $images = $embed['items'];
+        } elseif (str_contains($type, 'recordWithMedia') && is_array($embed['media']['images'] ?? null)) {
+            $images = $embed['media']['images'];
+        } elseif (str_contains($type, 'recordWithMedia') && is_array($embed['media']['items'] ?? null)) {
+            $images = $embed['media']['items'];
+        }
+    }
+    // The record keeps the alt text even when a thin view dropped it.
+    $recEmbed = is_array($record['embed'] ?? null) ? $record['embed'] : [];
+    $recImages = is_array($recEmbed['images'] ?? null) ? $recEmbed['images']
+        : (is_array($recEmbed['media']['images'] ?? null) ? $recEmbed['media']['images'] : []);
+    foreach (array_values($images) as $i => $img) {
+        if (!is_array($img)) {
+            continue;
+        }
+        $thumb = (string) ($img['thumb'] ?? $img['thumbnail'] ?? '');
+        $full = (string) ($img['fullsize'] ?? '');
+        $attachmentUrl = $thumb !== '' ? $thumb : $full;
+        if (!str_starts_with($attachmentUrl, 'https://')) {
+            continue;
+        }
+        $alt = (string) ($img['alt'] ?? '');
+        if ($alt === '' && is_array($recImages[$i] ?? null)) {
+            $alt = (string) ($recImages[$i]['alt'] ?? '');
+        }
+        $ratio = is_array($img['aspectRatio'] ?? null) ? $img['aspectRatio']
+            : (is_array($recImages[$i]['aspectRatio'] ?? null) ? $recImages[$i]['aspectRatio'] : []);
+        $out[] = [
+            'url' => str_starts_with($full, 'https://') ? $full : ap_bsky_cdn_fullsize_url($attachmentUrl),
+            'preview' => $attachmentUrl,
+            'attachment_url' => $attachmentUrl,
+            'mime' => 'image/jpeg',
+            'kind' => 'image',
+            'alt' => trim($alt),
+            'width' => max(0, (int) ($ratio['width'] ?? 0)),
+            'height' => max(0, (int) ($ratio['height'] ?? 0)),
+        ];
+    }
+    if ($out !== []) {
+        return $out;
+    }
+    $video = function_exists('ap_bsky_embed_video_view') ? ap_bsky_embed_video_view($embed) : null;
+    $playlist = is_array($video) ? (string) ($video['playlist'] ?? $video['url'] ?? '') : '';
+    if (str_starts_with($playlist, 'https://')) {
+        $thumb = (string) ($video['thumbnail'] ?? $video['thumb'] ?? '');
+        $ratio = is_array($video['aspectRatio'] ?? null) ? $video['aspectRatio'] : [];
+        return [[
+            'url' => $playlist,
+            'preview' => str_starts_with($thumb, 'https://') ? $thumb : '',
+            'attachment_url' => $playlist,
+            'mime' => 'application/x-mpegURL',
+            'kind' => 'video',
+            'alt' => trim((string) ($video['alt'] ?? '')),
+            'width' => max(0, (int) ($ratio['width'] ?? 0)),
+            'height' => max(0, (int) ($ratio['height'] ?? 0)),
+        ]];
+    }
+    // Bluesky GIFs are commonly external embeds rather than image blobs.
+    $linkEmbed = is_array($embed) ? $embed : ($recEmbed !== [] ? $recEmbed : null);
+    $external = is_array($linkEmbed['external'] ?? null) ? $linkEmbed['external'] : null;
+    if ($external === null && is_array($linkEmbed['media']['external'] ?? null)) {
+        $external = $linkEmbed['media']['external'];
+    }
+    $externalUrl = is_array($external) ? trim((string) ($external['uri'] ?? '')) : '';
+    if (str_starts_with($externalUrl, 'https://') && function_exists('ap_bsky_url_looks_like_media')
+        && ap_bsky_url_looks_like_media($externalUrl)) {
+        $path = strtolower((string) (parse_url($externalUrl, PHP_URL_PATH) ?? ''));
+        return [[
+            'url' => $externalUrl,
+            'preview' => '',
+            'attachment_url' => $externalUrl,
+            'mime' => str_ends_with($path, '.gif') ? 'image/gif' : 'image/jpeg',
+            'kind' => 'image',
+            'alt' => trim((string) ($external['title'] ?? '')),
+            'width' => 0,
+            'height' => 0,
+        ]];
+    }
+    return [];
+}
+
+/** cdn.bsky.app feed_thumbnail URL → the matching feed_fullsize URL (others unchanged). */
+function ap_bsky_cdn_fullsize_url(string $url): string
+{
+    if (str_starts_with($url, 'https://cdn.bsky.app/img/feed_thumbnail/')) {
+        return 'https://cdn.bsky.app/img/feed_fullsize/' . substr($url, strlen('https://cdn.bsky.app/img/feed_thumbnail/'));
+    }
+    return $url;
+}
+
+/**
+ * AS2 attachments for the stored Create of an import. Alt text goes in name.
+ *
+ * @param list<array<string,mixed>> $items from ap_bsky_import_media_items()
+ * @return list<array<string,mixed>>
+ */
+function ap_bsky_import_media_attachments(array $items): array
+{
+    $out = [];
+    foreach ($items as $item) {
+        $att = [
+            'type' => 'Document',
+            'mediaType' => (string) $item['mime'],
+            'url' => (string) $item['attachment_url'],
+            'name' => (string) $item['alt'],
+        ];
+        if ($item['kind'] === 'video') {
+            $att['thumbnail'] = $item['preview'] !== '' ? (string) $item['preview'] : null;
+        }
+        $out[] = $att;
+    }
+    return $out;
+}
+
+/**
+ * Media items rebuilt from an import's stored Create, for repairs when the
+ * post itself can no longer be fetched (no alt text or size then).
+ *
+ * @param array<string,mixed> $object Create.object
+ * @return list<array<string,mixed>>
+ */
+function ap_bsky_import_media_items_from_object(array $object): array
+{
+    $atts = $object['attachment'] ?? null;
+    if (!is_array($atts)) {
+        return [];
+    }
+    if (isset($atts['type'])) {
+        $atts = [$atts];
+    }
+    $out = [];
+    foreach ($atts as $att) {
+        $url = is_array($att) ? (string) ($att['url'] ?? '') : '';
+        if (!str_starts_with($url, 'https://')) {
+            continue;
+        }
+        $mime = strtolower((string) ($att['mediaType'] ?? 'image/jpeg'));
+        $isVideo = str_starts_with($mime, 'video/') || str_contains($mime, 'mpegurl');
+        $thumb = (string) ($att['thumbnail'] ?? '');
+        $out[] = [
+            'url' => $isVideo ? $url : ap_bsky_cdn_fullsize_url($url),
+            'preview' => $isVideo ? (str_starts_with($thumb, 'https://') ? $thumb : '') : $url,
+            'attachment_url' => $url,
+            'mime' => $mime !== '' ? $mime : 'image/jpeg',
+            'kind' => $isVideo ? 'video' : 'image',
+            'alt' => trim((string) ($att['name'] ?? '')),
+            'width' => 0,
+            'height' => 0,
+        ];
+    }
+    return $out;
+}
+
+/**
+ * Give an imported status its masto_media rows when it has none. The rows
+ * point at Bluesky's CDN and carry no storage key, so deleting the post (or
+ * retention) never tries to delete a VAAK file. Returns rows written.
+ *
+ * @param list<array<string,mixed>> $items
+ */
+function ap_bsky_import_media_rows_ensure(int $statusLocalId, int $ownerUserId, array $items, bool $dryRun = false): int
+{
+    if ($statusLocalId < 1 || $items === []) {
+        return 0;
+    }
+    $db = ap_db();
+    $st = $db->prepare('SELECT COUNT(*) FROM masto_media WHERE status_local_id = ?');
+    $st->execute([$statusLocalId]);
+    if ((int) $st->fetchColumn() > 0) {
+        return 0;
+    }
+    if ($dryRun) {
+        return count($items);
+    }
+    $ins = $db->prepare(
+        "INSERT INTO masto_media (owner_user_id, created_at, s3_key, public_url, preview_url, media_type, mime, file_size, width, height, description, status_local_id)
+         VALUES (?, ?, '', ?, ?, ?, ?, 0, ?, ?, ?, ?)"
+    );
+    $now = function_exists('ap_db_now') ? ap_db_now() : gmdate('c');
+    $n = 0;
+    foreach (array_slice($items, 0, 4) as $item) {
+        $ins->execute([
+            max(1, $ownerUserId),
+            $now,
+            (string) $item['url'],
+            $item['preview'] !== '' ? (string) $item['preview'] : null,
+            $item['kind'] === 'video' ? 'video' : 'image',
+            (string) $item['mime'],
+            $item['width'] > 0 ? (int) $item['width'] : null,
+            $item['height'] > 0 ? (int) $item['height'] : null,
+            $item['alt'] !== '' ? (string) $item['alt'] : null,
+            $statusLocalId,
+        ]);
+        $n++;
+    }
+    return $n;
+}
+
+/**
+ * Repair an earlier import's media: add the masto_media rows imports used to
+ * skip (the post showed only its text outside the profile) and put the alt
+ * text back on the stored attachments. $post may be null when the post can't
+ * be fetched; the stored attachments are used then. Only vaakOrigin=bluesky.
+ *
+ * @param array<string,mixed>|null $post
+ * @return array{ok:bool,updated:bool,rows?:int,error?:string}
+ */
+function ap_bsky_repair_imported_note_media(string $noteId, ?array $post, int $ownerUserId, bool $dryRun = false): array
+{
+    $noteId = rtrim(trim($noteId), '/');
+    if ($noteId === '') {
+        return ['ok' => false, 'updated' => false, 'error' => 'No note'];
+    }
+    try {
+        $db = ap_db();
+        $st = $db->prepare('SELECT id, raw_create_json, create_id FROM outbox_notes WHERE id = ? OR id = ? LIMIT 1');
+        $st->execute([$noteId, $noteId . '/']);
+        $row = $st->fetch(PDO::FETCH_ASSOC);
+        if (!is_array($row)) {
+            return ['ok' => false, 'updated' => false, 'error' => 'Note missing'];
+        }
+        $create = json_decode((string) ($row['raw_create_json'] ?? ''), true);
+        if (!is_array($create) || !is_array($create['object'] ?? null)
+            || (string) ($create['object']['vaakOrigin'] ?? '') !== 'bluesky') {
+            return ['ok' => true, 'updated' => false];
+        }
+        $items = is_array($post) ? ap_bsky_import_media_items($post) : [];
+        if ($items === []) {
+            $items = ap_bsky_import_media_items_from_object($create['object']);
+        }
+        if ($items === []) {
+            return ['ok' => true, 'updated' => false];
+        }
+        $st = $db->prepare('SELECT local_id FROM masto_statuses WHERE note_id = ? OR note_id = ? LIMIT 1');
+        $st->execute([$noteId, $noteId . '/']);
+        $localId = (int) ($st->fetchColumn() ?: 0);
+        $rows = ap_bsky_import_media_rows_ensure($localId, $ownerUserId, $items, $dryRun);
+
+        // Alt text the first import dropped (attachment name was always '').
+        $altChanged = false;
+        $atts = $create['object']['attachment'] ?? null;
+        if (is_array($atts) && !isset($atts['type'])) {
+            foreach ($atts as $i => $att) {
+                $alt = is_array($att) && is_array($items[$i] ?? null) ? (string) $items[$i]['alt'] : '';
+                if ($alt !== '' && trim((string) ($att['name'] ?? '')) === ''
+                    && (string) ($att['url'] ?? '') === (string) $items[$i]['attachment_url']) {
+                    $create['object']['attachment'][$i]['name'] = $alt;
+                    $altChanged = true;
+                }
+            }
+        }
+        if ($altChanged && !$dryRun) {
+            $db->prepare('UPDATE outbox_notes SET raw_create_json = ? WHERE id = ?')->execute([
+                json_encode($create, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE),
+                (string) $row['id'],
+            ]);
+        }
+        // Rows added by an earlier, alt-less repair get the alt once it is known.
+        if (!$dryRun && $localId > 0 && $rows === 0) {
+            $mst = $db->prepare('SELECT local_id, description, public_url, preview_url FROM masto_media WHERE status_local_id = ? AND s3_key = \'\' ORDER BY local_id ASC');
+            $mst->execute([$localId]);
+            foreach ($mst->fetchAll(PDO::FETCH_ASSOC) ?: [] as $i => $m) {
+                $alt = is_array($items[$i] ?? null) ? (string) $items[$i]['alt'] : '';
+                if ($alt !== '' && trim((string) ($m['description'] ?? '')) === ''
+                    && in_array((string) $items[$i]['attachment_url'], [(string) $m['public_url'], (string) ($m['preview_url'] ?? '')], true)) {
+                    $db->prepare('UPDATE masto_media SET description = ? WHERE local_id = ?')->execute([$alt, (int) $m['local_id']]);
+                    $altChanged = true;
+                }
+            }
+        }
+        $updated = $rows > 0 || $altChanged;
+        if ($updated && !$dryRun && function_exists('ap_public_doc_invalidate_note')) {
+            ap_public_doc_invalidate_note($noteId, (string) ($row['create_id'] ?? '') ?: null);
+        }
+        return ['ok' => true, 'updated' => $updated, 'rows' => $rows];
+    } catch (Throwable $e) {
+        return ['ok' => false, 'updated' => false, 'error' => $e->getMessage()];
+    }
+}
+
+/**
  * Rewrite the stored HTML of an earlier import whose content lost its facet
  * links. Only touches vaakOrigin=bluesky notes. Returns updated=true when the
  * content changed.
@@ -5611,7 +5910,8 @@ function ap_bsky_import_own_post_as_local(int $ownerUserId, array $post, int $de
             // Repair quote context on earlier imports that dropped the embed.
             $repaired = ap_bsky_repair_imported_note_quote($noteId, $post, $ownerUserId);
             $relinked = ap_bsky_repair_imported_note_content($noteId, $post);
-            if (!empty($relinked['updated'])) {
+            $remedia = ap_bsky_repair_imported_note_media($noteId, $post, $ownerUserId);
+            if (!empty($relinked['updated']) || !empty($remedia['updated'])) {
                 if (function_exists('ap_timeline_cache_invalidate_owner')) {
                     ap_timeline_cache_invalidate_owner($ownerUserId);
                 }
@@ -5656,64 +5956,8 @@ function ap_bsky_import_own_post_as_local(int $ownerUserId, array $post, int $de
     }
     $contentHtml = ap_bsky_import_content_html($post);
 
-    $attachments = [];
-    if (function_exists('ap_bsky_post_image_urls')) {
-        foreach (ap_bsky_post_image_urls($post) as $imgUrl) {
-            if (!is_string($imgUrl) || !str_starts_with($imgUrl, 'https://')) {
-                continue;
-            }
-            $attachments[] = [
-                'type' => 'Document',
-                'mediaType' => 'image/jpeg',
-                'url' => $imgUrl,
-                'name' => '',
-            ];
-        }
-    }
-    if ($attachments === [] && function_exists('ap_bsky_post_video_media')) {
-        $vids = ap_bsky_post_video_media($post);
-        if (is_array($vids)) {
-            foreach ($vids as $vid) {
-                if (!is_array($vid)) {
-                    continue;
-                }
-                $vurl = (string) ($vid['url'] ?? '');
-                if (!str_starts_with($vurl, 'https://')) {
-                    continue;
-                }
-                $attachments[] = [
-                    'type' => 'Document',
-                    'mediaType' => (string) ($vid['mediaType'] ?? 'video/mp4'),
-                    'url' => $vurl,
-                    'name' => '',
-                    'thumbnail' => str_starts_with((string) ($vid['thumbnail'] ?? ''), 'https://')
-                        ? (string) $vid['thumbnail']
-                        : null,
-                ];
-            }
-        }
-    }
-    // Bluesky GIFs are commonly represented as external embeds rather than
-    // image blobs. Preserve the direct media URL for HTML profiles and posts.
-    if ($attachments === [] && function_exists('ap_bsky_url_looks_like_media')) {
-        $embed = is_array($post['embed'] ?? null)
-            ? $post['embed']
-            : (is_array($record['embed'] ?? null) ? $record['embed'] : null);
-        $external = is_array($embed['external'] ?? null) ? $embed['external'] : null;
-        if ($external === null && is_array($embed['media']['external'] ?? null)) {
-            $external = $embed['media']['external'];
-        }
-        $externalUrl = is_array($external) ? trim((string) ($external['uri'] ?? '')) : '';
-        if ($externalUrl !== '' && ap_bsky_url_looks_like_media($externalUrl)) {
-            $path = strtolower((string) (parse_url($externalUrl, PHP_URL_PATH) ?? ''));
-            $attachments[] = [
-                'type' => 'Document',
-                'mediaType' => str_ends_with($path, '.gif') ? 'image/gif' : 'image/jpeg',
-                'url' => $externalUrl,
-                'name' => '',
-            ];
-        }
-    }
+    $mediaItems = ap_bsky_import_media_items($post);
+    $attachments = ap_bsky_import_media_attachments($mediaItems);
 
     $createId = $actorId . '/creates/' . substr(hash('sha256', 'bsky-import:' . $uri), 0, 16);
     $to = ['https://www.w3.org/ns/activitystreams#Public'];
@@ -5793,7 +6037,7 @@ function ap_bsky_import_own_post_as_local(int $ownerUserId, array $post, int $de
             }
         }
         if (function_exists('ap_masto_status_register')) {
-            ap_masto_status_register(
+            $statusLocalId = ap_masto_status_register(
                 $noteId,
                 $createId,
                 $published,
@@ -5803,6 +6047,13 @@ function ap_bsky_import_own_post_as_local(int $ownerUserId, array $post, int $de
                 false,
                 'public'
             );
+            // Status pages, notifications, link cards and Mastodon clients read
+            // masto_media, not the stored Create, so the image has to live there too.
+            try {
+                ap_bsky_import_media_rows_ensure((int) $statusLocalId, $ownerUserId, $mediaItems);
+            } catch (Throwable $e) {
+                error_log('[ap-bsky] import media rows: ' . $e->getMessage());
+            }
         }
         ap_bsky_crosspost_save($noteId, $uri, $cid !== '' ? $cid : null, $ownerUserId);
         ap_bsky_post_link_upsert($uri, $cid !== '' ? $cid : null, $noteId, $noteId);

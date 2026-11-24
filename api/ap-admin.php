@@ -18282,9 +18282,11 @@ function admin_linkify_body_html(string $plain, string $returnView = 'home', arr
         }
     }
 
-    // Hashtags → admin Search (statuses for that tag)
+    // Hashtags → admin Search (statuses for that tag). Bluesky tags may hold
+    // inner hyphens (#valerie-flux); keep them whole instead of #valerie + "-flux".
+    // Search normalizes the tag, so the link still finds it.
     $escaped = preg_replace_callback(
-        '/(^|[^A-Za-z0-9_&\/%])#([\p{L}\p{N}_]{1,100})/u',
+        '/(^|[^A-Za-z0-9_&\/%])#([\p{L}\p{N}_]{1,100}(?:-[\p{L}\p{N}_]+)*)/u',
         static function (array $m) use (&$placeholders): string {
             $tag = $m[2];
             $href = '?view=search&q=' . rawurlencode('#' . $tag) . '&type=statuses';
