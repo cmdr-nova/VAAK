@@ -12,6 +12,13 @@ anything else bumps the patch number.
 Releases up to **0.9.83** used a two-digit deploy counter (0.9.05, 0.9.83)
 and have no notes here; their tags and GitHub Releases are unchanged.
 
+## [0.91.1](https://github.com/cmdr-nova/VAAK/releases/tag/v0.91.1) - 2026-11-24
+
+### 🐛 Fixes
+* Show images on Bluesky posts imported to VAAK by @cmdr-nova in https://github.com/cmdr-nova/VAAK/pull/464
+
+**Full Changelog**: https://github.com/cmdr-nova/VAAK/compare/v0.91.0...v0.91.1
+
 ## [0.91.0](https://github.com/cmdr-nova/VAAK/releases/tag/v0.91.0) - 2026-11-22
 
 ### ✨ Features
