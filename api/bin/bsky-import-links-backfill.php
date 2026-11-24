@@ -10,6 +10,12 @@ declare(strict_types=1);
  * cache first, then the public AppView in batches of 25), rebuilds the HTML
  * from text + facets and clears the owner's timeline caches.
  *
+ * It also repairs media: imports never wrote masto_media rows, so status
+ * pages, notifications, link cards and Mastodon clients showed an image post
+ * as its text alone (often just hashtags). Each import with attachments gets
+ * CDN-pointing rows (no storage key) plus its alt text back. Posts AppView no
+ * longer serves are repaired from the stored attachments, without alt text.
+ *
  * Not installed as cron and not run by deploy. Run --dry-run first.
  *
  *   php api/bin/bsky-import-links-backfill.php --user=cmdr_nova --dry-run
@@ -132,6 +138,7 @@ foreach (array_chunk($missing, 25) as $chunk) {
 }
 
 $updated = [];
+$mediaUpdated = [];
 $errors = 0;
 foreach ($posts as $uri => $post) {
     $r = ap_bsky_repair_imported_note_content($byUri[$uri], $post, $dryRun);
@@ -143,7 +150,17 @@ foreach ($posts as $uri => $post) {
         $updated[] = $byUri[$uri];
     }
 }
-if (!$dryRun && $updated !== []) {
+foreach ($byUri as $uri => $noteId) {
+    $r = ap_bsky_repair_imported_note_media($noteId, $posts[$uri] ?? null, $ownerId, $dryRun);
+    if (empty($r['ok'])) {
+        $errors++;
+        continue;
+    }
+    if (!empty($r['updated'])) {
+        $mediaUpdated[] = $noteId;
+    }
+}
+if (!$dryRun && ($updated !== [] || $mediaUpdated !== [])) {
     ap_timeline_cache_invalidate_owner($ownerId);
     if (function_exists('admin_tl_cache_clear')) {
         admin_tl_cache_clear();
@@ -151,7 +168,7 @@ if (!$dryRun && $updated !== []) {
 }
 
 fwrite(STDOUT, sprintf(
-    "bsky-import-links-backfill user=%s dry_run=%d imported_rows=%d with_uri=%d found=%d appview_fetched=%d failed_batches=%d %s=%d errors=%d\n",
+    "bsky-import-links-backfill user=%s dry_run=%d imported_rows=%d with_uri=%d found=%d appview_fetched=%d failed_batches=%d %s=%d media_%s=%d errors=%d\n",
     $user,
     $dryRun ? 1 : 0,
     $rows,
@@ -161,6 +178,8 @@ fwrite(STDOUT, sprintf(
     $failedBatches,
     $dryRun ? 'would_update' : 'updated',
     count($updated),
+    $dryRun ? 'would_update' : 'updated',
+    count($mediaUpdated),
     $errors
 ));
 if ($firstError !== '') {
@@ -168,4 +187,7 @@ if ($firstError !== '') {
 }
 foreach (array_slice($updated, 0, 20) as $id) {
     fwrite(STDOUT, "  {$id}\n");
+}
+foreach (array_slice($mediaUpdated, 0, 20) as $id) {
+    fwrite(STDOUT, "  media {$id}\n");
 }
