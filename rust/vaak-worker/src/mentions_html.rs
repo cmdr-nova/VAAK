@@ -82,11 +82,32 @@ fn relative_time(created_at: &str) -> String {
     format!("{}mo", secs / (86400 * 30))
 }
 
+/// What a like / boost landed on. Bluesky likes can target a custom feed,
+/// list or starter pack; their status URL is that page, not a post.
+fn liked_subject_noun(status_uri: &str) -> &'static str {
+    let Some(rest) = status_uri.strip_prefix("https://bsky.app/") else {
+        return "post";
+    };
+    if rest.starts_with("starter-pack/") {
+        return "starter pack";
+    }
+    if let Some(profile) = rest.strip_prefix("profile/") {
+        let mut parts = profile.split('/');
+        let _actor = parts.next();
+        match parts.next() {
+            Some("feed") => return "feed",
+            Some("lists") => return "list",
+            _ => {}
+        }
+    }
+    "post"
+}
+
 fn type_label(n_type: &str, status_uri: &str) -> String {
     match n_type {
         "follow" => "👤 followed you".into(),
-        "favourite" => "★ liked your post".into(),
-        "reblog" => "🔁 boosted your post".into(),
+        "favourite" => format!("★ liked your {}", liked_subject_noun(status_uri)),
+        "reblog" => format!("🔁 boosted your {}", liked_subject_noun(status_uri)),
         "mention" => "＠ mentioned you".into(),
         "quote" => "💬 quoted your post".into(),
         "poll" => "📊 poll ended".into(),
@@ -343,12 +364,18 @@ fn profile_href_for(acct: &Value) -> String {
 
 fn paint_grouped_card(g: &GroupedNotif, viewer_actor: &str) -> String {
     let n_type = g.row.get("type").and_then(|v| v.as_str()).unwrap_or("favourite");
+    let status_uri = g
+        .row
+        .get("status")
+        .and_then(|st| st.get("uri").and_then(Value::as_str).or_else(|| st.get("url").and_then(Value::as_str)))
+        .unwrap_or("");
+    let noun = liked_subject_noun(status_uri);
     let label = if g.zap_sats > 0 {
         format!("zapped your post · {}", sats_label(g.zap_sats))
     } else if n_type == "reblog" {
-        "boosted your post".to_string()
+        format!("boosted your {noun}")
     } else {
-        "liked your post".to_string()
+        format!("liked your {noun}")
     };
     let created = g.row.get("created_at").and_then(|v| v.as_str()).unwrap_or("");
     let when = relative_time(created);

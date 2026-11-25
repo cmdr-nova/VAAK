@@ -66,7 +66,7 @@ if (ap_bsky_session_row((int) $owner['id']) === null) {
 
 $r = ap_bsky_notification_subjects_backfill((int) $owner['id'], $days, $limit, $dryRun);
 fwrite(STDOUT, sprintf(
-    "bsky-notif-subject-backfill user=%s days=%d dry_run=%d rows=%d subjects=%d cached_before=%d fetched=%d text_updated=%d still_missing=%s\n",
+    "bsky-notif-subject-backfill user=%s days=%d dry_run=%d rows=%d subjects=%d cached_before=%d fetched=%d text_updated=%d non_post=%d still_missing=%s\n",
     $user,
     $days,
     $dryRun ? 1 : 0,
@@ -75,5 +75,6 @@ fwrite(STDOUT, sprintf(
     $r['cached_before'],
     $r['fetched'],
     $r['text_updated'],
+    $r['non_post'],
     $r['still_missing'] === [] ? 'none' : implode(',', $r['still_missing'])
 ));

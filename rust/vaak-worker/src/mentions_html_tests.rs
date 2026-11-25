@@ -550,3 +550,12 @@ fn nostr_follower_follows_back_with_the_signer() {
     let html = paint_notif_card_follows(&row, "https://mkultra.monster/users/cmdr_nova", &HashSet::new());
     assert!(!html.contains("data-nostr-act") && !html.contains("follow_remote"));
 }
+
+#[test]
+fn bluesky_feed_like_says_feed_not_post() {
+    assert_eq!(type_label("favourite", "https://bsky.app/profile/did:plc:abc/feed/anime"), "★ liked your feed");
+    assert_eq!(type_label("reblog", "https://bsky.app/profile/a.bsky.social/lists/3k"), "🔁 boosted your list");
+    assert_eq!(type_label("favourite", "https://bsky.app/starter-pack/did:plc:abc/3x"), "★ liked your starter pack");
+    assert_eq!(type_label("favourite", "https://bsky.app/profile/a.bsky.social/post/3p"), "★ liked your post");
+    assert_eq!(type_label("favourite", "https://mkultra.monster/users/a/statuses/1"), "★ liked your post");
+}
