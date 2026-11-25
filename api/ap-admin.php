@@ -28760,8 +28760,8 @@ function admin_render_notification_card(array $n, array $followingIds, array $fo
         }
         $typeLabel = match ($nType) {
             'follow' => '👤 followed you',
-            'favourite' => '★ liked your post',
-            'reblog' => '🔁 boosted your post',
+            'favourite' => '★ liked your ' . admin_liked_subject_noun($nStatusUri),
+            'reblog' => '🔁 boosted your ' . admin_liked_subject_noun($nStatusUri),
             'mention' => '＠ mentioned you',
             'quote' => '💬 quoted your post',
             'poll' => '📊 poll ended',
@@ -30155,6 +30155,21 @@ function admin_notification_zap_sats(array $row): int
     return max(0, (int) ($row['vaak_zap_sats'] ?? 0));
 }
 
+/**
+ * What a like / boost landed on (Rust mentions_html liked_subject_noun).
+ * Bluesky likes can target a custom feed, list or starter pack.
+ */
+function admin_liked_subject_noun(string $statusUrl): string
+{
+    if (str_starts_with($statusUrl, 'https://bsky.app/starter-pack/')) {
+        return 'starter pack';
+    }
+    if (preg_match('~^https://bsky\.app/profile/[^/]+/(feed|lists)/~', $statusUrl, $m)) {
+        return $m[1] === 'feed' ? 'feed' : 'list';
+    }
+    return 'post';
+}
+
 /** "1 sat", "21 sats", "2,100 sats" (Rust mentions_html sats_label). */
 function admin_zap_sats_label(int $sats): string
 {
@@ -30442,7 +30457,7 @@ function admin_render_notification_stream(array $rows, array $followingIds, arra
         $groupSats = (int) ($n['_group_zap_sats'] ?? 0);
         $label = $groupSats > 0
             ? 'zapped your post · ' . admin_zap_sats_label($groupSats)
-            : ($type === 'reblog' ? 'boosted your post' : 'liked your post');
+            : ($type === 'reblog' ? 'boosted your ' : 'liked your ') . admin_liked_subject_noun($statusUrl);
         echo '<article class="tweet tweet-notif tweet-notif-grouped">';
         echo '<div class="tweet-hd" style="align-items:center">';
         echo '<div class="notification-avatar-stack" style="display:flex;align-items:center;min-width:3rem">';

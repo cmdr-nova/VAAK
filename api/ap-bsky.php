@@ -16329,6 +16329,32 @@ function ap_bsky_owner_has_fediverse_mention(int $ownerUserId, string $objectId)
     }
 }
 
+/**
+ * Body text for a like / repost whose subject is not a post: a custom feed,
+ * list, starter pack or labeler. Bluesky sends those with reason "like" too.
+ * Empty string for posts (and anything unknown), so callers keep the post path.
+ * The feed / list name comes from ap_bsky_feed_labels (cached a day).
+ */
+function ap_bsky_notification_non_post_subject_label(string $subjectAt): string
+{
+    if (!preg_match('~^at://[^/]+/(app\.bsky\.[a-z.]+)/[^/\s?#]+$~', trim($subjectAt), $m)) {
+        return '';
+    }
+    $collection = $m[1];
+    if ($collection === 'app.bsky.feed.generator' || $collection === 'app.bsky.graph.list') {
+        $names = function_exists('ap_bsky_feed_labels') ? ap_bsky_feed_labels([['value' => $subjectAt]], 1) : [];
+        $name = trim((string) ($names[$subjectAt] ?? ''));
+        $kind = $collection === 'app.bsky.graph.list' ? 'List' : 'Custom feed';
+        // ap_bsky_feed_labels falls back to the record key when the lookup fails.
+        return ($name !== '' && $name !== basename($subjectAt)) ? ($kind . ': ' . $name) : $kind;
+    }
+    return match ($collection) {
+        'app.bsky.graph.starterpack' => 'Starter pack',
+        'app.bsky.labeler.service' => 'Labeler',
+        default => '',
+    };
+}
+
 function ap_bsky_notification_to_mention_row(int $ownerUserId, string $ownerActorId, array $notif): ?array
 {
     $reason = strtolower(trim((string) ($notif['reason'] ?? '')));
@@ -16414,7 +16440,8 @@ function ap_bsky_notification_to_mention_row(int $ownerUserId, string $ownerActo
             $objType = 'Like';
             $kind = 'like';
             // Like records have no text — preview the liked subject (works for replies too).
-            if ($reasonSubject !== '') {
+            $text = ap_bsky_notification_non_post_subject_label($reasonSubject);
+            if ($text === '' && $reasonSubject !== '') {
                 $preview = ap_bsky_subject_post_preview_text($reasonSubject, $ownerUserId);
                 if ($preview !== '') {
                     $text = $preview;
@@ -16428,7 +16455,8 @@ function ap_bsky_notification_to_mention_row(int $ownerUserId, string $ownerActo
             $activityType = 'Announce';
             $objType = 'Announce';
             $kind = 'reblog';
-            if ($reasonSubject !== '') {
+            $text = ap_bsky_notification_non_post_subject_label($reasonSubject);
+            if ($text === '' && $reasonSubject !== '') {
                 $preview = ap_bsky_subject_post_preview_text($reasonSubject, $ownerUserId);
                 if ($preview !== '') {
                     $text = $preview;
@@ -16800,13 +16828,13 @@ function ap_bsky_notification_subjects_warm(int $ownerUserId, array $notifs): in
 function ap_bsky_notification_subjects_backfill(int $ownerUserId, int $days, int $limit, bool $dryRun): array
 {
     $out = ['rows' => 0, 'subjects' => 0, 'cached_before' => 0, 'fetched' => 0,
-        'text_updated' => 0, 'still_missing' => [], 'dry_run' => $dryRun];
+        'text_updated' => 0, 'non_post' => 0, 'still_missing' => [], 'dry_run' => $dryRun];
     if ($ownerUserId < 1) {
         return $out;
     }
     ap_bsky_posts_migrate();
     $st = ap_db()->prepare(
-        "SELECT id, object_id, activity_type, content FROM mentions
+        "SELECT id, object_id, activity_id, activity_type, content FROM mentions
          WHERE owner_user_id = ? AND deleted_at IS NULL AND created_at >= ?
            AND activity_type IN ('Like', 'Announce') AND object_id LIKE 'https://bsky.app/profile/%'
          ORDER BY id DESC LIMIT ?"
@@ -16821,15 +16849,24 @@ function ap_bsky_notification_subjects_backfill(int $ownerUserId, int $days, int
         $url = preg_replace('~#(like|reblog)-[a-z0-9]+$~i', '', (string) ($row['object_id'] ?? ''));
         $at = ap_bsky_at_uri_from_any_url((string) $url);
         if (!is_string($at) || !str_starts_with($at, 'at://')) {
-            $out['still_missing'][] = (int) $row['id'];
+            // A like / repost of a custom feed (or list, starter pack) was
+            // stored with a bare profile link before ingest knew those.
+            if (ap_bsky_notification_non_post_backfill_row($ownerUserId, $row, $dryRun)) {
+                $out['non_post']++;
+            } else {
+                $out['still_missing'][] = (int) $row['id'];
+            }
             continue;
         }
         $rows[] = ['id' => (int) $row['id'], 'at' => $at, 'content' => (string) ($row['content'] ?? '')];
         $want[$at] = (string) ($row['activity_type'] ?? '') === 'Announce' ? 'repost' : 'like';
     }
-    $out['rows'] = count($rows) + count($out['still_missing']);
+    $out['rows'] = count($rows) + count($out['still_missing']) + $out['non_post'];
     $out['subjects'] = count($want);
     if ($want === []) {
+        if ($out['non_post'] > 0 && !$dryRun) {
+            ap_notification_projection_invalidate_owner($ownerUserId);
+        }
         return $out;
     }
     $uris = array_keys($want);
@@ -16864,6 +16901,41 @@ function ap_bsky_notification_subjects_backfill(int $ownerUserId, int $days, int
     ap_notification_projection_invalidate_owner($ownerUserId);
     sort($out['still_missing']);
     return $out;
+}
+
+/**
+ * One stored like / repost row whose object_id is a bare profile link: read
+ * the like / repost record from the liker's PDS to learn its subject. When
+ * that subject is a feed, list, starter pack or labeler, point the row at
+ * its bsky.app page and give it a label body. False for anything else.
+ *
+ * @param array<string,mixed> $row id, object_id, activity_id, content
+ */
+function ap_bsky_notification_non_post_backfill_row(int $ownerUserId, array $row, bool $dryRun): bool
+{
+    $objectId = (string) ($row['object_id'] ?? '');
+    if (!preg_match('~^https://bsky\.app/profile/[^/#?]+(#(?:like|reblog)-[a-z0-9]+)?$~i', $objectId, $om)) {
+        return false;
+    }
+    $activity = trim((string) ($row['activity_id'] ?? ''));
+    if (!preg_match('~^at://did:[^/]+/app\.bsky\.feed\.(like|repost)/[^/\s]+$~', $activity)) {
+        return false;
+    }
+    $rec = ap_bsky_get_record_direct($activity);
+    $subject = trim((string) ($rec['value']['subject']['uri'] ?? ''));
+    $label = $subject !== '' ? ap_bsky_notification_non_post_subject_label($subject) : '';
+    if (empty($rec['ok']) || $label === '') {
+        return false;
+    }
+    if ($dryRun) {
+        return true;
+    }
+    $newObject = ap_bsky_https_url_from_at_uri($subject, null) . ($om[1] ?? '');
+    $content = (string) ($row['content'] ?? '');
+    $newContent = in_array($content, ['liked your Bluesky post', 'boosted your Bluesky post', ''], true) ? $label : $content;
+    ap_db()->prepare('UPDATE mentions SET object_id = ?, content = ? WHERE id = ? AND owner_user_id = ?')
+        ->execute([$newObject, $newContent, (int) $row['id'], $ownerUserId]);
+    return true;
 }
 
 /**

@@ -60,6 +60,16 @@ if (!function_exists('ap_bsky_https_url_from_at_uri')) {
             $actorPath = str_starts_with($actor, 'did:') ? $actor : rawurlencode($actor);
             return 'https://bsky.app/profile/' . $actorPath . '/post/' . rawurlencode($m[2]);
         }
+        // Likes / reposts can target a custom feed, a list or a starter pack,
+        // not only a post. Those have their own bsky.app pages.
+        if (preg_match('~^at://([^/]+)/(app\.bsky\.feed\.generator|app\.bsky\.graph\.list|app\.bsky\.graph\.starterpack)/([^/\s?#]+)~', $uri, $m)) {
+            $profile = ap_bsky_actor_profile_url($authorHandle !== null && $authorHandle !== '' ? $authorHandle : $m[1]);
+            $rkey = rawurlencode($m[3]);
+            if ($m[2] === 'app.bsky.graph.starterpack') {
+                return 'https://bsky.app/starter-pack/' . substr($profile, strlen('https://bsky.app/profile/')) . '/' . $rkey;
+            }
+            return $profile . ($m[2] === 'app.bsky.feed.generator' ? '/feed/' : '/lists/') . $rkey;
+        }
         if (preg_match('~^at://([^/]+)~', $uri, $m)) {
             return ap_bsky_actor_profile_url($authorHandle !== null && $authorHandle !== '' ? $authorHandle : $m[1]);
         }
